@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 import importlib
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 
 @dataclass(frozen=True, order=True)
@@ -30,6 +30,79 @@ class FunctionResolutionState(str, Enum):
     EXTERNAL = "external"
 
 
+class ParameterTransfer(str, Enum):
+    """How an argument's storage is presented to a function body."""
+
+    VALUE = "value"
+    ALIAS = "alias"
+    COPY = "copy"
+
+
+class ParameterAccess(str, Enum):
+    """Permitted data flow through a parameter binding."""
+
+    IN = "in"
+    OUT = "out"
+    INOUT = "inout"
+
+
+class ParameterStorage(str, Enum):
+    """Shape of the raw SSA data named by a parameter."""
+
+    SCALAR = "scalar"
+    SPAN = "span"
+    RECORD = "record"
+    TABLE = "table"
+
+
+class ParameterScope(str, Enum):
+    """Lifetime boundary expected for parameter storage."""
+
+    LOCAL = "local"
+    CALLER = "caller"
+    RETAINED = "retained"
+
+
+@dataclass(frozen=True)
+class ParameterContract:
+    """Compile-time memory flags for one ordered function parameter.
+
+    This describes how the call lowerer should direct raw SSA values or
+    addresses.  It is deliberately not a runtime wrapper and carries no
+    callable behavior.
+    """
+
+    name: str
+    transfer: ParameterTransfer = ParameterTransfer.VALUE
+    access: ParameterAccess = ParameterAccess.IN
+    storage: ParameterStorage = ParameterStorage.SCALAR
+    scope: ParameterScope = ParameterScope.LOCAL
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", str(self.name))
+        object.__setattr__(self, "transfer", ParameterTransfer(self.transfer))
+        object.__setattr__(self, "access", ParameterAccess(self.access))
+        object.__setattr__(self, "storage", ParameterStorage(self.storage))
+        object.__setattr__(self, "scope", ParameterScope(self.scope))
+
+
+def _parameter_contracts(
+    contracts: Iterable[ParameterContract | Mapping[str, Any]],
+) -> tuple[ParameterContract, ...]:
+    """Normalize and validate an ordered parameter contract sequence."""
+
+    normalized = tuple(
+        contract
+        if isinstance(contract, ParameterContract)
+        else ParameterContract(**dict(contract))
+        for contract in contracts
+    )
+    names = tuple(contract.name for contract in normalized)
+    if len(names) != len(set(names)):
+        raise ValueError("parameter contract names must be unique")
+    return normalized
+
+
 @dataclass
 class FunctionEntry:
     """One named function and its available representations."""
@@ -45,6 +118,13 @@ class FunctionEntry:
         default_factory=dict
     )
     recursive: bool = False
+    parameter_contracts: tuple[ParameterContract, ...] = ()
+
+    def __setstate__(self, state: Mapping[str, Any]) -> None:
+        """Load entries written before parameter contracts were introduced."""
+
+        self.__dict__.update(state)
+        self.__dict__.setdefault("parameter_contracts", ())
 
 
 class StaticFunctionSlot:
@@ -86,6 +166,9 @@ class FunctionTable:
         qualified_name: str | None = None,
         external: bool = False,
         metadata: Mapping[str, Any] | None = None,
+        parameter_contracts: (
+            Iterable[ParameterContract | Mapping[str, Any]] | None
+        ) = None,
     ) -> FunctionReference:
         """Declare a function or return its existing stable reference."""
 
@@ -105,6 +188,11 @@ class FunctionTable:
                     else FunctionResolutionState.DECLARED
                 ),
                 metadata=dict(metadata or {}),
+                parameter_contracts=(
+                    _parameter_contracts(parameter_contracts)
+                    if parameter_contracts is not None
+                    else ()
+                ),
             )
             self._qualified[qualified] = reference
         else:
@@ -112,8 +200,23 @@ class FunctionTable:
             entry.metadata.update(dict(metadata or {}))
             if external and entry.state == FunctionResolutionState.DECLARED:
                 entry.state = FunctionResolutionState.EXTERNAL
+            if parameter_contracts is not None:
+                entry.parameter_contracts = _parameter_contracts(
+                    parameter_contracts
+                )
         self._bindings[local_name] = reference
         return reference
+
+    def set_parameter_contracts(
+        self,
+        reference_or_name: FunctionReference | int | str,
+        contracts: Iterable[ParameterContract | Mapping[str, Any]],
+    ) -> FunctionEntry:
+        """Replace one entry's ordered compile-time parameter contracts."""
+
+        entry = self.entry(reference_or_name)
+        entry.parameter_contracts = _parameter_contracts(contracts)
+        return entry
 
     def bind(self, name: str, reference: FunctionReference) -> None:
         """Bind another source-language name to an existing function."""
@@ -122,9 +225,36 @@ class FunctionTable:
         self._bindings[str(name)] = reference
 
     def reference(self, name: str) -> FunctionReference | None:
-        """Return the function reference bound to ``name``, if any."""
+        """Return the function reference bound to ``name``, if any.
+
+        ``name`` is bare and unqualified -- ``declare`` rebinds it, last
+        writer wins, every time *any* function shares that name (a method
+        of the same name on an unrelated class, say). There is no
+        collision detection here at all. Safe only when the caller knows
+        no other declared function shares ``name``; otherwise use
+        ``reference_by_source_node``.
+        """
 
         return self._bindings.get(str(name))
+
+    def reference_by_source_node(self, node_id: int) -> FunctionReference | None:
+        """Return the reference declared for a specific source AST node.
+
+        Keyed by ``id()`` of the exact node ``declare`` was called for --
+        the same identity every entry's ``metadata["source_node"]`` already
+        records (``topological_reducer.py``). Collision-proof by
+        construction: two functions can share a bare name, but never the
+        same source node. Use this whenever the caller already holds the
+        specific node (an entrypoint's own ``FunctionDef``, discovered
+        unambiguously from the caller's own freshly-parsed source) instead
+        of re-deriving a reference from a name other code may since have
+        rebound to something else entirely.
+        """
+
+        for reference, entry in self._entries.items():
+            if entry.metadata.get("source_node") == node_id:
+                return reference
+        return None
 
     def entry(
         self,
@@ -262,5 +392,10 @@ __all__ = [
     "FunctionReference",
     "FunctionResolutionState",
     "FunctionTable",
+    "ParameterAccess",
+    "ParameterContract",
+    "ParameterScope",
+    "ParameterStorage",
+    "ParameterTransfer",
     "StaticFunctionSlot",
 ]

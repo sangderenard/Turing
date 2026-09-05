@@ -155,6 +155,16 @@ class NumPyTensorOperations(AbstractTensor):
         other = other.data if isinstance(other, AbstractTensor) else other
         return np.minimum(self.data, other)
 
+    def atan2_(self, other):
+        import numpy as np
+        other = other.data if isinstance(other, AbstractTensor) else other
+        return np.arctan2(self.data, other)
+
+    def complex_(self, imag):
+        import numpy as np
+        imag = imag.data if isinstance(imag, AbstractTensor) else imag
+        return self.data.astype(np.result_type(self.data, 1j)) + 1j * np.asarray(imag)
+
     def clamp_(self, min_val=None, max_val=None):
         import numpy as np
         return np.clip(self.data, a_min=min_val, a_max=max_val)
@@ -227,7 +237,11 @@ class NumPyTensorOperations(AbstractTensor):
 
     def round_(self, n=None):
         import numpy as np
-        return np.round(self.data, n)
+        # np.round's `decimals` must be an int; it does not accept None the
+        # way this hook's own default does, so the untested default arg
+        # crashed every call that omitted `n` -- which was every call, since
+        # no public `.round()` wrapper existed until now.
+        return np.round(self.data, n if n is not None else 0)
 
     def trunc_(self):
         import numpy as np
@@ -450,7 +464,12 @@ class NumPyTensorOperations(AbstractTensor):
             return torch.int32
         if dtype == np.bool_:
             return torch.bool
-        return None
+        # No torch equivalent (complex64/128, float16, uint*, ...): report the
+        # numpy dtype itself instead of None. ``.dtype`` must always be able
+        # to name what the tensor holds -- returning None here silently made
+        # a complex tensor (e.g. the output of ``fft()``) unable to report
+        # its own dtype at all.
+        return np.dtype(dtype)
 
     def full_(self, size, fill_value, dtype, device):
         return np.full(size, fill_value, dtype=self._torch_dtype_to_numpy(dtype))
@@ -484,23 +503,31 @@ class NumPyTensorOperations(AbstractTensor):
     def long_cast_(self, tensor):
         return self._AbstractTensor__unwrap(tensor).astype(np.int64)
 
+    # The dtype casts are called receiver-style by abstraction_methods
+    # (``self.long_()``); ``to_dtype_`` here already reads ``self.data``, so
+    # an explicit tensor argument casts that array with the same dtype map.
+    def _cast_(self, tensor, dtype: str):
+        if tensor is None:
+            return self.to_dtype_(dtype)
+        return np.asarray(self._AbstractTensor__unwrap(tensor)).astype(
+            {"float": np.float32, "double": np.float64, "int": np.int32,
+             "long": np.int64, "bool": np.bool_}[dtype]
+        )
+
     def float_(self, tensor=None):
-        if tensor is not None:
-            tensor.float()
-        else:
-            return self.to_dtype_("float")
+        return self._cast_(tensor, "float")
 
-    def double_(self, tensor):
-        return self.to_dtype_(tensor, "double")
+    def double_(self, tensor=None):
+        return self._cast_(tensor, "double")
 
-    def int_(self, tensor):
-        return self.to_dtype_(tensor, "int")
+    def int_(self, tensor=None):
+        return self._cast_(tensor, "int")
 
-    def long_(self, tensor):
-        return self.to_dtype_(tensor, "long")
+    def long_(self, tensor=None):
+        return self._cast_(tensor, "long")
 
-    def bool_(self, tensor):
-        return self.to_dtype_(tensor, "bool")
+    def bool_(self, tensor=None):
+        return self._cast_(tensor, "bool")
 
     def not_equal_(self, value):
         value = value.data if isinstance(value, AbstractTensor) else value
@@ -538,21 +565,46 @@ class NumPyTensorOperations(AbstractTensor):
         tensors = [self._AbstractTensor__unwrap(t) for t in tensors]
         return np.stack(tensors, axis=dim)
 
-    def pad_(self, pad, value=0.0):
-        if len(pad) % 2 != 0:
-            raise ValueError("Padding length must be even.")
-        num_dims_to_pad = len(pad) // 2
+    def pad_(self, pad, value=0.0, mode="constant"):
         tensor = self.data
-        if num_dims_to_pad > tensor.ndim:
-            raise ValueError("Padding tuple length implies padding more dimensions than tensor has.")
-        np_pad_width = []
-        for _ in range(tensor.ndim - num_dims_to_pad):
-            np_pad_width.append((0, 0))
-        for i in range(num_dims_to_pad):
-            left = pad[-2 * (i + 1)]
-            right = pad[-2 * (i + 1) + 1]
-            np_pad_width.append((left, right))
-        return np.pad(tensor, pad_width=np_pad_width, constant_values=value)
+        scalar_width = isinstance(pad, (int, np.integer))
+        if scalar_width:
+            np_pad_width = [(int(pad), int(pad))] * tensor.ndim
+            numpy_widths = True
+        else:
+            numpy_widths = bool(pad) and all(
+            isinstance(pair, (tuple, list)) and len(pair) == 2
+            for pair in pad
+            )
+        if scalar_width:
+            pass
+        elif numpy_widths:
+            if len(pad) != tensor.ndim:
+                raise ValueError(
+                    "NumPy-style padding must provide one pair per dimension."
+                )
+            np_pad_width = [tuple(map(int, pair)) for pair in pad]
+        else:
+            if len(pad) % 2 != 0:
+                raise ValueError("Padding length must be even.")
+            num_dims_to_pad = len(pad) // 2
+            if num_dims_to_pad > tensor.ndim:
+                raise ValueError("Padding tuple length implies padding more dimensions than tensor has.")
+            np_pad_width = []
+            for _ in range(tensor.ndim - num_dims_to_pad):
+                np_pad_width.append((0, 0))
+            for i in range(num_dims_to_pad):
+                left = pad[-2 * (i + 1)]
+                right = pad[-2 * (i + 1) + 1]
+                np_pad_width.append((left, right))
+        if mode == "constant":
+            return np.pad(
+                tensor,
+                pad_width=np_pad_width,
+                mode=mode,
+                constant_values=value,
+            )
+        return np.pad(tensor, pad_width=np_pad_width, mode=mode)
 
     def pad2d_(self, pad, value=0.0):
         pl, pr, pt, pb = pad
@@ -848,21 +900,29 @@ class NumPyTensorOperations(AbstractTensor):
     def to_dtype_(self, dtype: str = "float"):
         import numpy as np
         tensor = self.data
-        if dtype in ("float", "float32", "f32"):
-            return tensor.astype(np.float32)
-        elif dtype in ("float64", "double", "f64"):
-            return tensor.astype(np.float64)
-        elif dtype in ("int", "int32", "i32"):
-            return tensor.astype(np.int32)
-        elif dtype in ("int64", "long", "i64"):
-            return tensor.astype(np.int64)
-        elif dtype in ("uint8", "byte"):
-            return tensor.astype(np.uint8)
-        elif dtype in ("bool",):
-            return tensor.astype(np.bool_)
-        else:
-            # Default to float32
-            return tensor.astype(np.float32)
+        aliases = {
+            "float": np.float32, "float32": np.float32, "f32": np.float32,
+            "float64": np.float64, "double": np.float64, "f64": np.float64,
+            "int": np.int32, "int32": np.int32, "i32": np.int32,
+            "int64": np.int64, "long": np.int64, "i64": np.int64,
+            "uint8": np.uint8, "byte": np.uint8,
+            "bool": np.bool_,
+        }
+        if dtype in aliases:
+            return tensor.astype(aliases[dtype])
+        # A caller may also hand in a torch dtype object (this backend's
+        # values round-trip through torch-shaped dtype descriptors in a few
+        # places) or any dtype spelling numpy itself understands (e.g.
+        # "complex64", a np.dtype instance). Try the existing torch/numpy
+        # normaliser before giving up -- but give up loudly rather than
+        # silently coercing to float32, since that was a silent numeric
+        # change disguised as a no-op.
+        resolved = self._torch_dtype_to_numpy(dtype)
+        if resolved is not None:
+            return tensor.astype(resolved)
+        raise ValueError(
+            f"NumPyTensorOperations.to_dtype_: unrecognised dtype {dtype!r}"
+        )
 
     @property
     def long_dtype_(self):

@@ -12,7 +12,7 @@ import sys
 
 import numpy as np
 
-from ..abstraction import AbstractTensor as AT
+from ..abstraction import AbstractTensor as AT, tensor_identity
 from ..autograd import GradTape, autograd
 from ..autograd_process import AutogradProcess
 from . import (
@@ -115,7 +115,9 @@ def run_demo(
             )
             params = tuple(model.parameters())
             program, input_id = capture_forward_program(model, x_train)
-            parameter_feeds = {id(parameter): parameter for parameter in params}
+            parameter_feeds = {
+                tensor_identity(parameter): parameter for parameter in params
+            }
             unexplained = set(program.feeds) - {input_id} - set(parameter_feeds)
             if unexplained:
                 raise RuntimeError(f"unexplained FusedProgram feeds: {unexplained}")

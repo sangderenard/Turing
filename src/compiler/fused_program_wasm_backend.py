@@ -3,27 +3,13 @@ a ``FusedProgram``.
 
 .. warning::
 
-   **INTERNAL BACKEND SUBMECHANISM -- NOT THE PYTHON COMPILER ENTRYPOINT.**
+    **FULLY OFF-LIMITS INTERNAL IMPLEMENTATION.**
 
-   This module receives one numerical artifact only after Python AST
-   ingestion, ProcessGraph construction, control/map planning, specialization,
-   and numerical-region extraction have already occurred.  Its
-   ``FusedProgram`` input cannot be used to infer the language understood by
-   the Python recompiler.  Application and publishing code must enter through
-   the Python source compiler and let that pipeline invoke this emitter for
-   the numerical pieces it selects.
-
-Why this IR and not SSA or Fortran: WebAssembly has no ``goto``. Its control
-flow is structured (``block``/``loop``/``br``), so lowering an arbitrary SSA
-control-flow graph needs a relooper -- a real algorithm, not a translation.
-``FusedProgram`` is the one intermediary that sidesteps it entirely: a flat,
-topologically ordered list of ``OpStep`` with no branches at all (see
-``fused_ir.py``). The only loop in the emitted module is the elementwise walk
-over the extent, which this file writes itself.
-
-So this is the same shape as ``fused_program_python_backend.py`` -- one
-lowering per ``OpStep``, in the program's own order -- with a different
-instruction set underneath.
+    **FUSED PROGRAM IS NOT THE COMPILER.**  This module is not a compiler
+    entrypoint, public API, architecture description, or capability boundary.
+    Do not inspect, invoke, reference, modify, or use this file to infer any
+    compiler capability or limitation unless the task explicitly names this
+    internal backend implementation.
 
 No toolchain is required, and that includes producing something runnable.
 WAT is the human-readable form; a browser only ever executes the binary, so
@@ -59,10 +45,70 @@ from ..common.tensors.fused_ir import (
     ELEMENTWISE_UNARY,
     FusedProgram,
     OpStep,
+    canonicalize_elementwise_steps,
     flatten_tensor_constant,
     ordered_feed_ids,
+    resolve_view_source,
     uniform_tensor_constant,
+    unroll_feed_axis_reductions,
+    view_offset_stride,
 )
+from .wasm_binary import (
+    OP_F32_CONVERT_I32_S,
+    OP_F32_CONVERT_I64_S,
+    OP_F64_CONVERT_I32_S,
+    OP_F64_CONVERT_I64_S,
+    OP_I32_TRUNC_F32_S,
+    OP_I32_TRUNC_F64_S,
+    OP_I32_AND,
+    OP_I32_OR,
+    OP_I64_AND,
+    OP_I64_OR,
+    OP_I64_SHL,
+    OP_I64_SHR_S,
+    OP_I64_TRUNC_F32_S,
+    OP_I64_TRUNC_F64_S,
+    OP_I64_XOR,
+)
+from .wasm_container import (
+    DEFAULT_MAP_CAPACITY,
+    HEAP_CURSOR_ADDR,
+    emit_map_set,
+    emit_nested_map_store,
+)
+from .ir_byte_idioms import HASH_DELIMITED_PREFIX
+# Container recognition is backend-neutral IR analysis, shared from a central
+# module; this backend only supplies the lowering. Kept under the old private
+# names so internal callers and existing tests are unaffected.
+from .ir_container_ops import (
+    is_shapeless as _is_shapeless,
+    fnv1a_64 as _fnv1a_64,
+    string_constant as _string_constant,
+    constant_scalar_index as _constant_scalar_index,
+    slice_selectors as _slice_selectors,
+    container_key_spec as _container_key_spec,
+    pure_container_store as _pure_container_store,
+    pure_container_read as _pure_container_read,
+)
+
+# f64 bits reinterpreted as i64 read the raw 8 bytes unchanged, so a map key or
+# value keeps its exact identity whether it logically holds an integer (an RVA)
+# or a float. The container ABI hashes/stores these opaque 64-bit patterns.
+_I64_REINTERPRET_F64 = 0xBD
+
+# Bitwise/shift ops are integer-only, but a program can carry them on a float
+# working type (an integer-valued f64: the reversible decoder represents its
+# machine words as f64). The bits of an f64 are not the integer's bits, so the
+# lowering converts each operand f64->i64, applies the i64 opcode, and converts
+# back f64<-i64 -- exact for the integer values these actually carry. f64 only;
+# an f32 working type would need its own trunc/convert pair and has no caller.
+_I64_BITWISE_OPCODE = {
+    "bitand": OP_I64_AND,
+    "bitor": OP_I64_OR,
+    "bitxor": OP_I64_XOR,
+    "shl": OP_I64_SHL,
+    "shr": OP_I64_SHR_S,
+}
 
 
 class WasmEmissionError(ValueError):
@@ -89,6 +135,115 @@ _TYPES: dict[str, tuple[str, int, str, str]] = {
     "float32": ("f32", 4, "f32.load", "f32.store"),
     "f32": ("f32", 4, "f32.load", "f32.store"),
     "float": ("f32", 4, "f32.load", "f32.store"),
+    # Integer working types. Until these existed this module could only
+    # compile a program whose *own* arithmetic was floating point --
+    # integers were supported solely as separate memory buffers to convert
+    # in and out of (``_MEMORY_DTYPE_OPS`` below). That is fine for a
+    # numeric kernel and wrong for a program that is genuinely integral:
+    # a decoder, a register file, a state machine. Such a program has no
+    # meaningful f64 working type -- ``//`` and ``%`` are not float
+    # operations, bit masks are not float operations, and a 64-bit value
+    # does not survive f64's 2**53 exact-integer range. WebAssembly has
+    # native i32/i64 arithmetic; this simply stops pretending it does not.
+    "int64": ("i64", 8, "i64.load", "i64.store"),
+    "i64": ("i64", 8, "i64.load", "i64.store"),
+    "long": ("i64", 8, "i64.load", "i64.store"),
+    "int32": ("i32", 4, "i32.load", "i32.store"),
+    "i32": ("i32", 4, "i32.load", "i32.store"),
+    "int": ("i32", 4, "i32.load", "i32.store"),
+}
+
+# Which working types are integral. Everything that differs between the two
+# families keys off this rather than re-parsing the type name at each site.
+_INTEGER_VALUE_TYPES = frozenset({"i32", "i64"})
+
+
+def _is_integer_type(value_type: str) -> bool:
+    return str(value_type) in _INTEGER_VALUE_TYPES
+
+
+# The saturating bounds of each integer working type. A min/max reduction's
+# fold identity is spelled as an infinity (``_REDUCE_FOLD``), which has no
+# integer literal -- but the *meaning* of that identity, "a value no operand
+# can beat", is exactly the type's extreme, so an integral fold uses that
+# rather than refusing or overflowing on int(float("inf")).
+_INTEGER_BOUNDS: dict[str, tuple[int, int]] = {
+    "i32": (-(2 ** 31), 2 ** 31 - 1),
+    "i64": (-(2 ** 63), 2 ** 63 - 1),
+}
+
+
+def _typed_constant(value_type: str, value: Any) -> str:
+    """One scalar literal, spelled for its working type.
+
+    ``f64.const 0`` and ``i64.const 0.0`` are both invalid WAT, so the
+    literal's spelling has to follow the type rather than the Python value's
+    own repr.
+    """
+
+    if _is_integer_type(value_type):
+        numeric = float(value)
+        low, high = _INTEGER_BOUNDS[str(value_type)]
+        if numeric == float("inf"):
+            return f"{value_type}.const {high}"
+        if numeric == float("-inf"):
+            return f"{value_type}.const {low}"
+        return f"{value_type}.const {int(numeric)}"
+    return f"{value_type}.const {float(value)!r}"
+
+# A parameter whose real dtype is not the module's f32/f64 working type
+# still gets loaded and stored at its own byte width and WASM memory
+# instruction -- not silently reinterpreted as the working type's bytes.
+# "bool"/"logical" are deliberately absent: that tag arises naturally on an
+# ordinary comparison op's result flowing through this module's own uniform
+# elementwise array (Meta.dtype records what an operation *produced*, not
+# only what a caller declared), and narrowing it to 1 byte here corrupts
+# that array's stride for every other value sharing it. This table exists
+# for a caller-declared, genuinely separate byte/integer buffer (a register
+# file, raw memory) -- not for a value this module computed for itself.
+# (byte_width, load_instruction, store_instruction, wasm_value_kind)
+_MEMORY_DTYPE_OPS: dict[str, tuple[int, str, str, str]] = {
+    "uint8": (1, "i32.load8_u", "i32.store8", "i32"),
+    "u8": (1, "i32.load8_u", "i32.store8", "i32"),
+    "int32": (4, "i32.load", "i32.store", "i32"),
+    "i32": (4, "i32.load", "i32.store", "i32"),
+    "int": (4, "i32.load", "i32.store", "i32"),
+    "int64": (8, "i64.load", "i64.store", "i64"),
+    "i64": (8, "i64.load", "i64.store", "i64"),
+}
+
+# Converting an integer parameter to/from the module's f32/f64 working type
+# for arithmetic. Signed conversion is correct even for the unsigned kinds
+# above (uint8/bool load already zero-extends to a non-negative i32, and a
+# non-negative i32/i64 converts identically whether treated as signed or
+# unsigned), so one conversion table covers both.
+_TO_WORKING_TYPE = {
+    ("i32", "f64"): "f64.convert_i32_s",
+    ("i32", "f32"): "f32.convert_i32_s",
+    ("i64", "f64"): "f64.convert_i64_s",
+    ("i64", "f32"): "f32.convert_i64_s",
+}
+_FROM_WORKING_TYPE = {
+    ("f64", "i32"): "i32.trunc_f64_s",
+    ("f32", "i32"): "i32.trunc_f32_s",
+    ("f64", "i64"): "i64.trunc_f64_s",
+    ("f32", "i64"): "i64.trunc_f32_s",
+}
+
+# Same conversions as raw opcodes, for the binary assembler below -- the WAT
+# text and the binary are two independent emitters describing one program;
+# both need the same conversions, one as mnemonic text, one as opcode bytes.
+_TO_WORKING_OPCODE = {
+    ("i32", "f64"): OP_F64_CONVERT_I32_S,
+    ("i32", "f32"): OP_F32_CONVERT_I32_S,
+    ("i64", "f64"): OP_F64_CONVERT_I64_S,
+    ("i64", "f32"): OP_F32_CONVERT_I64_S,
+}
+_FROM_WORKING_OPCODE = {
+    ("f64", "i32"): OP_I32_TRUNC_F64_S,
+    ("f32", "i32"): OP_I32_TRUNC_F32_S,
+    ("f64", "i64"): OP_I64_TRUNC_F64_S,
+    ("f32", "i64"): OP_I64_TRUNC_F32_S,
 }
 
 # Operations that are one native instruction, given the value type prefix.
@@ -111,6 +266,69 @@ _UNARY_INSTRUCTION = {
     "round": "nearest",
 }
 
+# Integer counterparts. WebAssembly's integer instruction set is not the
+# float one with a different prefix, so these cannot be derived from the
+# tables above:
+#
+#   * division and remainder need an explicit signedness (``div_s``), where
+#     float division does not. Signed is correct here because every dtype
+#     this module maps to an integer working type is signed; ``uint8`` is a
+#     memory dtype (``_MEMORY_DTYPE_OPS``) that loads zero-extended into a
+#     non-negative i32, never a working type of its own.
+#   * ``min``/``max`` genuinely do not exist for integers in WebAssembly --
+#     they are lowered from a comparison plus ``select`` in
+#     ``_integer_binary_instructions`` rather than listed here.
+#   * ``mod``/``floordiv`` become expressible for the first time. They sit in
+#     ``_NO_WASM_INSTRUCTION`` below, whose comment already anticipated this
+#     exact unlock ("mod/floordiv await an integer-remainder lowering"); the
+#     integer working type is that lowering, so they are filtered back out
+#     of the unsupported set when the working type is integral.
+#   * ``shr`` is signed (``shr_s``, arithmetic/sign-extending) for the same
+#     reason ``div``/``mod`` are: every dtype mapped to an integer working
+#     type here is signed, and a memory-resident ``uint8`` loads zero-extended
+#     into a non-negative i32 rather than carrying its own signed/unsigned
+#     working type. ``bitand``/``bitor``/``bitxor``/``shl`` have single
+#     unambiguous WebAssembly opcodes regardless of signedness.
+_INTEGER_BINARY_INSTRUCTION = {
+    "add": "add",
+    "sub": "sub",
+    "mul": "mul",
+    "truediv": "div_s",
+    "floordiv": "div_s",
+    "mod": "rem_s",
+    "bitand": "and",
+    "bitor": "or",
+    "bitxor": "xor",
+    "shl": "shl",
+    "shr": "shr_s",
+}
+
+_INTEGER_COMPARISON_INSTRUCTION = {
+    "less": "lt_s",
+    "less_equal": "le_s",
+    "greater": "gt_s",
+    "greater_equal": "ge_s",
+    "equal": "eq",
+    "not_equal": "ne",
+}
+
+# Integer ops this module reaches by composition rather than one opcode.
+_INTEGER_COMPOSED_BINARY = frozenset({"minimum", "maximum"})
+
+# Boolean connectives over integers. WebAssembly has bitwise and/or, which
+# are *not* these: `2 & 1` is 0 while `bool(2) and bool(1)` is true. So each
+# operand is first reduced to a 0/1 truth value with ``eqz`` (which tests
+# "is zero", so the sense is inverted once and corrected by De Morgan) and
+# the connective is then applied to those. This keeps a predicate mask
+# exactly 0/1, which is what every other backend reports for these ops and
+# what ``select``-style lowerings downstream assume.
+_INTEGER_LOGICAL_BINARY = frozenset({"logical_and", "logical_or"})
+_INTEGER_LOGICAL_UNARY = frozenset({"logical_not"})
+
+# Float rounding that is the identity on an integer, so an integral program
+# asking for it is satisfied by doing nothing rather than being refused.
+_INTEGER_IDENTITY_UNARY = frozenset({"floor", "ceil", "trunc", "round"})
+
 # Comparisons return i32 0/1 in WebAssembly, so the result is converted back
 # to the value type -- every other backend in this repository reports a
 # comparison as 0.0/1.0 in the operand's own type, and the torture matrix
@@ -128,12 +346,11 @@ _COMPARISON_INSTRUCTION = {
 # Genuinely out of reach: no instruction, and no table either. tan has poles
 # inside any interval worth covering, so no bounded table describes it -- a
 # program wanting it should divide sin by cos and decide for itself what
-# happens near the pole. The rest are shape or predicate operations rather
-# than functions of one float.
-_NO_WASM_INSTRUCTION = {
-    "pow", "mod", "floordiv", "tan",
-    "sign", "isfinite", "isnan", "isinf", "logical_not",
-}
+# happens near the pole. The predicates return a boolean mask this elementwise
+# float pass does not model yet. (sign, pow, and now mod/floordiv ARE lowered --
+# mod is ``a - trunc(a/b)*b`` and floordiv is ``floor(a/b)``, both exact from
+# instructions WebAssembly has; see the float binary path in _step_instructions.)
+_NO_WASM_INSTRUCTION: set[str] = set()
 # Reachable through a baked table rather than an instruction. Taken from
 # the catalogue itself so the two cannot drift apart: adding a function to
 # wasm_math_tables makes it emittable here without a second edit. f64 only --
@@ -145,6 +362,55 @@ def _tabulated_ops() -> frozenset[str]:
 
 
 _LUT_OPS = _tabulated_ops()
+
+
+def supported_tensor_operations(dtype: str | None = None) -> frozenset[str]:
+    """Canonical operations with a real lowering in this WebAssembly lane.
+
+    With no dtype this returns the union of the floating and integral routes;
+    target selection has not fixed a working type yet.  Passing a dtype gives
+    the exact typed surface and prevents integer-only bit operations or
+    float-only table functions from being advertised for the wrong module.
+    """
+
+    from ..common.tensors.operator_catalog import (
+        CANONICAL_ABSTRACT_TENSOR_OPERATORS,
+    )
+
+    floating = (
+        frozenset(_BINARY_INSTRUCTION)
+        | frozenset(_COMPARISON_INSTRUCTION)
+        | frozenset(_UNARY_INSTRUCTION)
+        | frozenset(_LUT_OPS)
+        | frozenset({
+            "sign", "pow", "mod", "floordiv", "isfinite", "isnan",
+            "isinf", "logical_not", "logical_and", "logical_or", "tan",
+        })
+    )
+    integral = (
+        frozenset(_INTEGER_BINARY_INSTRUCTION)
+        | frozenset(_INTEGER_COMPARISON_INSTRUCTION)
+        | _INTEGER_COMPOSED_BINARY
+        | _INTEGER_LOGICAL_BINARY
+        | _INTEGER_LOGICAL_UNARY
+        | _INTEGER_IDENTITY_UNARY
+        | frozenset({"neg", "abs", "sign", "invert"})
+    )
+    structural = frozenset({
+        "tensor_from_list", "where", "gather", "reshape", "view", "clone",
+        "tobytes", "sum", "mean", "prod", "min", "max",
+    })
+    if dtype is None:
+        operations = floating | integral | structural | frozenset(
+            _I64_BITWISE_OPCODE
+        ) | frozenset({"invert"})
+    elif _is_integer_type(_TYPES.get(str(dtype).lower(), _TYPES["float64"])[0]):
+        operations = integral | structural
+    else:
+        operations = floating | structural
+        if _TYPES.get(str(dtype).lower(), _TYPES["float64"])[0] == "f64":
+            operations |= frozenset(_I64_BITWISE_OPCODE) | frozenset({"invert"})
+    return frozenset(operations & CANONICAL_ABSTRACT_TENSOR_OPERATORS)
 
 
 @dataclass(frozen=True)
@@ -210,6 +476,44 @@ def program_feed_order(program: FusedProgram) -> tuple[int, ...]:
     return tuple(order)
 
 
+# Ops whose result, in a flat linear-memory kernel, is bit-identical to their
+# operand -- lowered to ``x + 0`` so the elementwise walk copies it and any
+# extra (shape-argument) operands fall out as dead.
+#
+#   * Reshape/view/clone are pure views: the same linear elements under a new
+#     shape label. ``c_primitive_program`` gives a reshape this exact identity
+#     form at its own fused-program boundary.
+#   * ``tobytes`` is a HOST-boundary reinterpret (operator_catalog's
+#     HOST_BOUNDARY_OPERATORS), not compute: its result is the operand's own
+#     linear memory read back as bytes by the host. Kernel-side that is an
+#     identity of the operand -- exactly what the capture path already does,
+#     where an observed ``tobytes`` produces no numeric step and the region's
+#     output stays the pre-``tobytes`` tensor. The byte re-interpretation
+#     (N int64 -> 8N uint8) is the host's view of those same bytes, not a
+#     kernel computation.
+#
+# Each backend owns the lowering of its own tensor ops; this is WebAssembly's.
+_VIEW_OPS = frozenset({"reshape", "view", "clone", "tobytes"})
+
+
+def _lower_view_ops(steps: Sequence[OpStep]) -> list[OpStep]:
+    lowered: list[OpStep] = []
+    for step in steps:
+        if step.op_name in _VIEW_OPS and step.input_ids:
+            lowered.append(OpStep(
+                step_id=step.step_id,
+                op_name="add",
+                input_ids=[int(step.input_ids[0])],
+                attrs={"right_scalar": 0},
+                result_id=step.result_id,
+                mode_sensitive=step.mode_sensitive,
+                level=step.level,
+            ))
+        else:
+            lowered.append(step)
+    return lowered
+
+
 def required_steps(program: FusedProgram) -> list[OpStep]:
     """The steps the requested outputs actually depend on, in program order.
 
@@ -220,9 +524,14 @@ def required_steps(program: FusedProgram) -> list[OpStep]:
     array-valued constant, would demand space in linear memory for something
     nothing reads. Same traversal c_jit_backend._required_nodes performs for
     the C and Fortran backends.
+
+    View ops are lowered to their identity form first, so a reshape's dropped
+    shape-argument constants fall out of the dependency walk as dead rather than
+    demanding linear-memory slots nothing reads.
     """
 
-    producers = {step.result_id: step for step in program.steps}
+    steps = _lower_view_ops(program.steps)
+    producers = {step.result_id: step for step in steps}
     required: set[int] = set()
     stack = list(program.outputs.values())
     while stack:
@@ -234,7 +543,7 @@ def required_steps(program: FusedProgram) -> list[OpStep]:
             continue
         required.add(value_id)
         stack.extend(step.input_ids)
-    return [step for step in program.steps if step.result_id in required]
+    return [step for step in steps if step.result_id in required]
 
 
 def _flat_sum_steps(live: Sequence[OpStep]) -> tuple[OpStep, ...]:
@@ -262,6 +571,273 @@ def _sum_dependencies(step: OpStep, live: Sequence[OpStep]) -> tuple[OpStep, ...
         required.add(producer.result_id)
         stack.extend(producer.input_ids)
     return tuple(candidate for candidate in live if candidate.result_id in required)
+
+
+# One axis reduction folds a trailing axis away. The accumulator starts at the
+# identity and each grid element is combined with the value-type instruction
+# named here; ``mean`` uses the ``sum`` fold and divides by K afterwards.
+_REDUCE_FOLD: dict[str, tuple[str, float]] = {
+    "sum": ("add", 0.0),
+    "mean": ("add", 0.0),
+    "prod": ("mul", 1.0),
+    "min": ("min", float("inf")),
+    "amin": ("min", float("inf")),
+    "max": ("max", float("-inf")),
+    "amax": ("max", float("-inf")),
+}
+
+
+def _shape_product(shape: Any) -> int | None:
+    if shape is None:
+        return None
+    total = 1
+    for dim in shape:
+        total *= int(dim)
+    return total
+
+
+@dataclass(frozen=True)
+class _AxisReductionPlan:
+    """How to iterate a program whose outputs survive a trailing-axis reduce.
+
+    An axis reduction is a rank change (N*K -> N) the flat ``run(count, ...)``
+    model cannot express directly.  It is lowered as a nested walk: the outer
+    loop iterates the surviving extent N -- the independent, per-output lane,
+    exactly as parallel as an elementwise pass -- and an inner counted loop of
+    K accumulates the reduced axis.  Keeping N as the outer lane is deliberate:
+    a materialised pre-reduction segment stays parallel over N, so it can still
+    be scored as a parallel deployment region downstream; only the K fold is
+    serial.  ``ok`` is False when the program contains an axis reduction this
+    backend cannot yet express (the reasons are recorded as shortfalls).
+    """
+
+    ok: bool
+    axis_extent: int
+    reductions: tuple[OpStep, ...]
+    reduce_op: dict[int, str]
+    inner_dependencies: dict[int, tuple[OpStep, ...]]
+    pre_steps: tuple[OpStep, ...]
+    post_steps: tuple[OpStep, ...]
+    value_class: dict[int, str]
+    feed_class: dict[int, str]
+    grid_output_steps: tuple[OpStep, ...]
+
+
+def _plan_axis_reductions(
+    program: FusedProgram,
+    live: Sequence[OpStep],
+    feed_ids: Sequence[int],
+    shortfalls: list[WasmShortfall],
+) -> _AxisReductionPlan | None:
+    """Classify one reduction program, or return None when it has no axis reduce.
+
+    Shared by both emitters so the WAT and binary forms cannot disagree about
+    which values are grid/row/kaxis/scalar or which steps run in the inner
+    fold.  Records a shortfall (and returns an ``ok=False`` plan) for every
+    reduction shape this backend cannot express, so emission fails loudly
+    rather than returning a plausible wrong number.
+    """
+
+    reductions = tuple(
+        step for step in live if step.attrs.get("axis") is not None
+    )
+    if not reductions:
+        return None
+
+    def fail(step_id: int, op: str, reason: str) -> _AxisReductionPlan:
+        shortfalls.append(WasmShortfall(step_id, op, reason))
+        return _AxisReductionPlan(
+            ok=False, axis_extent=0, reductions=reductions, reduce_op={},
+            inner_dependencies={}, pre_steps=(), post_steps=(),
+            value_class={}, feed_class={}, grid_output_steps=(),
+        )
+
+    meta = program.meta or {}
+    whole_sums = tuple(
+        step for step in live
+        if step.op_name == "sum" and step.attrs.get("axis") is None
+    )
+    if whole_sums:
+        return fail(
+            reductions[0].step_id, "reduce",
+            "whole-tensor and axis reductions in one program are not lowered "
+            "together",
+        )
+
+    extents_n: set[int] = set()
+    extents_k: set[int] = set()
+    reduce_op: dict[int, str] = {}
+    for step in reductions:
+        if not step.input_ids:
+            return fail(step.step_id, step.op_name, "reduction has no operand")
+        entry = meta.get(step.input_ids[0])
+        shape = tuple(entry.shape) if entry is not None and entry.shape is not None else None
+        if shape is None:
+            return fail(
+                step.step_id, step.op_name,
+                "axis reduction input has no shape metadata",
+            )
+        axis = int(step.attrs["axis"])
+        norm = axis if axis >= 0 else len(shape) + axis
+        if norm != len(shape) - 1:
+            return fail(
+                step.step_id, step.op_name,
+                f"only trailing-axis (axis=-1) reduction is lowered; got "
+                f"axis={axis} on shape {shape}",
+            )
+        k = int(shape[-1])
+        total = _shape_product(shape) or 0
+        op = str(step.attrs.get("reduce_op") or step.op_name)
+        if op not in _REDUCE_FOLD:
+            return fail(
+                step.step_id, step.op_name,
+                f"reduce_op {op!r} has no WebAssembly accumulator",
+            )
+        reduce_op[step.result_id] = op
+        extents_k.add(k)
+        extents_n.add(total // k if k else 0)
+
+    if len(extents_k) != 1 or len(extents_n) != 1:
+        return fail(
+            reductions[0].step_id, "reduce",
+            f"mixed reduction extents N={sorted(extents_n)} K={sorted(extents_k)} "
+            "are not lowered in one program",
+        )
+    outer_n = next(iter(extents_n))
+    axis_k = next(iter(extents_k))
+    if outer_n == axis_k:
+        return fail(
+            reductions[0].step_id, "reduce",
+            f"ambiguous reduction where N == K == {outer_n}; broadcasting "
+            "cannot be classified by extent alone",
+        )
+
+    def classify(value_id: int) -> str:
+        entry = meta.get(value_id)
+        product = _shape_product(entry.shape) if entry is not None else None
+        if product is None:
+            return "unknown"
+        if product == outer_n * axis_k:
+            return "grid"
+        if product == outer_n:
+            return "row"
+        if product == axis_k:
+            return "kaxis"
+        if product == 1:
+            return "scalar"
+        return "other"
+
+    value_class: dict[int, str] = {}
+    for value_id in feed_ids:
+        value_class[value_id] = classify(value_id)
+    for step in live:
+        value_class[step.result_id] = classify(step.result_id)
+
+    reduction_results = {step.result_id for step in reductions}
+    producers = {step.result_id: step for step in live}
+
+    def depends_on_reduction(step: OpStep) -> bool:
+        seen: set[int] = set()
+        stack = list(step.input_ids)
+        while stack:
+            value_id = stack.pop()
+            if value_id in seen:
+                continue
+            seen.add(value_id)
+            if value_id in reduction_results:
+                return True
+            producer = producers.get(value_id)
+            if producer is not None:
+                stack.extend(producer.input_ids)
+        return False
+
+    feed_class: dict[int, str] = {}
+    for value_id in feed_ids:
+        klass = value_class.get(value_id, "unknown")
+        if klass == "grid":
+            return fail(
+                -1, "feed",
+                f"feed {value_id} is grid-shaped (N*K); the count-based ABI "
+                "cannot size it yet",
+            )
+        if klass in ("other", "unknown"):
+            return fail(
+                -1, "feed",
+                f"feed {value_id} has a shape that is not row/kaxis/scalar "
+                "relative to the reduction extents",
+            )
+        feed_class[value_id] = klass
+
+    pre_steps: list[OpStep] = []
+    post_steps: list[OpStep] = []
+    inner_dependencies: dict[int, tuple[OpStep, ...]] = {}
+    for step in live:
+        if step.result_id in reduction_results:
+            continue
+        klass = value_class.get(step.result_id, "unknown")
+        if klass in ("grid", "kaxis"):
+            # Inner-scope steps are emitted per reduction, in the fold loop.
+            # A grid/kaxis value may depend on an earlier reduction's row
+            # result (e.g. mask = dist <= dist.min(axis)): that reduction is
+            # emitted first and its result stays live in the outer scope, so a
+            # later reduction's inner loop can read it as a per-row scalar.
+            continue
+        if klass == "other" or klass == "unknown":
+            return fail(
+                step.step_id, step.op_name,
+                f"value {step.result_id} has an unclassifiable shape relative "
+                "to the reduction extents",
+            )
+        if depends_on_reduction(step):
+            post_steps.append(step)
+        else:
+            pre_steps.append(step)
+
+    for step in reductions:
+        deps = _sum_dependencies(step, live)
+        inner = tuple(
+            dep for dep in deps
+            if dep.result_id not in reduction_results
+            and value_class.get(dep.result_id) in ("grid", "kaxis")
+        )
+        inner_dependencies[step.result_id] = inner
+
+    # Grid/kaxis outputs need their own K-walk to be written at every (i, k).
+    # Gather the grid/kaxis steps that feed them (row/scalar ancestors are
+    # already computed once in the outer scope, so recursion stops there).
+    grid_output_ids = [
+        output_id for output_id in program.outputs.values()
+        if value_class.get(output_id) in ("grid", "kaxis")
+    ]
+    grid_needed: set[int] = set()
+    grid_stack = list(grid_output_ids)
+    while grid_stack:
+        value_id = grid_stack.pop()
+        if value_id in grid_needed:
+            continue
+        if value_class.get(value_id) not in ("grid", "kaxis"):
+            continue
+        producer = producers.get(value_id)
+        if producer is None:
+            continue
+        grid_needed.add(value_id)
+        grid_stack.extend(producer.input_ids)
+    grid_output_steps = tuple(
+        step for step in live if step.result_id in grid_needed
+    )
+
+    return _AxisReductionPlan(
+        ok=True,
+        axis_extent=axis_k,
+        reductions=reductions,
+        reduce_op=reduce_op,
+        inner_dependencies=inner_dependencies,
+        pre_steps=tuple(pre_steps),
+        post_steps=tuple(post_steps),
+        value_class=value_class,
+        feed_class=feed_class,
+        grid_output_steps=grid_output_steps,
+    )
 
 
 def _constant_scalar(step: OpStep) -> float | None:
@@ -297,6 +873,558 @@ def _value_type(program: FusedProgram, dtype: str | None) -> tuple[str, int, str
     return resolved
 
 
+def _emit_reduction_body_wat(
+    body: list[str],
+    plan: _AxisReductionPlan,
+    names: Mapping[int, str],
+    feed_label: Mapping[int, str],
+    feed_ids: Sequence[int],
+    value_type: str,
+    load: str,
+    store: str,
+    element_bytes: int,
+    static_data: Mapping[str, Any],
+    shortfalls: list[WasmShortfall],
+    output_ids: Sequence[int],
+) -> None:
+    """Append the nested reduction body for one axis-reduction program.
+
+    Runs inside the outer ``loop $body`` (which owns ``$i`` over N).  Row and
+    scalar feeds are read once per ``$i``; each reduction then runs an inner
+    ``$k`` loop over K that reads kaxis feeds/constants and folds the reduced
+    axis.  Post-reduction elementwise steps close out the iteration.
+    """
+
+    axis_k = plan.axis_extent
+
+    def index_lines(klass: str) -> list[str]:
+        if klass == "grid":
+            return [
+                "local.get $i", f"i32.const {axis_k}", "i32.mul",
+                "local.get $k", "i32.add",
+            ]
+        if klass == "kaxis":
+            return ["local.get $k"]
+        if klass == "row":
+            return ["local.get $i"]
+        return ["i32.const 0"]
+
+    def emit_load(pointer_expr: str, klass: str, destination: str) -> None:
+        body.append(f"      {pointer_expr}")
+        for line in index_lines(klass):
+            body.append(f"      {line}")
+        body.append(f"      i32.const {element_bytes}")
+        body.append("      i32.mul")
+        body.append("      i32.add")
+        body.append(f"      {load}")
+        body.append(f"      local.set {destination}")
+
+    def emit_feed(feed_id: int) -> None:
+        emit_load(
+            f"local.get {feed_label[feed_id]}",
+            plan.feed_class[feed_id],
+            names[feed_id],
+        )
+
+    def emit_step(step: OpStep) -> None:
+        constant = _constant_scalar(step)
+        if step.op_name == "tensor_from_list" and constant is None:
+            entry = static_data["constants"].get(step.result_id)
+            if entry is None:
+                shortfalls.append(WasmShortfall(
+                    step.step_id, step.op_name, "array constant was not baked",
+                ))
+                return
+            emit_load(
+                f"i32.const {entry['base']}",
+                plan.value_class.get(step.result_id, "row"),
+                names[step.result_id],
+            )
+            return
+        instructions = _step_instructions(
+            step, names, value_type, element_bytes,
+            static_data["constants"], shortfalls,
+        )
+        if instructions is None:
+            return
+        body.extend(instructions)
+        body.append(f"      local.set {names[step.result_id]}")
+
+    # Row/scalar feeds: read once for this $i, stable across every inner loop.
+    for feed_id in feed_ids:
+        if plan.feed_class[feed_id] in ("row", "scalar"):
+            emit_feed(feed_id)
+    for step in plan.pre_steps:
+        emit_step(step)
+
+    grid_slots = [
+        (output_id, slot, plan.value_class.get(output_id))
+        for slot, output_id in enumerate(output_ids)
+        if plan.value_class.get(output_id) in ("grid", "kaxis")
+    ]
+    for region_index, reduction in enumerate(plan.reductions):
+        op = plan.reduce_op[reduction.result_id]
+        fold, identity = _REDUCE_FOLD[op]
+        accumulator = names[reduction.result_id]
+        body.append(f"      {_typed_constant(value_type, identity)}")
+        body.append(f"      local.set {accumulator}")
+        body.append("      i32.const 0")
+        body.append("      local.set $k")
+        body.append(f"      (block $rdone_{region_index}")
+        body.append(f"        (loop $rbody_{region_index}")
+        body.append("          local.get $k")
+        body.append(f"          i32.const {axis_k}")
+        body.append("          i32.ge_s")
+        body.append(f"          br_if $rdone_{region_index}")
+        for feed_id in feed_ids:
+            if plan.feed_class[feed_id] == "kaxis":
+                emit_feed(feed_id)
+        for step in plan.inner_dependencies[reduction.result_id]:
+            emit_step(step)
+        body.append(f"          local.get {accumulator}")
+        body.append(f"          local.get {names[reduction.input_ids[0]]}")
+        if _is_integer_type(value_type) and fold in {"min", "max"}:
+            # No integer min/max instruction; fold by compare-and-select
+            # over the same two operands (see _INTEGER_COMPOSED_BINARY).
+            body.append(f"          local.get {accumulator}")
+            body.append(f"          local.get {names[reduction.input_ids[0]]}")
+            body.append(
+                f"          {value_type}.{'lt_s' if fold == 'min' else 'gt_s'}"
+            )
+            body.append("          select")
+        else:
+            body.append(f"          {value_type}.{fold}")
+        body.append(f"          local.set {accumulator}")
+        body.append("          local.get $k")
+        body.append("          i32.const 1")
+        body.append("          i32.add")
+        body.append("          local.set $k")
+        body.append(f"          br $rbody_{region_index}")
+        body.append("        )")
+        body.append("      )")
+        if op == "mean":
+            body.append(f"      local.get {accumulator}")
+            body.append(f"      {_typed_constant(value_type, axis_k)}")
+            body.append(
+                f"      {value_type}."
+                f"{'div_s' if _is_integer_type(value_type) else 'div'}"
+            )
+            body.append(f"      local.set {accumulator}")
+
+    for step in plan.post_steps:
+        emit_step(step)
+
+    # Grid/kaxis outputs get their own K-walk: they are full N*K tensors, so
+    # each is written at every (i, k) cell.  Independent of the folds above --
+    # an output that feeds no reduction is still materialised here.
+    if grid_slots:
+        body.append("      i32.const 0")
+        body.append("      local.set $k")
+        body.append("      (block $gdone")
+        body.append("        (loop $gbody")
+        body.append("          local.get $k")
+        body.append(f"          i32.const {axis_k}")
+        body.append("          i32.ge_s")
+        body.append("          br_if $gdone")
+        for feed_id in feed_ids:
+            if plan.feed_class[feed_id] == "kaxis":
+                emit_feed(feed_id)
+        for step in plan.grid_output_steps:
+            emit_step(step)
+        for output_id, slot, klass in grid_slots:
+            body.append(f"          local.get $out{slot}")
+            for line in index_lines(klass):
+                body.append(f"          {line}")
+            body.append(f"          i32.const {element_bytes}")
+            body.append("          i32.mul")
+            body.append("          i32.add")
+            body.append(f"          local.get {names[output_id]}")
+            body.append(f"          {store}")
+        body.append("          local.get $k")
+        body.append("          i32.const 1")
+        body.append("          i32.add")
+        body.append("          local.set $k")
+        body.append("          br $gbody")
+        body.append("        )")
+        body.append("      )")
+
+
+def _emit_container_store_module(
+    program: FusedProgram,
+    *,
+    name: str,
+    function_name: str,
+    value_type: str,
+    element_bytes: int,
+    parameter_feed_ids: Sequence[int],
+    output_ids: Sequence[int],
+    labels: Sequence[str],
+    imports: Sequence[object],
+    static_data_offset: int,
+    descriptor,
+) -> "WasmModule":
+    """Emit a dedicated kernel for a pure shapeless container store.
+
+    Unlike the elementwise ``run(count, ...)`` regions, this does no per-cell
+    array walk: the container base arrives as the ``data`` parameter (the
+    coordinator's field slot holds it), the scalar key/value operands are read
+    once from their fields, and the store mutates the heap map in place. The
+    output aliases the container, so nothing is written back to ``out``.
+    """
+
+    from .wasm_binary import CodeBuilder, build_module
+
+    data_id, value_spec, key_specs, _result_id = descriptor
+    parameter_count = 1 + len(parameter_feed_ids) + len(output_ids)
+    builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
+
+    def feed_param(vid: int) -> int:
+        source = resolve_view_source(program.meta, vid)
+        return 1 + list(parameter_feed_ids).index(source)
+
+    def load_spec_i64(spec, dest: int) -> None:
+        # dest = the operand as i64. An immediate (constant int or hashed string)
+        # is a literal; a feed reads its field's raw 8 bytes (``f64.load`` then
+        # reinterpret is byte-preserving, so an integer RVA or a float both keep
+        # their identity). Fields are scalars, read once at index 0.
+        kind, ref = spec
+        if kind == "imm":
+            builder.i64_const(int(ref)).local_set(dest)
+            return
+        offset, _stride = view_offset_stride(program.meta, ref)
+        builder.local_get(feed_param(ref))
+        byte_offset = offset * element_bytes
+        if byte_offset:
+            builder.i32_const(byte_offset).raw(0x6A)  # i32.add
+        if value_type == "f64":
+            builder.load()  # f64.load
+            builder.raw(_I64_REINTERPRET_F64)
+        else:  # i64 working type
+            builder.i64_load()
+        builder.local_set(dest)
+
+    key0 = builder.declare_local("i64")
+    key1 = builder.declare_local("i64") if len(key_specs) == 2 else None
+    val = builder.declare_local("i64")
+    child = builder.declare_local("i32")
+    child_val = builder.declare_local("i64")
+    cap = builder.declare_local("i32")
+    slot = builder.declare_local("i32")
+    addr = builder.declare_local("i32")
+    guard = builder.declare_local("i32")
+
+    load_spec_i64(key_specs[0], key0)
+    if key1 is not None:
+        load_spec_i64(key_specs[1], key1)
+    load_spec_i64(value_spec, val)
+
+    table_base = feed_param(data_id)  # the field slot's value is the map base
+    if len(key_specs) == 2:
+        emit_nested_map_store(
+            builder, table_base_local=table_base, gx_local=key0, gy_local=key1,
+            value_local=val, capacity=DEFAULT_MAP_CAPACITY,
+            heap_cursor_addr=HEAP_CURSOR_ADDR, child_local=child,
+            child_val_local=child_val, cap_local=cap, slot_local=slot,
+            addr_local=addr, guard_local=guard,
+        )
+    else:
+        emit_map_set(
+            builder, map_base_local=table_base, key_local=key0, value_local=val,
+            cap_local=cap, slot_local=slot, addr_local=addr, guard_local=guard,
+        )
+
+    binary = build_module(
+        function_name=function_name,
+        parameter_types=["i32"] * parameter_count,
+        body=builder,
+        imports=imports,
+    )
+    memory_import = next(
+        (e for e in imports if getattr(e, "kind", None) == "memory"), None
+    )
+    api = _describe(
+        name, function_name, list(parameter_feed_ids), list(output_ids),
+        value_type, element_bytes, 0, static_data_offset=static_data_offset,
+        shared_memory_import=(
+            {"module": memory_import.module, "field": memory_import.field}
+            if memory_import is not None else None
+        ),
+        input_names=list(labels), output_names=list(program.outputs.keys()),
+    )
+    parameters = (
+        ["$count"] + [f"${label}" for label in labels]
+        + [f"$out{i}" for i in range(len(output_ids))]
+    )
+    keys = ", ".join(
+        f"imm {value}" if kind == "imm" else f"feed {value}"
+        for kind, value in key_specs
+    )
+    source = (
+        f"(module ;; {name} -- container store lowered in the binary\n"
+        f"  ;; heap open-addressing map: table[{keys}] = value.\n"
+        f"  ;; The WAT is a placeholder; the emitted binary is authoritative.\n"
+        f"  (func (export \"{function_name}\")"
+        + "".join(f" (param {p} i32)" for p in parameters) + ")\n)\n"
+    )
+    return WasmModule(
+        name=name, source=source, shortfalls=(), parameters=tuple(parameters),
+        value_type=value_type, api=api, binary=binary,
+    )
+
+
+def _pure_delimited_name_hash(program: FusedProgram, live: Sequence[OpStep]):
+    """A region that is the single general ``hash_delimited_prefix`` op (folded
+    from ``subject[start].split(delim,1)[0]`` by ir_byte_idioms).
+
+    Returns ``(subject_id, start_id, delim, result_id, maxlen)`` or ``None``.
+    The recognition lives centrally in the IR fold; this only lowers the one op,
+    which a scalar kernel cannot express as-is because it reads a RUN of bytes
+    out of the subject buffer and folds them to one hash."""
+
+    if len(live) != 1 or live[0].op_name != HASH_DELIMITED_PREFIX:
+        return None
+    step = live[0]
+    if len(step.input_ids) != 2:
+        return None
+    subject_id, start_id = step.input_ids
+    feeds = set(program.feeds)
+    if subject_id not in feeds or start_id not in feeds:
+        return None
+    if list(program.outputs.values()) != [step.result_id]:
+        return None
+    return (subject_id, start_id, int(step.attrs.get("delim", 0)),
+            step.result_id, int(step.attrs.get("maxlen", 8)))
+
+
+def _emit_name_hash_module(
+    program: FusedProgram,
+    *,
+    name: str,
+    function_name: str,
+    value_type: str,
+    element_bytes: int,
+    parameter_feed_ids: Sequence[int],
+    output_ids: Sequence[int],
+    labels: Sequence[str],
+    imports: Sequence[object],
+    static_data_offset: int,
+    descriptor,
+) -> "WasmModule":
+    """Emit a kernel that hashes a null-terminated byte prefix of the subject.
+
+    This is the material break from scalar-only kernels: it reads up to
+    ``_SECTION_NAME_WIDTH`` bytes out of the subject buffer at a computed start,
+    folding them into one FNV-1a hash and stopping at the delimiter -- many
+    bytes in, one identity out."""
+
+    from .wasm_binary import CodeBuilder, build_module
+    from .wasm_sequence import emit_hash_delimited_prefix
+
+    subject_id, start_id, delim, result_id, maxlen = descriptor
+    parameter_count = 1 + len(parameter_feed_ids) + len(output_ids)
+    builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
+
+    def feed_param(vid: int) -> int:
+        return 1 + list(parameter_feed_ids).index(resolve_view_source(program.meta, vid))
+
+    buf_addr = builder.declare_local("i32")
+    start = builder.declare_local("i32")
+    maxlen_local = builder.declare_local("i32")
+    delim_local = builder.declare_local("i32")
+    result = builder.declare_local("i64")
+    index = builder.declare_local("i32")
+    byte = builder.declare_local("i32")
+
+    # buf_addr = subject buffer base (+ its view byte offset, usually 0). The
+    # subject is read byte-by-byte, so its element width is 1.
+    subject_off, _ = view_offset_stride(program.meta, subject_id)
+    builder.local_get(feed_param(subject_id))
+    if subject_off:
+        builder.i32_const(subject_off).raw(0x6A)
+    builder.local_set(buf_addr)
+
+    # start = the numeric offset operand, read from its field and narrowed to i32.
+    start_off, _ = view_offset_stride(program.meta, start_id)
+    builder.local_get(feed_param(start_id))
+    if start_off:
+        builder.i32_const(start_off * element_bytes).raw(0x6A)
+    if value_type == "f64":
+        builder.load()
+        builder.raw(0xAA)  # i32.trunc_f64_s
+    else:  # i64 working type
+        builder.i64_load()
+        builder.raw(0xA7)  # i32.wrap_i64
+    builder.local_set(start)
+
+    builder.i32_const(int(maxlen)).local_set(maxlen_local)
+    builder.i32_const(int(delim)).local_set(delim_local)
+
+    emit_hash_delimited_prefix(
+        builder, buf_addr_local=buf_addr, start_local=start, maxlen_local=maxlen_local,
+        delim_local=delim_local, result_local=result, index_local=index,
+        byte_local=byte,
+    )
+
+    out_param = 1 + len(parameter_feed_ids) + list(output_ids).index(result_id)
+    builder.local_get(out_param)
+    builder.local_get(result)
+    if value_type == "f64":
+        builder.raw(0xBF)  # f64.reinterpret_i64
+        builder.store()
+    else:
+        builder.i64_store()
+
+    binary = build_module(
+        function_name=function_name,
+        parameter_types=["i32"] * parameter_count,
+        body=builder, imports=imports,
+    )
+    memory_import = next(
+        (e for e in imports if getattr(e, "kind", None) == "memory"), None
+    )
+    api = _describe(
+        name, function_name, list(parameter_feed_ids), list(output_ids),
+        value_type, element_bytes, 0, static_data_offset=static_data_offset,
+        shared_memory_import=(
+            {"module": memory_import.module, "field": memory_import.field}
+            if memory_import is not None else None
+        ),
+        input_names=list(labels), output_names=list(program.outputs.keys()),
+    )
+    parameters = (
+        ["$count"] + [f"${label}" for label in labels]
+        + [f"$out{i}" for i in range(len(output_ids))]
+    )
+    source = (
+        f"(module ;; {name} -- null-terminated name hash lowered in the binary\n"
+        f"  ;; folds up to {int(maxlen)} subject bytes (many bytes -> one\n"
+        f"  ;; hash), stopping at delimiter {int(delim)}. Binary is authoritative.\n"
+        f"  (func (export \"{function_name}\")"
+        + "".join(f" (param {p} i32)" for p in parameters) + ")\n)\n"
+    )
+    return WasmModule(
+        name=name, source=source, shortfalls=(), parameters=tuple(parameters),
+        value_type=value_type, api=api, binary=binary,
+    )
+
+
+def _emit_container_load_module(
+    program: FusedProgram,
+    *,
+    name: str,
+    function_name: str,
+    value_type: str,
+    element_bytes: int,
+    parameter_feed_ids: Sequence[int],
+    output_ids: Sequence[int],
+    labels: Sequence[str],
+    imports: Sequence[object],
+    static_data_offset: int,
+    descriptor,
+) -> "WasmModule":
+    """Emit a kernel for a pure shapeless container read: look the key(s) up in
+    the heap map and write the value (0 on a miss) to the region output. Mirror
+    of ``_emit_container_store_module``."""
+
+    from .wasm_binary import CodeBuilder, build_module
+    from .wasm_container import emit_map_get, emit_nested_map_get
+
+    container_id, key_specs, result_id = descriptor
+    parameter_count = 1 + len(parameter_feed_ids) + len(output_ids)
+    builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
+
+    def feed_param(vid: int) -> int:
+        source = resolve_view_source(program.meta, vid)
+        return 1 + list(parameter_feed_ids).index(source)
+
+    def load_spec_i64(spec, dest: int) -> None:
+        kind, ref = spec
+        if kind == "imm":
+            builder.i64_const(int(ref)).local_set(dest)
+            return
+        offset, _stride = view_offset_stride(program.meta, ref)
+        builder.local_get(feed_param(ref))
+        byte_offset = offset * element_bytes
+        if byte_offset:
+            builder.i32_const(byte_offset).raw(0x6A)
+        if value_type == "f64":
+            builder.load()
+            builder.raw(_I64_REINTERPRET_F64)
+        else:
+            builder.i64_load()
+        builder.local_set(dest)
+
+    key0 = builder.declare_local("i64")
+    key1 = builder.declare_local("i64") if len(key_specs) == 2 else None
+    result = builder.declare_local("i64")
+    child = builder.declare_local("i32")
+    child_val = builder.declare_local("i64")
+    cap = builder.declare_local("i32")
+    slot = builder.declare_local("i32")
+    addr = builder.declare_local("i32")
+    guard = builder.declare_local("i32")
+
+    load_spec_i64(key_specs[0], key0)
+    if key1 is not None:
+        load_spec_i64(key_specs[1], key1)
+
+    table_base = feed_param(container_id)
+    if len(key_specs) == 2:
+        emit_nested_map_get(
+            builder, table_base_local=table_base, gx_local=key0, gy_local=key1,
+            result_local=result, child_local=child, child_val_local=child_val,
+            cap_local=cap, slot_local=slot, addr_local=addr, guard_local=guard,
+        )
+    else:
+        emit_map_get(
+            builder, map_base_local=table_base, key_local=key0, cap_local=cap,
+            slot_local=slot, addr_local=addr, result_local=result, guard_local=guard,
+        )
+
+    # Write the looked-up value to the region output field (index 0, scalar).
+    out_param = 1 + len(parameter_feed_ids) + list(output_ids).index(result_id)
+    builder.local_get(out_param)
+    builder.local_get(result)
+    if value_type == "f64":
+        builder.raw(0xBF)  # f64.reinterpret_i64 -- inverse of the store's reinterpret
+        builder.store()
+    else:
+        builder.i64_store()
+
+    binary = build_module(
+        function_name=function_name,
+        parameter_types=["i32"] * parameter_count,
+        body=builder, imports=imports,
+    )
+    memory_import = next(
+        (e for e in imports if getattr(e, "kind", None) == "memory"), None
+    )
+    api = _describe(
+        name, function_name, list(parameter_feed_ids), list(output_ids),
+        value_type, element_bytes, 0, static_data_offset=static_data_offset,
+        shared_memory_import=(
+            {"module": memory_import.module, "field": memory_import.field}
+            if memory_import is not None else None
+        ),
+        input_names=list(labels), output_names=list(program.outputs.keys()),
+    )
+    parameters = (
+        ["$count"] + [f"${label}" for label in labels]
+        + [f"$out{i}" for i in range(len(output_ids))]
+    )
+    source = (
+        f"(module ;; {name} -- container read lowered in the binary\n"
+        f"  ;; heap open-addressing map lookup ({len(key_specs)} level(s)).\n"
+        f"  ;; The WAT is a placeholder; the emitted binary is authoritative.\n"
+        f"  (func (export \"{function_name}\")"
+        + "".join(f" (param {p} i32)" for p in parameters) + ")\n)\n"
+    )
+    return WasmModule(
+        name=name, source=source, shortfalls=(), parameters=tuple(parameters),
+        value_type=value_type, api=api, binary=binary,
+    )
+
+
 def emit_wasm_module(
     program: FusedProgram,
     *,
@@ -325,9 +1453,57 @@ def emit_wasm_module(
     caller (``build_homepage.py`` included) is unaffected.
     """
 
+    # A trailing-axis reduction over a genuine feed buffer (not one
+    # composed in-program from lower-rank operands) has no memory contract
+    # under the flat run(count, ...) ABI otherwise; unroll it into an
+    # elementwise fold over K strided views of that same buffer first, so
+    # the rest of this emitter never has to special-case it.
+    program = canonicalize_elementwise_steps(program)
+    program = unroll_feed_axis_reductions(program)
     value_type, element_bytes, load, store = _value_type(program, dtype)
     shortfalls: list[WasmShortfall] = []
     live = required_steps(program)
+
+    # A pure shapeless container store (dict/list target keyed by unbounded
+    # RVAs/addresses or string names) does not fit the per-cell array walk and
+    # its string-key constants are not numeric tensors, so it must be detected
+    # before static-data planning: it lowers to the heap open-addressing map ABI.
+    if value_type in ("f64", "i64"):
+        container_store = _pure_container_store(program, live)
+        container_read = (
+            None if container_store is not None
+            else _pure_container_read(program, live)
+        )
+        name_hash = (
+            None if (container_store is not None or container_read is not None)
+            else _pure_delimited_name_hash(program, live)
+        )
+        if container_store is not None or container_read is not None or name_hash is not None:
+            container_feed_ids = program_feed_order(program)
+            container_output_ids = list(program.outputs.values())
+            container_param_feeds: list[int] = []
+            seen_container_sources: set[int] = set()
+            for feed_id in container_feed_ids:
+                source_id = resolve_view_source(program.meta, feed_id)
+                if source_id not in seen_container_sources:
+                    seen_container_sources.add(source_id)
+                    container_param_feeds.append(source_id)
+            if container_store is not None:
+                emit, descriptor = _emit_container_store_module, container_store
+            elif container_read is not None:
+                emit, descriptor = _emit_container_load_module, container_read
+            else:
+                emit, descriptor = _emit_name_hash_module, name_hash
+            return emit(
+                program, name=name, function_name=function_name,
+                value_type=value_type, element_bytes=element_bytes,
+                parameter_feed_ids=container_param_feeds,
+                output_ids=container_output_ids,
+                labels=feed_names(program, container_param_feeds),
+                imports=imports, static_data_offset=static_data_offset,
+                descriptor=descriptor,
+            )
+
     static_data = plan_static_data(
         live, value_type, data_offset=static_data_offset,
     )
@@ -336,25 +1512,123 @@ def emit_wasm_module(
     feed_ids = program_feed_order(program)
     output_ids = list(program.outputs.values())
     names: dict[int, str] = {}
-    labels = feed_names(program, feed_ids)
+    # A view feed (Meta.source_id set) reads another feed's buffer under its
+    # own offset/stride and must not get a second byte-offset parameter for
+    # the same memory; parameters are allocated per unique buffer owner.
+    parameter_feed_ids: list[int] = []
+    seen_sources: set[int] = set()
+    for feed_id in feed_ids:
+        source_id = resolve_view_source(program.meta, feed_id)
+        if source_id not in seen_sources:
+            seen_sources.add(source_id)
+            parameter_feed_ids.append(source_id)
+    labels = feed_names(program, parameter_feed_ids)
     parameters: list[str] = ["$count"]
-    for index, feed_id in enumerate(feed_ids):
+    for index, feed_id in enumerate(parameter_feed_ids):
         parameters.append("$" + labels[index])
     for index, _ in enumerate(output_ids):
         parameters.append(f"$out{index}")
 
+    # A value whose real dtype isn't the module's f32/f64 working type is
+    # still loaded/stored at its own byte width and WASM instruction; only
+    # the arithmetic in between stays the working type (converted at the
+    # boundary), not the parameter's memory representation.
+    program_meta = program.meta or {}
+
+    def _memory_ops(value_id: int) -> tuple[int, str, str, str | None]:
+        meta = program_meta.get(int(value_id))
+        entry = _MEMORY_DTYPE_OPS.get(str(meta.dtype)) if meta and meta.dtype else None
+        if entry is None:
+            return element_bytes, load, store, None
+        width, typed_load, typed_store, wasm_kind = entry
+        return width, typed_load, typed_store, wasm_kind
+
     body: list[str] = []
     locals_declared: list[str] = ["(local $i i32)", "(local $addr i32)"]
 
-    def element_address(pointer: str) -> list[str]:
-        # addr = pointer + i * element_bytes
+    def direct_element_address(pointer: str, byte_width: int = element_bytes) -> list[str]:
+        # addr = pointer + i * byte_width
         return [
             f"      local.get {pointer}",
             "      local.get $i",
-            f"      i32.const {element_bytes}",
+            f"      i32.const {byte_width}",
             "      i32.mul",
             "      i32.add",
         ]
+
+    def element_address(feed_id: int) -> list[str]:
+        # addr = source_pointer + offset*bytes + i * stride*bytes
+        # The offset/stride descriptor is the IR's memory manager
+        # (fused_ir.Meta); default (0, 1) reproduces a plain contiguous read.
+        source_id = resolve_view_source(program.meta, feed_id)
+        offset, stride = view_offset_stride(program.meta, feed_id)
+        byte_width, *_ = _memory_ops(source_id)
+        instructions = [f"      local.get {feed_label[source_id]}"]
+        byte_offset = offset * byte_width
+        if byte_offset:
+            instructions.extend([
+                f"      i32.const {byte_offset}",
+                "      i32.add",
+            ])
+        source_meta = program_meta.get(int(source_id))
+        if (
+            source_meta is not None
+            and _shape_product(source_meta.shape) == 1
+        ):
+            # A one-element feed is one resident scalar broadcast across the
+            # elementwise walk. Advancing it with $i reads the next ABI
+            # buffer, which can look correct for lane zero and corrupt every
+            # subsequent lane.
+            return instructions
+        instructions.extend([
+            "      local.get $i",
+            f"      i32.const {stride * byte_width}",
+            "      i32.mul",
+            "      i32.add",
+        ])
+        return instructions
+
+    def gather_address(table_id: int, index_local: str) -> list[str] | None:
+        """``table[index]`` -- the table's base plus a *computed* offset.
+
+        ``element_address`` walks with the loop cursor ``$i``; this walks
+        with a value the program computed, which is the whole difference
+        between an elementwise read and a table lookup.
+        """
+
+        source_id = resolve_view_source(program.meta, int(table_id))
+        label = feed_label.get(source_id)
+        if label is None:
+            return None
+        byte_width, typed_load, _store, wasm_kind = _memory_ops(source_id)
+        offset, _stride = view_offset_stride(program.meta, int(table_id))
+        # Address arithmetic is i32, so a wider index is narrowed for the
+        # address only -- the index value itself keeps its own type.
+        if value_type == "i64":
+            narrow = ["      i32.wrap_i64"]
+        elif value_type == "i32":
+            narrow = []
+        else:
+            narrow = [f"      {_FROM_WORKING_TYPE[(value_type, 'i32')]}"]
+        instructions = [f"      local.get {label}"]
+        if offset:
+            instructions.extend([
+                f"      i32.const {offset * byte_width}",
+                "      i32.add",
+            ])
+        instructions.extend([
+            f"      local.get {index_local}",
+            *narrow,
+            f"      i32.const {byte_width}",
+            "      i32.mul",
+            "      i32.add",
+            f"      {typed_load}",
+        ])
+        if wasm_kind is not None:
+            conversion = _TO_WORKING_TYPE.get((wasm_kind, value_type))
+            if conversion is not None:
+                instructions.append(f"      {conversion}")
+        return instructions
 
     # Allocate stable locals before emitting either reduction or output passes.
     for index, feed_id in enumerate(feed_ids):
@@ -366,21 +1640,28 @@ def emit_wasm_module(
         names[step.result_id] = local
         locals_declared.append(f"(local {local} {value_type})")
 
-    sums = _flat_sum_steps(live)
-    for step in sums:
-        if step.attrs.get("axis") is not None or bool(step.attrs.get("keepdim", False)):
-            shortfalls.append(WasmShortfall(
-                step.step_id,
-                step.op_name,
-                "axis/keepdim reduction needs tensor shape and stride metadata",
-            ))
+    sums = tuple(
+        step for step in _flat_sum_steps(live) if step.attrs.get("axis") is None
+    )
+    plan = _plan_axis_reductions(program, live, feed_ids, shortfalls)
+    if plan is not None:
+        locals_declared.append("(local $k i32)")
+
+    feed_label = {
+        feed_id: "$" + labels[index] for index, feed_id in enumerate(parameter_feed_ids)
+    }
 
     def load_feeds(target: list[str]) -> None:
         # Feeds are read once per iteration into locals, so a value used by
         # more than one step is loaded once rather than re-read from memory.
-        for index, feed_id in enumerate(feed_ids):
-            target.extend(element_address("$" + labels[index]))
-            target.append(f"      {load}")
+        for feed_id in feed_ids:
+            _, feed_load, _, feed_kind = _memory_ops(feed_id)
+            target.extend(element_address(feed_id))
+            target.append(f"      {feed_load}")
+            if feed_kind is not None:
+                conversion = _TO_WORKING_TYPE.get((feed_kind, value_type))
+                if conversion is not None:
+                    target.append(f"      {conversion}")
             target.append(f"      local.set {names[feed_id]}")
 
     def evaluate_steps(target: list[str], steps: Sequence[OpStep]) -> None:
@@ -394,6 +1675,7 @@ def emit_wasm_module(
                 element_bytes,
                 static_data["constants"],
                 shortfalls,
+                gather_address,
             )
             if instructions is None:
                 continue
@@ -401,53 +1683,138 @@ def emit_wasm_module(
             target.append(f"      local.set {names[candidate.result_id]}")
 
     reduction_passes: list[str] = []
-    for reduction_index, step in enumerate(sums):
-        dependencies = _sum_dependencies(step, live)
-        source = names.get(step.input_ids[0]) if step.input_ids else None
-        if source is None:
+    if plan is not None and plan.ok:
+        # Nested walk: outer loop iterates N (added by the assembly below),
+        # each reduction runs an inner counted loop over K.
+        _emit_reduction_body_wat(
+            body, plan, names, feed_label, feed_ids, value_type,
+            load, store, element_bytes, static_data, shortfalls, output_ids,
+        )
+    elif plan is not None:
+        # Unsupported axis reduction: the plan already recorded a shortfall, so
+        # no binary is built. The illustrative text body is left empty.
+        pass
+    else:
+        for reduction_index, step in enumerate(sums):
+            dependencies = _sum_dependencies(step, live)
+            source = names.get(step.input_ids[0]) if step.input_ids else None
+            if source is None:
+                shortfalls.append(WasmShortfall(
+                    step.step_id, step.op_name, "reduction operand was never produced",
+                ))
+                continue
+            reduction_passes.extend((
+                "    i32.const 0",
+                "    local.set $i",
+                f"    (block $sum_done_{reduction_index}",
+                f"      (loop $sum_body_{reduction_index}",
+                "        local.get $i",
+                "        local.get $count",
+                "        i32.ge_s",
+                f"        br_if $sum_done_{reduction_index}",
+            ))
+            load_feeds(reduction_passes)
+            evaluate_steps(reduction_passes, dependencies)
+            reduction_passes.extend((
+                f"      local.get {names[step.result_id]}",
+                f"      local.get {source}",
+                f"      {value_type}.add",
+                f"      local.set {names[step.result_id]}",
+                "        local.get $i",
+                "        i32.const 1",
+                "        i32.add",
+                "        local.set $i",
+                f"        br $sum_body_{reduction_index}",
+                "      )",
+                "    )",
+            ))
+
+        load_feeds(body)
+        evaluate_steps(body, live)
+
+    if plan is None or plan.ok:
+        for index, output_id in enumerate(output_ids):
+            if plan is not None and plan.value_class.get(output_id) in ("grid", "kaxis"):
+                continue  # written by the grid K-walk in the reduction body
+            target = names.get(output_id)
+            if target is None:
+                shortfalls.append(
+                    WasmShortfall(-1, "output", f"value {output_id} is never produced")
+                )
+                continue
+            out_width, _, out_store, out_kind = _memory_ops(output_id)
+            body.extend(direct_element_address(f"$out{index}", out_width))
+            body.append(f"      local.get {target}")
+            if out_kind is not None:
+                conversion = _FROM_WORKING_TYPE.get((value_type, out_kind))
+                if conversion is not None:
+                    body.append(f"      {conversion}")
+            body.append(f"      {out_store}")
+
+    # Scatter stores: one address+store per ``index_set``, emitted after the
+    # copy walk so the destination buffer is fully populated before the single
+    # element is overwritten. This is the write counterpart of ``gather``'s
+    # address+load. A constant scalar subscript and an addressable scalar value
+    # feed are required; anything else is an honest shortfall.
+    scatter_lines: list[str] = []
+    for step in live:
+        if step.op_name not in ("index_set", "IndexedStore"):
+            continue
+        descriptor = _slice_selectors(step)
+        if descriptor is None or step.result_id not in output_ids:
             shortfalls.append(WasmShortfall(
-                step.step_id, step.op_name, "reduction operand was never produced",
+                step.step_id, step.op_name,
+                "subscript store needs a resolvable (data, subscript, value) and "
+                "a result that is a region output",
             ))
             continue
-        reduction_passes.extend((
-            "    i32.const 0",
-            "    local.set $i",
-            f"    (block $sum_done_{reduction_index}",
-            f"      (loop $sum_body_{reduction_index}",
-            "        local.get $i",
-            "        local.get $count",
-            "        i32.ge_s",
-            f"        br_if $sum_done_{reduction_index}",
-        ))
-        load_feeds(reduction_passes)
-        evaluate_steps(reduction_passes, dependencies)
-        reduction_passes.extend((
-            f"      local.get {names[step.result_id]}",
-            f"      local.get {source}",
-            f"      {value_type}.add",
-            f"      local.set {names[step.result_id]}",
-            "        local.get $i",
-            "        i32.const 1",
-            "        i32.add",
-            "        local.set $i",
-            f"        br $sum_body_{reduction_index}",
-            "      )",
-            "    )",
-        ))
-
-    load_feeds(body)
-    evaluate_steps(body, live)
-
-    for index, output_id in enumerate(output_ids):
-        target = names.get(output_id)
-        if target is None:
-            shortfalls.append(
-                WasmShortfall(-1, "output", f"value {output_id} is never produced")
-            )
+        _data_id, value_id, selectors = descriptor
+        strides, reason = _store_dimension_strides(step, selectors, program.meta)
+        if strides is None:
+            shortfalls.append(WasmShortfall(step.step_id, step.op_name, reason))
             continue
-        body.extend(element_address(f"$out{index}"))
-        body.append(f"      local.get {target}")
-        body.append(f"      {store}")
+        out_pos = output_ids.index(step.result_id)
+        out_width, _, out_store, out_kind = _memory_ops(step.result_id)
+        value_local = names.get(value_id)
+        if value_local is None:
+            shortfalls.append(WasmShortfall(
+                step.step_id, step.op_name, "subscript value was never produced",
+            ))
+            continue
+        # addr = out + (sum_d selector_d * stride_d) * width. Constant subscripts
+        # fold into one byte offset; each runtime subscript loads its per-cell
+        # local, narrows to an i32, and scales by its dimension's byte stride.
+        emit = [f"      local.get $out{out_pos}"]
+        const_bytes = 0
+        missing = False
+        for (kind, selector), stride in zip(selectors, strides):
+            byte_stride = stride * out_width
+            if kind == "const":
+                const_bytes += selector * byte_stride
+                continue
+            index_local = names.get(selector)
+            if index_local is None:
+                shortfalls.append(WasmShortfall(
+                    step.step_id, step.op_name, "subscript index was never produced",
+                ))
+                missing = True
+                break
+            emit.append(f"      local.get {index_local}")
+            conversion = _INDEX_TO_I32.get(value_type)
+            if conversion is not None:
+                emit.append(f"      {conversion}")
+            emit += [f"      i32.const {byte_stride}", "      i32.mul", "      i32.add"]
+        if missing:
+            continue
+        if const_bytes:
+            emit += [f"      i32.const {const_bytes}", "      i32.add"]
+        emit.append(f"      local.get {value_local}")
+        if out_kind is not None:
+            conversion = _FROM_WORKING_TYPE.get((value_type, out_kind))
+            if conversion is not None:
+                emit.append(f"      {conversion}")
+        emit.append(f"      {out_store}")
+        scatter_lines.extend(emit)
 
     parameter_text = " ".join(f"(param {p} i32)" for p in parameters)
     memory_import = next(
@@ -485,6 +1852,7 @@ def emit_wasm_module(
         "        br $body",
         "      )",
         "    )",
+        *scatter_lines,
         "  )",
         ")",
         "",
@@ -492,15 +1860,26 @@ def emit_wasm_module(
     source = "\n".join(lines)
 
     reserved = static_data["reserved_bytes"]
-    api = _describe(name, function_name, feed_ids, output_ids, value_type,
+    parameter_dtypes = {
+        value_id: meta.dtype
+        for value_id in (*parameter_feed_ids, *output_ids)
+        if (meta := program_meta.get(value_id)) is not None and meta.dtype
+    }
+    api = _describe(name, function_name, parameter_feed_ids, output_ids, value_type,
                     element_bytes, reserved,
                     static_data_offset=static_data_offset,
                     shared_memory_import=(
                         {"module": memory_import.module, "field": memory_import.field}
                         if memory_import is not None else None
                     ),
-                    input_names=feed_names(program, feed_ids),
-                    output_names=list(program.outputs.keys()))
+                    transcendental_error=max(
+                        (float(entry.get("bound") or 0.0)
+                         for entry in (static_data.get("entries") or {}).values()),
+                        default=0.0,
+                    ),
+                    input_names=labels,
+                    output_names=list(program.outputs.keys()),
+                    parameter_dtypes=parameter_dtypes)
     binary = None
     if not shortfalls:
         binary = _assemble(
@@ -518,6 +1897,62 @@ def emit_wasm_module(
     )
 
 
+def _row_major_strides(shape) -> list[int]:
+    """Element strides for a row-major (C-order) tensor: the innermost axis has
+    stride 1 and each outer axis multiplies by the extent of the axis inside it.
+    ``(R, C)`` -> ``[C, 1]`` so element ``[i, j]`` sits at ``i*C + j``.
+    """
+
+    strides = [1] * len(shape)
+    for dim in range(len(shape) - 2, -1, -1):
+        strides[dim] = strides[dim + 1] * int(shape[dim + 1])
+    return strides
+
+
+def _store_dimension_strides(step: OpStep, selectors, meta):
+    """Row-major element strides for a subscript store's indexed dimensions, or
+    ``(None, reason)``.
+
+    A subscript store ``out[i0, i1, ...] = value`` writes the single element at
+    ``sum(i_d * stride_d)``. The 1-D case needs no shape metadata (a lone
+    selector addresses elements directly, stride 1). A higher-rank store flattens
+    against the output tensor's row-major strides; a *partial*-rank index (fewer
+    subscripts than dimensions) would write a whole sub-block rather than one
+    element and is an honest shortfall until a block copy is lowered.
+    """
+
+    if len(selectors) == 1:
+        return [1], None
+    entry = meta.get(step.result_id) if meta is not None else None
+    shape = (
+        tuple(entry.shape)
+        if entry is not None and getattr(entry, "shape", None) is not None
+        else None
+    )
+    if shape is None:
+        return None, (
+            "N-D subscript store output has no shape metadata to flatten against"
+        )
+    if len(selectors) != len(shape):
+        return None, (
+            f"only full-rank scalar subscript stores are lowered; "
+            f"{len(selectors)} indices into shape {tuple(shape)}"
+        )
+    return _row_major_strides(shape), None
+
+
+# WebAssembly memory addresses are i32; a subscript operand in the working type
+# is narrowed to one for the address arithmetic only (its value is unchanged).
+_INDEX_TO_I32 = {
+    "i64": "i32.wrap_i64",
+    "f64": "i32.trunc_f64_s",
+    "f32": "i32.trunc_f32_s",
+    "i32": None,
+}
+# Same narrowing as raw opcodes for the binary emitter.
+_INDEX_TO_I32_OPCODE = {"i64": 0xA7, "f64": 0xAA, "f32": 0xA8, "i32": None}
+
+
 def _step_instructions(
     step: OpStep,
     names: Mapping[int, str],
@@ -525,11 +1960,12 @@ def _step_instructions(
     element_bytes: int,
     constant_entries: Mapping[int, Mapping[str, Any]],
     shortfalls: list[WasmShortfall],
+    gather_address: Any = None,
 ) -> list[str] | None:
     op = step.op_name
     constant = _constant_scalar(step)
     if constant is not None:
-        return [f"      {value_type}.const {constant!r}"]
+        return [f"      {_typed_constant(value_type, constant)}"]
     if op == "tensor_from_list":
         entry = constant_entries.get(step.result_id)
         if entry is None:
@@ -542,7 +1978,36 @@ def _step_instructions(
             "      i32.add",
             f"      {value_type}.load",
         ]
-    if op in _NO_WASM_INSTRUCTION:
+    if op == "string_token":
+        # A word's universal token (an i64 identity) held in the working type;
+        # f64 carries it as reinterpreted bits so it round-trips exactly.
+        token = int(step.attrs["token"])
+        lines = [f"      i64.const {token}"]
+        if value_type == "f64":
+            lines.append("      f64.reinterpret_i64")
+        elif value_type != "i64":
+            lines.append(f"      {value_type}.reinterpret_i64")
+        return lines
+    if op == "string_split_part_hash":
+        # The split-part hash's byte-scanning loop is authoritative in the binary
+        # emitter; the WAT is a placeholder producing a balanced value.
+        return [
+            f"      ;; string_split_part_hash(part={step.attrs.get('part')}) "
+            "-- lowered in the binary",
+            f"      {_typed_constant(value_type, 0)}",
+        ]
+    integral = _is_integer_type(value_type)
+    if op in _NO_WASM_INSTRUCTION and not (
+        integral
+        and (
+            op in _INTEGER_BINARY_INSTRUCTION
+            or op in _INTEGER_LOGICAL_BINARY
+            or op in _INTEGER_LOGICAL_UNARY
+        )
+    ):
+        # mod/floordiv and the boolean connectives are only unsupported for
+        # a *float* working type; an integral program reaches them through
+        # rem_s/div_s and eqz below.
         shortfalls.append(
             WasmShortfall(
                 step.step_id,
@@ -561,6 +2026,95 @@ def _step_instructions(
         )
         return None
 
+    if op == "sign":
+        # sign(x) = (x>0) - (x<0): exact, using the comparison opcodes WASM has.
+        if integral:
+            # An integer comparison already yields i32 0/1. For an i64
+            # working type that still has to widen before the subtraction;
+            # for i32 the comparison result is already the working type.
+            widen = ["      i64.extend_i32_u"] if value_type == "i64" else []
+            return [
+                f"      local.get {left}",
+                f"      {_typed_constant(value_type, 0)}",
+                f"      {value_type}.gt_s",
+                *widen,
+                f"      local.get {left}",
+                f"      {_typed_constant(value_type, 0)}",
+                f"      {value_type}.lt_s",
+                *widen,
+                f"      {value_type}.sub",
+            ]
+        return [
+            f"      local.get {left}",
+            f"      {value_type}.const 0.0",
+            f"      {value_type}.gt",
+            f"      {value_type}.convert_i32_u",
+            f"      local.get {left}",
+            f"      {value_type}.const 0.0",
+            f"      {value_type}.lt",
+            f"      {value_type}.convert_i32_u",
+            f"      {value_type}.sub",
+        ]
+
+    if not integral and op in {"isfinite", "isnan", "isinf"}:
+        if op == "isnan":
+            return [
+                f"      local.get {left}",
+                f"      local.get {left}",
+                f"      {value_type}.ne",
+                f"      {value_type}.convert_i32_u",
+            ]
+        infinity_test = [
+            f"      local.get {left}",
+            f"      {value_type}.abs",
+            f"      {value_type}.const inf",
+            f"      {value_type}.{'eq' if op == 'isinf' else 'ne'}",
+        ]
+        if op == "isinf":
+            return [*infinity_test, f"      {value_type}.convert_i32_u"]
+        return [
+            f"      local.get {left}",
+            f"      local.get {left}",
+            f"      {value_type}.eq",
+            *infinity_test,
+            "      i32.and",
+            f"      {value_type}.convert_i32_u",
+        ]
+
+    if not integral and op == "logical_not":
+        return [
+            f"      local.get {left}",
+            f"      {value_type}.const 0.0",
+            f"      {value_type}.eq",
+            f"      {value_type}.convert_i32_u",
+        ]
+
+    if not integral and op == "invert" and value_type == "f64":
+        return [
+            f"      local.get {left}",
+            "      i64.trunc_f64_s",
+            "      i64.const -1",
+            "      i64.xor",
+            "      f64.convert_i64_s",
+        ]
+
+    if op == "pow":
+        if step.attrs.get("reverse", False):
+            shortfalls.append(WasmShortfall(
+                step.step_id, "pow",
+                "reverse pow (base on the right) is not lowered yet"))
+            return None
+        # pow(x, y) = exp(y*log(x)); the binary composes the baked exp/log
+        # tables. Text names the step rather than inlining it, like any LUT op.
+        return [f"      ;; pow via exp(y*log(x)) baked tables (see the .wasm)",
+                f"      local.get {left}"]
+
+    if op == "tan":
+        return [
+            "      ;; tan via sin(x)/cos(x) baked tables (see the .wasm)",
+            f"      local.get {left}",
+        ]
+
     if op in _LUT_OPS:
         # The binary carries the table and the interpolation; the text form
         # names the step instead of inlining it, so the two are not pretending
@@ -569,6 +2123,54 @@ def _step_instructions(
                 f"      local.get {left}"]
 
     if op in ELEMENTWISE_UNARY:
+        if integral:
+            if op in _INTEGER_IDENTITY_UNARY:
+                # Rounding an integer is the integer.
+                return [f"      local.get {left}"]
+            if op in _INTEGER_LOGICAL_UNARY:
+                # not(x) is exactly "x is zero", which eqz answers directly.
+                widen = (
+                    ["      i64.extend_i32_u"] if value_type == "i64" else []
+                )
+                return [
+                    f"      local.get {left}",
+                    f"      {value_type}.eqz",
+                    *widen,
+                ]
+            if op == "neg":
+                # No i32.neg/i64.neg exists; negation is 0 - x.
+                return [
+                    f"      {_typed_constant(value_type, 0)}",
+                    f"      local.get {left}",
+                    f"      {value_type}.sub",
+                ]
+            if op == "abs":
+                # No integer abs either: select between x and -x on x < 0.
+                return [
+                    f"      local.get {left}",
+                    f"      {_typed_constant(value_type, 0)}",
+                    f"      local.get {left}",
+                    f"      {value_type}.sub",
+                    f"      local.get {left}",
+                    f"      {_typed_constant(value_type, 0)}",
+                    f"      {value_type}.lt_s",
+                    "      select",
+                ]
+            if op == "invert":
+                # Bitwise NOT is an integer-only concept in the first place --
+                # WASM has no native "not" either, so it is composed the same
+                # way ``neg`` is above: XOR against all-ones flips every bit.
+                return [
+                    f"      local.get {left}",
+                    f"      {_typed_constant(value_type, -1)}",
+                    f"      {value_type}.xor",
+                ]
+            shortfalls.append(WasmShortfall(
+                step.step_id, op,
+                f"no integer instruction registered for this unary "
+                f"operation on {value_type}",
+            ))
+            return None
         instruction = _UNARY_INSTRUCTION.get(op)
         if instruction is None:
             shortfalls.append(
@@ -576,6 +2178,94 @@ def _step_instructions(
             )
             return None
         return [f"      local.get {left}", f"      {value_type}.{instruction}"]
+
+    if op in ("gather", "Indexed") and len(step.input_ids) == 2:
+        # table[index]: a read at a *computed* offset rather than at the
+        # elementwise walk's own cursor. This is what a table-driven decoder
+        # is made of -- an opcode byte selecting a row of an encoding table --
+        # so without it a state machine's every table lookup is a shortfall.
+        index_local = names.get(step.input_ids[1])
+        if index_local is None:
+            shortfalls.append(WasmShortfall(
+                step.step_id, op, "gather index was never produced",
+            ))
+            return None
+        if int(step.attrs.get("dim", 0)) != 0:
+            shortfalls.append(WasmShortfall(
+                step.step_id, op,
+                f"only dim=0 gather is lowered; got dim="
+                f"{step.attrs.get('dim')}",
+            ))
+            return None
+        instructions = (
+            None if gather_address is None
+            else gather_address(step.input_ids[0], index_local)
+        )
+        if instructions is None:
+            shortfalls.append(WasmShortfall(
+                step.step_id, op,
+                "gather source is not an addressable feed buffer",
+            ))
+            return None
+        return instructions
+
+    if op == "where" and len(step.input_ids) == 3:
+        # Ternary select: (condition, if_true, if_false). WebAssembly's own
+        # `select` is exactly this, so a predicated program -- which is what
+        # a branchless state machine compiles to, every update guarded by a
+        # mask rather than a jump -- needs no control flow to express.
+        #
+        # `select` pops (val1, val2, condition) and keeps val1 when the
+        # condition is a non-zero *i32*, so a wider or floating working type
+        # is first reduced to that. i64 goes through eqz twice rather than
+        # i32.wrap_i64: wrapping a value whose low 32 bits happen to be zero
+        # would silently invert the test, and nothing here guarantees a mask
+        # is only ever 0/1.
+        condition, if_true, if_false = (
+            names.get(value_id) for value_id in step.input_ids
+        )
+        if None in (condition, if_true, if_false):
+            shortfalls.append(WasmShortfall(
+                step.step_id, op, "an operand was never produced",
+            ))
+            return None
+        if value_type == "i32":
+            narrow: list[str] = []          # already an i32 truth value
+        elif value_type == "i64":
+            narrow = ["      i64.eqz", "      i32.eqz"]
+        else:
+            narrow = [
+                f"      {_typed_constant(value_type, 0)}",
+                f"      {value_type}.ne",
+            ]
+        return [
+            f"      local.get {if_true}",
+            f"      local.get {if_false}",
+            f"      local.get {condition}",
+            *narrow,
+            "      select",
+        ]
+
+    if op in ("index_set", "IndexedStore"):
+        # A subscript store (either capture convention) lowers to a scatter,
+        # symmetric to ``gather``'s address+load: per cell the region copies
+        # ``data`` through, and a single address+store (emitted after the walk
+        # by ``emit_wasm_module``) writes ``value`` at ``data[slices]``. With the
+        # output later aliased onto ``data``'s resident slot (StorageRedirect),
+        # the copy is a no-op and only the one store remains -- the in-place
+        # field write.
+        descriptor = _slice_selectors(step)
+        if descriptor is not None:
+            data_id, _value_id, _selectors = descriptor
+            data_local = names.get(data_id)
+            if data_local is not None:
+                return [f"      local.get {data_local}"]
+        shortfalls.append(WasmShortfall(
+            step.step_id, op,
+            "subscript store needs a resolvable (data, subscript, value); a "
+            "runtime index_set index carried only in the attr is not one yet",
+        ))
+        return None
 
     if op not in ELEMENTWISE_BINARY:
         shortfalls.append(
@@ -587,7 +2277,7 @@ def _step_instructions(
         right_source = [f"      local.get {names[step.input_ids[1]]}"]
     elif "right_scalar" in step.attrs:
         right_source = [
-            f"      {value_type}.const {float(step.attrs['right_scalar'])!r}"
+            f"      {_typed_constant(value_type, step.attrs['right_scalar'])}"
         ]
     else:
         shortfalls.append(
@@ -598,6 +2288,87 @@ def _step_instructions(
     operands = [f"      local.get {left}", *right_source]
     if step.attrs.get("reverse", False):
         operands = [*right_source, f"      local.get {left}"]
+
+    if step.attrs.get("string_compare") and op in ("equal", "not_equal"):
+        # Compare the 64-bit token identities, not the float they are held as
+        # (two distinct token bit patterns can be NaN, which mis-compares in f64).
+        cmp = "eq" if op == "equal" else "ne"
+        if value_type == "f64":
+            body = [operands[0], "      i64.reinterpret_f64",
+                    operands[1], "      i64.reinterpret_f64", f"      i64.{cmp}",
+                    "      f64.convert_i32_s"]
+        elif value_type == "i64":
+            body = [*operands, f"      i64.{cmp}", "      i64.extend_i32_u"]
+        else:
+            body = [*operands, f"      i64.{cmp}"]
+        return body
+
+    if integral:
+        instruction = _INTEGER_BINARY_INSTRUCTION.get(op)
+        if instruction is not None:
+            return [*operands, f"      {value_type}.{instruction}"]
+        if op in _INTEGER_LOGICAL_BINARY:
+            # Truth-value connectives, not bitwise ones. eqz gives "is zero",
+            # so De Morgan applies: a&&b == !(!a || !b), a||b == !(!a && !b).
+            combine = "or" if op == "logical_and" else "and"
+            widen = ["      i64.extend_i32_u"] if value_type == "i64" else []
+            return [
+                operands[0],
+                f"      {value_type}.eqz",
+                operands[1],
+                f"      {value_type}.eqz",
+                f"      i32.{combine}",
+                "      i32.eqz",
+                *widen,
+            ]
+        if op in _INTEGER_COMPOSED_BINARY:
+            # WebAssembly has no integer min/max, so compare and select.
+            # ``select`` pops (val1, val2, condition) and yields val1 when
+            # the condition is non-zero, so the operands are pushed twice:
+            # once as the candidate pair, once to compute the predicate.
+            keep_left = "lt_s" if op == "minimum" else "gt_s"
+            return [
+                *operands,
+                *operands,
+                f"      {value_type}.{keep_left}",
+                "      select",
+            ]
+        comparison = _INTEGER_COMPARISON_INSTRUCTION.get(op)
+        if comparison is not None:
+            # An integer comparison already produces i32 0/1. Only an i64
+            # working type needs a widening; i32 is already the value type.
+            widen = ["      i64.extend_i32_u"] if value_type == "i64" else []
+            return [*operands, f"      {value_type}.{comparison}", *widen]
+        shortfalls.append(WasmShortfall(
+            step.step_id, op,
+            f"no integer instruction registered for this operation on "
+            f"{value_type}",
+        ))
+        return None
+
+    if op == "mod":
+        # Float remainder = a - trunc(a/b)*b, matching the truncated division
+        # the integer path uses (rem_s). Exact from div/trunc/mul/sub, all of
+        # which WebAssembly has -- no approximation. operands = [a-push, b-push]
+        # (already swapped for ``reverse``); a and b are local.get/const pushes,
+        # safe to repeat.
+        return [
+            operands[0],
+            operands[0],
+            operands[1],
+            f"      {value_type}.div",
+            f"      {value_type}.trunc",
+            operands[1],
+            f"      {value_type}.mul",
+            f"      {value_type}.sub",
+        ]
+    if op == "floordiv":
+        # floor(a/b): the floored quotient, exact from div + floor.
+        return [
+            *operands,
+            f"      {value_type}.div",
+            f"      {value_type}.floor",
+        ]
 
     instruction = _BINARY_INSTRUCTION.get(op)
     if instruction is not None:
@@ -611,6 +2382,34 @@ def _step_instructions(
             *operands,
             f"      {value_type}.{comparison}",
             f"      {value_type}.convert_i32_u",
+        ]
+
+    if op in {"logical_and", "logical_or"}:
+        return [
+            operands[0],
+            f"      {value_type}.const 0.0",
+            f"      {value_type}.ne",
+            operands[1],
+            f"      {value_type}.const 0.0",
+            f"      {value_type}.ne",
+            f"      i32.{'and' if op == 'logical_and' else 'or'}",
+            f"      {value_type}.convert_i32_u",
+        ]
+
+    if op in _I64_BITWISE_OPCODE and value_type == "f64":
+        # Integer bitwise/shift on an integer-valued f64: round-trip through
+        # i64 so the operation is on the integer's bits, not the float's.
+        mnemonic = {
+            "bitand": "and", "bitor": "or", "bitxor": "xor",
+            "shl": "shl", "shr": "shr_s",
+        }[op]
+        return [
+            operands[0],
+            "      i64.trunc_f64_s",
+            operands[1],
+            "      i64.trunc_f64_s",
+            f"      i64.{mnemonic}",
+            "      f64.convert_i64_s",
         ]
 
     shortfalls.append(
@@ -641,7 +2440,12 @@ def _assemble(
     from .wasm_binary import CodeBuilder, build_module
 
     live = required_steps(program)
-    lut_ops = sorted({step.op_name for step in live} & _LUT_OPS)
+    lut_ops = {step.op_name for step in live} & _LUT_OPS
+    if any(step.op_name == "pow" for step in live):
+        lut_ops |= {"exp", "log"}
+    if any(step.op_name == "tan" for step in live):
+        lut_ops |= {"sin", "cos"}
+    lut_ops = sorted(lut_ops)
     if lut_ops and value_type != "f64":
         raise WasmEmissionError(
             f"{lut_ops} is only baked for f64; an f32 table would need its "
@@ -653,8 +2457,19 @@ def _assemble(
     parameter_count = 1 + len(feed_ids) + len(output_ids)
     builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
     count_param = 0
-    feed_params = {feed_id: 1 + i for i, feed_id in enumerate(feed_ids)}
-    output_params = [1 + len(feed_ids) + i for i in range(len(output_ids))]
+    # A view feed (Meta.source_id set) reads another feed's buffer under its
+    # own offset/stride and must not get a second byte-offset parameter for
+    # the same memory; parameters are allocated per unique buffer owner, same
+    # as the WAT lowering above.
+    parameter_feed_ids: list[int] = []
+    seen_sources: set[int] = set()
+    for feed_id in feed_ids:
+        source_id = resolve_view_source(program.meta, feed_id)
+        if source_id not in seen_sources:
+            seen_sources.add(source_id)
+            parameter_feed_ids.append(source_id)
+    feed_params = {feed_id: 1 + i for i, feed_id in enumerate(parameter_feed_ids)}
+    output_params = [1 + len(parameter_feed_ids) + i for i in range(len(output_ids))]
 
     index_local = builder.declare_local("i32")
     locals_for: dict[int, int] = {}
@@ -663,71 +2478,617 @@ def _assemble(
     for step in live:
         locals_for[step.result_id] = builder.declare_local(value_type)
 
-    def element_address(pointer_param: int) -> None:
+    # Same boundary-typing rule as the WAT lowering above: a value whose
+    # real dtype isn't this module's f32/f64 working type is still
+    # loaded/stored at its own byte width and WASM instruction, converted
+    # to/from the working type only for the arithmetic in between.
+    program_meta = program.meta or {}
+
+    def _memory_ops(value_id: int) -> tuple[int, str | None]:
+        meta = program_meta.get(int(value_id))
+        dtype = str(meta.dtype) if meta and meta.dtype else None
+        entry = _MEMORY_DTYPE_OPS.get(dtype) if dtype else None
+        if entry is None:
+            return element_bytes, None
+        width, _load_text, _store_text, wasm_kind = entry
+        return width, wasm_kind
+
+    def _typed_load(width: int, wasm_kind: str | None) -> None:
+        if wasm_kind == "i32":
+            builder.i32_load_width(8 if width == 1 else 32)
+        elif wasm_kind == "i64":
+            builder.i64_load_width(64)
+        else:
+            builder.load()
+
+    def _typed_store(width: int, wasm_kind: str | None) -> None:
+        if wasm_kind == "i32":
+            builder.i32_store_width(8 if width == 1 else 32)
+        elif wasm_kind == "i64":
+            builder.i64_store_width(64)
+        else:
+            builder.store()
+
+    def _convert_to_working(wasm_kind: str | None) -> None:
+        if wasm_kind is None:
+            return
+        opcode = _TO_WORKING_OPCODE.get((wasm_kind, value_type))
+        if opcode is not None:
+            builder.raw(opcode)
+
+    def _convert_from_working(wasm_kind: str | None) -> None:
+        if wasm_kind is None:
+            return
+        opcode = _FROM_WORKING_OPCODE.get((value_type, wasm_kind))
+        if opcode is not None:
+            builder.raw(opcode)
+
+    def direct_element_address(pointer_param: int, byte_width: int = element_bytes) -> None:
         builder.local_get(pointer_param)
         builder.local_get(index_local)
-        builder.i32_const(element_bytes)
+        builder.i32_const(byte_width)
+        builder.raw(0x6C)  # i32.mul
+        builder.raw(0x6A)  # i32.add
+
+    def element_address(feed_id: int) -> None:
+        source_id = resolve_view_source(program.meta, feed_id)
+        offset, stride = view_offset_stride(program.meta, feed_id)
+        byte_width, _ = _memory_ops(source_id)
+        builder.local_get(feed_params[source_id])
+        byte_offset = offset * byte_width
+        if byte_offset:
+            builder.i32_const(byte_offset)
+            builder.raw(0x6A)  # i32.add
+        source_meta = program_meta.get(int(source_id))
+        if (
+            source_meta is not None
+            and _shape_product(source_meta.shape) == 1
+        ):
+            return
+        builder.local_get(index_local)
+        builder.i32_const(stride * byte_width)
         builder.raw(0x6C)  # i32.mul
         builder.raw(0x6A)  # i32.add
 
     def load_feeds() -> None:
         for feed_id in feed_ids:
-            element_address(feed_params[feed_id])
-            builder.load()
+            width, kind = _memory_ops(feed_id)
+            element_address(feed_id)
+            _typed_load(width, kind)
+            _convert_to_working(kind)
             builder.local_set(locals_for[feed_id])
 
     def evaluate_steps(steps: Sequence[OpStep]) -> None:
         for step in steps:
             if step.op_name == "sum":
                 continue
-            local = locals_for[step.result_id]
-            constant = _constant_scalar(step)
-            if constant is not None:
-                builder.value_const(constant)
-                builder.local_set(local)
-                continue
-            if step.op_name == "tensor_from_list":
-                entry = tables["constants"][step.result_id]
-                builder.i32_const(entry["base"])
-                builder.local_get(index_local)
-                builder.i32_const(element_bytes)
-                builder.raw(0x6C)  # i32.mul
-                builder.raw(0x6A)  # i32.add
-                builder.load()
-                builder.local_set(local)
-                continue
-            left = locals_for[step.input_ids[0]]
+            emit_step(step, push_index_flat)
 
-            def push_right() -> None:
-                if len(step.input_ids) == 2:
-                    builder.local_get(locals_for[step.input_ids[1]])
-                else:
-                    builder.value_const(float(step.attrs["right_scalar"]))
+    def push_index_flat() -> None:
+        builder.local_get(index_local)
 
-            if step.op_name in _LUT_OPS:
-                entry = tables["entries"][step.op_name]
-                _emit_lut(
-                    builder, left, step.op_name, entry["base"], entry["intervals"],
-                    entry["lower"], entry["upper"], entry["periodic"],
+    def emit_step(step: OpStep, push_index) -> None:
+        local = locals_for[step.result_id]
+        constant = _constant_scalar(step)
+        if constant is not None:
+            builder.value_const(constant)
+            builder.local_set(local)
+            return
+        if step.op_name == "tensor_from_list":
+            entry = tables["constants"][step.result_id]
+            builder.i32_const(entry["base"])
+            push_index()
+            builder.i32_const(element_bytes)
+            builder.raw(0x6C)  # i32.mul
+            builder.raw(0x6A)  # i32.add
+            builder.load()
+            builder.local_set(local)
+            return
+        if step.op_name == "string_token":
+            # A word's universal i64 token, held in the working type (f64 carries
+            # it as reinterpreted bits so it round-trips exactly).
+            builder.i64_const(int(step.attrs["token"]))
+            if value_type == "f64":
+                builder.raw(0xBF)  # f64.reinterpret_i64
+            builder.local_set(local)
+            return
+        if step.op_name == "string_split_part_hash":
+            # x.split(delim,1)[part] -> its token. x is a fat-pointer view held in
+            # the working type; the part is a sub-range view, hashed in place.
+            from .wasm_sequence import emit_string_split_part_hash
+            view = builder.declare_local("i64")
+            builder.local_get(locals_for[step.input_ids[0]])
+            if value_type == "f64":
+                builder.raw(0xBD)  # i64.reinterpret_f64 -> fat pointer
+            builder.local_set(view)
+            token = builder.declare_local("i64")
+            ptr, length, pos, start, end, index, byte = (
+                builder.declare_local("i32") for _ in range(7)
+            )
+            delim = builder.declare_local("i32")
+            builder.i32_const(int(step.attrs["delim"])).local_set(delim)
+            emit_string_split_part_hash(
+                builder, view_local=view, delim_local=delim,
+                part=int(step.attrs["part"]), result_local=token, ptr_local=ptr,
+                length_local=length, pos_local=pos, start_local=start,
+                end_local=end, index_local=index, byte_local=byte,
+            )
+            builder.local_get(token)
+            if value_type == "f64":
+                builder.raw(0xBF)  # f64.reinterpret_i64 (hold token in working type)
+            builder.local_set(local)
+            return
+        if step.attrs.get("string_compare") and step.op_name in ("equal", "not_equal"):
+            # Compare the 64-bit token identities, not the float they are held as.
+            builder.local_get(locals_for[step.input_ids[0]])
+            if value_type == "f64":
+                builder.raw(0xBD)  # i64.reinterpret_f64
+            builder.local_get(locals_for[step.input_ids[1]])
+            if value_type == "f64":
+                builder.raw(0xBD)
+            builder.raw(0x51 if step.op_name == "equal" else 0x52)  # i64.eq / i64.ne
+            if value_type == "f64":
+                builder.raw(OP_F64_CONVERT_I32_S)
+            elif value_type == "i64":
+                builder.op("extend_i32_u")
+            builder.local_set(local)
+            return
+        if step.op_name in ("index_set", "IndexedStore"):
+            # Per cell: copy ``data`` through. The scatter store that writes
+            # ``value`` at ``data[slices]`` is emitted once after the walk.
+            descriptor = _slice_selectors(step)
+            if descriptor is None:
+                raise WasmEmissionError(
+                    f"{step.op_name} step {step.step_id} is not a lowerable "
+                    "subscript store"
                 )
-            elif step.op_name in ELEMENTWISE_UNARY:
+            builder.local_get(locals_for[descriptor[0]])
+            builder.local_set(local)
+            return
+        if step.op_name in ("gather", "Indexed") and len(step.input_ids) == 2:
+            # table[index]: a read at a computed offset (the binary counterpart
+            # of the WAT's gather_address). addr = table + offset + index*stride.
+            if int(step.attrs.get("dim", 0)) != 0:
+                raise WasmEmissionError(
+                    f"{step.op_name} step {step.step_id}: only dim=0 is lowered"
+                )
+            source_id = resolve_view_source(program.meta, step.input_ids[0])
+            if source_id not in feed_params:
+                raise WasmEmissionError(
+                    f"{step.op_name} source is not an addressable feed buffer"
+                )
+            offset, stride = view_offset_stride(program.meta, step.input_ids[0])
+            width, kind = _memory_ops(source_id)
+            builder.local_get(feed_params[source_id])
+            if offset * width:
+                builder.i32_const(offset * width)
+                builder.raw(0x6A)  # i32.add
+            builder.local_get(locals_for[step.input_ids[1]])
+            narrow = _INDEX_TO_I32_OPCODE.get(value_type)
+            if narrow is not None:
+                builder.raw(narrow)
+            builder.i32_const(stride * width)
+            builder.raw(0x6C)  # i32.mul
+            builder.raw(0x6A)  # i32.add
+            _typed_load(width, kind)
+            _convert_to_working(kind)
+            builder.local_set(local)
+            return
+        left = locals_for[step.input_ids[0]]
+
+        integral = _is_integer_type(value_type)
+
+        def push_right() -> None:
+            if len(step.input_ids) == 2:
+                builder.local_get(locals_for[step.input_ids[1]])
+            else:
+                builder.value_const(float(step.attrs["right_scalar"]))
+
+        if step.op_name == "sign":
+            # sign(x) = (x>0) - (x<0): exact, no table.
+            if integral:
+                for comparison in ("gt_s", "lt_s"):
+                    builder.local_get(left)
+                    builder.value_const(0.0)
+                    builder.op(comparison)
+                    if value_type == "i64":
+                        builder.op("extend_i32_u")
+                builder.op("sub")
+                builder.local_set(local)
+                return
+            builder.local_get(left)
+            builder.value_const(0.0)
+            builder.op("gt")
+            builder.op("convert_i32_u")
+            builder.local_get(left)
+            builder.value_const(0.0)
+            builder.op("lt")
+            builder.op("convert_i32_u")
+            builder.op("sub")
+            builder.local_set(local)
+            return
+
+        if not integral and step.op_name in {"isfinite", "isnan", "isinf"}:
+            if step.op_name == "isnan":
+                builder.local_get(left).local_get(left).op("ne")
+            else:
+                if step.op_name == "isfinite":
+                    builder.local_get(left).local_get(left).op("eq")
+                builder.local_get(left).op("abs").value_const(float("inf"))
+                builder.op("eq" if step.op_name == "isinf" else "ne")
+                if step.op_name == "isfinite":
+                    builder.raw(OP_I32_AND)
+            builder.op("convert_i32_u")
+            builder.local_set(local)
+            return
+
+        if not integral and step.op_name == "logical_not":
+            builder.local_get(left).value_const(0.0).op("eq")
+            builder.op("convert_i32_u").local_set(local)
+            return
+
+        if not integral and step.op_name == "invert" and value_type == "f64":
+            builder.local_get(left).raw(OP_I64_TRUNC_F64_S)
+            builder.i64_const(-1).raw(OP_I64_XOR, OP_F64_CONVERT_I64_S)
+            builder.local_set(local)
+            return
+
+        if step.op_name == "pow":
+            # pow(x, y) = exp(y * log(x)), composing the baked tables.
+            log_entry = tables["entries"]["log"]
+            exp_entry = tables["entries"]["exp"]
+            product = builder.declare_local(value_type)
+            _emit_lut(
+                builder, left, "log", log_entry["base"],
+                log_entry["intervals"], log_entry["lower"],
+                log_entry["upper"], log_entry["periodic"],
+            )
+            push_right()
+            builder.op("mul")
+            builder.local_set(product)
+            _emit_lut(
+                builder, product, "exp", exp_entry["base"],
+                exp_entry["intervals"], exp_entry["lower"],
+                exp_entry["upper"], exp_entry["periodic"],
+            )
+            builder.local_set(local)
+            return
+
+        if step.op_name == "tan":
+            sine = builder.declare_local(value_type)
+            _emit_lut(
+                builder, left, "sin", tables["entries"]["sin"]["base"],
+                tables["entries"]["sin"]["intervals"],
+                tables["entries"]["sin"]["lower"],
+                tables["entries"]["sin"]["upper"],
+                tables["entries"]["sin"]["periodic"],
+            )
+            builder.local_set(sine)
+            cosine = builder.declare_local(value_type)
+            _emit_lut(
+                builder, left, "cos", tables["entries"]["cos"]["base"],
+                tables["entries"]["cos"]["intervals"],
+                tables["entries"]["cos"]["lower"],
+                tables["entries"]["cos"]["upper"],
+                tables["entries"]["cos"]["periodic"],
+            )
+            builder.local_set(cosine)
+            builder.local_get(sine).local_get(cosine).op("div")
+            builder.local_set(local)
+            return
+
+        if step.op_name == "where" and len(step.input_ids) == 3:
+            # See the WAT emitter for why the condition is narrowed this way.
+            condition, if_true, if_false = (
+                locals_for[value_id] for value_id in step.input_ids
+            )
+            builder.local_get(if_true)
+            builder.local_get(if_false)
+            builder.local_get(condition)
+            if value_type == "i64":
+                builder.op("eqz")
+                builder.raw(0x45)  # i32.eqz
+            elif value_type != "i32":
+                builder.value_const(0.0)
+                builder.op("ne")
+            builder.select()
+            builder.local_set(local)
+            return
+
+        if step.op_name in _LUT_OPS:
+            entry = tables["entries"][step.op_name]
+            _emit_lut(
+                builder, left, step.op_name, entry["base"], entry["intervals"],
+                entry["lower"], entry["upper"], entry["periodic"],
+            )
+        elif step.op_name in ELEMENTWISE_UNARY:
+            if integral and step.op_name in _INTEGER_IDENTITY_UNARY:
+                builder.local_get(left)  # rounding an integer is the integer
+            elif integral and step.op_name in _INTEGER_LOGICAL_UNARY:
                 builder.local_get(left)
-                builder.op(_UNARY_INSTRUCTION[step.op_name])
-            elif step.attrs.get("reverse", False):
-                push_right()
+                builder.op("eqz")
+                if value_type == "i64":
+                    builder.op("extend_i32_u")
+            elif integral and step.op_name == "neg":
+                builder.value_const(0.0)  # no integer neg: 0 - x
                 builder.local_get(left)
+                builder.op("sub")
+            elif integral and step.op_name == "abs":
+                builder.local_get(left)
+                builder.value_const(0.0)
+                builder.local_get(left)
+                builder.op("sub")
+                builder.local_get(left)
+                builder.value_const(0.0)
+                builder.op("lt_s")
+                builder.select()
+            elif integral and step.op_name == "invert":
+                builder.local_get(left)  # bitwise NOT is x XOR -1
+                builder.value_const(-1)
+                builder.op("xor")
+            elif integral:
+                raise WasmEmissionError(
+                    f"no integer instruction registered for unary "
+                    f"{step.op_name!r} on {value_type}"
+                )
             else:
                 builder.local_get(left)
-                push_right()
+                builder.op(_UNARY_INSTRUCTION[step.op_name])
+        elif step.attrs.get("reverse", False):
+            push_right()
+            builder.local_get(left)
+        else:
+            builder.local_get(left)
+            push_right()
 
-            if step.op_name in ELEMENTWISE_BINARY:
+        if step.op_name in ELEMENTWISE_BINARY:
+            if integral:
+                instruction = _INTEGER_BINARY_INSTRUCTION.get(step.op_name)
+                if instruction is not None:
+                    builder.op(instruction)
+                elif step.op_name in _INTEGER_LOGICAL_BINARY:
+                    # Operands are already on the stack in order; reduce each
+                    # to a truth value and combine by De Morgan (see the WAT
+                    # emitter for the full explanation).
+                    combine_and = step.op_name == "logical_or"
+                    builder.op("eqz")          # top operand -> "is zero"
+                    swap = builder.declare_local("i32")
+                    builder.local_set(swap)
+                    builder.op("eqz")          # lower operand -> "is zero"
+                    builder.local_get(swap)
+                    builder.raw(0x71 if combine_and else 0x72)  # i32.and/or
+                    builder.raw(0x45)  # i32.eqz
+                    if value_type == "i64":
+                        builder.op("extend_i32_u")
+                elif step.op_name in _INTEGER_COMPOSED_BINARY:
+                    # No integer min/max: re-push the pair and select.
+                    if step.attrs.get("reverse", False):
+                        push_right()
+                        builder.local_get(left)
+                    else:
+                        builder.local_get(left)
+                        push_right()
+                    builder.op(
+                        "lt_s" if step.op_name == "minimum" else "gt_s"
+                    )
+                    builder.select()
+                else:
+                    builder.op(
+                        _INTEGER_COMPARISON_INSTRUCTION[step.op_name]
+                    )
+                    if value_type == "i64":
+                        builder.op("extend_i32_u")
+            elif step.op_name in ("mod", "floordiv"):
+                # Float remainder / floored quotient. Operands are already on
+                # the stack (a below, b on top, reverse already applied); stash
+                # them so they can be reused, since neither reduces to a single
+                # opcode. mod = a - trunc(a/b)*b; floordiv = floor(a/b) -- both
+                # exact from div/trunc/floor/mul/sub, which WebAssembly has.
+                second = builder.declare_local(value_type)
+                builder.local_set(second)   # b
+                first = builder.declare_local(value_type)
+                builder.local_set(first)    # a
+                if step.op_name == "mod":
+                    builder.local_get(first)
+                    builder.local_get(first)
+                    builder.local_get(second)
+                    builder.op("div")
+                    builder.op("trunc")
+                    builder.local_get(second)
+                    builder.op("mul")
+                    builder.op("sub")
+                else:
+                    builder.local_get(first)
+                    builder.local_get(second)
+                    builder.op("div")
+                    builder.op("floor")
+            elif step.op_name in _I64_BITWISE_OPCODE and value_type == "f64":
+                # Integer bitwise/shift on an integer-valued f64: operands are
+                # on the stack (a below, b on top). Round-trip through i64 so
+                # the op acts on the integer's bits, then convert back to f64.
+                second = builder.declare_local(value_type)
+                builder.local_set(second)   # b_f64
+                first = builder.declare_local(value_type)
+                builder.local_set(first)    # a_f64
+                builder.local_get(first)
+                builder.raw(OP_I64_TRUNC_F64_S)
+                builder.local_get(second)
+                builder.raw(OP_I64_TRUNC_F64_S)
+                builder.raw(_I64_BITWISE_OPCODE[step.op_name])
+                builder.raw(OP_F64_CONVERT_I64_S)
+            elif step.op_name in {"logical_and", "logical_or"}:
+                second = builder.declare_local(value_type)
+                builder.local_set(second)
+                first = builder.declare_local(value_type)
+                builder.local_set(first)
+                builder.local_get(first).value_const(0.0).op("ne")
+                builder.local_get(second).value_const(0.0).op("ne")
+                builder.raw(
+                    OP_I32_AND if step.op_name == "logical_and" else OP_I32_OR
+                )
+                builder.op("convert_i32_u")
+            else:
                 instruction = _BINARY_INSTRUCTION.get(step.op_name)
                 if instruction is not None:
                     builder.op(instruction)
                 else:
                     builder.op(_COMPARISON_INSTRUCTION[step.op_name])
                     builder.op("convert_i32_u")
-            builder.local_set(local)
+        builder.local_set(local)
+
+    plan = _plan_axis_reductions(program, live, feed_ids, [])
+    if plan is not None and plan.ok:
+        k_local = builder.declare_local("i32")
+        axis_k = plan.axis_extent
+
+        def push_class_index(klass: str) -> None:
+            if klass == "grid":
+                builder.local_get(index_local)
+                builder.i32_const(axis_k)
+                builder.raw(0x6C)  # i32.mul
+                builder.local_get(k_local)
+                builder.raw(0x6A)  # i32.add
+            elif klass == "kaxis":
+                builder.local_get(k_local)
+            elif klass == "row":
+                builder.local_get(index_local)
+            else:
+                builder.i32_const(0)
+
+        def load_feed_class(feed_id: int) -> None:
+            builder.local_get(feed_params[feed_id])
+            push_class_index(plan.feed_class[feed_id])
+            builder.i32_const(element_bytes)
+            builder.raw(0x6C)  # i32.mul
+            builder.raw(0x6A)  # i32.add
+            builder.load()
+            builder.local_set(locals_for[feed_id])
+
+        def emit_reduction_step(step: OpStep) -> None:
+            klass = plan.value_class.get(step.result_id, "row")
+            emit_step(step, lambda: push_class_index(klass))
+
+        builder.i32_const(0)
+        builder.local_set(index_local)
+        builder.block()
+        builder.loop()
+        builder.local_get(index_local)
+        builder.local_get(count_param)
+        builder.raw(0x4E)  # i32.ge_s
+        builder.br_if(1)
+        for feed_id in feed_ids:
+            if plan.feed_class[feed_id] in ("row", "scalar"):
+                load_feed_class(feed_id)
+        for step in plan.pre_steps:
+            emit_reduction_step(step)
+        grid_slots = [
+            (output_id, slot, plan.value_class.get(output_id))
+            for slot, output_id in enumerate(output_ids)
+            if plan.value_class.get(output_id) in ("grid", "kaxis")
+        ]
+        for reduction in plan.reductions:
+            op = plan.reduce_op[reduction.result_id]
+            fold, identity = _REDUCE_FOLD[op]
+            accumulator = locals_for[reduction.result_id]
+            builder.value_const(identity)
+            builder.local_set(accumulator)
+            builder.i32_const(0)
+            builder.local_set(k_local)
+            builder.block()
+            builder.loop()
+            builder.local_get(k_local)
+            builder.i32_const(axis_k)
+            builder.raw(0x4E)  # i32.ge_s
+            builder.br_if(1)
+            for feed_id in feed_ids:
+                if plan.feed_class[feed_id] == "kaxis":
+                    load_feed_class(feed_id)
+            for step in plan.inner_dependencies[reduction.result_id]:
+                emit_reduction_step(step)
+            builder.local_get(accumulator)
+            builder.local_get(locals_for[reduction.input_ids[0]])
+            if _is_integer_type(value_type) and fold in {"min", "max"}:
+                # No integer min/max instruction; compare and select over the
+                # same operand pair (matches the WAT emitter's fold above).
+                builder.local_get(accumulator)
+                builder.local_get(locals_for[reduction.input_ids[0]])
+                builder.op("lt_s" if fold == "min" else "gt_s")
+                builder.select()
+            else:
+                builder.op(fold)
+            builder.local_set(accumulator)
+            builder.local_get(k_local)
+            builder.i32_const(1)
+            builder.raw(0x6A)  # i32.add
+            builder.local_set(k_local)
+            builder.br(0)
+            builder.end()  # loop
+            builder.end()  # block
+            if op == "mean":
+                builder.local_get(accumulator)
+                builder.value_const(float(axis_k))
+                builder.op("div_s" if _is_integer_type(value_type) else "div")
+                builder.local_set(accumulator)
+        for step in plan.post_steps:
+            emit_reduction_step(step)
+        if grid_slots:
+            builder.i32_const(0)
+            builder.local_set(k_local)
+            builder.block()
+            builder.loop()
+            builder.local_get(k_local)
+            builder.i32_const(axis_k)
+            builder.raw(0x4E)  # i32.ge_s
+            builder.br_if(1)
+            for feed_id in feed_ids:
+                if plan.feed_class[feed_id] == "kaxis":
+                    load_feed_class(feed_id)
+            for step in plan.grid_output_steps:
+                emit_reduction_step(step)
+            for output_id, slot, klass in grid_slots:
+                grid_width, grid_kind = _memory_ops(output_id)
+                builder.local_get(output_params[slot])
+                push_class_index(klass)
+                builder.i32_const(grid_width)
+                builder.raw(0x6C)  # i32.mul
+                builder.raw(0x6A)  # i32.add
+                builder.local_get(locals_for[output_id])
+                _convert_from_working(grid_kind)
+                _typed_store(grid_width, grid_kind)
+            builder.local_get(k_local)
+            builder.i32_const(1)
+            builder.raw(0x6A)  # i32.add
+            builder.local_set(k_local)
+            builder.br(0)
+            builder.end()  # loop
+            builder.end()  # block
+        for slot, output_id in enumerate(output_ids):
+            if plan.value_class.get(output_id) in ("grid", "kaxis"):
+                continue  # written by the grid K-walk above
+            out_width, out_kind = _memory_ops(output_id)
+            direct_element_address(output_params[slot], out_width)
+            builder.local_get(locals_for[output_id])
+            _convert_from_working(out_kind)
+            _typed_store(out_width, out_kind)
+        builder.local_get(index_local)
+        builder.i32_const(1)
+        builder.raw(0x6A)  # i32.add
+        builder.local_set(index_local)
+        builder.br(0)
+        builder.end()  # loop
+        builder.end()  # block
+
+        data = tables["data"]
+        pages = max(1, (reserved_bytes + 65535) // 65536 + 1)
+        return build_module(
+            function_name=function_name,
+            parameter_types=["i32"] * parameter_count,
+            body=builder,
+            memory_pages=pages,
+            data=data,
+            data_offset=int(tables.get("data_offset", 0)),
+            imports=imports,
+        )
 
     # Each SSA sum gets an explicit whole-tensor pass. Its scalar local is
     # then consumed by later tensor expressions as a broadcast value.
@@ -767,9 +3128,11 @@ def _assemble(
     evaluate_steps(live)
 
     for slot, output_id in enumerate(output_ids):
-        element_address(output_params[slot])
+        out_width, out_kind = _memory_ops(output_id)
+        direct_element_address(output_params[slot], out_width)
         builder.local_get(locals_for[output_id])
-        builder.store()
+        _convert_from_working(out_kind)
+        _typed_store(out_width, out_kind)
 
     builder.local_get(index_local)
     builder.i32_const(1)
@@ -778,6 +3141,48 @@ def _assemble(
     builder.br(0)  # continue the loop
     builder.end()  # loop
     builder.end()  # block
+
+    # Scatter stores after the copy walk (write counterpart of gather's
+    # address+load): out[index] = value, one address+store per index_set. The
+    # value feed is a scalar broadcast, so its per-cell local already holds it.
+    for step in live:
+        if step.op_name not in ("index_set", "IndexedStore"):
+            continue
+        descriptor = _slice_selectors(step)
+        if descriptor is None or step.result_id not in output_ids:
+            raise WasmEmissionError(
+                f"{step.op_name} step {step.step_id} is not a lowerable subscript "
+                "store into a region output"
+            )
+        _data_id, value_id, selectors = descriptor
+        strides, reason = _store_dimension_strides(step, selectors, program.meta)
+        if strides is None:
+            raise WasmEmissionError(f"{step.op_name} step {step.step_id}: {reason}")
+        slot = output_ids.index(step.result_id)
+        out_width, out_kind = _memory_ops(step.result_id)
+        # addr = out + (sum_d selector_d * stride_d) * width, mirroring the text
+        # emitter: constant subscripts fold into one byte offset, runtime ones
+        # scale by their dimension's byte stride.
+        builder.local_get(output_params[slot])
+        const_bytes = 0
+        for (kind, selector), stride in zip(selectors, strides):
+            byte_stride = stride * out_width
+            if kind == "const":
+                const_bytes += selector * byte_stride
+                continue
+            builder.local_get(locals_for[selector])
+            narrow = _INDEX_TO_I32_OPCODE.get(value_type)
+            if narrow is not None:
+                builder.raw(narrow)
+            builder.i32_const(byte_stride)
+            builder.raw(0x6C)  # i32.mul
+            builder.raw(0x6A)  # i32.add
+        if const_bytes:
+            builder.i32_const(const_bytes)
+            builder.raw(0x6A)  # i32.add
+        builder.local_get(locals_for[value_id])
+        _convert_from_working(out_kind)
+        _typed_store(out_width, out_kind)
 
     data = tables["data"]
     # One page for the table, plus room for whatever the caller lays out
@@ -934,12 +3339,25 @@ def plan_static_data(
 
     import struct as _struct
 
-    tables = plan_tables(sorted({step.op_name for step in steps} & _LUT_OPS))
+    lut_ops = {step.op_name for step in steps} & _LUT_OPS
+    if any(step.op_name == "pow" for step in steps):
+        # pow composes exp and log tables even though it is not itself tabulated.
+        lut_ops |= {"exp", "log"}
+    if any(step.op_name == "tan" for step in steps):
+        lut_ops |= {"sin", "cos"}
+    tables = plan_tables(sorted(lut_ops))
     for entry in tables["entries"].values():
         entry["base"] += data_offset
     payload = bytearray(tables["data"])
-    element_bytes = 4 if value_type == "f32" else 8
-    pack_format = "<f" if value_type == "f32" else "<d"
+    # A constant is stored in the module's own working-type representation:
+    # float bytes for a float type, two's-complement integer bytes for an
+    # integer type. Packing an integer program's constants as float64 (the old
+    # unconditional ``<d``) laid an IEEE bit pattern where an i32.load/i64.load
+    # then read a nonsense integer -- e.g. the literal 2 read back as
+    # 0x4000000000000000. The per-value cast mirrors ``_typed_constant``.
+    _PACK = {"f32": ("<f", 4), "f64": ("<d", 8), "i32": ("<i", 4), "i64": ("<q", 8)}
+    pack_format, element_bytes = _PACK.get(str(value_type), ("<d", 8))
+    cast = int if str(value_type) in _INTEGER_VALUE_TYPES else float
     constants: dict[int, dict[str, int]] = {}
     shortfalls: list[WasmShortfall] = []
 
@@ -958,7 +3376,7 @@ def plan_static_data(
             payload.extend(bytes(padding))
         base = data_offset + len(payload)
         for value in values:
-            payload.extend(_struct.pack(pack_format, value))
+            payload.extend(_struct.pack(pack_format, cast(value)))
         constants[step.result_id] = {
             "base": base,
             "count": len(values),
@@ -1081,12 +3499,37 @@ def _describe(
     reserved_bytes: int = 0,
     static_data_offset: int = 0,
     shared_memory_import: Mapping[str, str] | None = None,
+    transcendental_error: float = 0.0,
     input_names: Sequence[str] | None = None,
     output_names: Sequence[str] | None = None,
+    parameter_dtypes: Mapping[int, str] | None = None,
 ):
-    """The same calling-contract descriptor the Fortran path emits."""
+    """The same calling-contract descriptor the Fortran path emits.
 
-    from .compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
+    Every value here is still stored and computed as ``value_type`` -- this
+    module's arithmetic is one uniform elementwise numeric type, and that is
+    unchanged. ``parameter_dtypes`` (keyed by feed/output value id, from the
+    same ``FusedProgram.meta`` the code generator already reads) only
+    corrects the *label* a caller sees for a parameter that logically holds
+    something else -- a byte buffer, a small integer counter -- so a reader
+    interprets the bytes it gets back correctly instead of assuming every
+    parameter is the module's numeric working type. A value that does not
+    survive its real dtype through this uniform-arithmetic path (anything
+    needing exact precision ``value_type`` cannot represent, such as a full
+    64-bit integer through float64 arithmetic) is not fixed by this label;
+    that is a real backend limitation, not a caller-facing one.
+    """
+
+    from .compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter, _C_TYPES
+
+    dtypes = {
+        int(key): str(value)
+        for key, value in (parameter_dtypes or {}).items()
+        if str(value) in _C_TYPES
+    }
+
+    def dtype_for(value_id: int) -> str:
+        return dtypes.get(int(value_id), value_type)
 
     parameters = [
         Parameter(
@@ -1099,12 +3542,12 @@ def _describe(
         )
     ]
     labels = list(input_names or [f"feed{i}" for i in range(len(feed_ids))])
-    for index, _ in enumerate(feed_ids):
+    for index, feed_id in enumerate(feed_ids):
         parameters.append(
             Parameter(
                 name=labels[index],
                 role="input",
-                dtype=value_type,
+                dtype=dtype_for(feed_id),
                 c_type="int32_t",
                 ctypes_name="c_int32",
                 # A WebAssembly parameter is always by value; what it holds
@@ -1114,7 +3557,7 @@ def _describe(
                 extent="count",
             )
         )
-    for index, _ in enumerate(output_ids):
+    for index, output_id in enumerate(output_ids):
         # A program that named its outputs gets to keep those names: the
         # caller reads them, and "red" carries information "out0" does not.
         parameters.append(
@@ -1122,7 +3565,7 @@ def _describe(
                 name=(output_names[index] if output_names and index < len(output_names)
                       else f"out{index}"),
                 role="output",
-                dtype=value_type,
+                dtype=dtype_for(output_id),
                 c_type="int32_t",
                 ctypes_name="c_int32",
                 passing="value",
@@ -1155,6 +3598,13 @@ def _describe(
             "reserved_bytes": int(reserved_bytes),
             "static_data_offset": int(static_data_offset),
             "shared_memory_import": dict(shared_memory_import or {}),
+            # WHAT THIS MODULE'S TRANSCENDENTALS DELIVER. Each baked table
+            # measures the error it actually achieves, and that number was
+            # computed and then discarded -- so a verifier had no way to
+            # know what the emitter promised and checked against a
+            # tolerance the table could never meet. A published module
+            # states its own accuracy.
+            "transcendental_error": float(transcendental_error),
         },
     )
 
@@ -1197,5 +3647,6 @@ __all__ = [
     "WasmShortfall",
     "compile_wat",
     "emit_wasm_module",
+    "supported_tensor_operations",
     "wat_assembler",
 ]

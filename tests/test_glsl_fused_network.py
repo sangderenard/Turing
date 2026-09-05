@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import sympy
 
 from src.common.tensors.accelerator_backends.glsl_fused_network import (
     GLSLFusedProgramNetwork,
@@ -40,12 +41,13 @@ from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )
 from src.compiler.glsl_deployment_strategy import (
+    _diagnostic_value_summary,
     _observe_process_graph_node,
     _planned_capture_context,
     _capture_feed_aliases,
     _tensorize_graph_input,
     _unique_runtime_feed_aliases,
-    strategize_glsl_deployment,
+    strategize_shell_deployment,
 )
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
@@ -80,6 +82,22 @@ def test_dtype_descriptor_remains_structural_graph_metadata():
     assert _tensorize_graph_input(dtype, device=None) is dtype
 
 
+def test_module_exporting_shape_function_remains_structural():
+    assert callable(sympy.shape)
+    assert _tensorize_graph_input(sympy, device=None) is sympy
+    assert _diagnostic_value_summary(sympy).startswith("module:")
+
+
+def test_shape_only_nested_domain_object_is_not_tensorized():
+    class DomainValue:
+        shape = (1,)
+        tolist = list
+
+    owner = SimpleNamespace(field=DomainValue())
+
+    assert _tensorize_graph_input(owner, device=None) is owner
+
+
 def test_installed_control_shell_executes_loop_in_one_dispatch(gl):
     program = _program(
         [10],
@@ -103,6 +121,9 @@ def test_installed_control_shell_executes_loop_in_one_dispatch(gl):
         control,
         {3: CapturedFusedProgram(program, {})},
         instrumentation=True,
+    )
+    assert artifact.shader_region_links[3]["cut"]["hole"]["marker"] == (
+        "__scheduled_region_3__"
     )
     installed = InstalledGLSLControlShell(artifact)
     try:
@@ -369,6 +390,46 @@ def test_closure_aggregate_fields_use_one_native_loop_body():
     ) == 1
     assert artifact.source.count("float s2 = s0 + s1;") == 1
     assert artifact.source.count(f"switch (int({induction}))") == 2
+
+
+def test_projected_resident_rows_share_the_control_shader_abi():
+    program = _program(
+        [20, 21],
+        [("add", 22, [20, 21], {})],
+        {"result": 22},
+        [20, 21, 22, 99],
+    )
+    program.meta[99] = Meta((6,), "float32", "glsl")
+    induction = "iteration_9"
+    control = ControlProgram(
+        LoopBlock(
+            induction,
+            "0",
+            "__iterable_extent_99__",
+            "1",
+            StatementBlock(("__scheduled_region_3__",)),
+        ),
+        region_indices=(3,),
+        projected_iterable_bindings=(
+            (99, 20, induction, 0),
+            (99, 21, induction, 1),
+        ),
+    )
+
+    artifact = build_control_shader_artifact(
+        control,
+        {3: CapturedFusedProgram(program, {})},
+        device_resident=True,
+    )
+
+    assert {99, 20, 21}.issubset(artifact.slot_value_ids)
+    iterable_slot = artifact.slot_value_ids.index(99)
+    assert (
+        f"int(u_extent_control[{iterable_slot}]) / 2"
+        in artifact.source
+    )
+    assert f"uint({induction}) * 2u + 0u" in artifact.source
+    assert f"uint({induction}) * 2u + 1u" in artifact.source
 
 
 def test_static_loop_target_is_present_in_artifact_slot_abi():
@@ -1145,7 +1206,7 @@ def test_glsl_deployment_accepts_ephemeral_vertical_programs(gl):
         parents=[],
         children=[],
     )
-    deployment = strategize_glsl_deployment(graph)(
+    deployment = strategize_shell_deployment(graph)(
         legacy_fused_network=True,
     )
     program = _program(
@@ -1173,7 +1234,7 @@ def test_composed_control_is_default_and_legacy_network_is_explicit(gl):
         parents=[],
         children=[],
     )
-    deployment = strategize_glsl_deployment(graph)()
+    deployment = strategize_shell_deployment(graph)()
     program = _program(
         [0],
         [("mul", 1, [0], {"right_scalar": 4.0})],
@@ -1197,7 +1258,7 @@ def test_glsl_deployment_shell_owns_named_and_fifo_execution(gl):
         parents=[],
         children=[],
     )
-    deployment = strategize_glsl_deployment(graph)(
+    deployment = strategize_shell_deployment(graph)(
         input_slots=2,
         output_slots=2,
         legacy_fused_network=True,
@@ -1254,7 +1315,7 @@ def test_glsl_deployment_installs_compiled_tapes(gl):
         parents=[],
         children=[],
     )
-    deployment = strategize_glsl_deployment(graph)(
+    deployment = strategize_shell_deployment(graph)(
         legacy_fused_network=True,
     )
     program = _program(
@@ -1332,7 +1393,7 @@ def test_glsl_deployment_rejects_per_region_tape_capture(gl):
     )
     graph.compute_levels(method="asap", order="dependency")
 
-    deployment = strategize_glsl_deployment(
+    deployment = strategize_shell_deployment(
         graph,
         max_nodes_per_dispatch=1,
     )(legacy_fused_network=True)
@@ -1391,7 +1452,7 @@ def test_glsl_deployment_coordinates_structural_result_around_numeric_region(gl)
     graph.roots = [3]
     graph.compute_levels(method="asap", order="dependency")
 
-    deployment = strategize_glsl_deployment(graph)()
+    deployment = strategize_shell_deployment(graph)()
     values = np.arange(16, dtype=np.float32)
     deployment.compile_process_graph()
     try:
@@ -1449,7 +1510,7 @@ def test_precompile_only_observes_numerics_without_glsl_compilation(
         raise AssertionError("precompile-only discovery compiled GLSL")
 
     monkeypatch.setattr(glsl_backend, "_compile", reject_glsl_compile)
-    deployment = strategize_glsl_deployment(graph)()
+    deployment = strategize_shell_deployment(graph)()
     try:
         deployment.compile_process_graph()
         deployment.capture_fused_programs(
@@ -1483,7 +1544,7 @@ def render_value(x):
         for entry in graph.function_table
         if entry.graph is not None
     }
-    deployment_type = strategize_glsl_deployment(graph)
+    deployment_type = strategize_shell_deployment(graph)
 
     assert set(deployment_type.function_shell_types) == set(expected)
     deployment = deployment_type(
@@ -1551,7 +1612,7 @@ def render(x):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
 
-    deployment = strategize_glsl_deployment(graph)()
+    deployment = strategize_shell_deployment(graph)()
     try:
         deployment.compile_process_graph()
         render_ref = graph.function_table.reference("render")
@@ -1603,7 +1664,7 @@ def render(x):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
 
-    deployment = strategize_glsl_deployment(graph)()
+    deployment = strategize_shell_deployment(graph)()
     try:
         deployment.compile_process_graph()
         render_ref = graph.function_table.reference("render")
@@ -1652,7 +1713,7 @@ def recurrent(x, iterations):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
 
-    deployment_type = strategize_glsl_deployment(graph)
+    deployment_type = strategize_shell_deployment(graph)
     deployment = deployment_type(
         profiling=True,
         verbose_profile=True,
@@ -1724,7 +1785,7 @@ def collect(x, iterations):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
 
-    deployment_type = strategize_glsl_deployment(graph)
+    deployment_type = strategize_shell_deployment(graph)
     reference = graph.function_table.reference("collect")
     assert reference is not None
     shell_type = deployment_type.function_shell_types[reference.address]

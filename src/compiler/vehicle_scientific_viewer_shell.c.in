@@ -1,0 +1,476 @@
+/* Compiler-emitted native scientific vehicle viewer.
+ *
+ * Thread architecture: the SDL/OpenGL thread owns events, camera, geometry
+ * upload, and display swap only.  A dedicated physics thread owns every
+ * compiled kernel invocation and publishes complete frames through a
+ * generation-tagged double buffer (the DisplayDoubleBufferABI discipline:
+ * front/back plus generation).  UI edits travel to physics as an explicit
+ * command queue, so Space/pause takes effect at the next window boundary
+ * while the last complete snapshot stays drawable.
+ */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <GL/gl.h>
+#include <math.h>
+#include <stdint.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define SDL_INIT_VIDEO 0x00000020u
+#define SDL_WINDOWPOS_CENTERED 0x2FFF0000
+#define SDL_WINDOW_OPENGL 0x00000002u
+#define SDL_WINDOW_INPUT_FOCUS 0x00000200u
+#define SDL_WINDOW_RESIZABLE 0x00000020u
+#define SDL_GL_CONTEXT_MAJOR_VERSION 17
+#define SDL_GL_CONTEXT_MINOR_VERSION 18
+#define SDL_GL_CONTEXT_PROFILE_MASK 21
+#define SDL_GL_CONTEXT_PROFILE_CORE 1
+#define SDL_QUIT 0x100u
+#define GL_ARRAY_BUFFER 0x8892u
+#define GL_DYNAMIC_DRAW 0x88E8u
+#define GL_VERTEX_SHADER 0x8B31u
+#define GL_FRAGMENT_SHADER 0x8B30u
+#define GL_COMPILE_STATUS 0x8B81u
+#define GL_LINK_STATUS 0x8B82u
+#define GL_PROGRAM_POINT_SIZE 0x8642u
+#define ENSEMBLE_BATCH_COUNT 8
+#define VEHICLE_INPUT_COUNT @VEHICLE_INPUT_COUNT@
+#define VEHICLE_OUTPUT_COUNT @VEHICLE_OUTPUT_COUNT@
+#define CONTACT_TOTAL_COUNT @CONTACT_TOTAL_COUNT@
+#define FIXTURE_INPUT_COUNT @FIXTURE_INPUT_COUNT@
+#define TIRE_STATE_COUNT @TIRE_STATE_COUNT@
+#define TIRE_VERTEX_COUNT @TIRE_VERTEX_COUNT@
+#define TIRE_EDGE_COUNT @TIRE_EDGE_COUNT@
+#define ASSEMBLY_STAGE_COUNT @ASSEMBLY_STAGE_COUNT@
+#define TIRE_DIAGNOSTIC_COUNT @TIRE_DIAGNOSTIC_COUNT@
+#define TELEMETRY_HEADER_DOUBLES 13
+#define TELEMETRY_MAGIC 8675309.0
+#define TUNE_EDIT_CAPACITY 64
+
+typedef ptrdiff_t GLsizeiptr;
+typedef char GLchar;
+typedef int (__cdecl *PFN_SDL_Init)(uint32_t);
+typedef void (__cdecl *PFN_SDL_Quit)(void);
+typedef int (__cdecl *PFN_SDL_GL_SetAttribute)(int,int);
+typedef void *(__cdecl *PFN_SDL_CreateWindow)(const char*,int,int,int,int,uint32_t);
+typedef void *(__cdecl *PFN_SDL_GL_CreateContext)(void*);
+typedef int (__cdecl *PFN_SDL_GL_SetSwapInterval)(int);
+typedef void (__cdecl *PFN_SDL_GL_SwapWindow)(void*);
+typedef int (__cdecl *PFN_SDL_PollEvent)(void*);
+typedef uint32_t (__cdecl *PFN_SDL_GetWindowFlags)(void*);
+typedef void (__cdecl *PFN_SDL_GL_DeleteContext)(void*);
+typedef void (__cdecl *PFN_SDL_DestroyWindow)(void*);
+typedef void *(__cdecl *PFN_SDL_GL_GetProcAddress)(const char*);
+typedef const char *(__cdecl *PFN_SDL_GetError)(void);
+
+typedef GLuint (APIENTRY *PFNGLCREATESHADERPROC)(GLenum);
+typedef void (APIENTRY *PFNGLSHADERSOURCEPROC)(GLuint,GLsizei,const GLchar*const*,const GLint*);
+typedef void (APIENTRY *PFNGLCOMPILESHADERPROC)(GLuint);
+typedef void (APIENTRY *PFNGLGETSHADERIVPROC)(GLuint,GLenum,GLint*);
+typedef void (APIENTRY *PFNGLGETSHADERINFOLOGPROC)(GLuint,GLsizei,GLsizei*,GLchar*);
+typedef GLuint (APIENTRY *PFNGLCREATEPROGRAMPROC)(void);
+typedef void (APIENTRY *PFNGLATTACHSHADERPROC)(GLuint,GLuint);
+typedef void (APIENTRY *PFNGLLINKPROGRAMPROC)(GLuint);
+typedef void (APIENTRY *PFNGLGETPROGRAMIVPROC)(GLuint,GLenum,GLint*);
+typedef void (APIENTRY *PFNGLGETPROGRAMINFOLOGPROC)(GLuint,GLsizei,GLsizei*,GLchar*);
+typedef void (APIENTRY *PFNGLUSEPROGRAMPROC)(GLuint);
+typedef void (APIENTRY *PFNGLGENVERTEXARRAYSPROC)(GLsizei,GLuint*);
+typedef void (APIENTRY *PFNGLBINDVERTEXARRAYPROC)(GLuint);
+typedef void (APIENTRY *PFNGLGENBUFFERSPROC)(GLsizei,GLuint*);
+typedef void (APIENTRY *PFNGLBINDBUFFERPROC)(GLenum,GLuint);
+typedef void (APIENTRY *PFNGLBUFFERDATAPROC)(GLenum,GLsizeiptr,const void*,GLenum);
+typedef void (APIENTRY *PFNGLENABLEVERTEXATTRIBARRAYPROC)(GLuint);
+typedef void (APIENTRY *PFNGLVERTEXATTRIBPOINTERPROC)(GLuint,GLint,GLenum,GLboolean,GLsizei,const void*);
+typedef GLint (APIENTRY *PFNGLGETUNIFORMLOCATIONPROC)(GLuint,const GLchar*);
+typedef void (APIENTRY *PFNGLUNIFORM1IPROC)(GLint,GLint);
+typedef void (APIENTRY *PFNGLUNIFORM1FPROC)(GLint,GLfloat);
+typedef void (APIENTRY *PFNGLUNIFORMMATRIX4FVPROC)(GLint,GLsizei,GLboolean,const GLfloat*);
+
+static PFNGLCREATESHADERPROC pCreateShader;
+static PFNGLSHADERSOURCEPROC pShaderSource;
+static PFNGLCOMPILESHADERPROC pCompileShader;
+static PFNGLGETSHADERIVPROC pGetShaderiv;
+static PFNGLGETSHADERINFOLOGPROC pGetShaderInfoLog;
+static PFNGLCREATEPROGRAMPROC pCreateProgram;
+static PFNGLATTACHSHADERPROC pAttachShader;
+static PFNGLLINKPROGRAMPROC pLinkProgram;
+static PFNGLGETPROGRAMIVPROC pGetProgramiv;
+static PFNGLGETPROGRAMINFOLOGPROC pGetProgramInfoLog;
+static PFNGLUSEPROGRAMPROC pUseProgram;
+static PFNGLGENVERTEXARRAYSPROC pGenVertexArrays;
+static PFNGLBINDVERTEXARRAYPROC pBindVertexArray;
+static PFNGLGENBUFFERSPROC pGenBuffers;
+static PFNGLBINDBUFFERPROC pBindBuffer;
+static PFNGLBUFFERDATAPROC pBufferData;
+static PFNGLENABLEVERTEXATTRIBARRAYPROC pEnableVertexAttribArray;
+static PFNGLVERTEXATTRIBPOINTERPROC pVertexAttribPointer;
+static PFNGLGETUNIFORMLOCATIONPROC pGetUniformLocation;
+static PFNGLUNIFORM1IPROC pUniform1i;
+static PFNGLUNIFORM1FPROC pUniform1f;
+static PFNGLUNIFORMMATRIX4FVPROC pUniformMatrix4fv;
+
+void vehicle_native_appendage_duty(double*);
+void vehicle_native_tire_diagnostics(double*);
+void vehicle_native_energy_diagnostics(double*);
+int vehicle_native_graph_tick_batch(int,double*,double*,double*,double*);
+void vehicle_native_graph_batch_tire_state(int,double*);
+void vehicle_native_graph_batch_reset(void);
+
+typedef struct { float p[3], n[3], type, strain, yield_strain, fracture_strain, damage, joint, energy, residual; } Vertex;
+typedef struct { float x,y,z,type,joint; int corner,moving,reveal_stage; } GraphNode;
+typedef struct { int a,b; float type,rest,yield_strain,fracture_strain,stiffness,damping; int reveal_stage; } GraphEdge;
+typedef struct { int a,b; float rest; } TireEdge;
+typedef struct { const char *name; int target,index; double lower,upper; } TuneParam;
+static Vertex vertices[131072];
+static int line_count=0, ensemble_start=0, ensemble_count=0, point_start=0, point_count=0, hud_start=0, hud_count=0;
+static float last_chassis_x=0,last_chassis_y=.9f,last_chassis_z=0;
+static float edge_strain[@GRAPH_EDGE_COUNT@];
+static float edge_energy[@GRAPH_EDGE_COUNT@],edge_residual[@GRAPH_EDGE_COUNT@];
+static const GraphNode graph_nodes[@GRAPH_NODE_COUNT@]={@GRAPH_NODES@};
+static const GraphEdge graph_edges[@GRAPH_EDGE_COUNT@]={@GRAPH_EDGES@};
+static const char *graph_edge_names[@GRAPH_EDGE_COUNT@]={@GRAPH_EDGE_NAMES@};
+static const int wheel_nodes[4]={@WHEEL_NODES@};
+static const float wheel_radius=@WHEEL_RADIUS@f;
+static const float wheel_width=@WHEEL_WIDTH@f;
+static float wheel_bx[3]={1,0,0},wheel_by[3]={0,1,0},wheel_bz[3]={0,0,1};
+static const TuneParam tune_params[@TUNE_PARAM_COUNT@]={@TUNE_PARAM_ROWS@};
+static const TireEdge tire_edges[TIRE_EDGE_COUNT]={@TIRE_EDGES@};
+static HANDLE telemetry_file=INVALID_HANDLE_VALUE,telemetry_mapping=NULL;
+static const double *telemetry_data=NULL;
+static int telemetry_stage=0,telemetry_stages=0;
+static double telemetry_progress=0,telemetry_time=0;
+
+/* One complete joined physics frame.  The physics thread fills `staging`
+ * privately (its arrays ARE the live simulation state), then publishes it
+ * whole under `snapshot_lock` with a new generation.  The render thread only
+ * ever copies the latest published frame into `view`; a stale frame can never
+ * partially overwrite a newer one because publication is a single guarded
+ * copy tagged by generation. */
+typedef struct {
+    double vehicle_in[VEHICLE_INPUT_COUNT],vehicle_out[VEHICLE_OUTPUT_COUNT];
+    double contact_in[CONTACT_TOTAL_COUNT],fixture_in[FIXTURE_INPUT_COUNT];
+    double tire_state[TIRE_STATE_COUNT];
+    double duty[4],td[TIRE_DIAGNOSTIC_COUNT],te[4];
+    double ensemble_fixture_in[ENSEMBLE_BATCH_COUNT*FIXTURE_INPUT_COUNT];
+    double ensemble_tire_state[ENSEMBLE_BATCH_COUNT*TIRE_STATE_COUNT];
+    double sim_time,physics_wall_ms;
+    long generation; int simulate,ensemble,pool_workers;
+} PhysicsSnapshot;
+
+typedef struct { int target,index; double value; } TuneEdit;
+static SRWLOCK snapshot_lock=SRWLOCK_INIT,command_lock=SRWLOCK_INIT;
+static PhysicsSnapshot staging={.vehicle_in={@VEHICLE_DEFAULTS@},.contact_in={@CONTACT_DEFAULTS@},.fixture_in={@FIXTURE_DEFAULTS@}};
+static PhysicsSnapshot shared_snapshot,view;
+static struct {
+    int simulate,beating,ensemble,quit;
+    TuneEdit edits[TUNE_EDIT_CAPACITY]; int edit_count;
+} commands;
+typedef int (*PFN_pool_workers)(void);
+static PFN_pool_workers p_pool_workers=NULL;
+
+static int telemetry_open(const char *path){
+    if(!path||!*path)return 0;telemetry_file=CreateFileA(path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(telemetry_file==INVALID_HANDLE_VALUE)return 0;telemetry_mapping=CreateFileMappingA(telemetry_file,NULL,PAGE_READONLY,0,0,NULL);
+    if(!telemetry_mapping)return 0;telemetry_data=(const double*)MapViewOfFile(telemetry_mapping,FILE_MAP_READ,0,0,0);return telemetry_data!=NULL;
+}
+static int telemetry_read(double *vehicle_in,double *vehicle_out,double *contact_in,double *fixture_in,double *tire_state){
+    const double *p;double before,after;if(!telemetry_data||telemetry_data[0]!=TELEMETRY_MAGIC)return 0;
+    before=telemetry_data[1];if(((uint64_t)before)&1u)return 0;
+    if((int)telemetry_data[8]!=VEHICLE_INPUT_COUNT||(int)telemetry_data[9]!=VEHICLE_OUTPUT_COUNT||
+       (int)telemetry_data[10]!=CONTACT_TOTAL_COUNT||(int)telemetry_data[11]!=FIXTURE_INPUT_COUNT||
+       (int)telemetry_data[12]!=TIRE_STATE_COUNT)return 0;
+    p=telemetry_data+TELEMETRY_HEADER_DOUBLES;memcpy(vehicle_in,p,sizeof(double)*VEHICLE_INPUT_COUNT);p+=VEHICLE_INPUT_COUNT;
+    memcpy(vehicle_out,p,sizeof(double)*VEHICLE_OUTPUT_COUNT);p+=VEHICLE_OUTPUT_COUNT;
+    memcpy(contact_in,p,sizeof(double)*CONTACT_TOTAL_COUNT);p+=CONTACT_TOTAL_COUNT;
+    memcpy(fixture_in,p,sizeof(double)*FIXTURE_INPUT_COUNT);p+=FIXTURE_INPUT_COUNT;
+    memcpy(tire_state,p,sizeof(double)*TIRE_STATE_COUNT);MemoryBarrier();after=telemetry_data[1];if(before!=after)return 0;
+    telemetry_stage=(int)telemetry_data[3];telemetry_stages=(int)telemetry_data[4];telemetry_progress=telemetry_data[5];telemetry_time=telemetry_data[6];return 1;
+}
+
+static double tune_get(const TuneParam *p,const double *vehicle_in,const double *contact_in){return p->target?contact_in[p->index]:vehicle_in[p->index];}
+/* UI-thread half of a parameter edit: clamp, then enqueue for the physics
+ * thread.  The physics thread owns the live arrays; edits never touch them
+ * directly from the UI thread. */
+static void tune_enqueue(int target,int index,double value){
+    AcquireSRWLockExclusive(&command_lock);
+    if(commands.edit_count<TUNE_EDIT_CAPACITY){
+        commands.edits[commands.edit_count].target=target;
+        commands.edits[commands.edit_count].index=index;
+        commands.edits[commands.edit_count].value=value;
+        commands.edit_count++;
+    }
+    ReleaseSRWLockExclusive(&command_lock);
+}
+static void tune_set(const TuneParam *p,double value){value=fmax(p->lower,fmin(p->upper,value));tune_enqueue(p->target,p->index,value);}
+
+static char *read_file(const char *path) {
+    FILE *f=fopen(path,"rb"); long n; char *s;
+    if(!f) return NULL; fseek(f,0,SEEK_END); n=ftell(f); rewind(f);
+    s=(char*)malloc((size_t)n+1); if(!s){fclose(f);return NULL;}
+    fread(s,1,(size_t)n,f); s[n]=0; fclose(f); return s;
+}
+static GLuint shader(GLenum kind,const char *path){
+    char *src=read_file(path); GLint ok=0; GLuint s;
+    if(!src){fprintf(stderr,"cannot read shader %s\n",path);exit(2);} s=pCreateShader(kind);
+    pShaderSource(s,1,(const GLchar*const*)&src,NULL); pCompileShader(s); free(src);
+    pGetShaderiv(s,GL_COMPILE_STATUS,&ok); if(!ok){char log[8192];pGetShaderInfoLog(s,8191,NULL,log);fprintf(stderr,"%s\n",log);exit(3);} return s;
+}
+static GLuint program(const char *vs,const char *fs){
+    GLuint p=pCreateProgram(),v=shader(GL_VERTEX_SHADER,vs),f=shader(GL_FRAGMENT_SHADER,fs); GLint ok=0;
+    pAttachShader(p,v);pAttachShader(p,f);pLinkProgram(p);pGetProgramiv(p,GL_LINK_STATUS,&ok);
+    if(!ok){char log[8192];pGetProgramInfoLog(p,8191,NULL,log);fprintf(stderr,"%s\n",log);exit(4);}return p;
+}
+static void identity(float *m){memset(m,0,16*sizeof(float));m[0]=m[5]=m[10]=m[15]=1;}
+static void multiply(float *o,const float *a,const float *b){float r[16];int c,k,row;for(c=0;c<4;c++)for(row=0;row<4;row++){r[c*4+row]=0;for(k=0;k<4;k++)r[c*4+row]+=a[k*4+row]*b[c*4+k];}memcpy(o,r,sizeof(r));}
+static void perspective(float *m,float fovy,float aspect,float zn,float zf){float q=1.0f/tanf(fovy*.5f);memset(m,0,64);m[0]=q/aspect;m[5]=q;m[10]=(zf+zn)/(zn-zf);m[11]=-1;m[14]=(2*zf*zn)/(zn-zf);}
+static void normalize3(float *x,float *y,float *z){float n=sqrtf((*x)*(*x)+(*y)*(*y)+(*z)*(*z));if(n<1e-7f)n=1;*x/=n;*y/=n;*z/=n;}
+static void orbit_view(float *m,float yaw,float pitch,float distance,float tx,float ty,float tz){
+    float ex=tx+distance*cosf(pitch)*cosf(yaw),ey=ty+distance*sinf(pitch),ez=tz+distance*cosf(pitch)*sinf(yaw);
+    float fx=tx-ex,fy=ty-ey,fz=tz-ez,sx,sy,sz,ux,uy,uz;normalize3(&fx,&fy,&fz);
+    sx=-fz;sy=0;sz=fx;normalize3(&sx,&sy,&sz);ux=sy*fz-sz*fy;uy=sz*fx-sx*fz;uz=sx*fy-sy*fx;
+    identity(m);m[0]=sx;m[4]=sy;m[8]=sz;m[1]=ux;m[5]=uy;m[9]=uz;m[2]=-fx;m[6]=-fy;m[10]=-fz;
+    m[12]=-(sx*ex+sy*ey+sz*ez);m[13]=-(ux*ex+uy*ey+uz*ez);m[14]=fx*ex+fy*ey+fz*ez;
+}
+static void put(int *count,float x,float y,float z,float type,float strain,float ys,float fs,float damage,float joint,float energy,float residual){Vertex *v=&vertices[(*count)++];memset(v,0,sizeof(*v));v->p[0]=x;v->p[1]=y;v->p[2]=z;v->n[1]=1;v->type=type;v->strain=strain;v->yield_strain=ys;v->fracture_strain=fs;v->damage=damage;v->joint=joint;v->energy=energy;v->residual=residual;}
+static void line(int *count,float ax,float ay,float az,float bx,float by,float bz,float type,float strain,float ys,float fs,float energy,float residual){put(count,ax,ay,az,type,strain,ys,fs,0,0,energy,residual);put(count,bx,by,bz,type,strain,ys,fs,0,0,energy,residual);}
+static float reveal_alpha(int stage){float p;if(!telemetry_data)return 1.0f;if(stage<telemetry_stage)return 1.0f;if(stage>telemetry_stage)return 0.0f;p=(float)fmax(0.0,fmin(1.0,telemetry_progress));return p*p*(3.0f-2.0f*p);}
+static void cosmetic_tire_handover(float cx,float cy,float cz,float *x,float *y,float *z){
+    float p,a,c,s,dx,dy,dz,lx,ly,lz;
+    if(!telemetry_data||telemetry_stage!=@MOUNT_TIRE_STAGE@)return;
+    p=(float)fmax(0.0,fmin(1.0,telemetry_progress));
+    a=12.5663706f*p;c=cosf(a);s=sinf(a);
+    dx=*x-cx;dy=*y-cy;dz=*z-cz;
+    lx=dx*wheel_bx[0]+dy*wheel_bx[1]+dz*wheel_bx[2];
+    ly=dx*wheel_by[0]+dy*wheel_by[1]+dz*wheel_by[2];
+    lz=dx*wheel_bz[0]+dy*wheel_bz[1]+dz*wheel_bz[2]+(1.0f-p)*1.25f*wheel_width;
+    *x=cx+(c*lx-s*ly)*wheel_bx[0]+(s*lx+c*ly)*wheel_by[0]+lz*wheel_bz[0];
+    *y=cy+(c*lx-s*ly)*wheel_bx[1]+(s*lx+c*ly)*wheel_by[1]+lz*wheel_bz[1];
+    *z=cz+(c*lx-s*ly)*wheel_bx[2]+(s*lx+c*ly)*wheel_by[2]+lz*wheel_bz[2];
+}
+static void force_arrow(int *count,float x,float y,float z,float force,float type){float length=.62f*tanhf(fabsf(force)/4500.0f),tip=y+(force>=0?length:-length),head=(force>=0?-.07f:.07f);if(length<.008f)return;line(count,x,y,z,x,tip,z,type,0,.1f,.3f,log1pf(fabsf(force))*.1f,0);line(count,x,tip,z,x-.045f,tip+head,z,type,0,.1f,.3f,0,0);line(count,x,tip,z,x+.045f,tip+head,z,type,0,.1f,.3f,0,0);}
+static float link_strain(float ax,float ay,float az,float bx,float by,float bz,float rest){float x=bx-ax,y=by-ay,z=bz-az;if(rest<=1e-6f)return 0;return (sqrtf(x*x+y*y+z*z)-rest)/rest;}
+static void circle(int *count,float cx,float cy,float cz,float r,float type,float strain){int i,side,volumetric=type==3;for(side=volumetric?-1:0;side<=(volumetric?1:0);side++)for(i=0;i<32;i++){float a=6.2831853f*i/32,b=6.2831853f*(i+1)/32,ca=cosf(a),sa=sinf(a),cb=cosf(b),sb=sinf(b),off=side*.5f*wheel_width;line(count,cx+r*ca*wheel_bx[0]+r*sa*wheel_by[0]+off*wheel_bz[0],cy+r*ca*wheel_bx[1]+r*sa*wheel_by[1]+off*wheel_bz[1],cz+r*ca*wheel_bx[2]+r*sa*wheel_by[2]+off*wheel_bz[2],cx+r*cb*wheel_bx[0]+r*sb*wheel_by[0]+off*wheel_bz[0],cy+r*cb*wheel_bx[1]+r*sb*wheel_by[1]+off*wheel_bz[1],cz+r*cb*wheel_bx[2]+r*sb*wheel_by[2]+off*wheel_bz[2],type,strain,.12f,.35f,0,0);}if(volumetric)for(i=0;i<16;i++){float a=6.2831853f*i/16,ca=cosf(a),sa=sinf(a),x=cx+r*ca*wheel_bx[0]+r*sa*wheel_by[0],y=cy+r*ca*wheel_bx[1]+r*sa*wheel_by[1],z=cz+r*ca*wheel_bx[2]+r*sa*wheel_by[2];line(count,x-.5f*wheel_width*wheel_bz[0],y-.5f*wheel_width*wheel_bz[1],z-.5f*wheel_width*wheel_bz[2],x+.5f*wheel_width*wheel_bz[0],y+.5f*wheel_width*wheel_bz[1],z+.5f*wheel_width*wheel_bz[2],type,strain,.12f,.35f,0,0);}}
+static const uint8_t font5x7[36][7]={
+ {14,17,19,21,25,17,14},{4,12,4,4,4,4,14},{14,17,1,2,4,8,31},{30,1,1,14,1,1,30},{2,6,10,18,31,2,2},{31,16,16,30,1,1,30},{14,16,16,30,17,17,14},{31,1,2,4,8,8,8},{14,17,17,14,17,17,14},{14,17,17,15,1,1,14},
+ {14,17,17,31,17,17,17},{30,17,17,30,17,17,30},{14,17,16,16,16,17,14},{30,17,17,17,17,17,30},{31,16,16,30,16,16,31},{31,16,16,30,16,16,16},{14,17,16,23,17,17,15},{17,17,17,31,17,17,17},{14,4,4,4,4,4,14},{7,2,2,2,2,18,12},{17,18,20,24,20,18,17},{16,16,16,16,16,16,31},{17,27,21,21,17,17,17},{17,25,21,19,17,17,17},{14,17,17,17,17,17,14},{30,17,17,30,16,16,16},{14,17,17,17,21,18,13},{30,17,17,30,20,18,17},{15,16,16,14,1,1,30},{31,4,4,4,4,4,4},{17,17,17,17,17,17,14},{17,17,17,17,17,10,4},{17,17,17,21,21,21,10},{17,17,10,4,10,17,17},{17,17,10,4,4,4,4},{31,1,2,4,8,16,31}
+};
+static uint8_t glyph_row(char ch,int row){
+    ch=(char)toupper((unsigned char)ch);if(ch>='0'&&ch<='9')return font5x7[ch-'0'][row];if(ch>='A'&&ch<='Z')return font5x7[10+ch-'A'][row];
+    if(ch=='-')return row==3?31:0;if(ch=='.')return row==6?4:0;if(ch==':')return (row==2||row==5)?4:0;if(ch=='/')return (uint8_t)(1<<(row<5?row:4));if(ch=='_')return row==6?31:0;return 0;
+}
+static void hud_text(int *count,float x,float y,float scale,const char *text,float type){int ci,row,col;for(ci=0;text[ci]&&*count<32760;ci++){for(row=0;row<7;row++){uint8_t bits=glyph_row(text[ci],row);for(col=0;col<5;col++)if(bits&(1<<(4-col)))put(count,x+(ci*6+col)*scale,y-row*scale,0,type,0,1,2,0,0,0,0);}}}
+static void append_hud(int *count,const double *out,const double *vehicle_in,const double *contact_in,const double *fixture,int simulate,int selected,int ensemble){
+    char text[192];double duty[4],td[@TIRE_DIAGNOSTIC_COUNT@],te[4],tire_energy=0,tire_loss=0,tire_contacts=0;float x=.30f,y=.94f,s=.00220f,total_energy=0,total_residual=0;int k,i,top[6]={-1,-1,-1,-1,-1,-1};float score[6]={-1,-1,-1,-1,-1,-1};memcpy(duty,view.duty,sizeof(duty));memcpy(td,view.td,sizeof(td));memcpy(te,view.te,sizeof(te));for(i=0;i<4;i++){tire_contacts+=td[13*i+9];tire_energy+=td[13*i+11];tire_loss+=td[13*i+12];}for(i=0;i<@GRAPH_EDGE_COUNT@;i++){total_energy+=edge_energy[i];total_residual+=edge_residual[i];}
+#define HUD(fmt,...) do{snprintf(text,sizeof(text),fmt,__VA_ARGS__);hud_text(count,x,y,s,text,7);y-=.044f;}while(0)
+    HUD("SIM %s  DT 1/%d",simulate?"RUN":"PAUSED",@PHYSICS_HZ@);
+    if(!telemetry_data)HUD("DISPATCH POOL %d  PHYS %.2f MS  GEN %ld",view.pool_workers,view.physics_wall_ms,view.generation);
+    if(telemetry_data)HUD("ASSEMBLY %d/%d  %.1f PCT  T %.2f",telemetry_stage+1,telemetry_stages,100*telemetry_progress,telemetry_time);
+    HUD("TIRE %s  REF A %.3f  TRIAL %.0f",duty[0]>=.5?"GPU DUTY":"EXACT SKIN",duty[2],duty[1]);
+    HUD("SURFACE %s  M TOGGLE",fixture[@SURFACE_MODE@]>=.5?"TRI TORUS":"HARD ROLLERS");
+    HUD("ENSEMBLE %s  BATCH %d  E TOGGLE",ensemble?"MEAN GHOSTS":"OFF",ENSEMBLE_BATCH_COUNT);
+    if(ensemble)HUD("ENSEMBLE EXACT STEPS %d PER DRAW",@ENSEMBLE_STEPS_PER_FRAME@);
+    HUD("ROLLER BEAT %s  B TOGGLE",fixture[@FIXTURE_MODE@]>=.5?"ACTIVE":"PASSIVE");
+    HUD("POS %.3f %.3f %.3f",out[@POS_X@],out[@POS_Y@],out[@POS_Z@]);
+    HUD("VEL %.3f %.3f %.3f",out[@VEL_X@],out[@VEL_Y@],out[@VEL_Z@]);
+    HUD("RPY %.3f %.3f %.3f",out[@ROLL@],out[@PITCH@],out[@YAW@]);
+    HUD("ENGINE RPM %.1f",out[@ENGINE_RPM@]);HUD("ENGINE TORQUE %.1f NM",out[@ENGINE_TORQUE@]);HUD("DRIVELINE %.1f NM",out[@DRIVELINE_TORQUE@]);
+    HUD("WHEEL W %.1f %.1f",out[@WHEEL_FL@],out[@WHEEL_FR@]);HUD("WHEEL W %.1f %.1f",out[@WHEEL_RL@],out[@WHEEL_RR@]);
+    HUD("COMP F %.4f %.4f",out[@COMP_FL@],out[@COMP_FR@]);HUD("COMP R %.4f %.4f",out[@COMP_RL@],out[@COMP_RR@]);
+    HUD("SPRING F %.0f %.0f",out[@SPRING_FL@],out[@SPRING_FR@]);HUD("SPRING R %.0f %.0f",out[@SPRING_RL@],out[@SPRING_RR@]);
+    HUD("LAPLACIAN E %.3G J  SUS %.3G W",total_energy,total_residual);
+    HUD("TIRE K %.3G E %.3G J LOSS %.3G W C %.0f",te[0],tire_energy,tire_loss,tire_contacts);
+    HUD("FORCE VECTORS SPRING AND CONTACT LIVE",0);
+#undef HUD
+    y-=.008f;hud_text(count,x,y,s,"TOP 6 ENERGY OR STRAIN SUSPECTS",7);y-=.044f;
+    for(i=0;i<@GRAPH_EDGE_COUNT@;i++){float u=fabsf(edge_strain[i])/fmaxf(graph_edges[i].yield_strain,1e-8f),r=log1pf(fmaxf(0,edge_residual[i]))*.12f,q=fmaxf(u,r);for(k=0;k<6;k++)if(q>score[k]){int j;for(j=5;j>k;j--){score[j]=score[j-1];top[j]=top[j-1];}score[k]=q;top[k]=i;break;}}
+    for(k=0;k<6;k++)if(top[k]>=0){int q=top[k];snprintf(text,sizeof(text),"%d U%.2f E%.3G R%.3G %s",k+1,fabsf(edge_strain[q])/fmaxf(graph_edges[q].yield_strain,1e-8f),edge_energy[q],edge_residual[q],graph_edge_names[q]);hud_text(count,x,y,s,text,score[k]>=1?2:1);y-=.044f;}
+    x=-.96f;y=.94f;hud_text(count,x,y,s,"LIVE PHYSICS PARAMETERS",7);y-=.044f;
+    for(k=0;k<@TUNE_PARAM_COUNT@;k++){snprintf(text,sizeof(text),"%d %s %.4G",k+1,tune_params[k].name,tune_get(&tune_params[k],vehicle_in,contact_in));hud_text(count,x,y,s,text,k==selected?2:7);y-=.044f;}
+    y-=.008f;snprintf(text,sizeof(text),"SELECTED %d",selected+1);hud_text(count,x,y,s,text,2);y-=.044f;
+    hud_text(count,x,y,s,"TAB SELECT  BRACKETS EDIT",7);y-=.044f;
+    snprintf(text,sizeof(text),"CONTACT C %.5f %.5f %.5f %.5f",contact_in[@CONTACT_COMPRESSION@],contact_in[@CONTACT_STRIDE@+@CONTACT_COMPRESSION@],contact_in[2*@CONTACT_STRIDE@+@CONTACT_COMPRESSION@],contact_in[3*@CONTACT_STRIDE@+@CONTACT_COMPRESSION@]);hud_text(count,x,y,s,text,3);y-=.044f;
+    snprintf(text,sizeof(text),"SUPPORT %.0f %.0f %.0f %.0f",contact_in[@CONTACT_SUPPORT@],contact_in[@CONTACT_STRIDE@+@CONTACT_SUPPORT@],contact_in[2*@CONTACT_STRIDE@+@CONTACT_SUPPORT@],contact_in[3*@CONTACT_STRIDE@+@CONTACT_SUPPORT@]);hud_text(count,x,y,s,text,3);
+}
+static float ensemble_terrain_height(int ix,int iz,float base_y){float u=6.2831853f*(float)((ix%8+8)%8)/8.0f,v=6.2831853f*(float)((iz%8+8)%8)/8.0f;return base_y+.075f*sinf(u)+.045f*sinf(2.0f*v+.7f)+.035f*sinf(u+1.5f*v);}
+static void append_ensemble(int *count,const double *fixture_batch,const double *tire_state_batch){
+    int lane,wheel,edge_index,gx,gz;const int carriage_index[4]={@CARRIAGE_FL@,@CARRIAGE_FR@,@CARRIAGE_RL@,@CARRIAGE_RR@};
+    for(lane=0;lane<ENSEMBLE_BATCH_COUNT;lane++){
+        const double *fixture=fixture_batch+lane*FIXTURE_INPUT_COUNT,*lane_state=tire_state_batch+lane*TIRE_STATE_COUNT;
+        float perx=(float)fixture[@TERRAIN_PERIOD_X@],perz=(float)fixture[@TERRAIN_PERIOD_Z@],sx=perx/8.0f,sz=perz/8.0f,phx=(float)fixture[@TERRAIN_PHASE_X@],phz=(float)fixture[@TERRAIN_PHASE_Z@];
+        for(wheel=0;wheel<4;wheel++){
+            const double *wheel_state=lane_state+wheel*TIRE_VERTEX_COUNT*6;float cx=0,cy=0,cz=0,base_y=(float)fixture[carriage_index[wheel]];
+            for(int vertex=0;vertex<TIRE_VERTEX_COUNT;vertex++){cx+=(float)wheel_state[6*vertex];cy+=(float)wheel_state[6*vertex+1];cz+=(float)wheel_state[6*vertex+2];}cx/=TIRE_VERTEX_COUNT;cy/=TIRE_VERTEX_COUNT;cz/=TIRE_VERTEX_COUNT;
+            if(!(isfinite(cx)&&isfinite(cy)&&isfinite(cz))||fabsf(cx)+fabsf(cy)+fabsf(cz)<1e-8f)continue;
+            {int bix=(int)floorf((cx+phx)/sx),biz=(int)floorf((cz+phz)/sz);for(gx=-2;gx<=2;gx++)for(gz=-2;gz<=2;gz++){int ix=bix+gx,iz=biz+gz;float x0=ix*sx-phx,z0=iz*sz-phz,x1=x0+sx,z1=z0+sz,h00=ensemble_terrain_height(ix,iz,base_y),h10=ensemble_terrain_height(ix+1,iz,base_y),h01=ensemble_terrain_height(ix,iz+1,base_y),h11=ensemble_terrain_height(ix+1,iz+1,base_y);line(count,x0,h00,z0,x1,h10,z0,4,0,.1f,.3f,0,0);line(count,x0,h00,z0,x0,h01,z1,4,0,.1f,.3f,0,0);line(count,x1,h11,z1,x1,h10,z0,4,0,.1f,.3f,0,0);line(count,x1,h11,z1,x0,h01,z1,4,0,.1f,.3f,0,0);line(count,x0,h00,z0,x1,h11,z1,4,0,.1f,.3f,0,0);}}
+            for(edge_index=0;edge_index<TIRE_EDGE_COUNT;edge_index++){const TireEdge *e=&tire_edges[edge_index];const double *a=wheel_state+6*e->a,*b=wheel_state+6*e->b;if(isfinite(a[0])&&isfinite(a[1])&&isfinite(a[2])&&isfinite(b[0])&&isfinite(b[1])&&isfinite(b[2])){float st=link_strain((float)a[0],(float)a[1],(float)a[2],(float)b[0],(float)b[1],(float)b[2],e->rest);line(count,(float)a[0],(float)a[1],(float)a[2],(float)b[0],(float)b[1],(float)b[2],3,st,.12f,.35f,0,0);}}
+        }
+    }
+}
+static void geometry(const double *out,const double *vehicle_in,const double *contact_in,const double *fixture,const double *tire_state,int simulate,int selected,int ensemble,const double *fixture_batch,const double *tire_state_batch){
+    int n=0,i;double duty[4]; float px[@GRAPH_NODE_COUNT@],py[@GRAPH_NODE_COUNT@],pz[@GRAPH_NODE_COUNT@];memcpy(duty,view.duty,sizeof(duty));
+    const int comp_index[4]={@COMP_FL@,@COMP_FR@,@COMP_RL@,@COMP_RR@};
+    const int carriage_index[4]={@CARRIAGE_FL@,@CARRIAGE_FR@,@CARRIAGE_RL@,@CARRIAGE_RR@};
+    float compression[4],chassis_y=(float)out[@POS_Y@],tx=(float)out[@POS_X@],tz=(float)out[@POS_Z@];
+    float roll=(float)out[@ROLL@],pitch=(float)out[@PITCH@],yaw=(float)out[@YAW@];
+    float cr=cosf(roll),sr=sinf(roll),cp=cosf(pitch),sp=sinf(pitch),cy=cosf(yaw),sy=sinf(yaw);
+    wheel_bx[0]=cp*cy-sp*sr*sy;wheel_bx[1]=-sp*cy-cp*sr*sy;wheel_bx[2]=cr*sy;wheel_by[0]=sp*cr;wheel_by[1]=cp*cr;wheel_by[2]=sr;wheel_bz[0]=-cp*sy-sp*sr*cy;wheel_bz[1]=sp*sy-cp*sr*cy;wheel_bz[2]=cr*cy;
+    if(!isfinite(chassis_y))chassis_y=.9f;if(!isfinite(tx))tx=0;if(!isfinite(tz))tz=0;last_chassis_x=tx;last_chassis_y=chassis_y;last_chassis_z=tz;
+    for(i=0;i<4;i++){compression[i]=(float)out[comp_index[i]];if(!isfinite(compression[i])||fabsf(compression[i])>1.5f)compression[i]=0;}
+    for(i=0;i<@GRAPH_NODE_COUNT@;i++){
+        float x=graph_nodes[i].x,y=graph_nodes[i].y,z=graph_nodes[i].z;
+        if(graph_nodes[i].moving&&graph_nodes[i].corner>=0)y+=compression[graph_nodes[i].corner];
+        {float x1=cy*x-sy*z,z1=sy*x+cy*z,y1=cr*y-sr*z1,z2=sr*y+cr*z1;px[i]=cp*x1+sp*y1+tx;py[i]=-sp*x1+cp*y1+chassis_y;pz[i]=z2+tz;}
+    }
+    for(i=0;i<@GRAPH_EDGE_COUNT@;i++){
+        const GraphEdge *e=&graph_edges[i];float reveal=reveal_alpha(e->reveal_stage),ax,ay,az,bx,by,bz,st;if(reveal<=0)continue;ax=.5f*(px[e->a]+px[e->b]);ay=.5f*(py[e->a]+py[e->b]);az=.5f*(pz[e->a]+pz[e->b]);bx=ax+reveal*(px[e->a]-ax);by=ay+reveal*(py[e->a]-ay);bz=az+reveal*(pz[e->a]-az);ax=ax+reveal*(px[e->b]-ax);ay=ay+reveal*(py[e->b]-ay);az=az+reveal*(pz[e->b]-az);st=link_strain(px[e->a],py[e->a],pz[e->a],px[e->b],py[e->b],pz[e->b],e->rest);
+        float prior=edge_strain[i],rate=simulate?(st-prior)*(@PHYSICS_HZ@.0f/@STEPS_PER_FRAME@.0f):0,extension=e->rest*st,energy=.5f*e->stiffness*extension*extension,loss=e->damping*(e->rest*rate)*(e->rest*rate),growth=simulate?(energy-edge_energy[i])*(@PHYSICS_HZ@.0f/@STEPS_PER_FRAME@.0f):0,residual=fmaxf(0,growth+loss);
+        edge_strain[i]=st;edge_energy[i]=energy;edge_residual[i]=residual;line(&n,bx,by,bz,ax,ay,az,e->type,st,e->yield_strain,e->fracture_strain,log1pf(energy)*.12f,log1pf(residual)*.12f);
+    }
+    for(i=0;i<4;i++){int wi=wheel_nodes[i];float wheel_reveal=reveal_alpha(6),st=compression[i]*.04f,roller_y=(float)fixture[carriage_index[i]];if(wheel_reveal>0)circle(&n,px[wi],py[wi],pz[wi],wheel_radius*wheel_reveal,3,st);if(wheel_reveal>0&&duty[3]>.0)circle(&n,px[wi],py[wi],pz[wi],(.075f+.025f*(float)duty[3])*wheel_reveal,duty[0]>=.5?5:6,0);if(fixture[@SURFACE_MODE@]<.5){circle(&n,px[wi]-.18f,roller_y,pz[wi],.13f,4,0);circle(&n,px[wi]+.18f,roller_y,pz[wi],.13f,4,0);}else{int gx,gz;float perx=(float)fixture[@TERRAIN_PERIOD_X@],perz=(float)fixture[@TERRAIN_PERIOD_Z@],sx=perx/8.0f,sz=perz/8.0f,phx=(float)fixture[@TERRAIN_PHASE_X@],phz=(float)fixture[@TERRAIN_PHASE_Z@];int bix=(int)floorf((px[wi]+phx)/sx),biz=(int)floorf((pz[wi]+phz)/sz);for(gx=-2;gx<=2;gx++)for(gz=-2;gz<=2;gz++){int ix=bix+gx,iz=biz+gz;float x0=ix*sx-phx,z0=iz*sz-phz,x1=x0+sx,z1=z0+sz;float h00=roller_y+.075f*sinf(6.2831853f*(float)((ix%8+8)%8)/8.0f)+.045f*sinf(12.5663706f*(float)((iz%8+8)%8)/8.0f+.7f)+.035f*sinf(6.2831853f*((float)((ix%8+8)%8)/8.0f+1.5f*(float)((iz%8+8)%8)/8.0f));float h10=roller_y+.075f*sinf(6.2831853f*(float)(((ix+1)%8+8)%8)/8.0f)+.045f*sinf(12.5663706f*(float)((iz%8+8)%8)/8.0f+.7f)+.035f*sinf(6.2831853f*((float)(((ix+1)%8+8)%8)/8.0f+1.5f*(float)((iz%8+8)%8)/8.0f));float h01=roller_y+.075f*sinf(6.2831853f*(float)((ix%8+8)%8)/8.0f)+.045f*sinf(12.5663706f*(float)(((iz+1)%8+8)%8)/8.0f+.7f)+.035f*sinf(6.2831853f*((float)((ix%8+8)%8)/8.0f+1.5f*(float)(((iz+1)%8+8)%8)/8.0f));float h11=roller_y+.075f*sinf(6.2831853f*(float)(((ix+1)%8+8)%8)/8.0f)+.045f*sinf(12.5663706f*(float)(((iz+1)%8+8)%8)/8.0f+.7f)+.035f*sinf(6.2831853f*((float)(((ix+1)%8+8)%8)/8.0f+1.5f*(float)(((iz+1)%8+8)%8)/8.0f));line(&n,x0,h00,z0,x1,h10,z0,4,0,.1f,.3f,0,0);line(&n,x0,h00,z0,x0,h01,z1,4,0,.1f,.3f,0,0);line(&n,x1,h11,z1,x1,h10,z0,4,0,.1f,.3f,0,0);line(&n,x1,h11,z1,x0,h01,z1,4,0,.1f,.3f,0,0);line(&n,x0,h00,z0,x1,h11,z1,4,0,.1f,.3f,0,0);}}line(&n,px[wi],roller_y-.13f,pz[wi],px[wi],-.75f,pz[wi],5,0,.02f,.15f,0,0);if(wheel_reveal>0){const int sf[4]={@SPRING_FL@,@SPRING_FR@,@SPRING_RL@,@SPRING_RR@};const int nf[4]={@NORMAL_FL@,@NORMAL_FR@,@NORMAL_RL@,@NORMAL_RR@};force_arrow(&n,px[wi]-.055f,py[wi],pz[wi],(float)out[sf[i]],5);force_arrow(&n,px[wi]+.055f,roller_y,pz[wi],(float)vehicle_in[nf[i]],3);}}
+    for(i=0;i<4;i++){int edge_index,base=i*TIRE_VERTEX_COUNT*6,wi=wheel_nodes[i];for(edge_index=0;edge_index<TIRE_EDGE_COUNT;edge_index++){const TireEdge *e=&tire_edges[edge_index];const double *a=tire_state+base+6*e->a,*b=tire_state+base+6*e->b;if(isfinite(a[0])&&isfinite(a[1])&&isfinite(a[2])&&isfinite(b[0])&&isfinite(b[1])&&isfinite(b[2])&&(fabs(a[0])+fabs(a[1])+fabs(a[2])+fabs(b[0])+fabs(b[1])+fabs(b[2])>1e-9)){float ax=(float)a[0],ay=(float)a[1],az=(float)a[2],bx=(float)b[0],by=(float)b[1],bz=(float)b[2],st=link_strain(ax,ay,az,bx,by,bz,e->rest);cosmetic_tire_handover(px[wi],py[wi],pz[wi],&ax,&ay,&az);cosmetic_tire_handover(px[wi],py[wi],pz[wi],&bx,&by,&bz);line(&n,ax,ay,az,bx,by,bz,3,st,.12f,.35f,0,0);}}}
+    ensemble_start=n;if(ensemble)append_ensemble(&n,fixture_batch,tire_state_batch);ensemble_count=n-ensemble_start;line_count=n; point_start=n;
+    for(i=0;i<@GRAPH_NODE_COUNT@;i++)if(graph_nodes[i].joint>0&&reveal_alpha(graph_nodes[i].reveal_stage)>0)put(&n,px[i],py[i],pz[i],graph_nodes[i].type,0,.01f,.08f,0,graph_nodes[i].joint,0,0);
+    point_count=n-point_start;
+    hud_start=n;append_hud(&n,out,vehicle_in,contact_in,fixture,simulate,selected,ensemble);hud_count=n-hud_start;
+}
+
+static void load_gl(PFN_SDL_GL_GetProcAddress get){
+#define GLLOAD(dst,type,name) dst=(type)get(name);if(!dst){fprintf(stderr,"missing %s\n",name);exit(5);}
+    GLLOAD(pCreateShader,PFNGLCREATESHADERPROC,"glCreateShader"); GLLOAD(pShaderSource,PFNGLSHADERSOURCEPROC,"glShaderSource");
+    GLLOAD(pCompileShader,PFNGLCOMPILESHADERPROC,"glCompileShader"); GLLOAD(pGetShaderiv,PFNGLGETSHADERIVPROC,"glGetShaderiv");
+    GLLOAD(pGetShaderInfoLog,PFNGLGETSHADERINFOLOGPROC,"glGetShaderInfoLog"); GLLOAD(pCreateProgram,PFNGLCREATEPROGRAMPROC,"glCreateProgram");
+    GLLOAD(pAttachShader,PFNGLATTACHSHADERPROC,"glAttachShader"); GLLOAD(pLinkProgram,PFNGLLINKPROGRAMPROC,"glLinkProgram");
+    GLLOAD(pGetProgramiv,PFNGLGETPROGRAMIVPROC,"glGetProgramiv"); GLLOAD(pGetProgramInfoLog,PFNGLGETPROGRAMINFOLOGPROC,"glGetProgramInfoLog");
+    GLLOAD(pUseProgram,PFNGLUSEPROGRAMPROC,"glUseProgram"); GLLOAD(pGenVertexArrays,PFNGLGENVERTEXARRAYSPROC,"glGenVertexArrays");
+    GLLOAD(pBindVertexArray,PFNGLBINDVERTEXARRAYPROC,"glBindVertexArray"); GLLOAD(pGenBuffers,PFNGLGENBUFFERSPROC,"glGenBuffers");
+    GLLOAD(pBindBuffer,PFNGLBINDBUFFERPROC,"glBindBuffer"); GLLOAD(pBufferData,PFNGLBUFFERDATAPROC,"glBufferData");
+    GLLOAD(pEnableVertexAttribArray,PFNGLENABLEVERTEXATTRIBARRAYPROC,"glEnableVertexAttribArray"); GLLOAD(pVertexAttribPointer,PFNGLVERTEXATTRIBPOINTERPROC,"glVertexAttribPointer");
+    GLLOAD(pGetUniformLocation,PFNGLGETUNIFORMLOCATIONPROC,"glGetUniformLocation"); GLLOAD(pUniform1i,PFNGLUNIFORM1IPROC,"glUniform1i");
+    GLLOAD(pUniform1f,PFNGLUNIFORM1FPROC,"glUniform1f"); GLLOAD(pUniformMatrix4fv,PFNGLUNIFORMMATRIX4FVPROC,"glUniformMatrix4fv");
+#undef GLLOAD
+}
+
+static void seed_ensemble(const double *vehicle_in,const double *vehicle_out,const double *contact_in,const double *fixture_in,double *vehicle_batch,double *output_batch,double *contact_batch,double *fixture_batch){
+    int lane;vehicle_native_graph_batch_reset();
+    for(lane=0;lane<ENSEMBLE_BATCH_COUNT;lane++){
+        double *bv=vehicle_batch+lane*VEHICLE_INPUT_COUNT,*bo=output_batch+lane*VEHICLE_OUTPUT_COUNT,*bc=contact_batch+lane*CONTACT_TOTAL_COUNT,*bf=fixture_batch+lane*FIXTURE_INPUT_COUNT;
+        double q=(double)lane/(double)(ENSEMBLE_BATCH_COUNT-1),scale=.82+.36*q;
+        memcpy(bv,vehicle_in,sizeof(double)*VEHICLE_INPUT_COUNT);memcpy(bo,vehicle_out,sizeof(double)*VEHICLE_OUTPUT_COUNT);memcpy(bc,contact_in,sizeof(double)*CONTACT_TOTAL_COUNT);memcpy(bf,fixture_in,sizeof(double)*FIXTURE_INPUT_COUNT);
+        bf[@SURFACE_MODE@]=1.0;bf[@TERRAIN_PERIOD_X@]=fmax(.5,bf[@TERRAIN_PERIOD_X@]*scale);bf[@TERRAIN_PERIOD_Z@]=fmax(.5,bf[@TERRAIN_PERIOD_Z@]*(1.18-.36*q));
+        bf[@TERRAIN_PHASE_X@]=bf[@TERRAIN_PERIOD_X@]*q;bf[@TERRAIN_PHASE_Z@]=bf[@TERRAIN_PERIOD_Z@]*(double)((lane*3)%ENSEMBLE_BATCH_COUNT)/(double)ENSEMBLE_BATCH_COUNT;
+    }
+}
+
+/* Physics thread: the only caller of the compiled kernels while the viewer
+ * runs live.  It owns `staging` outright, applies queued UI commands at
+ * window boundaries, paces itself to the target physics rate, and publishes
+ * every complete window as one generation-tagged snapshot. */
+static double ensemble_vehicle_in[ENSEMBLE_BATCH_COUNT*VEHICLE_INPUT_COUNT],ensemble_vehicle_out[ENSEMBLE_BATCH_COUNT*VEHICLE_OUTPUT_COUNT];
+static double ensemble_contact_in[ENSEMBLE_BATCH_COUNT*CONTACT_TOTAL_COUNT];
+static DWORD WINAPI physics_thread_main(LPVOID unused){
+    double *vehicle_in=staging.vehicle_in,*vehicle_out=staging.vehicle_out;
+    double *contact_in=staging.contact_in,*fixture_in=staging.fixture_in;
+    double *tire_state=staging.tire_state;
+    double *ensemble_fixture_in=staging.ensemble_fixture_in,*ensemble_tire_state=staging.ensemble_tire_state;
+    double sim_time=0.0; int i,ensemble_initialized=0;
+    LARGE_INTEGER frequency,window_start,window_end,next_deadline;
+    (void)unused;QueryPerformanceFrequency(&frequency);QueryPerformanceCounter(&next_deadline);
+    for(;;){
+        int simulate,beating,ensemble,edit_count;TuneEdit edits[TUNE_EDIT_CAPACITY];
+        AcquireSRWLockExclusive(&command_lock);
+        if(commands.quit){ReleaseSRWLockExclusive(&command_lock);return 0;}
+        simulate=commands.simulate;beating=commands.beating;ensemble=commands.ensemble;
+        edit_count=commands.edit_count;
+        if(edit_count>0)memcpy(edits,commands.edits,sizeof(TuneEdit)*(size_t)edit_count);
+        commands.edit_count=0;
+        ReleaseSRWLockExclusive(&command_lock);
+        for(i=0;i<edit_count;i++){
+            if(edits[i].target==0)vehicle_in[edits[i].index]=edits[i].value;
+            else if(edits[i].target==1){int corner;for(corner=0;corner<4;corner++)contact_in[corner*@CONTACT_STRIDE@+edits[i].index]=edits[i].value;}
+            else fixture_in[edits[i].index]=edits[i].value;
+        }
+        fixture_in[@FIXTURE_MODE@]=beating?1.0:0.0;
+        if(beating){fixture_in[@COMMAND_FL@]=@INITIAL_CARRIAGE_Y@+.055*sin(6.283185307179586*1.7*sim_time);fixture_in[@COMMAND_FR@]=@INITIAL_CARRIAGE_Y@+.045*sin(6.283185307179586*2.1*sim_time+1.1);fixture_in[@COMMAND_RL@]=@INITIAL_CARRIAGE_Y@+.070*sin(6.283185307179586*1.3*sim_time+2.2);fixture_in[@COMMAND_RR@]=@INITIAL_CARRIAGE_Y@+.050*sin(6.283185307179586*2.7*sim_time+3.0);}
+        QueryPerformanceCounter(&window_start);
+        if(simulate)for(i=0;i<@STEPS_PER_FRAME@;i++){vehicle_native_graph_tick_batch(1,vehicle_in,contact_in,fixture_in,vehicle_out);@VEHICLE_FEEDBACK@sim_time+=1.0/@PHYSICS_HZ@;}
+        vehicle_native_graph_batch_tire_state(1,tire_state);
+        if(ensemble){
+            if(!ensemble_initialized){seed_ensemble(vehicle_in,vehicle_out,contact_in,fixture_in,ensemble_vehicle_in,ensemble_vehicle_out,ensemble_contact_in,ensemble_fixture_in);ensemble_initialized=1;}
+            if(simulate)for(i=0;i<@ENSEMBLE_STEPS_PER_FRAME@;i++){vehicle_native_graph_tick_batch(ENSEMBLE_BATCH_COUNT,ensemble_vehicle_in,ensemble_contact_in,ensemble_fixture_in,ensemble_vehicle_out);for(int lane=0;lane<ENSEMBLE_BATCH_COUNT;lane++){double *bvi=ensemble_vehicle_in+lane*VEHICLE_INPUT_COUNT,*bvo=ensemble_vehicle_out+lane*VEHICLE_OUTPUT_COUNT;@VEHICLE_BATCH_FEEDBACK@}}
+            vehicle_native_graph_batch_tire_state(ENSEMBLE_BATCH_COUNT,ensemble_tire_state);
+        }else ensemble_initialized=0;
+        vehicle_native_appendage_duty(staging.duty);
+        vehicle_native_tire_diagnostics(staging.td);
+        vehicle_native_energy_diagnostics(staging.te);
+        QueryPerformanceCounter(&window_end);
+        staging.sim_time=sim_time;
+        staging.physics_wall_ms=1000.0*(double)(window_end.QuadPart-window_start.QuadPart)/(double)frequency.QuadPart;
+        staging.simulate=simulate;staging.ensemble=ensemble;
+        staging.pool_workers=p_pool_workers?p_pool_workers():0;
+        staging.generation++;
+        AcquireSRWLockExclusive(&snapshot_lock);
+        memcpy(&shared_snapshot,&staging,sizeof(shared_snapshot));
+        ReleaseSRWLockExclusive(&snapshot_lock);
+        if(simulate){
+            /* Pace to the target physics rate; if a window overran, run the
+             * next one immediately without accumulating debt. */
+            next_deadline.QuadPart+=frequency.QuadPart/@PHYSICS_HZ@*@STEPS_PER_FRAME@;
+            if(next_deadline.QuadPart<window_end.QuadPart)next_deadline.QuadPart=window_end.QuadPart;
+            else{double wait_ms=1000.0*(double)(next_deadline.QuadPart-window_end.QuadPart)/(double)frequency.QuadPart;if(wait_ms>=1.0)Sleep((DWORD)wait_ms);}
+        }else{Sleep(10);QueryPerformanceCounter(&next_deadline);}
+    }
+}
+
+int main(int argc,char **argv){
+    const char *vs=argc>1?argv[1]:"vehicle_scientific.vert.glsl",*fs=argc>2?argv[2]:"vehicle_scientific.frag.glsl",*sdlpath=argc>3?argv[3]:"SDL2.dll",*telemetry_path=argc>4?argv[4]:NULL;
+    HMODULE lib=LoadLibraryA(sdlpath); void *win,*ctx; uint8_t event[64]; int running=1,auto_tour=0,frame=0,i,selected=0; short old_space=0,old_t=0,old_m=0,old_b=0,old_e=0,old_tab=0,old_left_bracket=0,old_right_bracket=0; float camera_yaw=-2.28f,camera_pitch=.34f,camera_distance=4.2f; GLuint prog,vao,vbo; float proj[16],mv[16],mvp[16];
+    HANDLE physics_thread=NULL;
+    if(!lib){fprintf(stderr,"SDL2 load failed: %s\n",sdlpath);return 2;}
+#define SDLLOAD(var,type,name) type var=(type)GetProcAddress(lib,name);if(!var){fprintf(stderr,"missing %s\n",name);return 3;}
+    SDLLOAD(sdl_init,PFN_SDL_Init,"SDL_Init");SDLLOAD(sdl_quit,PFN_SDL_Quit,"SDL_Quit");SDLLOAD(sdl_attr,PFN_SDL_GL_SetAttribute,"SDL_GL_SetAttribute");
+    SDLLOAD(sdl_window,PFN_SDL_CreateWindow,"SDL_CreateWindow");SDLLOAD(sdl_context,PFN_SDL_GL_CreateContext,"SDL_GL_CreateContext");
+    SDLLOAD(sdl_swap_interval,PFN_SDL_GL_SetSwapInterval,"SDL_GL_SetSwapInterval");SDLLOAD(sdl_swap,PFN_SDL_GL_SwapWindow,"SDL_GL_SwapWindow");
+    SDLLOAD(sdl_poll,PFN_SDL_PollEvent,"SDL_PollEvent");SDLLOAD(sdl_window_flags,PFN_SDL_GetWindowFlags,"SDL_GetWindowFlags");SDLLOAD(sdl_delete_context,PFN_SDL_GL_DeleteContext,"SDL_GL_DeleteContext");
+    SDLLOAD(sdl_destroy_window,PFN_SDL_DestroyWindow,"SDL_DestroyWindow");SDLLOAD(sdl_get,PFN_SDL_GL_GetProcAddress,"SDL_GL_GetProcAddress");SDLLOAD(sdl_error,PFN_SDL_GetError,"SDL_GetError");
+    if(sdl_init(SDL_INIT_VIDEO)){fprintf(stderr,"SDL init: %s\n",sdl_error());return 4;}sdl_attr(SDL_GL_CONTEXT_MAJOR_VERSION,4);sdl_attr(SDL_GL_CONTEXT_MINOR_VERSION,3);sdl_attr(SDL_GL_CONTEXT_PROFILE_MASK,SDL_GL_CONTEXT_PROFILE_CORE);
+    win=sdl_window("Mechanical Creature | M hard rollers / triangle torus | arrows orbit | Space simulate",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,1280,760,SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE);if(!win){fprintf(stderr,"window: %s\n",sdl_error());return 5;}ctx=sdl_context(win);if(!ctx){fprintf(stderr,"context: %s\n",sdl_error());return 6;}sdl_swap_interval(1);load_gl(sdl_get);prog=program(vs,fs);
+    staging.vehicle_out[@POS_Y@]=.9;
+    {HMODULE kernels=GetModuleHandleA("vehicle_game_kernels.dll");if(kernels)p_pool_workers=(PFN_pool_workers)GetProcAddress(kernels,"turing_pool_workers");}
+    memcpy(&shared_snapshot,&staging,sizeof(shared_snapshot));
+    memcpy(&view,&staging,sizeof(view));
+    pGenVertexArrays(1,&vao);pBindVertexArray(vao);pGenBuffers(1,&vbo);pBindBuffer(GL_ARRAY_BUFFER,vbo);pBufferData(GL_ARRAY_BUFFER,sizeof(vertices),NULL,GL_DYNAMIC_DRAW);
+    for(i=0;i<10;i++){int sizes[10]={3,3,1,1,1,1,1,1,1,1};size_t offs[10]={0,12,24,28,32,36,40,44,48,52};pEnableVertexAttribArray((GLuint)i);pVertexAttribPointer((GLuint)i,sizes[i],GL_FLOAT,GL_FALSE,sizeof(Vertex),(const void*)offs[i]);}
+    glEnable(GL_DEPTH_TEST);glEnable(GL_PROGRAM_POINT_SIZE);glLineWidth(2.0f);pUseProgram(prog);perspective(proj,.82f,1280.0f/760.0f,.1f,50.0f);
+    telemetry_open(telemetry_path);
+    if(!telemetry_data){
+        physics_thread=CreateThread(NULL,0,physics_thread_main,NULL,0,NULL);
+        if(!physics_thread){fprintf(stderr,"physics thread failed\n");return 7;}
+    }
+    while(running){short space,tkey,tab,left_bracket,right_bracket;int window_focused;while(sdl_poll(event)){if(*(uint32_t*)event==SDL_QUIT)running=0;}
+        window_focused=(sdl_window_flags(win)&SDL_WINDOW_INPUT_FOCUS)!=0;
+        if(window_focused){
+            if(GetAsyncKeyState(VK_LEFT)&0x8000)camera_yaw-=.018f;if(GetAsyncKeyState(VK_RIGHT)&0x8000)camera_yaw+=.018f;if(GetAsyncKeyState(VK_UP)&0x8000)camera_pitch+=.014f;if(GetAsyncKeyState(VK_DOWN)&0x8000)camera_pitch-=.014f;
+            if(GetAsyncKeyState('W')&0x8000)camera_distance=fmaxf(2.0f,camera_distance-.035f);if(GetAsyncKeyState('S')&0x8000)camera_distance=fminf(12.0f,camera_distance+.035f);camera_pitch=fmaxf(-1.25f,fminf(1.25f,camera_pitch));
+            space=GetAsyncKeyState(VK_SPACE)&0x8000;if(space&&!old_space){AcquireSRWLockExclusive(&command_lock);commands.simulate=!commands.simulate;ReleaseSRWLockExclusive(&command_lock);}old_space=space;
+            tkey=GetAsyncKeyState('T')&0x8000;if(tkey&&!old_t)auto_tour=!auto_tour;old_t=tkey;
+            {short mkey=GetAsyncKeyState('M')&0x8000;if(mkey&&!old_m)tune_enqueue(2,@SURFACE_MODE@,view.fixture_in[@SURFACE_MODE@]<.5?1.0:0.0);old_m=mkey;}
+            {short bkey=GetAsyncKeyState('B')&0x8000;if(bkey&&!old_b){AcquireSRWLockExclusive(&command_lock);commands.beating=!commands.beating;ReleaseSRWLockExclusive(&command_lock);}old_b=bkey;}
+            {short ekey=GetAsyncKeyState('E')&0x8000;if(ekey&&!old_e){AcquireSRWLockExclusive(&command_lock);commands.ensemble=!commands.ensemble;ReleaseSRWLockExclusive(&command_lock);}old_e=ekey;}
+            if(GetAsyncKeyState('R')&0x8000){camera_yaw=-2.28f;camera_pitch=.34f;camera_distance=4.2f;}
+            tab=GetAsyncKeyState(VK_TAB)&0x8000;if(tab&&!old_tab)selected=(selected+1)%@TUNE_PARAM_COUNT@;old_tab=tab;left_bracket=GetAsyncKeyState(VK_OEM_4)&0x8000;right_bracket=GetAsyncKeyState(VK_OEM_6)&0x8000;if(left_bracket&&!old_left_bracket)tune_set(&tune_params[selected],tune_get(&tune_params[selected],view.vehicle_in,view.contact_in)*(GetAsyncKeyState(VK_SHIFT)&0x8000?.80:.95));if(right_bracket&&!old_right_bracket)tune_set(&tune_params[selected],tune_get(&tune_params[selected],view.vehicle_in,view.contact_in)*(GetAsyncKeyState(VK_SHIFT)&0x8000?1.25:1.05));old_left_bracket=left_bracket;old_right_bracket=right_bracket;
+        }else{
+            old_space=old_t=old_m=old_b=old_e=old_tab=old_left_bracket=old_right_bracket=0;
+        }
+        if(auto_tour)camera_yaw+=.004f;
+        if(telemetry_data){telemetry_read(view.vehicle_in,view.vehicle_out,view.contact_in,view.fixture_in,view.tire_state);view.sim_time=telemetry_time;vehicle_native_appendage_duty(view.duty);vehicle_native_tire_diagnostics(view.td);vehicle_native_energy_diagnostics(view.te);}
+        else{AcquireSRWLockShared(&snapshot_lock);memcpy(&view,&shared_snapshot,sizeof(view));ReleaseSRWLockShared(&snapshot_lock);vehicle_native_tire_diagnostics(view.td);}
+        geometry(view.vehicle_out,view.vehicle_in,view.contact_in,view.fixture_in,view.tire_state,view.simulate||telemetry_data!=NULL,selected,view.ensemble,view.ensemble_fixture_in,view.ensemble_tire_state);pBindBuffer(GL_ARRAY_BUFFER,vbo);pBufferData(GL_ARRAY_BUFFER,(GLsizeiptr)((line_count+point_count+hud_count)*sizeof(Vertex)),vertices,GL_DYNAMIC_DRAW);
+        glViewport(0,0,1280,760);glClearColor(.012f,.017f,.026f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);orbit_view(mv,camera_yaw,camera_pitch,camera_distance,last_chassis_x,last_chassis_y+.18f,last_chassis_z);multiply(mvp,proj,mv);
+        pUniformMatrix4fv(pGetUniformLocation(prog,"uMV"),1,GL_FALSE,mv);pUniformMatrix4fv(pGetUniformLocation(prog,"uMVP"),1,GL_FALSE,mvp);pUniform1f(pGetUniformLocation(prog,"uPointSize"),8);pUniform1i(pGetUniformLocation(prog,"uPrimitiveKind"),0);if(ensemble_count>0){glEnable(GL_BLEND);glBlendFunc(GL_ONE,GL_ONE);glDepthMask(GL_FALSE);pUniform1f(pGetUniformLocation(prog,"uAlpha"),1.0f/ENSEMBLE_BATCH_COUNT);glDrawArrays(GL_LINES,ensemble_start,ensemble_count);glDepthMask(GL_TRUE);glDisable(GL_BLEND);}pUniform1f(pGetUniformLocation(prog,"uAlpha"),1.0f);glDrawArrays(GL_LINES,0,ensemble_start);pUniform1i(pGetUniformLocation(prog,"uPrimitiveKind"),1);glDrawArrays(GL_POINTS,point_start,point_count);
+        identity(mv);identity(mvp);pUniformMatrix4fv(pGetUniformLocation(prog,"uMV"),1,GL_FALSE,mv);pUniformMatrix4fv(pGetUniformLocation(prog,"uMVP"),1,GL_FALSE,mvp);pUniform1f(pGetUniformLocation(prog,"uPointSize"),1.65f);pUniform1i(pGetUniformLocation(prog,"uPrimitiveKind"),2);glDisable(GL_DEPTH_TEST);glDrawArrays(GL_POINTS,hud_start,hud_count);glEnable(GL_DEPTH_TEST);sdl_swap(win);frame++;}
+    if(physics_thread){AcquireSRWLockExclusive(&command_lock);commands.quit=1;ReleaseSRWLockExclusive(&command_lock);WaitForSingleObject(physics_thread,5000);CloseHandle(physics_thread);}
+    if(telemetry_data)UnmapViewOfFile(telemetry_data);if(telemetry_mapping)CloseHandle(telemetry_mapping);if(telemetry_file!=INVALID_HANDLE_VALUE)CloseHandle(telemetry_file);
+    sdl_delete_context(ctx);sdl_destroy_window(win);sdl_quit();FreeLibrary(lib);return 0;
+}

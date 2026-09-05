@@ -39,27 +39,72 @@ class Metrics:
     advanced_dt: float | None = None
 
 
+def _scalar(value, default: float = 0.0) -> float:
+    """A Python float from a number or a 0-d tensor, never truncated.
+
+    ``float(tensor)`` on an AbstractTensor falls through ``__index__`` and
+    TRUNCATES (0.51 -> 0.0), which silently zeroed every sub-metre-per-second
+    velocity a tensor-publishing core reported and left the CFL proposal
+    unbounded.  ``.item()`` is the exact conversion.
+    """
+
+    if value is None:
+        return float(default)
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return float(item())
+        except (TypeError, ValueError):
+            pass
+    return float(value)
+
+
 def coerce_metrics(value) -> Metrics:
     """Normalize legacy metric-shaped records into the canonical contract."""
 
-    if isinstance(value, Metrics):
-        return value
     if value is None:
         raise TypeError("simulation advance returned no metrics")
-    return Metrics(
-        max_vel=float(getattr(value, "max_vel", 0.0)),
-        max_flux=float(getattr(value, "max_flux", 0.0)),
-        div_inf=float(getattr(value, "div_inf", 0.0)),
-        mass_err=float(getattr(value, "mass_err", 0.0)),
+    # A core that computes its metrics as 0-d tensors returns a genuine
+    # Metrics whose fields are tensors; every comparison and ``float()`` the
+    # controller then makes would truncate them.  Normalize BOTH shapes of
+    # record to exact Python floats here, once.
+    dt_limit = getattr(value, "dt_limit", None)
+    advanced_dt = getattr(value, "advanced_dt", None)
+    channels = {
+        str(name): _scalar(channel)
+        for name, channel in (getattr(value, "error_channels", {}) or {}).items()
+    }
+    normalized = Metrics(
+        max_vel=_scalar(getattr(value, "max_vel", 0.0)),
+        max_flux=_scalar(getattr(value, "max_flux", 0.0)),
+        div_inf=_scalar(getattr(value, "div_inf", 0.0)),
+        mass_err=_scalar(getattr(value, "mass_err", 0.0)),
         osc_flag=bool(getattr(value, "osc_flag", False)),
         stiff_flag=bool(getattr(value, "stiff_flag", False)),
         sim_frame=int(getattr(value, "sim_frame", 0)),
-        proc_ms=float(getattr(value, "proc_ms", 0.0)),
-        dt_limit=getattr(value, "dt_limit", None),
-        error_channels=dict(getattr(value, "error_channels", {}) or {}),
+        proc_ms=_scalar(getattr(value, "proc_ms", 0.0)),
+        dt_limit=None if dt_limit is None else _scalar(dt_limit),
+        error_channels=channels,
         hard_failure=bool(getattr(value, "hard_failure", False)),
-        advanced_dt=getattr(value, "advanced_dt", None),
+        advanced_dt=None if advanced_dt is None else _scalar(advanced_dt),
     )
+    if isinstance(value, Metrics):
+        # Keep the caller's object identity (diagnostics such as
+        # ``unresolved_report`` are attached to it later) but with exact
+        # scalar fields -- ALL twelve, not a subset.  Leaving any field
+        # untouched here means this branch and the ``normalized`` return
+        # below hand back the same field under two different concrete
+        # types depending on which branch ran (whatever type the caller's
+        # object already had here, vs the cast type below), which is
+        # exactly the aggregate-identity ambiguity a compiled build cannot
+        # unify (see run_superstep's ``last_metrics`` fix, same family).
+        for name in ("max_vel", "max_flux", "div_inf", "mass_err",
+                     "osc_flag", "stiff_flag", "sim_frame", "proc_ms",
+                     "dt_limit", "error_channels", "hard_failure",
+                     "advanced_dt"):
+            setattr(value, name, getattr(normalized, name))
+        return value
+    return normalized
 
 
 class ScalerControl:

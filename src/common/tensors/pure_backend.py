@@ -224,6 +224,8 @@ class PurePythonTensorOperations(AbstractTensor):
         return any(_flatten(self.data)) if dim is None else any(_flatten(row[dim] for row in self.data))
     def max_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
+        if dim is not None and dim < 0:
+            dim += len(_get_shape(data))
         def _max(lst):
             flat = _flatten(lst)
             return max(flat) if flat else 0.0
@@ -254,6 +256,8 @@ class PurePythonTensorOperations(AbstractTensor):
 
     def argmax_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
+        if dim is not None and dim < 0:
+            dim += len(_get_shape(data))
         def _argmax(lst):
             flat = _flatten(lst)
             return flat.index(max(flat)) if flat else 0
@@ -282,15 +286,6 @@ class PurePythonTensorOperations(AbstractTensor):
             return idx
         return reduce_dim(data, dim)
 
-    def unravel_index_(self, shape: Tuple[int, ...]):
-        idx = self.data
-        if isinstance(idx, list):
-            idx = idx[0]
-        coords = []
-        for dim in reversed(shape):
-            coords.append(idx % dim)
-            idx //= dim
-        return tuple(reversed(coords))
     """Educational tensor ops using nested Python lists."""
 
     def __init__(self, track_time: bool = False, tape=None, requires_grad: bool = False):
@@ -448,6 +443,10 @@ class PurePythonTensorOperations(AbstractTensor):
 
     # Creation ops
     def full_(self, size: Tuple[int, ...], fill_value: Any, dtype: Any, device: Any):
+        # ``zeros(8)`` is as valid as ``zeros((8,))`` on every other backend;
+        # accept the scalar spelling here too rather than indexing into an int.
+        if isinstance(size, int):
+            size = (size,)
         if not size:
             return fill_value
         return [self.full_(size[1:], fill_value, dtype, device) for _ in range(size[0])]
@@ -500,29 +499,28 @@ class PurePythonTensorOperations(AbstractTensor):
             return tensor[0]
         return tensor
 
-    def max_(self, tensor: Any) -> Any:
-        flat = _flatten(tensor)
-        return max(flat) if flat else None
-
     def long_cast_(self, tensor: Any) -> Any:
         if isinstance(tensor, list):
             return [self.long_cast_(item) for item in tensor]
         return int(tensor)
 
-    def float_(self, tensor: Any) -> Any:
-        return self.to_dtype_(tensor, "float")
+    # The dtype casts are called receiver-style by abstraction_methods
+    # (``self.long_()``), so the tensor argument defaults to this instance's
+    # own data; an explicit tensor argument still casts that instead.
+    def float_(self, tensor: Any = None) -> Any:
+        return self.to_dtype_(self.data if tensor is None else tensor, "float")
 
-    def double_(self, tensor: Any) -> Any:
-        return self.to_dtype_(tensor, "double")
+    def double_(self, tensor: Any = None) -> Any:
+        return self.to_dtype_(self.data if tensor is None else tensor, "double")
 
-    def int_(self, tensor: Any) -> Any:
-        return self.to_dtype_(tensor, "int")
+    def int_(self, tensor: Any = None) -> Any:
+        return self.to_dtype_(self.data if tensor is None else tensor, "int")
 
-    def long_(self, tensor: Any) -> Any:
-        return self.to_dtype_(tensor, "long")
+    def long_(self, tensor: Any = None) -> Any:
+        return self.to_dtype_(self.data if tensor is None else tensor, "long")
 
-    def bool_(self, tensor: Any) -> Any:
-        return self.to_dtype_(tensor, "bool")
+    def bool_(self, tensor: Any = None) -> Any:
+        return self.to_dtype_(self.data if tensor is None else tensor, "bool")
 
     def not_equal_(self, value: Any) -> Any:
         value = value.data if isinstance(value, AbstractTensor) else value
@@ -1103,6 +1101,8 @@ class PurePythonTensorOperations(AbstractTensor):
 
     def mean_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
+        if dim is not None and dim < 0:
+            dim += len(_get_shape(data))
         def _mean(lst):
             flat = _flatten(lst)
             return sum(flat) / len(flat) if flat else 0.0
@@ -1134,6 +1134,8 @@ class PurePythonTensorOperations(AbstractTensor):
 
     def sum_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
+        if dim is not None and dim < 0:
+            dim += len(_get_shape(data))
         def _sum(lst):
             flat = _flatten(lst)
             return sum(flat)
@@ -1163,6 +1165,8 @@ class PurePythonTensorOperations(AbstractTensor):
         return reduce_dim(data, dim)
     def min_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
+        if dim is not None and dim < 0:
+            dim += len(_get_shape(data))
         def _min(lst):
             flat = _flatten(lst)
             return min(flat) if flat else 0.0
@@ -1427,6 +1431,8 @@ class PurePythonTensorOperations(AbstractTensor):
 
     def argmin_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self._AbstractTensor__unwrap(tensor)
+        if dim is not None and dim < 0:
+            dim += len(_get_shape(data))
         def _argmin(lst):
             flat = _flatten(lst)
             return flat.index(min(flat)) if flat else 0
@@ -1638,12 +1644,27 @@ class PurePythonTensorOperations(AbstractTensor):
     def logical_not_(self):
         return self._map_unary(lambda x: not x, self.data)
 
-    def to_dtype_(self, tensor, dtype: str = "float"):
+    _DTYPE_SPELLINGS = frozenset({
+        "float", "float32", "f32", "float64", "double", "f64",
+        "int", "int32", "i32", "int64", "long", "i64",
+        "uint8", "byte", "bool",
+    })
+
+    def to_dtype_(self, tensor=None, dtype: str = "float"):
+        # Two calling conventions exist in the wild: abstraction_methods call
+        # receiver-style (``self.to_dtype_("float")``), this backend's own
+        # cast methods pass explicit data (``self.to_dtype_(data, "long")``).
+        # A dtype spelling in the tensor slot is the receiver-style call.
+        if isinstance(tensor, str) and tensor in self._DTYPE_SPELLINGS:
+            tensor, dtype = self.data, tensor
+        elif tensor is None:
+            tensor = self.data
         # For pure Python, just convert all elements recursively
         def convert(val):
-            if dtype in ("float", "float32", "f32"):
+            if dtype in ("float", "float32", "f32", "float64", "double", "f64"):
                 return float(val)
-            elif dtype in ("int", "int32", "i32"):
+            elif dtype in ("int", "int32", "i32", "int64", "long", "i64",
+                           "uint8", "byte"):
                 return int(val)
             elif dtype in ("bool",):
                 return bool(val)
@@ -1654,5 +1675,28 @@ class PurePythonTensorOperations(AbstractTensor):
         return convert(tensor)
 
     # _tensor_from_list is provided centrally by AbstractTensor; do not duplicate here.
+
+
+def pure_python_tensor_code_references():
+    """Return canonical tensor operations mapped to their Python source.
+
+    These references are compiler inputs.  They are not runtime callbacks:
+    ``ProcessGraph.build_from_ast`` uses each callable only to retrieve and
+    ingest its AST definition, after which the normal FunctionTable graph and
+    SSA lowering own the implementation.
+    """
+
+    from .operator_catalog import CANONICAL_ABSTRACT_TENSOR_OPERATORS
+
+    references = {}
+    for canonical_op in sorted(CANONICAL_ABSTRACT_TENSOR_OPERATORS):
+        implementation = getattr(
+            PurePythonTensorOperations,
+            f"{canonical_op}_",
+            None,
+        )
+        if callable(implementation):
+            references[str(canonical_op)] = implementation
+    return references
 
 register_backend("pure_python", PurePythonTensorOperations)

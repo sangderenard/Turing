@@ -142,6 +142,25 @@ Gradient/Update Semantics (Phase 2)
 - With `training=False`, updates are disabled while ops like dropout/batchnorm
   honor evaluation behavior.
 
+Reverse Proposal Boundary
+-------------------------
+`retain_uncaptured_outputs(program)` promotes every terminal result in an
+unpruned program to a named output. Apply it before output-reachability pruning;
+removed branches cannot be reconstructed afterward.
+
+`capture_reverse_fused_program(...)` makes every retained output a desired-value
+feed and uses AbstractTensor's canonical backward rules to capture a local VJP.
+Its executable result returns two sets:
+
+- proposed differentiable forward inputs, computed as
+  `current - step_size * gradient`;
+- incidentals: original feed values and backward-saved values that must also be
+  bound for that proposal to hold.
+
+This is a local reconstruction proposal, not an algebraic inverse. Non-injective
+operations can have multiple or no exact preimages, and missing backward rules
+remain explicit capture errors unless the caller opts into missing rules.
+
 Codegen Path (Outline)
 ----------------------
 1. Convert `steps` into a single function in the C backend (or any target).

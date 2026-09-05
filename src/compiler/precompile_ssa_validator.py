@@ -100,6 +100,13 @@ class PrecompileSSAValidationError(ValueError):
 # already-recorded precompile operation corresponds to.  Absence is reported;
 # the validator never invents a Handler or decomposes an operation.
 PRECOMPILE_TO_SSA: dict[str, Handler] = {
+    "getattr": Handler.GetAttr,
+    "Indexed": Handler.Indexed,
+    "IndexedStore": Handler.IndexedStore,
+    # These are representation/view boundaries, not numerical kernels. They
+    # remain explicit Calls carrying tensor_operation for backend policy.
+    "get_tensor": Handler.Call,
+    "tolist": Handler.Call,
     "add": Handler.Add,
     "sub": Handler.Sub,
     "mul": Handler.Mul,
@@ -111,6 +118,15 @@ PRECOMPILE_TO_SSA: dict[str, Handler] = {
     "matmul": Handler.MatMul,
     "neg": Handler.Neg,
     "abs": Handler.Abs,
+    # Shape operations remain canonical tensor calls in SSA. Backends such as
+    # Fortran spell them as native array expressions from the preserved attrs.
+    "reshape": Handler.Call,
+    "view": Handler.Call,
+    "broadcast_to": Handler.Call,
+    "repeat": Handler.Call,
+    "mean": Handler.Call,
+    "random_source": Handler.Call,
+    "zeros_like": Handler.Fill,
     "bitand": Handler.And,
     "bitor": Handler.Or,
     "bitxor": Handler.Xor,
@@ -126,6 +142,13 @@ PRECOMPILE_TO_SSA: dict[str, Handler] = {
     "less_equal": Handler.Le,
     "greater": Handler.Gt,
     "greater_equal": Handler.Ge,
+    # AbstractTensor.tensor(value) is an idempotent schema normalization at
+    # this already-typed SSA boundary.  CastLike preserves the value while
+    # carrying the result dtype selected by the captured metadata.  The same
+    # instruction is the direct repository-SSA spelling of _restore_type's
+    # captured cast_like identity.
+    "tensor": Handler.CastLike,
+    "cast_like": Handler.CastLike,
     "int_trunc": Handler.Trunc,
     "trunc": Handler.Trunc,
     "zext": Handler.ZExt,
@@ -140,6 +163,8 @@ PRECOMPILE_TO_SSA: dict[str, Handler] = {
 def ssa_handler_for_precompile(operation_name: str) -> Handler | None:
     if operation_name == "tensor_from_list":
         return Handler.Const
+    if operation_name == "deepcopy":
+        return Handler.Deepcopy
     if translations_for_operation(operation_name):
         return Handler.Call
     mapped = PRECOMPILE_TO_SSA.get(operation_name)

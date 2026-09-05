@@ -1,0 +1,519 @@
+{
+  "schema": "turing-spectral-dye-trace-v1",
+  "level": "ssa",
+  "emission_count": 4,
+  "target_count": 1,
+  "targets": [
+    {
+      "site": 0,
+      "dye_hue": 0.0,
+      "ssa_values": [
+        5,
+        7,
+        1,
+        9,
+        10,
+        11,
+        13,
+        14
+      ],
+      "field_keys": [
+        "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 1)",
+        "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 7)",
+        "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 9)",
+        "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 10)",
+        "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 13)",
+        "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 5)",
+        "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 9)",
+        "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 11)",
+        "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 14)",
+        "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 1)",
+        "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 10)",
+        "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 7)",
+        "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 5)",
+        "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 11)",
+        "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 13)",
+        "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 14)"
+      ],
+      "authored_names": [
+        "carrier",
+        "energy",
+        "mixed",
+        "phase",
+        "result_0"
+      ],
+      "name_correlations": [
+        {
+          "name": "carrier",
+          "occurrence": 0,
+          "value": 10
+        },
+        {
+          "name": "energy",
+          "occurrence": 0,
+          "value": 11
+        },
+        {
+          "name": "mixed",
+          "occurrence": 0,
+          "value": 5
+        },
+        {
+          "name": "phase",
+          "occurrence": 0,
+          "value": 1
+        },
+        {
+          "name": "result_0",
+          "occurrence": 0,
+          "value": 14
+        }
+      ],
+      "emission_count": 4,
+      "total_duration_ns": 24300,
+      "frequency_hz": 127659.5744680851,
+      "timings": [
+        {
+          "sequence": 0,
+          "at_ns": 0,
+          "duration_ns": 21900,
+          "phase": 0.0
+        },
+        {
+          "sequence": 1,
+          "at_ns": 21900,
+          "duration_ns": 800,
+          "phase": 4.999811286989711
+        },
+        {
+          "sequence": 2,
+          "at_ns": 22700,
+          "duration_ns": 800,
+          "phase": 5.641498297084649
+        },
+        {
+          "sequence": 3,
+          "at_ns": 23500,
+          "duration_ns": 800,
+          "phase": 0.0
+        }
+      ],
+      "dye": [
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 1)",
+          "value": 0.4484415648563672,
+          "staging": 0.0,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.2916666666666667,
+              "saturation": 1.0,
+              "weight": 1.0,
+              "dispersion": 0.0
+            },
+            "baked": {
+              "hue": 0.0,
+              "saturation": 0.0,
+              "weight": 0.0,
+              "dispersion": 0.0
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 7)",
+          "value": 0.8187158223612878,
+          "staging": 0.34722222222222227,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.10416666666666666,
+              "saturation": 0.9119214111605705,
+              "weight": 1.6611679999999998,
+              "dispersion": 0.1666666666666667
+            },
+            "baked": {
+              "hue": 0.0,
+              "saturation": 1.0,
+              "weight": 0.8835999999999999,
+              "dispersion": 0.0
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 9)",
+          "value": 0.4900264076522312,
+          "staging": 0.7800312012480499,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.5416666666666666,
+              "saturation": 0.8524873347147013,
+              "weight": 0.24917519999999996,
+              "dispersion": 0.2721655269759096
+            },
+            "baked": {
+              "hue": 0.375,
+              "saturation": 1.0,
+              "weight": 0.8835999999999999,
+              "dispersion": 0.0
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 10)",
+          "value": 0.9400028180219652,
+          "staging": 0.2535606387570134,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.17192468921653659,
+              "saturation": 0.8510446409652898,
+              "weight": 2.4450979199999994,
+              "dispersion": 0.2746550695084757
+            },
+            "baked": {
+              "hue": 0.0,
+              "saturation": 1.0,
+              "weight": 0.8305839999999999,
+              "dispersion": 0.0
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 13)",
+          "value": 0.7892982254373745,
+          "staging": 0.5474841035860349,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.17192468921653656,
+              "saturation": 0.8510446409652898,
+              "weight": 1.0802442610559997,
+              "dispersion": 0.2746550695084758
+            },
+            "baked": {
+              "hue": 0.05993589103658845,
+              "saturation": 0.9480032127288818,
+              "weight": 1.3069520112,
+              "dispersion": 0.09986111429273731
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 5)",
+          "value": 0.4900264076522312,
+          "staging": 0.7800312012480499,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.5416666666666666,
+              "saturation": 0.8524873347147013,
+              "weight": 0.24917519999999996,
+              "dispersion": 0.2721655269759096
+            },
+            "baked": {
+              "hue": 0.5,
+              "saturation": 1.0,
+              "weight": 0.8835999999999999,
+              "dispersion": 0.0
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 9)",
+          "value": 0.4287355412991579,
+          "staging": 0.0,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.2916666666666667,
+              "saturation": 1.0,
+              "weight": 0.94,
+              "dispersion": 0.0
+            },
+            "baked": {
+              "hue": 0.0,
+              "saturation": 0.0,
+              "weight": 0.0,
+              "dispersion": 0.0
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 11)",
+          "value": 0.4900264076522312,
+          "staging": 0.7800312012480499,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.5416666666666666,
+              "saturation": 0.8524873347147013,
+              "weight": 0.24917519999999996,
+              "dispersion": 0.2721655269759096
+            },
+            "baked": {
+              "hue": 0.25,
+              "saturation": 1.0,
+              "weight": 0.8835999999999999,
+              "dispersion": 0.0
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 14)",
+          "value": 0.4900264076522312,
+          "staging": 0.7800312012480499,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.5416666666666666,
+              "saturation": 0.8524873347147013,
+              "weight": 0.24917519999999996,
+              "dispersion": 0.2721655269759096
+            },
+            "baked": {
+              "hue": 0.7083333333333333,
+              "saturation": 0.9999999856700714,
+              "weight": 0.8835999999999999,
+              "dispersion": 2.809789900726269e-08
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 1)",
+          "value": 0.4484415648563672,
+          "staging": 0.0,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.6666666666666666,
+              "saturation": 1.0,
+              "weight": 1.0,
+              "dispersion": 0.0
+            },
+            "baked": {
+              "hue": 0.0,
+              "saturation": 0.0,
+              "weight": 0.0,
+              "dispersion": 0.0
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 10)",
+          "value": 0.4900264076522312,
+          "staging": 0.7800312012480499,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.5416666666666666,
+              "saturation": 0.8524873347147013,
+              "weight": 0.24917519999999996,
+              "dispersion": 0.2721655269759096
+            },
+            "baked": {
+              "hue": 0.33333333333333326,
+              "saturation": 0.9999999912247468,
+              "weight": 0.8835999999999999,
+              "dispersion": 1.7206378853011898e-08
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 7)",
+          "value": 0.4900264076522312,
+          "staging": 0.7800312012480499,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.5416666666666666,
+              "saturation": 0.8524873347147013,
+              "weight": 0.24917519999999996,
+              "dispersion": 0.2721655269759096
+            },
+            "baked": {
+              "hue": 0.45833333333333326,
+              "saturation": 0.9999999898672103,
+              "weight": 0.8835999999999999,
+              "dispersion": 1.9868214925130207e-08
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 5)",
+          "value": 0.8477025205658429,
+          "staging": 0.3472222222222222,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.10416666666666666,
+              "saturation": 0.9119214111605706,
+              "weight": 1.7671999999999999,
+              "dispersion": 0.16666666666666666
+            },
+            "baked": {
+              "hue": 0.0,
+              "saturation": 1.0,
+              "weight": 0.94,
+              "dispersion": 0.0
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 11)",
+          "value": 0.9095585000689057,
+          "staging": 0.25356063875701335,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.17192468921653656,
+              "saturation": 0.8510446409652898,
+              "weight": 2.2983920447999995,
+              "dispersion": 0.2746550695084758
+            },
+            "baked": {
+              "hue": 0.0,
+              "saturation": 1.0,
+              "weight": 0.7807489599999998,
+              "dispersion": 0.0
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route', 'entry', 13)",
+          "value": 0.4900264076522312,
+          "staging": 0.7800312012480499,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.5416666666666666,
+              "saturation": 0.8524873347147013,
+              "weight": 0.24917519999999996,
+              "dispersion": 0.2721655269759096
+            },
+            "baked": {
+              "hue": 0.125,
+              "saturation": 1.0,
+              "weight": 0.8835999999999999,
+              "dispersion": 0.0
+            }
+          }
+        },
+        {
+          "key": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 14)",
+          "value": 1.0,
+          "staging": 0.43224530220506735,
+          "recurrence": 0.0,
+          "categories": {
+            "dynamic": {
+              "hue": 0.17192468921653659,
+              "saturation": 0.8510446409652898,
+              "weight": 2.095673866448639,
+              "dispersion": 0.2746550695084758
+            },
+            "baked": {
+              "hue": 0.04615101086294371,
+              "saturation": 0.9423490361708045,
+              "weight": 1.5954869017279998,
+              "dispersion": 0.11046573785939612
+            }
+          }
+        }
+      ],
+      "paths": [
+        {
+          "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 7)",
+          "weight": 0.94,
+          "edges": [
+            {
+              "source": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 4)",
+              "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 5)",
+              "role": "data",
+              "weight": 0.94
+            },
+            {
+              "source": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 5)",
+              "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 7)",
+              "role": "data",
+              "weight": 1.6611679999999998
+            }
+          ]
+        },
+        {
+          "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 7)",
+          "weight": 0.94,
+          "edges": [
+            {
+              "source": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 0)",
+              "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 3)",
+              "role": "data",
+              "weight": 0.94
+            },
+            {
+              "source": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 3)",
+              "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 5)",
+              "role": "data",
+              "weight": 1.7671999999999999
+            },
+            {
+              "source": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 5)",
+              "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 7)",
+              "role": "data",
+              "weight": 1.6611679999999998
+            }
+          ]
+        },
+        {
+          "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 7)",
+          "weight": 0.94,
+          "edges": [
+            {
+              "source": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 2)",
+              "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 3)",
+              "role": "data",
+              "weight": 0.94
+            },
+            {
+              "source": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 3)",
+              "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 5)",
+              "role": "data",
+              "weight": 1.7671999999999999
+            },
+            {
+              "source": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 5)",
+              "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 7)",
+              "role": "data",
+              "weight": 1.6611679999999998
+            }
+          ]
+        },
+        {
+          "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 7)",
+          "weight": 0.8835999999999999,
+          "edges": [
+            {
+              "source": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 4)",
+              "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 5)",
+              "role": "data",
+              "weight": 0.94
+            },
+            {
+              "source": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 5)",
+              "target": "('spectral_spectral_route_spectral_route__spectral_route__planned_region_0', 'entry', 7)",
+              "role": "data",
+              "weight": 0.8835999999999999
+            }
+          ]
+        }
+      ],
+      "resolution": "resolved"
+    }
+  ],
+  "target_names": [
+    "energy",
+    "result_0"
+  ],
+  "identity_resolution": "authored name + occurrence -> deterministic SSA value",
+  "unmatched_target_names": [],
+  "unmatched_target_values": []
+}

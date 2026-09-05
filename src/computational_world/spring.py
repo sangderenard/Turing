@@ -120,6 +120,9 @@ def install_bound_spring(
         raise ValueError("BoundSpring activation group counts must match")
 
     state.spring_position = position
+    state.spring_node_count = _tensor([node_count], "int64")
+    state.spring_edge_count = _tensor([edge_count], "int64")
+    state.spring_group_count = _tensor([group_count], "int64")
     state.spring_velocity = AT.zeros_like(position)
     state.spring_edge_index = edge_index
     state.spring_mass = _tensor([1.0] * node_count, "float32")
@@ -147,11 +150,14 @@ def install_bound_spring(
             ((position - center) * (position - center)).sum(dim=1).sqrt().max().item()
         )
     else:
-        center = _tensor([[0.0, 0.0, 0.0]], "float32")
+        center = _tensor([], "float32").reshape((0, 3))
         radius = 0.0
     state.spring_boundary_center = center
     state.spring_boundary_radius = _tensor(
-        [cfg.boundary_radius if cfg.boundary_radius is not None else 2.0 * radius],
+        (
+            [cfg.boundary_radius if cfg.boundary_radius is not None else 2.0 * radius]
+            if node_count else []
+        ),
         "float32",
     )
     state.spring_node_network = _tensor([0] * node_count, "int32")
@@ -236,6 +242,13 @@ def append_bound_spring(
     state.spring_boundary_radius = AT.cat([
         state.spring_boundary_radius, incoming.spring_boundary_radius
     ], dim=0)
+    state.spring_node_count = _tensor(
+        [int(state.spring_position.shape[0])], "int64"
+    )
+    state.spring_edge_count = _tensor(
+        [int(state.spring_edge_index.shape[1])], "int64"
+    )
+    state.spring_group_count = _tensor([groups], "int64")
     state.validate_sparse_shapes()
     return network_id
 
@@ -256,8 +269,9 @@ def _resolved_caps(
 ) -> tuple[float, float, float]:
     """Resolve the same scale-derived safety defaults as legacy BoundSpring."""
 
-    if int(state.spring_base_length.shape[0]):
-        mean_length = float(state.spring_base_length.mean().item())
+    edge_count = int(state.spring_edge_count.item())
+    if edge_count:
+        mean_length = float(state.spring_base_length[:edge_count].mean().item())
     else:
         mean_length = 1.0
     max_displacement = (
@@ -311,13 +325,13 @@ def _forces(
     *,
     rest_length=None,
 ):
-    position = state.spring_position
-    node_count = int(position.shape[0])
-    edge_count = int(state.spring_edge_index.shape[1])
+    node_count = int(state.spring_node_count.item())
+    edge_count = int(state.spring_edge_count.item())
+    position = state.spring_position[:node_count].clone()
     force = AT.zeros_like(position)
     if edge_count:
-        source = state.spring_edge_index[0]
-        target = state.spring_edge_index[1]
+        source = state.spring_edge_index[0, :edge_count].clone()
+        target = state.spring_edge_index[1, :edge_count].clone()
         displacement = position.index_select(0, source) - position.index_select(0, target)
         # Incidence accumulation handles repeated endpoints without backend
         # indexed-assignment semantics. It is the same spring force sum as
@@ -325,18 +339,35 @@ def _forces(
         node_ids = AT.arange(node_count, dtype="int64").reshape((-1, 1))
         source_incidence = (node_ids == source.reshape((1, -1))).astype("float32")
         target_incidence = (node_ids == target.reshape((1, -1))).astype("float32")
-        force = bound_spring_stretch_force(
-            displacement,
-            source_incidence,
-            target_incidence,
-            state.spring_rest_length if rest_length is None else rest_length,
-            cfg.k_stretch,
+        active_rest_length = (
+            state.spring_rest_length[:edge_count].clone()
+            if rest_length is None else rest_length
         )
+        if edge_count == 1:
+            length = (
+                (displacement * displacement).sum(dim=1, keepdim=True).sqrt()
+                + 1.0e-9
+            )
+            direction = displacement / length
+            delta = length.reshape((-1,)) - active_rest_length
+            edge_force = cfg.k_stretch * delta.reshape((-1, 1)) * direction
+            force = (
+                source_incidence[:, :, None] * (-edge_force)[None, :, :]
+                + target_incidence[:, :, None] * edge_force[None, :, :]
+            ).sum(dim=1)
+        else:
+            force = bound_spring_stretch_force(
+                displacement,
+                source_incidence,
+                target_incidence,
+                active_rest_length,
+                cfg.k_stretch,
+            )
     if cfg.c_repulse and node_count:
         displacement = position[:, None, :] - position[None, :, :]
         distance2 = (displacement * displacement).sum(dim=2) + cfg.eps_rep
         off_diagonal = 1.0 - AT.eye(node_count, dtype="float32")
-        network = state.spring_node_network.reshape((-1, 1))
+        network = state.spring_node_network[:node_count].clone().reshape((-1, 1))
         network_rows = AT.broadcast_to(network, (node_count, node_count))
         network_columns = AT.broadcast_to(
             network.T(), (node_count, node_count)
@@ -346,11 +377,11 @@ def _forces(
         force = force + (
             cfg.c_repulse * inverse[:, :, None] * displacement
         ).sum(dim=1)
-    proposed_acceleration = force / state.spring_mass.reshape((-1, 1))
+    proposed_acceleration = force / state.spring_mass[:node_count].clone().reshape((-1, 1))
     _max_force, max_velocity, _max_displacement = _resolved_caps(state, cfg)
     c_abs = cfg.c_frac * max_velocity
     velocity_magnitude = (
-        state.spring_velocity * state.spring_velocity
+        state.spring_velocity[:node_count] * state.spring_velocity[:node_count]
     ).sum(dim=1, keepdim=True).sqrt()
     gamma = 1.0 / (
         1.0 - (velocity_magnitude / max(c_abs, 1.0e-12)) ** 2
@@ -365,13 +396,13 @@ def _causal_limit(
     force,
     acceleration,
 ) -> float:
-    node_count = int(state.spring_position.shape[0])
+    node_count = int(state.spring_node_count.item())
     if not node_count:
         return float("inf")
     force_mag = (force * force).sum(dim=1).sqrt()
     acceleration_mag = (acceleration * acceleration).sum(dim=1).sqrt()
     velocity_mag = (
-        state.spring_velocity * state.spring_velocity
+        state.spring_velocity[:node_count] * state.spring_velocity[:node_count]
     ).sum(dim=1).sqrt()
     limits = []
     max_force, max_velocity, max_displacement = _resolved_caps(state, cfg)
@@ -390,10 +421,11 @@ def advance_bound_spring(
 ) -> tuple[bool, Metrics]:
     """Attempt one spring step without internally changing the admitted dt."""
 
-    node_count = int(state.spring_position.shape[0])
+    node_count = int(state.spring_node_count.item())
+    edge_count = int(state.spring_edge_count.item())
     if not node_count:
         return True, Metrics(0.0, 0.0, 0.0, 0.0, advanced_dt=float(dt))
-    group_count = int(state.spring_edge_level_mask.shape[0])
+    group_count = int(state.spring_group_count.item())
     group = int(state.spring_group_index.item()) % max(group_count, 1)
     cycle_time = float(state.spring_cycle_time.item()) + float(dt)
     crosses_cycle = cycle_time >= parameters.cycle_period - 1.0e-15
@@ -402,23 +434,23 @@ def advance_bound_spring(
         if crosses_cycle and group_count
         else group
     )
-    proposed_rest_length = state.spring_rest_length
+    proposed_rest_length = state.spring_rest_length[:edge_count]
     if group_count:
-        level = state.spring_edge_level_mask[active_group].astype("float32")
-        typ = state.spring_edge_type_mask[active_group].astype("float32")
-        role = state.spring_edge_role_mask[active_group].astype("float32")
+        level = state.spring_edge_level_mask[active_group, :edge_count].astype("float32")
+        typ = state.spring_edge_type_mask[active_group, :edge_count].astype("float32")
+        role = state.spring_edge_role_mask[active_group, :edge_count].astype("float32")
         scale = float(dt) / parameters.nominal_dt
         contraction = (
-            state.spring_base_length * (1.0 - parameters.level_target) * level
-            + state.spring_base_length * (1.0 - parameters.type_target) * typ
-            + state.spring_base_length * (1.0 - parameters.role_target) * role
+            state.spring_base_length[:edge_count] * (1.0 - parameters.level_target) * level
+            + state.spring_base_length[:edge_count] * (1.0 - parameters.type_target) * typ
+            + state.spring_base_length[:edge_count] * (1.0 - parameters.role_target) * role
         ) * scale
-        relaxed = state.spring_rest_length - contraction
+        relaxed = state.spring_rest_length[:edge_count] - contraction
         relax = _scaled_fraction(
             parameters.relax_rate, dt, parameters.nominal_dt
         )
         proposed_rest_length = relaxed + (
-            state.spring_base_length - relaxed
+            state.spring_base_length[:edge_count] - relaxed
         ) * relax
 
     force, acceleration = _forces(
@@ -428,7 +460,7 @@ def advance_bound_spring(
     if float(dt) > ceiling + 1.0e-15:
         return False, Metrics(
             max_vel=float(
-                (state.spring_velocity * state.spring_velocity)
+                (state.spring_velocity[:node_count] * state.spring_velocity[:node_count])
                 .sum(dim=1).sqrt().max().item()
             ),
             max_flux=0.0,
@@ -438,28 +470,28 @@ def advance_bound_spring(
             error_channels={"spring_causal_dt_excess": float(dt) - ceiling},
             advanced_dt=0.0,
         )
-    state.spring_rest_length = proposed_rest_length
+    state.spring_rest_length[:edge_count] = proposed_rest_length
 
     growth = _scaled_fraction(
         parameters.growth_rate, dt, parameters.nominal_dt
     )
     delta_growth = (
-        state.spring_base_length - state.spring_natural_rest_length
+        state.spring_base_length[:edge_count] - state.spring_natural_rest_length[:edge_count]
     )
-    grow_mask = (~state.spring_done_growing) & (delta_growth.abs() > 1.0e-2)
-    state.spring_base_length = state.spring_base_length - (
+    grow_mask = (~state.spring_done_growing[:edge_count]) & (delta_growth.abs() > 1.0e-2)
+    state.spring_base_length[:edge_count] = state.spring_base_length[:edge_count] - (
         delta_growth * growth * grow_mask.astype("float32")
     )
-    state.spring_done_growing = state.spring_done_growing | (
+    state.spring_done_growing[:edge_count] = state.spring_done_growing[:edge_count] | (
         delta_growth.abs() <= 1.0e-2
     )
 
     velocity = (
-        state.spring_velocity + acceleration * float(dt)
+        state.spring_velocity[:node_count] + acceleration * float(dt)
     ) * math.exp(-parameters.damping * float(dt))
-    position = state.spring_position + velocity * float(dt)
+    position = state.spring_position[:node_count] + velocity * float(dt)
 
-    network_index = state.spring_node_network.astype("int64")
+    network_index = state.spring_node_network[:node_count].astype("int64")
     center = state.spring_boundary_center.index_select(0, network_index)
     radial = position - center
     distance = (radial * radial).sum(dim=1, keepdim=True).sqrt()
@@ -474,13 +506,13 @@ def advance_bound_spring(
         slipped = velocity - outward.clamp(min=0.0) * normal
         position = AT.where(escaped, projected, position)
         velocity = AT.where(escaped, slipped, velocity)
-    state.spring_position = position
-    state.spring_velocity = velocity
+    state.spring_position[:node_count] = position
+    state.spring_velocity[:node_count] = velocity
 
     if group_count:
-        level_n = state.spring_node_level_mask[active_group].astype("float32").reshape((-1, 1))
-        type_n = state.spring_node_type_mask[active_group].astype("float32").reshape((-1, 1))
-        role_n = state.spring_node_role_mask[active_group].astype("float32").reshape((-1, 1))
+        level_n = state.spring_node_level_mask[active_group, :node_count].astype("float32").reshape((-1, 1))
+        type_n = state.spring_node_type_mask[active_group, :node_count].astype("float32").reshape((-1, 1))
+        role_n = state.spring_node_role_mask[active_group, :node_count].astype("float32").reshape((-1, 1))
         weight = (
             level_n * parameters.beta_level
             + type_n * parameters.beta_type
@@ -493,20 +525,20 @@ def advance_bound_spring(
             parameters.glow_peak_radius - parameters.glow_floor_radius
         ) * weight
         rise_alpha = AT.where(
-            alpha_target > state.spring_glow_alpha,
+            alpha_target > state.spring_glow_alpha[:node_count],
             _scaled_fraction(parameters.glow_rise, dt, parameters.nominal_dt),
             _scaled_fraction(parameters.glow_decay, dt, parameters.nominal_dt),
         )
         rise_radius = AT.where(
-            radius_target > state.spring_glow_radius,
+            radius_target > state.spring_glow_radius[:node_count],
             _scaled_fraction(parameters.glow_rise, dt, parameters.nominal_dt),
             _scaled_fraction(parameters.glow_decay, dt, parameters.nominal_dt),
         )
-        state.spring_glow_alpha = state.spring_glow_alpha + (
-            alpha_target - state.spring_glow_alpha
+        state.spring_glow_alpha[:node_count] = state.spring_glow_alpha[:node_count] + (
+            alpha_target - state.spring_glow_alpha[:node_count]
         ) * rise_alpha
-        state.spring_glow_radius = state.spring_glow_radius + (
-            radius_target - state.spring_glow_radius
+        state.spring_glow_radius[:node_count] = state.spring_glow_radius[:node_count] + (
+            radius_target - state.spring_glow_radius[:node_count]
         ) * rise_radius
 
     if cycle_time >= parameters.cycle_period - 1.0e-15:

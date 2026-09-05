@@ -17,6 +17,83 @@ class Handler(Enum):
     Add           = "Add"
     Sub           = "Sub"
     Mul           = "Mul"
+    # Fixed-width signed multiplication primitives. ``SMulLow`` returns the
+    # low ``width`` bits; ``SMulOverflow`` reports whether the mathematical
+    # signed product is not the sign extension of those retained bits.  They
+    # keep machine legalization exact without presuming host int128 support.
+    SMulLow       = "SMulLow"
+    SMulOverflow  = "SMulOverflow"
+    SMulHigh      = "SMulHigh"
+    # Exact halves of an unsigned fixed-width product.  Keeping the high half
+    # explicit is required by accumulator-form MUL and avoids assuming that a
+    # destination backend has a native integer twice the operand width.
+    UMulLow       = "UMulLow"
+    UMulHigh      = "UMulHigh"
+    # The AMD64 DIV/IDIV dividend is the concatenated high:low register pair.
+    # The guard is an ordered, may-trap dependency which checks zero divisors
+    # and quotient range before the totalized quotient/remainder projections.
+    WideDivCheck     = "WideDivCheck"
+    WideDivQuotient  = "WideDivQuotient"
+    WideDivRemainder = "WideDivRemainder"
+    # Zero-totalized most-significant-set-bit index. It returns zero for a
+    # zero input so callers can explicitly select their architecture's
+    # undefined/preserved destination behavior without an eager trap.
+    MsbIndex      = "MsbIndex"
+    # Python integer magnitude width. Unlike MsbIndex this is defined for
+    # zero and negative operands: ``(-n).bit_length() == n.bit_length()``.
+    BitLength     = "BitLength"
+    # Interleave the low half of two 128-bit bit patterns at an explicit lane
+    # width. This is a machine-neutral vector permutation, not numeric fusion.
+    VectorUnpackLow = "VectorUnpackLow"
+    # Independent modular addition of fixed-width lanes in a vector bit
+    # pattern. Carries never cross lane boundaries.
+    VectorAddModulo = "VectorAddModulo"
+    VectorSubtractModulo = "VectorSubtractModulo"
+    VectorCompareEqualMask = "VectorCompareEqualMask"
+    VectorShuffle = "VectorShuffle"
+    # IEEE-754 binary64 operations over encoded 64-bit lanes. These do not
+    # consult the host process floating environment.
+    Float64IsNaNBits = "Float64IsNaNBits"
+    Float64IsSignalingNaNBits = "Float64IsSignalingNaNBits"
+    Float64BitsLt = "Float64BitsLt"
+    Float64BitsGt = "Float64BitsGt"
+    Float64BitsEq = "Float64BitsEq"
+    Float32IsNaNBits = "Float32IsNaNBits"
+    Float32IsSignalingNaNBits = "Float32IsSignalingNaNBits"
+    Float32BitsLt = "Float32BitsLt"
+    Float32BitsEq = "Float32BitsEq"
+    # Set MXCSR invalid status when requested; trap when its invalid mask is
+    # clear. The returned value is the post-operation MXCSR state.
+    MXCSRInvalid = "MXCSRInvalid"
+    SInt64ToFloat64Bits = "SInt64ToFloat64Bits"
+    SInt64ToFloat32Bits = "SInt64ToFloat32Bits"
+    MXCSRPrecision = "MXCSRPrecision"
+    # Exact IEEE binary64 addition under the supplied MXCSR rounding/DAZ/FTZ
+    # state, plus its ordered status/trap transition. These operate on encoded
+    # bits and do not consult the compiler host's floating environment.
+    Float64AddBits = "Float64AddBits"
+    MXCSRFloat64Add = "MXCSRFloat64Add"
+    Float64MultiplyBits = "Float64MultiplyBits"
+    MXCSRFloat64Multiply = "MXCSRFloat64Multiply"
+    Float32AddBits = "Float32AddBits"
+    MXCSRFloat32Add = "MXCSRFloat32Add"
+    Float32DivideBits = "Float32DivideBits"
+    MXCSRFloat32Divide = "MXCSRFloat32Divide"
+    Float64DivideBits = "Float64DivideBits"
+    MXCSRFloat64Divide = "MXCSRFloat64Divide"
+    Float64SubtractBits = "Float64SubtractBits"
+    MXCSRFloat64Subtract = "MXCSRFloat64Subtract"
+    Float64ToSInt64TruncBits = "Float64ToSInt64TruncBits"
+    MXCSRFloat64ToSIntInvalid = "MXCSRFloat64ToSIntInvalid"
+    Float64ToSInt32TruncBits = "Float64ToSInt32TruncBits"
+    VectorSInt32ToFloat64Bits = "VectorSInt32ToFloat64Bits"
+    MXCSRVectorSInt32ToFloat64 = "MXCSRVectorSInt32ToFloat64"
+    ByteSwap = "ByteSwap"
+    AtomicCompareExchangeObserved = "AtomicCompareExchangeObserved"
+    AtomicCompareExchangeSuccess = "AtomicCompareExchangeSuccess"
+    AtomicCompareExchangeMemory = "AtomicCompareExchangeMemory"
+    AtomicExchangeAddObserved = "AtomicExchangeAddObserved"
+    AtomicExchangeAddMemory = "AtomicExchangeAddMemory"
     Div           = "Div"
     FloorDiv      = "FloorDiv"
     Mod           = "Mod"
@@ -32,6 +109,7 @@ class Handler(Enum):
     Not           = "Not"
     Shl           = "Shl"
     Shr           = "Shr"
+    AShr          = "AShr"
 
     # Logical
     LAnd          = "LAnd"
@@ -45,15 +123,56 @@ class Handler(Enum):
     Le            = "Le"
     Gt            = "Gt"
     Ge            = "Ge"
+    # Integer comparisons over fixed-width bit patterns.  These are distinct
+    # from the language-level signed/real comparisons above; AMD64 carry and
+    # LLVM icmp unsigned predicates depend on the distinction.
+    ULt           = "ULt"
+    ULe           = "ULe"
+    UGt           = "UGt"
+    UGe           = "UGe"
 
     # Memory & Indexing
     Load          = "Load"
     Store         = "Store"
     Alloca        = "Alloca"
+    Fill          = "Fill"          # span-memory initialisation; zero-fill == calloc
+    # Store one fixed-width scalar ``count`` times starting at an address with
+    # an explicit signed byte stride.  This models string-store instructions
+    # without hiding iteration, direction, or memory state in a host callback.
+    StridedStoreFill = "StridedStoreFill"
+    # Sequential fixed-width copies over versioned memory.  Source and
+    # destination addresses advance by the same explicit signed byte stride;
+    # iteration order is observable when the regions overlap.
+    StridedMemoryCopy = "StridedMemoryCopy"
+    # A source-level deep copy. Not Python object-graph duplication (there is
+    # no Python object graph at this stage) and not a single flat
+    # StridedMemoryCopy either -- a record field that is itself a reference
+    # points at separate storage that a flat byte-range copy would leave
+    # shared between original and copy, exactly the shallow-copy bug a deep
+    # copy exists to avoid. Lowering must walk the value's own record/field
+    # descriptor (storage kind: scalar/span/record/reference/keyed, already
+    # tracked elsewhere in this compiler) and recurse into every
+    # record/reference field's own storage, copying each independently.
+    Deepcopy      = "Deepcopy"
     GetElementPtr = "GetElementPtr"
+    # Structured source operations retained until record/index legalization.
+    # Indexed forms are rewritten to GetElementPtr+Load/Store before target
+    # emission; GetAttr is resolved against record/class descriptors.
+    GetAttr       = "GetAttr"
+    # The storing half of the accessor pair. GetAttr already resolved a named
+    # field against the record/class descriptor; without its counterpart a
+    # field write had no opcode of its own and could only be spelled as a slot
+    # store, which loses the field's name and therefore its meaning.
+    SetAttr       = "SetAttr"
+    Indexed       = "Indexed"
+    IndexedStore  = "IndexedStore"
 
     # Casts & Conversions
     Cast          = "Cast"
+    # Convert the first operand to the schema/dtype represented by the second.
+    # The second edge is compile-time type evidence, not discarded Python
+    # control flow around isinstance/type/constructor calls.
+    CastLike      = "CastLike"
     Trunc         = "Trunc"
     ZExt          = "ZExt"
     SExt          = "SExt"
@@ -66,12 +185,50 @@ class Handler(Enum):
     Phi           = "Phi"
     Br            = "Br"
     CondBr        = "CondBr"
+    # Computed control transfer with an explicit target and complete carried
+    # state. Backends must implement or reject it; it is never converted into
+    # a host-language callback.
+    IndirectBr    = "IndirectBr"
+    # Explicit non-returning architectural trap.  The vector and provenance
+    # are data on the instruction; this is not a host exception or runtime
+    # callback.
+    Trap          = "Trap"
     Ret           = "Ret"
     Call          = "Call"
+    Deploy        = "Deploy"
+    Join          = "Join"
+
+    # Definitions.
+    #
+    # The SSA module already holds classes and functions as tables
+    # (SSAClassDefinition / SSAClassField / SSAClassMethod / SSAClassTable and
+    # the function table). Those are data carried alongside the program, so a
+    # definition could be transported but never *stated* in the instruction
+    # vocabulary itself. These opcodes mirror those objects one for one, so a
+    # complete program -- structure included -- can cross a suite boundary as
+    # operators rather than as an out-of-band attachment.
+    #
+    # Nothing written against AbstractTensor needs them: an author defines a
+    # class with `class`. They exist so a definition survives translation
+    # bit-exactly in both directions, which is what a custom epsilon or any
+    # other authored constant inside a method body depends on.
+    ClassDefine    = "ClassDefine"
+    FieldDefine    = "FieldDefine"
+    MethodDefine   = "MethodDefine"
+    FunctionDefine = "FunctionDefine"
 
     # Misc
     Select        = "Select"
     Const         = "Const"  # literal constants
+    # The language-level absence value.  It is deliberately distinct from
+    # Const: a missing Const payload has historically also meant malformed
+    # IR, and numeric backends must never guess that None means numeric zero.
+    # Object-capable targets may materialize this directly; numeric targets
+    # must first lower an optional to an explicit presence/payload ABI.
+    NoneValue     = "NoneValue"
+    # A fixed-width identity for a program object. Unlike ``ptr`` this is not
+    # a dereferenceable repository address; it may name host-resident state.
+    StaticRef     = "StaticRef"
 
     def __str__(self) -> str:
         return self.value
@@ -96,6 +253,8 @@ sympy_ssa_name_map: Dict[str, Handler] = {
     'imaginaryunit':       Handler.Const,
     'true':                Handler.Const,
     'false':               Handler.Const,
+    'deploy':              Handler.Deploy,
+    'join':                Handler.Join,
 
     # Arithmetic
     'add':                 Handler.Add,
@@ -139,6 +298,17 @@ sympy_ssa_name_map: Dict[str, Handler] = {
     'load':                Handler.Load,
     'store':               Handler.Store,
     'alloca':              Handler.Alloca,
+    # Span-memory initialisation collapses the construction constructors onto a
+    # single Fill operation. Zero-fill (``zeros``/``empty``) is the calloc case.
+    'fill':                Handler.Fill,
+    'zeros':               Handler.Fill,
+    'zeros_like':          Handler.Fill,
+    'ones':                Handler.Fill,
+    'ones_like':           Handler.Fill,
+    'full':                Handler.Fill,
+    'full_like':           Handler.Fill,
+    'empty':               Handler.Fill,
+    'empty_like':          Handler.Fill,
     'getelementptr':       Handler.GetElementPtr,
     'idx':                 Handler.GetElementPtr,
     'indexed':             Handler.Load,
@@ -148,6 +318,7 @@ sympy_ssa_name_map: Dict[str, Handler] = {
 
     # Casts & Conversions
     'cast':                Handler.Cast,
+    'cast_like':           Handler.CastLike,
     'trunc':               Handler.Trunc,
     'zext':                Handler.ZExt,
     'sext':                Handler.SExt,
@@ -213,6 +384,10 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
         'bytes',
         'nameconstant',
         'ellipsis',
+    ),
+    Handler.NoneValue: (
+        'constant:none',
+        'none',
     ),
     Handler.Alloca: (
         'list',
@@ -341,6 +516,7 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
         '__invert__',
     ),
     Handler.Shl: (
+        'shl',
         'lshift',
         'binop:lshift',
         'augassign:lshift',
@@ -350,6 +526,7 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
         '__ilshift__',
     ),
     Handler.Shr: (
+        'shr',
         'rshift',
         'binop:rshift',
         'augassign:rshift',
@@ -435,6 +612,19 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
         'index',
     ),
 
+    # Span-memory initialisation. Tensor construction constructors collapse onto
+    # a single Fill operation whose zero-fill spelling is the calloc case.
+    Handler.Fill: (
+        'call:zeros',
+        'call:zeros_like',
+        'call:ones',
+        'call:ones_like',
+        'call:full',
+        'call:full_like',
+        'call:empty',
+        'call:empty_like',
+    ),
+
     # Type expressions collapse to the existing conversion operators. Generic
     # Python constructors use Cast; explicitly typed IR spellings retain their
     # narrower conversion handler.
@@ -513,11 +703,185 @@ ast_ssa_name_map: Dict[str, Handler] = {
 }
 
 
+# -----------------------------------------------------------------------------
+# C (pycparser ``c_ast``) → the same SSA / BitOps language
+# -----------------------------------------------------------------------------
+#
+# Same equivalence-table contract as ``ast_ssa_equivalents`` above, for the node
+# type names ``C_ROLE_SCHEMAS`` (oop_language_translations.py) registers. Keys
+# are the lowercase spelling of the ``pycparser.c_ast`` class name, with the
+# same ``qualified:piece`` convention for compound nodes.
+#
+# One difference from Python is worth stating rather than leaving to be
+# rediscovered: Python spells its operators as *node classes* (``ast.Add``, so
+# ``binop:add``), while pycparser spells them as *strings* on the parent node
+# (``BinaryOp.op == '+'``, so ``binaryop:+``). Both are just surface spellings
+# converging on one Handler -- which is the entire point of this table, and why
+# C needs no new Handler of its own. Where a C spelling collides with a Python
+# one (``constant``, ``return``, ``if``, ``for``, ``while``, ``break``,
+# ``continue``) it deliberately resolves to the *same* Handler: those are a
+# shared vocabulary both languages genuinely share, not a collision to route
+# around.
+c_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
+    # Values and C literal spellings.
+    Handler.Load: (
+        'id',
+        'structref',
+        # Pointer dereference reads the pointee, the same reading Python's
+        # 'attribute:load' has: a Load.
+        'unaryop:*',
+    ),
+    Handler.Const: (
+        'constant',
+    ),
+    Handler.Alloca: (
+        'decl',
+        'initlist',
+        'struct',
+        'funcdef',
+    ),
+
+    # Arithmetic. C's compound assignments carry the same operator meaning as
+    # Python's AugAssign spellings already registered above.
+    Handler.Add: (
+        'binaryop:+',
+        'assignment:+=',
+    ),
+    Handler.Sub: (
+        'binaryop:-',
+        'assignment:-=',
+    ),
+    Handler.Mul: (
+        'binaryop:*',
+        'assignment:*=',
+    ),
+    Handler.Div: (
+        'binaryop:/',
+        'assignment:/=',
+    ),
+    Handler.Mod: (
+        'binaryop:%',
+        'assignment:%=',
+    ),
+    Handler.Neg: (
+        'unaryop:-',
+    ),
+
+    # Bitwise.
+    Handler.And: (
+        'binaryop:&',
+        'assignment:&=',
+    ),
+    Handler.Or: (
+        'binaryop:|',
+        'assignment:|=',
+    ),
+    Handler.Xor: (
+        'binaryop:^',
+        'assignment:^=',
+    ),
+    Handler.Not: (
+        'unaryop:~',
+    ),
+    Handler.Shl: (
+        'binaryop:<<',
+        'assignment:<<=',
+    ),
+    Handler.Shr: (
+        'binaryop:>>',
+        'assignment:>>=',
+    ),
+
+    # Logical.
+    Handler.LAnd: (
+        'binaryop:&&',
+    ),
+    Handler.LOr: (
+        'binaryop:||',
+    ),
+    Handler.LNot: (
+        'unaryop:!',
+    ),
+
+    # Comparison.
+    Handler.Eq: (
+        'binaryop:==',
+    ),
+    Handler.Ne: (
+        'binaryop:!=',
+    ),
+    Handler.Lt: (
+        'binaryop:<',
+    ),
+    Handler.Le: (
+        'binaryop:<=',
+    ),
+    Handler.Gt: (
+        'binaryop:>',
+    ),
+    Handler.Ge: (
+        'binaryop:>=',
+    ),
+
+    # Storage and addressing.
+    Handler.Store: (
+        'assignment',
+        'assignment:=',
+    ),
+    Handler.GetElementPtr: (
+        'arrayref',
+        # Address-of. C's only way to spell "a reference to this object",
+        # which the cpp shell's method desugaring emits for every receiver
+        # (``obj.m(x)`` -> ``Class_m(&obj, x)``).
+        'unaryop:&',
+    ),
+
+    # Conversions. C's unary plus is a no-op conversion, the same reading
+    # Python's 'uadd' already has above.
+    Handler.Cast: (
+        'cast',
+        'unaryop:+',
+    ),
+
+    # Control and calls.
+    Handler.CondBr: (
+        'if',
+        'switch',
+    ),
+    Handler.Br: (
+        'for',
+        'while',
+        'dowhile',
+        'break',
+        'continue',
+        'goto',
+    ),
+    Handler.Ret: (
+        'return',
+    ),
+    Handler.Call: (
+        'funccall',
+    ),
+    Handler.Select: (
+        'ternaryop',
+    ),
+}
+
+
+c_ssa_name_map: Dict[str, Handler] = {
+    spelling: handler
+    for handler, spellings in c_ssa_equivalents.items()
+    for spelling in spellings
+}
+
+
 # The registry is the language-neutral correlation table. Existing SymPy names
-# remain intact; AST spellings simply join them at the same Handler.
+# remain intact; AST spellings simply join them at the same Handler, and C
+# spellings join both.
 ssa_name_map: Dict[str, Handler] = {
     **sympy_ssa_name_map,
     **ast_ssa_name_map,
+    **c_ssa_name_map,
 }
 
 

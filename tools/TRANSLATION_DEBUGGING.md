@@ -1,0 +1,1537 @@
+# Why isn't this translating? — a decision tree
+
+## Managed multi-result calls: a control value disappears beside a record
+
+Use this branch when the full-native gate reports one undefined scalar or
+predicate after a source-linked call that also returns a record. A typical
+signature is a later `LNot`, `CondBr`, or comparison consuming an id which is
+absent from the linked call's `output_ids`, while record-field projections from
+the same call are present.
+
+Three opt-in receipts expose the boundary without changing the authored
+program:
+
+```powershell
+$env:TURING_DEBUG_STRUCTURAL_OUTPUTS = '1'
+$env:TURING_DEBUG_LINKED_CALLS = '1'
+$env:TURING_DEBUG_AGGREGATE_CALLSITE = '284'
+```
+
+- `TURING_DEBUG_STRUCTURAL_OUTPUTS` prints graph output names, named-output
+  identities, the physical `Ret` ids, and record layouts for every recovered
+  source function.
+- `TURING_DEBUG_LINKED_CALLS` prints source-linked calls and source-output
+  projections at the final full-native gate. Use it first to discover the
+  current callsite id; structural planning can renumber callsites after a
+  compiler change.
+- `TURING_DEBUG_AGGREGATE_CALLSITE` selects one exact callsite and prints its
+  semantic result bindings, expanded record layout, callee outputs, and
+  aggregate attributes immediately before and after output-view legalization.
+
+Read the receipt in this order:
+
+1. `semantic=(scalar, record)` proves the source-call result contract.
+2. `physical=(scalar, expanded fields...)` proves result expansion retained
+   the scalar.
+3. `callee_outputs=(expanded fields...)` with no scalar proves the callee's
+   physical `Ret` was built from the record alone. Do not blame subdivision,
+   scheduling, or a backend emitter.
+4. `DEBUG-AGGREGATE-BEFORE` missing the scalar means the defect precedes
+   aggregate-view legalization. If it is present before and absent after,
+   legalization may prune it only when a concrete projection is rebound and
+   there is no independent direct consumer.
+
+The generic ABI authority is the ordered `semantic_output_ids`, with each
+record identity expanded through `record_return_layouts`. The actual `Ret`,
+caller correlation, C, LLVM, and Fortran must all consume that same ordered
+surface. A record layout must never replace sibling scalar results. Scalar
+results also must not be passed through a tensor-storage alias ledger merely
+because they share a call with record storage.
+
+The validator investigation that added these receipts found exactly this
+sequence: control partition overlap, then a resolved multi-result call, then a
+boolean omitted from the callee `Ret`, and finally aggregate legalization
+correctly exposing the incomplete ABI. The focused regression is
+`test_aggregate_output_view_keeps_independently_consumed_call_result` in
+`tests/test_tensor_ssa_call_metadata.py`.
+
+The executable tree can inspect either its historical symbolic-fluid fixture
+or an already-published repository-SSA unit. The latter is the appropriate
+route when debugging the compiler compiling itself: it does not rebuild a
+proxy program, and it selects functions through their authored-name
+correlation.
+
+An isolated meta-compilation worker can also be inspected before it has
+published SSA:
+
+```powershell
+python tools/diagnose_translation.py --compilation-unit build/compiler-bootstrap-catalogue/lower_control_creep_v1/units/lower_control_program_to_ssa
+```
+
+Stage 0 reads the worker's durable `compile-progress.json`, `failure.json`,
+and `unit.json`. A resource stop remains a resource frontier, a frontend
+exception remains a pre-publication structural frontier, and a published unit
+flows directly into the ordinary repository-SSA checks. This distinction is
+essential for meta-compiling: an absent artifact cannot truthfully be called
+malformed SSA.
+
+For a published partial compiler unit, Stage 0 also reads the exact hashed
+`process-graph-units.json` used to build it and prints the unresolved authored
+dependency closure in leaves-first order. Follow that order before repairing
+the caller: a caller's unresolved calls, unknown boundary types, or conditional
+accounting can be downstream of a dependency that still had to remain source.
+The bounded scheduler uses the same rule operationally. It runs independent
+leaves in parallel, waits for every direct dependency to reach a terminal
+receipt, links only verified dependencies, and preserves partial/failed ones as
+authored-source fallbacks. Thus worker timing cannot decide whether a proven
+dependency is linked into its caller.
+
+Resolved-unit workers also persist their latest internal phase and memory in
+`compile-progress.json`. If the parent enforces a memory/time boundary, that
+last phase is copied into the failure receipt before Stage 0 routes it. A
+subdivision raised while preparing an authored fallback records the fallback's
+actual function reference and qualified name; the child integral is therefore
+attached to its real owner, not to the selected caller that happened to expose
+it. Identical owned boundaries encountered through several callers collapse to
+one deterministic token chain.
+
+For a whole bounded pass, inspect the product rather than opening 58 receipts
+by hand:
+
+```powershell
+python tools/diagnose_translation.py --compilation-product build/compiler-bootstrap-catalogue/lower_control_program_to_ssa_v259
+```
+
+The same inlet accepts a deterministic subdivision product. It reads
+``integrals`` as first-class compiler work rather than silently treating the
+product as empty. ``source-only`` is a safe terminal result, while
+``compiled-unverified`` remains an open semantic/ABI frontier and is never
+reported as clean. Live products also remain open while any worker is running,
+even when their pending queue is empty.
+
+### Meta-compilation branch
+
+Ordinary translation begins at published SSA. Compiler bootstrapping has two
+earlier layers, so route it in this order:
+
+1. Inspect one worker with ``--compilation-unit``. A resource stop during
+   ``deployment-instantiation`` belongs to authored function/SCC activation;
+   divide that shell before asking any SSA question. A stop during
+   ``repository-ssa-lowering`` belongs to the selected numeric integral.
+2. Inspect the bounded pass with ``--compilation-product``. A failed child is
+   a worker/compiler frontier, ``partial`` is an SSA or boundary-contract
+   frontier, ``source-only`` is a safe terminal authored fallback, and
+   ``compiled-unverified`` is still open until exact semantic and ABI probes
+   pass. Running or pending work is never reported as clean.
+3. For a partial resolved unit, follow the printed authored-name dependency
+   repair order leaves-first. For a partial subdivision product, follow the
+   deterministic context-token identities recorded beside unresolved boundary
+   values; local integer slots are correlation aids, not the repair identity.
+4. Install only a verified product. Recursive compilation must be able to
+   recover its authored source rather than descending into the installed
+   binary.
+
+The Stage 0 ``NEXT`` line is the recursion guard for this process. A published
+``subdivision-integrals.json`` means the current boundary can be divided and
+the child plan should run before retrying its parent. A partial subdivision
+product with no deeper plan has reached a semantic boundary instead: another
+blind cut or a larger resource allowance cannot repair it. Fix the reported
+type propagation, identity, control lowering, or storage/ABI semantics in the
+owning authored source, regenerate the parent plan, and retain source fallback
+until exact verification succeeds.
+
+Meta-compilation adds one important discriminator inside that semantic branch:
+a planner region is not automatically a numerical integral.  A region whose
+operation mutates resident structure (for example ``IndexedStore`` into an
+annotated mapping field) must retain the MapIR-declared key/value/record
+contract and lower through the repository sequence-table machinery.  Sending
+it through ordinary numeric ``FusedProgram`` lowering erases its containing
+record ABI and presents anonymous boundary scalars.  The correct repair is to
+propagate the structural contract into the captured region and emit a typed
+resident mutation integral; do not subdivide again, guess dtypes, or run the
+whole blocked function shell once outside its loop.  Such an integral remains
+``compiled-unverified`` until a mutation/ABI equivalence probe passes.
+
+A standalone subdivision directory is itself a compilation product. Inspect
+it with the same decision-tree inlet used for an aggregate catalogue::
+
+    python -m tools.diagnose_translation --compilation-product build/<subdivision-product>
+
+For a resident-table mutation, ``verified`` means the repository-SSA artifact
+and its self-contained sequence helper passed an exact ABI audit plus insert,
+update, and fixed-capacity rejection probes.  It does **not** mean the child is
+already installed into a blocked loop owner.  If the owner has no control
+program, linking only its body would erase iteration semantics; keep authored
+source authoritative and repair or subdivide the control owner first.
+
+Fresh frozen plans also pin a compiler-toolchain fingerprint covering the
+reducer, planner, repository-SSA lowering, backend identity modules, and
+extraction contract. If any of those files changes, compilation refuses the
+stale plan and Stage 0 names the changed files. Legacy plans remain readable,
+but Stage 0 explicitly reports that compiler staleness cannot be ruled out.
+
+The bounded producers for those diagnostic objects are:
+
+```powershell
+python -m tools.compile_project_catalogue --resolved-process-graph <graph.pkl> --process-graph-unit-plan <units.json> --compile-resolved-plan --output <product> --jobs 3 --max-total-gb 12 --max-worker-gb 4
+python -m tools.compile_project_catalogue --subdivision-plan <subdivision-integrals.json> --compile-subdivision-plan --output <children> --jobs 3 --max-total-gb 12 --max-worker-gb 4
+```
+
+These commands are the meta-compilation counterpart to the scorecard: they
+preserve exact inputs, isolate RAM/time, and publish durable phase receipts
+instead of rebuilding a smaller proxy and guessing from its behavior.
+
+The product view reports live/pending/terminal counts, groups hard failures by
+their stable authored error category (without conflating volatile node ids),
+and groups partial publications by their next declared repair action.
+
+```powershell
+python tools/diagnose_translation.py --repository-ssa build/compiler-bootstrap-catalogue/wasm_build_module_native_diagnostic_v249/units/build_module/repository-ssa.pkl --entry build_module --stages 1,2,4
+```
+
+In repository mode, Stage 1 reads the sibling `unit.json` completeness
+receipt when present, Stage 2 checks the selected repository function, and
+Stage 4 reports only the repository function boundary. It deliberately does
+not claim that an internal SSA value is observable from a later backend.
+
+Stage 2 also checks the dominance edge specific to generator-backed sequence
+queries, plus the structural sequence dataflow used heavily by meta-compiling
+compiler functions. A query result can have one globally valid producer and
+therefore pass ordinary dangling/duplicate checks while still being consumed
+before its producer loop executes. Likewise, a resident sequence descriptor
+can be a valid formal while its contents are consumed before their append
+chain runs, or an immutable ``bytes([value])`` view can exist without ever
+materializing that scalar. The diagnostic reports these as distinct failures:
+producer ordering versus missing singleton materialization.
+
+For compiler self-compilation, use the tree twice: first on the published
+repository SSA, then run the product's native equivalence probes. A clean
+Stage 2 proves the structural route is internally coherent; it does **not**
+prove the emitted ABI populated strings, records, or returned bytes correctly.
+Exact authored/native probes with zero fallback remain the semantic gate.
+
+A translation runs Python → ProcessGraph → dual IR → repository SSA →
+backend (Fortran / LLVM / C shell) → runtime buffers. A defect anywhere
+surfaces at the **end**, as a compiler error or a wrong number. The
+expensive mistake — the one that has actually cost days here — is guessing
+which stage owns it and reading code at the wrong altitude.
+
+So don't guess. Answer the questions below in order. Each one is cheap,
+each one either clears a stage or names it, and each one says what it does
+**not** prove.
+
+---
+
+## The rule that matters most
+
+> **A measurement you cannot take is not a zero.**
+
+Every tool here refuses to invent a value it cannot observe. This is not
+fastidiousness: `_read()` used to return `0.0` for any value id absent from
+the artifact's public buffer ABI, internal allocas are absent from it, and
+so probing one returned a zero indistinguishable from a measured zero.
+That fabricated evidence produced a full day of confident, wrong diagnosis.
+
+If a tool says **NOT OBSERVABLE**, you have learned nothing about that
+value. Do not reason from it.
+
+---
+
+## Q0 — Does it compile at all?
+
+| answer | go to |
+|---|---|
+| No — the compiler raises | **Q1** |
+| Yes, but a number is wrong | **Q0b**, then **Q4** |
+| Yes, but it crashes at runtime | **Q3** then **Q4** |
+
+---
+
+## Q0b — Read the program back as Python
+
+Do this **before** Q4 when the compiler is happy and a number is wrong. It is
+cheap, it needs no ids, and it answers a question the other tools cannot:
+*what did the compiler actually build?*
+
+```python
+from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+from src.compiler.ssa_python_materializer import materialize_ir_module, to_source
+
+module, outputs, exports = lower_ast_source_to_ssa(SOURCE, "entry", name="probe")
+emitted, skipped = materialize_ir_module(module)
+print(skipped)          # functions that could NOT be rendered, and why
+print(to_source(emitted))
+```
+
+The emitted module is real Python: readable, runnable, and diffable against
+what you wrote. Run it on the same inputs and compare against the authored
+function directly — that comparison is the only check that catches the defect
+class below, because none of them raises.
+
+Two limits, stated so a clear result is not over-read:
+
+* Only single-block functions and the five-block counted loop are rendered.
+  Anything else appears in `skipped` with a reason. A `skipped` entry is not
+  evidence about correctness, only about coverage.
+* A lowering that RAISES returns no module, so the program you most want to
+  read is the one you cannot. That is the open prerequisite: the lowering
+  needs to hand back its IR alongside its shortfalls.
+
+`python tools/translation_scorecard.py` runs this over a graded corpus and
+prints how far each complexity level gets. Use it to place your program: if a
+level below yours already stops, that is your bug and it is already known.
+
+**To see WHERE two runs part, not just whether:** the instrumented shell
+records every SSA value assignment as it executes, and the emitted local
+names ARE the value ids (`t7` is value 7) — no correlation table.
+
+```python
+from src.compiler.python_shell import compile_python_shell
+
+shell = compile_python_shell(module, "probe__train")
+run = shell.run(w=2.0, n=3)
+run.trace                          # every tN, in order, once per iteration
+run.last_value("probe__train", 7)  # refuses if never assigned — not a zero
+run.first_divergence(other_run)    # the first entry where two runs part
+```
+
+This is the honest version of the source-level probe the "Do not do this"
+section forbids: it records AFTER lowering, so the observed program is
+bit-for-bit the compiled one and observation cannot perturb it. It also hosts
+retained Python callables via `bindings=`, and `shell.write(path)` emits the
+whole thing as a standalone runnable `.py`.
+
+**Static checks over the same product, before running anything:**
+
+```python
+from src.compiler.ssa_self_check import run_all, suspicious_loop_invariant_formals
+
+run_all(module)                            # violations: formal parity,
+                                           # id()-scale ids, disagreeing
+                                           # region output contracts
+suspicious_loop_invariant_formals(module)  # CANDIDATES for the frozen-carried
+                                           # check — not convictions
+```
+
+The candidate list is separate on purpose: a formal consumed inside a loop
+body is either a legitimate loop-invariant input or a carried value the
+planner dropped, and the SSA does not record which the author meant. That gap
+is the thing to fix — stamping the authored carried set into
+`Function.metadata` would make the frozen-carried defect statically decidable.
+
+---
+
+## Q1 — Does the SSA claim to be complete?
+
+```bash
+python tools/diagnose_translation.py --stages 1
+```
+
+* **Shortfalls reported** → the lowering already knows it failed. Read the
+  shortfall text; it names the domain (`ssa-sequence`, `ssa-table`, …) and
+  the location. Nothing downstream is meaningful until it clears. **Stop
+  here.**
+* **Complete** → the SSA believes it is whole. Continue.
+
+Does not prove the SSA is *correct* — only that no pass reported giving up.
+
+### Q1b — A tensor has rank `()` or incompatible reshape/batch shapes
+
+If the shortfall names `gather source has no declared rank` or reports a
+mixture such as `(2, 4, ...)` versus `(8, ...)`, stop before every emitter.
+This is a repository-SSA call-boundary failure, not a missing C, Fortran,
+LLVM, Wasm, or WebGPU operator table entry.
+
+Check the planned region call itself. `feed_ids` names storage/dependency
+identity, but it is not a sufficient tensor descriptor: one caller-owned
+buffer may be viewed through several reshapes. Each ordered call operand must
+retain the matching `feed_shapes`/`feed_dtypes` contract from the callee formal.
+A global `value_id -> first shaped occurrence` lookup is invalid for views.
+Likewise, when `wire_repository_ssa_region_products` replaces provisional
+storage with a projected producer, it must reconstruct the consumer's ordered
+view instead of installing the producer's unrelated shape object.
+
+For the vehicle family, isolate the balloon half before paying for the whole
+vehicle graph:
+
+```bash
+python -c "from src.compiler.vehicle_python_compilation import lower_balloon_tire_python_ssa; x=lower_balloon_tire_python_ssa(batch_size=8); print(x.root_name, len(x.module.functions))"
+```
+
+The batch `8` here is a compilation capacity specialization. A genuinely
+dynamic tensor needs rank plus a runtime `count` bounded by capacity; capacity
+must not be substituted for the semantic shape of every view.
+
+---
+
+## Q2 — Is the SSA well-formed?
+
+```bash
+python tools/diagnose_translation.py --stages 2
+```
+
+Three independent checks:
+
+**2a — Duplicate producers.** Is one id produced by two *different*
+`SSAValue` objects?
+
+> **The distinction that costs hours:** an id that is both a formal
+> argument and an instruction result is **fine** when both are the *same
+> object* — that is deliberate in-place cell reuse, and it is fast. All 14
+> such ids in `symbolic_fluid_advance` are exactly that. A **true**
+> collision is two *distinct* objects sharing one id; then whichever
+> renders last in the backend's id-keyed pointer cache silently wins.
+
+**2b — Phi arity.** Does every phi's incoming-block count match its
+operand count?
+
+**2c — Dangling operands.** Is every operand a formal, or produced, or a
+known constant?
+
+* **Any FAIL** → the defect is at or above `precompile_to_ssa.py`. The
+  backend is faithfully rendering a broken graph; do not read backend code
+  yet. **Go to Q6.**
+* **All clear** → continue.
+
+---
+
+## Q3 — Is in-place fusion safe here?
+
+```bash
+python tools/diagnose_translation.py --stages 3
+```
+
+In-place is **wanted**: an out-param that aliases a feed avoids a copy.
+This check exists to keep it, not to discourage it. It reports fusions as
+expected and flags only the two ways fusion is genuinely unsafe:
+
+* **Two different outputs sharing one pointer** — the second write
+  destroys the first.
+* **A fused formal read *after* being written** inside the callee — the
+  result then depends on instruction order rather than on the program.
+
+* **FAIL** → the *fusion decision* is wrong, not the arithmetic. **Go to
+  Q6.**
+* **Clear** → the fusions are safe. Continue.
+
+---
+
+## Q4 — Can you even see the value you are blaming?
+
+```bash
+python tools/diagnose_translation.py --ids 141,116,47 --stages 4
+```
+
+* **NOT OBSERVABLE** → it is an internal alloca with no public buffer.
+  You cannot read it. Any earlier conclusion drawn from reading it is void.
+  Pick a value that *is* observable and downstream of your suspect, and
+  reason from that instead.
+* **Observable** → readings from it are real evidence. Continue.
+
+In code: `adv.observable(id)` before `adv._read(id)`, or
+`adv._read(id, required=True)` to make the mistake impossible.
+
+---
+
+## Q5 — What actually reaches the wrong value?
+
+```bash
+python tools/diagnose_translation.py --ids 141,117 --stages 5
+```
+
+This runs the **dye trace** (`influence_field.field_from_ssa`, which *is*
+wired to lowered SSA — ~8k transports over the advance function). It
+answers the question static IR reading answers only expensively: *what
+reaches this, from where, and how much survived.*
+
+Read it **comparatively, never absolutely**:
+
+| reading | means |
+|---|---|
+| dominant `dynamic` | genuinely runtime-fed |
+| dominant `baked` | compile-time-constant influence |
+| `recurrent` | arrived through a loop-carried edge — state, not derivation |
+
+> **Calibration warning, learned the hard way:** "dominantly baked" is
+> *not* a defect signal in this program. `dt`/`dx`/`gravity`/limits feed
+> nearly everything, and the known-**correct** `max_wave_speed` reads
+> dominantly baked. An earlier version of this tool flagged it and would
+> have sent you down a blind alley.
+
+What *does* carry signal:
+
+* A value whose profile differs from a **comparable value known to work**.
+  (Pass both ids; the tool diffs them for you.)
+* Two supposedly-**independent** values with *identical* weights — they
+  share an influence path. The tool flags these automatically. Note the
+  built-in caveat it prints: two outputs of the *same* region call are one
+  node in the def-use view, so identical weights there are expected.
+
+---
+
+## Q5b — Watch the value directly (when it isn't observable)
+
+Q4 says an internal value cannot be read. **Watch makes it readable**, without
+touching the program:
+
+```python
+from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
+art = emit_ssa_function_to_llvm(module, name, watch=(116, 47, 136))
+# art.watched            -> ids now in the public buffer ABI
+# art.watch_shortfalls   -> ((id, reason), ...) for any that could not be
+```
+
+A watch appends an output slot and copies a value the program **already
+computed**. It adds no arithmetic, reorders nothing, renames nothing, and
+with `watch=()` the emitted IR is byte-identical. Verified on this program:
+`mass_err`, `max_vel`, `dt_limit`, the final state and the `ok` flag are all
+bit-identical with watches on and off.
+
+This is the sanctioned alternative to the thing you must not do (below).
+A source-level probe shifts value ids; a watch cannot.
+
+**Loop-carried accumulators are watchable**, including the phis. A phi's
+storage is a register that does not dominate the return, so a watch on one
+gets a *shadow slot* in the entry frame, updated wherever the phi executes.
+It therefore reads **the converged value at loop exit** — which is what you
+want from an accumulator.
+
+A watch that cannot be honoured is reported, never dropped. A watch that
+silently vanished would read as "nothing to see here", which is precisely
+the false reassurance this whole mechanism exists to end.
+
+---
+
+## Q5c — Which LAYER owns it? (the routing question)
+
+This is the question that decides where to read code, and getting it wrong
+costs days. Run the SSA itself and see which side it agrees with:
+
+```bash
+python tools/differential_matrix.py          # oracle / ssa / llvm / fortran
+```
+
+```python
+from src.compiler.ssa_reference_evaluator import (
+    SSAReferenceEvaluator, bind_program_abi_arguments,
+)
+arguments, unbound = bind_program_abi_arguments(
+    function, record=state,
+    named={"dt": 0.2, "height_count": 4, "width_count": 4},
+    functions=module.functions,      # needed to find parameters BY NAME
+)
+SSAReferenceEvaluator(module).run(name, arguments)
+```
+
+| result | means |
+|---|---|
+| ssa == oracle, backend differs | **emission** changed the meaning |
+| ssa == backend, oracle differs | **lowering/planning** changed it |
+| all three differ | the evaluator is not calibrated for this shape — fix that first |
+| ssa == oracle == backend | the defect is in something none of them observes |
+
+Worked example, and the reason this step exists: the fluid traversal read
+`ssa vs oracle = 0.0` and `llvm vs oracle = 6.66e-03`, which put the
+defect in LLVM **emission** — after days of searching the planner and the
+AST/SymPy inlet on the assumption it was upstream.
+
+**The evaluator is only usable while its calibration passes.**
+`tests/test_ssa_reference_evaluator.py` calibrates it on a pure function,
+on a synthetic traversal with hand-computable truth, and on the real
+traversal against the authored oracle. If those fail, no routing claim
+from it means anything, and the tests say so in their failure messages.
+
+---
+
+## Q5d — Emission owns it. Which INSTRUCTION?
+
+Once Q5c says emission, narrow inside it. Do these in order; each one
+throws away a layer, and the later steps are worthless without the
+earlier ones.
+
+```bash
+python tools/bisect_emission.py            # first divergence, program order
+```
+
+**1. Get a series, not an endpoint.** Both sides record per-iteration
+rings, and they deliberately record the same thing so they are
+comparable:
+
+```python
+artifact = emit_ssa_function_to_llvm(module, name, watch=ids, history=24)
+ring, count = history_ids(value_id)     # read execution.buffers[ring]
+
+evaluator = SSAReferenceEvaluator(module, history=ids)
+evaluator.run(name, arguments)          # evaluator.history[value_id]
+```
+
+A final value proves an accumulator ended wrong; only the series says
+which iteration spoiled it. `bisect_emission.py` orders by static block
+order, so for a loop-carried phi it names the accumulator rather than the
+cause — the series is what resolves that. **Check the cadences match**
+(some value both sides agree on, ringed at the same length) before
+trusting any disagreement between them.
+
+**2. Find the boundary where inputs agree and outputs do not.** Ring a
+call's arguments and its results. Arguments agreeing per-iteration while
+results disagree localises the defect inside that callee and rules out
+everything upstream of it.
+
+**3. Read the pattern of WHICH outputs are wrong.** In the case above the
+wrong ones were exactly the time-integrated quantities and every pure
+diagnostic was right. That shape pointed at arithmetic and away from the
+neighbour gathering, before any code was read.
+
+**4. Reproduce it standalone.** Feed the callee its exact inputs on fresh
+buffers, outside the loop:
+
+```python
+execution = prepare_artifact_execution(native, {formal_id: value})
+```
+
+If it still diverges, the loop, the gathering and in-place aliasing are
+all excluded at once. If it does NOT, the defect is in the surroundings
+and step 5 would have chased a ghost.
+
+**5. Fingerprint a pure reproducer.** Perturb each input, compare
+sensitivities on both sides. Inputs the artifact ignores, or a
+coefficient equal to the SUM of several the SSA has separately, say the
+operands are collapsing.
+
+**6. Count opcodes before believing an instruction was dropped.** Compare
+the SSA's operation census against the emitted body's, and count EVERY
+spelling — `mul` as well as `fmul`, `icmp`/`select` as well as `maxnum`.
+A shortfall that reconciles exactly once the other spellings are counted
+means nothing was lost; it means something is being emitted in the wrong
+domain, which is a different and much quieter bug.
+
+Two limits worth knowing before they mislead you:
+
+* `watch=` reaches the ROOT function's frame only. A region-local id is a
+  different numbering space and is reported, not silently dropped.
+* the single-block emission path publishes its own value set, and a
+  Ret-less region as root publishes nothing — so a region cannot be
+  bisected by making it the root. Reach it through the smallest caller
+  that has a `Ret`.
+
+---
+
+## Q5e — The whole-program native executable runs but a buffer is wrong
+
+Everything above assumes one function, reached through `watch=`/LLVM. A
+standalone Fortran/C-shell executable is a different shape of problem:
+dozens of `bind(C)` subroutines calling each other by POSITION, each
+level with its own local id numbering, and the question is no longer
+"what is this SSA value" but **"does this specific C-visible buffer ever
+get written, anywhere in the call graph reachable from here"**.
+
+Reading that by eye does not scale — a real case here required following
+one buffer through five nested `call` statements across hundreds of
+positional arguments each. `tools/trace_fortran_alias.py` does it
+mechanically:
+
+```bash
+python tools/trace_fortran_alias.py path/to/generated.f90 \
+    --entry the_bind_c_entry_name --source state.height
+```
+
+Given an entry point and a dotted source name from the `.api.yaml`
+contract beside the `.f90`, it finds the entry's own formal for that
+source, then for every `call` statement in the entry's body checks
+whether the SAME actual token is among the arguments; if so it resolves
+the CALLEE's formal at that position (by index, not by name — two
+functions' local numbering never has to agree), reports that formal's
+declared Fortran `intent` and whether the callee's own body writes an
+array element into it, and recurses. The output is the whole chain in
+one table: subroutine, formal, intent, write-or-not, at every hop.
+
+**What it is good for:** proving a buffer is never written anywhere
+reachable (a `no local write` at every hop, all the way down, is a real
+finding — not a "not observable"), and finding exactly which hop a write
+happens at when one exists.
+
+**What it does NOT do, and do not read it as if it did:** it follows one
+TOKEN. A value can arrive at a callee under MULTIPLE different formal
+names (five spatial neighbour views of `state.height` is a real example
+in this tree — `t54, t56, t58, t60, t45, t52, t122, t23, t27` are all
+"state.height" at one function, and the tracer only follows whichever one
+the caller happened to forward under the traced token). A clean trace of
+one token is not a clean trace of the value's every occurrence.
+
+> **Always verify against the api contract, never against hand-parsed
+> Fortran text.** A prior pass in this exact investigation counted 367
+> formals on a subroutine by splitting a declaration line on commas with
+> `line[line.index('('):line.rindex(')')]` — `rindex(')')` found the
+> LAST `)` on the line, which sits inside the trailing
+> `bind(C, name="...")` clause, so the split captured two fragments of
+> that string as if they were extra formal names. The real count,
+> read from the `.api.yaml` contract (which is generated data, not
+> re-derived by eye), was 366 — matching the call site exactly. The
+> wrong count was recorded as a finding and had to be corrected later.
+> `trace_fortran_alias.py` reads the contract for source-name resolution
+> and a real regex-based parser for the rest, specifically so this
+> mistake cannot recur.
+
+---
+
+## Q6 — Which layer disagrees with which?
+
+```bash
+python tools/correlate_compile.py 141,116,47
+```
+
+One fresh compile, then per id, side by side:
+
+* the repository SSA in the **advance function** (producer and consumers),
+* the repository SSA in **every planned region** that touches it,
+* every **LLVM IR** line mentioning its register,
+* the **runtime value**, or an explicit `NOT OBSERVABLE`.
+
+This is the tool for *"the SSA says X but the IR says Y"*. Use it when a
+stage above named a suspect and you need to see where the layers stop
+agreeing.
+
+---
+
+## Id selection — every tool, same syntax
+
+```bash
+--ids 141                     # one
+--ids 141,47                  # a list
+--ids 141 47                  # spaces work too
+--ids 100-120                 # inclusive range
+--ids 100-120,141,187..193    # mixed; a..b is the same as a-b
+```
+
+`tools/correlate_compile.py` takes the same forms positionally:
+
+```bash
+python tools/correlate_compile.py 100-120,141
+```
+
+Ranges are capped at 4096 ids per token, and an unreadable token is a hard
+error rather than a silent skip — a typo that quietly narrows your search
+is worse than one that stops you.
+
+Stages are selectable the same way:
+
+```bash
+python tools/diagnose_translation.py --stages 2,3
+python tools/diagnose_translation.py --stages 1-3 --ids 141
+```
+
+---
+
+## Finding the id to ask about
+
+```python
+fn.metadata["value_names"]        # (name, id) for authored locals
+fn.metadata["carried_port_values"]  # loop-carried port -> phi
+adv.artifact.buffer_order         # exactly what is observable
+```
+
+A value's *authored name* is the honest starting point: `value_names` maps
+`mass_error`, `max_wave_speed`, `next_mass` to their ids in the advance
+function's own numbering. Region-local ids are a **different numbering
+space** — an id that means one thing in `advance` means something
+unrelated inside `planned_region_0`. `correlate_compile.py` shows both, and
+labels which is which, precisely because conflating them is easy.
+
+---
+
+## Silent miscompilations already paid for
+
+These compile with **no shortfall**, run, and return the wrong number. No
+stage of the compiler reports anything. Each one has a signature you can check
+directly rather than rediscovering it; all three were found by Q0b.
+
+**Only the first loop-carried value is carried — FIXED, signature kept.** A
+loop carrying two names froze the second at its ENTRY value for every
+iteration. Root cause: the reducer's lexical environment materializes
+parameters lazily at first read, so a parameter first touched INSIDE the loop
+was absent from the pre-loop snapshot and could never be discovered as
+carried state. `topological_reducer` now materializes every parameter the
+loop reads before the snapshot.
+
+*Signature (if it recurs):* compute what the program WOULD return with the
+suspect value held constant, and compare. A bit-exact match convicts it. The
+chain to check, in order: `loop_carried_bindings` on the graph's loop node
+(the reducer's discovery), `loop.carried_aliases` reaching
+`_ControlSSABuilder.lower_loop` (the plan), the carried phis in the emitted
+header (the SSA). The stage whose count first disagrees with the source owns
+it — in the original defect the reducer's own discovery was already short.
+
+**A value can be both a formal and a region output.** A one-parameter source
+compiles to a two-parameter function whose extra formal is also an output of a
+planned region, consumed by a call scheduled BEFORE the one producing it. The
+use-before-def is invisible precisely because the value is also a formal, so
+it is never unbound.
+
+*Signature:* the emitted function has more parameters than the source, and the
+extra one is unnamed. Compare `len(function.args)` against
+`metadata["parameter_names"]`.
+
+**A loop body that only forwards a call result is elided entirely — FIXED.**
+The body emitted nothing but `Br`, so the carried update had no producer and
+the lowering raised `loop_carried`. The structural repair: the control
+program gained a CALL STATEMENT (`__plan_callsite_N__`), scheduled by
+`_schedule_loop_callsites` for a loop-enclosed callsite whose result is the
+loop's carried update; the builder lowers it at the plan's position and frame
+linking fills callee and bindings in place. `w = update(w)` — the natural
+spelling of a training step — compiles and computes correctly.
+
+*The rule behind it:* loop-body emission is REGION-DRIVEN. Scheduled regions
+are seeded from numeric operations only; an authored-function call is not a
+numeric op -- it is a linked call, and linked calls are emitted only as
+dependencies OF a region (their result feeding a region's inputs). A body
+whose only statement forwards a call result contains no numeric op, so no
+region forms, so nothing anchors the linked call, so the body is empty. There
+is no rule against calls in loop bodies; there is no rule FOR them either --
+they only ride along behind arithmetic.
+
+*Signature:* `next_w = update(w)` where `w` is the carried value. A call on
+some OTHER value is fine; it is the round trip that fails. See
+`tests/test_loop_carried_producers.py`.
+
+**The anchored-call binding — FIXED, and it named the design.** When
+arithmetic IS present (`stepped = update(w); next_w = stepped * 1.0`), the
+linked call binds its argument to the carried UPDATED id — the slot this
+iteration has not written yet. That turned out to be the aliased-IO design,
+not a mistake: one slot per carried value, read at the top of an iteration,
+written before the latch, no copies inside the loop. It was correct on every
+iteration except the FIRST, where nothing had written the slot; the
+materializer's dependency-order check refused it ("value %tN is used before
+it is produced"), and a native backend would read garbage.
+
+The regulation: `lower_loop` now seeds every carried slot from its initial
+value in the PREHEADER (a `Cast` onto the same reserved SSAValue object —
+in-place reuse of one slot, stage-2a-clean), and the loop_carried
+no-producer check tightened to count producers in the BODY's blocks only, so
+the seed cannot stand in for a producer and mask a genuinely empty body.
+A shell trace now shows the seed as the slot's first entry.
+
+**A helper exists in repository SSA but its PlanCall marker survives — FIXED,
+signature kept.**  The backend reported an unknown
+`__plan_callsite_N__` symbol even though the named specialized helper and its
+planned regions were present and typed.  The linker had resolved every frame
+operand; it refused only the result because the callee's `Ret` had 50 authored
+positions (38 unique values) while the caller selected 20.  The old aggregate
+contract accepted one output or the entire return record, never an exact
+subset.
+
+*Signature:* audit unresolved call records before reading any backend table.
+If `unresolved_frame_value_ids` is empty and the sole eligibility reason is
+`unmaterialized_result`, compare the callee `Ret` identities with
+`record.result_bindings`.  An exact subset is a partial aggregate ABI, not an
+unknown helper.  The linked call now records all four correlations:
+`output_ids` (caller identities), `callee_output_ids` (callee identities),
+`output_positions` (authored `Ret` positions), and `output_slots` (deduplicated
+native output slots).  C, LLVM, and Fortran must consume that shared record;
+an emitter must not rediscover it positionally.
+
+**A synthetic aggregate container reused a real tensor id — FIXED, signature
+kept.**  After the marker was linked, C reported a cascade of “has no address”
+operands.  The first missing value was a real tensor used before the helper
+call, but the later helper call also had that integer as its aggregate result.
+The “fresh” counter had considered arguments and instruction results only;
+the tensor existed at that moment only as an operand-owned frame value.
+
+*Signature:* start with the first missing address, not the whole cascade.  For
+that id print every producer and consumer in the caller, including object
+identity.  A later synthetic `Call.res` sharing the number with an earlier
+operand is an allocator defect, not scheduling.  Linker allocation now reserves
+caller arguments, results, operands, graph-node ids, and every pending call
+binding before minting containers or projections.
+
+**A semantic PlanCall result leaked into the public frame — FIXED, signature
+kept.**  Values such as `%467` and `%718` appeared as unnamed root arguments,
+then fed planned regions that dereferenced them as pointer tables.  The linker
+had created the real native aggregate but had not replaced consumers already
+holding the semantic callsite placeholder.
+
+*Signature:* collect `plan_callsite_id` from linked aggregate calls and
+intersect it with `function.args`.  If an intersecting argument is used as an
+aggregate feed, the linker must substitute the exact placeholder object with
+the real call result and remove only that object from the frame.  Never replace
+all numerically equal ids: caller, callee, and region numbering domains can
+legitimately reuse integers.
+
+**An ordered view survived replacement of its semantic container — FIXED,
+signature kept.**  Region-call arguments are intentionally distinct
+`SSAValue` objects so one storage identity may carry the exact shape required
+at each call position.  Object-only PlanCall substitution removed the original
+placeholder formal but left its marked view undefined; C then reported the
+view followed by every downstream output as “has no address.”
+
+*Signature:* if the first missing operand is neither a formal nor an
+instruction result, inspect its accounting before touching scheduling or a
+backend allocation table.  `ssa_storage_alias=<old callsite>` means the linker
+must clone that ordered view onto the fresh physical result id, preserving its
+dtype, shape, device, and region position.  Unmarked same-number operands must
+remain untouched.  Full-native closure now audits undefined operands directly,
+so this class fails at the linker gate rather than in C, LLVM, or Fortran.
+
+**The fresh SSA counter was seeded by structural ProcessGraph identities —
+FIXED, signature kept.**  A linked aggregate result appeared as a changing
+trillion-scale value on each run.  `ProcessGraph.nodes` contains both monotonic
+value ids and structural/domain nodes keyed by Python object identity; frame
+receipts also contain integer literals.  Neither is automatically an SSA id.
+
+*Signature:* run `ssa_self_check.check_id_scale` before backend emission.  A
+changing id above its threshold is allocator-domain poisoning, not a large
+program.  Fresh allocation reserves actual SSA arguments/results/operands,
+small graph value ids, callsite/result bindings, and only frame kinds
+`caller_value`, `caller_alias`, and `caller_storage`.  Literal/default payloads
+and id()-scale structural nodes do not constrain the counter.
+
+**An ordered view did not make its aggregate escape whole — FIXED, signature
+kept.**  C used object identity to decide whether to materialize a call result
+as a native pointer table.  After correct linker rebinding, the consumer was a
+distinct ordered-view object over the same fresh storage, so C skipped the
+table and produced an address cascade.  The shared aggregate ABI now recognizes
+only the exact result object or an explicit `ssa_storage_alias` view.  C and
+LLVM consume that predicate; numeric equality alone is not evidence because
+numbering domains may collide.
+
+**PointerArray is a backend coverage question, not a Python fallback.**  Stack
+and concatenate lower to a repository `PointerArray` whose slots are tensor
+addresses.  C and LLVM materialize a native pointer table; LLVM also refuses a
+callee pointer-table formal unless its caller actually built such a table.
+Fortran must either register the equivalent interoperable table contract or
+lower the stack/cat kernel directly.  Do not declare an ordinary tensor buffer
+to be a table merely to silence the check.
+
+For the canonical balloon tire, the product entry is
+`vehicle_python_compilation.lower_balloon_tire_python_ssa`; native C and LLVM
+emitters consume that same non-fused module.  `compile_balloon_tire_python_aot`
+is retained only as the historical dual-IR compatibility adapter and is not
+the native vehicle emission route.
+
+---
+
+## A worked hunt, end to end: the fluid ok-flag
+
+Kept here because it exercised nearly every tool in this document in one
+sitting and added two signatures. The symptom: the whole-program dt-system
+test rejected every attempt at every dt. The route, each hop a measurement:
+
+1. **Attempt log first.** Same rejection reason at every dt, healthy
+   metrics (`mass_err` 1e-16, channels 0.0). A dt-independent rejection is
+   not stiffness -- physics responds to subdivision, plumbing does not.
+   This one observation separated "controller/physics problem" from
+   "compiler problem" before any IR was read.
+2. **Route with the evaluator (Q5c).** The reference evaluator reproduced
+   `ok=False` on the same SSA: two independent executors agreeing means
+   LOWERING owns it, not emission. One command, whole layers eliminated.
+3. **Split the value, not the theory.** `result.values` showed the failing
+   conjunct compared `0.728 == 0.0`. The magnitude itself testified: 0.728
+   is not a violation, it is a tracer FIELD value. Read the number as
+   evidence about which value arrived, not only whether it is right.
+4. **Exonerate layers one hop at a time.** Step's return record: clean.
+   Accumulator region (materialized to Python): correct. Call-site pairing,
+   all 28 positions: correct. Unpack loads audited against every
+   aggregate's contract: zero miswired. Every "obviously it's X" theory
+   died against a measurement before the next hop was taken. Never let two
+   theories stack -- each unverified theory in the chain multiplies the
+   ways the conclusion can be wrong.
+5. **Capture and replay at the oracle.** Instrument the callsite, capture
+   the offending cell's ACTUAL inputs, replay the callee in isolation, ask
+   SymPy. Verdict: the arithmetic was CORRECT for the inputs received --
+   the step had been handed `tracer_diffusivity = 1.0` instead of the
+   state's `1.0e-4`. The compiler's math was innocent; its plumbing had
+   swapped an input. Without this step the hunt would have "fixed" a
+   correct formula.
+6. **Audit the ABI boundary.** `bind_program_abi_arguments` over the
+   formals showed the two scalars were not ABI formals at all -- they were
+   read from a region's published output, and the region's value at that id
+   was a GetElementPtr ADDRESS into the height array. The caller read a
+   height cell (~1.0) where its diffusivity belonged.
+
+Two signatures out of it:
+
+**A flag disagrees with its own numbers.** `ok` false while every metric
+it summarizes is healthy means the flag's OPERAND chain reads a different
+value than the metrics' chain -- a wiring split, not a computation error.
+Diff the two chains' value ids; the first id they disagree on names the
+defect.
+
+**Same number, different space (namespace edition) -- FIXED, signature
+kept.** A region-internal temporary and a caller scalar can carry the same
+integer, and the read then succeeds with the wrong value. Two mints of that
+collision were found, both now closed:
+
+* `plan_region_to_ssa_instrs` seeded its fold/clamp temporaries from the
+  region's OWN max line id (fixed a1aee9b: it takes the caller's watermark).
+* `lower_indexing_to_ssa_addressing` minted every `GetElementPtr` address
+  from **that function's** max id. A planner region shares its caller's value
+  space, so region_2's first address landed on 80 and region_1's on 89 --
+  exactly the caller's `tracer_diffusivity` and `viscosity`. The allocator is
+  now module-wide, so no address can occupy an id used anywhere in the module.
+
+The binding that turned the collision into a wrong number is the
+whole-program structural-output recovery in `fortran_c_shell.py`: for a
+`desired_id` the caller lacks, it scans every callee for **any** instruction
+producing that id, appends it to that call's `output_ids`, and inserts a
+`GetElementPtr`+`Load` to unpack it. It matched on the raw integer alone, so
+it bound a caller scalar to a pointer into a height array. It now refuses a
+`GetElementPtr` result as a recovered output -- an address is a location in
+the callee's own storage, never a value the caller asked for.
+
+*Check, if this class recurs:* for a suspect id, find the caller's `Load`
+carrying `source_output_id = <id>`, read its `callee`, and look at what that
+callee's instruction with `res.id == <id>` actually IS. If it is an address,
+a cast, or anything the region minted rather than the shared graph named, the
+match is namespace noise. The plan is the arbiter of what a region may
+publish: compare against the region's PlanLine outputs
+(`region_output_value_ids`), not against what its SSA happens to produce
+after later lowering passes have minted ids inside it.
+
+*The rule underneath:* **every pass that mints an SSA id inside a region must
+mint above the whole shared value space, not above what it can see.** A pass
+handed one function cannot tell a caller id from a free integer. Three passes
+have now paid for learning that separately.
+
+---
+
+## Backend-specific traps already paid for
+
+**gfortran fails silently.** Invoked by absolute path with its own `bin`
+off `PATH`, it exits non-zero with *no diagnostic at all* — it spawns
+`f951`, which cannot load `libgmp`/`libmpfr`. `ssa_fortran_backend.py`
+puts the toolchain on `PATH` for the child; do the same by hand:
+
+```bash
+PATH="/c/msys64/mingw64/bin:$PATH" gfortran -fsyntax-only isolated.f90
+```
+
+**A huge generated file truncates the real error.** Isolating just the
+calling subroutine and its callee into a small file makes gfortran report
+the actual mismatch instead of a summary.
+
+**Git Bash `/tmp` is invisible to Windows Python.** Write scratch files to
+a real path under `build/` instead; a redirect that "worked" and a Python
+open that "cannot find the file" is this, not a race.
+
+---
+
+## Deployment outlining receipts (2026-09-01)
+
+The pooled-dispatch seam runs SSA-first: `deployment_outlining.
+outline_independent_iteration_lanes(module)` converts a proven single-lane
+`independent_iterations` region (a retained loop's lane template) into a
+real module function, and `ssa_c_backend` then replaces the loop execution
+with `turing_pool_deploy_span` (jumping to the join on success) while the
+serial loop remains in-text as the fallback. Read the receipts, never guess:
+
+- `OutlineReport.outlined[*]`: outline name, induction/start/stop/step ids,
+  live-in order (the outlined callee's exact formal order), and
+  `guarded_blocks` — blocks holding an order-insensitive shared append that
+  the emitter wraps in `turing_pool_effect_lock/unlock`.
+- `OutlineReport.refused[*]`: `(function, region_id, reason)`. The reasons
+  are a closed vocabulary worth trusting verbatim:
+  - "mixes lane and non-lane instructions" — a lane block contains
+    non-member instructions that are not hoisted `Const`s;
+  - "consumed outside the lane" — lane live-outs need an aggregate return
+    lowering that does not exist yet;
+  - "ordered-join lowering is required" — a shared-sequence mutation whose
+    operands are lane-DEPENDENT, so append order is iteration order.  A
+    lane-INVARIANT append is not refused: every iteration pushes an
+    identical element, so only the count is observable and the effect lock
+    preserves serial semantics (this is why the managed vehicle window
+    loop outlines);
+  - "without the induction in its address chain" — an unproven shared
+    store; induction-indexed slots are the sanctioned pattern.
+- `CModuleArtifact.pool_required` / `pooled_regions`: whether compile()
+  will link `turing_pool.c`, and exactly which regions emitted a native
+  deploy.  Emission NEVER blocks on a refusal — refusal means serial text.
+
+`plan_repository_ssa_dispatch` consumes the same records: an outlined
+iteration region plans launchable with one lane; an un-outlined one carries
+the shortfall "run outline_independent_iteration_lanes first".  There is no
+Python runtime dispatcher: execution is `turing_pool.c` inside the compiled
+artifact (the former `RepositorySSAFrameExecutor` was removed).
+
+Compile-and-run proof of the whole seam: `tests/test_deployment_outlining.py`
+(pooled numerics equal serial bit-for-bit).
+
+---
+
+## Do not do this
+
+**Do not add a source-level probe to observe a value.** Writing
+`state.some_field = suspect + 0.0` to make a value observable *shifts value
+ids and can rebind the very thing being measured*. It has already produced
+a wrong conclusion in this codebase — twice. It also perturbs unrelated
+consumers: a probe added to `max_wave_speed` corrupted a different
+consumer of that same reduction.
+
+Prefer reading an **existing** public id. If you must add a probe, verify
+with `correlate_compile.py` that the ids still mean what you think
+**before** trusting its readout.
+
+---
+
+## When every stage clears and it is still wrong
+
+That is a real state, and it is where this program currently sits for
+`mass_err`. It means the defect is not in shortfalls, SSA well-formedness,
+in-place fusion, observability, or influence topology. Record what you
+ruled out **with the check that ruled it out** — a hypothesis closed
+without evidence gets re-opened by the next person, and re-walking a
+cleared branch is the single largest time sink in this work.
+
+`tools/HANDOFF_fluid_c_shell.md` is that record for the current defect,
+including a correction of a claim that was wrong and load-bearing. Keep it
+honest in the same way: an overturned finding is more valuable written
+down than quietly deleted.
+
+---
+
+# The tool log: what was reached for, in what order, and what it bought
+
+One real hunt, end to end. The order matters more than any individual
+tool — each answer narrowed what the next tool had to look at.
+
+| # | Reached for | Question it answered | What it bought |
+|---|---|---|---|
+| 1 | `git log` / reading the handoff | what was already known | avoided re-deriving four fixed defects |
+| 2 | `emit_module` + `gfortran` | does it build at all | 9 errors → a concrete, finite list |
+| 3 | Isolating caller+callee into one small `.f90` | what is the REAL diagnostic | full-file compiles truncate the error; isolation revealed it |
+| 4 | Reading the pickled SSA directly | does the IR say what I think | disproved three plausible theories in minutes |
+| 5 | `correlate_compile.py` (built here) | which layer disagrees | SSA vs LLVM vs runtime, side by side, per id |
+| 6 | `diagnose_translation.py` (built here) | which STAGE owns it | routing, instead of reading the wrong altitude |
+| 7 | `influence_field` dye (already existed) | what reaches this value | closed the "are they aliased" question |
+| 8 | `watch=` (built here) | what IS this value at runtime | turned NOT OBSERVABLE into a measurement |
+| 9 | `history=N` (built here) | which ITERATION went wrong | the series, not just the final value — this cracked it |
+| 10 | `differential_translation.py` (built here) | is the translation faithful | an independent oracle; found a second, larger defect |
+| 11 | `ssa_reference_evaluator.py` (built here) | lowering's fault or emission's | **the routing answer** — SSA matched the oracle exactly, so emission owns it |
+| 12 | `differential_matrix.py` (built here) | all representations at once | one table; backend-vs-backend needs no oracle |
+| 13 | `bisect_emission.py` (built here) | which VALUE emission got wrong | first divergence in program order; for a carried phi it names the accumulator, so pair it with 14 |
+| 14 | `history=` on BOTH sides (extended here) | which ITERATION, on either side | rings every watched value, not only phis, and the evaluator rings the same way — arguments agreeing per-iteration while outputs did not is what localised the defect to one callee |
+| 15 | sensitivity fingerprint (ad hoc) | which INPUTS the artifact actually uses | perturb each input of a pure reproducer; the artifact used 3 of 9, and one coefficient equalled the sum of the 6 it lost |
+| 16 | opcode census (ad hoc) | is an instruction missing, or in the wrong domain | `fmul` 118 + `mul` 22 = SSA's 140 `Mul`. Nothing missing — 22 were integer. **This named the bug.** |
+| 17 | `--trace` on `compile_fortran_module_c_shell` (built here) | per-launch timing/status inside a standalone executable | compile-time-only ring buffer; an untraced artifact has none of this code in it at all |
+| 18 | `trace_fortran_alias.py` (built here) | does a buffer get written ANYWHERE reachable in a whole-program native build | follows one token through nested `call` statements by position; proved `state.height` is never written across 5 hops, and where `state.next_height` is |
+| 19 | `compile_project_catalogue.py --compile-resolved-plan` | which compiler units fit and publish SSA under explicit RAM/time bounds | parallel leaves-first compilation with authored-source fallback for unverified dependencies |
+| 20 | `diagnose_translation.py --compilation-unit` | where one self-compilation worker actually stopped | durable phase/resource routing before SSA exists; ordinary SSA stages after publication |
+| 21 | `compile_project_catalogue.py --compile-subdivision-plan` | can a resource-bound SCC be converted into smaller deterministic integrals | bounded function-shell/owned-region workers and a sealed result matrix |
+| 22 | `diagnose_translation.py --compilation-product` | what the aggregate bootstrap frontier now is | distinguishes source-only, partial, compiled-unverified, resource failure, running, and pending work |
+
+**What each stage cost when skipped.** Steps 8 and 9 existed only after
+days of reasoning about structure. Every one of those days would have been
+saved by asking "what is this value, actually?" on day one — which was
+impossible, because the answer was `NOT OBSERVABLE` and the tool returned
+`0.0` instead of saying so.
+
+**The shape of the whole hunt**, which is the transferable part:
+
+1. A symptom (`mass_err = 0.0`) that turned out to be **correct behaviour**.
+2. A "ground truth" (`1.68e-04`) that turned out to be **computed from the
+   bug itself**.
+3. Structural checks that all passed, repeatedly, because the defect was
+   not structural.
+4. A measurement that could not be taken, silently reported as a zero.
+5. The real defect — a whole-array copy moving one element — found only
+   once values became observable, and found *next to* where everyone was
+   looking, not inside it.
+
+If a hunt here is going badly, the odds strongly favour one of those five
+over an exotic compiler bug.
+
+---
+
+# Field notes: counterintuitive things that actually happened
+
+These are not hypotheticals. Each cost real time in this tree, each looked
+like something else first, and each is the reason a check above exists.
+They are written down because the *shape* of these mistakes transfers even
+when the specific bug does not.
+
+### 1. A tool that answers `0.0` for "I cannot see that"
+
+`_read()` returned `0.0` for any value absent from the public buffer ABI.
+Internal allocas are absent from it. So probing an internal accumulator
+returned a zero **indistinguishable from a measured zero** — and a
+computation that was genuinely producing zero was the thing under
+investigation.
+
+I reported "the subtraction itself computes zero" as an established fact
+and reasoned onward from it for hours. It was the probe, not the program.
+
+> **The lesson is not "check for None".** It is that a diagnostic which
+> degrades gracefully is a diagnostic that lies. Every tool here now
+> refuses: `observable()` asks, `_read(required=True)` raises, and the
+> correlate tool prints `NOT OBSERVABLE` where a number would go.
+
+### 2. The heuristic that flagged the healthy value
+
+Stage 5 originally flagged "dominantly BAKED" influence as suspicious. Its
+first run flagged `max_wave_speed` — which is **correct**. Baked dominance
+is simply the norm here, because `dt`/`dx`/`gravity` feed nearly
+everything.
+
+Had it shipped, it would have sent the next reader to a known-good value
+with an authoritative-looking `[FAIL]` beside it.
+
+> Test a new check against something you *know* is healthy before you trust
+> it on something you suspect. A check is a claim; claims get verified.
+
+### 3. Two things sharing an id, where one is fine and one is fatal
+
+14 values in the advance function are **both a formal argument and an
+instruction result**. That looks exactly like the id-collision class of bug
+that had already been found twice in this session.
+
+It is not a bug. `arg97 is load97` — they are the *same object*. The
+argument cell is deliberately reused as that value's storage, which is
+in-place and fast. A real collision is two *distinct* objects on one id.
+
+> The check that matters is `is`, not `==`, and not "same number". Stage 2
+> encodes this distinction precisely because the number alone sent me
+> chasing a non-bug through the emitter.
+
+### 4. A probe that corrupted the thing it measured
+
+To observe an accumulator, I added `state.some_field = accumulator + 0.0`
+to the authored source. This **shifted value ids** and rebound a different
+consumer of that same reduction — a previously-correct value started
+reading `0.0`.
+
+The reading it produced was then used as evidence. Twice.
+
+> This is why `watch=` exists at the emitter instead. Never make a program
+> observable by editing it when you can make it observable by *emitting one
+> extra copy of what it already computed*.
+
+### 5. The compiler enforcing a rule that saved the tool
+
+The first version of `watch` appended the value to the function's outputs
+and copied it at the return. For a loop-carried phi, LLVM rejected the
+module: *"Instruction does not dominate all uses"*.
+
+That refusal was **correct and valuable**. A phi's storage is a register
+selected per-edge; it genuinely is not readable at the return. The naive
+fix (skip phis) would have made accumulators — the most interesting values
+to watch — permanently unwatchable. The real fix was a shadow slot in the
+entry frame.
+
+The second attempt then hit *"PHI nodes not grouped at top of basic
+block!"*, because the capture was emitted between two phis. Also correct,
+also load-bearing: the copies now defer to the end of the phi group.
+
+> A verifier rejecting your instrumentation is information about the IR's
+> real structure, not an obstacle. Both errors taught the mechanism
+> something it needed to know.
+
+### 6. A cached artifact that made a fix look like a no-op
+
+Loading a stale `control_repository_ssa.pkl` produced a failure in an
+*unrelated* subsystem, several layers from the change under test. The
+pickle held a program lowered by a compiler that no longer existed.
+
+> Now enforced in code: `_cache_is_stale()` compares the pickle against
+> every compiler source and re-lowers rather than trusting it. A spurious
+> 30-second recompile costs a coffee; a silently stale artifact costs a day
+> *and* produces confident wrong conclusions along the way.
+
+### 7. Chasing a symptom that was correct behaviour
+
+`mass_err` read exactly `0.0` against an expected `1.68e-04`. I treated that
+as the defect and pursued it for a very long time — aliasing, CFG, phi
+propagation, influence topology, backend registers. Every one came back
+clean, which should itself have been the signal.
+
+The per-iteration watch showed the two accumulators taking *genuinely
+different* summands (`0.997309…` vs `1.0…`) and converging on the same
+total. That is a **mass-conserving scheme working correctly**. `mass_err =
+0.0` was the right answer all along.
+
+The real defect was one layer away and had never been examined: the
+whole-array copy `state.height = state.next_height + 0.0` updated **1 cell
+of 16**. My "expected" `1.68e-04` had been computed from `state.height`
+*after* the call — i.e. from the corrupted copy. **The number I was
+treating as ground truth was itself produced by the bug.**
+
+> When every hypothesis about a symptom clears, question the symptom.
+> And check where your reference value came from: a "truth" derived from
+> the same run as the observation is not independent of it.
+
+### 8. The check that would have taken seconds
+
+The four broken values carry `program_abi_rank: 2` and
+`program_abi_storage: "span"` in accounting, while their `.shape` is `()`.
+The emitter's `_value_element_count` reads `.shape`, gets 1, and emits a
+scalar load/store where a whole-array copy belongs.
+
+The instructive part is what makes this *hard to see*: rank-with-empty-shape
+is the **normal** representation for a dynamically-sized array here, and the
+Fortran backend handles it correctly through the extents vector. So the
+disagreement is not itself a defect — a naive check on it reports 35 values
+and buries the 4 that matter. The hazard is specifically a rank>0 value
+standing as a **region-call output**, where the return-copy sizes itself
+statically.
+
+Stage 2 now checks exactly that, and names them:
+
+```
+[FAIL] 4 region-call OUTPUT(s) declare rank>0 but carry an empty .shape
+       id 122 (field height, rank 2) out of planned_region_4
+       id 126 (field momentum_x, rank 2) out of planned_region_4
+       ...
+```
+
+> A check that fires on everything teaches nothing. Narrow it to the
+> configuration that actually causes harm, and say what the harm is.
+
+### 9. A zero that made the compiler look guilty
+
+The SSA evaluator reproduced neither the artifact nor the oracle, and its
+traversal looked like it was collapsing neighbour reads: every cell's
+`height_next` came out exactly equal to its own centre height, and the
+mass accumulator summed the OLD grid. That is precisely what a compiler
+dropping its flux terms would look like, and it was investigated as such.
+
+The cause was in the instrument. `dt` carries no per-argument accounting,
+so the binder matched it by dtype-and-rank, found **two** float64 scalar
+candidates, correctly refused the ambiguity — and then let it fall through
+to a scratch fill that bound it to **0.0**.
+
+Nothing crashed. Every other value stayed plausible: neighbour reads were
+being resolved perfectly the whole time, `wave_speed` was exactly right,
+the loop visited all sixteen cells and read each one correctly. With
+`dt = 0`, `h + dt*(fluxes)` is just `h`, for any fluxes at all.
+
+Fixing the binding changed `ssa vs oracle` from "wrong everywhere" to
+**exactly 0.0**, and with it the whole conclusion: the SSA was correct all
+along and the defect is in emission.
+
+> **A default is a claim.** `unbound` and `zero` are different statements,
+> and code that turns the first into the second manufactures evidence. The
+> binder now reports what it could not bind, and identifies a parameter the
+> way the runtime does — through the callee formal it feeds, by name.
+>
+> Note the shape: this is the SAME defect as field note 1, in a new place,
+> committed by someone who had just written field note 1. Silent defaults
+> are that easy to reintroduce.
+
+### 10. The bug that deleted terms instead of failing
+
+The one the whole differential apparatus was built to find, kept here in
+full because the ROUTE is more reusable than the patch.
+
+A binary scalar operation took its arithmetic domain from `args[0]` alone.
+The lowering spells negation as `Mul(int -1, x)`, so every negation of a
+float ran as an **integer** multiply and the float operand was reached by
+`fptosi`. Fractional values truncated to zero. Nothing raised, nothing was
+dropped from the instruction stream, and the emitted code verified clean —
+whole terms simply evaluated to nothing. The compiled fluid step ignored
+six of its twenty-eight inputs, never saw a tracer go negative, and so
+accepted a frame the authored mathematics rejects.
+
+The sequence that found it, each step discarding a layer:
+
+1. **Route first.** The SSA matched the authored oracle exactly, the
+   artifact did not (Q5c). Emission owns it. Two earlier hunts through the
+   planner and the AST inlet were spent on layers that were innocent.
+2. **Series, not endpoints.** The first divergence in program order was a
+   loop-carried phi — which says an accumulator ended wrong, never which
+   iteration spoiled it. Ringing both sides per iteration showed all 28
+   call arguments agreeing while four outputs did not.
+3. **Read the pattern before reading code.** The four wrong outputs were
+   exactly the time-integrated quantities; every pure diagnostic of the
+   current state was right. That is a shape, and it pointed at arithmetic
+   rather than at the neighbour gathering.
+4. **Shrink to a reproducer.** It reproduced standalone on fresh buffers —
+   which killed the loop, the gathering, and in-place aliasing at once.
+5. **Fingerprint the reproducer.** A pure function of 28 scalars: perturb
+   each input, compare sensitivities. The artifact depended on three inputs
+   where the SSA depended on nine, and its one shared coefficient equalled
+   the SUM of the six it had lost — which is what a collapsed domain looks
+   like from the outside.
+6. **Count opcodes before believing anything is missing.** SSA `Mul` 140
+   against emitted `fmul` 118 looks like 22 dropped instructions. It was
+   not: `fmul` 118 + `mul` 22 = 140. Everything reconciled. Twenty-two
+   multiplications were simply integer ones, and that named the defect.
+
+Two confident hypotheses were killed on the way, both by measurement:
+that the call site permuted its arguments (checked against the emitted IR
+by script, not by eye — reading a 28-pointer call by eye had "confirmed"
+it, wrongly), and that six formals were unwired (`buffer_order` was
+complete and duplicate-free).
+
+> **Promote, never demote.** Widening an integer operand is exact;
+> narrowing a float discards its value. A conversion that loses data in
+> service of a type rule will not announce itself — it returns a plausible
+> number. This is field note 1's disease in the type system: a silent
+> default, wearing a cast.
+
+### 11. What all of these have in common
+
+Most were **the instrument lying, not the program**. The program under
+investigation was deterministic and consistent the entire time; what varied
+was the quality of the observation.
+
+When a result is baffling, suspect the measurement before the mechanism —
+and prefer an instrument that refuses to answer over one that answers
+plausibly.
+
+The compressed version, for anyone starting a hunt here:
+
+1. **Can I observe this at all?** (`observable()` — if not, `watch=`.)
+2. **Where did my reference value come from?** If the same run produced
+   both, it is not independent evidence.
+3. **Is the symptom actually wrong?** Correct-but-surprising behaviour has
+   eaten more time in this tree than any real bug.
+4. **Does a known-good value pass my new check?** If not, the check is
+   broken, not the value.
+5. **Same number or same object?** `is`, not `==`.
+6. **Is my artifact current?** A stale lowering makes a fix look like a
+   no-op.
+7. **Which LAYER owns it?** (Q5c.) Answer this before reading code, not
+   after. Two of the longest hunts here were spent in the wrong layer.
+8. **Did anything default silently?** An unbound input that became a zero
+   will implicate the compiler for a bug in your harness — and it will
+   look exactly like a real one.
+
+---
+
+# Companion documents still to be written
+
+This document covers **one span** of the pipeline: repository SSA through
+the backends, for a program that already lowered. Three neighbouring spans
+deserve the same treatment and do not have it yet. These are notes on what
+each will need — not the documents themselves.
+
+The house style to keep, because it is what made this one useful:
+
+* **Ordered questions, not a feature list.** Each answer clears a stage or
+  names one. A reader in trouble is not browsing.
+* **Every check states what it does NOT prove.** A check that overclaims
+  sends people down blind alleys, which is worse than no check.
+* **Refuse to fabricate.** No silent defaults for unobservable things.
+* **Record calibration failures in the document.** The
+  "dominantly-baked is not a defect signal" warning is worth more than the
+  check it qualifies.
+* **Every command copy-pasteable and actually run before shipping.**
+
+---
+
+## A. Code/math ingestion → dual IR
+
+Covers: source text and SymPy → `ProcessGraph` → topology reduction →
+hierarchy plan → dual IR. Everything *before* SSA exists, where the
+authored program is still recognisable and identity is still being decided.
+
+Notes toward it:
+
+* **Node identity is the whole subject.** `ensure_node` keys nodes on
+  `id(node)` — the *Python object address*. Object lifetime therefore
+  affects graph identity, and a freed temporary's address can be reused.
+  Any questionnaire here starts with "is this one node or two, and why".
+* **`deduplicate_node` merges on `label` + `type` alone** — no scope, no
+  version, no source span. It is guarded to skip `ast.AST` nodes (the
+  guard's comment records that merging every `GetAttr` once collapsed
+  `x.detach().tanh()` into a self-cycle), but it still applies to non-AST
+  structural objects, notably SymPy expressions. "Did two things merge that
+  shouldn't have" needs a first-class check.
+* **Auto-aliasing at capture.** `result is parent_value` records a
+  `value_aliases` entry — correct and necessary, and `max()` returning one
+  of its own arguments makes it fire in ordinary code. Needs a way to dump
+  the alias chain for a value and ask "is this an alias, and of what".
+* **Extraction contract decisions are policy, not accident.** `parent_include`
+  labels but does not gate pursuit; a "why was this function ingested / not
+  ingested" question belongs here, answered from the receipts
+  (`extraction_action`, `extraction_rule`, `extraction_identity`) that are
+  already attached to every node.
+* **Tooling that likely needs building:** a node-provenance dumper (source
+  span → node → what it became), and an alias-chain resolver. The dye trace
+  already has `field_from_process_graph` and `field_from_dual_ir` adapters,
+  so influence is available at this altitude *now* — the SSA one turned out
+  to be wired and unused, and these two probably are too.
+
+## B. The binary head / machine-state operation
+
+Covers: decoding native binaries into repository SSA — the read head,
+`InstructionSpec` vocabulary, scalar decoder, machine-state dialect, and
+the legalisation that turns retained machine state into ordinary SSA.
+
+Notes toward it:
+
+* **The authority hierarchy is the first thing to state.** The scalar
+  `InstructionSpec` vocabulary is the source of truth; the tensor read-head
+  is a *derived* write/reversibility accelerator, not a rival decoder. New
+  ISAs get added at the spec + scalar-decoder layer. A reader who does not
+  know this will "fix" the wrong decoder.
+* **The completeness facts are already recorded and should drive the
+  tree:** `host_repository_ssa_complete`, `host_machine_state_complete`,
+  `host_ssa_blockers`, `host_ssa_hard_blockers`,
+  `host_ssa_legalization_shortfalls`, `host_ssa_unresolved_dependencies`.
+  The questionnaire is largely "which of these is false, and what does that
+  one mean".
+* **Blocker vs hard blocker is the load-bearing distinction** — one is
+  "not yet", the other is "not this way". `select_host_implementation`
+  already encodes the decision; the document should explain the choice it
+  makes rather than restate the flags.
+* **Retained machine state is legitimate**, the same way in-place fusion is
+  legitimate here: the question is never "is there machine state" but "is
+  it legalised or is it leaking into a public ABI".
+* **Reversibility is the sharp diagnostic** — a decode that cannot be
+  re-encoded to the same bytes has lost something, and that check is
+  mechanical.
+
+## C. Backends (Fortran / C shell / LLVM / SPIR-V / WASM)
+
+Covers: repository SSA → emitted target text → linked artifact. Partly
+covered above for Fortran and LLVM; the *shared* structure deserves its own
+document as more backends land.
+
+Notes toward it:
+
+* **The recurring bug class, across every backend, is one identity meaning
+  two things** — the same disease as the ingestion layer, one layer down.
+  Every backend keeps an id-keyed pointer/register cache, so two distinct
+  values on one id means whichever renders last silently wins. A shared
+  "id-keyed cache soundness" check would serve all of them.
+* **Positional binding is the second recurring class.** `zip(caller_args,
+  callee_formals)` truncates silently on a length mismatch;
+  `zip(dataclass_fields, return_record)` mispaired every `Metrics` field
+  here. Any backend that pairs by position needs a check that the two
+  sequences are the same length *and* the same thing.
+* **Fixed-point emission loops need their convergence stated.**
+  `emit_module` runs five (`ranks`, `scalars`, `array-contracts`, `dtypes`,
+  `mutation`) plus two bounded re-emission loops, and "did this converge,
+  and what does it mean if it did not" should be answerable without reading
+  the loop.
+* **Per-backend traps belong in one table**, in the spirit of the gfortran
+  silent-failure note above: each is cheap to write down and expensive to
+  rediscover.
+* **`emit_module` cannot fix what SSA got wrong.** Its loops only unify
+  *metadata* on an already-fixed, positionally-paired `Call.args` tuple —
+  it can never change how many arguments a call passes. The document should
+  say this plainly so structural defects are chased upstream instead of in
+  the emitter.
+* **A complete emission followed by hundreds of dynamic shell extents is a
+  storage-contract failure, not permission to choose arbitrary sizes.** Check
+  `ssa_storage_requirements.function_storage_requirements` for the root. It
+  combines occurrence views and `SSATensorTable` evidence and propagates the
+  result through actual/formal call bindings. C, LLVM, and Fortran must all
+  consume that one capacity result; allocating one element in C/LLVM while
+  exposing dimensions in Fortran is the same defect wearing three costumes.
+* **Callee-local dynamic extent names do not transitively belong to the public
+  entry.** Resolve them at each call from the actual tensor view. Only a
+  genuinely unresolved caller dimension may climb another level. A blind
+  set-union over call-graph extent names preserves compilation but manufactures
+  an unusable ABI.
+* **An initialized empty private sequence is still dead when nothing observes
+  it.** The compiler-created zero store to its length cell is scaffolding, not
+  a semantic use. Remove the unused descriptor, its resident frame members,
+  and that initializer together; otherwise synthetic list columns become
+  anonymous native inputs and demand invented capacities.
+* **Imported `llvm.memcpy(product(shape) * sizeof(T))` is a semantic whole-array
+  copy when that dependency is proven.** Fortran should emit conformable array
+  assignment. A partial or unproven byte copy must remain a shortfall rather
+  than being widened.
+* **`PointerArray` followed by `stack_double`/`cat_double` is a low-level
+  C/LLVM carrier, not a Fortran data structure.** Legalize the complete group
+  to native array-section stack/concat statements; do not synthesize a pointer
+  table in Fortran.

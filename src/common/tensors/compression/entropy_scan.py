@@ -44,7 +44,7 @@ def interleave_codewords_and_payloads(
             (payloads >= 0)
             & (
                 (payloads < (2 ** payload_lengths.maximum(1)))
-                | ~payload_present
+                | payload_present.logical_not()
             )
             & ((payloads == 0) | payload_present)
         )

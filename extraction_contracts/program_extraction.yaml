@@ -1,0 +1,389 @@
+version: 1
+mode: exhaustive
+
+# Python is the complete execution context. Dependency pursuit discovers the
+# semantic program, while proven numerical compartments may be replaced by
+# modular native dispatches. Failure to lower one compartment leaves an
+# explicit Python-resident boundary; it is not a failed Python program and it
+# is never reported as full-native coverage.
+execution:
+  host_runtime: python
+  dependency_search: reachable
+  native_lowering: opportunistic
+  dispatch_unit: isolated_numeric_subgraph
+  unlowered_behavior: execute_in_python
+  require_full_native: false
+  backward_source: process_graph
+  python_callbacks: contract_only
+  numeric_semantics: abstract_tensor
+  scalar_promotion: all_numeric
+
+# Paths are relative to this sheet. First matching root/rule wins.
+roots:
+  authored:
+    - ../examples
+  repository:
+    - ..
+
+# Physical records crossing the Python/native program boundary. These entries
+# describe storage only; they neither execute Python objects nor authorize
+# dependency pursuit. Wildcard bindings apply the same record ABI to pursued
+# helper functions whose parameter keeps the declared semantic role.
+program_abi:
+  records:
+    SymbolicFluidGridState:
+      identity: src.compiler.symbolic_fluid_dt.SymbolicFluidGridState
+      fields:
+        height: {storage: span, dtype: float64, rank: 2, mutable: true}
+        momentum_x: {storage: span, dtype: float64, rank: 2, mutable: true}
+        momentum_y: {storage: span, dtype: float64, rank: 2, mutable: true}
+        tracer: {storage: span, dtype: float64, rank: 2, mutable: true}
+        next_height: {storage: span, dtype: float64, rank: 2, mutable: true}
+        next_momentum_x: {storage: span, dtype: float64, rank: 2, mutable: true}
+        next_momentum_y: {storage: span, dtype: float64, rank: 2, mutable: true}
+        next_tracer: {storage: span, dtype: float64, rank: 2, mutable: true}
+        forcing_amplitude: {storage: scalar, dtype: float64, mutable: false}
+        forcing_wavenumber: {storage: scalar, dtype: float64, mutable: false}
+        dx: {storage: scalar, dtype: float64, mutable: false}
+        gravity: {storage: scalar, dtype: float64, mutable: false}
+        viscosity: {storage: scalar, dtype: float64, mutable: false}
+        tracer_diffusivity: {storage: scalar, dtype: float64, mutable: false}
+        linear_drag: {storage: scalar, dtype: float64, mutable: false}
+        coriolis: {storage: scalar, dtype: float64, mutable: false}
+        minimum_height: {storage: scalar, dtype: float64, mutable: false}
+        last_wave_speed: {storage: scalar, dtype: float64, mutable: true}
+        last_height_violation: {storage: scalar, dtype: float64, mutable: true}
+        last_tracer_violation: {storage: scalar, dtype: float64, mutable: true}
+        height_count: {storage: scalar, dtype: int64, mutable: false}
+        width_count: {storage: scalar, dtype: int64, mutable: false}
+    Targets:
+      identity: src.common.dt_system.dt_controller.Targets
+      fields:
+        cfl: {storage: scalar, dtype: float64, mutable: false}
+        div_max: {storage: scalar, dtype: float64, mutable: false}
+        mass_max: {storage: scalar, dtype: float64, mutable: false}
+        # Keyed by scientific channel name. The keys are words, so they lower
+        # to the repository's universal string tokens rather than to one
+        # opaque handle; a constant channel name and one derived at run time
+        # resolve to the same slot.
+        error_limits: {storage: keyed, dtype: float64, mutable: false}
+    STController:
+      identity: src.common.dt_system.dt_controller.STController
+      fields:
+        Kp: {storage: scalar, dtype: float64, mutable: false}
+        Ki: {storage: scalar, dtype: float64, mutable: false}
+        A: {storage: scalar, dtype: float64, mutable: false}
+        shrink: {storage: scalar, dtype: float64, mutable: false}
+        dt_min: {storage: scalar, dtype: float64, mutable: false}
+        dt_max: {storage: scalar, dtype: float64, mutable: true}
+        acc: {storage: scalar, dtype: float64, mutable: true}
+        max_vel_ever: {storage: scalar, dtype: float64, mutable: true}
+        clamp_events: {storage: scalar, dtype: int64, mutable: true}
+    Metrics:
+      identity: src.common.dt_system.dt_scaler.Metrics
+      fields:
+        max_vel: {storage: scalar, dtype: float64, mutable: true}
+        max_flux: {storage: scalar, dtype: float64, mutable: true}
+        div_inf: {storage: scalar, dtype: float64, mutable: true}
+        mass_err: {storage: scalar, dtype: float64, mutable: true}
+        osc_flag: {storage: scalar, dtype: bool, mutable: true, default: false}
+        stiff_flag: {storage: scalar, dtype: bool, mutable: true, default: false}
+        sim_frame: {storage: scalar, dtype: int64, mutable: true, default: 0}
+        proc_ms: {storage: scalar, dtype: float64, mutable: true, default: 0.0}
+        dt_limit: {storage: scalar, dtype: float64, mutable: true, default: null}
+        error_channels: {storage: keyed, dtype: float64, mutable: true}
+        hard_failure: {storage: scalar, dtype: bool, mutable: true, default: false}
+        advanced_dt: {storage: scalar, dtype: float64, mutable: true, default: null}
+    # Compiler bootstrap boundary.  The graph and its nested DiGraph are
+    # structural records; their deterministic SSA/node identities are never
+    # renumbered at this boundary.  ``nodes`` and graph metadata remain named
+    # references until the tagged columnar node/property tables are lowered --
+    # keeping those leaves explicit makes the next bootstrap frontier honest.
+    CompilerProcessGraph:
+      identity: src.transmogrifier.graph.graph_express2.ProcessGraph
+      fields:
+        G: {storage: record, record: CompilerDirectedGraph, mutable: false}
+        roots: {storage: span, dtype: int64, rank: 1, mutable: true}
+        levels: {storage: reference, mutable: true}
+        function_table: {storage: reference, mutable: false}
+    CompilerDirectedGraph:
+      identity: networkx.classes.digraph.DiGraph
+      fields:
+        # Deterministic SSA node id -> dense node-row handle.  The key is the
+        # existing id itself; it is never hashed, interned, or renumbered.
+        nodes: {storage: keyed, dtype: int64, rank: 1, key_encoding: integer_identity, value_record: CompilerNode, value_identity: key, mutable: true}
+        graph: {storage: record, record: CompilerGraphMetadata, mutable: true}
+    # The row reached by G.nodes[deterministic_node_id].  These are the exact
+    # source-facing fields consumed by the first bootstrap targets.  Opaque
+    # leaves stay explicit references until their tagged/token-chain column
+    # layouts are installed; they must not be mistaken for native scalars.
+    CompilerNode:
+      identity: turing.compiler.CompilerNode
+      fields:
+        # One lexical token, encoded by its explicit one-based vocabulary
+        # position.  This is a length-one token chain, not a hash; the ordered
+        # vocabulary is carried in every contract/artifact receipt.
+        type:
+          storage: scalar
+          dtype: int64
+          mutable: false
+          token_vocabulary: [Constant, Const, const, StaticReference, Input]
+        attributes: {storage: record, record: CompilerNodeAttributes, mutable: false}
+        # Runtime AST class tag.  The authored isinstance checks are lowered
+        # to equality against these same exact vocabulary positions.
+        expr_obj:
+          storage: scalar
+          dtype: int64
+          mutable: false
+          token_vocabulary: [ast.Tuple, ast.List, ast.Set, ast.Dict]
+        parents:
+          storage: table
+          rank: 1
+          mutable: false
+          columns:
+            - {name: parent_id, dtype: int64}
+            - {name: role_token, dtype: int64}
+    CompilerNodeAttributes:
+      identity: turing.compiler.CompilerNodeAttributes
+      fields:
+        binding_name: {storage: reference, mutable: false}
+    CompilerGraphMetadata:
+      identity: turing.compiler.CompilerGraphMetadata
+      fields:
+        # This first physical view is a presence table.  Its string-token keys
+        # answer the membership query used by source-static classification;
+        # tagged specialization payloads remain a later field, so no Python
+        # object is smuggled through this table.
+        planner_specializations: {storage: keyed, dtype: int64, rank: 1, key_encoding: string_token, mutable: false}
+  bindings:
+    - {function: "*", parameter: state, record: SymbolicFluidGridState}
+    - {function: "*", parameter: targets, record: Targets}
+    - {function: "*", parameter: controller, record: STController}
+    - {function: "*", parameter: ctrl, record: STController}
+    - {function: "*", parameter: metrics, record: Metrics}
+    - {function: "*coerce_metrics", parameter: value, record: Metrics}
+    - {function: _dependency_order, parameter: graph, record: CompilerProcessGraph}
+    - {function: _source_static_value, parameter: graph, record: CompilerProcessGraph}
+    - {function: _source_static_literal, parameter: graph, record: CompilerProcessGraph}
+    - {function: _tensor_descriptor, parameter: graph, record: CompilerProcessGraph}
+    - {function: _is_ast_metadata_node, parameter: graph, record: CompilerProcessGraph}
+    - {function: _semantic_children, parameter: graph, record: CompilerProcessGraph}
+  # Native scalar entry values have an explicit source-language type.  This
+  # makes authored type-preserving guards deterministic during preprocessing;
+  # the compiler does not guess whether a float64 slot is still a Python or
+  # AbstractTensor object.
+  values:
+    - {function: symbolic_fluid_advance, parameter: dt, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: symbolic_fluid_frame, parameter: frame_duration, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: symbolic_fluid_frame, parameter: dt_initial, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: step_with_dt_control_used, parameter: dt, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: step_with_dt_control_used, parameter: dx, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: step_with_dt_control_used, parameter: ref, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: run_superstep, parameter: round_max, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: run_superstep, parameter: dt_init, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: run_superstep, parameter: dx, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: _restore_type, parameter: value, storage: scalar, dtype: float64, python_type: src.common.tensors.abstraction.AbstractTensor}
+    - {function: _restore_type, parameter: ref, storage: scalar, dtype: float64, python_type: builtins.float}
+
+# Every callable must land in exactly one class, and every class has a choice.
+# No implicit "inspect it and see" fallback exists.
+defaults:
+  authored_python:
+    action: ingest_python
+    parameters: {follow_reachable_calls: true}
+  repository_python:
+    action: ingest_python
+    parameters: {follow_reachable_calls: true}
+  third_party_python:
+    action: use_native
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system}
+  stdlib_python:
+    action: use_native
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system}
+  builtin:
+    action: intrinsic
+    parameters: {lowering_namespace: cpython_semantics}
+  native_extension:
+    action: use_native
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system}
+  dynamic_library:
+    action: use_native
+    parameters: {loader: operating_system, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system}
+  unknown:
+    action: reject
+    parameters: {reason: provenance_not_declared}
+
+rules:
+  # Exact result transport is part of the native call ABI. Arbitrary Python
+  # objects remain shell-owned handles; scalar clock readings return inline.
+  - id: native-pickle-object-result
+    match: {module: _pickle, qualname: "*", occurrence: definition}
+    action: use_native
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: opaque_ref}
+  - id: native-json-object-result
+    match: {module: json, qualname: loads, occurrence: definition}
+    action: use_native
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: opaque_ref}
+  - id: native-performance-counter-scalar-result
+    match: {module: time, qualname: perf_counter, occurrence: definition}
+    action: use_native
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: float64}
+  - id: native-os-replace-none-result
+    match: {module: nt, qualname: replace, occurrence: definition}
+    action: use_native
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: opaque_ref}
+
+  # These are ordinary live Python objects, not runtime graph parameters.
+  # When an instance or one of its definitions occurs on a reachable source
+  # path, pursue the referenced attribute into repository source (and onward
+  # to any declared native boundary).
+  - id: abstract-tensor-autograd-object-surface
+    match:
+      module: src.common.tensors.autograd
+      occurrence: [instance, definition]
+    action: ingest_python
+    parameters:
+      follow_reachable_calls: true
+      occurrence_pursuit: referenced_attributes
+
+  - id: authored-abstract-nn-is-real-program
+    match:
+      module: src.common.tensors.abstract_nn*
+    action: ingest_python
+    parameters:
+      follow_reachable_calls: true
+      include_classes: true
+      include_nested_methods: reachable
+
+  - id: abstract-tensor-vocabulary-is-intrinsic
+    match:
+      identity:
+        - src.common.tensors.abstraction.AbstractTensor.*
+        # AbstractTensor exposes these authored module functions as static
+        # methods.  Python introspection retains the defining identity, so
+        # match the public creation vocabulary as well as the class spelling;
+        # otherwise ``AbstractTensor.ones_like`` is recursively compiled as
+        # its implementation body instead of remaining a tensor operation.
+        - src.common.tensors.abstraction_methods.creation.empty
+        - src.common.tensors.abstraction_methods.creation.eye_like
+        - src.common.tensors.abstraction_methods.creation.full
+        - src.common.tensors.abstraction_methods.creation.full_like
+        - src.common.tensors.abstraction_methods.creation.hanning
+        - src.common.tensors.abstraction_methods.creation.linspace
+        - src.common.tensors.abstraction_methods.creation.meshgrid
+        - src.common.tensors.abstraction_methods.creation.ones
+        - src.common.tensors.abstraction_methods.creation.ones_like
+        - src.common.tensors.abstraction_methods.creation.rand_like
+        - src.common.tensors.abstraction_methods.creation.randint
+        - src.common.tensors.abstraction_methods.creation.randint_like
+        - src.common.tensors.abstraction_methods.creation.randn
+        - src.common.tensors.abstraction_methods.creation.random_tensor
+        - src.common.tensors.abstraction_methods.creation.randoms
+        - src.common.tensors.abstraction_methods.creation.zeros
+        - src.common.tensors.abstraction_methods.creation.zeros_like
+    action: intrinsic
+    parameters:
+      lowering_namespace: abstract_tensor
+
+  - id: control-and-scalar-builtins
+    match:
+      module: builtins
+      qualname:
+        - range
+        - len
+        - enumerate
+        - zip
+        - int
+        - float
+        - bool
+        - min
+        - max
+        - abs
+        - sum
+        - all
+        - any
+        - id
+        - getattr
+        - setattr
+        - hasattr
+        - isinstance
+        - type
+        - callable
+        - super
+        - list
+        - tuple
+    action: intrinsic
+    parameters:
+      lowering_namespace: python_language
+
+  - id: print-is-an-output-port
+    match: {module: builtins, qualname: print}
+    action: python_host_call
+    parameters:
+      execution: shell_io.stdout
+      port: stdout
+      callbacks: reject
+
+  # Files are resources supplied by the enclosing native/web shell.  Keep
+  # Python's convenient Path and stream APIs as the authored spelling, but do
+  # not ingest their implementation or pretend a numerical backend owns the
+  # host filesystem.  FileBrokerABI is the shared open/read/write/close ABI.
+  - id: python-filesystem-is-a-shell-boundary
+    match:
+      identity: [builtins.open, io.*, _io.*, pathlib.*]
+    action: python_host_call
+    parameters:
+      execution: shell_io.file_broker
+      callbacks: reject
+      shell_capability: files
+      shell_abi: turing-shell-io-abi.files
+
+  - id: never-extract-cpython-bootstrap
+    match:
+      module: [importlib*, _frozen_importlib*, inspect, ast, dis, types]
+    action: reject
+    parameters: {reason: interpreter_implementation}
+
+  # ``re``'s own compiler is real, ordinary Python source with a genuine
+  # multi-key cache table (``_cache[type(pattern), pattern, flags]``) --
+  # compile it natively instead of bailing out to a host call into the
+  # existing interpreter. ``_sre``/``sys``/``unicodedata`` are C-implemented
+  # (no ``.py`` source) and are intentionally excluded: they fall through to
+  # the native_extension/builtin defaults instead.
+  - id: stdlib-re-module-is-real-program
+    match:
+      module: [re, re._compiler, re._parser, re._constants, re._casefix]
+    action: ingest_python
+    parameters:
+      follow_reachable_calls: true
+
+  # Machine decompilation is forbidden unless an exact rule opts in. Example:
+  # - id: exact-vendor-kernel-decompile
+  #   match: {identity: vendor.kernel.entry, origin: "C:/vendor/kernel.dll"}
+  #   action: decompile_machine
+  #   parameters:
+  #     explicit_opt_in: true
+  #     architecture: amd64
+  #     dependency_policy: use_native
+  #     max_functions: 32
+
+limits:
+  python_source:
+    # Zero means unbounded. Reachability is bounded by the exhaustive action
+    # table above, not by arbitrary program-size truncation.
+    max_files: 0
+    max_total_bytes: 0
+    max_definitions: 0
+    max_work_items: 0
+    max_dependency_depth: 0
+  machine_decompilation:
+    enabled_by_default: false
+    max_functions: 0
+    max_total_bytes: 0
+    max_dependency_depth: 0
+  native_use_in_place:
+    allow_callbacks: false
+    require_declared_abi: true
+  receipts:
+    record_every_identity: true
+    record_rule_parameters: true

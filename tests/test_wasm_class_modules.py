@@ -12,7 +12,8 @@ from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.wasm_class_modules import (
     build_embedded_class_graph, build_hued_process_graph_views, build_manifest, build_module_process_graph,
     describe_process_graph_api, emit_class_modules,
-    partition_reduced_program, partition_threaded_wasm_program,
+    fused_program_extent_effect, partition_reduced_program,
+    partition_threaded_wasm_program,
     schedule_module_levels,
 )
 
@@ -87,6 +88,19 @@ def test_thread_partition_vertically_fuses_before_parallel_waves():
         "vertical-fusion" in history
         for history in summary["rewrite_history"]
     )
+
+
+def test_extent_effect_marks_whole_invocation_reductions_collective():
+    pointwise = _linear_program(3)
+    collective = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[OpStep(0, "sum", [1], {}, 2)],
+        outputs={"result": 2},
+    )
+
+    assert fused_program_extent_effect(pointwise) == "pointwise"
+    assert fused_program_extent_effect(collective) == "collective"
 
 
 def test_each_chunk_declares_only_the_values_it_actually_needs():
@@ -506,6 +520,43 @@ def test_embedded_graph_can_redirect_a_logical_input_to_output_storage():
     assert manifest["storage_redirects"] == {
         "in::x": f"out::{producer[0]}::{producer[1]}"
     }
+
+
+def test_state_feedback_names_an_originless_feed_before_inventory_consumes_it():
+    program = FusedProgram(
+        version=1,
+        feeds={4},
+        steps=[OpStep(
+            step_id=0, op_name="add", input_ids=[4],
+            attrs={"right_scalar": 1.0}, result_id=5,
+        )],
+        outputs={"phase_next": 5},
+    )
+    specs = partition_reduced_program(program, chunk_size=10, owner_name="kernel")
+    modules = emit_class_modules(
+        specs, link_calls=False, shared_memory=True,
+    )
+
+    manifest = build_embedded_class_graph(
+        specs,
+        modules,
+        program,
+        entrypoint="kernel",
+        storage_redirects={"phase": "phase_next"},
+        input_names=("phase",),
+    )
+
+    producer = manifest["logical_outputs"]["phase_next"]
+    assert set(manifest["logical_inputs"]) == {"phase"}
+    assert manifest["storage_redirects"] == {
+        "in::phase": f"out::{producer[0]}::{producer[1]}"
+    }
+    from src.compiler.wasm_class_coordinator import build_class_inventory
+
+    inventory = build_class_inventory(manifest)
+    assert [field.key for field in inventory.fields] == [
+        f"out::{producer[0]}::{producer[1]}"
+    ]
 
 
 def test_describe_process_graph_api_falls_back_to_a_synthetic_name():

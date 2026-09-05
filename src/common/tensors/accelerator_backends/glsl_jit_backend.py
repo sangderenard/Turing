@@ -51,6 +51,17 @@ class GLSLJITProgram:
         source_artifact: CachedArtifact,
     ):
         self.captured = captured
+        # Diagnostics, attached once if at all. A program that was never
+        # attached launches exactly as before, and in a shell built without
+        # ``trace`` the hook these would feed is not compiled in.
+        self._trace_shell: Any | None = None
+        self._trace_site: Any | None = None
+
+    def attach_trace(self, shell: Any, ring: Any, region: int) -> None:
+        """Bind this program to a trace ring, for one region."""
+
+        self._trace_shell = shell
+        self._trace_site = shell.trace_site(ring, region)
         self.input_ids = dict(input_ids)
         self.source_artifact = source_artifact
 
@@ -73,7 +84,7 @@ class GLSLJITProgram:
             )
             for name, value_id in self.input_ids.items()
         }
-        shell = profiled_c_shell()
+        shell = self._trace_shell or profiled_c_shell()
         result_holder: dict[str, Any] = {}
 
         @shell.callback
@@ -116,7 +127,14 @@ class GLSLJITProgram:
             if profiler is not None
             else None
         )
-        profile = shell.launch(dispatch)
+        if self._trace_site is not None:
+            profile = shell.launch(
+                dispatch,
+                logger=shell.trace_logger,
+                logger_user=self._trace_site,
+            )
+        else:
+            profile = shell.launch(dispatch)
         if profiler is not None:
             shell.record(
                 profiler,

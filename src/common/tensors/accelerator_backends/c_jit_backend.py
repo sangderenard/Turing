@@ -21,6 +21,10 @@ from .artifact_cache import (
 )
 from .c_primitive_program import _OP_NAMES
 from .profiled_c_shell import CLaunchProfile, profiled_c_shell
+# The tape keys its nodes by ``tensor_identity``, not by ``id``; looking a
+# value up with a memory address finds nothing at all and this lowering then
+# reports a complete, empty program. Same reason as in c_backend_llvm_ssa.
+from ..abstraction import tensor_identity as _identity
 from .tensor_torture import CapturedTortureCase
 
 
@@ -83,7 +87,7 @@ def _required_nodes(captured: CapturedTortureCase):
     required: set[int] = set()
 
     def visit(value):
-        identity = id(value)
+        identity = _identity(value)
         if identity in required:
             return
         node = nodes.get(identity)
@@ -107,12 +111,12 @@ def _emit_c_tape(
     shell_name: str,
 ) -> tuple[str, tuple[str, ...], tuple[COutputSpec, ...]]:
     nodes = _required_nodes(captured)
-    produced = {id(node.ctx["result"]) for node in nodes}
+    produced = {_identity(node.ctx["result"]) for node in nodes}
     feeds = []
     seen = set()
     for node in nodes:
         for operand in node.ctx.get("inputs", ()):
-            identity = id(operand)
+            identity = _identity(operand)
             if (
                 identity not in produced
                 and identity not in seen
@@ -121,10 +125,10 @@ def _emit_c_tape(
                 feeds.append(operand)
                 seen.add(identity)
     names_by_id = {
-        id(value): name for name, value in captured.inputs.items()
+        _identity(value): name for name, value in captured.inputs.items()
     }
     try:
-        feed_names = tuple(names_by_id[id(value)] for value in feeds)
+        feed_names = tuple(names_by_id[_identity(value)] for value in feeds)
     except KeyError as error:
         raise CJITShortfall(
             "C lowering exposed an undeclared torture-case feed "
@@ -139,10 +143,10 @@ def _emit_c_tape(
         *(f"double *output{index}" for index in range(len(output_specs))),
     ]
     pointers = {
-        id(value): f"feed{index}" for index, value in enumerate(feeds)
+        _identity(value): f"feed{index}" for index, value in enumerate(feeds)
     }
     output_pointers = {
-        id(value): f"output{index}"
+        _identity(value): f"output{index}"
         for index, value in enumerate(captured.outputs.values())
     }
     global_declarations = []
@@ -165,16 +169,16 @@ def _emit_c_tape(
             + ", ".join(_c_double(value) for value in values)
             + "};"
         )
-        pointers[id(result)] = symbol
+        pointers[_identity(result)] = symbol
 
     for node_index, node in enumerate(nodes):
         original_operation = str(node.op)
         result = node.ctx["result"]
-        result_id = id(result)
+        result_id = _identity(result)
         if original_operation == "tensor_from_list":
             continue
         operands = tuple(node.ctx.get("inputs", ()))
-        missing = [id(value) for value in operands if id(value) not in pointers]
+        missing = [_identity(value) for value in operands if _identity(value) not in pointers]
         if missing:
             raise CJITShortfall(
                 f"{original_operation} operands have no C storage: {missing}"
@@ -185,7 +189,7 @@ def _emit_c_tape(
                 raise CJITShortfall(
                     f"{original_operation} is not a compatible zero-copy view"
                 )
-            source = pointers[id(operands[0])]
+            source = pointers[_identity(operands[0])]
             if result_id in output_pointers:
                 destination = output_pointers[result_id]
                 statements.append(
@@ -227,7 +231,7 @@ def _emit_c_tape(
             opcode = _OP_NAMES[operation]
             if len(operands) == 1:
                 statements.append(
-                    f"    unary_double({pointers[id(operands[0])]}, "
+                    f"    unary_double({pointers[_identity(operands[0])]}, "
                     f"{destination}, {_count(result)}, {opcode});"
                 )
                 continue
@@ -235,8 +239,8 @@ def _emit_c_tape(
                 left, right = operands
                 left_count, right_count = _count(left), _count(right)
                 if left_count == _count(result) and right_count == _count(result):
-                    left_pointer = pointers[id(left)]
-                    right_pointer = pointers[id(right)]
+                    left_pointer = pointers[_identity(left)]
+                    right_pointer = pointers[_identity(right)]
                     if reverse:
                         left_pointer, right_pointer = right_pointer, left_pointer
                     statements.append(
@@ -246,15 +250,15 @@ def _emit_c_tape(
                     continue
                 if left_count == _count(result) and right_count == 1:
                     statements.append(
-                        f"    binary_scalar_double({pointers[id(left)]}, "
-                        f"{pointers[id(right)]}[0], {destination}, "
+                        f"    binary_scalar_double({pointers[_identity(left)]}, "
+                        f"{pointers[_identity(right)]}[0], {destination}, "
                         f"{_count(result)}, {opcode}, {int(reverse)});"
                     )
                     continue
                 if left_count == 1 and right_count == _count(result):
                     statements.append(
-                        f"    binary_scalar_double({pointers[id(right)]}, "
-                        f"{pointers[id(left)]}[0], {destination}, "
+                        f"    binary_scalar_double({pointers[_identity(right)]}, "
+                        f"{pointers[_identity(left)]}[0], {destination}, "
                         f"{_count(result)}, {opcode}, {int(not reverse)});"
                     )
                     continue
@@ -271,7 +275,7 @@ def _emit_c_tape(
                 )
             statements.append(
                 "    where_double("
-                + ", ".join(pointers[id(value)] for value in operands)
+                + ", ".join(pointers[_identity(value)] for value in operands)
                 + f", {destination}, {_count(result)});"
             )
             continue
@@ -289,8 +293,8 @@ def _emit_c_tape(
             if inner != inner_right:
                 raise CJITShortfall("matmul dimensions do not agree")
             statements.append(
-                f"    matmul_double({pointers[id(left)]}, "
-                f"{pointers[id(right)]}, {destination}, "
+                f"    matmul_double({pointers[_identity(left)]}, "
+                f"{pointers[_identity(right)]}, {destination}, "
                 f"{rows}, {inner}, {columns});"
             )
             continue
@@ -312,7 +316,7 @@ def _emit_c_tape(
                 )
             )
             statements.append(
-                f"    transpose_double({pointers[id(source)]}, {destination}, "
+                f"    transpose_double({pointers[_identity(source)]}, {destination}, "
                 f"shape_{node_index}, axes_{node_index}, {len(shape)});"
             )
             continue
@@ -326,7 +330,7 @@ def _emit_c_tape(
                 "{" + ", ".join(map(str, shape)) + "};"
             )
             statements.append(
-                f"    cumsum_dim_double({pointers[id(source)]}, {destination}, "
+                f"    cumsum_dim_double({pointers[_identity(source)]}, {destination}, "
                 f"shape_{node_index}, {len(shape)}, {dim});"
             )
             continue
@@ -337,7 +341,7 @@ def _emit_c_tape(
             if axis is None:
                 statements.append(
                     f"    {destination}[0] = sum_double("
-                    f"{pointers[id(source)]}, {_count(source)});"
+                    f"{pointers[_identity(source)]}, {_count(source)});"
                 )
                 continue
             shape = tuple(int(size) for size in source.shape)
@@ -347,7 +351,7 @@ def _emit_c_tape(
                 "{" + ", ".join(map(str, shape)) + "};"
             )
             statements.append(
-                f"    reduce_dim_double({pointers[id(source)]}, {destination}, "
+                f"    reduce_dim_double({pointers[_identity(source)]}, {destination}, "
                 f"shape_{node_index}, {len(shape)}, {dim}, 0);"
             )
             continue
@@ -365,7 +369,7 @@ def _emit_c_tape(
                 f"const double *inputs_{node_index}[{len(operands)}];"
             )
             setup_statements.extend(
-                f"inputs_{node_index}[{index}] = {pointers[id(value)]};"
+                f"inputs_{node_index}[{index}] = {pointers[_identity(value)]};"
                 for index, value in enumerate(operands)
             )
             statements.append(
@@ -392,7 +396,7 @@ def _emit_c_tape(
                 f"const double *inputs_{node_index}[{len(operands)}];"
             )
             setup_statements.extend(
-                f"inputs_{node_index}[{index}] = {pointers[id(value)]};"
+                f"inputs_{node_index}[{index}] = {pointers[_identity(value)]};"
                 for index, value in enumerate(operands)
             )
             statements.append(
@@ -470,6 +474,23 @@ class CJITProgram:
         self.output_specs = outputs
         self.source_artifact = source_artifact
         self._shell_address = shell_address
+        # Diagnostics, attached once if at all. ``_trace_site`` is a resident
+        # pointer stamped with the region this program belongs to, so a launch
+        # passes an argument it already holds rather than looking anything up.
+        self._trace_shell: Any | None = None
+        self._trace_site: Any | None = None
+
+    def attach_trace(self, shell: Any, ring: Any, region: int) -> None:
+        """Bind this program to a trace ring, for one region.
+
+        Called once when diagnostics are requested. A program that was never
+        attached launches exactly as before: the logger arguments stay ``None``
+        and, in a shell built without ``trace``, the hook they would feed is
+        not compiled in at all.
+        """
+
+        self._trace_shell = shell
+        self._trace_site = shell.trace_site(ring, region)
 
     def execute(
         self,
@@ -490,7 +511,7 @@ class CJITProgram:
             for spec in self.output_specs
         ]
         arrays = [*feed_arrays, *output_arrays]
-        shell = profiled_c_shell()
+        shell = self._trace_shell or profiled_c_shell()
         context = shell.ffi.new(
             "void *[]",
             [
@@ -503,7 +524,15 @@ class CJITProgram:
             if profiler is not None
             else None
         )
-        profile = shell.launch(self._shell_address, context)
+        if self._trace_site is not None:
+            profile = shell.launch(
+                self._shell_address,
+                context,
+                logger=shell.trace_logger,
+                logger_user=self._trace_site,
+            )
+        else:
+            profile = shell.launch(self._shell_address, context)
         if profiler is not None:
             shell.record(
                 profiler,

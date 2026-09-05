@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import time
 from typing import Any, Callable, Mapping, Sequence
 import hashlib
@@ -28,6 +29,7 @@ _CTYPES = {
     "c_double": ctypes.c_double,
     "c_int32": ctypes.c_int32,
     "c_int64": ctypes.c_int64,
+    "c_uint8": ctypes.c_uint8,
 }
 _DTYPES = {
     "c_bool": np.dtype("bool"),
@@ -35,12 +37,61 @@ _DTYPES = {
     "c_double": np.dtype("float64"),
     "c_int32": np.dtype("int32"),
     "c_int64": np.dtype("int64"),
+    "c_uint8": np.dtype("uint8"),
 }
 
 _RUNTIME_OPTION_NAMES = {
     "frames", "headless", "profile", "profile_ignore_transfer",
     "profile_warmup",
 }
+
+
+def _file_option_name(port_name: str) -> str:
+    return "file_port__" + re.sub(r"[^A-Za-z0-9_]", "_", str(port_name))
+
+
+@dataclass(frozen=True)
+class NativeFilePortValue:
+    name: str
+    path: Path
+    data: np.ndarray
+
+    @property
+    def byte_length(self) -> int:
+        return int(self.data.size)
+
+
+class NativeFilePortHandler:
+    """Resolve descriptor-declared file ports to stable native byte storage."""
+
+    def __init__(self, manifest: Mapping[str, Any], options: Mapping[str, Any]):
+        self.values: dict[str, NativeFilePortValue] = {}
+        for port in manifest.get("system_ports", ()):
+            if port.get("kind") != "file" or port.get("direction") not in {
+                "input", "bidirectional",
+            }:
+                continue
+            name = str(port["name"])
+            supplied = options.get(_file_option_name(name))
+            if not supplied:
+                if port.get("optional"):
+                    continue
+                raise ValueError(f"native shell requires file port {name!r}")
+            path = Path(str(supplied)).resolve()
+            if not path.is_file():
+                raise ValueError(f"native file port {name!r} is not a file: {path}")
+            data = np.frombuffer(path.read_bytes(), dtype=np.uint8).copy()
+            self.values[name] = NativeFilePortValue(name, path, data)
+
+    def resource(self, port_name: str, field: str) -> Any:
+        value = self.values.get(port_name)
+        if value is None:
+            raise KeyError(f"native file port {port_name!r} has no supplied value")
+        if field == "data":
+            return value.data
+        if field == "length":
+            return value.byte_length
+        raise KeyError(f"native file port {port_name!r} has no field {field!r}")
 
 
 @dataclass(frozen=True)
@@ -154,6 +205,10 @@ def compile_ast_fortran_io_shell(
 ) -> CompiledNativeShell:
     """Compile and generate one native shell using only declarative IO."""
 
+    from .compiler_entrypoints import warn_legacy_source_compiler
+
+    warn_legacy_source_compiler("compile_ast_fortran_io_shell")
+
     from ..common.tensors.accelerator_backends.aot_compile import compile_ast_aot
     from .backend_sources import collect_backend_sources
     from .shell_io import attach_shell_io
@@ -227,7 +282,7 @@ def compile_and_launch_ast_fortran_io(
     values = vars(parsed)
     compile_options = {
         key: value for key, value in values.items()
-        if key not in _RUNTIME_OPTION_NAMES
+        if key not in _RUNTIME_OPTION_NAMES and not key.startswith("file_port__")
     }
     compiled = compile_ast_fortran_io_shell(
         source, entrypoint, manifest, compile_options
@@ -263,6 +318,18 @@ def _option_parser(manifest: Mapping[str, Any]) -> argparse.ArgumentParser:
                 default=option["default"],
                 help=option.get("help") or None,
             )
+    for port in manifest.get("system_ports", ()):
+        if port.get("kind") != "file" or port.get("direction") not in {
+            "input", "bidirectional",
+        }:
+            continue
+        name = str(port["name"])
+        parser.add_argument(
+            "--file-" + name.replace("_", "-"),
+            dest=_file_option_name(name),
+            required=not bool(port.get("optional")),
+            help="path supplied to the " + name + " file system port",
+        )
     parser.add_argument("--frames", type=int, default=0)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
@@ -296,13 +363,24 @@ class NativeShellRuntime:
         self.manifest = self.contract["requirements"]
         self.options = dict(options)
         bindings = self.manifest.get("bindings", ())
+        system_ports = self.manifest.get("system_ports", ())
         entry_names = {binding["entry_point"] for binding in bindings}
+        entry_names.update(
+            str(port["entry_point"])
+            for port in system_ports if port.get("entry_point")
+        )
         if len(entry_names) != 1:
             raise ValueError("generated native shell requires one bound entry point")
         self.entry = _entry(self.api, next(iter(entry_names)))
         self.bindings = {
             binding["parameter"]: binding["resource"] for binding in bindings
         }
+        self.system_fields = {
+            str(field["parameter"]): (str(port["name"]), str(field["name"]))
+            for port in system_ports
+            for field in port.get("fields", ())
+        }
+        self.file_ports = NativeFilePortHandler(self.manifest, self.options)
         self.width = int(self.options.get("width", 640))
         self.height = int(self.options.get("height", 480))
         if self.width < 2 or self.height < 2:
@@ -323,12 +401,21 @@ class NativeShellRuntime:
             self._outputs[parameter["name"]] = [
                 np.empty(shape, dtype=dtype), np.empty(shape, dtype=dtype)
             ]
-        if not self._outputs:
+        has_display = any(
+            request.get("capability") == "display_double_buffer"
+            for request in self.manifest.get("requests", ())
+        )
+        if has_display and not self._outputs:
             raise ValueError("display capability has no bound output parameter")
-        display = next(
+        display = next((
             request for request in self.manifest["requests"]
             if request["capability"] == "display_double_buffer"
-        )
+        ), None)
+        if display is None:
+            self._dll_directory = None
+            self.library = ctypes.CDLL(str(Path(library_path).resolve()))
+            self.native = getattr(self.library, self.entry["symbol"])
+            return
         pixel_format = (display.get("attributes") or {}).get(
             "pixel_format", "rgba8"
         )
@@ -383,6 +470,15 @@ class NativeShellRuntime:
             return self.options[name.split(".", 1)[1]]
         raise KeyError(f"native shell does not provide resource {name!r}")
 
+    def _parameter_resource(self, parameter_name: str, elapsed: float) -> Any:
+        system = self.system_fields.get(parameter_name)
+        if system is not None:
+            return self.file_ports.resource(*system)
+        resource = self.bindings.get(parameter_name)
+        if resource is None:
+            raise ValueError(f"unbound native input {parameter_name!r}")
+        return self._resource(resource, elapsed)
+
     def execute(self, elapsed: float) -> int:
         """Complete one compiled generation without acquiring its display plane."""
 
@@ -404,9 +500,7 @@ class NativeShellRuntime:
                     )
                 value = self._outputs[parameter["name"]][back]
             else:
-                if resource is None:
-                    raise ValueError(f"unbound native input {parameter['name']!r}")
-                value = self._resource(resource, elapsed)
+                value = self._parameter_resource(parameter["name"], elapsed)
             if parameter["passing"] == "value":
                 arguments.append(ctype(value))
                 argument_types.append(ctype)
@@ -426,11 +520,13 @@ class NativeShellRuntime:
     def display_plane(self) -> np.ndarray:
         """Acquire the current display plane, including target readback if needed."""
 
+        if not self._outputs:
+            raise RuntimeError("compiled program has no display output plane")
         return next(iter(self._outputs.values()))[self.front]
 
     def frame(self, elapsed: float) -> np.ndarray:
         self.execute(elapsed)
-        return self.display_plane()
+        return self.display_plane() if self._outputs else np.empty(0, dtype=np.uint8)
 
     def rgb(self, pixels: np.ndarray, elapsed: float) -> np.ndarray:
         display = next(
@@ -506,13 +602,20 @@ def launch_native_shell(
             )
             print(json.dumps(result.to_mapping(), sort_keys=True))
             return 0
-        if headless:
+        has_display = any(
+            request.get("capability") == "display_double_buffer"
+            for request in manifest.get("requests", ())
+        )
+        if headless or not has_display:
             for index in range(frame_limit or 1):
                 runtime.frame(index / float(options.get("fps", 30.0)))
-            print(
-                f"rendered {runtime.generation} frame(s), "
-                f"{runtime.width}x{runtime.height}"
-            )
+            if has_display:
+                print(
+                    f"rendered {runtime.generation} frame(s), "
+                    f"{runtime.width}x{runtime.height}"
+                )
+            else:
+                print(f"executed {runtime.generation} generation(s)")
             return 0
         import pygame
 
@@ -592,6 +695,8 @@ __all__ = [
     "CompiledNativeShell",
     "ArrivalProfile",
     "NativeShellRuntime",
+    "NativeFilePortHandler",
+    "NativeFilePortValue",
     "emit_python_native_shell",
     "compile_ast_fortran_io_shell",
     "compile_and_launch_ast_fortran_io",

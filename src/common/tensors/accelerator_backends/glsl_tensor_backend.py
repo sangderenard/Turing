@@ -27,7 +27,7 @@ from .glsl_backend import (
     index_assign_index_chunk,
     index_assign_offsets_chunk,
     index_select_chunk,
-    matmul_chunks,
+    glslblas_gemm,
     permute_chunk,
     repeat_chunk,
     reduce_chunk,
@@ -55,7 +55,7 @@ class GLSLTensorOperations(AbstractTensor):
 
     def _apply_operator__(self, op: str, left: Any, right: Any):
         if op in {"matmul", "rmatmul", "imatmul"}:
-            return matmul_chunks(left, right, reverse=op == "rmatmul")
+            return glslblas_gemm(left, right, reverse=op == "rmatmul")
         return run_op(op, left, right)
 
     def where_(self, x, y):

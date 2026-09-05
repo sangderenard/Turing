@@ -17,18 +17,46 @@ one, or many of these numeric segments.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from numbers import Real
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
 
 @dataclass
 class Meta:
-    """Per-id snapshot of tensor metadata."""
+    """Per-id snapshot of tensor metadata.
+
+    A value can either own storage (the default: ``source_id`` is ``None``)
+    or be an explicit strided view over another value's buffer -- the same
+    offset/stride composition ``nodus``'s ``TensorDesc``/``TensorStrides``
+    use for its native tensor views. ``offset``/``stride`` are measured in
+    elements of the source buffer, addressed per flat program index ``i`` as
+    ``source[offset + i * stride]``. This is IR-level and backend-agnostic:
+    any backend's per-index addressing consults it instead of assuming every
+    operand is its own contiguous, stride-1 buffer.
+
+    ``shape`` is the concrete extent observed during the one discovery trace
+    that recorded this value -- correct for that trace, not necessarily for
+    every real run.  ``shape_source_ids`` gives each dimension the same
+    "usually absent, sometimes a real reference" treatment ``source_id``
+    already gives storage: ``None`` at a position means that dimension is a
+    genuine compile-time constant (the overwhelming common case, and the
+    only case any backend consumes today); a ProcessGraph node id at a
+    position instead means that dimension's real extent is whatever that
+    node computes at actual runtime, and ``shape[i]`` is only the value one
+    discovery trace happened to observe there.  A dimension whose origin
+    cannot be traced at all falls back to ``None`` here the same way any
+    other unresolvable value in this compiler becomes a plain ``Input`` --
+    this field records a known origin, it does not invent one.
+    """
 
     shape: Iterable[int] | None = None
     dtype: str | None = None
     device: str | None = None
+    source_id: int | None = None
+    offset: int = 0
+    stride: int = 1
+    shape_source_ids: tuple[int | None, ...] | None = None
 
 
 @dataclass
@@ -42,6 +70,160 @@ class OpStep:
     result_id: int = -1
     mode_sensitive: bool = False
     level: Optional[int] = None
+
+
+def resolve_view_source(meta: Mapping[int, Meta] | None, value_id: int) -> int:
+    """The buffer-owning value id backing ``value_id`` (itself, if none)."""
+
+    if meta is None:
+        return value_id
+    entry = meta.get(value_id)
+    if entry is None or entry.source_id is None:
+        return value_id
+    return resolve_view_source(meta, entry.source_id)
+
+
+def view_offset_stride(meta: Mapping[int, Meta] | None, value_id: int) -> tuple[int, int]:
+    """``(offset, stride)`` in elements for ``value_id`` against its buffer."""
+
+    if meta is None:
+        return 0, 1
+    entry = meta.get(value_id)
+    if entry is None:
+        return 0, 1
+    return entry.offset, entry.stride
+
+
+# Trailing-axis reductions with a known, associative binary fold and
+# identity element -- the set this IR can unroll into elementwise steps.
+# Fold op names are the canonical ELEMENTWISE_BINARY vocabulary, since each
+# fold becomes an ordinary binary OpStep between two lane views.
+AXIS_REDUCTION_FOLDS: dict[str, tuple[str, float]] = {
+    "sum": ("add", 0.0),
+    "mean": ("add", 0.0),
+    "prod": ("mul", 1.0),
+    "min": ("minimum", float("inf")),
+    "max": ("maximum", float("-inf")),
+}
+
+
+def unroll_feed_axis_reductions(program: "FusedProgram") -> "FusedProgram":
+    """Replace a trailing-axis reduction over a dense feed buffer with an
+    elementwise fold over ``K`` strided views of that same buffer.
+
+    A flat ``run(count, ...)`` ABI has no memory contract for an externally
+    supplied ``(..., K)`` feed -- nothing describes how its layout maps to a
+    single byte offset -- so a reduction over a genuine feed buffer has
+    always been an unlowerable shortfall for such a backend. The view
+    descriptor on :class:`Meta` (``source_id``/``offset``/``stride``) now
+    gives every K-th lane of that same buffer its own value id, so the
+    reduction becomes an ordinary elementwise fold: no backend needs a
+    dedicated reduction control path to run it.
+
+    Only reductions whose operand is itself a feed (a value with no
+    producing step) are eligible. A reduction over a value computed inside
+    the program -- e.g. a broadcast composition of two lower-rank feeds --
+    is left untouched; a backend that recomputes such a grid per fold step
+    keeps doing so, unchanged by this pass.
+    """
+
+    meta: dict[int, Meta] = dict(program.meta or {})
+    producers = {step.result_id for step in program.steps}
+    used_ids = {step.result_id for step in program.steps} | set(program.feeds)
+    next_id = (max(used_ids) + 1) if used_ids else 0
+
+    def fresh_id() -> int:
+        nonlocal next_id
+        value_id = next_id
+        next_id += 1
+        return value_id
+
+    rewritten: List[OpStep] = []
+    changed = False
+    new_feed_ids: set[int] = set()
+    retired_feed_ids: set[int] = set()
+    for step in program.steps:
+        axis = step.attrs.get("axis")
+        fold = AXIS_REDUCTION_FOLDS.get(step.op_name)
+        if axis is None or fold is None or len(step.input_ids) != 1:
+            rewritten.append(step)
+            continue
+        source_id = step.input_ids[0]
+        if source_id in producers:
+            rewritten.append(step)
+            continue
+        entry = meta.get(source_id)
+        shape = tuple(entry.shape) if entry is not None and entry.shape is not None else None
+        if shape is None or not shape:
+            rewritten.append(step)
+            continue
+        norm_axis = axis if axis >= 0 else len(shape) + axis
+        if norm_axis != len(shape) - 1:
+            rewritten.append(step)
+            continue
+        lanes = int(shape[-1])
+        if lanes <= 0:
+            rewritten.append(step)
+            continue
+        changed = True
+        retired_feed_ids.add(source_id)
+        reduced_shape = shape[:-1]
+        base_source = resolve_view_source(program.meta, source_id)
+        base_offset, base_stride = view_offset_stride(program.meta, source_id)
+        fold_op, _identity = fold
+        final_id = fresh_id() if step.op_name == "mean" else step.result_id
+        if lanes == 1:
+            # A single lane needs no fold; the sole view already is the value.
+            meta[final_id] = Meta(
+                shape=reduced_shape, dtype=entry.dtype, device=entry.device,
+                source_id=base_source, offset=base_offset, stride=base_stride,
+            )
+            new_feed_ids.add(final_id)
+        else:
+            view_ids = []
+            for lane in range(lanes):
+                view_id = fresh_id()
+                meta[view_id] = Meta(
+                    shape=reduced_shape, dtype=entry.dtype, device=entry.device,
+                    source_id=base_source,
+                    offset=base_offset + lane * base_stride,
+                    stride=base_stride * lanes,
+                )
+                view_ids.append(view_id)
+            new_feed_ids.update(view_ids)
+            acc = view_ids[0]
+            for index, lane_id in enumerate(view_ids[1:], start=1):
+                is_last = index == lanes - 1
+                rewritten.append(OpStep(
+                    step_id=len(rewritten), op_name=fold_op,
+                    input_ids=[acc, lane_id],
+                    result_id=final_id if is_last else fresh_id(),
+                ))
+                acc = rewritten[-1].result_id
+        if step.op_name == "mean":
+            rewritten.append(OpStep(
+                step_id=len(rewritten), op_name="truediv",
+                input_ids=[final_id], attrs={"right_scalar": float(lanes)},
+                result_id=step.result_id,
+            ))
+
+    if not changed:
+        return program
+
+    rewritten = [
+        OpStep(
+            step_id=index, op_name=step.op_name, input_ids=step.input_ids,
+            attrs=step.attrs, result_id=step.result_id,
+            mode_sensitive=step.mode_sensitive, level=step.level,
+        )
+        for index, step in enumerate(rewritten)
+    ]
+    feeds = (set(program.feeds) - retired_feed_ids) | new_feed_ids
+    return FusedProgram(
+        version=program.version, feeds=feeds, steps=rewritten,
+        outputs=dict(program.outputs), state_in=program.state_in,
+        meta=meta, extras=program.extras,
+    )
 
 
 @dataclass
@@ -132,6 +314,7 @@ ELEMENTWISE_UNARY = frozenset(
         "exp",
         "log",
         "tanh",
+        "sigmoid",
         "sin",
         "cos",
         "tan",
@@ -209,10 +392,73 @@ def canonical_elementwise_op(op: str) -> tuple[str, bool]:
     # symbolic_process_graph.py's _SYMPY_TO_CANONICAL) rather than this
     # module's lowercase tape-op vocabulary. Accept that spelling here, once,
     # instead of every caller lowercasing before calling in.
-    lowered = name.lower()
+    lowered_name = name.lower()
+    lowered = ELEMENTWISE_ALIASES.get(lowered_name, lowered_name)
     if lowered != name and lowered in known:
         return lowered, False
+    if lowered_name[:1] in ("i", "r"):
+        base = ELEMENTWISE_ALIASES.get(lowered_name[1:], lowered_name[1:])
+        if base in known:
+            return base, lowered_name[0] == "r"
     raise KeyError(op)
+
+
+def canonicalize_elementwise_steps(program: FusedProgram) -> FusedProgram:
+    """Normalize elementwise step spellings without altering structural ops.
+
+    Frontends retain their natural vocabulary (for example Python AST
+    ``Div`` or reflected ``rsub``).  Backends should consume the common
+    elementwise vocabulary, including the explicit ``reverse`` attribute,
+    rather than each carrying another frontend-specific translation table.
+    """
+
+    steps: list[OpStep] = []
+    changed = False
+    for step in program.steps:
+        # Python builtins and tensor methods share the source spellings
+        # ``max``/``min``.  Their arity is the semantic distinction: one
+        # tensor operand is a reduction, while two operands (including a
+        # captured scalar attribute) are the binary elementwise operation.
+        # Resolve that ambiguity in the common IR canonicalizer so every
+        # backend receives one stable identity.
+        binary_extrema = (
+            step.op_name in {"max", "min"}
+            and (
+                len(step.input_ids) == 2
+                or (
+                    len(step.input_ids) == 1
+                    and any(
+                        key in step.attrs
+                        for key in ("left_scalar", "right_scalar")
+                    )
+                )
+            )
+        )
+        if binary_extrema:
+            normalized = replace(
+                step,
+                op_name=(
+                    "maximum" if step.op_name == "max" else "minimum"
+                ),
+            )
+            steps.append(normalized)
+            changed = changed or normalized != step
+            continue
+        try:
+            op_name, prefix_reverse = canonical_elementwise_op(step.op_name)
+        except KeyError:
+            steps.append(step)
+            continue
+        attrs = dict(step.attrs)
+        reverse = bool(attrs.get("reverse", False)) ^ prefix_reverse
+        if reverse:
+            attrs["reverse"] = True
+        else:
+            attrs.pop("reverse", None)
+        normalized = replace(step, op_name=op_name, attrs=attrs)
+        changed = changed or normalized != step
+        steps.append(normalized)
+    return replace(program, steps=steps) if changed else program
 
 
 def ordered_feed_ids(program: FusedProgram) -> tuple[int, ...]:

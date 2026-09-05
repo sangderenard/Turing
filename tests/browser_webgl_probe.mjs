@@ -80,7 +80,10 @@ try {
     return value && value.ready === "complete" && value.href === pageURL;
   });
   const expression = `(async () => {
-    const deadline = performance.now() + 30000;
+    // Deep divided programs may publish hundreds of immutable Wasm cards.
+    // Give cold HTTP caches enough time; the measured execution time below
+    // remains the runner's own interval and does not include this wait.
+    const deadline = performance.now() + 120000;
     while (!window.TuringShaderLiaison && performance.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 20));
     }
@@ -99,6 +102,18 @@ try {
     const pixel = new Uint8Array(4);
     liaison.gl.readPixels(x, y, 1, 1, liaison.gl.RGBA,
                           liaison.gl.UNSIGNED_BYTE, pixel);
+    const frame = liaison.wasm ? liaison.wasm.outputFrame() : null;
+    const globalStateSpreads = {};
+    for (const output of frame ? frame.outputs : []) {
+      if (!/^(next_entity(?:_b|_c)?_(?:x|y)|next_time)$/.test(output.name)) continue;
+      let minimum = Infinity;
+      let maximum = -Infinity;
+      for (const value of output.values) {
+        minimum = Math.min(minimum, Number(value));
+        maximum = Math.max(maximum, Number(value));
+      }
+      globalStateSpreads[output.name] = maximum - minimum;
+    }
     return {
       error: liaison.canvas.dataset.error || null,
       revision: liaison.wasm ? liaison.wasm.outputFrame().revision : -1,
@@ -109,6 +124,9 @@ try {
       height: liaison.canvas.height,
       center: Array.from(pixel),
       glError: liaison.gl.getError(),
+      threadProfile: window.TuringWasmThreads
+        ? window.TuringWasmThreads.profile() : null,
+      globalStateSpreads,
     };
   })()`;
   const evaluated = await request("Runtime.evaluate", {

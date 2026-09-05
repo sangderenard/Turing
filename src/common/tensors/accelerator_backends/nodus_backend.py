@@ -211,13 +211,21 @@ class NodusTensorOperations(NumPyTensorOperations):
             array, scalar, scalar_on_left = (
                 (a, b, False) if a_is_array else (b, a, True)
             )
+            # NumPy's promotion rule decides the result dtype (bool * 0.0 is
+            # float64, int * 2.5 is float64); the arena computes in that
+            # dtype so the result type stays identical to NumPy's -- and so
+            # bool masks, which the arena's numeric executor cannot take
+            # directly, arrive already promoted.
+            result_dtype = np.result_type(array, scalar)
+            if array.dtype != result_dtype:
+                array = array.astype(result_dtype)
             handle = self._push(arena, array)
             try:
                 out = arena.scalar(
                     op, handle, float(scalar), scalar_on_left=scalar_on_left
                 )
                 try:
-                    return self._pull(arena, out, array.dtype, array.shape)
+                    return self._pull(arena, out, result_dtype, array.shape)
                 finally:
                     arena.destroy(out)
             finally:
@@ -236,13 +244,20 @@ class NodusTensorOperations(NumPyTensorOperations):
         # with NumPy's rule keeps the result type identical to what
         # NumPyTensorOperations would have produced.
         result_dtype = np.result_type(left_array, right_array)
-        left = self._push(arena, left_array.astype(result_dtype, copy=False))
-        right = self._push(arena, right_array.astype(result_dtype, copy=False))
+        # NumPy's bool arithmetic is logical (mask * mask stays bool); the
+        # arena's elementwise executor computes numeric dtypes only. Compute
+        # in uint8 and cast the pull back, so the result type stays identical
+        # to what NumPyTensorOperations would have produced.
+        compute_dtype = np.dtype(np.uint8) if result_dtype == np.bool_ else result_dtype
+        left = self._push(arena, left_array.astype(compute_dtype, copy=False))
+        right = self._push(arena, right_array.astype(compute_dtype, copy=False))
         try:
-            out = arena.create(self._dtype_code(np.empty(0, result_dtype)), result_shape)
+            out = arena.create(self._dtype_code(np.empty(0, compute_dtype)), result_shape)
             try:
                 arena.binary(op, left, right, out=out)
-                return self._pull(arena, out, result_dtype, result_shape)
+                pulled = self._pull(arena, out, compute_dtype, result_shape)
+                return (pulled.astype(np.bool_)
+                        if compute_dtype != result_dtype else pulled)
             finally:
                 arena.destroy(out)
         finally:

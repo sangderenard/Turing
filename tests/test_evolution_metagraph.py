@@ -1,14 +1,23 @@
 import numpy as np
+import pytest
+import threading
+import time
+from types import SimpleNamespace
 
 from src.compiler.evolution_metagraph import (
     EvolutionComponentRef,
     EvolutionMetaGraph,
+    extend_compiled_execution_lineage,
+    record_compiled_execution_evolution,
     record_evolution,
     record_fused_program_evolution,
 )
 from src.compiler.control_source import (
+    ControlDeploymentLane,
+    ControlDeploymentRegion,
     ControlProgram,
     LoopBlock,
+    ParallelDeployment,
     StatementBlock,
 )
 from src.common.tensors.fused_ir import FusedProgram, OpStep
@@ -16,8 +25,12 @@ from src.compiler.precompile_to_ssa import (
     lower_control_program_to_ssa,
     lower_fused_program_to_ssa,
 )
+from src.compiler.autogenesis import compile_source_autogenesis
 from src.rendering.precompiled_graph import (
+    ExpansionEmergencyClamp,
+    ExpansionLimitExceeded,
     EvolutionVisualProjector,
+    LiveEvolutionEventBuffer,
     SpringVisualSimulation,
 )
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
@@ -54,6 +67,7 @@ def test_process_graph_updates_optional_metagraph_in_the_hot_ingestion_loop():
 def kernel(x, y):
     return (x + y) * 3
 """)
+        levels = dict(graph.compute_levels("asap", "dependency"))
 
     snapshot = meta.snapshot()
     process_graph = next(item for item in snapshot.graphs if item.stage == "process-graph")
@@ -68,6 +82,13 @@ def kernel(x, y):
     assert len(spawned) == graph.G.number_of_nodes()
     assert len(links) == graph.G.number_of_edges()
     assert any(event.detail["kind"] == "add" for event in spawned)
+    schedule = next(
+        event for event in snapshot.events
+        if event.kind == "graph-schedule-finalized"
+    )
+    assert dict(schedule.detail["levels"]) == {
+        str(node_id): level for node_id, level in levels.items()
+    }
 
 
 def test_exact_value_identity_spawns_precompile_then_ssa_geometry():
@@ -159,3 +180,321 @@ def test_handoff_geometry_spawns_at_source_then_moves_to_stage_anchor():
     for _ in range(30):
         simulation.step(1.0 / 60.0)
     assert not np.array_equal(simulation.positions[index[target_key]], before)
+
+
+def test_visual_projection_does_not_promote_spawn_provenance_to_an_edge():
+    meta = EvolutionMetaGraph()
+    graph = meta.open_graph("process-graph", "spawn-lineage")
+    source = meta.component(graph, "source", label="source", kind="input")
+    target = meta.component(
+        graph,
+        "target",
+        label="target",
+        kind="operation",
+        consumes=(source,),
+    )
+    projector = EvolutionVisualProjector()
+    events = meta.snapshot().events
+
+    projector.apply(events[0])
+    projector.apply(events[1])
+    assert {node.key for node in projector.graph().nodes} == {
+        f"{source.graph_id}/{source.local_id}",
+    }
+
+    projected = projector.apply(events[2])
+    assert {node.key for node in projected.nodes} == {
+        f"{source.graph_id}/{source.local_id}",
+        f"{target.graph_id}/{target.local_id}",
+    }
+    assert projected.edges == ()
+
+
+def test_visual_projection_replays_only_compiler_authored_schedule_groups():
+    meta = EvolutionMetaGraph()
+    graph = meta.open_graph("process-graph", "scheduled")
+    source = meta.component(graph, "source", label="source", kind="input")
+    target = meta.component(graph, "target", label="target", kind="operation")
+    meta.relationship(graph, source, target, role="argument")
+    meta.finalize_schedule(
+        graph,
+        {"source": 4, "target": 9},
+        method="alap",
+        order="dependency",
+    )
+    meta.close_graph(graph)
+
+    projector = EvolutionVisualProjector()
+    for event in meta.snapshot().events:
+        projector.apply(event, materialize=False)
+    projected = projector.graph()
+    nodes = {node.label: node for node in projected.nodes}
+
+    assert nodes["source"].level == 4
+    assert nodes["source"].schedule_group == 0
+    assert nodes["target"].level == 9
+    assert nodes["target"].schedule_group == 1
+    assert {node.state for node in projected.nodes} == {"finalized"}
+    assert projected.edges == (
+        projected.edges[0].__class__(
+            f"{graph.id}/source", f"{graph.id}/target", "argument"
+        ),
+    )
+
+
+def test_compiled_execution_plan_retains_loops_deployments_and_region_membership():
+    left = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[OpStep(0, "sin", [1], {}, 2)],
+        outputs={"result": 2},
+    )
+    right = FusedProgram(
+        version=1,
+        feeds={3},
+        steps=[OpStep(0, "cos", [3], {}, 4)],
+        outputs={"result": 4},
+    )
+    control = ControlProgram(
+        LoopBlock(
+            "iteration", "0", "4", "1",
+            ParallelDeployment((
+                StatementBlock(("__scheduled_region_0__",)),
+                StatementBlock(("__scheduled_region_1__",)),
+            )),
+        ),
+        region_indices=(0, 1),
+        deployment_regions=(ControlDeploymentRegion(
+            region_id=7,
+            kind="parallel_iterations",
+            schedule="independent_lanes",
+            lanes=(
+                ControlDeploymentLane(0, region_indices=(0,)),
+                ControlDeploymentLane(1, region_indices=(1,)),
+            ),
+        ),),
+    )
+
+    with record_evolution() as meta:
+        left_graph = record_fused_program_evolution(left, label="left")
+        right_graph = record_fused_program_evolution(right, label="right")
+        execution_graph = record_compiled_execution_evolution(
+            control,
+            region_graphs={0: left_graph, 1: right_graph},
+            region_programs={0: left, 1: right},
+        )
+        left_function, shortfalls = lower_fused_program_to_ssa(left)
+        assert not shortfalls
+        extend_compiled_execution_lineage(execution_graph)
+
+    snapshot = meta.snapshot()
+    plan = next(
+        event for event in snapshot.events
+        if event.kind == "compiled-execution-plan-finalized"
+    )
+    assert execution_graph is not None
+    assert plan.graph == execution_graph
+    assert {frame["kind"] for frame in plan.detail["frames"]} >= {
+        "loop-header", "deployment", "deployment-lanes",
+        "deployment-join", "loop-latch", "loop-exit",
+    }
+    roles = {
+        event.detail.get("role")
+        for event in snapshot.events
+        if event.kind == "component-link"
+        and event.graph == execution_graph
+    }
+    assert {"loop-back", "deployment-lane", "deployment-join",
+            "dispatch-membership"} <= roles
+
+    projector = EvolutionVisualProjector()
+    for event in snapshot.events:
+        projector.apply(event, materialize=False)
+    projected = projector.graph()
+    left_nodes = [node for node in projected.nodes if node.network == left_graph.id]
+    right_nodes = [node for node in projected.nodes if node.network == right_graph.id]
+    execution_nodes = [
+        node for node in projected.nodes if node.network == execution_graph.id
+    ]
+    assert left_nodes and all(node.execution_groups for node in left_nodes)
+    assert right_nodes and all(node.execution_groups for node in right_nodes)
+    left_ssa = meta.graph_for_artifact(left_function)
+    assert left_ssa is not None
+    assert all(
+        node.execution_groups
+        for node in projected.nodes
+        if node.network == left_ssa.id
+    )
+    assert any(node.execution_kind == "loop-header" for node in execution_nodes)
+    assert any(node.execution_kind == "deployment-lanes" for node in projected.nodes)
+
+
+def test_class_branch_growth_reports_without_perturbing_spring_physics():
+    meta = EvolutionMetaGraph()
+    source_graph = meta.open_graph("process-graph", "source")
+    lowered_graph = meta.open_graph("ssa", "lowered")
+    class_ref = meta.component(
+        source_graph,
+        "class",
+        label="LeakyLayer",
+        kind="ClassDef",
+        attributes={
+            "source_class": "LeakyLayer",
+            "source_scope": ("LeakyLayer",),
+            "boundary_rule": "python.LeakyLayer.stopgap",
+        },
+    )
+    previous = class_ref
+    for index in range(12):
+        target = meta.component(
+            lowered_graph,
+            index,
+            label=f"expanded_{index}",
+            kind="instruction",
+        )
+        meta.handoff(target, (previous,), transformation="expand")
+        previous = target
+
+    projector = EvolutionVisualProjector()
+    simulation = SpringVisualSimulation(projector.graph())
+    for event in meta.snapshot().events:
+        simulation.replace_graph(projector.apply(event))
+    before_positions = simulation.positions.copy()
+    before_velocities = simulation.velocities.copy()
+    simulation.set_haze(projector.haze_scores())
+
+    report = projector.report()
+    assert report.hotspots[0].owner == "class LeakyLayer"
+    assert report.hotspots[0].node_count == 13
+    assert report.hotspots[0].depth == 12
+    assert report.hotspots[0].height == 12
+    assert report.hotspots[0].stages == (("process-graph", 1), ("ssa", 12))
+    assert report.hotspots[0].boundaries == (
+        "python.LeakyLayer.stopgap",
+    )
+    assert np.array_equal(simulation.positions, before_positions)
+    assert np.array_equal(simulation.velocities, before_velocities)
+    class_key = f"{class_ref.graph_id}/{class_ref.local_id}"
+    class_index = simulation._keys.index(class_key)
+    assert simulation.fluxspring.visual_haze[class_index] > 0.0
+
+
+def test_emergency_growth_clamp_aborts_the_event_thread_with_culprit():
+    meta = EvolutionMetaGraph()
+    guard = ExpansionEmergencyClamp(
+        max_depth=1,
+        max_height=1,
+        max_nodes_per_branch=100,
+        check_interval=1,
+    )
+    meta.subscribe(guard)
+    source_graph = meta.open_graph("process-graph", "source")
+    target_graph = meta.open_graph("ssa", "target")
+    root = meta.component(
+        source_graph,
+        "class",
+        label="UnboundedLayer",
+        kind="ClassDef",
+        attributes={"source_class": "UnboundedLayer"},
+    )
+    first = meta.component(target_graph, 1, label="one", kind="instruction")
+    meta.handoff(first, (root,), transformation="expand")
+    second = meta.component(target_graph, 2, label="two", kind="instruction")
+
+    with pytest.raises(ExpansionLimitExceeded, match="class UnboundedLayer") as caught:
+        meta.handoff(second, (first,), transformation="expand")
+    assert caught.value.depth == 2
+    assert caught.value.height == 2
+
+
+def test_live_event_buffer_never_backpressures_compiler():
+    stream = LiveEvolutionEventBuffer(max_backlog=1)
+    stream.activate()
+    stream.publish("node")
+    published_edge = threading.Event()
+
+    def publish_edge() -> None:
+        stream.publish("edge")
+        published_edge.set()
+
+    worker = threading.Thread(target=publish_edge)
+    worker.start()
+    assert published_edge.wait(1.0)
+    assert len(stream) == 2
+    assert stream.pop() == "node"
+    assert stream.pop() == "edge"
+    stream.close()
+    worker.join(timeout=1.0)
+
+
+def test_live_event_buffer_repairs_replay_startup_race_by_compiler_sequence():
+    stream = LiveEvolutionEventBuffer(max_backlog=4)
+    stream.publish(SimpleNamespace(sequence=1, kind="component-spawn"))
+    stream.publish(SimpleNamespace(sequence=0, kind="graph-open"))
+    stream.activate()
+
+    assert stream.pop().sequence == 0
+    assert stream.pop().sequence == 1
+    stream.close()
+
+
+def test_projector_reveals_node_then_edge_on_their_exact_events():
+    meta = EvolutionMetaGraph()
+    graph = meta.open_graph("process-graph", "source")
+    first = meta.component(graph, "first", label="first", kind="Name")
+    second = meta.component(graph, "second", label="second", kind="Call")
+    meta.relationship(graph, first, second, role="argument")
+
+    projector = EvolutionVisualProjector()
+    snapshots = [projector.apply(event) for event in meta.snapshot().events]
+
+    assert [len(snapshot.nodes) for snapshot in snapshots] == [0, 1, 2, 2]
+    assert [len(snapshot.edges) for snapshot in snapshots] == [0, 0, 0, 1]
+
+
+def test_autogenesis_exposes_compiler_run_before_aot_source_graph():
+    meta = EvolutionMetaGraph()
+    compile_source_autogenesis(
+        "def kernel():\n    return 1\n",
+        "kernel",
+        {},
+        metagraph=meta,
+        final_target=None,
+    )
+    snapshot = meta.snapshot()
+    run_graph = next(graph for graph in snapshot.graphs if graph.stage == "compiler-run")
+    run_events = [event for event in snapshot.events if event.graph == run_graph]
+
+    assert run_events[0].kind == "graph-open"
+    assert run_events[1].kind == "component-spawn"
+    assert run_events[1].detail["label"] == "compile requested"
+    assert any(
+        event.kind == "component-link"
+        and event.detail.get("role") == "phase-order"
+        for event in run_events
+    )
+    execution_graph = next(
+        graph for graph in snapshot.graphs if graph.stage == "execution-plan"
+    )
+    execution_event = next(
+        event for event in snapshot.events
+        if event.kind == "compiled-execution-plan-finalized"
+    )
+    assert execution_event.graph == execution_graph
+    assert execution_event.detail["schema"] == "compiled-execution-plan-v1"
+
+
+def test_isolated_compiler_events_replay_without_renumbering():
+    compiler = EvolutionMetaGraph()
+    graph = compiler.open_graph("process-graph", "isolated")
+    compiler.component(graph, "node", label="node", kind="Name")
+    visual = EvolutionMetaGraph()
+    delivered = []
+    visual.subscribe(delivered.append)
+
+    for event in compiler.snapshot().events:
+        visual.ingest_event(event)
+
+    assert [event.sequence for event in delivered] == [0, 1]
+    assert visual.snapshot().graphs == (graph,)
+    assert visual.snapshot().components[0].label == "node"

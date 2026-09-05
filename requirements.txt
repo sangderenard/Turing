@@ -10,5 +10,7 @@ scipy>=1.7
 Pillow>=10
 fonttools>=4
 scikit-image>=0.21
+joblib>=1
 pandas>=2
 cffi>=1.16
+pycparser>=2.21

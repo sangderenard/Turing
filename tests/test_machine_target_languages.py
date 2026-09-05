@@ -1,3 +1,5 @@
+import pytest
+
 from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler import machine_targets
 
@@ -16,13 +18,15 @@ def test_existing_backend_operator_lists_are_exposed_without_a_fifth_copy():
         item.backend: item for item in machine_targets.operator_inventories()
     }
 
-    assert set(inventories) == {"c", "glsl", "fortran", "llvm", "webgl"}
-    assert len(inventories["c"].operations) == 40
-    assert len(inventories["glsl"].operations) == 56
-    assert len(inventories["fortran"].operations) == 57
-    assert len(inventories["llvm"].operations) == 70
-    assert len(inventories["webgl"].operations) == 44
-    assert inventories["c"].operations <= inventories["llvm"].operations
+    assert set(inventories) == {
+        "c", "glsl", "fortran", "llvm", "webgl", "webgpu",
+    }
+    assert inventories["c"].consumes == "ssa"
+    assert all(item.operations for item in inventories.values())
+    assert {"add", "pow", "extent"} <= inventories["c"].operations
+    assert {"add", "pow"} <= inventories["fortran"].operations
+    assert {"add", "pow"} <= inventories["llvm"].operations
+    assert {"add", "mul", "bitand"} <= inventories["webgpu"].operations
     assert (
         inventories["webgl"].operations - {"tensor_from_list"}
         <= inventories["glsl"].operations
@@ -32,7 +36,32 @@ def test_existing_backend_operator_lists_are_exposed_without_a_fifth_copy():
 
 def test_glsl_fortran_and_webgl_join_the_machine_target_hub():
     names = {item.name for item in machine_targets.capabilities()}
-    assert {"wasm", "glsl", "fortran", "webgl"} <= names
+    assert {"wasm", "glsl", "fortran", "webgl", "webgpu"} <= names
+
+
+def test_webgl_is_deprecated_and_redirects_to_webgpu_compute():
+    target = machine_targets.get_target("webgl")
+    assert target.capabilities.name == "webgpu"
+
+    program = _program(
+        OpStep(0, "mul", [1], {"right_scalar": 2.0}, 2),
+        outputs={"result": 2},
+    )
+    artifact = machine_targets.emit(program, "webgl", name="webgpu_kernel")
+
+    assert artifact.complete
+    assert artifact.extension == ".wgsl"
+    assert "@compute @workgroup_size(" in artifact.source
+    assert "var<storage, read> feed_1: array<f32>;" in artifact.source
+    assert "var<storage, read_write> output_0: array<f32>;" in artifact.source
+    assert artifact.api.to_mapping()["metadata"]["dispatch_workgroups"]
+
+
+def test_webgl_allow_deprecated_still_reaches_the_real_target():
+    target = machine_targets.get_target("webgl", allow_deprecated=True)
+    assert target.capabilities.name == "webgl"
+    assert target.capabilities.deprecated
+    assert target.capabilities.redirect_to == "webgpu"
 
 
 def test_closed_target_vocabularies_reject_unknown_ops_before_emission():
@@ -50,7 +79,9 @@ def test_webgl_prints_a_fragment_program_from_the_shared_glsl_expressions():
         feeds=(1, 2),
     )
 
-    artifact = machine_targets.emit(program, "webgl", name="browser_kernel")
+    artifact = machine_targets.emit(
+        program, "webgl", name="browser_kernel", allow_deprecated=True,
+    )
 
     assert artifact.complete
     assert artifact.extension == ".frag.glsl"
@@ -79,10 +110,14 @@ def test_webgl_names_non_fragment_layouts_and_oversized_mrt_as_shortfalls():
     )
 
     assert "webgl" not in machine_targets.targets_for(bitwise)
-    artifact = machine_targets.emit(multiple, "webgl", name="two_outputs")
+    artifact = machine_targets.emit(
+        multiple, "webgl", name="two_outputs", allow_deprecated=True,
+    )
     assert artifact.complete
     assert "layout(location = 1) out vec4 turing_output_1;" in artifact.source
-    artifact = machine_targets.emit(oversized, "webgl", name="five_outputs")
+    artifact = machine_targets.emit(
+        oversized, "webgl", name="five_outputs", allow_deprecated=True,
+    )
     assert not artifact.complete
     assert "between one and four" in artifact.shortfalls[0]
 

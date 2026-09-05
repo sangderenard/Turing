@@ -14,6 +14,26 @@ from typing import Any, Iterable, Mapping
 from .deployment_frame import DeploymentFrame, DeploymentJoin
 
 
+class ControlOverlayScopeError(ValueError):
+    """One control body has region markers in several insertion scopes."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        control_index: int,
+        region_indices: Iterable[int],
+        scopes: Mapping[tuple[str, ...], Iterable[int]],
+    ) -> None:
+        super().__init__(message)
+        self.control_index = int(control_index)
+        self.region_indices = tuple(sorted(map(int, region_indices)))
+        self.scopes = {
+            tuple(map(str, scope)): tuple(sorted(map(int, regions)))
+            for scope, regions in scopes.items()
+        }
+
+
 class ControlTarget(str, Enum):
     PYTHON = "python"
     C = "c"
@@ -47,6 +67,59 @@ class ControlExpression:
 
 
 @dataclass(frozen=True)
+class ConditionalBlock:
+    """Execute one compiled control body under a resident predicate."""
+
+    predicate_value_id: int
+    body: "ControlBlock"
+    orelse: "ControlBlock | None" = None
+    expect_true: bool = True
+    predicate_expression: ControlExpression | None = None
+    # (true-arm value, false-arm value, pre-branch value, merged value).
+    # A missing arm repeats the pre-branch value and is encoded by giving that
+    # arm the same id as ``initial_value_id``.
+    carried_aliases: tuple[tuple[int, int, int, int], ...] = ()
+    source_node_id: int | None = None
+    # Resident sequences cannot be merged as scalar SSA values.  Each tuple
+    # has the same (true, false, initial, merged) shape as ``carried_aliases``;
+    # lowering replaces the initial arena from the selected branch and keeps
+    # the merged spelling correlated with that one storage descriptor.
+    carried_sequence_aliases: tuple[tuple[int, int, int, int], ...] = ()
+    # (origin sequence, selected row handle, result value, physical column,
+    # dtype).  These loads are valid only in the selected arm and therefore
+    # belong at conditional entry, never beside the optional query itself.
+    entry_record_projections: tuple[
+        tuple[int, int, int, int, str], ...
+    ] = ()
+    # Source call nodes lexically inside each arm. A planned call (a
+    # ``__plan_callsite_N__`` statement) is otherwise scheduled relative to
+    # numerical regions and loops only; an arm whose entire content is a
+    # call (``if d is not None: return d(...)``) has no region for the
+    # scheduler to anchor on, so the callsite scheduler places these inside
+    # the arm that owns them.
+    body_callsite_ids: tuple[int, ...] = ()
+    orelse_callsite_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class ControlSequenceMutation:
+    """One explicit mutation of caller-provided sequence/table storage."""
+
+    sequence_value_id: int
+    operator: str
+    argument_value_ids: tuple[int, ...]
+    effect_node_id: int
+    policy: str | None = None
+    argument_kind: str = "value"
+    predicate_expression: ControlExpression | None = None
+    # Expressions aligned with ``argument_value_ids``.  A non-None entry
+    # proves how a coordinator scalar is computed inside the selected arm,
+    # preventing its result ID from becoming an invented function argument.
+    argument_expressions: tuple[ControlExpression | None, ...] = ()
+    extraction_identity: str | None = None
+
+
+@dataclass(frozen=True)
 class LoopBlock:
     induction: str
     start: str
@@ -56,6 +129,16 @@ class LoopBlock:
     # Storage aliases remain listed on ControlProgram for allocation, while
     # the actual carried-state commits belong only to this lexical loop.
     carried_aliases: tuple[tuple[int, int], ...] = ()
+    # ``(port id, initial id, updated id)`` per carried binding: the
+    # LoopResult port is the value id every post-loop consumer was rewired
+    # to, so the SSA lowering must define it as the carried Phi's exit value.
+    # Left uncarried, each port materialized as a producerless argument and
+    # every reduction result after the loop read its own seed.
+    result_ports: tuple[tuple[int, int, int], ...] = ()
+    #: ``(initial id, literal)`` for carried seeds that folded to constants;
+    #: the SSA lowering materializes these as Const instead of inventing a
+    #: producerless argument for an evaporated node.
+    carried_seeds: tuple[tuple[int, float], ...] = ()
     # The planner has proved that iterations communicate only through
     # induction-indexed publications.  A parallel backend may map one
     # iteration to one workgroup; ordinary renderers retain a serial loop.
@@ -67,6 +150,24 @@ class LoopBlock:
     # with the ProcessGraph SCC from which this loop was retained.
     recursion_region_id: int | None = None
     schedule_preference: str = "alap"
+    sequence_mutations: tuple[ControlSequenceMutation, ...] = ()
+    # Forward ranges normally use ``lt``. Reverse schedules use ``gt`` with a
+    # negative step; keeping this explicit prevents C/SSA renderers from
+    # silently applying a forward-only comparison to an adjoint loop.
+    comparison: str = "lt"
+    # Terminal source exits run after resident effects for the iteration.  A
+    # planner may populate this only for a return proven to be in tail
+    # position; ordinary break/continue remain lexically embedded in body.
+    terminal_controls: tuple["LoopControlBlock", ...] = ()
+    # Exact authored ProcessGraph loop identity.  Like WhileBlock's identity,
+    # this survives scheduling so verification can prove that source loops
+    # became CFG loops rather than merely observing generic Phi/Lt blocks.
+    source_loop_node_id: int | None = None
+    # Graph nodes of every source break/continue in this loop's body.  The
+    # lowering checks each one was emitted (in an arm or at its lexical
+    # position); a site nothing placed is a loud shortfall, never a loop
+    # that silently runs to completion.
+    control_site_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         preference = str(self.schedule_preference).lower()
@@ -75,6 +176,10 @@ class LoopBlock:
                 "loop schedule preference must be 'asap' or 'alap'"
             )
         object.__setattr__(self, "schedule_preference", preference)
+        comparison = str(self.comparison).lower()
+        if comparison not in {"lt", "gt"}:
+            raise ValueError("loop comparison must be 'lt' or 'gt'")
+        object.__setattr__(self, "comparison", comparison)
 
 
 @dataclass(frozen=True)
@@ -91,8 +196,22 @@ class WhileBlock:
     condition: "ControlBlock"
     body: "ControlBlock"
     carried_aliases: tuple[tuple[int, int], ...] = ()
+    result_ports: tuple[tuple[int, int, int], ...] = ()
+    carried_seeds: tuple[tuple[int, float], ...] = ()
     recursion_region_id: int | None = None
     predicate_expression: ControlExpression | None = None
+    sequence_mutations: tuple[ControlSequenceMutation, ...] = ()
+    # Exact source ProcessGraph loop identity.  A source-linked call retains
+    # this same identity in ``PlanCall.enclosing_loop_ids``; carrying it into
+    # Control IR lets the SSA linker place that call in the authored while
+    # body instead of guessing from a later result consumer.
+    source_loop_node_id: int | None = None
+    terminal_controls: tuple["LoopControlBlock", ...] = ()
+    # Graph nodes of every source break/continue in this loop's body.  The
+    # lowering checks each one was emitted (in an arm or at its lexical
+    # position); a site nothing placed is a loud shortfall, never a loop
+    # that silently runs to completion.
+    control_site_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -107,10 +226,31 @@ class LoopControlBlock:
     predicate_value_id: int | None = None
     expect_true: bool = True
     predicate_expression: ControlExpression | None = None
+    source_action: str | None = None
+    # ``action == "return"``: a source ``return`` inside a loop or
+    # conditional. Lowering captures these slot values (function-output
+    # order) on the edge and branches to the function's exit block, where
+    # every return edge is merged per slot (control-aware result merging;
+    # docs/PLAN_CONTROL_AWARE_RESULT_MERGING.md). A ``None`` slot is one the
+    # reducer could not resolve at that return.
+    return_value_ids: tuple[int | None, ...] = ()
+    # ``break``/``continue``: the graph node of the source statement, and
+    # the bindings live at that site as (pre-loop identity, value-at-site)
+    # pairs -- the values the exit edge carries for every name the arm
+    # rebound (reducer ``loop_break_sites``).  A missing pair means the
+    # site did not rebind that name.
+    site_node_id: int | None = None
+    site_values: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
-        if self.action not in {"break", "continue"}:
-            raise ValueError("loop control action must be break or continue")
+        if self.action not in {"break", "continue", "return"}:
+            raise ValueError(
+                "loop control action must be break, continue or return"
+            )
+        if self.source_action not in {
+            None, "break", "continue", "loop-return", "return",
+        }:
+            raise ValueError("unknown source loop-control action")
 
 
 @dataclass(frozen=True)
@@ -201,12 +341,70 @@ class CallBlock:
 
 
 @dataclass(frozen=True)
+class ExternalReferenceCallBlock:
+    """One authored call through the shell external-reference capability."""
+
+    callsite_id: int
+    identity: str
+    argument_value_ids: tuple[int, ...]
+    keyword_argument_value_ids: tuple[tuple[str, int], ...]
+    result_value_id: int
+    result_dtype: str
+    shell_abi: str = "turing-shell-io-abi.external_references"
+    external_domain: str = "host_system"
+    native_abi: str = ""
+    runtime_owner: str = ""
+    shell_profiles: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ValidationBlock:
     """Device-side predicate whose failure is reported through shell errors."""
 
     predicate_value_id: int
     error_code: int
     expect_true: bool = True
+    predicate_expression: ControlExpression | None = None
+    extraction_identity: str | None = None
+
+
+@dataclass(frozen=True)
+class SequenceMutationBlock:
+    """One lexical resident-sequence effect outside implicit loop storage."""
+
+    mutation: ControlSequenceMutation
+
+
+@dataclass(frozen=True)
+class SequenceQueryBlock:
+    """Read one scalar fact from a resident sequence at lexical position."""
+
+    result_value_id: int
+    sequence_value_id: int
+    operation: str
+    default_value_id: int | None = None
+    source_call_node_id: int | None = None
+    extraction_identity: str | None = None
+    result_alias_ids: tuple[int, ...] = ()
+    producer_loop_node_id: int | None = None
+    # Exact authored key identities for a resident keyed-table read.  These
+    # are defined at this lexical position (often by a loop projection), so a
+    # backend must not hoist the lookup to function entry.
+    key_value_ids: tuple[int, ...] = ()
+    # A first-or-default query over a derived record sequence yields a tagged
+    # integer row handle.  The default arm uses -1 and subsequent source
+    # ``is [not] None`` tests consume that tag.
+    row_handle: bool = False
+
+    def __post_init__(self) -> None:
+        if self.operation not in {
+            "length", "first_or_default", "lookup",
+        }:
+            raise ValueError("unknown resident sequence query")
+        if self.operation == "first_or_default" and self.default_value_id is None:
+            raise ValueError("first_or_default requires an explicit default")
+        if self.operation == "lookup" and not self.key_value_ids:
+            raise ValueError("lookup requires at least one exact key identity")
 
 
 @dataclass(frozen=True)
@@ -229,13 +427,17 @@ class StreamPublishBlock:
 ControlBlock = (
     StatementBlock
     | SequenceBlock
+    | ConditionalBlock
     | LoopBlock
     | WhileBlock
     | LoopControlBlock
     | StateMachineTick
     | ParallelDeployment
     | CallBlock
+    | ExternalReferenceCallBlock
     | ValidationBlock
+    | SequenceMutationBlock
+    | SequenceQueryBlock
     | StreamPublishBlock
 )
 
@@ -283,6 +485,140 @@ class ControlProgram:
     # is where an evaporated/unrolled loop can condense instead of becoming
     # indistinguishable straight-line work.
     deployment_regions: tuple[ControlDeploymentRegion, ...] = ()
+    # (resident iterable value id, target value id, induction, projection).
+    # Projection is ``"induction"`` for enumerate's counter, ``None`` for
+    # the whole resident element, or a zero-based integer field within a
+    # destructured resident tuple/row.
+    projected_iterable_bindings: tuple[
+        tuple[int, int, str, object], ...
+    ] = ()
+    # Source ``if`` nodes whose complete arm effects are represented by a
+    # specialized control form (for example, predicated resident mutations
+    # plus a loop-return edge), rather than by a ConditionalBlock.  These are
+    # semantic-accounting identities, not permission to omit either arm.
+    specialized_conditional_node_ids: tuple[int, ...] = ()
+    # A control that owns NO numerical region (a guard clause whose arm is
+    # only a ``return``, or a call) has no marker to replace in the
+    # schedule.  ``anchor_region`` names the first scheduled region that
+    # lexically follows it; the overlay inserts the control immediately
+    # before that region (or at the end of its scope when None) instead of
+    # dropping it.  Declared last: ControlProgram is built positionally in
+    # places, so a new field must never shift the existing ones.
+    anchor_region: int | None = None
+
+
+def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[int]:
+    """Return every value identity explicitly consumed by planned control."""
+
+    values: set[int] = set()
+    if control is None:
+        return frozenset()
+
+    values.update(int(uniform.value_id) for uniform in control.uniforms)
+    for bindings in (
+        control.value_aliases,
+        control.iterable_bindings,
+        control.static_iterable_bindings,
+        control.collection_bindings,
+        control.closure_iterable_bindings,
+        control.projected_iterable_bindings,
+    ):
+        for binding in bindings:
+            for value in binding:
+                if isinstance(value, int):
+                    values.add(int(value))
+                elif isinstance(value, tuple):
+                    values.update(int(item) for item in value if isinstance(item, int))
+
+    def expression_values(expression: ControlExpression | None) -> None:
+        if expression is None:
+            return
+        if expression.value_id is not None:
+            values.add(int(expression.value_id))
+        for operand in expression.operands:
+            expression_values(operand)
+
+    def carried_values(bindings) -> None:
+        values.update(int(value_id) for binding in bindings for value_id in binding)
+
+    def mutation_values(mutations) -> None:
+        for mutation in mutations:
+            values.add(int(mutation.sequence_value_id))
+            values.update(int(value_id) for value_id in mutation.argument_value_ids)
+            expression_values(mutation.predicate_expression)
+            for expression in mutation.argument_expressions:
+                expression_values(expression)
+
+    def visit(block: ControlBlock) -> None:
+        if isinstance(block, ValidationBlock):
+            values.add(int(block.predicate_value_id))
+            expression_values(block.predicate_expression)
+        elif isinstance(block, SequenceMutationBlock):
+            mutation_values((block.mutation,))
+        elif isinstance(block, SequenceQueryBlock):
+            values.add(int(block.result_value_id))
+            values.update(int(value_id) for value_id in block.result_alias_ids)
+            values.add(int(block.sequence_value_id))
+            values.update(int(value_id) for value_id in block.key_value_ids)
+            if block.default_value_id is not None:
+                values.add(int(block.default_value_id))
+        elif isinstance(block, StreamPublishBlock):
+            values.add(int(block.value_id))
+            if block.count_value_id is not None:
+                values.add(int(block.count_value_id))
+            if block.predicate_value_id is not None:
+                values.add(int(block.predicate_value_id))
+        elif isinstance(block, ExternalReferenceCallBlock):
+            values.update(int(value_id) for value_id in block.argument_value_ids)
+            values.update(
+                int(value_id)
+                for _name, value_id in block.keyword_argument_value_ids
+            )
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                visit(child)
+        elif isinstance(block, ConditionalBlock):
+            values.add(int(block.predicate_value_id))
+            expression_values(block.predicate_expression)
+            carried_values(block.carried_aliases)
+            carried_values(block.carried_sequence_aliases)
+            visit(block.body)
+            if block.orelse is not None:
+                visit(block.orelse)
+        elif isinstance(block, LoopBlock):
+            carried_values(block.carried_aliases)
+            mutation_values(block.sequence_mutations)
+            visit(block.body)
+            for terminal in block.terminal_controls:
+                visit(terminal)
+        elif isinstance(block, WhileBlock):
+            values.add(int(block.predicate_value_id))
+            expression_values(block.predicate_expression)
+            carried_values(block.carried_aliases)
+            mutation_values(block.sequence_mutations)
+            visit(block.condition)
+            visit(block.body)
+            for terminal in block.terminal_controls:
+                visit(terminal)
+        elif isinstance(block, LoopControlBlock):
+            if block.predicate_value_id is not None:
+                values.add(int(block.predicate_value_id))
+            expression_values(block.predicate_expression)
+        elif isinstance(block, StateMachineTick):
+            for _case, body in block.cases:
+                visit(body)
+            if block.default is not None:
+                visit(block.default)
+        elif isinstance(block, ParallelDeployment):
+            for lane in block.lanes:
+                visit(lane)
+        elif isinstance(block, CallBlock):
+            carried_values(block.argument_bindings)
+            carried_values(block.result_bindings)
+            visit(block.callee)
+
+    visit(control.root)
+    return frozenset(values)
 
 
 @dataclass(frozen=True)
@@ -318,6 +654,11 @@ def _indent(lines: Iterable[str], spaces: int = 4) -> tuple[str, ...]:
 
 
 def _render_loop(block: LoopBlock, target: ControlTarget) -> tuple[str, ...]:
+    if block.sequence_mutations:
+        raise ValueError(
+            "sequence mutations require repository-SSA memory lowering; "
+            "direct control-source rendering would hide their arena ABI"
+        )
     body = _indent(render_control_block(block.body, target))
     if target is ControlTarget.GLSL and block.dispatch_shell == "c":
         return (
@@ -341,16 +682,18 @@ def _render_loop(block: LoopBlock, target: ControlTarget) -> tuple[str, ...]:
     if target is ControlTarget.FORTRAN:
         # A Fortran do-loop bound is inclusive, so the exclusive stop used by
         # every other target becomes stop - 1.
+        exclusive_adjustment = "- 1" if block.comparison == "lt" else "+ 1"
         return (
             f"do {block.induction} = {block.start}, "
-            f"({block.stop}) - 1, {block.step}",
+            f"({block.stop}) {exclusive_adjustment}, {block.step}",
             *body,
             "end do",
         )
     declaration = "int " if target in {ControlTarget.C, ControlTarget.GLSL} else ""
+    comparison = "<" if block.comparison == "lt" else ">"
     return (
         f"for ({declaration}{block.induction} = {block.start}; "
-        f"{block.induction} < {block.stop}; "
+        f"{block.induction} {comparison} {block.stop}; "
         f"{block.induction} += {block.step}) {{",
         *body,
         "}",
@@ -370,6 +713,11 @@ def _render_expression(
         return f"value_{int(expression.value_id)}"
     if expression.op == "const":
         return repr(expression.literal).lower() if target is not ControlTarget.PYTHON else repr(expression.literal)
+    if expression.op == "sequence_nonempty":
+        raise ValueError(
+            "sequence truth predicates require repository-SSA memory "
+            "lowering; direct source rendering would hide the length-cell ABI"
+        )
     if expression.op in {"item", "float", "int", "bool"}:
         return _render_expression(expression.operands[0], target)
     unary = {"not": "!", "neg": "-"}
@@ -387,6 +735,11 @@ def _render_expression(
 
 
 def _render_while(block: WhileBlock, target: ControlTarget) -> tuple[str, ...]:
+    if block.sequence_mutations:
+        raise ValueError(
+            "sequence mutations require repository-SSA memory lowering; "
+            "direct control-source rendering would hide their arena ABI"
+        )
     condition = render_control_block(block.condition, target)
     body = render_control_block(block.body, target)
     predicate = (
@@ -466,6 +819,41 @@ def render_control_block(
             for child in block.blocks
             for line in render_control_block(child, target)
         )
+    if isinstance(block, ConditionalBlock):
+        predicate = (
+            _render_expression(block.predicate_expression, target)
+            if block.predicate_expression is not None
+            else _predicate_spelling(block.predicate_value_id, target)
+        )
+        if not block.expect_true:
+            predicate = (
+                f"not {predicate}"
+                if target is ControlTarget.PYTHON
+                else f".not. ({predicate})"
+                if target is ControlTarget.FORTRAN
+                else f"!({predicate})"
+            )
+        body = render_control_block(block.body, target)
+        orelse = (
+            () if block.orelse is None
+            else render_control_block(block.orelse, target)
+        )
+        if target is ControlTarget.PYTHON:
+            return (
+                f"if {predicate}:", *_indent(body, 4),
+                *(("else:", *_indent(orelse, 4)) if orelse else ()),
+            )
+        if target is ControlTarget.FORTRAN:
+            return (
+                f"if ({predicate}) then", *_indent(body, 4),
+                *(("else", *_indent(orelse, 4)) if orelse else ()),
+                "end if",
+            )
+        return (
+            f"if ({predicate}) {{", *_indent(body, 4),
+            *(("} else {", *_indent(orelse, 4)) if orelse else ()),
+            "}",
+        )
     if isinstance(block, LoopBlock):
         return _render_loop(block, target)
     if isinstance(block, WhileBlock):
@@ -515,6 +903,29 @@ def render_control_block(
         # A target renderer therefore sees the callee as ordinary nested
         # control, not as a host-language function call.
         return render_control_block(block.callee, target)
+    if isinstance(block, ExternalReferenceCallBlock):
+        if target is not ControlTarget.PYTHON:
+            raise ValueError(
+                "external-reference control requires a target-owned ABI adapter; "
+                f"none is installed for {target.value} control rendering"
+            )
+        positional = ", ".join(
+            f"value_{int(value_id)}" for value_id in block.argument_value_ids
+        )
+        positional_tuple = (
+            "()" if not positional else
+            f"({positional},)" if len(block.argument_value_ids) == 1 else
+            f"({positional})"
+        )
+        keywords = ", ".join(
+            f"{name!r}: value_{int(value_id)}"
+            for name, value_id in block.keyword_argument_value_ids
+        )
+        return (
+            f"value_{int(block.result_value_id)} = "
+            f"__turing_external_call__({block.identity!r}, "
+            f"{positional_tuple}, {{{keywords}}}, {block.result_dtype!r})",
+        )
     if isinstance(block, ValidationBlock):
         predicate = f"value_{int(block.predicate_value_id)}"
         expected = "true" if block.expect_true else "false"
@@ -527,6 +938,32 @@ def render_control_block(
             f"if (bool({predicate}) != {expected}) {{",
             f"    turing_validation_error({int(block.error_code)}u);",
             "}",
+        )
+    if isinstance(block, SequenceMutationBlock):
+        mutation = block.mutation
+        return (
+            f"turing_sequence_{mutation.operator}(value_{int(mutation.sequence_value_id)});",
+        )
+    if isinstance(block, SequenceQueryBlock):
+        if block.operation == "length":
+            return (
+                f"value_{int(block.result_value_id)} = "
+                f"turing_sequence_length(value_{int(block.sequence_value_id)});",
+            )
+        if block.operation == "lookup":
+            keys = ", ".join(
+                f"value_{int(value_id)}" for value_id in block.key_value_ids
+            )
+            return (
+                f"value_{int(block.result_value_id)} = "
+                f"turing_sequence_lookup(value_{int(block.sequence_value_id)}, "
+                f"{keys});",
+            )
+        return (
+            f"value_{int(block.result_value_id)} = "
+            f"turing_sequence_first_or_default("
+            f"value_{int(block.sequence_value_id)}, "
+            f"value_{int(block.default_value_id)});",
         )
     if isinstance(block, StreamPublishBlock):
         count = (
@@ -557,6 +994,146 @@ def _region_marker(block: StatementBlock) -> int | None:
     if not marker.startswith(prefix) or not marker.endswith("__"):
         return None
     return int(marker[len(prefix):-2])
+
+
+def _anchored_control(control: "ControlProgram") -> bool:
+    """A region-less control the overlay must place by anchor, not drop.
+
+    Only source conditionals qualify: a region-less loop is handled by the
+    existing sequence-mutation / call-only-induction rule below.
+    """
+
+    if control.region_indices:
+        return False
+    root = control.root
+    blocks = root.blocks if isinstance(root, SequenceBlock) else (root,)
+    return any(isinstance(block, ConditionalBlock) for block in blocks)
+
+
+def _insert_before_marker(
+    block: "ControlBlock", anchor: int | None, inserted: "ControlBlock",
+) -> tuple["ControlBlock", bool]:
+    """Insert ``inserted`` immediately before the ``anchor`` region marker.
+
+    Walks sequences and the bodies of conditionals/loops; returns the
+    rewritten block and whether the anchor was found.  ``anchor=None``
+    never matches, so the caller appends at the end of the scope instead.
+    """
+
+    if anchor is None:
+        return block, False
+    if isinstance(block, SequenceBlock):
+        children = []
+        found = False
+        for child in block.blocks:
+            if (
+                not found
+                and isinstance(child, StatementBlock)
+                and _region_marker(child) == anchor
+            ):
+                children.append(inserted)
+                found = True
+                children.append(child)
+                continue
+            if not found:
+                child, found = _insert_before_marker(child, anchor, inserted)
+            children.append(child)
+        return SequenceBlock(tuple(children)), found
+    if isinstance(block, StatementBlock):
+        if _region_marker(block) == anchor:
+            return SequenceBlock((inserted, block)), True
+        return block, False
+    if isinstance(block, ConditionalBlock):
+        body, found = _insert_before_marker(block.body, anchor, inserted)
+        orelse = block.orelse
+        if not found and orelse is not None:
+            orelse, found = _insert_before_marker(orelse, anchor, inserted)
+        return replace(block, body=body, orelse=orelse), found
+    if isinstance(block, (LoopBlock, WhileBlock)):
+        body, found = _insert_before_marker(block.body, anchor, inserted)
+        return replace(block, body=body), found
+    return block, False
+
+
+def _marker_scope_paths(
+    block: "ControlBlock",
+    nested_regions: frozenset[int],
+    path: tuple[str, ...] = ("top",),
+) -> dict[int, tuple[str, ...]]:
+    """Map each marker in ``nested_regions`` found under ``block`` to the
+    scope-label path that owns it -- the granularity ``embed`` (inside
+    ``overlay_scheduled_control``) inserts a nested control at.
+
+    ``SequenceBlock`` is transparent: it does not open a new insertion
+    scope, matching ``embed``'s own single local ``inserted`` flag per
+    ``SequenceBlock``. Every composite construct's structural SLOT (a loop
+    body, a while condition or body, a conditional arm, a state-machine
+    case or default, a parallel lane) opens one, because ``embed`` recurses
+    into each such slot with its own separate insertion decision. Two
+    markers of the SAME nested control found at two different paths is
+    exactly the shape ``embed`` cannot honor with one insertion -- calling
+    this before ``embed`` runs turns that into a named refusal instead of
+    a downstream duplicate-region crash.
+    """
+
+    found: dict[int, tuple[str, ...]] = {}
+    if isinstance(block, StatementBlock):
+        marker = _region_marker(block)
+        if marker is not None and marker in nested_regions:
+            found[marker] = path
+        return found
+    if isinstance(block, SequenceBlock):
+        for child in block.blocks:
+            found.update(_marker_scope_paths(child, nested_regions, path))
+        return found
+    if isinstance(block, ConditionalBlock):
+        label = f"if(node={block.source_node_id})"
+        found.update(_marker_scope_paths(
+            block.body, nested_regions, path + (f"{label}.body",),
+        ))
+        if block.orelse is not None:
+            found.update(_marker_scope_paths(
+                block.orelse, nested_regions, path + (f"{label}.orelse",),
+            ))
+        return found
+    if isinstance(block, LoopBlock):
+        found.update(_marker_scope_paths(
+            block.body, nested_regions,
+            path + (f"loop({block.induction})",),
+        ))
+        return found
+    if isinstance(block, WhileBlock):
+        found.update(_marker_scope_paths(
+            block.condition, nested_regions, path + ("while.condition",),
+        ))
+        found.update(_marker_scope_paths(
+            block.body, nested_regions, path + ("while.body",),
+        ))
+        return found
+    if isinstance(block, StateMachineTick):
+        for value, body in block.cases:
+            found.update(_marker_scope_paths(
+                body, nested_regions, path + (f"case({value})",),
+            ))
+        if block.default is not None:
+            found.update(_marker_scope_paths(
+                block.default, nested_regions, path + ("default",),
+            ))
+        return found
+    if isinstance(block, ParallelDeployment):
+        for index, lane in enumerate(block.lanes):
+            found.update(_marker_scope_paths(
+                lane, nested_regions, path + (f"lane({index})",),
+            ))
+        return found
+    if isinstance(block, CallBlock):
+        # Lexical organization around nested control, not a runtime
+        # scope of its own -- it has exactly one child, so it cannot
+        # itself introduce a split the way a while's condition/body or a
+        # conditional's two arms can.
+        found.update(_marker_scope_paths(block.callee, nested_regions, path))
+        return found
+    return found
 
 
 def compose_region_code(
@@ -624,6 +1201,17 @@ def compose_region_code(
             return region.launch_body
         if isinstance(block, SequenceBlock):
             return SequenceBlock(tuple(substitute(child) for child in block.blocks))
+        if isinstance(block, ConditionalBlock):
+            return ConditionalBlock(
+                block.predicate_value_id,
+                substitute(block.body),
+                None if block.orelse is None else substitute(block.orelse),
+                block.expect_true,
+                block.predicate_expression,
+                block.carried_aliases,
+                block.source_node_id,
+                block.carried_sequence_aliases,
+            )
         if isinstance(block, LoopBlock):
             return LoopBlock(
                 block.induction,
@@ -631,22 +1219,39 @@ def compose_region_code(
                 block.stop,
                 block.step,
                 substitute(block.body),
-                block.carried_aliases,
-                block.parallel_iterations,
-                block.dispatch_shell,
-                block.recursion_region_id,
-                block.schedule_preference,
+                carried_aliases=block.carried_aliases,
+                result_ports=block.result_ports,
+                control_site_ids=block.control_site_ids,
+                carried_seeds=block.carried_seeds,
+                parallel_iterations=block.parallel_iterations,
+                dispatch_shell=block.dispatch_shell,
+                recursion_region_id=block.recursion_region_id,
+                schedule_preference=block.schedule_preference,
+                sequence_mutations=block.sequence_mutations,
+                comparison=block.comparison,
+                terminal_controls=block.terminal_controls,
+                source_loop_node_id=block.source_loop_node_id,
             )
         if isinstance(block, WhileBlock):
             return WhileBlock(
                 block.predicate_value_id,
                 substitute(block.condition),
                 substitute(block.body),
-                block.carried_aliases,
-                block.recursion_region_id,
-                block.predicate_expression,
+                carried_aliases=block.carried_aliases,
+                result_ports=block.result_ports,
+                control_site_ids=block.control_site_ids,
+                carried_seeds=block.carried_seeds,
+                recursion_region_id=block.recursion_region_id,
+                predicate_expression=block.predicate_expression,
+                sequence_mutations=block.sequence_mutations,
+                source_loop_node_id=block.source_loop_node_id,
+                terminal_controls=block.terminal_controls,
             )
         if isinstance(block, LoopControlBlock):
+            return block
+        if isinstance(block, SequenceMutationBlock):
+            return block
+        if isinstance(block, SequenceQueryBlock):
             return block
         if isinstance(block, StateMachineTick):
             return StateMachineTick(
@@ -666,6 +1271,8 @@ def compose_region_code(
                 block.argument_bindings,
                 block.result_bindings,
             )
+        if isinstance(block, ExternalReferenceCallBlock):
+            return block
         if isinstance(block, ValidationBlock):
             if (
                 retained_values is not None
@@ -694,6 +1301,10 @@ def compose_region_code(
         closure_iterable_bindings=program.closure_iterable_bindings,
         recursion_regions=program.recursion_regions,
         deployment_regions=program.deployment_regions,
+        projected_iterable_bindings=program.projected_iterable_bindings,
+        specialized_conditional_node_ids=(
+            program.specialized_conditional_node_ids
+        ),
     )
 
 
@@ -732,29 +1343,87 @@ def project_control_regions(
                 if (projected := project(child)) is not None
             )
             return SequenceBlock(children) if children else None
+        if isinstance(block, ConditionalBlock):
+            body = project(block.body)
+            orelse = (
+                None if block.orelse is None else project(block.orelse)
+            )
+            if body is None and orelse is None:
+                return None
+            return ConditionalBlock(
+                block.predicate_value_id,
+                body or SequenceBlock(()),
+                orelse,
+                block.expect_true,
+                block.predicate_expression,
+                tuple(
+                    carried for carried in block.carried_aliases
+                    if retained_values is None
+                    or all(
+                        int(value_id) in retained_values
+                        for value_id in carried
+                    )
+                ),
+                block.source_node_id,
+                tuple(
+                    carried for carried in block.carried_sequence_aliases
+                    if retained_values is None
+                    or all(
+                        int(value_id) in retained_values
+                        for value_id in carried
+                    )
+                ),
+            )
         if isinstance(block, LoopBlock):
             body = project(block.body)
-            if body is None:
+            has_structural_body = any(
+                str(binding[2]) == str(block.induction)
+                and str(binding[3]) == "induction"
+                for binding in program.projected_iterable_bindings
+            )
+            if (
+                body is None
+                and not block.sequence_mutations
+                and not has_structural_body
+            ):
                 return None
             return LoopBlock(
                 block.induction,
                 block.start,
                 block.stop,
                 block.step,
-                body,
-                tuple(
+                body or SequenceBlock(()),
+                carried_aliases=tuple(
                     (updated, initial)
                     for updated, initial in block.carried_aliases
+                    # The UPDATE is what the body must produce; requiring the
+                    # initial too dropped every reduction whose seed folded to
+                    # a constant (max/sum seeds are literal zeros).  A carried
+                    # value whose only consumer is its LoopResult port is not
+                    # in retained_values at all, yet the port IS its
+                    # retention: the loop itself declares the continuation.
                     if retained_values is None
-                    or (
-                        int(updated) in retained_values
-                        and int(initial) in retained_values
+                    or int(updated) in retained_values
+                    or any(
+                        int(updated) == int(port_updated)
+                        for _port, _init, port_updated in block.result_ports
                     )
                 ),
-                block.parallel_iterations,
-                block.dispatch_shell,
-                block.recursion_region_id,
-                block.schedule_preference,
+                carried_seeds=block.carried_seeds,
+                result_ports=block.result_ports,
+                control_site_ids=block.control_site_ids,
+                parallel_iterations=block.parallel_iterations,
+                dispatch_shell=block.dispatch_shell,
+                recursion_region_id=block.recursion_region_id,
+                schedule_preference=block.schedule_preference,
+                sequence_mutations=block.sequence_mutations,
+                comparison=block.comparison,
+                terminal_controls=tuple(
+                    projected
+                    for terminal in block.terminal_controls
+                    if (projected := project(terminal)) is not None
+                ),
+                source_loop_node_id=block.source_loop_node_id,
             )
         if isinstance(block, WhileBlock):
             condition = project(block.condition)
@@ -767,21 +1436,39 @@ def project_control_regions(
                 block.predicate_value_id,
                 condition or SequenceBlock(()),
                 body,
-                tuple(
+                carried_aliases=tuple(
                     (updated, initial)
                     for updated, initial in block.carried_aliases
+                    # The UPDATE is what the body must produce; requiring the
+                    # initial too dropped every reduction whose seed folded to
+                    # a constant (max/sum seeds are literal zeros).  A carried
+                    # value whose only consumer is its LoopResult port is not
+                    # in retained_values at all, yet the port IS its
+                    # retention: the loop itself declares the continuation.
                     if retained_values is None
-                    or (
-                        int(updated) in retained_values
-                        and int(initial) in retained_values
+                    or int(updated) in retained_values
+                    or any(
+                        int(updated) == int(port_updated)
+                        for _port, _init, port_updated in block.result_ports
                     )
                 ),
-                block.recursion_region_id,
-                block.predicate_expression,
+                carried_seeds=block.carried_seeds,
+                result_ports=block.result_ports,
+                control_site_ids=block.control_site_ids,
+                recursion_region_id=block.recursion_region_id,
+                predicate_expression=block.predicate_expression,
+                sequence_mutations=block.sequence_mutations,
+                source_loop_node_id=block.source_loop_node_id,
+                terminal_controls=tuple(
+                    projected
+                    for terminal in block.terminal_controls
+                    if (projected := project(terminal)) is not None
+                ),
             )
         if isinstance(block, LoopControlBlock):
             if (
                 block.predicate_value_id is not None
+                and block.predicate_expression is None
                 and retained_values is not None
                 and int(block.predicate_value_id) not in retained_values
             ):
@@ -821,6 +1508,10 @@ def project_control_regions(
                 block.result_bindings,
             )
         if isinstance(block, ValidationBlock):
+            return block
+        if isinstance(block, SequenceMutationBlock):
+            return block
+        if isinstance(block, SequenceQueryBlock):
             return block
         if isinstance(block, StreamPublishBlock):
             return block
@@ -941,14 +1632,37 @@ def project_control_regions(
             if region.region_id in active_recursion_regions
         ),
         tuple(projected_deployments),
+        tuple(
+            binding
+            for binding in program.projected_iterable_bindings
+            if str(binding[2]) in active_inductions
+        ),
+        program.specialized_conditional_node_ids,
     )
 
 
 def overlay_scheduled_control(
     region_indices: Iterable[int],
     controls: Iterable[ControlProgram],
+    *,
+    known_nesting: "Mapping[int, Iterable[int]] | None" = None,
 ) -> ControlProgram:
-    """Overlay planned control blocks on the flat scheduled region order."""
+    """Overlay planned control blocks on the flat scheduled region order.
+
+    ``known_nesting``, if given, maps a control's index (into ``controls``)
+    to the indices of controls known -- by real structure, not inferred
+    here -- to be lexically nested directly inside it. Region-set strict
+    containment (``child < parent``) is the ordinary signal for "this
+    control is nested inside that one", but it is only a proxy: a loop
+    whose entire body is another loop (``while a: while b: ...`` with
+    nothing of its own between them) computes the *same* region set as
+    its child, not a superset, since it contributes no region of its own.
+    Strict-subset containment cannot tell those two controls apart -- ``<``
+    is ``False`` in both directions for equal sets -- so without this hint
+    they are wrongly treated as independent siblings both claiming the
+    same regions, which is exactly the "maximal control blocks overlap
+    without containment" failure this parameter exists to prevent.
+    """
 
     order = tuple(int(index) for index in region_indices)
     positions = {region_index: index for index, region_index in enumerate(order)}
@@ -962,12 +1676,99 @@ def overlay_scheduled_control(
     static_iterable_bindings = []
     collection_bindings = []
     closure_iterable_bindings = []
+    projected_iterable_bindings = []
     recursion_regions = []
     deployment_regions = []
+    specialized_conditional_node_ids = []
     controls = tuple(controls)
+    direct_children = {
+        int(parent): frozenset(int(child) for child in children)
+        for parent, children in (known_nesting or {}).items()
+    }
+    nested_children_overall = frozenset(
+        child
+        for children in direct_children.values()
+        for child in children
+    )
+
+    # A predicate-producing numerical region is a dataflow predecessor, not
+    # private syntax owned by one branch. Two sibling structural conditionals
+    # can consequently name the same predicate region plus distinct later
+    # regions. The shared marker must remain once in the flat dependency
+    # schedule; embedding either complete control would otherwise duplicate
+    # it, while treating the siblings as nested would invent source structure.
+    # Hoist only a marker proven to be a direct Sequence prelude in every
+    # claimant. Anything inside a loop/arm remains a real cross-scope overlap
+    # and is still refused below.
+    initial_sets = tuple(
+        frozenset(control.region_indices) for control in controls
+    )
+    claims = {
+        region: tuple(
+            index for index, regions in enumerate(initial_sets)
+            if region in regions
+        )
+        for region in set().union(*initial_sets) if initial_sets
+    }
+
+    def declared_nested(left: int, right: int) -> bool:
+        return (
+            left in direct_children.get(right, ())
+            or right in direct_children.get(left, ())
+            or initial_sets[left] < initial_sets[right]
+            or initial_sets[right] < initial_sets[left]
+        )
+
+    hoisted = set()
+    for region, owners in claims.items():
+        if len(owners) < 2 or all(
+            declared_nested(left, right)
+            for offset, left in enumerate(owners)
+            for right in owners[offset + 1:]
+        ):
+            continue
+        if all(
+            isinstance(controls[index].root, SequenceBlock)
+            and any(
+                isinstance(block, StatementBlock)
+                and _region_marker(block) == region
+                for block in controls[index].root.blocks
+            )
+            for index in owners
+        ):
+            hoisted.add(region)
+    if hoisted:
+        rewritten = []
+        for control in controls:
+            root = control.root
+            if isinstance(root, SequenceBlock):
+                root = SequenceBlock(tuple(
+                    block for block in root.blocks
+                    if not (
+                        isinstance(block, StatementBlock)
+                        and _region_marker(block) in hoisted
+                    )
+                ))
+            rewritten.append(replace(
+                control,
+                root=root,
+                region_indices=tuple(
+                    region for region in control.region_indices
+                    if region not in hoisted
+                ),
+            ))
+        controls = tuple(rewritten)
+
     controlled_sets = tuple(
         frozenset(control.region_indices) for control in controls
     )
+
+    def _nested_in(child: int, parent: int) -> bool:
+        if child == parent:
+            return False
+        if controlled_sets[child] < controlled_sets[parent]:
+            return True
+        return child in direct_children.get(parent, ())
 
     def embed(
         block: ControlBlock,
@@ -991,28 +1792,65 @@ def overlay_scheduled_control(
                 projected, consumed = embed(
                     child, nested_root, nested_regions
                 )
-                if consumed and not inserted:
+                # A leaf marker returns ``None`` after consuming the nested
+                # region span, so this sequence owns insertion at that exact
+                # lexical position.  A composite child returns its rewritten
+                # block and ``consumed=True`` because it already inserted the
+                # nested root internally; inserting again here duplicates the
+                # complete subtree beside itself.
+                if consumed and projected is None and not inserted:
                     children.append(nested_root)
                     inserted = True
                 if projected is not None:
                     children.append(projected)
+                    inserted |= consumed
             return SequenceBlock(tuple(children)), inserted
+        if isinstance(block, ConditionalBlock):
+            body, body_consumed = embed(
+                block.body, nested_root, nested_regions
+            )
+            orelse = None
+            else_consumed = False
+            if block.orelse is not None:
+                orelse, else_consumed = embed(
+                    block.orelse, nested_root, nested_regions
+                )
+            # Rebuild by `replace` so every field survives embedding --
+            # positional reconstruction silently dropped
+            # `entry_record_projections` and the arm callsite ownership.
+            return (
+                replace(
+                    block,
+                    body=body or SequenceBlock(()),
+                    orelse=orelse,
+                ),
+                body_consumed or else_consumed,
+            )
         if isinstance(block, LoopBlock):
             body, consumed = embed(
                 block.body, nested_root, nested_regions
             )
+            if body is None:
+                body = nested_root if consumed else SequenceBlock(())
             return (
                 LoopBlock(
                     block.induction,
                     block.start,
                     block.stop,
                     block.step,
-                    body or SequenceBlock(()),
-                    block.carried_aliases,
-                    block.parallel_iterations,
-                    block.dispatch_shell,
-                    block.recursion_region_id,
-                    block.schedule_preference,
+                    body,
+                    carried_aliases=block.carried_aliases,
+                    result_ports=block.result_ports,
+                    control_site_ids=block.control_site_ids,
+                    carried_seeds=block.carried_seeds,
+                    parallel_iterations=block.parallel_iterations,
+                    dispatch_shell=block.dispatch_shell,
+                    recursion_region_id=block.recursion_region_id,
+                    schedule_preference=block.schedule_preference,
+                    sequence_mutations=block.sequence_mutations,
+                    comparison=block.comparison,
+                    terminal_controls=block.terminal_controls,
+                    source_loop_node_id=block.source_loop_node_id,
                 ),
                 consumed,
             )
@@ -1023,14 +1861,26 @@ def overlay_scheduled_control(
             body, body_consumed = embed(
                 block.body, nested_root, nested_regions
             )
+            if condition is None:
+                condition = (
+                    nested_root if condition_consumed else SequenceBlock(())
+                )
+            if body is None:
+                body = nested_root if body_consumed else SequenceBlock(())
             return (
                 WhileBlock(
                     block.predicate_value_id,
-                    condition or SequenceBlock(()),
-                    body or SequenceBlock(()),
-                    block.carried_aliases,
-                    block.recursion_region_id,
-                    block.predicate_expression,
+                    condition,
+                    body,
+                    carried_aliases=block.carried_aliases,
+                    result_ports=block.result_ports,
+                    control_site_ids=block.control_site_ids,
+                    carried_seeds=block.carried_seeds,
+                    recursion_region_id=block.recursion_region_id,
+                    predicate_expression=block.predicate_expression,
+                    sequence_mutations=block.sequence_mutations,
+                    source_loop_node_id=block.source_loop_node_id,
+                    terminal_controls=block.terminal_controls,
                 ),
                 condition_consumed or body_consumed,
             )
@@ -1043,14 +1893,17 @@ def overlay_scheduled_control(
                 projected, consumed = embed(
                     body, nested_root, nested_regions
                 )
-                cases.append((value, projected or SequenceBlock(())))
+                if projected is None:
+                    projected = nested_root if consumed else SequenceBlock(())
+                cases.append((value, projected))
                 consumed_any |= consumed
             default = None
             if block.default is not None:
                 default, consumed = embed(
                     block.default, nested_root, nested_regions
                 )
-                default = default or SequenceBlock(())
+                if default is None:
+                    default = nested_root if consumed else SequenceBlock(())
                 consumed_any |= consumed
             return (
                 StateMachineTick(block.state, tuple(cases), default),
@@ -1063,7 +1916,9 @@ def overlay_scheduled_control(
                 projected, consumed = embed(
                     lane, nested_root, nested_regions
                 )
-                lanes.append(projected or SequenceBlock(()))
+                if projected is None:
+                    projected = nested_root if consumed else SequenceBlock(())
+                lanes.append(projected)
                 consumed_any |= consumed
             return (
                 ParallelDeployment(tuple(lanes), block.schedule_preference),
@@ -1073,10 +1928,12 @@ def overlay_scheduled_control(
             callee, consumed = embed(
                 block.callee, nested_root, nested_regions
             )
+            if callee is None:
+                callee = nested_root if consumed else SequenceBlock(())
             return (
                 CallBlock(
                     block.callsite_id,
-                    callee or SequenceBlock(()),
+                    callee,
                     block.argument_bindings,
                     block.result_bindings,
                 ),
@@ -1097,10 +1954,10 @@ def overlay_scheduled_control(
             for child, child_regions in enumerate(controlled_sets)
             if child != index
             and child_regions
-            and child_regions < controlled_sets[index]
+            and _nested_in(child, index)
             and not any(
-                child_regions < middle_regions < controlled_sets[index]
-                for middle, middle_regions in enumerate(controlled_sets)
+                _nested_in(child, middle) and _nested_in(middle, index)
+                for middle in range(len(controlled_sets))
                 if middle not in {index, child}
             )
         ]
@@ -1110,6 +1967,33 @@ def overlay_scheduled_control(
                 positions[region] for region in controlled_sets[item]
             ),
         ):
+            child_regions = controlled_sets[child]
+            scope_paths = _marker_scope_paths(root, child_regions)
+            distinct_scopes = sorted(set(scope_paths.values()))
+            if len(distinct_scopes) > 1:
+                by_scope: dict[tuple[str, ...], list[int]] = {}
+                for region, scope in scope_paths.items():
+                    by_scope.setdefault(scope, []).append(region)
+                message = (
+                    "nested control's regions span "
+                    f"{len(distinct_scopes)} sequence scopes of the parent "
+                    f"(control index {child}, regions "
+                    f"{tuple(sorted(child_regions))}): "
+                    + "; ".join(
+                        f"{' > '.join(scope)}: regions {sorted(regions)}"
+                        for scope, regions in sorted(by_scope.items())
+                    )
+                    + ". The schedule and the conditional compartments "
+                    "disagree about where these regions live; embed "
+                    "cannot insert one planner-owned control body into "
+                    "more than one scope."
+                )
+                raise ControlOverlayScopeError(
+                    message,
+                    control_index=child,
+                    region_indices=child_regions,
+                    scopes=by_scope,
+                )
             root, consumed = embed(
                 root,
                 nested_root(child, visiting | {index}),
@@ -1121,27 +2005,38 @@ def overlay_scheduled_control(
                     f"parent={tuple(controls[index].region_indices)!r}, "
                     f"child={tuple(controls[child].region_indices)!r}"
                 )
+        # Region-less children declared nested in this control (a guard
+        # clause inside an arm or a loop body) are placed before their
+        # anchor region within this root, or appended to it.
+        for child in sorted(direct_children.get(index, ())):
+            control = controls[child]
+            if not _anchored_control(control):
+                continue
+            child_root = nested_root(child, visiting | {index})
+            root, found = _insert_before_marker(
+                root, control.anchor_region, child_root
+            )
+            if not found:
+                root = SequenceBlock((
+                    *(root.blocks if isinstance(root, SequenceBlock) else (root,)),
+                    child_root,
+                ))
         nested_roots[index] = root
         return root
 
     maximal = [
         index
         for index, regions in enumerate(controlled_sets)
-        if regions and not any(
-            regions < other
-            for other in controlled_sets
+        if regions
+        and index not in nested_children_overall
+        and not any(
+            _nested_in(index, other)
+            for other in range(len(controlled_sets))
+            if other != index
         )
     ]
     for index, control in enumerate(controls):
         controlled = tuple(control.region_indices)
-        if not controlled:
-            continue
-        missing = set(controlled) - set(order)
-        if missing:
-            raise ValueError(
-                "control overlay does not partition the schedule: "
-                f"missing={sorted(missing)!r}"
-            )
         uniforms.extend(control.uniforms)
         aliases.extend(control.value_aliases)
         iterable_bindings.extend(control.iterable_bindings)
@@ -1150,25 +2045,92 @@ def overlay_scheduled_control(
         closure_iterable_bindings.extend(
             control.closure_iterable_bindings
         )
+        projected_iterable_bindings.extend(
+            control.projected_iterable_bindings
+        )
         recursion_regions.extend(control.recursion_regions)
         deployment_base = len(deployment_regions)
         deployment_regions.extend(
             replace(region, region_id=deployment_base + offset)
             for offset, region in enumerate(control.deployment_regions)
         )
+        specialized_conditional_node_ids.extend(
+            control.specialized_conditional_node_ids
+        )
+        if not controlled:
+            continue
+        missing = set(controlled) - set(order)
+        if missing:
+            raise ValueError(
+                "control overlay does not partition the schedule: "
+                f"missing={sorted(missing)!r}"
+            )
         if index not in maximal:
             continue
         overlap = set(controlled) & covered
         if overlap:
+            previous = [
+                {
+                    "index": other,
+                    "regions": tuple(controls[other].region_indices),
+                    "root": type(controls[other].root).__name__,
+                }
+                for other in maximal
+                if other != index
+                and set(controls[other].region_indices) & set(controlled)
+            ]
             raise ValueError(
                 "maximal control blocks overlap without containment: "
-                f"overlap={sorted(overlap)!r}"
+                f"overlap={sorted(overlap)!r}; current={{'index': {index}, "
+                f"'regions': {controlled!r}, 'root': "
+                f"{type(control.root).__name__!r}}}; previous={previous!r}"
             )
         first = min(controlled, key=positions.__getitem__)
         replacements[first] = nested_root(index)
         covered.update(controlled)
-    blocks = []
+    # Controls with no numerical region can still own complete compiled work:
+    # resident sequence mutation, or an empty loop body into which hierarchy
+    # composition will insert a source-linked CallBlock.  They have no schedule
+    # marker to replace, so retain their roots explicitly.  A genuinely empty
+    # loop remains filtered unless its induction appears in a projected
+    # iterable binding, which is the loop composer's structural proof that a
+    # retained body construct still owns this iteration.
+    call_only_inductions = {
+        str(induction)
+        for control in controls
+        for _iterable, _target, induction, projection
+        in control.projected_iterable_bindings
+        if str(projection) == "induction"
+    }
+    blocks = [
+        control.root
+        for control in controls
+        if not control.region_indices
+        and (
+            isinstance(control.root, LoopBlock)
+            and (
+                bool(control.root.sequence_mutations)
+                or str(control.root.induction) in call_only_inductions
+            )
+            or isinstance(control.root, WhileBlock)
+            and bool(control.root.sequence_mutations)
+        )
+    ]
+    # Region-less controls that declare an anchor (a guard clause whose arm
+    # is only a return/call): those nested under another control were
+    # inserted by `nested_root`; the maximal ones are inserted here, just
+    # before their anchor region in the flat schedule, or at the end when
+    # nothing follows them.
+    anchored_top_level: dict[int | None, list[ControlBlock]] = {}
+    for index, control in enumerate(controls):
+        if index in nested_children_overall or not _anchored_control(control):
+            continue
+        anchored_top_level.setdefault(
+            control.anchor_region, []
+        ).append(control.root)
     for region_index in order:
+        for anchored in anchored_top_level.pop(region_index, ()):
+            blocks.append(anchored)
         replacement = replacements.get(region_index)
         if replacement is not None:
             blocks.append(replacement)
@@ -1176,22 +2138,165 @@ def overlay_scheduled_control(
             blocks.append(StatementBlock((
                 f"__scheduled_region_{region_index}__",
             )))
+    for anchored_blocks in anchored_top_level.values():
+        blocks.extend(anchored_blocks)
+
+    def stable_key(value):
+        if isinstance(value, slice):
+            return ("slice", value.start, value.stop, value.step)
+        if isinstance(value, tuple):
+            return ("tuple", tuple(stable_key(item) for item in value))
+        if isinstance(value, list):
+            return ("list", tuple(stable_key(item) for item in value))
+        if isinstance(value, dict):
+            return (
+                "dict",
+                tuple(sorted(
+                    (stable_key(key), stable_key(item))
+                    for key, item in value.items()
+                )),
+            )
+        try:
+            hash(value)
+        except TypeError:
+            return (type(value).__qualname__, repr(value))
+        return ("value", value)
+
+    def unique_unhashable(values):
+        seen = set()
+        unique = []
+        for value in values:
+            key = stable_key(value)
+            if key not in seen:
+                seen.add(key)
+                unique.append(value)
+        return tuple(unique)
+
     return ControlProgram(
         root=SequenceBlock(tuple(blocks)),
         region_indices=order,
         uniforms=tuple(dict.fromkeys(uniforms)),
         value_aliases=tuple(dict.fromkeys(aliases)),
         iterable_bindings=tuple(dict.fromkeys(iterable_bindings)),
-        static_iterable_bindings=tuple(
-            dict.fromkeys(static_iterable_bindings)
-        ),
+        static_iterable_bindings=unique_unhashable(static_iterable_bindings),
         collection_bindings=tuple(dict.fromkeys(collection_bindings)),
         closure_iterable_bindings=tuple(
             dict.fromkeys(closure_iterable_bindings)
         ),
         recursion_regions=tuple(dict.fromkeys(recursion_regions)),
         deployment_regions=tuple(deployment_regions),
+        projected_iterable_bindings=tuple(
+            dict.fromkeys(projected_iterable_bindings)
+        ),
+        specialized_conditional_node_ids=tuple(dict.fromkeys(
+            int(node_id) for node_id in specialized_conditional_node_ids
+        )),
     )
+
+
+def place_validations_after_region_producers(
+    program: ControlProgram,
+    validations: Iterable[ValidationBlock],
+    *,
+    predicate_regions: Mapping[int, int],
+) -> ControlProgram:
+    """Place each guard after the region that computes its predicate.
+
+    Validation is lexical compiled control, not an entrypoint precondition.
+    In particular, a predicate can itself be the output of an earlier
+    numerical region.  Prefixing every guard to ``program.root`` reads that
+    result before it exists and quietly turns the canonical SSA identity into
+    an invented public argument.  Correlate by the existing value identity
+    and splice the guard directly after the unique scheduled region marker.
+
+    A predicate with no numerical producer is already an authored input (or a
+    control expression over authored inputs), so its guard remains an entry
+    prelude.  A predicate reported in two regions is not a schedule at all and
+    is refused rather than guessed.
+    """
+
+    pending_by_region: dict[int, list[ValidationBlock]] = {}
+    prelude: list[ValidationBlock] = []
+    for validation in validations:
+        region = predicate_regions.get(int(validation.predicate_value_id))
+        if region is None:
+            prelude.append(validation)
+        else:
+            pending_by_region.setdefault(int(region), []).append(validation)
+
+    placed: set[int] = set()
+
+    def marker(line: str) -> int | None:
+        prefix = "__scheduled_region_"
+        suffix = "__"
+        if not (line.startswith(prefix) and line.endswith(suffix)):
+            return None
+        try:
+            return int(line[len(prefix):-len(suffix)])
+        except ValueError:
+            return None
+
+    def visit(block: ControlBlock) -> ControlBlock:
+        if isinstance(block, StatementBlock):
+            expanded: list[ControlBlock] = []
+            residual: list[str] = []
+            for line in block.lines:
+                residual.append(line)
+                region = marker(line)
+                if region is None or region not in pending_by_region:
+                    continue
+                expanded.append(StatementBlock(tuple(residual)))
+                residual = []
+                if region in placed:
+                    raise ValueError(
+                        "scheduled region marker occurs more than once while "
+                        f"placing validation predicates: region={region}"
+                    )
+                expanded.extend(pending_by_region[region])
+                placed.add(region)
+            if residual:
+                expanded.append(StatementBlock(tuple(residual)))
+            if len(expanded) == 1:
+                return expanded[0]
+            return SequenceBlock(tuple(expanded))
+        if isinstance(block, SequenceBlock):
+            return replace(block, blocks=tuple(map(visit, block.blocks)))
+        if isinstance(block, ConditionalBlock):
+            return replace(
+                block,
+                body=visit(block.body),
+                orelse=(visit(block.orelse) if block.orelse is not None else None),
+            )
+        if isinstance(block, LoopBlock):
+            return replace(block, body=visit(block.body))
+        if isinstance(block, WhileBlock):
+            return replace(
+                block,
+                condition=visit(block.condition),
+                body=visit(block.body),
+            )
+        if isinstance(block, StateMachineTick):
+            return replace(
+                block,
+                cases=tuple((value, visit(body)) for value, body in block.cases),
+                default=(visit(block.default) if block.default is not None else None),
+            )
+        if isinstance(block, ParallelDeployment):
+            return replace(block, lanes=tuple(map(visit, block.lanes)))
+        if isinstance(block, CallBlock):
+            return replace(block, callee=visit(block.callee))
+        return block
+
+    root = visit(program.root)
+    missing = set(pending_by_region) - placed
+    if missing:
+        raise ValueError(
+            "validation predicate producer regions are absent from the "
+            f"scheduled control tree: regions={sorted(missing)!r}"
+        )
+    if prelude:
+        root = SequenceBlock((*prelude, root))
+    return replace(program, root=root)
 
 
 def render_control_program(
@@ -1273,11 +2378,19 @@ def compile_python_shell(
             "",
         ))
     scope = dict(namespace or {})
+    if "__turing_external_call__" not in scope:
+        from .shell_external_references import PythonShellExternalReferenceResolver
+
+        external_resolver = PythonShellExternalReferenceResolver()
+        scope["__turing_external_call__"] = external_resolver.call
+    else:
+        external_resolver = None
     if abstract_tensor_backend is not None:
         scope["AbstractTensor"] = AbstractTensor
     exec(compile(source, f"<compiled-shell:{function_name}>", "exec"), scope)
     result = scope[function_name]
     result.__compiled_shell_source__ = source
+    result.__external_reference_resolver__ = external_resolver
     return result
 
 
@@ -1336,7 +2449,9 @@ __all__ = [
     "ControlDeploymentLane",
     "ControlDeploymentRegion",
     "ControlExpression",
+    "ControlSequenceMutation",
     "CallBlock",
+    "ExternalReferenceCallBlock",
     "ValidationBlock",
     "ControlProgram",
     "ControlTarget",
@@ -1348,6 +2463,8 @@ __all__ = [
     "RecursionRegion",
     "RegionCode",
     "SequenceBlock",
+    "SequenceMutationBlock",
+    "SequenceQueryBlock",
     "StateMachineTick",
     "StatementBlock",
     "StreamPublishBlock",

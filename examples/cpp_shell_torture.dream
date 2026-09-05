@@ -1,0 +1,57 @@
+/*@turing.segment.v1
+id = cpp-torture
+language = cpp
+encoding = utf-8
+outputs = total_score
+entry = total_score
+@end*/
+class Animal {
+    int lifeage;
+    int mass;
+
+    Animal(int start_age, int start_mass) {
+        lifeage = start_age;
+        mass = start_mass;
+    }
+
+    int lifespan_estimate() {
+        int estimate = 0;
+        int factor = 2;
+        while (factor > 0) {
+            estimate = estimate + lifeage * factor;
+            factor = factor - 1;
+        }
+        if (mass > 100) {
+            estimate = estimate - 5;
+        } else {
+            estimate = estimate + 5;
+        }
+        return estimate;
+    }
+};
+
+class Dog : public Animal {
+    int loyalty;
+
+    Dog(int start_age, int start_mass, int start_loyalty) {
+        loyalty = start_loyalty;
+    }
+
+    int total_score() {
+        int base = lifespan_estimate();
+        int total = base + loyalty;
+        int i = 0;
+        while (i < loyalty) {
+            total = total + i;
+            i = i + 1;
+        }
+        return total;
+    }
+};
+
+int run_report() {
+    Dog fido = Dog__new(3, 40, 10);
+    int score = fido.total_score();
+    return score;
+}
+/*@turing.end*/
