@@ -5427,13 +5427,22 @@ def _dict_literal_mutations(graph_obj: Any) -> tuple[Any, ...]:
 
 def _graph_control_expression(
     graph_obj: Any, node_id: int, visiting: frozenset[int] = frozenset(),
+    *, resident: frozenset[int] = frozenset(),
 ):
-    """Translate a retained scalar predicate from ProcessGraph structure."""
+    """Translate a retained scalar predicate from ProcessGraph structure.
+
+    ``resident`` names every value a scheduled region owns.  The shell
+    consumes such a value through the region's publication; re-deriving it
+    from the node's parents would give one source value a second physical
+    definition (and, for a loop-carried update, a stale one).
+    """
 
     from .control_source import ControlExpression
 
     node_id = int(node_id)
     if node_id in visiting or node_id not in graph_obj:
+        return ControlExpression("value", value_id=node_id)
+    if node_id in resident:
         return ControlExpression("value", value_id=node_id)
     data = graph_obj.nodes[node_id]
     expression = data.get("expr_obj")
@@ -5472,7 +5481,7 @@ def _graph_control_expression(
         operator = "and" if isinstance(expression.op, ast.And) else "or"
         operands = tuple(
             _graph_control_expression(
-                graph_obj, parent, visiting | {node_id}
+                graph_obj, parent, visiting | {node_id}, resident=resident,
             )
             for parent in ordered
         )
@@ -5504,7 +5513,7 @@ def _graph_control_expression(
         arity = 1 if operation in {"not", "neg", "invert"} else 2
         operands = tuple(
             _graph_control_expression(
-                graph_obj, parent, visiting | {node_id}
+                graph_obj, parent, visiting | {node_id}, resident=resident,
             )
             for parent in ordered[:arity]
         )
@@ -5513,7 +5522,19 @@ def _graph_control_expression(
     return ControlExpression("value", value_id=node_id)
 
 
-def _attach_graph_control_expressions(control: Any, graph_obj: Any):
+def _region_resident_value_ids(dispatch_subgraphs: Iterable[Any]) -> frozenset[int]:
+    """Every graph value a scheduled region owns (and so publishes)."""
+
+    return frozenset(
+        int(node_id)
+        for subgraph in dispatch_subgraphs
+        for node_id in subgraph.G.graph.get("deployment_nodes", ())
+    )
+
+
+def _attach_graph_control_expressions(
+    control: Any, graph_obj: Any, *, resident: frozenset[int] = frozenset(),
+):
     """Recover structured predicates for every retained conditional."""
 
     from .control_source import (
@@ -5527,7 +5548,8 @@ def _attach_graph_control_expressions(control: Any, graph_obj: Any):
                 body=attach(block.body),
                 orelse=(None if block.orelse is None else attach(block.orelse)),
                 predicate_expression=_graph_control_expression(
-                    graph_obj, int(block.predicate_value_id)
+                    graph_obj, int(block.predicate_value_id),
+                    resident=resident,
                 ),
             )
         if isinstance(block, SequenceBlock):
@@ -5547,6 +5569,132 @@ def _attach_graph_control_expressions(control: Any, graph_obj: Any):
         return block
 
     return replace(control, root=attach(control.root))
+
+
+def _consume_resident_control_values(control: Any, resident: frozenset[int]):
+    """Consume every region-owned value a control expression names.
+
+    Control expressions are composed in two places: the loop composer builds
+    return/break guards, while predicates and mutation guards before regions
+    are carved, and the shell recovers conditional predicates afterwards
+    (``_graph_control_expression``).  Both re-derive a scalar from its graph
+    parents.  Once a scheduled region owns that node, the region is its one
+    physical producer: the shell consumes the publication.  Re-deriving it
+    would define the same source value twice, and for a loop-carried update
+    the shell's copy would read the pre-update Phi.
+
+    A subtree rooted at a resident value becomes ``value``.  A predicate whose
+    root is itself resident and equal to the block's predicate id keeps no
+    expression at all; for a while loop this is the designed path, where the
+    condition region publishes the latch predicate.
+    """
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, ControlExpression, ControlSequenceMutation,
+        LoopBlock, LoopControlBlock, ParallelDeployment, ResourceScopeBlock,
+        SequenceBlock, SequenceMutationBlock, StateMachineTick,
+        ValidationBlock, WhileBlock,
+    )
+
+    if not resident:
+        return control
+
+    def expression(item):
+        if item is None:
+            return None
+        if (
+            item.op not in {"value", "const", "sequence_nonempty"}
+            and item.value_id is not None
+            and int(item.value_id) in resident
+        ):
+            return ControlExpression("value", value_id=int(item.value_id))
+        operands = tuple(expression(operand) for operand in item.operands)
+        if all(a is b for a, b in zip(operands, item.operands)):
+            return item
+        return replace(item, operands=operands)
+
+    def predicate(item, predicate_value_id):
+        rewritten = expression(item)
+        if (
+            rewritten is not None
+            and rewritten.op == "value"
+            and predicate_value_id is not None
+            and rewritten.value_id is not None
+            and int(rewritten.value_id) == int(predicate_value_id)
+            and int(predicate_value_id) in resident
+        ):
+            return None
+        return rewritten
+
+    def mutation(item: ControlSequenceMutation) -> ControlSequenceMutation:
+        return replace(
+            item,
+            predicate_expression=expression(item.predicate_expression),
+            argument_expressions=tuple(
+                expression(argument) for argument in item.argument_expressions
+            ),
+        )
+
+    def visit(block):
+        if isinstance(block, SequenceBlock):
+            return replace(block, blocks=tuple(visit(child) for child in block.blocks))
+        if isinstance(block, ConditionalBlock):
+            return replace(
+                block,
+                body=visit(block.body),
+                orelse=None if block.orelse is None else visit(block.orelse),
+                predicate_expression=predicate(
+                    block.predicate_expression, block.predicate_value_id
+                ),
+            )
+        if isinstance(block, LoopControlBlock):
+            return replace(
+                block,
+                predicate_expression=predicate(
+                    block.predicate_expression, block.predicate_value_id
+                ),
+            )
+        if isinstance(block, ValidationBlock):
+            return replace(
+                block,
+                predicate_expression=predicate(
+                    block.predicate_expression, block.predicate_value_id
+                ),
+            )
+        if isinstance(block, WhileBlock):
+            return replace(
+                block,
+                condition=visit(block.condition),
+                body=visit(block.body),
+                predicate_expression=predicate(
+                    block.predicate_expression, block.predicate_value_id
+                ),
+                sequence_mutations=tuple(map(mutation, block.sequence_mutations)),
+                terminal_controls=tuple(map(visit, block.terminal_controls)),
+            )
+        if isinstance(block, LoopBlock):
+            return replace(
+                block,
+                body=visit(block.body),
+                sequence_mutations=tuple(map(mutation, block.sequence_mutations)),
+            )
+        if isinstance(block, SequenceMutationBlock):
+            return replace(block, mutation=mutation(block.mutation))
+        if isinstance(block, StateMachineTick):
+            return replace(
+                block,
+                cases=tuple((value, visit(body)) for value, body in block.cases),
+                default=None if block.default is None else visit(block.default),
+            )
+        if isinstance(block, ParallelDeployment):
+            return replace(block, lanes=tuple(map(visit, block.lanes)))
+        if isinstance(block, CallBlock):
+            return replace(block, callee=visit(block.callee))
+        if isinstance(block, ResourceScopeBlock):
+            return replace(block, body=visit(block.body))
+        return block
+
+    return replace(control, root=visit(control.root))
 
 
 def _install_lexical_sequence_mutations(
@@ -5854,7 +6002,10 @@ def _install_lexical_sequence_mutations(
                         mutation_block if arm == "body" else empty,
                         mutation_block if arm == "orelse" else None,
                         predicate_expression=_graph_control_expression(
-                            graph.G, int(predicate_id)
+                            graph.G, int(predicate_id),
+                            resident=_region_resident_value_ids(
+                                dispatch_subgraphs
+                            ),
                         ),
                         source_node_id=int(owner_id),
                     )
@@ -9658,7 +9809,13 @@ def _class_surface_ssa_program(
             graph,
             getattr(shell, "dispatch_subgraphs", ()),
         )
-        control = _attach_graph_control_expressions(control, graph_obj)
+        resident_value_ids = _region_resident_value_ids(
+            getattr(shell, "dispatch_subgraphs", ())
+        )
+        control = _attach_graph_control_expressions(
+            control, graph_obj, resident=resident_value_ids,
+        )
+        control = _consume_resident_control_values(control, resident_value_ids)
         # Query placement initially sees only predicate result ids.  Once the
         # structured expression is attached, reschedule so a conditional such
         # as ``optional_row is None`` exposes its dependency on the row handle

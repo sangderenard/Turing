@@ -2523,6 +2523,20 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         _CONSTANT_UNAVAILABLE = 2
         _constant_status: dict[int, int] = {}
         _constant_values: dict[int, Any] = {}
+        # A loop-carried initial is the entry arm of a runtime Phi, not a
+        # literal every consumer may fold: inside the loop the name holds
+        # the previous iteration's update.  Region extraction already
+        # captures such a seed as an Input; a capture derived from it
+        # (``i + 1`` over the seed ``0``) is likewise a runtime input, never
+        # a region-local constant.  Seeding the evaluator state here keeps
+        # every closure through a carried seed unavailable.
+        for _node_id, _node_data in graph.G.nodes(data=True):
+            for _initial, _updated in (
+                (_node_data.get("attributes") or {}).get(
+                    "loop_carried_bindings"
+                ) or {}
+            ).values():
+                _constant_status[int(_initial)] = _CONSTANT_UNAVAILABLE
 
         def _constant_expression(value_id: int):
             """Evaluate a literal producer closure without Python recursion.
