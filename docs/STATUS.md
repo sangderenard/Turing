@@ -74,6 +74,10 @@ way and left alone: region `less`/`greater` over loop-carried scalars have
 no module-lane C spelling, which blocks any while-loop variant of the
 native repro.
 
+## Handoff
+
+See `HANDOFF_2026-09-06.md` (narrative, evidence, tools, open defects).
+
 ## Next step
 
 1. Make the gate loud: a call result or record projection that becomes a

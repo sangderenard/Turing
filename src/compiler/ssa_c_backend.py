@@ -2445,13 +2445,22 @@ def emit_ssa_module_to_c(
                 return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
             return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
 
+        # Module-lane helpers (binary_value, index_select_double, ...) log
+        # every element of their inner loops and swamp the trace (2 GB and a
+        # timeout on the managed DT window).  Trace the authored program:
+        # the functions carrying the module's own prefix.
+        trace_this_function = bool(trace) and (
+            fn.startswith(str(function_name).split("__", 1)[0] + "__")
+            if "__" in str(function_name) else True
+        )
+
         def flush_trace() -> None:
-            if not trace or not pending_trace:
+            if not trace_this_function or not pending_trace:
                 return
             instruction, block_name = pending_trace.pop()
             body.extend(trace_lines(instruction, block_name))
 
-        if trace:
+        if trace_this_function:
             body.append(
                 f"        turing_trace_event({_trace_text(fn)}, \"entry\", "
                 f"{_trace_text('ENTER ' + fn)});"
@@ -2469,7 +2478,7 @@ def emit_ssa_module_to_c(
                 body.append("        turing_pool_effect_lock();")
             for position, instruction in enumerate(block.instrs):
                 flush_trace()
-                if trace:
+                if trace_this_function:
                     pending_trace.append((instruction, block_name))
                 if block_is_guarded and position == len(block.instrs) - 1:
                     body.append("        turing_pool_effect_unlock();")
@@ -2593,7 +2602,7 @@ def emit_ssa_module_to_c(
                     continue
                 if op in {"Br", "br"}:
                     target = str(instruction.attributes.get("target"))
-                    if trace:
+                    if trace_this_function:
                         pending_trace.clear()
                         body.append(
                             f"        turing_trace_event({_trace_text(fn)}, "
@@ -2608,7 +2617,7 @@ def emit_ssa_module_to_c(
                     on_false = str(instruction.attributes.get("false_target"))
                     if condition is None:
                         continue
-                    if trace:
+                    if trace_this_function:
                         pending_trace.clear()
                         body.append(
                             f"        turing_trace_i64({_trace_text(fn)}, "
@@ -2631,7 +2640,7 @@ def emit_ssa_module_to_c(
                     body.append("        }")
                     continue
                 if op in {"Ret", "ret", "Return", "return"}:
-                    if trace:
+                    if trace_this_function:
                         pending_trace.clear()
                         for returned in instruction.args:
                             held = expressions.get(int(returned.id))
