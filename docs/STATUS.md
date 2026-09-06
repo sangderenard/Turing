@@ -13,8 +13,9 @@ notes; sequencing in `ACTION_PLAN_2026-09-05_EVENING.md`.
 | `python tools/repro_record_row_effects.py` | 2 s | pass (e1f94cc3 .. dbf77f32) |
 | four control-region pytest files + two threading tests + five record-row tests | 15 s | 17 pass |
 | `python tools/scan_managed_duplicates.py` | 5.5 min | LOWERED OK, 178 functions, 0 duplicates, INOUT-REDEFINED pi_update only (dbf77f32) |
-| native DT build `build/managed_dt_record_rows9_20260906` (O0, batch 8, window = dt = 2^-20) | 10 min | builds and runs to completion (1445946f) |
-| `python tools/managed_dt_parity.py build/managed_dt_record_rows9_20260906 --frames 1 --timeout 60` | 1 min | **FAIL**: 10 mismatches, see below |
+| `python tools/repro_record_field_mutation_native.py` (native, real material ABI) | 15 s | pass (8dc639b3) |
+| native DT build `build/managed_dt_record_rows10_20260906` (O0, batch 8, window = dt = 2^-20) | 10 min | builds and runs to completion (8dc639b3) |
+| `python tools/managed_dt_parity.py build/managed_dt_record_rows10_20260906 --frames 1 --timeout 60` | 1 min | **FAIL**: 10 mismatches, root cause below |
 | `tests/test_ir_sequence_tables.py::test_compiled_retained_loop_mutates_caller_sequence_record` | 5 s | FAIL, pre-existing at f90b36ea (expects an empty C shell source) |
 
 ## Identity rules landed 2026-09-05/06
@@ -40,35 +41,48 @@ notes; sequencing in `ACTION_PLAN_2026-09-05_EVENING.md`.
   record default carries the field's physical dtype
   (`TURING_DEBUG_PHYSICAL` prints type-union conflicts).
 
-## Current blocker: native parity
+## Current blocker: native parity (build/managed_dt_record_rows10_20260906)
 
-The fresh binary runs to completion (no crash, no unresolved calls, no
-undefined operands) but every value the callee chain writes is invisible
-at the root buffers the parity tool reads: `material.telemetry` stays 0,
-`material.inputs[:, 0] = dt` never lands, the controller's `dt_max/acc/
-max_vel_ever` keep their initial values, `last_maximum_*` are NaN and the
-returned `dt_next` is 0. Verified on this binary's repository SSA:
+The binary runs to completion; `advanced` matches eager; everything else
+the retry loop touches is wrong in one recognisable shape (telemetry 0,
+inputs rows 2-7 uninitialised, controller untouched, dt_next 0).  Traced
+through the C: the material record's buffers pass by pointer through
+window -> run_superstep -> step -> advance, and advance's regions store
+through them.  What undoes those writes is the rollback path, and two
+silent identity defects sit under it:
 
-- the retry loop runs (`while_condition` Phi of two `True` constants);
-- `advance` is called first in `while_body` with the caller's own record
-  formals (telemetry 222, state 221, inputs 219, output 220);
-- inside `advance` the telemetry/inputs stores (source lines 382-392) are
-  regions 0/1/6/7 at the top of `entry`, unconditional, as authored;
-- `copy_shallow`/`restore` are correctly absent (the managed window runs
-  the `rollback=False` lane).
+1. `saved = state.copy_shallow()` (a source-linked record method returning
+   a tuple of array copies) was never lowered.  `saved` became a FABRICATED
+   float64 scalar input of `step_with_dt_control_used` (formal 46), passed
+   up as an invented input of `run_superstep` (589) and of the window, so
+   `state.restore(saved)` (lowered as step's planned_region_2, guarded by
+   `rejected`) copies inputs/state/output/telemetry from garbage.  The
+   full-native gate reported `unresolved_calls=0`: the call vanished before
+   the gate, exactly the class the plan forbids.
+2. `targets.mass_max`, `targets.error_limits`, `ctrl.dt_min` projections in
+   step are recorded as `unresolved_record_projection_receivers`
+   (function metadata), i.e. the rejection test compares metrics against
+   receivers the linker could not bind.  Whether native rejects the first
+   attempt because of this or for another reason needs a native trace
+   (`--trace` is not implemented for the managed C host).
 
-So the remaining defect is below the DT controller: the material record's
-mutable fields (and the window's returned scalar) are not the root
-storage in the native chain `window -> run_superstep ->
-step_with_dt_control_used -> advance`. This is the still-open
-"material_state param-mutation" half of the store-chain identity
-(`project-store-chain-identity`), the same class as the previous binary's
-11 mismatches. It is not a placement or record-identity defect.
+Both are record/method resolution defects (the "opaque material methods"
+frontier), not placement, not numerics.  The record plumbing itself is
+proven by tools/repro_record_field_mutation_native.py (writes two calls
+deep land, returned scalar right).  Two further backend gaps met on the
+way and left alone: region `less`/`greater` over loop-carried scalars have
+no module-lane C spelling, which blocks any while-loop variant of the
+native repro.
 
 ## Next step
 
-Prove which frame breaks the aliasing: a seconds-long repro with a record
-parameter whose field is written two calls deep and read at the root
-(`window -> a -> b` with `b` doing `rec.field[k] = v`), asserting the root
-buffer changes natively. Then section 5 of the evening plan
-(`DESIGN_DISPATCHER_THREADS_2026-09-05.md`, regressions before code).
+1. Make the gate loud: a call result or record projection that becomes a
+   fabricated ABI input of a linked function is a hard finding, never a
+   silent input (formal 46 / 589 above would have failed the scan).
+2. Lower `copy_shallow`/`restore` as what they are: a snapshot is the
+   record's mutable arrays copied into caller-owned storage, restore is
+   the copy back; seconds-long repro first (`tools/repro_record_field_
+   mutation_native.py` shape plus a snapshot/restore pair).
+3. Resolve the `targets`/`ctrl` projection receivers in step, then rebuild
+   and rerun parity.  Then section 5 of the evening plan
+   (`DESIGN_DISPATCHER_THREADS_2026-09-05.md`, regressions before code).
