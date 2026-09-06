@@ -1,3 +1,7 @@
+from types import SimpleNamespace
+
+import networkx as nx
+
 from src.compiler.control_source import (
     ControlProgram,
     ControlTarget,
@@ -14,6 +18,7 @@ from src.compiler.control_source import (
     project_control_regions,
     render_python_shell,
     compile_python_shell,
+    overlay_scheduled_control,
 )
 from src.common.tensors.accelerator_backends.glsl_backend import (
     compose_control_shader,
@@ -22,6 +27,8 @@ from src.common.tensors.accelerator_backends.c_primitive_program import (
     CapturedFusedProgram,
 )
 from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
+from src.compiler.glsl_deployment_strategy import _loop_reduction_nesting_hints
+from src.compiler.loop_composer import LoopShaderReduction
 
 
 def test_same_planned_loop_renders_as_python_c_and_glsl():
@@ -218,6 +225,150 @@ def test_project_control_regions_keeps_structural_binding_for_live_loop():
     assert projected.iterable_bindings == ((40, 41, "iteration_9"),)
 
 
+def test_overlay_uses_known_nesting_for_equal_region_sets():
+    inner = ControlProgram(
+        LoopBlock(
+            "iteration_2",
+            "0",
+            "4",
+            "1",
+            StatementBlock(("__scheduled_region_32__",)),
+        ),
+        region_indices=(32,),
+    )
+    outer = ControlProgram(
+        LoopBlock(
+            "iteration_1",
+            "0",
+            "4",
+            "1",
+            StatementBlock(("__scheduled_region_32__",)),
+        ),
+        region_indices=(32,),
+    )
+
+    overlaid = overlay_scheduled_control(
+        (32,),
+        (outer, inner),
+        known_nesting={0: (1,)},
+    )
+
+    assert isinstance(overlaid.root, SequenceBlock)
+    assert len(overlaid.root.blocks) == 1
+    outer_root = overlaid.root.blocks[0]
+    assert isinstance(outer_root, LoopBlock)
+    assert isinstance(outer_root.body, LoopBlock)
+    assert outer_root.body.induction == "iteration_2"
+
+
+def test_overlay_hoists_a_predicate_region_shared_by_sibling_controls():
+    left = ControlProgram(
+        SequenceBlock((
+            StatementBlock(("__scheduled_region_10__",)),
+            StatementBlock(("__scheduled_region_11__",)),
+        )),
+        region_indices=(10, 11),
+    )
+    right = ControlProgram(
+        SequenceBlock((
+            StatementBlock(("__scheduled_region_10__",)),
+            StatementBlock(("__scheduled_region_12__",)),
+        )),
+        region_indices=(10, 12),
+    )
+
+    overlaid = overlay_scheduled_control((10, 11, 12), (left, right))
+
+    assert isinstance(overlaid.root, SequenceBlock)
+    rendered = render_control_program(overlaid, ControlTarget.C)
+    assert rendered.count("__scheduled_region_10__") == 1
+    assert rendered.count("__scheduled_region_11__") == 1
+    assert rendered.count("__scheduled_region_12__") == 1
+
+
+def test_loop_nesting_hints_fall_back_to_unprojected_control_tree():
+    inner_loop = LoopBlock(
+        "iteration_2",
+        "0",
+        "4",
+        "1",
+        StatementBlock(("__scheduled_region_32__",)),
+    )
+    outer = LoopShaderReduction(
+        loop_node_id=1,
+        region_indices=(32,),
+        carried_bindings=(),
+        collapsible=True,
+        blockers=(),
+        estimated_dispatches_removed=1,
+        control_program=ControlProgram(
+            LoopBlock("iteration_1", "0", "4", "1", inner_loop),
+            region_indices=(32,),
+        ),
+    )
+    inner = LoopShaderReduction(
+        loop_node_id=2,
+        region_indices=(32,),
+        carried_bindings=(),
+        collapsible=True,
+        blockers=(),
+        estimated_dispatches_removed=1,
+        control_program=ControlProgram(inner_loop, region_indices=(32,)),
+    )
+
+    assert _loop_reduction_nesting_hints((outer, inner), ()) == {
+        0: frozenset({1})
+    }
+
+
+def test_loop_nesting_hints_follow_comprehension_generator_order():
+    outer = LoopShaderReduction(
+        loop_node_id=673,
+        region_indices=(32,),
+        carried_bindings=(),
+        collapsible=True,
+        blockers=(),
+        estimated_dispatches_removed=1,
+        control_program=ControlProgram(
+            LoopBlock(
+                "iteration_673",
+                "0",
+                "4",
+                "1",
+                StatementBlock(("__scheduled_region_32__",)),
+            ),
+            region_indices=(32,),
+        ),
+    )
+    inner = LoopShaderReduction(
+        loop_node_id=692,
+        region_indices=(32,),
+        carried_bindings=(),
+        collapsible=True,
+        blockers=(),
+        estimated_dispatches_removed=1,
+        control_program=ControlProgram(
+            LoopBlock(
+                "iteration_692",
+                "0",
+                "4",
+                "1",
+                StatementBlock(("__scheduled_region_32__",)),
+            ),
+            region_indices=(32,),
+        ),
+    )
+    graph = nx.DiGraph()
+    graph.add_node(
+        693,
+        parents=((688, "elt"), (673, "generators"), (692, "generators")),
+    )
+
+    assert _loop_reduction_nesting_hints(
+        (outer, inner), (), SimpleNamespace(G=graph)
+    ) == {0: frozenset({1})}
+
+
 def test_control_shader_preserves_repeated_structural_operand_slots():
     program = FusedProgram(
         version=1,
@@ -411,3 +562,34 @@ def test_python_shell_finalizes_to_callable_only_after_selection():
 
     assert state == [0, 1, 2, 3]
     assert function.__compiled_shell_source__.startswith("def collect")
+
+
+def test_python_shell_owns_existing_module_external_reference_calls():
+    from src.compiler.control_source import ExternalReferenceCallBlock
+
+    logical = ControlProgram(
+        ExternalReferenceCallBlock(
+            callsite_id=7,
+            identity="_pickle.loads",
+            argument_value_ids=(1,),
+            keyword_argument_value_ids=(),
+            result_value_id=2,
+            result_dtype="opaque_ref",
+        ),
+    )
+    function = compile_python_shell(
+        logical,
+        (),
+        function_name="load_pickled_value",
+        parameters=("value_1",),
+    )
+
+    import pickle
+
+    assert function(pickle.dumps({"native": [1, 2, 3]})) is None
+    resolver = function.__external_reference_resolver__
+    assert resolver is not None
+    assert resolver.host.values.object(1) == {"native": [1, 2, 3]}
+    assert "__turing_external_call__('_pickle.loads'" in (
+        function.__compiled_shell_source__
+    )

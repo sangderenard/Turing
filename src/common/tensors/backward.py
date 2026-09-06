@@ -59,6 +59,9 @@ class BackwardRegistry:
             "eps": br.eps,
             "T": br.T,
             "matmul_vjp": br.matmul_vjp,
+            "pad_vjp": br.pad_vjp,
+            "repeat_vjp": br.repeat_vjp,
+            "repeat_interleave_vjp": br.repeat_interleave_vjp,
 
             # optional helper used by 'trace'
             "I_like": getattr(br, "I_like", None),

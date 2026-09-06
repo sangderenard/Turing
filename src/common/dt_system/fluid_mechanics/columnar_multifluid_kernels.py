@@ -136,28 +136,32 @@ def columnar_multifluid_rgb_step(
     # A new deterministic spatial hash is admitted every twelve and a half
     # managed seconds.  Its sparse fertile peaks grow into persistent food
     # entities; no host RNG or wall clock enters the state machine.
-    food_epoch = (next_time * 0.08).floor()
+    # Lower spatial frequencies (was 12.9898/78.233/39.3467/11.135) widen the
+    # fertile blobs from fine speckle into actual patches; a slower epoch
+    # rate (was 0.08, ~12.5s cycle) and a smaller growth-rate constant (was
+    # 0.032) make a patch take longer to grow back once it is eaten out.
+    food_epoch = (next_time * 0.02).floor()
     food_hash_a = (
-        column_x * 12.9898 + column_y * 78.233 + food_epoch * 37.719
+        column_x * 3.25 + column_y * 19.56 + food_epoch * 37.719
     ).sin()
     food_hash_b = (
-        column_x * 39.3467 - column_y * 11.135 + food_epoch * 19.913
+        column_x * 9.84 - column_y * 2.78 + food_epoch * 19.913
     ).cos()
     food_fertility = (
         (food_hash_a * food_hash_b - 0.72).maximum(0.0) / 0.28
     )
     food_fertility = food_fertility * food_fertility
     growing_food = (
-        food_store * (-0.003 * dt).exp() + 0.032 * dt * food_fertility
+        food_store * (-0.003 * dt).exp() + 0.014 * dt * food_fertility
     ).maximum(0.0).minimum(1.0)
 
     sight_x = column_x - entity_x
     sight_y = column_y - entity_y
     sight_distance_squared = sight_x * sight_x + sight_y * sight_y
-    sight_distance = (sight_distance_squared + 0.08).sqrt()
+    sight_distance = (sight_distance_squared + 0.16).sqrt()
     visibility = (
         (-sight_distance_squared / (2.0 * 1.55 * 1.55)).exp()
-        / (sight_distance_squared + 0.14)
+        / (sight_distance_squared + 0.22)
     )
     signed_visibility = visibility * (
         1.20 * foraging_a * trail_c
@@ -174,22 +178,22 @@ def columnar_multifluid_rgb_step(
     separation_ac_y = entity_y - entity_c_y
     separation_ab = (
         separation_ab_x * separation_ab_x
-        + separation_ab_y * separation_ab_y + 0.18
+        + separation_ab_y * separation_ab_y + 0.30
     )
     separation_ac = (
         separation_ac_x * separation_ac_x
-        + separation_ac_y * separation_ac_y + 0.18
+        + separation_ac_y * separation_ac_y + 0.30
     )
     nest_a_x = nest_x - entity_x
     nest_a_y = nest_y - entity_y
-    nest_a_length = (nest_a_x * nest_a_x + nest_a_y * nest_a_y + 0.08).sqrt()
+    nest_a_length = (nest_a_x * nest_a_x + nest_a_y * nest_a_y + 0.16).sqrt()
     acceleration_x = (
         2.35 * steering_x
         + 1.85 * cargo_a * nest_a_x / nest_a_length
         + 0.58 * (next_time * 1.71 + 0.20).cos()
         + 0.30 * separation_ab_x / separation_ab
         + 0.30 * separation_ac_x / separation_ac
-        + 0.08 * (5.0 - entity_x) - 0.54 * entity_velocity_x
+        + 0.08 * (5.0 - entity_x) - 0.30 * entity_velocity_x
     )
     acceleration_y = (
         2.35 * steering_y
@@ -197,7 +201,7 @@ def columnar_multifluid_rgb_step(
         + 0.58 * (next_time * 1.37 + 1.10).sin()
         + 0.30 * separation_ab_y / separation_ab
         + 0.30 * separation_ac_y / separation_ac
-        + 0.08 * (3.5 - entity_y) - 0.54 * entity_velocity_y
+        + 0.08 * (3.5 - entity_y) - 0.30 * entity_velocity_y
     )
     next_entity_velocity_x = entity_velocity_x + acceleration_x * dt
     next_entity_velocity_y = entity_velocity_y + acceleration_y * dt
@@ -211,10 +215,10 @@ def columnar_multifluid_rgb_step(
     sight_b_x = column_x - entity_b_x
     sight_b_y = column_y - entity_b_y
     sight_b_distance_squared = sight_b_x * sight_b_x + sight_b_y * sight_b_y
-    sight_b_distance = (sight_b_distance_squared + 0.08).sqrt()
+    sight_b_distance = (sight_b_distance_squared + 0.16).sqrt()
     visibility_b = (
         (-sight_b_distance_squared / (2.0 * 1.55 * 1.55)).exp()
-        / (sight_b_distance_squared + 0.14)
+        / (sight_b_distance_squared + 0.22)
     )
     signed_visibility_b = visibility_b * (
         1.20 * foraging_b * trail_a - 0.30 * trail_b
@@ -231,18 +235,18 @@ def columnar_multifluid_rgb_step(
     separation_bc_y = entity_b_y - entity_c_y
     separation_bc = (
         separation_bc_x * separation_bc_x
-        + separation_bc_y * separation_bc_y + 0.18
+        + separation_bc_y * separation_bc_y + 0.30
     )
     nest_b_x = nest_x - entity_b_x
     nest_b_y = nest_y - entity_b_y
-    nest_b_length = (nest_b_x * nest_b_x + nest_b_y * nest_b_y + 0.08).sqrt()
+    nest_b_length = (nest_b_x * nest_b_x + nest_b_y * nest_b_y + 0.16).sqrt()
     acceleration_b_x = (
         2.35 * steering_b_x
         + 1.85 * cargo_b * nest_b_x / nest_b_length
         + 0.58 * (next_time * 1.63 + 2.30).cos()
         - 0.30 * separation_ab_x / separation_ab
         + 0.30 * separation_bc_x / separation_bc
-        + 0.08 * (5.0 - entity_b_x) - 0.54 * entity_b_velocity_x
+        + 0.08 * (5.0 - entity_b_x) - 0.30 * entity_b_velocity_x
     )
     acceleration_b_y = (
         2.35 * steering_b_y
@@ -250,7 +254,7 @@ def columnar_multifluid_rgb_step(
         + 0.58 * (next_time * 1.43 + 2.80).sin()
         - 0.30 * separation_ab_y / separation_ab
         + 0.30 * separation_bc_y / separation_bc
-        + 0.08 * (3.5 - entity_b_y) - 0.54 * entity_b_velocity_y
+        + 0.08 * (3.5 - entity_b_y) - 0.30 * entity_b_velocity_y
     )
     next_entity_b_velocity_x = entity_b_velocity_x + acceleration_b_x * dt
     next_entity_b_velocity_y = entity_b_velocity_y + acceleration_b_y * dt
@@ -264,10 +268,10 @@ def columnar_multifluid_rgb_step(
     sight_c_x = column_x - entity_c_x
     sight_c_y = column_y - entity_c_y
     sight_c_distance_squared = sight_c_x * sight_c_x + sight_c_y * sight_c_y
-    sight_c_distance = (sight_c_distance_squared + 0.08).sqrt()
+    sight_c_distance = (sight_c_distance_squared + 0.16).sqrt()
     visibility_c = (
         (-sight_c_distance_squared / (2.0 * 1.55 * 1.55)).exp()
-        / (sight_c_distance_squared + 0.14)
+        / (sight_c_distance_squared + 0.22)
     )
     signed_visibility_c = visibility_c * (
         1.20 * foraging_c * trail_b - 0.30 * trail_c
@@ -282,14 +286,14 @@ def columnar_multifluid_rgb_step(
     steering_c_y = column_y * 0.0 + (sight_c_y * steering_c_weight).sum()
     nest_c_x = nest_x - entity_c_x
     nest_c_y = nest_y - entity_c_y
-    nest_c_length = (nest_c_x * nest_c_x + nest_c_y * nest_c_y + 0.08).sqrt()
+    nest_c_length = (nest_c_x * nest_c_x + nest_c_y * nest_c_y + 0.16).sqrt()
     acceleration_c_x = (
         2.35 * steering_c_x
         + 1.85 * cargo_c * nest_c_x / nest_c_length
         + 0.58 * (next_time * 1.79 + 4.20).cos()
         - 0.30 * separation_ac_x / separation_ac
         - 0.30 * separation_bc_x / separation_bc
-        + 0.08 * (5.0 - entity_c_x) - 0.54 * entity_c_velocity_x
+        + 0.08 * (5.0 - entity_c_x) - 0.30 * entity_c_velocity_x
     )
     acceleration_c_y = (
         2.35 * steering_c_y
@@ -297,7 +301,7 @@ def columnar_multifluid_rgb_step(
         + 0.58 * (next_time * 1.31 + 5.00).sin()
         - 0.30 * separation_ac_y / separation_ac
         - 0.30 * separation_bc_y / separation_bc
-        + 0.08 * (3.5 - entity_c_y) - 0.54 * entity_c_velocity_y
+        + 0.08 * (3.5 - entity_c_y) - 0.30 * entity_c_velocity_y
     )
     next_entity_c_velocity_x = entity_c_velocity_x + acceleration_c_x * dt
     next_entity_c_velocity_y = entity_c_velocity_y + acceleration_c_y * dt
@@ -412,30 +416,62 @@ def columnar_multifluid_rgb_step(
     ).minimum(1.0)
     delivered_food = dt * (delivery_a + delivery_b + delivery_c)
     next_nest_food = (nest_food + delivered_food).maximum(0.0)
-    clean_release = filter_reservoir.maximum(0.0).minimum(0.42)
+    # Pump aggressiveness: a higher cap and release rate move more filtered
+    # fluid through faster (was 0.42 cap / 0.30 emission rate below), and a
+    # larger surface-target coefficient makes the return jet actually push
+    # the surface instead of barely nudging it (was 0.16).
+    clean_release = filter_reservoir.maximum(0.0).minimum(0.65)
     target = (
         -0.42 * load - 0.22 * entity_interior * entity_interior
-        + 0.16 * clean_release * return_mask
+        + 0.30 * clean_release * return_mask
     )
+    # Damping lowered (was 4.6) so the surface actually oscillates instead
+    # of critically damping back to rest almost immediately.
     acceleration = (
-        20.0 * (target - displacement) - 4.6 * displacement_velocity
+        20.0 * (target - displacement) - 2.6 * displacement_velocity
     )
     next_velocity = displacement_velocity + acceleration * dt
     next_displacement = displacement + next_velocity * dt
     surface = rest_surface + next_displacement
-    height = ((surface - 0.5) / 5.0).maximum(0.0).minimum(1.0)
+    # Both the divisor (was 5.0) and the color coefficients below (was
+    # 27/34/18/21/16/15) were small enough that real displacement barely
+    # moved the rendered color -- height now saturates over a narrower
+    # displacement range and pushes color much harder once it does.
+    height = ((surface - 0.5) / 2.0).maximum(0.0).minimum(1.0)
     compression = (-next_displacement / 0.42).maximum(0.0).minimum(1.0)
     motion = next_velocity.abs().minimum(1.0)
 
+    # A synthesized flow-direction field: each column's velocity is the
+    # inverse-distance-weighted blend of the three ants' own velocities,
+    # since the surface's own vertical spring velocity carries no x/y
+    # direction to show. Tinting by this is the closest a scalar RGB raster
+    # gets to drawing velocity vectors without literal arrow geometry.
+    flow_weight_a = 1.0 / (distance_a_squared + 0.35)
+    flow_weight_b = 1.0 / (distance_b_squared + 0.35)
+    flow_weight_c = 1.0 / (distance_c_squared + 0.35)
+    flow_weight_total = flow_weight_a + flow_weight_b + flow_weight_c
+    flow_x = (
+        flow_weight_a * next_entity_velocity_x
+        + flow_weight_b * next_entity_b_velocity_x
+        + flow_weight_c * next_entity_c_velocity_x
+    ) / flow_weight_total
+    flow_y = (
+        flow_weight_a * next_entity_velocity_y
+        + flow_weight_b * next_entity_b_velocity_y
+        + flow_weight_c * next_entity_c_velocity_y
+    ) / flow_weight_total
+
     base_red = (
-        186.0 + 27.0 * height - 34.0 * compression + 54.0 * load
+        186.0 + 50.0 * height - 60.0 * compression + 54.0 * load
+        + 16.0 * flow_x
     ).maximum(0.0).minimum(255.0)
     base_green = (
-        220.0 + 18.0 * height - 21.0 * compression + 30.0 * load
-        + 8.0 * motion
+        220.0 + 35.0 * height - 40.0 * compression + 30.0 * load
+        + 26.0 * motion
     ).maximum(0.0).minimum(255.0)
     base_blue = (
-        232.0 + 16.0 * height + 15.0 * compression + 20.0 * load
+        232.0 + 30.0 * height + 28.0 * compression + 20.0 * load
+        + 16.0 * flow_y
     ).maximum(0.0).minimum(255.0)
 
     # Paired fields are the ants' pheromone vocabulary.  The narrow band is
@@ -488,7 +524,7 @@ def columnar_multifluid_rgb_step(
     next_ink_cyan = next_ink_cyan * drain_retention
     next_ink_blue = next_ink_blue * drain_retention
     next_ink_magenta = next_ink_magenta * drain_retention
-    clean_emission = 0.30 * dt * clean_release
+    clean_emission = 0.70 * dt * clean_release
     next_filter_reservoir = (
         filter_reservoir + drained_material - clean_emission
     ).maximum(0.0)
@@ -531,7 +567,7 @@ def columnar_multifluid_rgb_step(
     green = green * nest_retention + nest_green * nest_body
     blue = blue * nest_retention + nest_blue * nest_body
 
-    clean_alpha = (return_mask * clean_release).minimum(0.60)
+    clean_alpha = (return_mask * clean_release).minimum(0.80)
     clean_retention = 1.0 - clean_alpha
     red = red * clean_retention + 218.0 * clean_alpha
     green = green * clean_retention + 249.0 * clean_alpha

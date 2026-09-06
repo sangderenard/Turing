@@ -6,9 +6,11 @@ each nested scope is an explicit closure with an explicit capture set.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import Any, Mapping
+
+from ..transmogrifier.ssa import Instr, SSAValue
 
 
 @dataclass(frozen=True)
@@ -17,6 +19,7 @@ class PlanLine:
     inputs: tuple[int, ...] = ()
     outputs: tuple[int, ...] = ()
     attributes: tuple[tuple[str, Any], ...] = ()
+    input_roles: tuple[str, ...] = ()
 
     @classmethod
     def create(
@@ -26,12 +29,14 @@ class PlanLine:
         inputs=(),
         outputs=(),
         attributes: Mapping[str, Any] | None = None,
+        input_roles=(),
     ) -> "PlanLine":
         return cls(
             str(opcode),
             tuple(int(value) for value in inputs),
             tuple(int(value) for value in outputs),
             tuple(sorted((attributes or {}).items())),
+            tuple(str(role) for role in input_roles),
         )
 
 
@@ -41,6 +46,10 @@ class PlanClosure:
     captures: tuple[int, ...]
     items: tuple["PlanItem", ...]
     closure_id: int = -1
+    # Shape (and dtype) of the region's values, carried from the process graph's
+    # per-node domain so the lowered SSA values are the arrays they are, not
+    # shapeless scalars. ``(value_id, shape, dtype)`` per value.
+    value_shapes: tuple[tuple[int, tuple[int, ...], str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -62,6 +71,447 @@ class PlanCall:
 
 
 PlanItem = PlanLine | PlanClosure | PlanCall
+
+
+#: How a tensor operation is spelled once it is known to act on scalars.
+#:
+#: The planner applies this ONLY when the result and every operand have an
+#: empty shape; a genuinely tensor-shaped operation keeps its lowercase
+#: name and is resolved through the tensor likeness table instead. The two
+#: spellings are therefore the same operation at different ranks, which is
+#: why anything interpreting repository SSA -- a backend, or the reference
+#: evaluator -- must read them through this one table rather than keep a
+#: private copy that can drift from it.
+TENSOR_OPERATION_SCALAR_SPELLING: dict[str, str] = {
+    "add": "Add", "sub": "Sub", "mul": "Mul",
+    "truediv": "Div", "div": "Div", "floordiv": "FloorDiv",
+    "mod": "Mod", "pow": "Pow", "neg": "Neg", "abs": "Abs",
+    "equal": "Eq", "not_equal": "Ne", "less": "Lt",
+    "less_equal": "Le", "greater": "Gt", "greater_equal": "Ge",
+    "logical_and": "LAnd", "logical_or": "LOr",
+    "logical_not": "LNot", "maximum": "Max", "minimum": "Min",
+    "bitand": "BitAnd", "bitor": "BitOr", "bitxor": "BitXor",
+    "shl": "Shl", "shr": "Shr", "invert": "Invert",
+    "sqrt": "Sqrt", "exp": "Exp", "log": "Log",
+}
+
+#: Operations whose result is a truth value rather than a number.
+#:
+#: This is a fact about the vocabulary, so it lives with the vocabulary and
+#: not inside whichever backend noticed it first. A relation lowered as
+#: float64 tells every consumer the wrong thing, and the consumer cannot
+#: recover it: the LLVM template for `Lt` emits `fcmp`, which yields i1
+#: whatever the SSA claims, so a value declared double and rendered i1
+#: disagrees with itself and the verifier rejects the first instruction
+#: that consumes it. Fortran and SPIR-V have the same exposure.
+PREDICATE_OPERATIONS: frozenset[str] = frozenset({
+    "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "ULt", "ULe",
+    "LAnd", "LOr", "LNot", "LXor",
+})
+
+
+def plan_value_id_watermark(plan: PlanClosure) -> int:
+    """First value id above every id the plan (recursively) mentions."""
+
+    watermark = 0
+    for value_id, _shape, _dtype in plan.value_shapes:
+        watermark = max(watermark, int(value_id) + 1)
+    for item in plan.items:
+        if isinstance(item, PlanLine):
+            for value_id in (*item.inputs, *item.outputs):
+                watermark = max(watermark, int(value_id) + 1)
+        elif isinstance(item, PlanClosure):
+            watermark = max(watermark, plan_value_id_watermark(item))
+        elif isinstance(item, PlanCall):
+            for value_id in (
+                *item.argument_value_ids, *item.result_value_ids,
+                *(caller for caller, _callee in item.argument_bindings),
+                *(caller for _callee, caller in item.result_bindings),
+            ):
+                watermark = max(watermark, int(value_id) + 1)
+    return watermark
+
+
+def expand_plan_regions(
+    plan: PlanClosure, *, first_free_value_id: int = 0,
+) -> dict[tuple[str, int], tuple[Instr, ...]]:
+    """Lower every top-level ``region_*`` closure of ``plan`` exactly once.
+
+    A region's lowering may synthesize temporaries an authored graph never
+    named (the binary ``Max`` chain of a variadic ``max(a, b, c)``).  Those
+    temporaries live in the SAME value-id space as every other id of the
+    function, so they are allocated from one watermark that starts above
+    every id the function already has in play (``first_free_value_id``:
+    the plan alone is not the function -- control-only graph values such as
+    an ``is not None`` test are never plan lines) and advances past each
+    region's synthesized ids: no two regions coin the same temporary, and
+    no temporary lands on an authored id (region 2's ``max`` chain coined
+    50 while region 5's authored ``Div`` was 50, and the emitted function
+    defined one result twice).  Every consumer of a region's instructions
+    must read this one expansion so all stages agree on which ids the
+    region defines.
+    """
+
+    watermark = max(int(first_free_value_id), plan_value_id_watermark(plan))
+    expanded: dict[tuple[str, int], tuple[Instr, ...]] = {}
+    for item in plan.items:
+        if not (
+            isinstance(item, PlanClosure) and item.name.startswith("region_")
+        ):
+            continue
+        instructions = plan_region_to_ssa_instrs(
+            item, first_free_value_id=watermark,
+        )
+        for instruction in instructions:
+            for value in (
+                *instruction.args,
+                *((instruction.res,) if instruction.res is not None else ()),
+            ):
+                watermark = max(watermark, int(value.id) + 1)
+        expanded[(str(item.name), int(item.closure_id))] = instructions
+    return expanded
+
+
+def copy_region_instructions(
+    instructions: tuple[Instr, ...],
+) -> list[Instr]:
+    """Fresh instruction and value objects carrying the same identities.
+
+    Stages retype a region's occurrences in place; each stage works on its
+    own copies so one stage's view never leaks into another's.
+    """
+
+    return [
+        replace(
+            instruction,
+            args=[replace(value) for value in instruction.args],
+            res=(
+                None if instruction.res is None else replace(instruction.res)
+            ),
+            arg_roles=list(instruction.arg_roles),
+            attributes=dict(instruction.attributes),
+        )
+        for instruction in instructions
+    ]
+
+
+def plan_region_to_ssa_instrs(
+    region: PlanClosure, *, first_free_value_id: int = 0,
+) -> tuple[Instr, ...]:
+    """Lower one planner-owned flat region to repository SSA instructions.
+
+    Each SSA value carries the shape and dtype recorded for it on the region
+    (``value_shapes``, from the process graph's per-node domain), so a value is
+    the array it is and array ops lower as array ops rather than scalars.
+    """
+
+    shape_of = {
+        int(value_id): tuple(int(dimension) for dimension in shape)
+        for value_id, shape, _dtype in region.value_shapes
+    }
+    dtype_of = {
+        int(value_id): dtype for value_id, _shape, dtype in region.value_shapes
+    }
+    # The graph domain is deliberately permissive and often records scalar
+    # control values with its default numerical dtype.  Operator semantics are
+    # authoritative where they are stricter: comparisons/logical operations
+    # produce predicates, and address indices/extents are integers.  Retain
+    # these contracts in repository SSA rather than asking a target emitter to
+    # reverse-engineer them from syntax.
+    predicate_ops = {
+        "eq", "equal", "ne", "not_equal", "lt", "less", "le",
+        "less_equal", "gt", "greater", "ge", "greater_equal",
+        "land", "logical_and", "lor", "logical_or", "lnot",
+        "logical_not", "is", "is_not", "contains", "not_contains",
+    }
+    integer_result_ops = {
+        "len", "length", "extent", "bitlength", "bit_length",
+    }
+    scalar_cast_dtypes = {
+        "float": "float64",
+        # Python ``int`` is not the backend's C ``int``.  Repository SSA uses
+        # the widest portable signed scalar ABI for authored Python integers;
+        # wrappers retain authored fallback for values outside that domain.
+        "int": "int64",
+        "bool": "bool",
+    }
+
+    def semantic_input_ids(item: PlanLine) -> tuple[int, ...]:
+        if len(item.input_roles) != len(item.inputs):
+            return tuple(map(int, item.inputs))
+        return tuple(
+            int(value_id)
+            for value_id, role in zip(
+                item.inputs, item.input_roles, strict=True,
+            )
+            if str(role).casefold() not in {
+                "callee", "func", "function", "definition",
+                "operator", "operator_reference",
+            }
+        )
+
+    def promoted_numeric_dtype(value_ids: tuple[int, ...]) -> str | None:
+        candidates = {
+            str(dtype_of.get(int(value_id)) or "")
+            for value_id in value_ids
+        }
+        if candidates.intersection({
+            "float", "float16", "float32", "float64", "double",
+            "f16", "f32", "f64",
+        }):
+            return "float64"
+        if candidates.intersection({"int64", "i64"}):
+            return "int64"
+        if candidates.intersection({"int", "int32", "i32"}):
+            return "int"
+        if candidates == {"bool"}:
+            return "bool"
+        return None
+
+    # Refine permissive graph-domain defaults using authored scalar operator
+    # semantics before constructing any SSAValue.  Iterate because a chain
+    # such as int(record[index]) -> min -> shift must carry the corrected
+    # integer width through every intermediate, independent of node order.
+    dtype_preserving_ops = {
+        "add", "sub", "mul", "floordiv", "mod", "pow", "neg", "abs",
+        "min", "max", "minimum", "maximum", "bitand", "bitor",
+        "bitxor", "shl", "shr", "invert",
+    }
+    projection_ops = {
+        "indexed", "getitem", "get_item", "subscript", "load",
+    }
+    for _ in range(max(1, len(region.items))):
+        changed = False
+        for item in region.items:
+            if not isinstance(item, PlanLine) or not item.outputs:
+                continue
+            output_id = int(item.outputs[0])
+            opcode = str(item.opcode).casefold()
+            inferred: str | None = None
+            if opcode in {"const", "constant"}:
+                literal = dict(item.attributes).get("value")
+                inferred = (
+                    "bool" if isinstance(literal, bool)
+                    else "int64" if isinstance(literal, int)
+                    else "float64" if isinstance(literal, float)
+                    else None
+                )
+            elif opcode in predicate_ops:
+                inferred = "bool"
+            elif opcode in integer_result_ops:
+                inferred = "int64"
+            elif opcode in scalar_cast_dtypes:
+                inferred = scalar_cast_dtypes[opcode]
+            elif opcode in {"truediv", "div"}:
+                inferred = "float64"
+            elif opcode in dtype_preserving_ops:
+                inferred = promoted_numeric_dtype(semantic_input_ids(item))
+            elif opcode in projection_ops:
+                sources = semantic_input_ids(item)
+                inferred = (
+                    None if not sources else dtype_of.get(int(sources[0]))
+                )
+            if inferred is not None and dtype_of.get(output_id) != inferred:
+                dtype_of[output_id] = inferred
+                changed = True
+        if not changed:
+            break
+
+    for item in region.items:
+        if not isinstance(item, PlanLine):
+            continue
+        opcode = str(item.opcode).casefold()
+        if item.outputs and opcode in {"const", "constant"}:
+            literal = dict(item.attributes).get("value")
+            if isinstance(literal, bool):
+                dtype_of[int(item.outputs[0])] = "bool"
+            elif isinstance(literal, int):
+                dtype_of[int(item.outputs[0])] = "int64"
+            elif isinstance(literal, float):
+                dtype_of[int(item.outputs[0])] = "float64"
+        if item.outputs and opcode in predicate_ops:
+            dtype_of[int(item.outputs[0])] = "bool"
+        elif item.outputs and opcode in integer_result_ops:
+            dtype_of[int(item.outputs[0])] = "int64"
+        elif item.outputs and opcode in scalar_cast_dtypes:
+            dtype_of[int(item.outputs[0])] = scalar_cast_dtypes[opcode]
+        if opcode == "getelementptr":
+            # Only repository address arithmetic requires integer indices.
+            # High-level Indexed/IndexedStore may be a dictionary lookup whose
+            # key retains any authored type and is lowered through a table.
+            index_inputs = item.inputs[1:]
+            for value_id in index_inputs:
+                dtype_of[int(value_id)] = "int64"
+
+    def value(value_id: int) -> SSAValue:
+        value_id = int(value_id)
+        existing = values.get(value_id)
+        if existing is not None:
+            return existing
+        made = SSAValue(
+            value_id,
+            dtype=dtype_of.get(value_id, "float64"),
+            shape=shape_of.get(value_id, ()),
+        )
+        values[value_id] = made
+        return made
+
+    values: dict[int, SSAValue] = {}
+    # Temporaries minted here live in the CALLER's numbering: a planner
+    # region is carved out of the caller and shares its value space, so the
+    # caller reads a region's published values by id. Seeding the allocator
+    # from only this region's own line ids let temporaries collide with
+    # caller ids the region never mentions -- region-internal GEP addresses
+    # landed on the ids of the caller's scalar parameters, and the fluid
+    # advance read a height cell where tracer_diffusivity should have been
+    # (same-number-different-space, the class this tree keeps paying for).
+    # ``first_free_value_id`` is the caller's watermark; the region's own
+    # max stays in the seed so a caller that cannot supply one keeps the
+    # old behaviour.
+    next_value_id = max(int(first_free_value_id) - 1, max((
+        int(value_id)
+        for item in region.items
+        if isinstance(item, PlanLine)
+        for value_id in (*item.inputs, *item.outputs)
+    ), default=-1)) + 1
+
+    def fresh_like(result: SSAValue) -> SSAValue:
+        nonlocal next_value_id
+        made = SSAValue(
+            next_value_id,
+            dtype=result.dtype,
+            shape=tuple(result.shape),
+        )
+        values[next_value_id] = made
+        next_value_id += 1
+        return made
+
+    instructions = []
+    for item in region.items:
+        if not isinstance(item, PlanLine):
+            raise ValueError(
+                f"{region.name!r} is not a flat operator region"
+            )
+        if len(item.outputs) > 1:
+            raise ValueError(
+                f"{item.opcode!r} may publish at most one SSA result"
+            )
+        result = (
+            value(int(item.outputs[0])) if item.outputs else None
+        )
+        # A Python identity replacement is already the call's graph-native
+        # meaning.  Its callable/definition input is provenance, not runtime
+        # data.  Keep this distinction explicit through argument roles instead
+        # of teaching each backend that ``float`` (or every future identity)
+        # happens to carry a CPython function object in operand zero.
+        paired_inputs = tuple(zip(item.inputs, item.input_roles))
+        if len(item.input_roles) == len(item.inputs):
+            semantic_inputs = semantic_input_ids(item)
+            semantic_roles = tuple(
+                str(role)
+                for _value_id, role in paired_inputs
+                if str(role).casefold() not in {
+                    "callee", "func", "function", "definition",
+                    "operator", "operator_reference",
+                }
+            )
+        else:
+            semantic_inputs = tuple(int(value_id) for value_id in item.inputs)
+            semantic_roles = tuple(str(role) for role in item.input_roles)
+
+        opcode = str(item.opcode)
+        attributes = dict(item.attributes)
+        if opcode.casefold() in scalar_cast_dtypes:
+            attributes.setdefault("source_operator", opcode)
+            attributes.setdefault(
+                "target_dtype", scalar_cast_dtypes[opcode.casefold()]
+            )
+            opcode = "Cast"
+        elif opcode.casefold() == "tensor":
+            # AbstractTensor.tensor(x) is the general ensure-type idiom.  Once
+            # x reaches typed repository SSA, normalization is represented by
+            # a same-value cast carrying the schema promise; target code does
+            # not reconstruct or invoke a Python object.
+            attributes.setdefault("source_operator", opcode)
+            attributes.setdefault("target_dtype", dtype_of.get(
+                int(item.outputs[0]) if item.outputs else -1, "float64"
+            ))
+            opcode = "Cast"
+
+        scalar_spelling = TENSOR_OPERATION_SCALAR_SPELLING
+        is_scalar = (
+            result is not None
+            and not tuple(result.shape)
+            and all(not tuple(value(value_id).shape) for value_id in semantic_inputs)
+        )
+        semantic_opcode = str(
+            attributes.get("tensor_operation")
+            or attributes.get("tensor_candidate")
+            or opcode
+        )
+        if is_scalar and semantic_opcode.casefold() in scalar_spelling:
+            opcode = scalar_spelling[semantic_opcode.casefold()]
+
+        # Python's variadic min/max and the tensor clamp convenience are
+        # ordinary binary SSA folds.  Decomposing them here keeps evaluation
+        # order and data dependencies visible, and gives every backend the
+        # same primitive program instead of four bespoke builtin handlers.
+        fold_opcode = {"max": "Max", "min": "Min"}.get(
+            semantic_opcode.casefold()
+        )
+        if is_scalar and fold_opcode is not None and len(semantic_inputs) >= 2:
+            scalar_attributes = {
+                key: value
+                for key, value in attributes.items()
+                if key not in {
+                    "callee", "lowered_from", "tensor",
+                    "tensor_candidate", "tensor_operation",
+                }
+            }
+            operands = [value(value_id) for value_id in semantic_inputs]
+            accumulator = operands[0]
+            for position, operand in enumerate(operands[1:], 1):
+                fold_result = (
+                    result if position == len(operands) - 1
+                    else fresh_like(result)
+                )
+                instructions.append(Instr(
+                    fold_opcode,
+                    [accumulator, operand],
+                    fold_result,
+                    arg_roles=["left", "right"],
+                    attributes={
+                        **scalar_attributes,
+                        "source_operator": semantic_opcode,
+                    },
+                ))
+                accumulator = fold_result
+            continue
+        if is_scalar and opcode.casefold() == "clamp" and len(semantic_inputs) == 3:
+            operand, lower, upper = (
+                value(value_id) for value_id in semantic_inputs
+            )
+            bounded_below = fresh_like(result)
+            instructions.append(Instr(
+                "Max", [operand, lower], bounded_below,
+                arg_roles=["operand", "lower"],
+                attributes={**attributes, "source_operator": opcode},
+            ))
+            instructions.append(Instr(
+                "Min", [bounded_below, upper], result,
+                arg_roles=["operand", "upper"],
+                attributes={**attributes, "source_operator": opcode},
+            ))
+            continue
+
+        instructions.append(Instr(
+            opcode,
+            [value(value_id) for value_id in semantic_inputs],
+            result,
+            arg_roles=list(semantic_roles),
+            attributes=attributes,
+        ))
+    return tuple(instructions)
 
 
 @dataclass(frozen=True)
@@ -151,6 +601,7 @@ def reduce_hierarchy_identities(
                 closure.captures,
                 tuple(items),
                 closure.closure_id,
+                closure.value_shapes,
             )
 
         updated = rewrite(current)
@@ -169,13 +620,13 @@ def assign_hierarchy_ids(
     root: PlanClosure,
     previous: HierarchyValueTable | None = None,
 ) -> tuple[PlanClosure, HierarchyValueTable]:
-    """Assign canonical IDs once and preserve them when a plan is extended.
+    """Assign dense IDs from deterministic scoped-identity token ordering.
 
     ``(closure_id, local_id)`` is a scoped source address, not a second
     runtime identity.  The returned global ID is the one semantic identity
-    used by every later compiler stage.  A refresh may append newly exposed
-    control endpoints, but it must never renumber an endpoint that was
-    already assigned.
+    used by every later compiler stage.  ``previous`` is accepted for API
+    compatibility but never influences the result: unchanged plan structure
+    always produces the same dense IDs without a cache or dispenser.
     """
 
     next_closure = 0
@@ -205,6 +656,7 @@ def assign_hierarchy_ids(
             closure.captures,
             items,
             closure_id,
+            closure.value_shapes,
         )
 
     planned = number(root)
@@ -257,42 +709,25 @@ def assign_hierarchy_ids(
         if left_root != right_root:
             parents[right_root] = left_root
 
-    previous_ids = (
-        {}
-        if previous is None
-        else {
-            (int(scope), int(local)): int(global_id)
-            for scope, local, global_id in previous.correlations
-        }
-    )
-    class_previous_ids: dict[tuple[int, int], set[int]] = {}
+    del previous
+    equivalence_classes: dict[
+        tuple[int, int], list[tuple[int, int]]
+    ] = {}
     for key in keys:
-        if key in previous_ids:
-            class_previous_ids.setdefault(find(key), set()).add(
-                previous_ids[key]
-            )
-    conflicting = {
-        root_key: tuple(sorted(ids))
-        for root_key, ids in class_previous_ids.items()
-        if len(ids) > 1
+        equivalence_classes.setdefault(find(key), []).append(key)
+    class_tokens = {
+        root_key: tuple(sorted(members))
+        for root_key, members in equivalence_classes.items()
     }
-    if conflicting:
-        raise ValueError(
-            "hierarchy refresh attempted to merge previously distinct "
-            f"canonical IDs: {conflicting!r}"
+    root_ids = {
+        root_key: global_id
+        for global_id, root_key in enumerate(
+            sorted(class_tokens, key=lambda item: class_tokens[item])
         )
-
-    root_ids: dict[tuple[int, int], int] = {
-        root_key: next(iter(ids))
-        for root_key, ids in class_previous_ids.items()
     }
-    next_global_id = 1 + max(previous_ids.values(), default=-1)
     correlations = []
     for closure_id, local_id in sorted(keys):
         root_key = find((closure_id, local_id))
-        if root_key not in root_ids:
-            root_ids[root_key] = next_global_id
-            next_global_id += 1
         global_id = root_ids[root_key]
         correlations.append((closure_id, local_id, global_id))
     return planned, HierarchyValueTable(tuple(correlations))
@@ -337,12 +772,14 @@ def render_plan_ascii(root: PlanClosure) -> str:
             return
         inputs = ",".join(map(str, item.inputs)) or "-"
         outputs = ",".join(map(str, item.outputs)) or "-"
+        roles = ",".join(item.input_roles) or "-"
         attributes = " ".join(
             f"{name}={value!r}" for name, value in item.attributes
         )
         suffix = f" {attributes}" if attributes else ""
         lines.append(
-            f"{prefix}{branch}{item.opcode} in=[{inputs}] out=[{outputs}]"
+            f"{prefix}{branch}{item.opcode} in=[{inputs}] roles=[{roles}] "
+            f"out=[{outputs}]"
             f"{suffix}"
         )
 
@@ -360,4 +797,5 @@ __all__ = [
     "assign_hierarchy_ids",
     "reduce_hierarchy_identities",
     "render_plan_ascii",
+    "plan_region_to_ssa_instrs",
 ]

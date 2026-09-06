@@ -1,0 +1,235 @@
+pygame 2.6.1 (SDL 2.28.4, Python 3.11.7)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+
+FN training_motion__x__planned_region_0 ARGS [(0, 'float64', (2,), {}), (1, 'float64', (2,), {})]
+Const args [] res (19, 'int32', (), {}) attrs {'constant': 2}
+Const args [] res (20, 'int32', (), {}) attrs {'constant': 2}
+Call args [(0, 'float64', (2,), {}), (1, 'float64', (2,), {}), (2, 'float64', (2,), {'physical_dtype': 'float64'}), (19, 'int32', (), {}), (20, 'int32', (), {})] res (2, 'float64', (2,), {'physical_dtype': 'float64'}) attrs {'region': 0, 'training_motion_phase': 'forward', 'callee': 'binary_double', 'ssa_output_argument': 2}
+
+FN training_motion__x__planned_region_1 ARGS [(6, 'float64', (), {})]
+Const args [] res (4, 'int64', (), {}) attrs {'region': 1, 'value': 0}
+Const args [] res (5, 'int64', (), {}) attrs {'region': 1, 'value': 1}
+GetElementPtr args [(6, 'float64', (), {}), (4, 'int64', (), {})] res (17, None, (), {}) attrs {}
+Load args [(17, None, (), {})] res (7, 'float64', (2,), {}) attrs {}
+GetElementPtr args [(6, 'float64', (), {}), (5, 'int64', (), {})] res (18, None, (), {}) attrs {}
+Load args [(18, None, (), {})] res (8, 'float64', (2,), {'physical_dtype': 'float64'}) attrs {}
+
+FN training_motion__x ARGS [(0, 'float64', (2,), {}), (1, 'float64', (2,), {}), (3, 'float64', (2,), {'ssa_call_rank': 1}), (6, 'float64', (), {})]
+Const args [] res (10, 'int64', (), {}) attrs {'value': 0}
+Const args [] res (13, 'int64', (), {}) attrs {'value': 0}
+Const args [] res (15, 'int64', (), {}) attrs {'value': 1}
+Call args [(0, 'float64', (2,), {}), (1, 'float64', (2,), {})] res (9, 'ssa.aggregate', (), {}) attrs {'callee': 'training_motion__x__planned_region_0', 'region_index': 0, 'feed_ids': (0, 1), 'output_ids': (2,), 'result_convention': 'ssa.aggregate'}
+GetElementPtr args [(9, 'ssa.aggregate', (), {}), (10, 'int64', (), {})] res (11, 'ptr', (), {}) attrs {'region_index': 0, 'aggregate_index': 0, 'source_output_id': 2}
+Load args [(11, 'ptr', (), {})] res (2, 'float64', (2,), {'ssa_call_result_from': ('training_motion__x__planned_region_0', 2), 'physical_dtype': 'float64'}) attrs {'region_index': 0, 'aggregate_index': 0, 'source_output_id': 2}
+Call args [(6, 'float64', (), {})] res (12, 'ssa.aggregate', (), {}) attrs {'callee': 'training_motion__x__planned_region_1', 'region_index': 1, 'feed_ids': (6,), 'output_ids': (7, 8), 'result_convention': 'ssa.aggregate'}
+GetElementPtr args [(12, 'ssa.aggregate', (), {}), (13, 'int64', (), {})] res (14, 'ptr', (), {}) attrs {'region_index': 1, 'aggregate_index': 0, 'source_output_id': 7}
+Load args [(14, 'ptr', (), {})] res (7, 'float64', (2,), {'ssa_call_result_from': ('training_motion__x__planned_region_1', 7)}) attrs {'region_index': 1, 'aggregate_index': 0, 'source_output_id': 7}
+GetElementPtr args [(12, 'ssa.aggregate', (), {}), (15, 'int64', (), {})] res (16, 'ptr', (), {}) attrs {'region_index': 1, 'aggregate_index': 1, 'source_output_id': 8}
+Load args [(16, 'ptr', (), {})] res (8, 'ssa.aggregate', (2,), {'ssa_call_result_from': ('training_motion__x__planned_region_1', 8), 'physical_dtype': 'float64'}) attrs {'region_index': 1, 'aggregate_index': 1, 'source_output_id': 8}
+Call args [(3, 'float64', (2,), {'ssa_call_rank': 1}), (0, 'float64', (2,), {}), (1, 'float64', (2,), {})] res (17, None, (), {'ssa_aggregate_outputs': (7, 8)}) attrs {'callee': 'training_motion__bw_mul__specialized_926acb370753', 'source_linked': True, 'plan_callsite_id': 6, 'callee_reference': 42, 'result_convention': 'ssa.aggregate', 'output_ids': (7, 8)}
+Const args [] res (18, 'int', (), {}) attrs {'value': 0}
+GetElementPtr args [(17, None, (), {'ssa_aggregate_outputs': (7, 8)}), (18, 'int', (), {})] res (19, 'ptr', (), {}) attrs {'aggregate_index': 0}
+Load args [(19, 'ptr', (), {})] res (7, 'float64', (2,), {'ssa_call_result_from': ('training_motion__x__planned_region_1', 7)}) attrs {'aggregate_index': 0, 'source_output_id': 7}
+Const args [] res (20, 'int', (), {}) attrs {'value': 1}
+GetElementPtr args [(17, None, (), {'ssa_aggregate_outputs': (7, 8)}), (20, 'int', (), {})] res (21, 'ptr', (), {}) attrs {'aggregate_index': 1}
+Load args [(21, 'ptr', (), {})] res (8, 'ssa.aggregate', (2,), {'ssa_call_result_from': ('training_motion__x__planned_region_1', 8), 'physical_dtype': 'float64'}) attrs {'aggregate_index': 1, 'source_output_id': 8}
+Ret args [(2, 'float64', (2,), {'ssa_call_result_from': ('training_motion__x__planned_region_0', 2), 'physical_dtype': 'float64'}), (7, 'float64', (2,), {'ssa_call_result_from': ('training_motion__x__planned_region_1', 7)}), (8, 'ssa.aggregate', (2,), {'ssa_call_result_from': ('training_motion__x__planned_region_1', 8), 'physical_dtype': 'float64'})] res None attrs {}
+
+FN binary_value ARGS [(68, 'double', (), {}), (69, 'double', (), {}), (70, 'int32', (), {'ssa_call_dtype': 'int32'})]
+Const args [] res (71, 'i32', (), {}) attrs {'llvm_literal': 'i32 0'}
+Const args [] res (72, 'i32', (), {}) attrs {'llvm_literal': 'i32 1'}
+Const args [] res (73, 'i32', (), {}) attrs {'llvm_literal': 'i32 2'}
+Const args [] res (74, 'i32', (), {}) attrs {'llvm_literal': 'i32 3'}
+Const args [] res (75, 'i32', (), {}) attrs {'llvm_literal': 'i32 4'}
+Const args [] res (76, 'i32', (), {}) attrs {'llvm_literal': 'i32 5'}
+Const args [] res (77, 'i32', (), {}) attrs {'llvm_literal': 'i32 6'}
+Const args [] res (78, 'i32', (), {}) attrs {'llvm_literal': 'i32 20'}
+Const args [] res (79, 'i32', (), {}) attrs {'llvm_literal': 'i32 21'}
+Const args [] res (80, 'i32', (), {}) attrs {'llvm_literal': 'i32 22'}
+Const args [] res (81, 'i32', (), {}) attrs {'llvm_literal': 'i32 23'}
+Const args [] res (82, 'i32', (), {}) attrs {'llvm_literal': 'i32 24'}
+Const args [] res (83, 'i32', (), {}) attrs {'llvm_literal': 'i32 25'}
+Const args [] res (84, 'i32', (), {}) attrs {'llvm_literal': 'i32 26'}
+Const args [] res (85, 'i32', (), {}) attrs {'llvm_literal': 'i32 27'}
+Const args [] res (86, 'i32', (), {}) attrs {'llvm_literal': 'i32 42'}
+Const args [] res (87, 'i32', (), {}) attrs {'llvm_literal': 'i32 43'}
+Const args [] res (88, 'i32', (), {}) attrs {'llvm_literal': 'i32 44'}
+Const args [] res (89, 'i32', (), {}) attrs {'llvm_literal': 'i32 45'}
+Const args [] res (90, 'i32', (), {}) attrs {'llvm_literal': 'i32 46'}
+Const args [] res (91, 'i32', (), {}) attrs {'llvm_literal': 'i32 47'}
+Const args [] res (92, 'i32', (), {}) attrs {'llvm_literal': 'i32 48'}
+Const args [] res (134, 'i64', (), {}) attrs {'llvm_literal': 'i64 63'}
+Const args [] res (143, 'double', (), {}) attrs {'llvm_literal': 'double 0.000000e+00'}
+Const args [] res (152, 'double', (), {}) attrs {'llvm_literal': 'double 0x7FF8000000000000'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (71, 'i32', (), {})] res (153, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(153, 'i1', (), {})] res None attrs {'true_target': 'add', 'false_target': 'entry.switch.0', 'llvm_opcode': 'switch'}
+Add args [(68, 'double', (), {}), (69, 'double', (), {})] res (93, 'double', (), {}) attrs {'llvm_opcode': 'fadd'}
+Ret args [(93, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Sub args [(68, 'double', (), {}), (69, 'double', (), {})] res (94, 'double', (), {}) attrs {'llvm_opcode': 'fsub'}
+Ret args [(94, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Mul args [(68, 'double', (), {}), (69, 'double', (), {})] res (95, 'double', (), {}) attrs {'llvm_opcode': 'fmul'}
+Ret args [(95, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Div args [(68, 'double', (), {}), (69, 'double', (), {})] res (96, 'double', (), {}) attrs {'llvm_opcode': 'fdiv'}
+Ret args [(96, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Call args [(68, 'double', (), {}), (69, 'double', (), {})] res (97, 'double', (), {}) attrs {'llvm_opcode': 'call', 'callee': 'pow'}
+Ret args [(97, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Div args [(68, 'double', (), {}), (69, 'double', (), {})] res (98, 'double', (), {}) attrs {'llvm_opcode': 'fdiv'}
+Call args [(98, 'double', (), {})] res (99, 'double', (), {}) attrs {'llvm_opcode': 'call', 'callee': 'llvm.floor.f64'}
+Mul args [(99, 'double', (), {}), (69, 'double', (), {})] res (100, 'double', (), {}) attrs {'llvm_opcode': 'fmul'}
+Sub args [(68, 'double', (), {}), (100, 'double', (), {})] res (101, 'double', (), {}) attrs {'llvm_opcode': 'fsub'}
+Ret args [(101, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Div args [(68, 'double', (), {}), (69, 'double', (), {})] res (102, 'double', (), {}) attrs {'llvm_opcode': 'fdiv'}
+Call args [(102, 'double', (), {})] res (103, 'double', (), {}) attrs {'llvm_opcode': 'call', 'callee': 'llvm.floor.f64'}
+Ret args [(103, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Lt args [(68, 'double', (), {}), (69, 'double', (), {})] res (104, 'i1', (), {}) attrs {'llvm_opcode': 'fcmp', 'predicate': 'olt'}
+UiToFp args [(104, 'i1', (), {})] res (105, 'double', (), {}) attrs {'llvm_opcode': 'uitofp'}
+Ret args [(105, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Le args [(68, 'double', (), {}), (69, 'double', (), {})] res (106, 'i1', (), {}) attrs {'llvm_opcode': 'fcmp', 'predicate': 'ole'}
+UiToFp args [(106, 'i1', (), {})] res (107, 'double', (), {}) attrs {'llvm_opcode': 'uitofp'}
+Ret args [(107, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Gt args [(68, 'double', (), {}), (69, 'double', (), {})] res (108, 'i1', (), {}) attrs {'llvm_opcode': 'fcmp', 'predicate': 'ogt'}
+UiToFp args [(108, 'i1', (), {})] res (109, 'double', (), {}) attrs {'llvm_opcode': 'uitofp'}
+Ret args [(109, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Ge args [(68, 'double', (), {}), (69, 'double', (), {})] res (110, 'i1', (), {}) attrs {'llvm_opcode': 'fcmp', 'predicate': 'oge'}
+UiToFp args [(110, 'i1', (), {})] res (111, 'double', (), {}) attrs {'llvm_opcode': 'uitofp'}
+Ret args [(111, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Eq args [(68, 'double', (), {}), (69, 'double', (), {})] res (112, 'i1', (), {}) attrs {'llvm_opcode': 'fcmp', 'predicate': 'oeq'}
+UiToFp args [(112, 'i1', (), {})] res (113, 'double', (), {}) attrs {'llvm_opcode': 'uitofp'}
+Ret args [(113, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Ne args [(68, 'double', (), {}), (69, 'double', (), {})] res (114, 'i1', (), {}) attrs {'llvm_opcode': 'fcmp', 'predicate': 'une'}
+UiToFp args [(114, 'i1', (), {})] res (115, 'double', (), {}) attrs {'llvm_opcode': 'uitofp'}
+Ret args [(115, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Gt args [(68, 'double', (), {}), (69, 'double', (), {})] res (116, 'i1', (), {}) attrs {'llvm_opcode': 'fcmp', 'predicate': 'ogt'}
+Select args [(116, 'i1', (), {}), (68, 'double', (), {}), (69, 'double', (), {})] res (117, 'double', (), {}) attrs {'llvm_opcode': 'select'}
+Ret args [(117, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Lt args [(68, 'double', (), {}), (69, 'double', (), {})] res (118, 'i1', (), {}) attrs {'llvm_opcode': 'fcmp', 'predicate': 'olt'}
+Select args [(118, 'i1', (), {}), (68, 'double', (), {}), (69, 'double', (), {})] res (119, 'double', (), {}) attrs {'llvm_opcode': 'select'}
+Ret args [(119, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+FpToSi args [(68, 'double', (), {})] res (120, 'i64', (), {}) attrs {'llvm_opcode': 'fptosi'}
+FpToSi args [(69, 'double', (), {})] res (121, 'i64', (), {}) attrs {'llvm_opcode': 'fptosi'}
+And args [(120, 'i64', (), {}), (121, 'i64', (), {})] res (122, 'i64', (), {}) attrs {'llvm_opcode': 'and'}
+SiToFp args [(122, 'i64', (), {})] res (123, 'double', (), {}) attrs {'llvm_opcode': 'sitofp'}
+Ret args [(123, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+FpToSi args [(68, 'double', (), {})] res (124, 'i64', (), {}) attrs {'llvm_opcode': 'fptosi'}
+FpToSi args [(69, 'double', (), {})] res (125, 'i64', (), {}) attrs {'llvm_opcode': 'fptosi'}
+Or args [(124, 'i64', (), {}), (125, 'i64', (), {})] res (126, 'i64', (), {}) attrs {'llvm_opcode': 'or'}
+SiToFp args [(126, 'i64', (), {})] res (127, 'double', (), {}) attrs {'llvm_opcode': 'sitofp'}
+Ret args [(127, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+FpToSi args [(68, 'double', (), {})] res (128, 'i64', (), {}) attrs {'llvm_opcode': 'fptosi'}
+FpToSi args [(69, 'double', (), {})] res (129, 'i64', (), {}) attrs {'llvm_opcode': 'fptosi'}
+Xor args [(128, 'i64', (), {}), (129, 'i64', (), {})] res (130, 'i64', (), {}) attrs {'llvm_opcode': 'xor'}
+SiToFp args [(130, 'i64', (), {})] res (131, 'double', (), {}) attrs {'llvm_opcode': 'sitofp'}
+Ret args [(131, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+FpToSi args [(68, 'double', (), {})] res (132, 'i64', (), {}) attrs {'llvm_opcode': 'fptosi'}
+FpToSi args [(69, 'double', (), {})] res (133, 'i64', (), {}) attrs {'llvm_opcode': 'fptosi'}
+And args [(133, 'i64', (), {}), (134, 'i64', (), {})] res (135, 'i64', (), {}) attrs {'llvm_opcode': 'and'}
+Shl args [(132, 'i64', (), {}), (135, 'i64', (), {})] res (136, 'i64', (), {}) attrs {'llvm_opcode': 'shl'}
+SiToFp args [(136, 'i64', (), {})] res (137, 'double', (), {}) attrs {'llvm_opcode': 'sitofp'}
+Ret args [(137, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+FpToSi args [(68, 'double', (), {})] res (138, 'i64', (), {}) attrs {'llvm_opcode': 'fptosi'}
+FpToSi args [(69, 'double', (), {})] res (139, 'i64', (), {}) attrs {'llvm_opcode': 'fptosi'}
+And args [(139, 'i64', (), {}), (134, 'i64', (), {})] res (140, 'i64', (), {}) attrs {'llvm_opcode': 'and'}
+AShr args [(138, 'i64', (), {}), (140, 'i64', (), {})] res (141, 'i64', (), {}) attrs {'llvm_opcode': 'ashr'}
+SiToFp args [(141, 'i64', (), {})] res (142, 'double', (), {}) attrs {'llvm_opcode': 'sitofp'}
+Ret args [(142, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Ne args [(68, 'double', (), {}), (143, 'double', (), {})] res (144, 'i1', (), {}) attrs {'llvm_opcode': 'fcmp', 'predicate': 'une'}
+Ne args [(69, 'double', (), {}), (143, 'double', (), {})] res (145, 'i1', (), {}) attrs {'llvm_opcode': 'fcmp', 'predicate': 'une'}
+And args [(144, 'i1', (), {}), (145, 'i1', (), {})] res (146, 'i1', (), {}) attrs {'llvm_opcode': 'and'}
+UiToFp args [(146, 'i1', (), {})] res (147, 'double', (), {}) attrs {'llvm_opcode': 'uitofp'}
+Ret args [(147, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Ne args [(68, 'double', (), {}), (143, 'double', (), {})] res (148, 'i1', (), {}) attrs {'llvm_opcode': 'fcmp', 'predicate': 'une'}
+Ne args [(69, 'double', (), {}), (143, 'double', (), {})] res (149, 'i1', (), {}) attrs {'llvm_opcode': 'fcmp', 'predicate': 'une'}
+Or args [(148, 'i1', (), {}), (149, 'i1', (), {})] res (150, 'i1', (), {}) attrs {'llvm_opcode': 'or'}
+UiToFp args [(150, 'i1', (), {})] res (151, 'double', (), {}) attrs {'llvm_opcode': 'uitofp'}
+Ret args [(151, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Ret args [(152, 'double', (), {})] res None attrs {'llvm_opcode': 'ret'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (72, 'i32', (), {})] res (154, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(154, 'i1', (), {})] res None attrs {'true_target': 'sub', 'false_target': 'entry.switch.1', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (73, 'i32', (), {})] res (155, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(155, 'i1', (), {})] res None attrs {'true_target': 'mul', 'false_target': 'entry.switch.2', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (74, 'i32', (), {})] res (156, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(156, 'i1', (), {})] res None attrs {'true_target': 'div', 'false_target': 'entry.switch.3', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (75, 'i32', (), {})] res (157, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(157, 'i1', (), {})] res None attrs {'true_target': 'pow', 'false_target': 'entry.switch.4', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (76, 'i32', (), {})] res (158, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(158, 'i1', (), {})] res None attrs {'true_target': 'mod', 'false_target': 'entry.switch.5', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (77, 'i32', (), {})] res (159, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(159, 'i1', (), {})] res None attrs {'true_target': 'floordiv', 'false_target': 'entry.switch.6', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (78, 'i32', (), {})] res (160, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(160, 'i1', (), {})] res None attrs {'true_target': 'lt', 'false_target': 'entry.switch.7', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (79, 'i32', (), {})] res (161, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(161, 'i1', (), {})] res None attrs {'true_target': 'le', 'false_target': 'entry.switch.8', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (80, 'i32', (), {})] res (162, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(162, 'i1', (), {})] res None attrs {'true_target': 'gt', 'false_target': 'entry.switch.9', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (81, 'i32', (), {})] res (163, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(163, 'i1', (), {})] res None attrs {'true_target': 'ge', 'false_target': 'entry.switch.10', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (82, 'i32', (), {})] res (164, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(164, 'i1', (), {})] res None attrs {'true_target': 'eq', 'false_target': 'entry.switch.11', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (83, 'i32', (), {})] res (165, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(165, 'i1', (), {})] res None attrs {'true_target': 'ne', 'false_target': 'entry.switch.12', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (84, 'i32', (), {})] res (166, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(166, 'i1', (), {})] res None attrs {'true_target': 'maximum', 'false_target': 'entry.switch.13', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (85, 'i32', (), {})] res (167, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(167, 'i1', (), {})] res None attrs {'true_target': 'minimum', 'false_target': 'entry.switch.14', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (86, 'i32', (), {})] res (168, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(168, 'i1', (), {})] res None attrs {'true_target': 'bitand', 'false_target': 'entry.switch.15', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (87, 'i32', (), {})] res (169, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(169, 'i1', (), {})] res None attrs {'true_target': 'bitor', 'false_target': 'entry.switch.16', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (88, 'i32', (), {})] res (170, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(170, 'i1', (), {})] res None attrs {'true_target': 'bitxor', 'false_target': 'entry.switch.17', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (89, 'i32', (), {})] res (171, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(171, 'i1', (), {})] res None attrs {'true_target': 'shl', 'false_target': 'entry.switch.18', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (90, 'i32', (), {})] res (172, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(172, 'i1', (), {})] res None attrs {'true_target': 'shr', 'false_target': 'entry.switch.19', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (91, 'i32', (), {})] res (173, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(173, 'i1', (), {})] res None attrs {'true_target': 'logical_and', 'false_target': 'entry.switch.20', 'llvm_opcode': 'switch'}
+Eq args [(70, 'int32', (), {'ssa_call_dtype': 'int32'}), (92, 'i32', (), {})] res (174, 'i1', (), {}) attrs {'llvm_opcode': 'switch'}
+CondBr args [(174, 'i1', (), {})] res None attrs {'true_target': 'logical_or', 'false_target': 'invalid', 'llvm_opcode': 'switch'}
+
+FN binary_double ARGS [(176, 'float64', (), {'ssa_call_rank': 1, 'ssa_call_dtype': 'float64'}), (177, 'float64', (), {'ssa_call_rank': 1, 'ssa_call_dtype': 'float64'}), (178, 'float64', (), {'ssa_call_rank': 1, 'ssa_call_dtype': 'float64'}), (179, 'int32', (), {'ssa_call_dtype': 'int32'}), (180, 'int32', (), {'ssa_call_dtype': 'int32'})]
+Const args [] res (181, 'i32', (), {}) attrs {'llvm_literal': 'i32 0'}
+Const args [] res (191, 'i32', (), {}) attrs {'llvm_literal': 'i32 1'}
+Br args [] res None attrs {'target': 'loop.header', 'llvm_opcode': 'br'}
+Phi args [(181, 'i32', (), {}), (192, 'i32', (), {})] res (182, 'i32', (), {}) attrs {'llvm_opcode': 'phi', 'incoming_blocks': ('entry', 'loop.body')}
+Lt args [(182, 'i32', (), {}), (179, 'int32', (), {'ssa_call_dtype': 'int32'})] res (183, 'i1', (), {}) attrs {'llvm_opcode': 'icmp', 'predicate': 'slt'}
+CondBr args [(183, 'i1', (), {})] res None attrs {'true_target': 'loop.body', 'false_target': 'exit', 'llvm_opcode': 'br'}
+SExt args [(182, 'i32', (), {})] res (184, 'i64', (), {}) attrs {'llvm_opcode': 'sext'}
+GetElementPtr args [(176, 'float64', (), {'ssa_call_rank': 1, 'ssa_call_dtype': 'float64'}), (184, 'i64', (), {})] res (185, 'ptr', (), {}) attrs {'llvm_opcode': 'getelementptr'}
+GetElementPtr args [(177, 'float64', (), {'ssa_call_rank': 1, 'ssa_call_dtype': 'float64'}), (184, 'i64', (), {})] res (186, 'ptr', (), {}) attrs {'llvm_opcode': 'getelementptr'}
+GetElementPtr args [(178, 'float64', (), {'ssa_call_rank': 1, 'ssa_call_dtype': 'float64'}), (184, 'i64', (), {})] res (187, 'ptr', (), {}) attrs {'llvm_opcode': 'getelementptr'}
+Load args [(185, 'ptr', (), {})] res (188, 'double', (), {}) attrs {'llvm_opcode': 'load'}
+Load args [(186, 'ptr', (), {})] res (189, 'double', (), {}) attrs {'llvm_opcode': 'load'}
+Call args [(188, 'double', (), {}), (189, 'double', (), {}), (180, 'int32', (), {'ssa_call_dtype': 'int32'})] res (190, 'double', (), {}) attrs {'llvm_opcode': 'call', 'callee': 'binary_value'}
+Store args [(190, 'double', (), {}), (187, 'ptr', (), {})] res None attrs {'llvm_opcode': 'store'}
+Add args [(182, 'i32', (), {}), (191, 'i32', (), {})] res (192, 'i32', (), {}) attrs {'llvm_opcode': 'add'}
+Br args [] res None attrs {'target': 'loop.header', 'llvm_opcode': 'br'}
+Ret args [] res None attrs {'llvm_opcode': 'ret'}
+
+FN training_motion__bw_mul__specialized_926acb370753__planned_region_0 ARGS [(0, 'float64', (2,), {}), (2, 'float64', (2,), {}), (1, 'float64', (2,), {})]
+Const args [] res (14, 'int32', (), {}) attrs {'constant': 2}
+Const args [] res (15, 'int32', (), {}) attrs {'constant': 2}
+Const args [] res (16, 'int32', (), {}) attrs {'constant': 2}
+Const args [] res (17, 'int32', (), {}) attrs {'constant': 2}
+Call args [(0, 'float64', (2,), {}), (2, 'float64', (2,), {}), (3, 'float64', (2,), {'physical_dtype': 'float64'}), (14, 'int32', (), {}), (15, 'int32', (), {})] res (3, 'float64', (2,), {'physical_dtype': 'float64'}) attrs {'region': 0, 'source_type': 'BinOp', 'callee': 'binary_double', 'ssa_output_argument': 2}
+Call args [(0, 'float64', (2,), {}), (1, 'float64', (2,), {}), (6, 'float64', (2,), {'physical_dtype': 'float64'}), (16, 'int32', (), {}), (17, 'int32', (), {})] res (6, 'float64', (2,), {'physical_dtype': 'float64'}) attrs {'region': 0, 'source_type': 'BinOp', 'callee': 'binary_double', 'ssa_output_argument': 2}
+
+FN training_motion__bw_mul__specialized_926acb370753 ARGS [(0, 'float64', (2,), {}), (1, 'float64', (2,), {}), (2, 'float64', (2,), {})]
+Const args [] res (10, 'int64', (), {}) attrs {'value': 0}
+Const args [] res (12, 'int64', (), {}) attrs {'value': 1}
+Call args [(0, 'float64', (2,), {}), (2, 'float64', (2,), {}), (1, 'float64', (2,), {})] res (9, 'ssa.aggregate', (), {}) attrs {'callee': 'training_motion__bw_mul__specialized_926acb370753__planned_region_0', 'region_index': 0, 'feed_ids': (0, 2, 1), 'output_ids': (3, 6), 'result_convention': 'ssa.aggregate'}
+GetElementPtr args [(9, 'ssa.aggregate', (), {}), (10, 'int64', (), {})] res (11, 'ptr', (), {}) attrs {'region_index': 0, 'aggregate_index': 0, 'source_output_id': 3}
+Load args [(11, 'ptr', (), {})] res (3, 'float64', (2,), {'ssa_call_result_from': ('training_motion__bw_mul__specialized_926acb370753__planned_region_0', 3), 'physical_dtype': 'float64'}) attrs {'region_index': 0, 'aggregate_index': 0, 'source_output_id': 3}
+GetElementPtr args [(9, 'ssa.aggregate', (), {}), (12, 'int64', (), {})] res (13, 'ptr', (), {}) attrs {'region_index': 0, 'aggregate_index': 1, 'source_output_id': 6}
+Load args [(13, 'ptr', (), {})] res (6, 'float64', (2,), {'ssa_call_result_from': ('training_motion__bw_mul__specialized_926acb370753__planned_region_0', 6), 'physical_dtype': 'float64'}) attrs {'region_index': 0, 'aggregate_index': 1, 'source_output_id': 6}
+Call args [(3, 'float64', (2,), {'ssa_call_result_from': ('training_motion__bw_mul__specialized_926acb370753__planned_region_0', 3), 'physical_dtype': 'float64'})] res (5, 'float64', (2,), {'physical_dtype': 'float64'}) attrs {'callee': 'training_motion__unbroadcast__specialized_5a5a7f0147e6', 'source_linked': True, 'plan_callsite_id': 5, 'callee_reference': 0}
+Call args [(6, 'float64', (2,), {'ssa_call_result_from': ('training_motion__bw_mul__specialized_926acb370753__planned_region_0', 6), 'physical_dtype': 'float64'})] res (8, 'float64', (2,), {'physical_dtype': 'float64'}) attrs {'callee': 'training_motion__unbroadcast__specialized_5a5a7f0147e6', 'source_linked': True, 'plan_callsite_id': 8, 'callee_reference': 0}
+Ret args [(5, 'float64', (2,), {'physical_dtype': 'float64'}), (8, 'float64', (2,), {'physical_dtype': 'float64'})] res None attrs {}
+
+FN training_motion__unbroadcast__specialized_5a5a7f0147e6__planned_region_0 ARGS [(0, 'float64', (2,), {'ssa_call_dtype': 'ssa.aggregate', 'physical_dtype': 'float64'})]
+
+FN training_motion__unbroadcast__specialized_5a5a7f0147e6 ARGS [(0, 'float64', (2,), {'ssa_call_dtype': 'float64', 'ssa_call_result_source': ('training_motion__bw_mul__specialized_926acb370753__planned_region_0', 6), 'physical_dtype': 'float64'})]
+Const args [] res (55, 'int64', (), {}) attrs {'value': 0}
+Call args [(0, 'float64', (2,), {'ssa_call_dtype': 'float64', 'ssa_call_result_source': ('training_motion__bw_mul__specialized_926acb370753__planned_region_0', 6), 'physical_dtype': 'float64'})] res (54, 'ssa.aggregate', (), {}) attrs {'callee': 'training_motion__unbroadcast__specialized_5a5a7f0147e6__planned_region_0', 'region_index': 0, 'feed_ids': (0,), 'output_ids': (1,), 'result_convention': 'ssa.aggregate'}
+GetElementPtr args [(54, 'ssa.aggregate', (), {}), (55, 'int64', (), {})] res (56, 'ptr', (), {}) attrs {'region_index': 0, 'aggregate_index': 0, 'source_output_id': 1}
+Load args [(56, 'ptr', (), {})] res (1, 'float64', (2,), {'ssa_call_result_from': ('training_motion__unbroadcast__specialized_5a5a7f0147e6__planned_region_0', 1), 'physical_dtype': 'float64'}) attrs {'region_index': 0, 'aggregate_index': 0, 'source_output_id': 1}
+Ret args [(1, 'float64', (2,), {'ssa_call_result_from': ('training_motion__unbroadcast__specialized_5a5a7f0147e6__planned_region_0', 1), 'physical_dtype': 'float64'})] res None attrs {}

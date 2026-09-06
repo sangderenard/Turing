@@ -54,12 +54,27 @@ class SuperstepPlan:
     eps:
         Numerical tolerance for deciding when the target window has been
         satisfied.
+    rollback_threshold_multiplier:
+        Numeric errors above their ordinary thresholds still steer ``dt``.
+        State is restored and the substep retried only when an error exceeds
+        this multiple of its threshold. Physical-bound and hard failures are
+        never softened.
+    rollback:
+        When True (default), each micro-step is attempted against a saved
+        copy of the state and reverted on rejection, retrying at a smaller
+        ``dt``. When False, no copy is taken and nothing is ever restored:
+        whatever the advance call leaves the state in stands, rejected or
+        not, and only ``dt`` itself is steered by the metrics. This is the
+        "no-save" configuration for a real-time frame budget where the
+        copy/restore cost is what can't be afforded, not the physics.
     """
     round_max: float | AbstractTensor
     dt_init: float | AbstractTensor
     allow_increase_mid_round: bool = False
     eps: float = 1e-15
     event_boundaries: tuple[float, ...] = ()
+    rollback: bool = True
+    rollback_threshold_multiplier: float = 1.0
 
 
 @dataclass

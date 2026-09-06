@@ -13,7 +13,12 @@ import struct
 from typing import Dict, List, Tuple
 import numpy as np
 
-from ..hardware.analog_spec import BiosHeader, InstructionWord, Opcode
+from ..hardware.analog_spec import (
+    BiosHeader,
+    InstructionWord,
+    Opcode,
+    pack_instruction_word,
+)
 from ..hardware.constants import LANES, REGISTERS
 from ..turing_machine.tape_map import TapeMap
 from ..turing_machine.turing_provenance import ProvenanceGraph, ProvNode
@@ -39,14 +44,17 @@ class TapeCompiler:
         self.memory_map: MemoryMap = {}
         self.data_map: Dict[ObjectID, TapeAddress] = {}
         self._next_reg_idx = 0
+        self.instruction_value_ids: List[ObjectID | None] = []
+        self.spill_mode = False
 
     def _allocate_register(self, obj_id: ObjectID) -> int:
-        """Assign a register to ``obj_id`` or spill it to tape if none remain."""
+        """Assign a register or reserve an explicit fixed-width spill slot."""
         if obj_id not in self.memory_map:
             if self._next_reg_idx >= REGISTERS:
                 # Register file is exhausted – cache the value in data space.
                 addr = self.data_map.setdefault(obj_id, len(self.data_map))
-                # Returning zero reserves R0 as a staging area for later loads.
+                # The emission pass detects the slot and emits explicit
+                # LOAD/STORE operations using R0-R2 as scratch registers.
                 return 0
             self.memory_map[obj_id] = self._next_reg_idx
             self._next_reg_idx += 1
@@ -81,12 +89,16 @@ class TapeCompiler:
         guides register allocation so temporaries only consume registers while
         live. φ-instructions reuse the register of their first operand and do
         not emit machine words. All other instructions map 1:1 to the minimal
-        Opcode set defined in :mod:`analog_spec`.
+        Opcode set defined in :mod:`analog_spec`.  If any live value exceeds
+        the physical register file, the complete stream uses the fixed-width
+        spill ABI so graph-coloured residents cannot be silently clobbered.
         """
 
         self.memory_map = {}
         self.data_map = {}
         self._next_reg_idx = 0
+        self.instruction_value_ids = []
+        self.spill_mode = False
 
         if process_graph is not None:
             import networkx as nx
@@ -115,38 +127,117 @@ class TapeCompiler:
             if self.memory_map:
                 self._next_reg_idx = min(max(self.memory_map.values()) + 1, REGISTERS)
 
+        value_ids = list(dict.fromkeys(
+            value.id
+            for inst in ssa_instrs
+            for value in (*inst.args, inst.res)
+            if value.id >= 0
+        ))
+        for value_id in value_ids:
+            if value_id not in self.memory_map and value_id not in self.data_map:
+                self._allocate_register(value_id)
+
         instructions: InstructionStream = []
+        self.spill_mode = any(value_id in self.data_map for value_id in value_ids)
+        if self.spill_mode:
+            # Once any live SSA value requires tape storage, use one coherent
+            # storage ABI for the stream.  Mixing permanent graph-coloured
+            # registers with scratch loads can otherwise clobber a resident
+            # operand when all three physical registers are occupied.
+            for value_id in value_ids:
+                self.data_map.setdefault(value_id, len(self.data_map))
+            if max(self.data_map.values(), default=-1) >= 64:
+                raise ValueError("SSA spill storage exceeds the 64-slot ABI")
+            self.memory_map = {
+                value_id: register
+                for value_id, register in self.memory_map.items()
+                if value_id not in value_ids
+            }
+
+            for inst in ssa_instrs:
+                if inst.op == "phi":
+                    if not inst.args:
+                        raise ValueError("phi instruction requires an incoming value")
+                    self.data_map[inst.res.id] = self.data_map[inst.args[0].id]
+                    continue
+                if len(inst.args) > REGISTERS:
+                    raise ValueError(
+                        "tape spill lowering supports at most three operands"
+                    )
+                opcode = self._op_to_opcode(inst.op)
+                argument_registers: list[int] = []
+                loaded: dict[int, int] = {}
+                for position, argument in enumerate(inst.args):
+                    register = loaded.get(argument.id)
+                    if register is None:
+                        register = position
+                        loaded[argument.id] = register
+                        instructions.append(InstructionWord(
+                            opcode=Opcode.LOAD,
+                            dest=register,
+                            reg_a=0,
+                            reg_b=0,
+                            param=self.data_map[argument.id],
+                        ))
+                        self.instruction_value_ids.append(argument.id)
+                    argument_registers.append(register)
+                reg_a = argument_registers[0] if argument_registers else 0
+                reg_b = argument_registers[1] if len(argument_registers) > 1 else 0
+                if len(argument_registers) == 3:
+                    dest_reg = reg_a
+                    param = argument_registers[2]
+                else:
+                    dest_reg = 2
+                    param = reg_b
+                instructions.append(InstructionWord(
+                    opcode=opcode,
+                    dest=dest_reg,
+                    reg_a=reg_a,
+                    reg_b=reg_b,
+                    param=param,
+                ))
+                self.instruction_value_ids.append(inst.res.id)
+                instructions.append(InstructionWord(
+                    opcode=Opcode.STORE,
+                    dest=0,
+                    reg_a=dest_reg,
+                    reg_b=0,
+                    param=self.data_map[inst.res.id],
+                ))
+                self.instruction_value_ids.append(inst.res.id)
 
         def _ensure(val_id: int) -> int:
             if val_id < 0:
                 return 0
             if val_id in self.data_map:
-                return 0  # will require explicit LOAD/STORE in a later pass
+                raise RuntimeError("spilled value reached register-only emission")
             if val_id not in self.memory_map:
                 return self._allocate_register(val_id)
             return self.memory_map[val_id]
 
-        for inst in ssa_instrs:
-            if inst.op == "phi":
-                # Reuse the first operand's register for the φ-result
-                reg = _ensure(inst.args[0].id)
-                self.memory_map[inst.res.id] = reg
-                continue
+        if not self.spill_mode:
+            for inst in ssa_instrs:
+                if inst.op == "phi":
+                    # Reuse the first operand's register for the φ-result
+                    reg = _ensure(inst.args[0].id)
+                    self.memory_map[inst.res.id] = reg
+                    continue
 
-            opcode = self._op_to_opcode(inst.op)
-            dest_reg = _ensure(inst.res.id)
-            reg_a = _ensure(inst.args[0].id) if inst.args else 0
-            reg_b = _ensure(inst.args[1].id) if len(inst.args) > 1 else 0
+                opcode = self._op_to_opcode(inst.op)
+                dest_reg = _ensure(inst.res.id)
+                reg_a = _ensure(inst.args[0].id) if inst.args else 0
+                reg_b = _ensure(inst.args[1].id) if len(inst.args) > 1 else 0
 
-            instructions.append(
-                InstructionWord(
-                    opcode=opcode,
-                    dest=dest_reg,
-                    reg_a=reg_a,
-                    reg_b=reg_b,
-                    param=reg_b,
+                instructions.append(
+                    InstructionWord(
+                        opcode=opcode,
+                        dest=dest_reg,
+                        reg_a=reg_a,
+                        reg_b=reg_b,
+                        param=reg_b,
+                    )
                 )
-            )
+                self.instruction_value_ids.append(inst.res.id)
 
         # Build BIOS and PCM frames identical to ``compile``
         bios = BiosHeader(
@@ -210,13 +301,7 @@ class TapeCompiler:
         """
         bit_frames = []
         for instr in instructions:
-            # Pack into a 16-bit integer: OOOODDDDAAAABBBB
-            word = (
-                (instr.opcode.value & 0xF) << 12 |
-                (instr.dest & 0xF) << 8 |
-                (instr.reg_a & 0xF) << 4 |
-                (instr.param & 0xF)
-            )
+            word = pack_instruction_word(instr)
             
             # Unpack into a list of 16 bits (MSB first)
             bits = [(word >> (15 - i)) & 1 for i in range(16)]

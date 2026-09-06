@@ -1,4 +1,22 @@
-"""LLVM compute compilation and execution through the shared profiled C shell."""
+"""LLVM compute compilation and execution through the shared profiled C shell.
+
+**This is a differential ORACLE, not a deployment backend.** The name is a
+misnomer worth reading past: the only public entry,
+``compile_torture_case_to_llvm``, accepts a ``CapturedTortureCase`` and
+nothing else, so a standard object or kernel-bank variant cannot be routed
+through it even in principle. Its consumers are
+``backend_torture_runner`` (the shared AbstractTensor backend torture matrix)
+and ``src/compiler/llvm_optimizing_pipeline.py``, which keeps it as the
+unoptimized comparison.
+
+It reaches LLVM by ``lower_abstract_tensor_tape_to_llvm_ssa`` -- a tape path
+that is itself dead to the compiler and kept only for reference. Neither is a
+standard path: deployment products lower from repository SSA through
+``emit_ssa_function_to_llvm``.
+
+Their independence from the standard path is the whole point. Keep them
+working, measure against them, and do not migrate deployment work onto them.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +32,7 @@ from .artifact_cache import (
     RepositoryArtifactCache,
     implementation_digest,
 )
+from ..abstraction import tensor_identity
 from .c_backend_llvm_ssa import lower_abstract_tensor_tape_to_llvm_ssa
 from .profiled_c_shell import CLaunchProfile, profiled_c_shell
 from .tensor_torture import CapturedTortureCase
@@ -205,7 +224,7 @@ class LLVMJITProgram:
 def compile_torture_case_to_llvm(
     captured: CapturedTortureCase,
     *,
-    trig_solver: str = "libm",
+    trig_solver: str = "lut",
     trig_epsilon: float | None = None,
     cache: RepositoryArtifactCache | None = None,
     llvm_profile: Any | None = None,
@@ -279,8 +298,10 @@ def compile_torture_case_to_llvm(
         raise LLVMJITShortfall(
             f"{captured.case.name} cannot lower completely to LLVM: {details}"
         )
+    # Keyed by the same token the lowering reports, which is the tape's own
+    # ``tensor_identity`` rather than a memory address.
     input_names_by_id = {
-        id(value): name for name, value in captured.inputs.items()
+        tensor_identity(value): name for name, value in captured.inputs.items()
     }
     try:
         feed_names = tuple(

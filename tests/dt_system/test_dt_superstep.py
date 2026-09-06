@@ -7,7 +7,9 @@ import pytest
 from src.cells.bath.dt_controller import (
     Targets,
     STController,
+    run_superstep,
     run_superstep_plan,
+    step_with_dt_control_used,
 )
 from src.common.dt_system.dt_scaler import Metrics
 from src.common.dt_system.dt import SuperstepPlan
@@ -22,6 +24,167 @@ class FakeState:
 
     def restore(self, other: "FakeState"):
         self.t = float(other.t)
+
+
+@dataclass
+class CountingState:
+    value: float = 0.0
+    restore_count: int = 0
+
+    def copy_shallow(self):
+        return CountingState(self.value, self.restore_count)
+
+    def restore(self, other: "CountingState"):
+        self.value = float(other.value)
+        self.restore_count += 1
+
+
+@pytest.mark.dt
+def test_superstep_runs_until_the_requested_window_is_complete():
+    state = CountingState()
+
+    def advance(state_local: CountingState, dt: float):
+        state_local.value += float(dt)
+        return True, Metrics(0.0, 0.0, 0.0, 0.0)
+
+    advanced, _dt_next, metrics = run_superstep(
+        state,
+        1.0,
+        0.25,
+        1.0,
+        Targets(1.0, 1.0, 1.0),
+        STController(),
+        advance,
+    )
+
+    assert advanced == pytest.approx(1.0)
+    assert state.value == pytest.approx(1.0)
+    assert metrics.hard_failure is False
+    assert "superstep_window_remaining_s" not in metrics.error_channels
+
+
+@pytest.mark.dt
+def test_soft_error_band_retains_state_and_steers_next_dt():
+    state = CountingState()
+    attempts: list[dict] = []
+
+    def advance(state_local: CountingState, dt: float):
+        state_local.value += float(dt)
+        return True, Metrics(
+            max_vel=1.0,
+            max_flux=1.0,
+            div_inf=0.0,
+            mass_err=0.0,
+            error_channels={"shape_error": 1.5},
+        )
+
+    _metrics, dt_next, dt_used = step_with_dt_control_used(
+        state,
+        0.1,
+        1.0,
+        Targets(1.0, 1.0, 1.0, error_limits={"shape_error": 1.0}),
+        STController(),
+        advance,
+        attempt_log=attempts,
+        rollback_threshold_multiplier=2.0,
+    )
+
+    assert dt_used == pytest.approx(0.1)
+    assert state.value == pytest.approx(0.1)
+    assert state.restore_count == 0
+    assert dt_next < 1.0
+    assert attempts[0]["accepted"] is True
+    assert attempts[0]["reasons"] == ()
+    assert "shape_error" in attempts[0]["soft_reasons"][0]
+
+
+@pytest.mark.dt
+def test_error_beyond_soft_band_restores_then_retries():
+    state = CountingState()
+    attempts: list[dict] = []
+
+    def advance(state_local: CountingState, dt: float):
+        state_local.value += float(dt)
+        error = 2.5 if float(dt) > 0.05 else 0.5
+        return True, Metrics(
+            max_vel=1.0,
+            max_flux=1.0,
+            div_inf=0.0,
+            mass_err=0.0,
+            error_channels={"shape_error": error},
+        )
+
+    _metrics, _dt_next, dt_used = step_with_dt_control_used(
+        state,
+        0.1,
+        1.0,
+        Targets(1.0, 1.0, 1.0, error_limits={"shape_error": 1.0}),
+        STController(),
+        advance,
+        attempt_log=attempts,
+        rollback_threshold_multiplier=2.0,
+    )
+
+    assert dt_used == pytest.approx(0.05)
+    assert state.value == pytest.approx(0.05)
+    assert state.restore_count == 1
+    assert [item["accepted"] for item in attempts] == [False, True]
+    assert "rollback limit" in attempts[0]["reasons"][0]
+
+
+@pytest.mark.dt
+def test_physical_failure_ignores_soft_error_band():
+    state = CountingState()
+
+    def advance(state_local: CountingState, dt: float):
+        state_local.value += float(dt)
+        return float(dt) <= 0.05, Metrics(1.0, 1.0, 0.0, 0.0)
+
+    _metrics, _dt_next, dt_used = step_with_dt_control_used(
+        state,
+        0.1,
+        1.0,
+        Targets(1.0, 1.0, 1.0),
+        STController(),
+        advance,
+        rollback_threshold_multiplier=100.0,
+    )
+
+    assert dt_used == pytest.approx(0.05)
+    assert state.value == pytest.approx(0.05)
+    assert state.restore_count == 1
+
+
+@pytest.mark.dt
+def test_dt_floor_retains_even_a_hard_proposal_without_restore():
+    state = CountingState()
+    attempts: list[dict] = []
+
+    def advance(state_local: CountingState, dt: float):
+        state_local.value += float(dt)
+        return False, Metrics(
+            1.0, 1.0, 0.0, 0.0, hard_failure=True,
+            error_channels={"shape_error": 100.0},
+        )
+
+    metrics, _dt_next, dt_used = step_with_dt_control_used(
+        state,
+        1.0 / 1024.0,
+        1.0,
+        Targets(1.0, 1.0, 1.0, error_limits={"shape_error": 1.0}),
+        STController(dt_min=1.0 / 1024.0),
+        advance,
+        attempt_log=attempts,
+        rollback_threshold_multiplier=2.0,
+    )
+
+    assert dt_used == pytest.approx(1.0 / 1024.0)
+    assert state.value == pytest.approx(1.0 / 1024.0)
+    assert state.restore_count == 0
+    assert metrics.hard_failure is False
+    assert metrics.error_channels["dt_min_retained"] == pytest.approx(dt_used)
+    assert attempts[0]["accepted"] is True
+    assert attempts[0]["dt_min_retained_reasons"]
 
 
 def make_advance(vel_fn, *, fail_over_dt: float | None = None):
@@ -210,6 +373,31 @@ def test_controller_reports_and_raises_on_persistent_failure(capsys):
 
     out = capsys.readouterr().out
     assert "timestep controller failed" in out
+
+
+@pytest.mark.dt
+def test_strict_controller_rolls_back_mutating_persistent_failure():
+    """The default policy must never commit an exhausted bad proposal."""
+
+    state = FakeState()
+    targets = Targets(cfl=1.0, div_max=1.0, mass_max=1.0)
+    ctrl = STController(dt_min=None, dt_max=None)
+
+    def violating_advance(state_local: FakeState, dt: float):
+        state_local.t += float(dt)
+        return False, Metrics(1.0, 1.0, 0.0, 0.0)
+
+    with pytest.raises(RuntimeError, match="failed to complete"):
+        run_superstep_plan(
+            state,
+            SuperstepPlan(round_max=0.1, dt_init=0.1),
+            1.0,
+            targets,
+            ctrl,
+            violating_advance,
+        )
+
+    assert state.t == 0.0
 
 
 @pytest.mark.dt

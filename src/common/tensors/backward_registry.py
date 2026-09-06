@@ -131,6 +131,13 @@ def unbroadcast(G, target_shape):
     g_shape = list(getattr(G, "shape", ()))
     t_shape = list(target_shape)
 
+    # A precision wrapper deliberately supports arithmetic but not a general
+    # reshape surface.  Scalar vehicle equations arrive here already at their
+    # target shape, so preserve the value (and its limbs) instead of crossing
+    # the precision boundary merely to perform an identity reshape.
+    if tuple(g_shape) == tuple(t_shape):
+        return G
+
     # If gradient is a scalar, broadcast directly to target shape
     if not g_shape and t_shape:
         return AbstractTensor.ones(tuple(t_shape), dtype=getattr(G, "dtype", None), device=getattr(G, "device", None)) * G
@@ -149,13 +156,9 @@ def unbroadcast(G, target_shape):
     return G.reshape(tuple(t_shape))
 
 def expand_to(G, shape):
-    # Prefer a native broadcast_to if available
-    try:
-        return AbstractTensor.broadcast_to(G, shape)
-    except Exception:
-        # Fallback: multiply by ones of target shape to force broadcast
-        ones = AbstractTensor.ones(shape, dtype=getattr(G, "dtype", None), device=getattr(G, "device", None))
-        return ones * G
+    """Broadcast through the guaranteed AbstractTensor operator surface."""
+
+    return AbstractTensor.broadcast_to(G, shape)
 
 
 def expand_reduction(G, shape, axis=None, keepdim=False):
@@ -364,6 +367,93 @@ def matmul_vjp(g, A, B):
     gB = unbroadcast(AbstractTensor.matmul(T(A2), g2), B2.shape)
     return gA.reshape(A.shape), gB.reshape(B.shape)
 
+def pad_vjp(g, source, pad, mode="constant"):
+    """Adjoint of a constant pad: crop the gradient back to the original region.
+
+    ``pad`` follows the forward's own convention -- ``(before, after)`` pairs
+    running from the LAST dimension backwards -- so this reads it the same way
+    rather than assuming a leading-axis order that would silently crop the
+    wrong side of a rank-2 gradient.
+
+    Only the constant mode is adjoint-by-cropping. ``reflect``/``replicate``
+    fold the padded values back onto interior positions, so their gradient is a
+    scatter-add and not a crop; they raise rather than return a plausible wrong
+    answer. Negative pads are a crop in the forward direction, whose adjoint is
+    a pad, and are refused here for the same reason.
+    """
+
+    if str(mode) != "constant":
+        raise NotImplementedError(
+            f"pad backward is defined for the constant mode; {mode!r} folds "
+            "padded positions back onto interior ones and needs a scatter-add "
+            "adjoint, not a crop"
+        )
+    widths = tuple(int(width) for width in (pad or ()))
+    if any(width < 0 for width in widths):
+        raise NotImplementedError(
+            "pad backward is defined for non-negative widths; a negative pad "
+            "is a forward crop whose adjoint is a pad"
+        )
+    rank = len(tuple(g.shape))
+    index = [slice(None)] * rank
+    for offset, position in enumerate(range(0, len(widths) - 1, 2)):
+        axis = rank - 1 - offset
+        if axis < 0:
+            break
+        before, after = widths[position], widths[position + 1]
+        index[axis] = slice(before, int(g.shape[axis]) - after)
+    return g[tuple(index)].reshape(tuple(source.shape))
+
+
+def repeat_vjp(g, source, repeats, dim=0):
+    """Adjoint of a tiling repeat: sum the tiles back onto one period.
+
+    ``repeat`` lays the whole operand down ``repeats`` times end to end along
+    ``dim``, so each source position receives gradient from ``repeats``
+    positions spaced one period apart. Splitting the axis into
+    ``(repeats, period)`` and summing the leading half is exactly that sum.
+    """
+
+    count = int(repeats)
+    if count <= 0:
+        raise ValueError(f"repeat backward needs a positive count, got {repeats!r}")
+    shape = tuple(int(extent) for extent in source.shape)
+    if dim is None:
+        flat = g.reshape((count, -1))
+        return flat.sum(dim=0).reshape(shape)
+    axis = int(dim)
+    axis = axis if axis >= 0 else len(shape) + axis
+    split = (*shape[:axis], count, shape[axis], *shape[axis + 1:])
+    return g.reshape(split).sum(dim=axis).reshape(shape)
+
+
+def repeat_interleave_vjp(g, source, repeats, dim=None):
+    """Adjoint of an interleaving repeat: sum each consecutive run.
+
+    Unlike ``repeat``, the copies of one source position are adjacent, so the
+    axis splits as ``(extent, repeats)`` and the *trailing* half is summed.
+    Getting these two the wrong way round produces a correctly-shaped and
+    entirely wrong gradient whenever the extent and the count differ, which is
+    why they are separate helpers rather than one with a flag.
+    """
+
+    count = int(repeats)
+    if count <= 0:
+        raise ValueError(
+            f"repeat_interleave backward needs a positive count, got {repeats!r}"
+        )
+    shape = tuple(int(extent) for extent in source.shape)
+    if dim is None:
+        total = 1
+        for extent in shape:
+            total *= extent
+        return g.reshape((total, count)).sum(dim=1).reshape(shape)
+    axis = int(dim)
+    axis = axis if axis >= 0 else len(shape) + axis
+    split = (*shape[:axis], shape[axis], count, *shape[axis + 1:])
+    return g.reshape(split).sum(dim=axis + 1).reshape(shape)
+
+
 BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
     # ----------------------------------------------------------------------
     # Elementwise unary
@@ -493,6 +583,220 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "domain": "x: any real",
         "notes": "",
         "tags": ["elementwise", "unary", "smooth", "nn"],
+    },
+    # Widening a value into a float changes its type, not its magnitude, so
+    # the reverse is the identity. The narrowing direction is piecewise
+    # constant and is declared nondifferentiable in ``autograd`` instead --
+    # the pair is deliberately asymmetric, and saying so here is what keeps
+    # someone from "fixing" the asymmetry later.
+    "sitofp": {
+        "arity": "unary",
+        "signature": "y = float(x)",
+        "latex": r"y = x, \quad \frac{\partial y}{\partial x} = 1",
+        "backward": {"x": "gx = unbroadcast(g, x.shape)"},
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g, x.shape)",
+        },
+        "domain": "x: any value representable in the wider type",
+        "notes": "A widening cast is an identity on the value.",
+        "tags": ["cast", "unary", "identity"],
+    },
+    "uitofp": {
+        "arity": "unary",
+        "signature": "y = float(x)",
+        "latex": r"y = x, \quad \frac{\partial y}{\partial x} = 1",
+        "backward": {"x": "gx = unbroadcast(g, x.shape)"},
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g, x.shape)",
+        },
+        "domain": "x >= 0",
+        "notes": "Unsigned widening; identical adjoint to sitofp.",
+        "tags": ["cast", "unary", "identity"],
+    },
+    # Structural reverses. These move gradient between positions rather than
+    # scaling it, so each one is a rearrangement whose adjoint is the exact
+    # inverse rearrangement -- and each carries its forward's own metadata
+    # convention, which is where getting one wrong stays invisible.
+    "pad": {
+        "arity": "unary",
+        "signature": "y = pad(x, pad, value=0, mode='constant')",
+        "latex": r"y_{i+b} = x_i,\quad \frac{\partial L}{\partial x_i} = g_{i+b}",
+        "backward": {
+            "x": "gx = crop(g, pad)"
+        },
+        "python": {
+            "parameters": ["g", "x", "pad", "mode"],
+            "body": "return pad_vjp(g, x, pad, mode)",
+        },
+        "domain": "constant mode, non-negative widths",
+        "notes": (
+            "``pad`` runs (before, after) from the LAST dimension backwards. "
+            "reflect/replicate need a scatter-add adjoint and raise. "
+            "The crop records a ``slice`` step, which ``ProgramRunner`` reaches "
+            "through ``__getitem__`` -- see the dispatch note there. It is not "
+            "written with ``index_select`` because that forward is not "
+            "instrumented on the tape at all, so such a rule would silently "
+            "drop the step from a captured backward program."
+        ),
+        "tags": ["structural", "unary", "shape"],
+    },
+    "repeat": {
+        "arity": "unary",
+        "signature": "y = repeat(x, repeats, dim=0)",
+        "latex": r"\frac{\partial L}{\partial x_i} = \sum_{k<r} g_{i + kn}",
+        "backward": {
+            "x": "gx = sum_over_tiles(g, repeats, dim)"
+        },
+        "python": {
+            "parameters": ["g", "x", "repeats", "dim"],
+            "body": "return repeat_vjp(g, x, repeats, dim)",
+        },
+        "domain": "repeats >= 1",
+        "notes": "Tiling: the copies are one period apart, so the split is (repeats, extent).",
+        "tags": ["structural", "unary", "shape"],
+    },
+    "repeat_interleave": {
+        "arity": "unary",
+        "signature": "y = repeat_interleave(x, repeats, dim=None)",
+        "latex": r"\frac{\partial L}{\partial x_i} = \sum_{k<r} g_{ir + k}",
+        "backward": {
+            "x": "gx = sum_over_runs(g, repeats, dim)"
+        },
+        "python": {
+            "parameters": ["g", "x", "repeats", "dim"],
+            "body": "return repeat_interleave_vjp(g, x, repeats, dim)",
+        },
+        "domain": "repeats >= 1",
+        "notes": "Interleaving: the copies are adjacent, so the split is (extent, repeats).",
+        "tags": ["structural", "unary", "shape"],
+    },
+    # The inverse-trigonometric and hyperbolic family. Every one of these was
+    # already a forward primitive -- ELEMENTWISE_UNARY carries them and the C,
+    # LLVM and Fortran lanes all lower them -- but none had a reverse, so any
+    # tape touching one simply had no gradient for it. Their derivatives are
+    # exact and elementary; the only care they need is at the domain edges,
+    # where the guard is stated per rule rather than left to chance.
+    "asin": {
+        "arity": "unary",
+        "signature": "y = asin(x)",
+        "latex": r"y = \arcsin x, \quad \frac{\partial y}{\partial x} = \frac{1}{\sqrt{1-x^2}}",
+        "backward": {
+            "x": "gx = unbroadcast(g / sqrt(1 - x*x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g / (AbstractTensor.sqrt(1 - x*x) + eps()), x.shape)",
+        },
+        "domain": "|x| < 1; the derivative diverges at +/-1",
+        "notes": "eps guards the endpoints, where the true slope is unbounded.",
+        "tags": ["elementwise", "unary", "smooth", "trig", "domain"],
+    },
+    "acos": {
+        "arity": "unary",
+        "signature": "y = acos(x)",
+        "latex": r"y = \arccos x, \quad \frac{\partial y}{\partial x} = \frac{-1}{\sqrt{1-x^2}}",
+        "backward": {
+            "x": "gx = unbroadcast(-g / sqrt(1 - x*x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(-g / (AbstractTensor.sqrt(1 - x*x) + eps()), x.shape)",
+        },
+        "domain": "|x| < 1; the derivative diverges at +/-1",
+        "notes": "Same magnitude as asin with the opposite sign.",
+        "tags": ["elementwise", "unary", "smooth", "trig", "domain"],
+    },
+    "atan": {
+        "arity": "unary",
+        "signature": "y = atan(x)",
+        "latex": r"y = \arctan x, \quad \frac{\partial y}{\partial x} = \frac{1}{1+x^2}",
+        "backward": {
+            "x": "gx = unbroadcast(g / (1 + x*x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g / (1 + x*x), x.shape)",
+        },
+        "domain": "x: any real",
+        "notes": "No guard needed; the denominator is bounded below by 1.",
+        "tags": ["elementwise", "unary", "smooth", "trig"],
+    },
+    "sinh": {
+        "arity": "unary",
+        "signature": "y = sinh(x)",
+        "latex": r"y = \sinh x, \quad \frac{\partial y}{\partial x} = \cosh x",
+        "backward": {
+            "x": "gx = unbroadcast(g * cosh(x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g * AbstractTensor.cosh(x), x.shape)",
+        },
+        "domain": "x: any real",
+        "notes": "The hyperbolic mirror of sin -> cos, without the sign flip.",
+        "tags": ["elementwise", "unary", "smooth", "hyperbolic"],
+    },
+    "cosh": {
+        "arity": "unary",
+        "signature": "y = cosh(x)",
+        "latex": r"y = \cosh x, \quad \frac{\partial y}{\partial x} = \sinh x",
+        "backward": {
+            "x": "gx = unbroadcast(g * sinh(x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g * AbstractTensor.sinh(x), x.shape)",
+        },
+        "domain": "x: any real",
+        "notes": "Unlike cos -> -sin, this one carries no sign flip.",
+        "tags": ["elementwise", "unary", "smooth", "hyperbolic"],
+    },
+    "asinh": {
+        "arity": "unary",
+        "signature": "y = asinh(x)",
+        "latex": r"y = \operatorname{arcsinh} x, \quad \frac{\partial y}{\partial x} = \frac{1}{\sqrt{x^2+1}}",
+        "backward": {
+            "x": "gx = unbroadcast(g / sqrt(x*x + 1), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g / AbstractTensor.sqrt(x*x + 1), x.shape)",
+        },
+        "domain": "x: any real",
+        "notes": "No guard needed; the radicand is bounded below by 1.",
+        "tags": ["elementwise", "unary", "smooth", "hyperbolic"],
+    },
+    "acosh": {
+        "arity": "unary",
+        "signature": "y = acosh(x)",
+        "latex": r"y = \operatorname{arccosh} x, \quad \frac{\partial y}{\partial x} = \frac{1}{\sqrt{x^2-1}}",
+        "backward": {
+            "x": "gx = unbroadcast(g / sqrt(x*x - 1), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g / (AbstractTensor.sqrt(x*x - 1) + eps()), x.shape)",
+        },
+        "domain": "x > 1; the derivative diverges at 1",
+        "notes": "eps guards x -> 1+, where the true slope is unbounded.",
+        "tags": ["elementwise", "unary", "smooth", "hyperbolic", "domain"],
+    },
+    "atanh": {
+        "arity": "unary",
+        "signature": "y = atanh(x)",
+        "latex": r"y = \operatorname{arctanh} x, \quad \frac{\partial y}{\partial x} = \frac{1}{1-x^2}",
+        "backward": {
+            "x": "gx = unbroadcast(g / (1 - x*x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g / (1 - x*x + eps()), x.shape)",
+        },
+        "domain": "|x| < 1; the derivative diverges at +/-1",
+        "notes": "eps guards the endpoints, where the true slope is unbounded.",
+        "tags": ["elementwise", "unary", "smooth", "hyperbolic", "domain"],
     },
     "sigmoid": {
         "arity": "unary",
@@ -690,6 +994,123 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "domain": "x,y: any real",
         "notes": "At ties (x==y) split the gradient 0.5/0.5.",
         "tags": ["elementwise", "binary", "nonsmooth"],
+    },
+    "atan2": {
+        "arity": "binary",
+        "signature": "z = atan2(y, x)  (angle of the point (x, y))",
+        "latex": r"z = \operatorname{atan2}(y,x),\quad \frac{\partial z}{\partial y} = \frac{x}{x^2+y^2},\ \frac{\partial z}{\partial x} = \frac{-y}{x^2+y^2}",
+        "backward": {
+            "y": "gy = unbroadcast(g * x / (x*x + y*y + eps), y.shape)",
+            "x": "gx = unbroadcast(g * (-y) / (x*x + y*y + eps), x.shape)",
+        },
+        "python": {
+            "parameters": ["g", "y", "x"],
+            "body": (
+                "denom = x*x + y*y + eps(); "
+                "return unbroadcast(g * x / denom, y.shape), unbroadcast(g * (-y) / denom, x.shape)"
+            ),
+        },
+        "domain": "x, y: any real; undefined gradient at the origin, guarded by eps",
+        "notes": "Standard atan2 derivative; needed for phase (angle-of-complex) work.",
+        "tags": ["elementwise", "binary", "smooth", "trig"],
+    },
+    "round": {
+        "arity": "unary",
+        "signature": "y = round(x)",
+        "latex": r"y = \operatorname{round}(x),\quad \frac{\partial y}{\partial x} = 0 \text{ a.e.}",
+        "backward": {
+            "x": "gx = zeros_like(x)",
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return AbstractTensor.zeros_like(x)",
+        },
+        "domain": "x: any real",
+        "notes": "Piecewise-constant; gradient is zero almost everywhere (straight-through is not assumed here).",
+        "tags": ["elementwise", "unary", "nonsmooth", "nondifferentiable"],
+    },
+    "floor": {
+        "arity": "unary",
+        "signature": "y = floor(x)",
+        "latex": r"y = \lfloor x \rfloor,\quad \frac{\partial y}{\partial x} = 0 \text{ a.e.}",
+        "backward": {
+            "x": "gx = zeros_like(x)",
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return AbstractTensor.zeros_like(x)",
+        },
+        "domain": "x: any real",
+        "notes": "Piecewise-constant; gradient is zero almost everywhere.",
+        "tags": ["elementwise", "unary", "nonsmooth", "nondifferentiable"],
+    },
+
+    # ----------------------------------------------------------------------
+    # Complex real/imag/assembly
+    #
+    # These follow the standard (non-Wirtinger) convention used by e.g.
+    # PyTorch: the gradient of ``real(x)`` w.r.t. a complex ``x`` is placed
+    # entirely in the real component, and likewise for ``imag``. This is
+    # sufficient for optimizing a real-valued loss through real/imag/complex,
+    # which is the case this fixes (fft -> real -> sum used to return no
+    # gradient at all). Full Wirtinger calculus for holomorphic/antiholomorphic
+    # complex objectives is a separate, harder problem -- see the manifesto's
+    # open questions.
+    # ----------------------------------------------------------------------
+    "real": {
+        "arity": "unary",
+        "signature": "y = real(x)",
+        "latex": r"y = \Re(x),\quad \frac{\partial y}{\partial x} = 1 \text{ (placed in the real component)}",
+        "backward": {
+            "x": "gx = complex(g, zeros_like(g)) if is_complex(x) else g",
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": (
+                "return AbstractTensor.complex(g, AbstractTensor.zeros_like(g)) "
+                "if 'complex' in str(getattr(x, 'dtype', '')) else g"
+            ),
+        },
+        "domain": "x: real or complex",
+        "notes": "Non-Wirtinger convention: gradient placed in the real part only.",
+        "tags": ["elementwise", "unary", "complex", "linear"],
+    },
+    "imag": {
+        "arity": "unary",
+        "signature": "y = imag(x)",
+        "latex": r"y = \Im(x),\quad \frac{\partial y}{\partial x} = 1 \text{ (placed in the imaginary component)}",
+        "backward": {
+            "x": "gx = complex(zeros_like(g), g) if is_complex(x) else zeros_like(g)",
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": (
+                "return AbstractTensor.complex(AbstractTensor.zeros_like(g), g) "
+                "if 'complex' in str(getattr(x, 'dtype', '')) else AbstractTensor.zeros_like(g)"
+            ),
+        },
+        "domain": "x: real or complex",
+        "notes": "Non-Wirtinger convention: gradient placed in the imaginary part only. Zero if x was never complex.",
+        "tags": ["elementwise", "unary", "complex", "linear"],
+    },
+    "complex": {
+        "arity": "binary",
+        "signature": "z = complex(re, im) = re + i*im",
+        "latex": r"z = \mathrm{re} + i\,\mathrm{im},\quad \frac{\partial z}{\partial \mathrm{re}} = 1,\ \frac{\partial z}{\partial \mathrm{im}} = 1",
+        "backward": {
+            "real": "g_re = unbroadcast(real(g), real.shape)",
+            "imag": "g_im = unbroadcast(imag(g), imag.shape)",
+        },
+        "python": {
+            "parameters": ["g", "real", "imag"],
+            "body": (
+                "return (unbroadcast(AbstractTensor.real(g), real.shape), "
+                "unbroadcast(AbstractTensor.imag(g), imag.shape))"
+            ),
+        },
+        "domain": "real, imag: real-valued",
+        "notes": "Inverse of real/imag; splits an upstream complex gradient back into its two real components.",
+        "tags": ["elementwise", "binary", "complex", "linear"],
     },
 
     # ----------------------------------------------------------------------
@@ -944,6 +1365,41 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "notes": "Right-inverse of broadcasting via summation.",
         "tags": ["shape"],
     },
+    "unfold2d": {
+        "arity": "unary",
+        "signature": "y = unfold2d(x, kernel_size, stride, padding, dilation)",
+        "latex": r"y = \operatorname{im2col}(x)",
+        "backward": {
+            "x": "gx = fold2d(g, x.shape, kernel_size, stride, padding, dilation)"
+        },
+        "python": {
+            "parameters": [
+                "g", "x", "kernel_size", "stride", "padding", "dilation"
+            ],
+            "body": "return AbstractTensor.fold2d(g, tuple(x.shape), kernel_size, stride=stride, padding=padding, dilation=dilation)",
+        },
+        "domain": "Rank-four NCHW tensors with valid convolution geometry.",
+        "notes": "The adjoint is overlap-accumulating column-to-image fold.",
+        "tags": ["shape", "convolution"],
+    },
+    "fold2d": {
+        "arity": "unary",
+        "signature": "y = fold2d(x, output_size, kernel_size, stride, padding, dilation)",
+        "latex": r"y = \operatorname{col2im}(x)",
+        "backward": {
+            "x": "gx = unfold2d(g, kernel_size, stride, padding, dilation)"
+        },
+        "python": {
+            "parameters": [
+                "g", "x", "output_size", "kernel_size", "stride",
+                "padding", "dilation"
+            ],
+            "body": "return AbstractTensor.unfold2d(g, kernel_size, stride=stride, padding=padding, dilation=dilation)",
+        },
+        "domain": "Column tensors paired with valid rank-four output geometry.",
+        "notes": "The adjoint is the matching image-to-column transform.",
+        "tags": ["shape", "convolution"],
+    },
     "slice": {
         "arity": "unary",
         "signature": "y = x[slices]",
@@ -964,15 +1420,15 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = x; y[idx] = v",
         "latex": r"y = x; y[\\text{idx}] = v",
         "backward": {
-            "x": "gx = g.clone()",
+            "x": "gx = g.clone(); gx[idx] = 0",
             "v": "gv = g[idx]"
         },
         "python": {
             "parameters": ["g", "x", "v", "idx"],
-            "body": "gx=g.clone(); gv=g[idx]; return gx, gv"
+            "body": "gx=g.clone(); gx[idx]=0; gv=g[idx]; return gx, gv"
         },
         "domain": "Any real; idx valid.",
-        "notes": "Scatter assignment; gradient flows from selected region to the value.",
+        "notes": "Overwrite assignment; replaced source entries have zero adjoint and the selected gradient flows to the value.",
         "tags": ["indexing"],
     },
     "clone": {
@@ -995,14 +1451,51 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = gather(x, index, dim)",
         "latex": r"y_i = x_{index_i}",
         "backward": {
-            "x": "gx = zeros_like(x); idx=[slice(None)]*x.ndims(); axis=dim if dim>=0 else x.ndims()+dim; idx[axis]=index; gx[tuple(idx)] = g"
+            "x": "gx = index_adjoint(g, x, idx) with idx=[slice(None)]*x.ndims(), idx[axis]=index: the transpose of the gather, ACCUMULATING every position index names more than once"
         },
         "python": {
             "parameters": ["g", "x", "index", "dim"],
-            "body": "gx=AbstractTensor.zeros_like(x); idx=[slice(None)]*x.ndims(); axis=dim if dim>=0 else x.ndims()+dim; idx[axis]=index; gx[tuple(idx)] = g; return gx"
+            "body": "idx=[slice(None)]*x.ndims(); axis=dim if dim>=0 else x.ndims()+dim; idx[axis]=index; return index_adjoint(g, x, tuple(idx))"
         },
-        "domain": "Any real; index valid.",
-        "notes": "Backward of gather: scatter gradient back to x; no gradient w.r.t index.",
+        "domain": "Any real; index valid; repeated indices accumulate (a many-to-one gather such as face->vertex lookup).",
+        "notes": (
+            "Backward of gather: the adjoint of the same fancy-index read, via "
+            "index_adjoint (sort + prefix-sum), so a source position gathered "
+            "k times receives the SUM of its k output gradients.  The previous "
+            "rule assigned gx[idx] = g, which OVERWRITES on repeated indices and "
+            "kept only the last contribution -- measured 2026-09-03 as a 69% "
+            "wrong directional derivative on a 5-index gather with two repeats, "
+            "and a wholly wrong VJP through the balloon tire's face-vertex "
+            "gathers.  No gradient w.r.t index."
+        ),
+        "tags": ["indexing"],
+    },
+    "index_select": {
+        "arity": "unary",
+        "signature": "y = index_select(x, dim, indices)",
+        "latex": r"y_i = x_{\text{indices}_i} \text{ along axis } \mathrm{dim}",
+        "backward": {
+            "x": "gx = swapaxes(index_adjoint(swapaxes(g, 0, dim), swapaxes(x, 0, dim), indices), 0, dim)",
+        },
+        "python": {
+            "parameters": ["g", "x", "indices", "dim"],
+            "body": (
+                "xt = x.swapaxes(0, dim); gt = g.swapaxes(0, dim); "
+                "adj = index_adjoint(gt, xt, indices); return adj.swapaxes(0, dim)"
+            ),
+        },
+        "domain": "indices valid for x.shape[dim]; repeated indices accumulate (correct for a many-to-one gather).",
+        "notes": (
+            "Was entirely missing: index_select() never called _pre_autograd, so "
+            "gradients silently stopped at any index_select in the forward graph "
+            "-- discovered while building AbstractTensor.interp (a real linear-"
+            "interpolation primitive genuinely needs to backprop through the "
+            "gathers that pick each query point's bracketing samples). Reuses "
+            "index_adjoint, the same repeated-index-accumulating adjoint "
+            "__getitem__'s own fancy-indexing backward already uses, rather than "
+            "gather's backward above, which overwrites on repeated indices "
+            "instead of accumulating."
+        ),
         "tags": ["indexing"],
     },
     "scatter": {

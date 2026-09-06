@@ -35,7 +35,6 @@ class LLVMSignalMath:
 
 
 class LLVMTrigSolver(str, Enum):
-    LIBM = "libm"
     LUT = "lut"
     CONTINUOUS = "continuous"
 
@@ -244,8 +243,6 @@ def link_llvm_trig_solver(
     """Resolve C/libm trig calls to a selected LLVM implementation."""
 
     solver = LLVMTrigSolver(solver)
-    if solver is LLVMTrigSolver.LIBM:
-        return llvm_ir, None
     signal = build_llvm_signal_math(epsilon)
     prefix = (
         "turing_lut"

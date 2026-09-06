@@ -146,6 +146,8 @@ def _render_c_or_glsl(
                 block.carried_aliases,
                 block.parallel_iterations,
                 block.dispatch_shell,
+                block.recursion_region_id,
+                block.schedule_preference,
             )
         if isinstance(block, StateMachineTick):
             return StateMachineTick(
@@ -154,7 +156,8 @@ def _render_c_or_glsl(
             )
         if isinstance(block, ParallelDeployment):
             return ParallelDeployment(
-                tuple(substitute(lane) for lane in block.lanes)
+                tuple(substitute(lane) for lane in block.lanes),
+                block.schedule_preference,
             )
         if isinstance(block, CallBlock):
             return CallBlock(

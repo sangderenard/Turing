@@ -6,11 +6,20 @@ pytest_run_times.log
 .turing-cache/
 .vs
 env
+/build/
+
+# Generated diagnostics and render captures are local artifacts. Reference
+# images intentionally kept under src/rendering/ascii_diff remain tracked.
+*.log
+/*.png
+/*.jpg
+/src/common/tensors/abstract_nn/*lossxor.png
 
 # Agent scratch artifacts: probe drivers, captured run logs, and rendered
 # media produced while debugging.  These are session output, not sources.
 .codex-*
 .probe_*
+.native_re_compile*/
 .conv_batch*.py
 .convert.py
 .a[0-9]*.log
@@ -38,3 +47,11 @@ standard_graph.jpg
 # Published gallery output belongs to the parent nogodsnomasters repository.
 /index.html
 /site/
+repo-cache/
+tools/_precision_benchmark/
+
+# Browser-automation temp profiles: real cookies, saved passwords, and
+# trust tokens live here, never project content. Committed once by
+# accident on 2026-09-03 (blanket `git add -A`) and removed the same
+# commit; ignored from here on so it can't happen again.
+.tmp-chrome-*/

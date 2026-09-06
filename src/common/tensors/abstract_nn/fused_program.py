@@ -16,10 +16,14 @@ import difflib
 
 import networkx as nx
 
-from ..abstraction import AbstractTensor as AT
+from ..abstraction import AbstractTensor as AT, tensor_identity
 from ..graph_translator import GraphTranslator
 from ....transmogrifier.ilpscheduler import ILPScheduler
-from ..autograd import autograd
+from ..autograd import (
+    _AUTOGRAD_SOURCE_OPERATIONS,
+    _INTENTIONALLY_NONDIFFERENTIABLE,
+    autograd,
+)
 from ..backward import BACKWARD_REGISTRY
 from .optimizer import Adam, adam_step
 from collections import deque
@@ -78,8 +82,13 @@ def build_fused_program(
             if not pred_ops:
                 if isinstance(nid, int):
                     feeds.add(nid)
+            raw_shape = data.get("shape")
             m = Meta(
-                shape=tuple(data.get("shape", [])) or None,
+                # Rank-zero is a complete scalar shape, not absent tensor
+                # accommodation metadata. Collapsing ``()`` to ``None`` made
+                # the shared compiler reject otherwise valid captured scalar
+                # spans and forced late targets to guess their ABI.
+                shape=None if raw_shape is None else tuple(raw_shape),
                 dtype=data.get("dtype"),
                 device=data.get("device"),
             )
@@ -99,7 +108,7 @@ def build_fused_program(
         ctx_inputs = ctx.get("inputs")
         if ctx_inputs is not None:
             try:
-                input_ids = [int(id(x)) for x in ctx_inputs]
+                input_ids = [int(tensor_identity(x)) for x in ctx_inputs]
             except Exception:
                 # Fallback to graph predecessors if ctx is not materialized
                 input_ids = [
@@ -118,7 +127,7 @@ def build_fused_program(
         ctx_res = ctx.get("result")
         if ctx_res is not None:
             try:
-                result_id = int(id(ctx_res))
+                result_id = int(tensor_identity(ctx_res))
             except Exception:
                 result_id = nid
         else:
@@ -172,13 +181,14 @@ def capture_forward_program(model, inputs: AT, *, output_name: str = "prediction
     inputs._tape = tape
     tape.create_tensor_node(inputs)
     prediction = model.forward(inputs)
-    output_id = id(prediction)
+    output_id = tensor_identity(prediction)
     reachable = nx.ancestors(tape.graph, output_id) | {output_id}
     graph = tape.graph.subgraph(reachable).copy()
     program = build_fused_program(graph, outputs={output_name: output_id})
-    if id(inputs) not in program.feeds:
+    input_id = tensor_identity(inputs)
+    if input_id not in program.feeds:
         raise RuntimeError("captured forward program lost its input feed")
-    return program, id(inputs)
+    return program, input_id
 
 
 @dataclass(frozen=True)
@@ -208,14 +218,27 @@ def capture_backward_program(
     """
     wrt = tuple(wrt)
     forward_tape = getattr(loss, "_tape", None) or autograd.tape
-    if id(loss) not in forward_tape.graph:
+    if tensor_identity(loss) not in forward_tape.graph:
         raise ValueError("loss is not present on the active forward GradTape")
     override_names = set(backward_overrides or {})
+    # An operation that is deliberately nondifferentiable contributes no
+    # backward step and no gradient -- ``autograd.grad`` already walks past it
+    # -- and a source manufactures its value rather than transforming one.
+    # Neither is a rule someone failed to write, so neither may block a capture
+    # the tape is perfectly able to perform. Counting them here refused whole
+    # programs over a ``sign`` inside ``eigh`` or a ``zeros_like`` inside
+    # ``pad``, which is the same accounting the tape's own ``backward_status``
+    # gets right.
+    accounted = (
+        set(BACKWARD_REGISTRY._methods)
+        | override_names
+        | _INTENTIONALLY_NONDIFFERENTIABLE
+        | _AUTOGRAD_SOURCE_OPERATIONS
+    )
     missing = tuple(sorted({
         str(node.op)
         for _, node in forward_tape.traverse(loss)
-        if node.op not in override_names
-        and node.op not in BACKWARD_REGISTRY._methods
+        if node.op not in accounted
     }))
     if missing and not allow_missing:
         raise RuntimeError(
@@ -251,7 +274,7 @@ def capture_backward_program(
         selected.update(graph.predecessors(node_id))
     backward_graph = graph.subgraph(selected).copy()
     outputs = {
-        f"{output_prefix}_{index}": id(gradient)
+        f"{output_prefix}_{index}": tensor_identity(gradient)
         for index, gradient in enumerate(gradients)
         if gradient is not None
     }
@@ -266,20 +289,21 @@ def capture_backward_program(
     for node in getattr(forward_tape, "_nodes", {}).values():
         for value in node.ctx.get("inputs", ()):
             if isinstance(value, AT):
-                live_values[id(value)] = value
+                live_values[tensor_identity(value)] = value
         value = node.ctx.get("result")
         if isinstance(value, AT):
-            live_values[id(value)] = value
+            live_values[tensor_identity(value)] = value
     for value in (*wrt, loss, grad_output, *gradients):
         if isinstance(value, AT):
-            live_values[id(value)] = value
+            live_values[tensor_identity(value)] = value
     feed_values = {
         feed_id: live_values[feed_id]
         for feed_id in program.feeds
         if feed_id in live_values
     }
-    if id(grad_output) in program.feeds:
-        feed_values[id(grad_output)] = grad_output
+    grad_output_id = tensor_identity(grad_output)
+    if grad_output_id in program.feeds:
+        feed_values[grad_output_id] = grad_output
     return BackwardProgramCapture(program, feed_values, missing)
 
 
@@ -382,6 +406,16 @@ class ProgramRunner:
                 fn = getattr(args[0], "_apply_operator", None) if args else None
             elif step.op_name == "matmul" and args:
                 fn = getattr(args[0], "_apply_operator", None)
+            elif step.op_name == "slice" and args:
+                # ``slice`` is a real recorded operator -- ``__getitem__``
+                # publishes it, with the index in ``slices`` -- but it reaches
+                # a backend through the subscript protocol rather than through
+                # a method of that name, so ``getattr`` finds nothing and the
+                # step dies here. It is the same operator either way; only the
+                # call path differs, so route it to the protocol the forward
+                # itself used rather than requiring every backend to grow a
+                # second spelling of indexing.
+                fn = type(args[0]).__getitem__
             else:
                 fn = getattr(cls, step.op_name, None)
             if fn is None:
@@ -410,6 +444,14 @@ class ProgramRunner:
                 )
                 if permutation is not None:
                     positional_tail = tuple(permutation)
+            elif step.op_name == "slice":
+                # ``index_tensors`` is the recorded list of tensor-valued index
+                # operands, kept by the forward for dataflow. The subscript
+                # itself is ``slices``; passing the bookkeeping entry on would
+                # be an argument ``__getitem__`` has no name for.
+                call_kwargs.pop("index_tensors", None)
+                subscript = call_kwargs.pop("slices", None)
+                positional_tail = (subscript,)
             elif step.op_name in {"sum", "mean", "max", "min"}:
                 if "axis" in call_kwargs and "dim" not in call_kwargs:
                     call_kwargs["dim"] = call_kwargs.pop("axis")
@@ -949,7 +991,17 @@ class IRGraphedModel:
                     raise RuntimeError("Failed to apply strict whitelist labels")
             if params:
                 try:
-                    grads = autograd.grad(loss, params, retain_graph=True)
+                    # ``record_backward=True`` is what makes this a training
+                    # program rather than a forward with a frozen gradient
+                    # stapled on. Without it the backward runs under no_grad,
+                    # so the gradients never become steps -- they enter the
+                    # captured program as CONSTANT FEEDS. The result still has
+                    # a loss output, param*_new outputs and a plausible first
+                    # couple of steps, and then applies the capture-time
+                    # gradient forever while looking like it is training.
+                    grads = autograd.grad(
+                        loss, params, retain_graph=True, record_backward=True
+                    )
                 except Exception as e:
                     raise RuntimeError(f"autograd.grad failed during capture: {e}") from e
             else:
@@ -965,10 +1017,26 @@ class IRGraphedModel:
                 self.opt_v = [p.zeros_like() for p in params]
             if self.opt_t is None:
                 self.opt_t = AT.get_tensor(0.0)
-            # Register state tensors on current tape as feeds
+            # Register state tensors on current tape as feeds.
+            #
+            # They also have to REQUIRE GRAD, which reads as wrong and is not:
+            # an operator only records when one of its operands requires grad,
+            # so ``t + 1.0`` on a plain scalar records nothing at all. The step
+            # counter's update then never enters the program, ``opt_t_new`` is
+            # declared as an output that no step produces, and a compiled loop
+            # either fails at replay or -- worse, if it feeds the same t back --
+            # applies the first step's bias correction forever while looking
+            # like it is training.
+            #
+            # ``mark_structural`` is the mechanism for exactly this: a tensor
+            # allowed to require grad without being treated as a trainable
+            # parameter. Optimizer state is state, not a parameter, and stays
+            # out of every parameter list and strict connectivity check.
             for s in self.opt_m + self.opt_v + [self.opt_t]:
                 try:
+                    s.requires_grad_(True)
                     autograd.tape.create_tensor_node(s)
+                    autograd.tape.mark_structural(s, label="optimizer_state")
                 except Exception:
                     raise RuntimeError("Failed to create tensor node for optimizer state")
             # Record adam updates per param
@@ -986,11 +1054,11 @@ class IRGraphedModel:
                 new_m.append(m_new)
                 new_v.append(v_new)
                 t_new_any = t_new
-                extras[f"param{ i }_new"] = id(p_new)
-                extras[f"opt_m{ i }_new"] = id(m_new)
-                extras[f"opt_v{ i }_new"] = id(v_new)
+                extras[f"param{ i }_new"] = tensor_identity(p_new)
+                extras[f"opt_m{ i }_new"] = tensor_identity(m_new)
+                extras[f"opt_v{ i }_new"] = tensor_identity(v_new)
             if t_new_any is not None:
-                extras["opt_t_new"] = id(t_new_any)
+                extras["opt_t_new"] = tensor_identity(t_new_any)
 
         # Build program from the full autograd tape graph (includes backward/optimizer ops if any)
         try:
@@ -1001,15 +1069,15 @@ class IRGraphedModel:
         # Determine default outputs if not provided
         out_map: Dict[str, int] = {}
         try:
-            pred_id = id(pred)
+            pred_id = tensor_identity(pred)
             out_map["pred"] = pred_id
         except Exception:
-            raise RuntimeError("Failed to get id() of pred tensor")
+            raise RuntimeError("Failed to obtain prediction tensor identity")
         if loss is not None:
             try:
-                out_map["loss"] = id(loss)
+                out_map["loss"] = tensor_identity(loss)
             except Exception:
-                raise RuntimeError("Failed to get id() of loss tensor")
+                raise RuntimeError("Failed to obtain loss tensor identity")
         # Updated parameters from optimizer (if any)
         if extras:
             out_map.update(extras)
@@ -1036,16 +1104,16 @@ class IRGraphedModel:
             val = refs.get(fid)
             if val is None:
                 # best effort: try to reconstruct from model/inputs/targets ids
-                if id(inputs) == fid:
+                if tensor_identity(inputs) == fid:
                     val = inputs
-                elif targets is not None and id(targets) == fid:
+                elif targets is not None and tensor_identity(targets) == fid:
                     val = targets
-                elif self.opt_t is not None and id(self.opt_t) == fid:
+                elif self.opt_t is not None and tensor_identity(self.opt_t) == fid:
                     val = self.opt_t
                 else:
                     # search in opt state arrays
                     for s in (self.opt_m + self.opt_v):
-                        if id(s) == fid:
+                        if tensor_identity(s) == fid:
                             val = s
                             break
             if val is None:

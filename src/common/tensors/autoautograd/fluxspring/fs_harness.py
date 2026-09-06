@@ -8,7 +8,7 @@ import logging
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
-from ...abstraction import AbstractTensor as AT
+from ...abstraction import AbstractTensor as AT, tensor_identity
 from .fs_types import FluxSpringSpec
 
 logger = logging.getLogger(__name__)
@@ -350,7 +350,7 @@ class RingHarness:
             if p is None or not getattr(p, "requires_grad", False):
                 return []
             if label is None:
-                label = tape.graph.nodes.get(id(p), {}).get("annotations", {}).get("label")
+                label = tape.graph.nodes.get(tensor_identity(p), {}).get("annotations", {}).get("label")
             if label is None:
                 return []
             return [(label, p)]
@@ -359,7 +359,7 @@ class RingHarness:
         for n in spec.nodes:
             for attr in ("alpha", "w", "b"):
                 p = getattr(n.ctrl, attr)
-                lbl = tape.graph.nodes.get(id(p), {}).get("annotations", {}).get("label") if p is not None else None
+                lbl = tape.graph.nodes.get(tensor_identity(p), {}).get("annotations", {}).get("label") if p is not None else None
                 for label, param in _maybe(lbl, p):
                     val = AT.get_tensor(param).reshape(-1)
                     D = int(val.shape[0])
@@ -373,7 +373,7 @@ class RingHarness:
         for e in spec.edges:
             for attr in ("alpha", "w", "b"):
                 p = getattr(e.ctrl, attr)
-                lbl = tape.graph.nodes.get(id(p), {}).get("annotations", {}).get("label") if p is not None else None
+                lbl = tape.graph.nodes.get(tensor_identity(p), {}).get("annotations", {}).get("label") if p is not None else None
                 for label, param in _maybe(lbl, p):
                     val = AT.get_tensor(param).reshape(-1)
                     D = int(val.shape[0])
@@ -384,7 +384,7 @@ class RingHarness:
                             self.param_labels.append(label)
             for attr in ("kappa", "k", "l0", "lambda_s", "x"):
                 p = getattr(e.transport, attr)
-                lbl = tape.graph.nodes.get(id(p), {}).get("annotations", {}).get("label") if p is not None else None
+                lbl = tape.graph.nodes.get(tensor_identity(p), {}).get("annotations", {}).get("label") if p is not None else None
                 for label, param in _maybe(lbl, p):
                     val = AT.get_tensor(param).reshape(-1)
                     D = int(val.shape[0])
@@ -398,7 +398,7 @@ class RingHarness:
         for f in spec.faces:
             for attr in ("alpha", "c"):
                 p = getattr(f, attr, None)
-                lbl = tape.graph.nodes.get(id(p), {}).get("annotations", {}).get("label") if p is not None else None
+                lbl = tape.graph.nodes.get(tensor_identity(p), {}).get("annotations", {}).get("label") if p is not None else None
                 for label, param in _maybe(lbl, p):
                     val = AT.get_tensor(param).reshape(-1)
                     D = int(val.shape[0])

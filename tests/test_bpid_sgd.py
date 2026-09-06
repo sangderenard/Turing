@@ -1,5 +1,5 @@
-from src.common.tensors.abstract_nn.optimizer import BPIDSGD, SGD
-from src.common.tensors.abstraction import AbstractTensor as AT
+from src.common.tensors.abstract_nn.optimizer import Adam, BPIDSGD, SGD
+from src.common.tensors.abstraction import AbstractTensor as AT, tensor_identity
 
 
 def test_bpid_sgd_integral_accumulation():
@@ -20,3 +20,29 @@ def test_sgd_step():
     opt = SGD([p], lr=0.1)
     new_p = opt.step([p], [g])[0]
     assert new_p.tolist() == [-0.1]
+
+
+def test_optimizer_state_uses_monotonic_tensor_identity():
+    parameter = AT.get_tensor([1.0])
+    gradient = AT.get_tensor([0.25])
+    optimizer = Adam([parameter])
+
+    optimizer.step([parameter], [gradient])
+
+    token = tensor_identity(parameter)
+    assert token in optimizer.m
+    assert token in optimizer.v
+    assert id(parameter) not in optimizer.m
+
+
+def test_bpid_state_uses_monotonic_tensor_identity():
+    parameter = AT.get_tensor([1.0])
+    gradient = AT.get_tensor([0.25])
+    optimizer = BPIDSGD([parameter])
+
+    optimizer.step([parameter], [gradient])
+
+    token = tensor_identity(parameter)
+    assert token in optimizer.pid._integral
+    assert token in optimizer.pid._prev_error
+    assert id(parameter) not in optimizer.pid._integral

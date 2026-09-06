@@ -28,7 +28,7 @@ import os
 
 from .fused_program import IRGraphedModel
 from .completion_training import CompletionTrainer
-from ..abstraction import AbstractTensor as AT
+from ..abstraction import AbstractTensor as AT, tensor_identity
 from ..abstract_convolution.metric_steered_conv3d import MetricSteeredConv3DWrapper
 from ..abstract_convolution.ndpca3transform import fit_metric_pca, PCANDTransform
 from ..abstract_nn.core import Linear
@@ -158,7 +158,7 @@ def run_eager_training_test(model, AT, args):
         tape._loss_tensor = None
         tape._loss_id = None
         params = model.parameters()
-        keep = {id(p) for p in params}
+        keep = {tensor_identity(p) for p in params}
         tape._tensor_refs = {tid: ref for tid, ref in tape._tensor_refs.items() if tid in keep}
         for p in params:
             tape.create_tensor_node(p)

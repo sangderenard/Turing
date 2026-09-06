@@ -1,11 +1,13 @@
 from src.compiler.compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
 from src.compiler.python_native_shell import (
+    NativeFilePortHandler, _option_parser,
     emit_python_native_shell, profile_frame_arrivals,
 )
 from src.compiler.shell_io import (
     ShellIOBinding,
     ShellIOManifest,
     ShellIORequest,
+    SystemPort,
     ShellOption,
     attach_shell_io,
 )
@@ -81,3 +83,23 @@ def test_arrival_profile_includes_display_acquisition_by_default():
     assert profile.to_mapping()["measurement_boundary"] == (
         "display_plane_arrival"
     )
+
+
+def test_native_file_port_cli_loads_byte_exact_data_and_length(tmp_path):
+    subject = tmp_path / "subject.exe"
+    subject.write_bytes(b"MZ\x00\xff")
+    manifest = ShellIOManifest(
+        (ShellIORequest.create("files"),),
+        system_ports=(SystemPort.create(
+            "subject-binary", "file", "input", entry_point="load_subject",
+            fields={"data": "subject_bytes", "length": "subject_length"},
+        ),),
+    ).to_mapping()
+
+    options = vars(_option_parser(manifest).parse_args([
+        "--file-subject-binary", str(subject), "--headless",
+    ]))
+    handler = NativeFilePortHandler(manifest, options)
+
+    assert handler.resource("subject-binary", "data").tolist() == [77, 90, 0, 255]
+    assert handler.resource("subject-binary", "length") == 4

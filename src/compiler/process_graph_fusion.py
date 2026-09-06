@@ -19,10 +19,12 @@ from typing import Any, Iterable, Mapping
 import networkx as nx
 
 from ..common.tensors.fused_ir import (
+    AXIS_REDUCTION_FOLDS,
     FusedProgram,
     Meta,
     OpStep,
     canonical_elementwise_op,
+    flatten_tensor_constant,
     ordered_feed_ids,
     uniform_tensor_constant,
 )
@@ -131,7 +133,9 @@ def extract_clean_process_subgraph(
             return frozenset(isolate_metadata(item) for item in value)
         return value
 
-    included = set(node_ids)
+    included = {
+        int(node_id) for node_id in node_ids if int(node_id) in graph.G
+    }
     extracted = copy.copy(graph)
     extracted.G = graph.G.subgraph(included).copy()
     extracted.G.graph = isolate_metadata(dict(graph.G.graph))
@@ -788,8 +792,47 @@ def reduce_scheduled_shader_regions(
                 candidates[:len(group)] = [merged]
                 changed = True
 
+    # Regions execute in the order they are listed, so that order must respect
+    # the quotient graph, not the position of each region's earliest member.
+    # Fusing a node with a consumer that depends on a later region moved the
+    # whole region ahead of its own producer: the consumer then read the
+    # producer's pre-loop value while the real result was versioned into a
+    # value nothing read -- a use before definition that emitted cleanly.
+    # Every accepted merge keeps the quotient acyclic, so a topological order
+    # always exists; the earliest-member index remains the tie-break, which
+    # leaves every already-legal listing exactly as it was.
+    # Projected edges through structural nodes can put two regions in an
+    # apparent mutual dependency the merge legality never examined, so the
+    # quotient is not guaranteed acyclic.  Order through the condensation:
+    # strongly-connected regions share a rank (their internal order falls to
+    # the earliest-member tie-break) while every true dependency still holds.
+    quotient_graph = quotient()
+    condensed = nx.condensation(quotient_graph)
+    component_rank = {
+        member: position
+        for position, component in enumerate(
+            nx.lexicographical_topological_sort(
+                condensed,
+                key=lambda component: min(
+                    order_index[node_id]
+                    for member in condensed.nodes[component]["members"]
+                    for node_id in regions[member]
+                ),
+            )
+        )
+        for member in condensed.nodes[component]["members"]
+    }
+    region_order = {
+        region_id: (
+            component_rank[region_id],
+            min(order_index[node_id] for node_id in regions[region_id]),
+        )
+        for region_id in regions
+    }
     dispatches = []
-    for region_id, members in regions.items():
+    for region_id, members in sorted(
+        regions.items(), key=lambda item: region_order[item[0]]
+    ):
         ordered = tuple(sorted(members, key=order_index.__getitem__))
         dispatches.append(FlatComputeDispatch(
             kind="shader_region",
@@ -798,11 +841,6 @@ def reduce_scheduled_shader_regions(
             operator_pattern=tuple(_operation(graph, node) for node in ordered),
             rewrite_history=tuple(histories[region_id]),
         ))
-    dispatches.sort(
-        key=lambda dispatch: min(
-            order_index[node_id] for node_id in dispatch.node_ids
-        )
-    )
     node_locations = {
         node_id: (dispatch_index, lane_index)
         for dispatch_index, dispatch in enumerate(dispatches)
@@ -928,14 +966,44 @@ def fused_program_to_process_graph(program: FusedProgram) -> ProcessGraph:
                 ),
             )
             continue
-        if step.op_name == "sum":
+        if step.op_name in AXIS_REDUCTION_FOLDS:
             add_node(
                 step.result_id,
                 _node_payload(
-                    "sum",
+                    step.op_name,
                     parents=tuple(
                         (value_id, "operand") for value_id in step.input_ids
                     ),
+                    attributes=copy.deepcopy(dict(step.attrs)),
+                    meta=metadata.get(step.result_id),
+                ),
+            )
+            continue
+        if step.op_name in {"reshape", "broadcast_to"}:
+            add_node(
+                step.result_id,
+                _node_payload(
+                    step.op_name,
+                    parents=tuple(
+                        (value_id, "operand") for value_id in step.input_ids
+                    ),
+                    attributes=copy.deepcopy(dict(step.attrs)),
+                    meta=metadata.get(step.result_id),
+                ),
+            )
+            continue
+        if step.op_name == "where":
+            if len(step.input_ids) != 3:
+                raise ValueError(
+                    f"where step {step.step_id} needs condition, true, and false inputs"
+                )
+            add_node(
+                step.result_id,
+                _node_payload(
+                    "where",
+                    parents=tuple(zip(
+                        step.input_ids, ("condition", "true", "false")
+                    )),
                     attributes=copy.deepcopy(dict(step.attrs)),
                     meta=metadata.get(step.result_id),
                 ),
@@ -1033,10 +1101,23 @@ def plan_process_graph_dispatches(
         raise ValueError(
             "fusion planning requires loop structure to be normalized first"
         )
+    def has_only_numeric_constant_operands(node_id: int) -> bool:
+        for parent_id, _role in graph.G.nodes[node_id].get("parents") or ():
+            if _operation(graph, int(parent_id)) != "const":
+                continue
+            try:
+                flatten_tensor_constant(
+                    graph.G.nodes[int(parent_id)].get("constant")
+                )
+            except (TypeError, ValueError):
+                return False
+        return True
+
     fusible = {
         node_id
         for node_id in graph.G
         if _operation(graph, node_id) in profile.fusible_ops
+        and has_only_numeric_constant_operands(int(node_id))
     }
     induced = graph.G.subgraph(fusible)
     components = list(nx.weakly_connected_components(induced))
@@ -1169,9 +1250,35 @@ def dispatch_region_to_fused_program(
     for node_id in region.node_ids:
         data = graph.G.nodes[node_id]
         raw_op = _operation(graph, node_id)
-        reduction = raw_op == "sum"
-        op = raw_op if reduction else canonical_elementwise_op(raw_op)[0]
         parents = list(data.get("parents") or ())
+        # ``max``/``min`` name both Python's binary scalar operations and
+        # tensor axis reductions.  Arity disambiguates them at this semantic
+        # boundary: a reduction consumes one tensor; a two-parent node is the
+        # ordinary elementwise binary operation and may legitimately carry a
+        # scalar constant operand (for example ``max(speed, 1e-30)`` in the
+        # managed-dt controller).
+        reduction = raw_op in AXIS_REDUCTION_FOLDS and len(parents) == 1
+        # The builder is a faithful transcriber, not a translator: an op that is
+        # neither a fused-elementwise op nor an axis reduction (a reshape/view/
+        # cast/native kernel) is emitted under its own name with its operands
+        # and attributes intact, exactly as reductions are. Its *semantics* --
+        # a reshape being a view, say -- are the SSA-stage translator's job, not
+        # this adapter's. Only genuine elementwise ops are canonicalized (and
+        # only they carry the right_scalar operand form).
+        if reduction:
+            elementwise = False
+            op = raw_op
+        elif raw_op in {"min", "max"} and len(parents) == 2:
+            elementwise = True
+            op = {"min": "minimum", "max": "maximum"}[raw_op]
+        else:
+            try:
+                op = canonical_elementwise_op(raw_op)[0]
+                elementwise = True
+            except KeyError:
+                op = raw_op
+                elementwise = False
+        structural = not reduction and not elementwise
         value_parents: list[int] = []
         scalar_parent: tuple[int, Any] | None = None
         for parent_id, _role in parents:
@@ -1179,7 +1286,11 @@ def dispatch_region_to_fused_program(
             if _operation(graph, parent_id) == "const":
                 constant = parent_data.get("constant")
                 scalar = uniform_tensor_constant(constant)
-                if scalar is not None:
+                # A non-elementwise op has no right_scalar operand slot; keep
+                # every constant parent as a plain constant input so the op's
+                # arguments (a reshape's target extent, a pad's width) survive
+                # verbatim for the translator to interpret.
+                if scalar is not None and not structural:
                     if scalar_parent is not None:
                         # FusedProgram represents a binary scalar operand in
                         # right_scalar, so two constant operands cannot both
@@ -1201,16 +1312,26 @@ def dispatch_region_to_fused_program(
                 value_parents.append(parent_id)
         attrs: dict[str, Any] = (
             copy.deepcopy(dict(data.get("attributes") or {}))
-            if reduction else {}
+            if reduction or structural else {}
         )
         if scalar_parent is not None:
             if reduction:
-                raise ValueError("sum cannot consume a scalar constant operand")
-            if len(value_parents) != 1:
+                raise ValueError(f"{op} cannot consume a scalar constant operand")
+            if len(value_parents) == 0:
+                # A unary op whose only operand is a constant (log(const)) has a
+                # tensor value operand, not the right-hand scalar of a binary
+                # a-OP-scalar form. Keep the constant as an ordinary tensor
+                # constant input rather than forcing it into the scalar slot.
+                append_tensor_constant(
+                    scalar_parent[0], graph.G.nodes[scalar_parent[0]]
+                )
+                value_parents.append(scalar_parent[0])
+            elif len(value_parents) != 1:
                 raise ValueError(f"{op} has an invalid scalar operand layout")
-            attrs["right_scalar"] = scalar_parent[1]
-            if parents[0][0] == scalar_parent[0]:
-                attrs["reverse"] = True
+            else:
+                attrs["right_scalar"] = scalar_parent[1]
+                if parents[0][0] == scalar_parent[0]:
+                    attrs["reverse"] = True
         steps.append(
             OpStep(
                 step_id=len(steps),

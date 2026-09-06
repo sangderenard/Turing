@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Tuple, Iterable, Mapping
+from typing import Callable, Optional, Tuple, Iterable, Mapping
 import ctypes
 import numpy as np
 
@@ -12,18 +12,21 @@ from OpenGL.GL import (
     glCreateShader, glShaderSource, glCompileShader, glGetShaderiv, glGetShaderInfoLog,
     glCreateProgram, glAttachShader, glLinkProgram, glGetProgramiv, glGetProgramInfoLog,
     glDeleteShader, glDeleteProgram, glUseProgram,
-    glGenVertexArrays, glBindVertexArray,
-    glGenBuffers, glBindBuffer, glBufferData, glBufferSubData,
-    glEnableVertexAttribArray, glVertexAttribPointer,
-    glGetUniformLocation, glGetAttribLocation, glUniformMatrix4fv, glUniform1f, glUniform4fv,
+    glGenVertexArrays, glBindVertexArray, glDeleteVertexArrays,
+    glGenBuffers, glBindBuffer, glBufferData, glBufferSubData, glDeleteBuffers,
+    glEnableVertexAttribArray, glVertexAttribPointer, glVertexAttribIPointer,
+    glGetUniformLocation, glGetAttribLocation, glUniformMatrix4fv, glUniform1f, glUniform1i, glUniform4fv,
     glDrawArrays, glDrawElements, glPolygonMode, glLineWidth,
+    glGenTextures, glBindTexture, glTexBuffer, glDeleteTextures, glActiveTexture,
     glEnable, glDisable, glBlendFunc, glDepthMask, glCullFace, glViewport, glClearColor, glClear,
     glWindowPos2f, glDrawPixels, glPixelStorei, glReadPixels, glGetError,
     GL_COMPILE_STATUS, GL_LINK_STATUS,
     GL_VERTEX_SHADER, GL_FRAGMENT_SHADER,
     GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER, GL_DYNAMIC_DRAW, GL_STATIC_DRAW,
-    GL_FLOAT, GL_FALSE, GL_TRIANGLES, GL_LINES, GL_POINTS,
+    GL_FLOAT, GL_FALSE, GL_TRIANGLES, GL_LINES, GL_POINTS, GL_INT,
+    GL_TEXTURE_BUFFER, GL_TEXTURE0, GL_RGB32F,
     GL_DEPTH_TEST, GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_PROGRAM_POINT_SIZE,
+    GL_POINT_SPRITE, GL_POINT_SMOOTH,
     GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_CULL_FACE, GL_BACK,
     GL_UNPACK_ALIGNMENT, GL_RGBA, GL_UNSIGNED_BYTE
 )
@@ -79,9 +82,10 @@ MESH_FS = """
 in vec4 vColor;
 out vec4 FragColor;
 uniform vec4 uMeshColor;     // used if no per-vertex color bound
+uniform int uHasColor;
 uniform float uAlpha;        // overall alpha multiplier
 void main(){
-    vec4 base = (vColor.a > 0.0) ? vColor : uMeshColor;
+    vec4 base = (uHasColor != 0) ? vColor : uMeshColor;
     FragColor = vec4(base.rgb, clamp(base.a, 0.0, 1.0) * uAlpha);
 }
 """
@@ -90,10 +94,16 @@ LINE_VS = """
 #version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec4 aColor;
+layout(location=2) in float aActive;
 uniform mat4 uMVP;
+uniform float uPulse;
 out vec4 vColor;
 void main(){
-    vColor = aColor;
+    float activation = clamp(aActive * uPulse, 0.0, 1.0);
+    vColor = vec4(
+        mix(aColor.rgb, vec3(1.0), activation),
+        mix(aColor.a, 1.0, activation)
+    );
     gl_Position = uMVP * vec4(aPos, 1.0);
 }
 """
@@ -114,12 +124,35 @@ POINT_VS = """
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec4 aColor;   // rgba; use .a as per-point alpha
 layout(location=2) in float aSize;   // pixel size
+layout(location=3) in float aActive;
 uniform mat4 uMVP;
+uniform float uPulse;
 out vec4 vColor;
 void main(){
-    vColor = aColor;
+    float activation = clamp(aActive * uPulse, 0.0, 1.0);
+    vColor = vec4(mix(aColor.rgb, vec3(1.0), activation), aColor.a);
     gl_Position = uMVP * vec4(aPos, 1.0);
-    gl_PointSize = aSize;
+    gl_PointSize = aSize + 5.0 * activation;
+}
+"""
+
+INDEXED_LINE_VS = """
+#version 330 core
+layout(location=0) in int aNodeIndex;
+layout(location=1) in vec4 aColor;
+layout(location=2) in float aActive;
+uniform samplerBuffer uPositions;
+uniform mat4 uMVP;
+uniform float uPulse;
+out vec4 vColor;
+void main(){
+    float activation = clamp(aActive * uPulse, 0.0, 1.0);
+    vColor = vec4(
+        mix(aColor.rgb, vec3(1.0), activation),
+        mix(aColor.a, 1.0, activation)
+    );
+    vec3 position = texelFetch(uPositions, aNodeIndex).xyz;
+    gl_Position = uMVP * vec4(position, 1.0);
 }
 """
 
@@ -155,6 +188,10 @@ class LineLayer:
     colors:    Optional[np.ndarray] = None   # (Nl, 4) rgba
     width:     float = 2.0
     alpha:     float = 1.0
+    active:    Optional[np.ndarray] = None
+    pulse:     float = 0.0
+    topology_revision: int = -1
+    activation_revision: object = None
 
 @dataclass
 class PointLayer:
@@ -163,6 +200,31 @@ class PointLayer:
     sizes_px:  Optional[np.ndarray] = None   # (Np,) float32
     size_px_default: float = 6.0
     alpha: float = 1.0
+    active: Optional[np.ndarray] = None
+    pulse: float = 0.0
+    topology_revision: int = -1
+    activation_revision: object = None
+
+
+@dataclass
+class CudaGraphLayer:
+    """One leased CUDA position page plus immutable topology presentation."""
+
+    positions: object
+    node_count: int
+    edge_indices: np.ndarray
+    node_colors: np.ndarray
+    node_sizes: np.ndarray
+    edge_colors: np.ndarray
+    node_active: np.ndarray
+    edge_active: np.ndarray
+    pulse: float = 0.0
+    width: float = 1.5
+    topology_revision: int = -1
+    activation_revision: object = None
+    camera_center: Optional[np.ndarray] = None
+    camera_radius: float = 8.0
+    release: Optional[Callable[[], None]] = None
     
 
 # ---------------------------
@@ -230,6 +292,22 @@ class DebugRenderer:
 # Core renderer
 # ---------------------------
 
+@dataclass(frozen=True)
+class RendererHost:
+    """Services for an already-current GL context, owned by the caller.
+
+    ``present`` returns after the host accepts presentation, or raises on
+    failure. An asynchronous host must wait for its completion here. This is
+    not a guarantee of physical scanout. The caller owns events and teardown.
+    ``ticks_ms`` supplies elapsed milliseconds for shader animation/capture.
+    """
+
+    present: Callable[[], None]
+    ticks_ms: Callable[[], float]
+    draw_overlay: Optional[Callable[[tuple[str, ...], Tuple[int, int]], None]] = None
+    compatibility_point_sprites: bool = False
+
+
 class GLRenderer:
     """A minimal scene graph: Mesh → Lines → Points (draw order)."""
 
@@ -239,6 +317,7 @@ class GLRenderer:
         *,
         size: Tuple[int, int] = (640, 480),
         point_shader_sources: tuple[str, str] | None = None,
+        host: RendererHost | None = None,
     ):
         """Create a renderer and its backing window.
 
@@ -251,26 +330,37 @@ class GLRenderer:
             ``(width, height)`` of the window in pixels.  A new ``pygame``
             window is created on construction which also establishes the OpenGL
             context used for subsequent draw calls.
+        host:
+            Services for a caller-owned, current GL context. When provided,
+            construction creates no window and rendering never imports Pygame.
+            Text overlays require the host's explicit overlay implementation.
         """
 
-        # Create an OpenGL context for this renderer (pygame based).
-        import pygame
-        from pygame.locals import DOUBLEBUF, OPENGL
+        if host is None:
+            # Legacy convenience host; external contexts never import Pygame.
+            import pygame
+            from pygame.locals import DOUBLEBUF, OPENGL
 
-        pygame.init()
-        flags = DOUBLEBUF | OPENGL
-        try:  # pragma: no cover - best effort for headless environments
-            pygame.display.set_mode(size, flags)
-        except Exception:  # noqa: BLE001
-            # Fall back to dummy driver so tests can run headless.
-            import os
-            os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-            pygame.display.set_mode(size, flags)
+            pygame.init()
+            flags = DOUBLEBUF | OPENGL
+            try:  # pragma: no cover - best effort for headless environments
+                pygame.display.set_mode(size, flags)
+            except Exception:  # noqa: BLE001
+                import os
+                os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+                pygame.display.set_mode(size, flags)
+            host = RendererHost(
+                pygame.display.flip, pygame.time.get_ticks,
+                lambda lines, viewport: self._draw_pygame_overlay(),
+                compatibility_point_sprites=True,
+            )
+        self._host = host
         self._window_size = size
 
         # programs
         self.prog_mesh = _link_program(MESH_VS,  MESH_FS)
         self.prog_line = _link_program(LINE_VS,  LINE_FS)
+        self.prog_indexed_line = _link_program(INDEXED_LINE_VS, LINE_FS)
         self._point_shader_sources = point_shader_sources
         point_vertex, point_fragment = point_shader_sources or (POINT_VS, POINT_FS)
         self.prog_point = _link_program(point_vertex, point_fragment)
@@ -281,13 +371,21 @@ class GLRenderer:
         # VAOs/VBOs per layer instance
         self._mesh = None
         self._line = None
+        self._indexed_line = None
         self._point = None
+        self._cuda_position_resource = None
 
         # GL global state
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glEnable(GL_PROGRAM_POINT_SIZE)
+        # The Windows compatibility contexts created by pygame require these
+        # two enables before shader point sprites become rasterized at all.
+        # Without them draw calls succeed with GL_NO_ERROR but emit no pixels.
+        if self._host.compatibility_point_sprites:
+            glEnable(GL_POINT_SPRITE)
+            glEnable(GL_POINT_SMOOTH)
         glCullFace(GL_BACK)
 
         self._overlay_lines: list[str] = []
@@ -297,42 +395,77 @@ class GLRenderer:
         self._capture_after_ms = int(os.environ.get(
             "TURING_GL_CAPTURE_AFTER_MS", "4000"
         ))
+        self.buffer_growth_allocations = 0
+        self.buffer_updates = 0
+
+    @staticmethod
+    def _next_buffer_capacity(required: int, current: int = 0) -> int:
+        """Return a geometric byte capacity suitable for a persistent VBO."""
+
+        capacity = max(256, int(current))
+        while capacity < int(required):
+            capacity *= 2
+        return capacity
+
+    def _upload_persistent(
+        self,
+        state: dict,
+        *,
+        buffer_key: str,
+        capacity_key: str,
+        target: int,
+        data: np.ndarray,
+        usage: int = GL_DYNAMIC_DRAW,
+    ) -> None:
+        """Update one resident GL buffer, growing it only when necessary."""
+
+        contiguous = np.ascontiguousarray(data)
+        required = int(contiguous.nbytes)
+        glBindBuffer(target, state[buffer_key])
+        capacity = int(state.get(capacity_key, 0))
+        if required > capacity:
+            capacity = self._next_buffer_capacity(required, capacity)
+            glBufferData(target, capacity, None, usage)
+            state[capacity_key] = capacity
+            self.buffer_growth_allocations += 1
+        elif capacity == 0:
+            capacity = self._next_buffer_capacity(required)
+            glBufferData(target, capacity, None, usage)
+            state[capacity_key] = capacity
+            self.buffer_growth_allocations += 1
+        if required:
+            glBufferSubData(target, 0, required, contiguous)
+            self.buffer_updates += 1
 
     # ---- Mesh API ----
     def set_mesh(self, layer: MeshLayer):
-        # build VAO / VBO / EBO
-        vao = glGenVertexArrays(1); glBindVertexArray(vao)
-
-        vbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, vbo)
-        pos = layer.positions.astype(np.float32, copy=False)
-        nrm = (layer.normals.astype(np.float32, copy=False) if layer.normals is not None else None)
-        clr = (layer.colors.astype(np.float32, copy=False)  if layer.colors  is not None else None)
-
-        # pack attributes as tightly-separated buffers (simpler updates)
-        glBufferData(GL_ARRAY_BUFFER, pos.nbytes, pos, GL_DYNAMIC_DRAW)
-        glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
-
-        nbo = None
-        if nrm is not None:
-            nbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, nbo)
-            glBufferData(GL_ARRAY_BUFFER, nrm.nbytes, nrm, GL_DYNAMIC_DRAW)
-            glEnableVertexAttribArray(1); glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
-
-        cbo = None
-        if clr is not None:
-            cbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, cbo)
-            glBufferData(GL_ARRAY_BUFFER, clr.nbytes, clr, GL_DYNAMIC_DRAW)
-            glEnableVertexAttribArray(2); glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(0))
-
-        ebo = glGenBuffers(1); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo)
-        idx = layer.indices.astype(np.uint32, copy=False).ravel()
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.nbytes, idx, GL_STATIC_DRAW)
-
+        pos = np.ascontiguousarray(layer.positions, dtype=np.float32)
+        nrm = (np.zeros_like(pos) if layer.normals is None else
+               np.ascontiguousarray(layer.normals, dtype=np.float32))
+        clr = (np.zeros((len(pos), 4), dtype=np.float32) if layer.colors is None else
+               np.ascontiguousarray(layer.colors, dtype=np.float32))
+        idx = np.ascontiguousarray(layer.indices, dtype=np.uint32).ravel()
+        if self._mesh is None:
+            vao = glGenVertexArrays(1)
+            vbo, nbo, cbo, ebo = glGenBuffers(4)
+            self._mesh = dict(vao=vao, vbo=vbo, nbo=nbo, cbo=cbo, ebo=ebo)
+            glBindVertexArray(vao)
+            for attribute, buffer, components in ((0, vbo, 3), (1, nbo, 3), (2, cbo, 4)):
+                glBindBuffer(GL_ARRAY_BUFFER, buffer)
+                glEnableVertexAttribArray(attribute)
+                glVertexAttribPointer(attribute, components, GL_FLOAT, GL_FALSE,
+                                      components * 4, ctypes.c_void_p(0))
+        else:
+            glBindVertexArray(self._mesh["vao"])
+        for key, data, target in (
+            ("vbo", pos, GL_ARRAY_BUFFER), ("nbo", nrm, GL_ARRAY_BUFFER),
+            ("cbo", clr, GL_ARRAY_BUFFER), ("ebo", idx, GL_ELEMENT_ARRAY_BUFFER),
+        ):
+            self._upload_persistent(self._mesh, buffer_key=key,
+                                    capacity_key=key + "_capacity", target=target, data=data)
         glBindVertexArray(0)
-        self._mesh = dict(vao=vao, vbo=vbo, nbo=nbo, cbo=cbo, ebo=ebo,
-                          count=idx.size,
-                          rgba=np.array(layer.rgba, np.float32),
-                          alpha=float(layer.alpha))
+        self._mesh.update(count=idx.size, rgba=np.array(layer.rgba, np.float32),
+                          alpha=float(layer.alpha), has_colors=layer.colors is not None)
 
     def update_mesh_positions(self, positions: np.ndarray):
         if not self._mesh: return
@@ -342,35 +475,226 @@ class GLRenderer:
 
     # ---- Line API ----
     def set_lines(self, layer: LineLayer):
-        vao = glGenVertexArrays(1); glBindVertexArray(vao)
-
-        # positions
-        vbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, vbo)
-        pos = layer.positions.astype(np.float32, copy=False)
-        glBufferData(GL_ARRAY_BUFFER, pos.nbytes, pos, GL_DYNAMIC_DRAW)
-        glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
-
-        # colors
-        cbo = None
-        if layer.colors is not None:
-            cbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, cbo)
-            col = layer.colors.astype(np.float32, copy=False)
-            glBufferData(GL_ARRAY_BUFFER, col.nbytes, col, GL_DYNAMIC_DRAW)
-            glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(0))
-
-        glBindVertexArray(0)
-        self._line = dict(vao=vao, vbo=vbo, cbo=cbo, count=pos.shape[0], width=float(layer.width), alpha=float(layer.alpha))
+        pos = np.ascontiguousarray(layer.positions, dtype=np.float32)
+        col = (
+            np.zeros((pos.shape[0], 4), dtype=np.float32)
+            if layer.colors is None
+            else np.ascontiguousarray(layer.colors, dtype=np.float32)
+        )
+        active = (
+            np.zeros(pos.shape[0], dtype=np.float32)
+            if layer.active is None
+            else np.ascontiguousarray(layer.active, dtype=np.float32).reshape(-1)
+        )
+        if self._line is None:
+            vao = glGenVertexArrays(1)
+            vbo = glGenBuffers(1)
+            cbo = glGenBuffers(1)
+            abo = glGenBuffers(1)
+            self._line = dict(
+                vao=vao, vbo=vbo, cbo=cbo, abo=abo,
+                vbo_capacity=0, cbo_capacity=0, abo_capacity=0,
+                count=0, width=float(layer.width), alpha=float(layer.alpha),
+                topology_revision=None, activation_revision=None, pulse=0.0,
+            )
+            glBindVertexArray(vao)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo)
+            glEnableVertexAttribArray(0)
+            glVertexAttribPointer(
+                0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0)
+            )
+            glBindBuffer(GL_ARRAY_BUFFER, cbo)
+            glEnableVertexAttribArray(1)
+            glVertexAttribPointer(
+                1, 4, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(0)
+            )
+            glBindBuffer(GL_ARRAY_BUFFER, abo)
+            glEnableVertexAttribArray(2)
+            glVertexAttribPointer(
+                2, 1, GL_FLOAT, GL_FALSE, 4, ctypes.c_void_p(0)
+            )
+            glBindVertexArray(0)
+        self._upload_persistent(
+            self._line,
+            buffer_key="vbo",
+            capacity_key="vbo_capacity",
+            target=GL_ARRAY_BUFFER,
+            data=pos,
+        )
+        topology_revision = int(getattr(layer, "topology_revision", -1))
+        if (
+            topology_revision < 0
+            or self._line.get("topology_revision") != topology_revision
+        ):
+            self._upload_persistent(
+                self._line,
+                buffer_key="cbo",
+                capacity_key="cbo_capacity",
+                target=GL_ARRAY_BUFFER,
+                data=col,
+            )
+            self._line["topology_revision"] = topology_revision
+        activation_revision = getattr(layer, "activation_revision", None)
+        if (
+            activation_revision is None
+            or self._line.get("activation_revision") != activation_revision
+        ):
+            self._upload_persistent(
+                self._line,
+                buffer_key="abo",
+                capacity_key="abo_capacity",
+                target=GL_ARRAY_BUFFER,
+                data=active,
+            )
+            self._line["activation_revision"] = activation_revision
+        self._line["count"] = pos.shape[0]
+        self._line["width"] = float(layer.width)
+        self._line["alpha"] = float(layer.alpha)
+        self._line["pulse"] = float(getattr(layer, "pulse", 0.0))
 
     def update_lines(self, positions: np.ndarray):
         if not self._line: return
-        glBindBuffer(GL_ARRAY_BUFFER, self._line["vbo"])
-        data = positions.astype(np.float32, copy=False)
-        glBufferSubData(GL_ARRAY_BUFFER, 0, data.nbytes, data)
+        self._upload_persistent(
+            self._line,
+            buffer_key="vbo",
+            capacity_key="vbo_capacity",
+            target=GL_ARRAY_BUFFER,
+            data=np.ascontiguousarray(positions, dtype=np.float32),
+        )
+
+    def set_cuda_graph(self, layer: CudaGraphLayer) -> None:
+        """Present resident CUDA positions without constructing edge geometry."""
+
+        from ..cuda_gl_interop import CudaGLBuffer
+
+        tensor = layer.positions
+        if not getattr(tensor, "is_cuda", False):
+            raise TypeError("CudaGraphLayer.positions must be CUDA resident")
+        if getattr(tensor, "dtype", None) != __import__("torch").float32:
+            raise TypeError("CudaGraphLayer.positions must be float32")
+        if not tensor.is_contiguous():
+            raise ValueError("CudaGraphLayer.positions must be contiguous")
+        node_count = int(layer.node_count)
+        required = node_count * 3 * 4
+
+        if self._point is None:
+            vao = glGenVertexArrays(1)
+            vbo, cbo, sbo, abo = glGenBuffers(4)
+            self._point = dict(
+                mode="split", vao=vao, vbo=vbo, cbo=cbo, sbo=sbo, abo=abo,
+                vbo_capacity=0, cbo_capacity=0, sbo_capacity=0, abo_capacity=0,
+                count=0, alpha=1.0, fluxspring=False,
+                topology_revision=None, activation_revision=None, pulse=0.0,
+            )
+            glBindVertexArray(vao)
+            for location, buffer, count, stride in (
+                (0, vbo, 3, 12), (1, cbo, 4, 16),
+                (2, sbo, 1, 4), (3, abo, 1, 4),
+            ):
+                glBindBuffer(GL_ARRAY_BUFFER, buffer)
+                glEnableVertexAttribArray(location)
+                glVertexAttribPointer(
+                    location, count, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0)
+                )
+            glBindVertexArray(0)
+        elif self._point.get("mode") != "split":
+            raise RuntimeError("CUDA graph cannot share the particles point ABI")
+
+        capacity = int(self._point.get("vbo_capacity", 0))
+        if required > capacity or capacity == 0:
+            if self._cuda_position_resource is not None:
+                self._cuda_position_resource.close()
+                self._cuda_position_resource = None
+            capacity = self._next_buffer_capacity(required, capacity)
+            glBindBuffer(GL_ARRAY_BUFFER, self._point["vbo"])
+            glBufferData(GL_ARRAY_BUFFER, capacity, None, GL_DYNAMIC_DRAW)
+            self._point["vbo_capacity"] = capacity
+            self.buffer_growth_allocations += 1
+        if self._cuda_position_resource is None:
+            device_index = int(getattr(tensor.device, "index", 0) or 0)
+            self._cuda_position_resource = CudaGLBuffer(
+                self._point["vbo"], device_index=device_index
+            )
+        if required:
+            self._cuda_position_resource.copy_from_tensor(tensor, required)
+
+        topology_revision = int(layer.topology_revision)
+        if self._point.get("topology_revision") != topology_revision:
+            self._upload_persistent(
+                self._point, buffer_key="cbo", capacity_key="cbo_capacity",
+                target=GL_ARRAY_BUFFER,
+                data=np.ascontiguousarray(layer.node_colors, dtype=np.float32),
+            )
+            self._upload_persistent(
+                self._point, buffer_key="sbo", capacity_key="sbo_capacity",
+                target=GL_ARRAY_BUFFER,
+                data=np.ascontiguousarray(layer.node_sizes, dtype=np.float32),
+            )
+            self._point["topology_revision"] = topology_revision
+        if self._point.get("activation_revision") != layer.activation_revision:
+            self._upload_persistent(
+                self._point, buffer_key="abo", capacity_key="abo_capacity",
+                target=GL_ARRAY_BUFFER,
+                data=np.ascontiguousarray(layer.node_active, dtype=np.float32),
+            )
+            self._point["activation_revision"] = layer.activation_revision
+        self._point["count"] = node_count
+        self._point["pulse"] = float(layer.pulse)
+
+        if self._indexed_line is None:
+            vao = glGenVertexArrays(1)
+            ibo, cbo, abo = glGenBuffers(3)
+            texture = glGenTextures(1)
+            self._indexed_line = dict(
+                vao=vao, ibo=ibo, cbo=cbo, abo=abo, texture=texture,
+                ibo_capacity=0, cbo_capacity=0, abo_capacity=0,
+                count=0, width=1.5, alpha=1.0, pulse=0.0,
+                topology_revision=None, activation_revision=None,
+            )
+            glBindVertexArray(vao)
+            glBindBuffer(GL_ARRAY_BUFFER, ibo)
+            glEnableVertexAttribArray(0)
+            glVertexAttribIPointer(0, 1, GL_INT, 4, ctypes.c_void_p(0))
+            for location, buffer, count, stride in (
+                (1, cbo, 4, 16), (2, abo, 1, 4),
+            ):
+                glBindBuffer(GL_ARRAY_BUFFER, buffer)
+                glEnableVertexAttribArray(location)
+                glVertexAttribPointer(
+                    location, count, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0)
+                )
+            glBindVertexArray(0)
+            glBindTexture(GL_TEXTURE_BUFFER, texture)
+            glTexBuffer(GL_TEXTURE_BUFFER, GL_RGB32F, self._point["vbo"])
+            glBindTexture(GL_TEXTURE_BUFFER, 0)
+
+        if self._indexed_line.get("topology_revision") != topology_revision:
+            endpoints = np.ascontiguousarray(
+                layer.edge_indices, dtype=np.int32
+            ).reshape(-1)
+            self._upload_persistent(
+                self._indexed_line, buffer_key="ibo", capacity_key="ibo_capacity",
+                target=GL_ARRAY_BUFFER, data=endpoints,
+            )
+            self._upload_persistent(
+                self._indexed_line, buffer_key="cbo", capacity_key="cbo_capacity",
+                target=GL_ARRAY_BUFFER,
+                data=np.ascontiguousarray(layer.edge_colors, dtype=np.float32),
+            )
+            self._indexed_line["topology_revision"] = topology_revision
+            self._indexed_line["count"] = int(endpoints.size)
+        if self._indexed_line.get("activation_revision") != layer.activation_revision:
+            self._upload_persistent(
+                self._indexed_line, buffer_key="abo", capacity_key="abo_capacity",
+                target=GL_ARRAY_BUFFER,
+                data=np.ascontiguousarray(layer.edge_active, dtype=np.float32),
+            )
+            self._indexed_line["activation_revision"] = layer.activation_revision
+        self._indexed_line["width"] = float(layer.width)
+        self._indexed_line["pulse"] = float(layer.pulse)
 
     # ---- Point API ----
     def set_points(self, layer: PointLayer):
-        vao = glGenVertexArrays(1); glBindVertexArray(vao)
-
         # The older particles surface uses a nine-float interleaved ABI. Keep
         # supporting it for callers that explicitly supply that shader, while
         # FluxSpring's real LiveViz shader follows the ordinary position/color/
@@ -387,7 +711,7 @@ class GLRenderer:
             and "in float in_size" in self._point_shader_sources[0]
         )
         if particles_abi:
-            pos = layer.positions.astype(np.float32, copy=False)
+            pos = np.ascontiguousarray(layer.positions, dtype=np.float32)
             col = (
                 np.ones((pos.shape[0], 4), np.float32)
                 if layer.colors is None
@@ -407,39 +731,43 @@ class GLRenderer:
                 size / 20.0,
                 np.zeros((pos.shape[0],), dtype=np.float32),
             )).astype(np.float32, copy=False)
-            vbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, vbo)
-            glBufferData(GL_ARRAY_BUFFER, interleaved.nbytes, interleaved, GL_DYNAMIC_DRAW)
-            stride = 9 * 4
-            for name, count, offset in (
-                ("in_position", 3, 0),
-                ("in_color", 3, 3 * 4),
-                ("in_alpha", 1, 6 * 4),
-                ("in_radius", 1, 7 * 4),
-                ("in_ke", 1, 8 * 4),
-            ):
-                location = glGetAttribLocation(self.prog_point, name)
-                glEnableVertexAttribArray(location)
-                glVertexAttribPointer(
-                    location, count, GL_FLOAT, GL_FALSE, stride,
-                    ctypes.c_void_p(offset),
+            if self._point is None:
+                vao = glGenVertexArrays(1)
+                vbo = glGenBuffers(1)
+                self._point = dict(
+                    mode="particles", vao=vao, vbo=vbo, cbo=None, sbo=None,
+                    vbo_capacity=0, count=0, alpha=float(layer.alpha),
+                    fluxspring=False,
                 )
-            glBindVertexArray(0)
-            self._point = dict(
-                vao=vao,
-                vbo=vbo,
-                cbo=None,
-                sbo=None,
-                count=pos.shape[0],
-                alpha=float(layer.alpha),
-                fluxspring=True,
+                glBindVertexArray(vao)
+                glBindBuffer(GL_ARRAY_BUFFER, vbo)
+                stride = 9 * 4
+                for name, count, offset in (
+                    ("in_position", 3, 0),
+                    ("in_color", 3, 3 * 4),
+                    ("in_alpha", 1, 6 * 4),
+                    ("in_radius", 1, 7 * 4),
+                    ("in_ke", 1, 8 * 4),
+                ):
+                    location = glGetAttribLocation(self.prog_point, name)
+                    glEnableVertexAttribArray(location)
+                    glVertexAttribPointer(
+                        location, count, GL_FLOAT, GL_FALSE, stride,
+                        ctypes.c_void_p(offset),
+                    )
+                glBindVertexArray(0)
+            self._upload_persistent(
+                self._point,
+                buffer_key="vbo",
+                capacity_key="vbo_capacity",
+                target=GL_ARRAY_BUFFER,
+                data=interleaved,
             )
+            self._point["count"] = pos.shape[0]
+            self._point["alpha"] = float(layer.alpha)
             return
 
-        # positions
-        vbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, vbo)
-        pos = layer.positions.astype(np.float32, copy=False)
-        glBufferData(GL_ARRAY_BUFFER, pos.nbytes, pos, GL_DYNAMIC_DRAW)
-        glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
+        pos = np.ascontiguousarray(layer.positions, dtype=np.float32)
 
         # colors
         # Falling back to all-zero RGBA keeps points fully transparent when a
@@ -452,57 +780,139 @@ class GLRenderer:
             # generic renderer's RGBA attribute. This distinction is visible
             # on drivers that enforce the shader's vec3 declaration strictly.
             col = np.ascontiguousarray(col[:, :3], dtype=np.float32)
-        cbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, cbo)
-        glBufferData(GL_ARRAY_BUFFER, col.nbytes, col, GL_DYNAMIC_DRAW)
         color_components = 3 if fluxspring_abi else 4
         color_stride = color_components * 4
-        glEnableVertexAttribArray(1); glVertexAttribPointer(1, color_components, GL_FLOAT, GL_FALSE, color_stride, ctypes.c_void_p(0))
 
         # sizes
         size = (np.full((pos.shape[0],), layer.size_px_default, np.float32) if layer.sizes_px is None
-                else layer.sizes_px.astype(np.float32, copy=False))
-        sbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, sbo)
-        glBufferData(GL_ARRAY_BUFFER, size.nbytes, size, GL_DYNAMIC_DRAW)
-        glEnableVertexAttribArray(2); glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 4, ctypes.c_void_p(0))
-
-        glBindVertexArray(0)
-        self._point = dict(
-            vao=vao,
-            vbo=vbo,
-            cbo=cbo,
-            sbo=sbo,
-            count=pos.shape[0],
-            alpha=float(layer.alpha),
-            fluxspring=self._point_shader_sources is not None,
-            size_min=float(size.min()) if size.size else 0.0,
-            size_max=float(size.max()) if size.size else 0.0,
+                else np.ascontiguousarray(layer.sizes_px, dtype=np.float32))
+        supports_pulse = self._point_shader_sources is None
+        active = (
+            np.zeros(pos.shape[0], dtype=np.float32)
+            if layer.active is None
+            else np.ascontiguousarray(layer.active, dtype=np.float32).reshape(-1)
         )
+        if self._point is None:
+            vao = glGenVertexArrays(1)
+            if supports_pulse:
+                vbo, cbo, sbo, abo = glGenBuffers(4)
+            else:
+                vbo, cbo, sbo = glGenBuffers(3)
+                abo = None
+            self._point = dict(
+                mode="split", vao=vao, vbo=vbo, cbo=cbo, sbo=sbo, abo=abo,
+                vbo_capacity=0, cbo_capacity=0, sbo_capacity=0,
+                abo_capacity=0,
+                count=0, alpha=float(layer.alpha),
+                fluxspring=self._point_shader_sources is not None,
+                topology_revision=None, activation_revision=None, pulse=0.0,
+            )
+            glBindVertexArray(vao)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo)
+            glEnableVertexAttribArray(0)
+            glVertexAttribPointer(
+                0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0)
+            )
+            glBindBuffer(GL_ARRAY_BUFFER, cbo)
+            glEnableVertexAttribArray(1)
+            glVertexAttribPointer(
+                1, color_components, GL_FLOAT, GL_FALSE, color_stride,
+                ctypes.c_void_p(0),
+            )
+            glBindBuffer(GL_ARRAY_BUFFER, sbo)
+            glEnableVertexAttribArray(2)
+            glVertexAttribPointer(
+                2, 1, GL_FLOAT, GL_FALSE, 4, ctypes.c_void_p(0)
+            )
+            if supports_pulse:
+                glBindBuffer(GL_ARRAY_BUFFER, abo)
+                glEnableVertexAttribArray(3)
+                glVertexAttribPointer(
+                    3, 1, GL_FLOAT, GL_FALSE, 4, ctypes.c_void_p(0)
+                )
+            glBindVertexArray(0)
+        self._upload_persistent(
+            self._point,
+            buffer_key="vbo",
+            capacity_key="vbo_capacity",
+            target=GL_ARRAY_BUFFER,
+            data=pos,
+        )
+        topology_revision = int(getattr(layer, "topology_revision", -1))
+        if (
+            topology_revision < 0
+            or self._point.get("topology_revision") != topology_revision
+        ):
+            for buffer_key, capacity_key, data in (
+                ("cbo", "cbo_capacity", col),
+                ("sbo", "sbo_capacity", size),
+            ):
+                self._upload_persistent(
+                    self._point,
+                    buffer_key=buffer_key,
+                    capacity_key=capacity_key,
+                    target=GL_ARRAY_BUFFER,
+                    data=data,
+                )
+            self._point["topology_revision"] = topology_revision
+        activation_revision = getattr(layer, "activation_revision", None)
+        if supports_pulse and (
+            activation_revision is None
+            or self._point.get("activation_revision") != activation_revision
+        ):
+            self._upload_persistent(
+                self._point,
+                buffer_key="abo",
+                capacity_key="abo_capacity",
+                target=GL_ARRAY_BUFFER,
+                data=active,
+            )
+            self._point["activation_revision"] = activation_revision
+        self._point["count"] = pos.shape[0]
+        self._point["alpha"] = float(layer.alpha)
+        self._point["pulse"] = float(getattr(layer, "pulse", 0.0))
+        self._point["size_min"] = float(size.min()) if size.size else 0.0
+        self._point["size_max"] = float(size.max()) if size.size else 0.0
 
     def update_points(self, positions: Optional[np.ndarray] = None,
                       colors: Optional[np.ndarray] = None,
                       sizes_px: Optional[np.ndarray] = None):
         #if not self._point: return
         if positions is not None:
-            glBindBuffer(GL_ARRAY_BUFFER, self._point["vbo"])
-            data = positions.astype(np.float32, copy=False)
-            glBufferSubData(GL_ARRAY_BUFFER, 0, data.nbytes, data)
+            self._upload_persistent(
+                self._point,
+                buffer_key="vbo",
+                capacity_key="vbo_capacity",
+                target=GL_ARRAY_BUFFER,
+                data=np.ascontiguousarray(positions, dtype=np.float32),
+            )
         if colors is not None:
-            glBindBuffer(GL_ARRAY_BUFFER, self._point["cbo"])
-            col = colors.astype(np.float32, copy=False)
-            glBufferSubData(GL_ARRAY_BUFFER, 0, col.nbytes, col)
+            col = np.ascontiguousarray(colors, dtype=np.float32)
+            if self._point.get("fluxspring") and col.ndim == 2:
+                col = np.ascontiguousarray(col[:, :3], dtype=np.float32)
+            self._upload_persistent(
+                self._point,
+                buffer_key="cbo",
+                capacity_key="cbo_capacity",
+                target=GL_ARRAY_BUFFER,
+                data=col,
+            )
         if sizes_px is not None:
-            glBindBuffer(GL_ARRAY_BUFFER, self._point["sbo"])
-            s = sizes_px.astype(np.float32, copy=False)
-            glBufferSubData(GL_ARRAY_BUFFER, 0, s.nbytes, s)
+            self._upload_persistent(
+                self._point,
+                buffer_key="sbo",
+                capacity_key="sbo_capacity",
+                target=GL_ARRAY_BUFFER,
+                data=np.ascontiguousarray(sizes_px, dtype=np.float32),
+            )
 
     # ---- MVP / draw ----
     def set_mvp(self, mvp: np.ndarray):
         self.mvp = np.asarray(mvp, dtype=np.float32)
 
     def draw(self, viewport_px: Tuple[int,int]):
-        import pygame
-
         w, h = viewport_px
+        self._window_size = (int(w), int(h))
         glViewport(0, 0, int(w), int(h))
         glClearColor(0.08, 0.08, 0.1, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -515,18 +925,48 @@ class GLRenderer:
             uAlph = glGetUniformLocation(self.prog_mesh, "uAlpha")
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, self.mvp)
             glUniform4fv(uCol, 1, self._mesh["rgba"])
+            glUniform1i(glGetUniformLocation(self.prog_mesh, "uHasColor"),
+                        int(self._mesh["has_colors"]))
             glUniform1f(uAlph, self._mesh["alpha"])
             glBindVertexArray(self._mesh["vao"])
             glDrawElements(GL_TRIANGLES, self._mesh["count"], 0x1405, ctypes.c_void_p(0))  # GL_UNSIGNED_INT = 0x1405
             glBindVertexArray(0)
 
-        # 2) Lines (edges)
-        if self._line:
+        # 2) Lines (edges). CUDA graphs fetch endpoints from the shared
+        # resident point buffer, so neither edge expansion nor position upload
+        # occurs on the host.
+        if self._indexed_line:
+            glUseProgram(self.prog_indexed_line)
+            glUniformMatrix4fv(
+                glGetUniformLocation(self.prog_indexed_line, "uMVP"),
+                1, GL_FALSE, self.mvp,
+            )
+            glUniform1f(
+                glGetUniformLocation(self.prog_indexed_line, "uAlpha"),
+                self._indexed_line["alpha"],
+            )
+            glUniform1f(
+                glGetUniformLocation(self.prog_indexed_line, "uPulse"),
+                self._indexed_line.get("pulse", 0.0),
+            )
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_BUFFER, self._indexed_line["texture"])
+            glUniform1i(
+                glGetUniformLocation(self.prog_indexed_line, "uPositions"), 0
+            )
+            glLineWidth(max(1.0, self._indexed_line["width"]))
+            glBindVertexArray(self._indexed_line["vao"])
+            glDrawArrays(GL_LINES, 0, self._indexed_line["count"])
+            glBindVertexArray(0)
+            glBindTexture(GL_TEXTURE_BUFFER, 0)
+        elif self._line:
             glUseProgram(self.prog_line)
             uMVP  = glGetUniformLocation(self.prog_line, "uMVP")
             uAlph = glGetUniformLocation(self.prog_line, "uAlpha")
+            uPulse = glGetUniformLocation(self.prog_line, "uPulse")
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, self.mvp)
             glUniform1f(uAlph, self._line["alpha"])
+            glUniform1f(uPulse, self._line.get("pulse", 0.0))
             glLineWidth(max(1.0, self._line["width"]))
             glBindVertexArray(self._line["vao"])
             glDrawArrays(GL_LINES, 0, self._line["count"])
@@ -546,14 +986,17 @@ class GLRenderer:
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, self.mvp)
             if fluxspring:
                 uTime = glGetUniformLocation(self.prog_point, "u_time")
-                glUniform1f(uTime, float(pygame.time.get_ticks()))
+                glUniform1f(uTime, float(self._host.ticks_ms()))
+            elif self._point_shader_sources is None:
+                uPulse = glGetUniformLocation(self.prog_point, "uPulse")
+                glUniform1f(uPulse, self._point.get("pulse", 0.0))
             glBindVertexArray(self._point["vao"])
             glDrawArrays(GL_POINTS, 0, self._point["count"])
             glBindVertexArray(0)
 
         if (
             self._capture_path
-            and pygame.time.get_ticks() >= self._capture_after_ms
+            and self._host.ticks_ms() >= self._capture_after_ms
             and self._point
             and self._point["count"]
         ):
@@ -579,10 +1022,40 @@ class GLRenderer:
 
         glUseProgram(0)
         self._draw_overlay()
-        pygame.display.flip()
+        self._host.present()
     # ---- disposal ----
     def dispose(self):
-        for pid in (self.prog_mesh, self.prog_line, self.prog_point):
+        if self._cuda_position_resource is not None:
+            try:
+                self._cuda_position_resource.close()
+            except Exception:
+                pass
+            self._cuda_position_resource = None
+        if self._indexed_line:
+            try:
+                glDeleteTextures(1, [int(self._indexed_line["texture"])])
+            except Exception:
+                pass
+        for state in (self._mesh, self._line, self._indexed_line, self._point):
+            if not state:
+                continue
+            buffers = [
+                int(state[key])
+                for key in ("vbo", "nbo", "cbo", "sbo", "abo", "ebo", "ibo")
+                if state.get(key) is not None
+            ]
+            if buffers:
+                try:
+                    glDeleteBuffers(len(buffers), buffers)
+                except Exception:
+                    pass
+            try:
+                glDeleteVertexArrays(1, [int(state["vao"])])
+            except Exception:
+                pass
+        for pid in (
+            self.prog_mesh, self.prog_line, self.prog_indexed_line, self.prog_point
+        ):
             try:
                 glDeleteProgram(pid)
             except Exception:
@@ -594,6 +1067,11 @@ class GLRenderer:
     def _draw_overlay(self) -> None:
         if not self._overlay_lines:
             return
+        if self._host.draw_overlay is None:
+            raise RuntimeError("renderer host does not support text overlays")
+        self._host.draw_overlay(tuple(self._overlay_lines), self._window_size)
+
+    def _draw_pygame_overlay(self) -> None:
         try:
             import pygame
             if self._font is None:

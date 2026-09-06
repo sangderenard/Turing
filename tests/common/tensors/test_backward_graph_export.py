@@ -1,5 +1,6 @@
 import pytest
 import networkx as nx
+from src.common.tensors.abstraction import tensor_identity
 
 from src.common.tensors.autograd import autograd, GradTape
 
@@ -30,12 +31,12 @@ def test_export_backward_graph_structure():
     g = autograd.tape.export_backward_graph(result)
     assert isinstance(g, nx.DiGraph)
 
-    assert g.nodes[id(result)]["op"] == "add"
-    assert g.nodes[id(inter)]["op"] == "mul"
-    assert set(g.nodes[id(inter)]["required"]) == {id(a), id(b)}
-    assert g.nodes[id(result)]["required"] == []
+    assert g.nodes[tensor_identity(result)]["op"] == "add"
+    assert g.nodes[tensor_identity(inter)]["op"] == "mul"
+    assert set(g.nodes[tensor_identity(inter)]["required"]) == {tensor_identity(a), tensor_identity(b)}
+    assert g.nodes[tensor_identity(result)]["required"] == []
 
-    assert g.has_edge(id(result), id(inter))
-    assert g.has_edge(id(result), id(c))
-    assert g.has_edge(id(inter), id(a))
-    assert g.has_edge(id(inter), id(b))
+    assert g.has_edge(tensor_identity(result), tensor_identity(inter))
+    assert g.has_edge(tensor_identity(result), tensor_identity(c))
+    assert g.has_edge(tensor_identity(inter), tensor_identity(a))
+    assert g.has_edge(tensor_identity(inter), tensor_identity(b))

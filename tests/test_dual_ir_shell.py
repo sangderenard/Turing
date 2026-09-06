@@ -9,6 +9,10 @@ from src.common.tensors.accelerator_backends.profiled_c_shell import (
 )
 
 
+def test_native_glsl_dispatch_language_is_explicit_compatibility_alias():
+    assert ShellLanguage.NATIVE_GLSL is ShellLanguage.GLSL
+
+
 def _aot(entrypoint="f", numeric="numeric-program", control=None, map_ir=None):
     return AOTCompilation(
         entrypoint=entrypoint,

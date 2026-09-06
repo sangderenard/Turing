@@ -1,5 +1,6 @@
 import pytest
 from src.common.tensors import AbstractTensor
+from src.common.tensors.abstraction import tensor_identity
 
 
 def test_grad_error_identifies_missing_input():
@@ -17,4 +18,4 @@ def test_grad_error_identifies_missing_input():
         autograd.grad(y, [a, b], allow_unused=False)
     msg = str(excinfo.value)
     assert "index 1" in msg
-    assert str(id(b)) in msg
+    assert str(tensor_identity(b)) in msg

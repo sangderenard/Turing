@@ -28,8 +28,17 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import struct
+from functools import lru_cache
 from typing import Any, Iterable, Mapping
 
+
+# The tape keys its nodes by ``tensor_identity``, not by ``id``: a memory
+# address is reused once its object is freed, so an ``id`` used as a durable
+# key silently conflates two values that were never alive together. Anything
+# here that looks a value up in the tape, or hands an identity back to a
+# caller, has to use the same token the tape stores -- mixing the two is what
+# made this lowering find no nodes at all and still report itself complete.
+from ..abstraction import tensor_identity as _identity
 
 _C_BACKEND_DIR = Path(__file__).with_name("c_backend")
 _C_SOURCE_PATH = _C_BACKEND_DIR / "ctensor_ops.c"
@@ -39,7 +48,70 @@ _C_BACKEND_PATH = Path(__file__).with_name("c_backend.py")
 # ``slice`` is emitted by the numerical precompiler after Python indexing has
 # already been normalized.  It is intentionally not a public AbstractTensor
 # method name, but it still needs the same real C -> LLVM algorithm registry.
-PRECOMPILE_INTERNAL_OPERATORS = frozenset({"slice"})
+PRECOMPILE_INTERNAL_OPERATORS = frozenset({"slice", "index_set"})
+
+# Explicit output-buffer positions in the authored low-level SSA signatures.
+# Scalar-returning helpers (binary_value, sum_double, count_true_double) carry
+# a repository-SSA ``return_value`` instead and therefore do not appear here.
+C_SSA_OUTPUT_ARGUMENTS = {
+    "fill_double": 0,
+    "binary_double": 2,
+    "binary_scalar_double": 2,
+    "unary_double": 1,
+    "matmul_double": 2,
+    "batched_matmul_indexed_double": 2,
+    "where_double": 3,
+    "broadcast_double": 1,
+    "reduce_dim_double": 1,
+    "transpose_double": 1,
+    "cumsum_dim_double": 1,
+    "stack_double": 5,
+    "cat_double": 6,
+    "pad_double_nd": 1,
+    "slice_copy_double": 1,
+    "index_select_double": 1,
+    "gather_values_double": 1,
+    "index_assign_double": 0,
+    "index_set_double": 1,
+    "unfold2d_double": 1,
+    "fold2d_double": 1,
+    "sign_double": 1,
+    "mask_select_double": 2,
+    "increment_mask_double": 0,
+    "cast_double_to_int_values": 1,
+    "cast_double_to_float_values": 1,
+    "cast_double_to_double_values": 1,
+    "cast_double_to_bool_values": 1,
+    "create_arange": 3,
+}
+
+# LLVM opaque pointers erase pointee types.  Repository SSA and its Fortran
+# ABI still need to distinguish integer metadata vectors from double tensor
+# buffers, so retain that finite part of the authored C signatures here.
+C_SSA_I32_POINTER_ARGUMENTS = {
+    "batched_matmul_indexed_double": (3, 4),
+    "pad_double_nd": (2, 3, 4),
+    "slice_copy_double": (2,),
+    "index_select_double": (2, 5),
+    "gather_values_double": (2,),
+    "index_assign_double": (1, 3, 4),
+    "index_set_double": (2, 4, 5),
+    "cumsum_dim_double": (2,),
+    "reduce_dim_double": (2,),
+    "transpose_double": (2, 3),
+    "broadcast_double": (2, 4),
+    "stack_double": (2,),
+    "cat_double": (1, 3),
+}
+
+# Opaque LLVM ``ptr`` does not state whether one address names tensor values
+# or an array of tensor addresses.  The authored C signatures do: stack/cat's
+# first parameter is ``const double **``. Retain that finite pointer depth in
+# repository SSA so generic native emitters do not flatten it to ``double *``.
+C_SSA_POINTER_ARRAY_ARGUMENTS = {
+    "stack_double": (0,),
+    "cat_double": (0,),
+}
 
 
 # These values are consumed by the handwritten switch instructions below.
@@ -86,7 +158,29 @@ C_TENSOR_OPCODE_ORDER = (
     "ASINH",
     "ACOSH",
     "ATANH",
+    "SIGN",
+    "INVERT",
+    "BITAND",
+    "BITOR",
+    "BITXOR",
+    "SHL",
+    "SHR",
+    "LOGICAL_AND",
+    "LOGICAL_OR",
+    # Appended, not grouped with the transcendentals, because CTensorOp is
+    # appended the same way: ctensor_ops.c's is_unary_op classifies by enum
+    # range, so a mid-list insertion would renumber every opcode after it.
+    "SIGMOID",
 )
+
+C_SSA_EXTERNAL_PRIMITIVES = frozenset({
+    "acos", "acosh", "asin", "asinh", "atan", "atanh", "cos", "cosh",
+    "exp", "llvm.ceil.f64", "llvm.fabs.f64", "llvm.fcmp.ord",
+    "llvm.fcmp.uno", "llvm.floor.f64", "llvm.round.f64", "llvm.sqrt.f64",
+    "llvm.trunc.f64", "llvm.memcpy.p0.p0.i64", "llvm.memset.p0.i64",
+    "log", "pow", "sin", "sinh", "tan", "tanh",
+    "llvm.maxnum.f64", "llvm.minnum.f64", "llvm.pow.f64",
+})
 
 
 # Classification covers names discovered from ctensor_ops.c.  Validation below
@@ -116,14 +210,20 @@ _C_FUNCTION_ROLES = {
     "repeat_interleave_double": "tensor_kernel",
     "tile_double": "tensor_kernel",
     "index_select_double": "tensor_kernel",
+    "gather_values_double": "tensor_kernel",
     "slice_copy_double": "tensor_kernel",
     "index_assign_double": "tensor_kernel",
+    "index_set_double": "tensor_kernel",
+    "unfold2d_double": "tensor_kernel",
+    "fold2d_double": "tensor_kernel",
     "sign_double": "tensor_kernel",
     "count_true_double": "tensor_kernel",
     "mask_select_double": "tensor_kernel",
     "increment_mask_double": "tensor_kernel",
     "cast_double_to_int_values": "tensor_kernel",
     "cast_double_to_float_values": "tensor_kernel",
+    "cast_double_to_double_values": "tensor_kernel",
+    "cast_double_to_bool_values": "tensor_kernel",
     "log_softmax_1d": "tensor_kernel",
     "log_softmax_callback": "private_callback",
     "pad_double_nd": "tensor_kernel",
@@ -152,7 +252,11 @@ declare double @llvm.round.f64(double)
 declare double @llvm.trunc.f64(double)
 declare double @llvm.floor.f64(double)
 declare double @llvm.ceil.f64(double)
+declare double @llvm.maxnum.f64(double, double)
+declare double @llvm.minnum.f64(double, double)
+declare double @llvm.pow.f64(double, double)
 declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
 declare double @pow(double, double)
 declare double @exp(double)
 declare double @log(double)
@@ -189,6 +293,100 @@ exit:
   ret void
 }
 
+define void @pad_double_nd(
+    ptr %input, ptr %output, ptr %shape, ptr %new_shape,
+    ptr %left_pad, i32 %dims, double %value) {
+entry:
+  br label %output.product.header
+
+output.product.header:
+  %output.dimension = phi i32 [ 0, %entry ], [ %output.dimension.next, %output.product.body ]
+  %total.out = phi i32 [ 1, %entry ], [ %total.out.next, %output.product.body ]
+  %output.product.continue = icmp slt i32 %output.dimension, %dims
+  br i1 %output.product.continue, label %output.product.body, label %fill.header
+
+output.product.body:
+  %output.dimension64 = sext i32 %output.dimension to i64
+  %output.extent.ptr = getelementptr inbounds i32, ptr %new_shape, i64 %output.dimension64
+  %output.extent = load i32, ptr %output.extent.ptr, align 4
+  %total.out.next = mul nsw i32 %total.out, %output.extent
+  %output.dimension.next = add nsw i32 %output.dimension, 1
+  br label %output.product.header
+
+fill.header:
+  %fill.index = phi i32 [ 0, %output.product.header ], [ %fill.index.next, %fill.body ]
+  %fill.continue = icmp slt i32 %fill.index, %total.out
+  br i1 %fill.continue, label %fill.body, label %input.product.header
+
+fill.body:
+  %fill.index64 = sext i32 %fill.index to i64
+  %fill.ptr = getelementptr inbounds double, ptr %output, i64 %fill.index64
+  store double %value, ptr %fill.ptr, align 8
+  %fill.index.next = add nsw i32 %fill.index, 1
+  br label %fill.header
+
+input.product.header:
+  %input.dimension = phi i32 [ 0, %fill.header ], [ %input.dimension.next, %input.product.body ]
+  %input.size = phi i32 [ 1, %fill.header ], [ %input.size.next, %input.product.body ]
+  %input.product.continue = icmp slt i32 %input.dimension, %dims
+  br i1 %input.product.continue, label %input.product.body, label %copy.header
+
+input.product.body:
+  %input.dimension64 = sext i32 %input.dimension to i64
+  %input.extent.ptr = getelementptr inbounds i32, ptr %shape, i64 %input.dimension64
+  %input.extent = load i32, ptr %input.extent.ptr, align 4
+  %input.size.next = mul nsw i32 %input.size, %input.extent
+  %input.dimension.next = add nsw i32 %input.dimension, 1
+  br label %input.product.header
+
+copy.header:
+  %input.index = phi i32 [ 0, %input.product.header ], [ %input.index.next, %copy.store ]
+  %copy.continue = icmp slt i32 %input.index, %input.size
+  br i1 %copy.continue, label %coordinate.entry, label %exit
+
+coordinate.entry:
+  %last.dimension = sub nsw i32 %dims, 1
+  br label %coordinate.header
+
+coordinate.header:
+  %dimension = phi i32 [ %last.dimension, %coordinate.entry ], [ %dimension.next, %coordinate.body ]
+  %remaining = phi i32 [ %input.index, %coordinate.entry ], [ %remaining.next, %coordinate.body ]
+  %output.index = phi i32 [ 0, %coordinate.entry ], [ %output.index.next, %coordinate.body ]
+  %output.stride = phi i32 [ 1, %coordinate.entry ], [ %output.stride.next, %coordinate.body ]
+  %coordinate.continue = icmp sge i32 %dimension, 0
+  br i1 %coordinate.continue, label %coordinate.body, label %copy.store
+
+coordinate.body:
+  %dimension64 = sext i32 %dimension to i64
+  %shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %dimension64
+  %shape.value = load i32, ptr %shape.ptr, align 4
+  %coordinate = srem i32 %remaining, %shape.value
+  %remaining.next = sdiv i32 %remaining, %shape.value
+  %left.ptr = getelementptr inbounds i32, ptr %left_pad, i64 %dimension64
+  %left.value = load i32, ptr %left.ptr, align 4
+  %padded.coordinate = add nsw i32 %coordinate, %left.value
+  %coordinate.offset = mul nsw i32 %padded.coordinate, %output.stride
+  %output.index.next = add nsw i32 %output.index, %coordinate.offset
+  %new.shape.ptr = getelementptr inbounds i32, ptr %new_shape, i64 %dimension64
+  %new.shape.value = load i32, ptr %new.shape.ptr, align 4
+  %output.stride.next = mul nsw i32 %output.stride, %new.shape.value
+  %dimension.next = sub nsw i32 %dimension, 1
+  br label %coordinate.header
+
+copy.store:
+  %input.index64 = sext i32 %input.index to i64
+  %output.index64 = sext i32 %output.index to i64
+  %input.ptr = getelementptr inbounds double, ptr %input, i64 %input.index64
+  %output.ptr = getelementptr inbounds double, ptr %output, i64 %output.index64
+  %input.value = load double, ptr %input.ptr, align 8
+  store double %input.value, ptr %output.ptr, align 8
+  %input.index.next = add nsw i32 %input.index, 1
+  br label %copy.header
+
+exit:
+  ret void
+}
+
 define internal double @binary_value(double %a, double %b, i32 %op) {
 entry:
   switch i32 %op, label %invalid [
@@ -207,6 +405,13 @@ entry:
     i32 25, label %ne
     i32 26, label %maximum
     i32 27, label %minimum
+    i32 42, label %bitand
+    i32 43, label %bitor
+    i32 44, label %bitxor
+    i32 45, label %shl
+    i32 46, label %shr
+    i32 47, label %logical_and
+    i32 48, label %logical_or
   ]
 
 add:
@@ -266,6 +471,50 @@ minimum:
   %minimum.bit = fcmp olt double %a, %b
   %minimum.value = select i1 %minimum.bit, double %a, double %b
   ret double %minimum.value
+bitand:
+  %bitand.a = fptosi double %a to i64
+  %bitand.b = fptosi double %b to i64
+  %bitand.int = and i64 %bitand.a, %bitand.b
+  %bitand.value = sitofp i64 %bitand.int to double
+  ret double %bitand.value
+bitor:
+  %bitor.a = fptosi double %a to i64
+  %bitor.b = fptosi double %b to i64
+  %bitor.int = or i64 %bitor.a, %bitor.b
+  %bitor.value = sitofp i64 %bitor.int to double
+  ret double %bitor.value
+bitxor:
+  %bitxor.a = fptosi double %a to i64
+  %bitxor.b = fptosi double %b to i64
+  %bitxor.int = xor i64 %bitxor.a, %bitxor.b
+  %bitxor.value = sitofp i64 %bitxor.int to double
+  ret double %bitxor.value
+shl:
+  %shl.a = fptosi double %a to i64
+  %shl.b.raw = fptosi double %b to i64
+  %shl.b = and i64 %shl.b.raw, 63
+  %shl.int = shl i64 %shl.a, %shl.b
+  %shl.value = sitofp i64 %shl.int to double
+  ret double %shl.value
+shr:
+  %shr.a = fptosi double %a to i64
+  %shr.b.raw = fptosi double %b to i64
+  %shr.b = and i64 %shr.b.raw, 63
+  %shr.int = ashr i64 %shr.a, %shr.b
+  %shr.value = sitofp i64 %shr.int to double
+  ret double %shr.value
+logical_and:
+  %logical.and.a = fcmp une double %a, 0.000000e+00
+  %logical.and.b = fcmp une double %b, 0.000000e+00
+  %logical.and.bit = and i1 %logical.and.a, %logical.and.b
+  %logical.and.value = uitofp i1 %logical.and.bit to double
+  ret double %logical.and.value
+logical_or:
+  %logical.or.a = fcmp une double %a, 0.000000e+00
+  %logical.or.b = fcmp une double %b, 0.000000e+00
+  %logical.or.bit = or i1 %logical.or.a, %logical.or.b
+  %logical.or.value = uitofp i1 %logical.or.bit to double
+  ret double %logical.or.value
 invalid:
   ret double 0x7FF8000000000000
 }
@@ -362,6 +611,9 @@ loop.body:
     i32 37, label %asinh
     i32 38, label %acosh
     i32 39, label %atanh
+    i32 40, label %sign
+    i32 41, label %invert
+    i32 49, label %sigmoid
   ]
 
 sqrt:
@@ -447,6 +699,30 @@ acosh:
 atanh:
   %atanh.value = call double @atanh(double %value)
   br label %store
+sign:
+  %sign.positive = fcmp ogt double %value, 0.000000e+00
+  %sign.negative = fcmp olt double %value, 0.000000e+00
+  %sign.positive.value = uitofp i1 %sign.positive to double
+  %sign.negative.value = uitofp i1 %sign.negative to double
+  %sign.value = fsub double %sign.positive.value, %sign.negative.value
+  br label %store
+invert:
+  %invert.int = fptosi double %value to i64
+  %invert.flipped = xor i64 %invert.int, -1
+  %invert.value = sitofp i64 %invert.flipped to double
+  br label %store
+sigmoid:
+  ; Same branch-free stable form as ctensor_ops.c: exp() of a large positive
+  ; argument overflows, so exp is only ever given -|x| and the sign of the
+  ; input picks the numerator. Both arms are the same function.
+  %sigmoid.magnitude = call double @llvm.fabs.f64(double %value)
+  %sigmoid.exponent = fneg double %sigmoid.magnitude
+  %sigmoid.decay = call double @exp(double %sigmoid.exponent)
+  %sigmoid.denominator = fadd double 1.000000e+00, %sigmoid.decay
+  %sigmoid.negative = fcmp olt double %value, 0.000000e+00
+  %sigmoid.numerator = select i1 %sigmoid.negative, double %sigmoid.decay, double 1.000000e+00
+  %sigmoid.value = fdiv double %sigmoid.numerator, %sigmoid.denominator
+  br label %store
 identity:
   br label %store
 
@@ -477,6 +753,9 @@ store:
     [ %asinh.value, %asinh ],
     [ %acosh.value, %acosh ],
     [ %atanh.value, %atanh ],
+    [ %sign.value, %sign ],
+    [ %invert.value, %invert ],
+    [ %sigmoid.value, %sigmoid ],
     [ %value, %identity ]
   store double %result, ptr %out.ptr, align 8
   %i.next = add nsw i32 %i, 1
@@ -510,6 +789,119 @@ loop.body:
   store double %result, ptr %out.ptr, align 8
   %i.next = add nsw i32 %i, 1
   br label %loop.header
+
+exit:
+  ret void
+}
+
+define void @broadcast_double(
+    ptr %input, ptr %output, ptr %input_shape, i32 %input_ndim,
+    ptr %output_shape, i32 %output_ndim) {
+entry:
+  br label %total.header
+
+total.header:
+  %total.axis = phi i32 [ 0, %entry ], [ %total.axis.next, %total.body ]
+  %total = phi i32 [ 1, %entry ], [ %total.next, %total.body ]
+  %total.continue = icmp slt i32 %total.axis, %output_ndim
+  br i1 %total.continue, label %total.body, label %flat.header
+
+total.body:
+  %total.axis64 = sext i32 %total.axis to i64
+  %total.extent.ptr = getelementptr inbounds i32, ptr %output_shape, i64 %total.axis64
+  %total.extent = load i32, ptr %total.extent.ptr, align 4
+  %total.next = mul nsw i32 %total, %total.extent
+  %total.axis.next = add nsw i32 %total.axis, 1
+  br label %total.header
+
+flat.header:
+  %flat = phi i32 [ 0, %total.header ], [ %flat.next, %flat.latch ]
+  %flat.continue = icmp slt i32 %flat, %total
+  br i1 %flat.continue, label %axis.header, label %exit
+
+axis.header:
+  %axis = phi i32 [ 0, %flat.header ], [ %axis.next, %axis.latch ]
+  %remaining = phi i32 [ %flat, %flat.header ], [ %remaining.next, %axis.latch ]
+  %input.flat = phi i32 [ 0, %flat.header ], [ %input.flat.next, %axis.latch ]
+  %axis.continue = icmp slt i32 %axis, %output_ndim
+  br i1 %axis.continue, label %output.stride.entry, label %store
+
+output.stride.entry:
+  %output.later.start = add nsw i32 %axis, 1
+  br label %output.stride.header
+
+output.stride.header:
+  %output.later = phi i32 [ %output.later.start, %output.stride.entry ], [ %output.later.next, %output.stride.body ]
+  %output.stride = phi i32 [ 1, %output.stride.entry ], [ %output.stride.next, %output.stride.body ]
+  %output.later.continue = icmp slt i32 %output.later, %output_ndim
+  br i1 %output.later.continue, label %output.stride.body, label %coordinate
+
+output.stride.body:
+  %output.later64 = sext i32 %output.later to i64
+  %output.extent.ptr = getelementptr inbounds i32, ptr %output_shape, i64 %output.later64
+  %output.extent = load i32, ptr %output.extent.ptr, align 4
+  %output.stride.next = mul nsw i32 %output.stride, %output.extent
+  %output.later.next = add nsw i32 %output.later, 1
+  br label %output.stride.header
+
+coordinate:
+  %coordinate.value = sdiv i32 %remaining, %output.stride
+  %remaining.next = srem i32 %remaining, %output.stride
+  %offset = sub nsw i32 %output_ndim, %input_ndim
+  %input.axis = sub nsw i32 %axis, %offset
+  %input.axis.valid = icmp sge i32 %input.axis, 0
+  br i1 %input.axis.valid, label %input.extent.block, label %axis.noinput
+
+input.extent.block:
+  %input.axis64 = sext i32 %input.axis to i64
+  %input.extent.ptr = getelementptr inbounds i32, ptr %input_shape, i64 %input.axis64
+  %input.extent = load i32, ptr %input.extent.ptr, align 4
+  %input.broadcast = icmp eq i32 %input.extent, 1
+  br i1 %input.broadcast, label %axis.noinput, label %input.stride.entry
+
+input.stride.entry:
+  %input.later.start = add nsw i32 %input.axis, 1
+  br label %input.stride.header
+
+input.stride.header:
+  %input.later = phi i32 [ %input.later.start, %input.stride.entry ], [ %input.later.next, %input.stride.body ]
+  %input.stride = phi i32 [ 1, %input.stride.entry ], [ %input.stride.next, %input.stride.body ]
+  %input.later.continue = icmp slt i32 %input.later, %input_ndim
+  br i1 %input.later.continue, label %input.stride.body, label %axis.input
+
+input.stride.body:
+  %input.later64 = sext i32 %input.later to i64
+  %input.later.extent.ptr = getelementptr inbounds i32, ptr %input_shape, i64 %input.later64
+  %input.later.extent = load i32, ptr %input.later.extent.ptr, align 4
+  %input.stride.next = mul nsw i32 %input.stride, %input.later.extent
+  %input.later.next = add nsw i32 %input.later, 1
+  br label %input.stride.header
+
+axis.input:
+  %input.contribution = mul nsw i32 %coordinate.value, %input.stride
+  %input.flat.with = add nsw i32 %input.flat, %input.contribution
+  br label %axis.latch
+
+axis.noinput:
+  br label %axis.latch
+
+axis.latch:
+  %input.flat.next = phi i32 [ %input.flat, %axis.noinput ], [ %input.flat.with, %axis.input ]
+  %axis.next = add nsw i32 %axis, 1
+  br label %axis.header
+
+store:
+  %input.flat64 = sext i32 %input.flat to i64
+  %flat64 = sext i32 %flat to i64
+  %input.ptr = getelementptr inbounds double, ptr %input, i64 %input.flat64
+  %output.ptr = getelementptr inbounds double, ptr %output, i64 %flat64
+  %value = load double, ptr %input.ptr, align 8
+  store double %value, ptr %output.ptr, align 8
+  br label %flat.latch
+
+flat.latch:
+  %flat.next = add nsw i32 %flat, 1
+  br label %flat.header
 
 exit:
   ret void
@@ -701,6 +1093,102 @@ exit:
   ret void
 }
 
+define void @gather_values_double(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+    ptr %indices, i32 %index.count) {
+entry:
+  br label %before.header
+
+before.header:
+  %before.axis = phi i32 [ 0, %entry ], [ %before.axis.next, %before.body ]
+  %before = phi i32 [ 1, %entry ], [ %before.next, %before.body ]
+  %before.continue = icmp slt i32 %before.axis, %dim
+  br i1 %before.continue, label %before.body, label %after.init
+
+before.body:
+  %before.axis64 = sext i32 %before.axis to i64
+  %before.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %before.axis64
+  %before.extent = load i32, ptr %before.shape.ptr, align 4
+  %before.next = mul nsw i32 %before, %before.extent
+  %before.axis.next = add nsw i32 %before.axis, 1
+  br label %before.header
+
+after.init:
+  %after.first = add nsw i32 %dim, 1
+  br label %after.header
+
+after.header:
+  %after.axis = phi i32 [ %after.first, %after.init ], [ %after.axis.next, %after.body ]
+  %after = phi i32 [ 1, %after.init ], [ %after.next, %after.body ]
+  %after.continue = icmp slt i32 %after.axis, %ndim
+  br i1 %after.continue, label %after.body, label %copy.init
+
+after.body:
+  %after.axis64 = sext i32 %after.axis to i64
+  %after.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %after.axis64
+  %after.extent = load i32, ptr %after.shape.ptr, align 4
+  %after.next = mul nsw i32 %after, %after.extent
+  %after.axis.next = add nsw i32 %after.axis, 1
+  br label %after.header
+
+copy.init:
+  %dim64 = sext i32 %dim to i64
+  %source.count.ptr = getelementptr inbounds i32, ptr %shape, i64 %dim64
+  %source.count = load i32, ptr %source.count.ptr, align 4
+  br label %batch.header
+
+batch.header:
+  %batch = phi i32 [ 0, %copy.init ], [ %batch.next, %batch.latch ]
+  %batch.continue = icmp slt i32 %batch, %before
+  br i1 %batch.continue, label %item.header, label %exit
+
+item.header:
+  %item = phi i32 [ 0, %batch.header ], [ %item.next, %item.latch ]
+  %item.continue = icmp slt i32 %item, %index.count
+  br i1 %item.continue, label %item.load, label %batch.latch
+
+item.load:
+  %item64 = sext i32 %item to i64
+  %index.ptr = getelementptr inbounds double, ptr %indices, i64 %item64
+  %source.item.double = load double, ptr %index.ptr, align 8
+  %source.item = fptosi double %source.item.double to i32
+  br label %element.header
+
+element.header:
+  %element = phi i32 [ 0, %item.load ], [ %element.next, %element.body ]
+  %element.continue = icmp slt i32 %element, %after
+  br i1 %element.continue, label %element.body, label %item.latch
+
+element.body:
+  %output.batch.base = mul nsw i32 %batch, %index.count
+  %output.item.base = add nsw i32 %output.batch.base, %item
+  %output.outer = mul nsw i32 %output.item.base, %after
+  %output.index = add nsw i32 %output.outer, %element
+  %source.batch.base = mul nsw i32 %batch, %source.count
+  %source.item.base = add nsw i32 %source.batch.base, %source.item
+  %source.outer = mul nsw i32 %source.item.base, %after
+  %source.index = add nsw i32 %source.outer, %element
+  %source.index64 = sext i32 %source.index to i64
+  %output.index64 = sext i32 %output.index to i64
+  %source.ptr = getelementptr inbounds double, ptr %input, i64 %source.index64
+  %output.ptr = getelementptr inbounds double, ptr %output, i64 %output.index64
+  %value = load double, ptr %source.ptr, align 8
+  store double %value, ptr %output.ptr, align 8
+  %element.next = add nsw i32 %element, 1
+  br label %element.header
+
+item.latch:
+  %item.next = add nsw i32 %item, 1
+  br label %item.header
+
+batch.latch:
+  %batch.next = add nsw i32 %batch, 1
+  br label %batch.header
+
+exit:
+  ret void
+}
+
 define void @index_assign_double(
     ptr %target, ptr %shape, i32 %ndim, ptr %axis.offsets,
     ptr %axis.indices, ptr %values, i32 %value.count) {
@@ -807,6 +1295,223 @@ flat.store:
 flat.latch:
   %flat.next = add nsw i32 %flat, 1
   br label %flat.header
+
+exit:
+  ret void
+}
+
+define void @index_set_double(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim,
+    ptr %axis.offsets, ptr %axis.indices, ptr %values, i32 %value.count) {
+entry:
+  br label %count.header
+
+count.header:
+  %axis = phi i32 [ 0, %entry ], [ %axis.next, %count.body ]
+  %element.count = phi i32 [ 1, %entry ], [ %element.count.next, %count.body ]
+  %continue = icmp slt i32 %axis, %ndim
+  br i1 %continue, label %count.body, label %copy
+
+count.body:
+  %axis64 = sext i32 %axis to i64
+  %shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %axis64
+  %extent = load i32, ptr %shape.ptr, align 4
+  %element.count.next = mul nsw i32 %element.count, %extent
+  %axis.next = add nsw i32 %axis, 1
+  br label %count.header
+
+copy:
+  %byte.count32 = mul nsw i32 %element.count, 8
+  %byte.count = sext i32 %byte.count32 to i64
+  call void @llvm.memcpy.p0.p0.i64(
+      ptr %output, ptr %input, i64 %byte.count, i1 false)
+  call void @index_assign_double(
+      ptr %output, ptr %shape, i32 %ndim,
+      ptr %axis.offsets, ptr %axis.indices,
+      ptr %values, i32 %value.count)
+  ret void
+}
+
+define void @unfold2d_double(
+    ptr %input, ptr %output,
+    i32 %n, i32 %c, i32 %h, i32 %w,
+    i32 %kh.count, i32 %kw.count,
+    i32 %sh, i32 %sw, i32 %ph, i32 %pw, i32 %dh, i32 %dw) {
+entry:
+  %kh.minus = sub nsw i32 %kh.count, 1
+  %kw.minus = sub nsw i32 %kw.count, 1
+  %effective.h.raw = mul nsw i32 %kh.minus, %dh
+  %effective.w.raw = mul nsw i32 %kw.minus, %dw
+  %effective.h = add nsw i32 %effective.h.raw, 1
+  %effective.w = add nsw i32 %effective.w.raw, 1
+  %twoph = mul nsw i32 %ph, 2
+  %twopw = mul nsw i32 %pw, 2
+  %padded.h = add nsw i32 %h, %twoph
+  %padded.w = add nsw i32 %w, %twopw
+  %numerator.h = sub nsw i32 %padded.h, %effective.h
+  %numerator.w = sub nsw i32 %padded.w, %effective.w
+  %oh.raw = sdiv i32 %numerator.h, %sh
+  %ow.raw = sdiv i32 %numerator.w, %sw
+  %oh.count = add nsw i32 %oh.raw, 1
+  %ow.count = add nsw i32 %ow.raw, 1
+  %count.0 = mul nsw i32 %n, %c
+  %count.1 = mul nsw i32 %count.0, %kh.count
+  %count.2 = mul nsw i32 %count.1, %kw.count
+  %count.3 = mul nsw i32 %count.2, %oh.count
+  %count = mul nsw i32 %count.3, %ow.count
+  br label %loop.header
+
+loop.header:
+  %flat = phi i32 [ 0, %entry ], [ %flat.next, %loop.latch ]
+  %continue = icmp slt i32 %flat, %count
+  br i1 %continue, label %decode, label %exit
+
+decode:
+  %ow = srem i32 %flat, %ow.count
+  %q.ow = sdiv i32 %flat, %ow.count
+  %oh = srem i32 %q.ow, %oh.count
+  %q.oh = sdiv i32 %q.ow, %oh.count
+  %kw = srem i32 %q.oh, %kw.count
+  %q.kw = sdiv i32 %q.oh, %kw.count
+  %kh = srem i32 %q.kw, %kh.count
+  %q.kh = sdiv i32 %q.kw, %kh.count
+  %channel = srem i32 %q.kh, %c
+  %batch = sdiv i32 %q.kh, %c
+  %ih.base = mul nsw i32 %oh, %sh
+  %iw.base = mul nsw i32 %ow, %sw
+  %ih.unpadded = sub nsw i32 %ih.base, %ph
+  %iw.unpadded = sub nsw i32 %iw.base, %pw
+  %kh.offset = mul nsw i32 %kh, %dh
+  %kw.offset = mul nsw i32 %kw, %dw
+  %ih = add nsw i32 %ih.unpadded, %kh.offset
+  %iw = add nsw i32 %iw.unpadded, %kw.offset
+  %ih.low = icmp sge i32 %ih, 0
+  %ih.high = icmp slt i32 %ih, %h
+  %iw.low = icmp sge i32 %iw, 0
+  %iw.high = icmp slt i32 %iw, %w
+  %h.valid = and i1 %ih.low, %ih.high
+  %w.valid = and i1 %iw.low, %iw.high
+  %valid = and i1 %h.valid, %w.valid
+  br i1 %valid, label %load, label %zero
+
+load:
+  %input.bc = mul nsw i32 %batch, %c
+  %input.channel = add nsw i32 %input.bc, %channel
+  %input.row.base = mul nsw i32 %input.channel, %h
+  %input.row = add nsw i32 %input.row.base, %ih
+  %input.flat.base = mul nsw i32 %input.row, %w
+  %input.flat = add nsw i32 %input.flat.base, %iw
+  %input.flat64 = sext i32 %input.flat to i64
+  %input.ptr = getelementptr inbounds double, ptr %input, i64 %input.flat64
+  %loaded = load double, ptr %input.ptr, align 8
+  br label %store
+
+zero:
+  br label %store
+
+store:
+  %value = phi double [ %loaded, %load ], [ 0.000000e+00, %zero ]
+  %flat64 = sext i32 %flat to i64
+  %output.ptr = getelementptr inbounds double, ptr %output, i64 %flat64
+  store double %value, ptr %output.ptr, align 8
+  br label %loop.latch
+
+loop.latch:
+  %flat.next = add nsw i32 %flat, 1
+  br label %loop.header
+
+exit:
+  ret void
+}
+
+define void @fold2d_double(
+    ptr %columns, ptr %output,
+    i32 %n, i32 %c, i32 %h, i32 %w,
+    i32 %kh.count, i32 %kw.count,
+    i32 %sh, i32 %sw, i32 %ph, i32 %pw, i32 %dh, i32 %dw) {
+entry:
+  %output.count.0 = mul nsw i32 %n, %c
+  %output.count.1 = mul nsw i32 %output.count.0, %h
+  %output.count = mul nsw i32 %output.count.1, %w
+  %byte.count32 = mul nsw i32 %output.count, 8
+  %byte.count = sext i32 %byte.count32 to i64
+  call void @llvm.memset.p0.i64(ptr %output, i8 0, i64 %byte.count, i1 false)
+  %kh.minus = sub nsw i32 %kh.count, 1
+  %kw.minus = sub nsw i32 %kw.count, 1
+  %effective.h.raw = mul nsw i32 %kh.minus, %dh
+  %effective.w.raw = mul nsw i32 %kw.minus, %dw
+  %effective.h = add nsw i32 %effective.h.raw, 1
+  %effective.w = add nsw i32 %effective.w.raw, 1
+  %twoph = mul nsw i32 %ph, 2
+  %twopw = mul nsw i32 %pw, 2
+  %padded.h = add nsw i32 %h, %twoph
+  %padded.w = add nsw i32 %w, %twopw
+  %numerator.h = sub nsw i32 %padded.h, %effective.h
+  %numerator.w = sub nsw i32 %padded.w, %effective.w
+  %oh.raw = sdiv i32 %numerator.h, %sh
+  %ow.raw = sdiv i32 %numerator.w, %sw
+  %oh.count = add nsw i32 %oh.raw, 1
+  %ow.count = add nsw i32 %ow.raw, 1
+  %count.0 = mul nsw i32 %n, %c
+  %count.1 = mul nsw i32 %count.0, %kh.count
+  %count.2 = mul nsw i32 %count.1, %kw.count
+  %count.3 = mul nsw i32 %count.2, %oh.count
+  %count = mul nsw i32 %count.3, %ow.count
+  br label %loop.header
+
+loop.header:
+  %flat = phi i32 [ 0, %entry ], [ %flat.next, %loop.latch ]
+  %continue = icmp slt i32 %flat, %count
+  br i1 %continue, label %decode, label %exit
+
+decode:
+  %ow = srem i32 %flat, %ow.count
+  %q.ow = sdiv i32 %flat, %ow.count
+  %oh = srem i32 %q.ow, %oh.count
+  %q.oh = sdiv i32 %q.ow, %oh.count
+  %kw = srem i32 %q.oh, %kw.count
+  %q.kw = sdiv i32 %q.oh, %kw.count
+  %kh = srem i32 %q.kw, %kh.count
+  %q.kh = sdiv i32 %q.kw, %kh.count
+  %channel = srem i32 %q.kh, %c
+  %batch = sdiv i32 %q.kh, %c
+  %ih.base = mul nsw i32 %oh, %sh
+  %iw.base = mul nsw i32 %ow, %sw
+  %ih.unpadded = sub nsw i32 %ih.base, %ph
+  %iw.unpadded = sub nsw i32 %iw.base, %pw
+  %kh.offset = mul nsw i32 %kh, %dh
+  %kw.offset = mul nsw i32 %kw, %dw
+  %ih = add nsw i32 %ih.unpadded, %kh.offset
+  %iw = add nsw i32 %iw.unpadded, %kw.offset
+  %ih.low = icmp sge i32 %ih, 0
+  %ih.high = icmp slt i32 %ih, %h
+  %iw.low = icmp sge i32 %iw, 0
+  %iw.high = icmp slt i32 %iw, %w
+  %h.valid = and i1 %ih.low, %ih.high
+  %w.valid = and i1 %iw.low, %iw.high
+  %valid = and i1 %h.valid, %w.valid
+  br i1 %valid, label %accumulate, label %loop.latch
+
+accumulate:
+  %flat64 = sext i32 %flat to i64
+  %column.ptr = getelementptr inbounds double, ptr %columns, i64 %flat64
+  %column.value = load double, ptr %column.ptr, align 8
+  %output.bc = mul nsw i32 %batch, %c
+  %output.channel = add nsw i32 %output.bc, %channel
+  %output.row.base = mul nsw i32 %output.channel, %h
+  %output.row = add nsw i32 %output.row.base, %ih
+  %output.flat.base = mul nsw i32 %output.row, %w
+  %output.flat = add nsw i32 %output.flat.base, %iw
+  %output.flat64 = sext i32 %output.flat to i64
+  %output.ptr = getelementptr inbounds double, ptr %output, i64 %output.flat64
+  %previous = load double, ptr %output.ptr, align 8
+  %updated = fadd double %previous, %column.value
+  store double %updated, ptr %output.ptr, align 8
+  br label %loop.latch
+
+loop.latch:
+  %flat.next = add nsw i32 %flat, 1
+  br label %loop.header
 
 exit:
   ret void
@@ -981,6 +1686,52 @@ exit:
   ret void
 }
 
+define void @cast_double_to_double_values(ptr %a, ptr %out, i32 %n) {
+entry:
+  br label %loop.header
+
+loop.header:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.body ]
+  %continue = icmp slt i32 %i, %n
+  br i1 %continue, label %loop.body, label %exit
+
+loop.body:
+  %i64 = sext i32 %i to i64
+  %a.ptr = getelementptr inbounds double, ptr %a, i64 %i64
+  %out.ptr = getelementptr inbounds double, ptr %out, i64 %i64
+  %value = load double, ptr %a.ptr, align 8
+  store double %value, ptr %out.ptr, align 8
+  %i.next = add nsw i32 %i, 1
+  br label %loop.header
+
+exit:
+  ret void
+}
+
+define void @cast_double_to_bool_values(ptr %a, ptr %out, i32 %n) {
+entry:
+  br label %loop.header
+
+loop.header:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.body ]
+  %continue = icmp slt i32 %i, %n
+  br i1 %continue, label %loop.body, label %exit
+
+loop.body:
+  %i64 = sext i32 %i to i64
+  %a.ptr = getelementptr inbounds double, ptr %a, i64 %i64
+  %out.ptr = getelementptr inbounds double, ptr %out, i64 %i64
+  %value = load double, ptr %a.ptr, align 8
+  %nonzero = fcmp une double %value, 0.0
+  %result = uitofp i1 %nonzero to double
+  store double %result, ptr %out.ptr, align 8
+  %i.next = add nsw i32 %i, 1
+  br label %loop.header
+
+exit:
+  ret void
+}
+
 define double @sum_double(ptr %a, i32 %n) {
 entry:
   br label %loop.header
@@ -1044,6 +1795,7 @@ j.header:
 k.header:
   %k = phi i32 [ 0, %j.header ], [ %k.next, %k.body ]
   %sum = phi double [ 0.000000e+00, %j.header ], [ %sum.next, %k.body ]
+  %correction = phi double [ 0.000000e+00, %j.header ], [ %correction.next, %k.body ]
   %k.continue = icmp slt i32 %k, %n
   br i1 %k.continue, label %k.body, label %store
 
@@ -1059,7 +1811,10 @@ k.body:
   %a.value = load double, ptr %a.ptr, align 8
   %b.value = load double, ptr %b.ptr, align 8
   %product = fmul double %a.value, %b.value
-  %sum.next = fadd double %sum, %product
+  %adjusted = fsub double %product, %correction
+  %sum.next = fadd double %sum, %adjusted
+  %sum.delta = fsub double %sum.next, %sum
+  %correction.next = fsub double %sum.delta, %adjusted
   %k.next = add nsw i32 %k, 1
   br label %k.header
 
@@ -1078,6 +1833,41 @@ j.latch:
 i.latch:
   %i.next = add nsw i32 %i, 1
   br label %i.header
+
+exit:
+  ret void
+}
+
+define void @batched_matmul_indexed_double(
+    ptr %a, ptr %b, ptr %out, ptr %a_offsets, ptr %b_offsets,
+    i32 %batch_count, i32 %m, i32 %n, i32 %p) {
+entry:
+  %output.stride = mul nsw i32 %m, %p
+  br label %batch.header
+
+batch.header:
+  %batch = phi i32 [ 0, %entry ], [ %batch.next, %batch.body ]
+  %batch.continue = icmp slt i32 %batch, %batch_count
+  br i1 %batch.continue, label %batch.body, label %exit
+
+batch.body:
+  %batch64 = sext i32 %batch to i64
+  %a.offset.ptr = getelementptr inbounds i32, ptr %a_offsets, i64 %batch64
+  %b.offset.ptr = getelementptr inbounds i32, ptr %b_offsets, i64 %batch64
+  %a.offset = load i32, ptr %a.offset.ptr, align 4
+  %b.offset = load i32, ptr %b.offset.ptr, align 4
+  %a.offset64 = sext i32 %a.offset to i64
+  %b.offset64 = sext i32 %b.offset to i64
+  %a.batch = getelementptr inbounds double, ptr %a, i64 %a.offset64
+  %b.batch = getelementptr inbounds double, ptr %b, i64 %b.offset64
+  %out.offset = mul nsw i32 %batch, %output.stride
+  %out.offset64 = sext i32 %out.offset to i64
+  %out.batch = getelementptr inbounds double, ptr %out, i64 %out.offset64
+  call void @matmul_double(
+      ptr %a.batch, ptr %b.batch, ptr %out.batch,
+      i32 %m, i32 %n, i32 %p)
+  %batch.next = add nsw i32 %batch, 1
+  br label %batch.header
 
 exit:
   ret void
@@ -1619,7 +2409,7 @@ class TapeLLVMModule:
     output_ids: Mapping[str, int]
     workspace_sizes: tuple[int, ...]
     shortfalls: tuple[TapeLLVMShortfall, ...]
-    trig_solver: str = "libm"
+    trig_solver: str = "lut"
     trig_epsilon: float | None = None
 
     @property
@@ -1631,7 +2421,10 @@ TRANSLATIONS = (
     CBackendLLVMSSA(
         "fill_double",
         "fill_double",
-        ("full", "zeros"),
+        (
+            "fill", "full", "full_like", "zeros", "zeros_like",
+            "empty", "empty_like", "ones", "ones_like",
+        ),
         "construction fill loop",
     ),
     CBackendLLVMSSA(
@@ -1653,6 +2446,13 @@ TRANSLATIONS = (
             "not_equal",
             "maximum",
             "minimum",
+            "bitand",
+            "bitor",
+            "bitxor",
+            "shl",
+            "shr",
+            "logical_and",
+            "logical_or",
         ),
         "scalar binary semantics",
     ),
@@ -1675,6 +2475,13 @@ TRANSLATIONS = (
             "not_equal",
             "maximum",
             "minimum",
+            "bitand",
+            "bitor",
+            "bitxor",
+            "shl",
+            "shr",
+            "logical_and",
+            "logical_or",
         ),
         "elementwise binary loop",
     ),
@@ -1697,6 +2504,13 @@ TRANSLATIONS = (
             "not_equal",
             "maximum",
             "minimum",
+            "bitand",
+            "bitor",
+            "bitxor",
+            "shl",
+            "shr",
+            "logical_and",
+            "logical_or",
         ),
         "elementwise tensor-scalar loop",
     ),
@@ -1729,6 +2543,8 @@ TRANSLATIONS = (
             "asinh",
             "acosh",
             "atanh",
+            "sign",
+            "invert",
         ),
         "elementwise unary loop and signal-call frontier",
     ),
@@ -1737,6 +2553,12 @@ TRANSLATIONS = (
         "where_double",
         ("where",),
         "elementwise conditional selection",
+    ),
+    CBackendLLVMSSA(
+        "broadcast_double",
+        "broadcast_double",
+        ("broadcast_to", "expand"),
+        "row-major singleton-axis broadcast materialization",
     ),
     CBackendLLVMSSA(
         "reduce_dim_double",
@@ -1769,6 +2591,12 @@ TRANSLATIONS = (
         "existing-axis tensor concatenation",
     ),
     CBackendLLVMSSA(
+        "pad_double_nd",
+        "pad_double_nd",
+        ("pad",),
+        "arbitrary-rank tensor padding",
+    ),
+    CBackendLLVMSSA(
         "slice_copy_double",
         "slice_copy_double",
         ("slice",),
@@ -1781,10 +2609,34 @@ TRANSLATIONS = (
         "single-axis indexed selection",
     ),
     CBackendLLVMSSA(
+        "gather_values_double",
+        "gather_values_double",
+        ("gather",),
+        "single-axis selection from numerical index values",
+    ),
+    CBackendLLVMSSA(
         "index_assign_double",
         "index_assign_double",
         ("scatter",),
         "arbitrary-rank indexed mutation",
+    ),
+    CBackendLLVMSSA(
+        "index_set_double",
+        "index_set_double",
+        ("index_set",),
+        "functional arbitrary-rank indexed assignment",
+    ),
+    CBackendLLVMSSA(
+        "unfold2d_double",
+        "unfold2d_double",
+        ("unfold2d",),
+        "two-dimensional image-to-column transform",
+    ),
+    CBackendLLVMSSA(
+        "fold2d_double",
+        "fold2d_double",
+        ("fold2d",),
+        "two-dimensional overlap-accumulating column-to-image transform",
     ),
     CBackendLLVMSSA(
         "sign_double",
@@ -1819,8 +2671,20 @@ TRANSLATIONS = (
     CBackendLLVMSSA(
         "cast_double_to_float_values",
         "cast_double_to_float_values",
-        ("float", "double", "to_dtype"),
-        "double-storage float-value cast",
+        ("float", "to_dtype"),
+        "double-storage single-precision-value cast",
+    ),
+    CBackendLLVMSSA(
+        "cast_double_to_double_values",
+        "cast_double_to_double_values",
+        ("double", "to_dtype"),
+        "double-storage double-value cast (copying identity)",
+    ),
+    CBackendLLVMSSA(
+        "cast_double_to_bool_values",
+        "cast_double_to_bool_values",
+        ("bool", "to_dtype"),
+        "double-storage boolean-value cast (nonzero -> 1)",
     ),
     CBackendLLVMSSA(
         "sum_double",
@@ -1839,6 +2703,12 @@ TRANSLATIONS = (
         "matmul_double",
         ("matmul",),
         "three-loop matrix multiplication",
+    ),
+    CBackendLLVMSSA(
+        "batched_matmul_indexed_double",
+        "batched_matmul_indexed_double",
+        ("matmul",),
+        "broadcast-indexed batched matrix multiplication",
     ),
 )
 
@@ -1911,6 +2781,7 @@ def discover_c_backend_functions() -> tuple[CBackendFunction, ...]:
     return tuple(functions)
 
 
+@lru_cache(maxsize=1)
 def _c_backend_operator_codes() -> tuple[dict[str, str], dict[str, str]]:
     """Read the real ``_apply_operator__`` dispatch dictionaries."""
 
@@ -1974,15 +2845,46 @@ def _flatten_host_values(value: Any):
         yield value
 
 
+# Span-memory initialisation constructors and their implicit fill scalar.
+# ``None`` requires an explicit ``fill_value`` parameter (``full``/``fill``).
+_TAPE_FILL_DEFAULTS: Mapping[str, float | None] = {
+    "fill": None,
+    "zeros": 0.0,
+    "zeros_like": 0.0,
+    "empty": 0.0,
+    "empty_like": 0.0,
+    "ones": 1.0,
+    "ones_like": 1.0,
+    "full": None,
+    "full_like": None,
+}
+
+
 def lower_abstract_tensor_tape_to_llvm_ssa(
     tape: Any,
     outputs: Mapping[str, Any] | Any,
     *,
     function_name: str = "abstract_tensor_tape",
-    trig_solver: str = "libm",
+    trig_solver: str = "lut",
     trig_epsilon: float | None = None,
 ) -> TapeLLVMModule:
     """Lower a recorded AbstractTensor tape directly to real C-kernel LLVM.
+
+    **DEAD CODE, KEPT AS REFERENCE.** Nothing in the compiler or in any
+    deployment product reaches this function. Its only callers are
+    ``llvm_jit_backend.compile_torture_case_to_llvm`` -- itself a differential
+    oracle over the backend torture matrix rather than a deployment backend --
+    and ``tests/test_c_backend_llvm_ssa.py``. It is NOT a standard path
+    through the compiler: a standard object, a kernel-bank variant and every
+    shader product are lowered from repository SSA by
+    ``emit_ssa_function_to_llvm``, which never consults this module.
+
+    Retained deliberately, not by neglect. Being independent of the standard
+    path is exactly what lets it serve as a differential reference (see
+    ``src/compiler/llvm_optimizing_pipeline.py``, which keeps it as the
+    unoptimized comparison). Do not route new work through it, and do not
+    delete it to tidy up: a differential that shares machinery with the thing
+    it checks proves nothing.
 
     This first direct path covers the C backend's actual elementwise dispatch,
     rank-two ``matmul_double``, and recorded ``tensor_from_list`` constants.
@@ -2002,7 +2904,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
     required: set[int] = set()
 
     def require(value: Any) -> None:
-        identity = id(value)
+        identity = _identity(value)
         if identity in required:
             return
         node = nodes.get(identity)
@@ -2021,14 +2923,14 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
         if result_id in required
     ]
     produced_ids = {
-        id(node.ctx.get("result"))
+        _identity(node.ctx.get("result"))
         for node in live_nodes
     }
     feeds: list[Any] = []
     feed_seen: set[int] = set()
     for node in live_nodes:
         for operand in node.ctx.get("inputs", ()):
-            identity = id(operand)
+            identity = _identity(operand)
             if (
                 identity not in produced_ids
                 and identity not in feed_seen
@@ -2042,10 +2944,10 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
         *(f"ptr %output{index}" for index in range(len(outputs))),
     ]
     feed_pointer = {
-        id(value): f"%feed{index}" for index, value in enumerate(feeds)
+        _identity(value): f"%feed{index}" for index, value in enumerate(feeds)
     }
     output_pointer = {
-        id(value): f"%output{index}"
+        _identity(value): f"%output{index}"
         for index, value in enumerate(outputs.values())
     }
     globals_: list[str] = []
@@ -2058,7 +2960,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
         node for node in live_nodes if str(node.op) == "tensor_from_list"
     ):
         result = node.ctx["result"]
-        identity = id(result)
+        identity = _identity(result)
         values = tuple(_flatten_host_values(node.ctx["params"]["data"]))
         count = len(values)
         elements = ", ".join(
@@ -2076,7 +2978,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
     for node_index, node in enumerate(live_nodes):
         operation = ELEMENTWISE_ALIASES.get(str(node.op), str(node.op))
         result = node.ctx["result"]
-        result_id = id(result)
+        result_id = _identity(result)
         if operation == "tensor_from_list":
             continue
         if result_id in output_pointer:
@@ -2097,12 +2999,12 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
     for node_index, node in enumerate(live_nodes):
         operation = ELEMENTWISE_ALIASES.get(str(node.op), str(node.op))
         result = node.ctx["result"]
-        result_id = id(result)
+        result_id = _identity(result)
         if operation == "tensor_from_list":
             continue
         operands = tuple(node.ctx.get("inputs", ()))
         missing = [
-            id(operand) for operand in operands if id(operand) not in pointers
+            _identity(operand) for operand in operands if _identity(operand) not in pointers
         ]
         if missing:
             shortfalls.append(
@@ -2116,13 +3018,35 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
         destination = pointers[result_id]
         result_count = _element_count(result)
 
-        if operation in {"full", "zeros"} and "fill_double" in translated_symbols:
+        if operation in _TAPE_FILL_DEFAULTS and "fill_double" in translated_symbols:
             parameters = dict(node.ctx.get("params") or {})
-            fill_value = 0.0 if operation == "zeros" else parameters["fill_value"]
-            entry.append(
-                f"  call void @fill_double(ptr {destination}, "
-                f"double {_llvm_double(fill_value)}, i32 {result_count})"
+            default_value = _TAPE_FILL_DEFAULTS[operation]
+            fill_value = parameters.get(
+                "fill_value", parameters.get("value", default_value)
             )
+            if fill_value is None:
+                shortfalls.append(
+                    TapeLLVMShortfall(
+                        result_id,
+                        operation,
+                        "span initialisation requires an explicit fill_value",
+                    )
+                )
+                continue
+            fill_value = float(fill_value)
+            if fill_value == 0.0:
+                # Zero-fill is the calloc case: a bytewise memset is the
+                # definite lowering for zero-initialised span memory.
+                byte_count = result_count * 8
+                entry.append(
+                    f"  call void @llvm.memset.p0.i64(ptr {destination}, i8 0, "
+                    f"i64 {byte_count}, i1 false)"
+                )
+            else:
+                entry.append(
+                    f"  call void @fill_double(ptr {destination}, "
+                    f"double {_llvm_double(fill_value)}, i32 {result_count})"
+                )
             continue
 
         if operation == "arange" and "create_arange" in translated_symbols:
@@ -2163,7 +3087,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
                 )
                 entry.append(
                     f"  call void @reduce_dim_double("
-                    f"ptr {pointers[id(source)]}, ptr {destination}, "
+                    f"ptr {pointers[_identity(source)]}, ptr {destination}, "
                     f"ptr {symbol}, i32 {len(shape)}, i32 {dim}, i32 0)"
                 )
                 continue
@@ -2179,7 +3103,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
             scalar = f"%sum{node_index}"
             entry.append(
                 f"  {scalar} = call double @sum_double("
-                f"ptr {pointers[id(operands[0])]}, "
+                f"ptr {pointers[_identity(operands[0])]}, "
                 f"i32 {_element_count(operands[0])})"
             )
             entry.append(
@@ -2197,7 +3121,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
                     )
                 )
                 continue
-            source_pointer = pointers[id(operands[0])]
+            source_pointer = pointers[_identity(operands[0])]
             if result_id in output_pointer:
                 entry.append(
                     f"  call void @llvm.memcpy.p0.p0.i64("
@@ -2244,7 +3168,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
             )
             entry.append(
                 f"  call void @transpose_double("
-                f"ptr {pointers[id(source)]}, ptr {destination}, "
+                f"ptr {pointers[_identity(source)]}, ptr {destination}, "
                 f"ptr {shape_symbol}, ptr {axes_symbol}, i32 {len(shape)})"
             )
             continue
@@ -2268,7 +3192,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
             )
             entry.append(
                 f"  call void @cumsum_dim_double("
-                f"ptr {pointers[id(source)]}, ptr {destination}, "
+                f"ptr {pointers[_identity(source)]}, ptr {destination}, "
                 f"ptr {shape_symbol}, i32 {len(shape)}, i32 {dim})"
             )
             continue
@@ -2302,7 +3226,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
                         f"  {slot} = getelementptr inbounds "
                         f"[{len(operands)} x ptr], ptr {array}, "
                         f"i64 0, i64 {input_index}",
-                        f"  store ptr {pointers[id(operand)]}, ptr {slot}, align 8",
+                        f"  store ptr {pointers[_identity(operand)]}, ptr {slot}, align 8",
                     )
                 )
             entry.append(
@@ -2346,7 +3270,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
                         f"  {slot} = getelementptr inbounds "
                         f"[{len(operands)} x ptr], ptr {array}, "
                         f"i64 0, i64 {input_index}",
-                        f"  store ptr {pointers[id(operand)]}, ptr {slot}, align 8",
+                        f"  store ptr {pointers[_identity(operand)]}, ptr {slot}, align 8",
                     )
                 )
             entry.append(
@@ -2372,9 +3296,9 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
             condition, if_true, if_false = operands
             entry.append(
                 f"  call void @where_double("
-                f"ptr {pointers[id(condition)]}, "
-                f"ptr {pointers[id(if_true)]}, "
-                f"ptr {pointers[id(if_false)]}, "
+                f"ptr {pointers[_identity(condition)]}, "
+                f"ptr {pointers[_identity(if_true)]}, "
+                f"ptr {pointers[_identity(if_false)]}, "
                 f"ptr {destination}, i32 {result_count})"
             )
             continue
@@ -2389,7 +3313,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
                 continue
             opcode = opcode_index[unary_codes[operation]]
             entry.append(
-                f"  call void @unary_double(ptr {pointers[id(operands[0])]}, "
+                f"  call void @unary_double(ptr {pointers[_identity(operands[0])]}, "
                 f"ptr {destination}, i32 {result_count}, i32 {opcode})"
             )
             continue
@@ -2412,27 +3336,27 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
             if left_count == result_count and right_count == result_count:
                 entry.append(
                     f"  call void @binary_double("
-                    f"ptr {pointers[id(left)]}, ptr {pointers[id(right)]}, "
+                    f"ptr {pointers[_identity(left)]}, ptr {pointers[_identity(right)]}, "
                     f"ptr {destination}, i32 {result_count}, i32 {opcode})"
                 )
             elif left_count == result_count and right_count == 1:
                 scalar = f"%scalar{node_index}"
                 entry.append(
-                    f"  {scalar} = load double, ptr {pointers[id(right)]}, align 8"
+                    f"  {scalar} = load double, ptr {pointers[_identity(right)]}, align 8"
                 )
                 entry.append(
                     f"  call void @binary_scalar_double("
-                    f"ptr {pointers[id(left)]}, double {scalar}, "
+                    f"ptr {pointers[_identity(left)]}, double {scalar}, "
                     f"ptr {destination}, i32 {result_count}, i32 {opcode}, i32 0)"
                 )
             elif left_count == 1 and right_count == result_count:
                 scalar = f"%scalar{node_index}"
                 entry.append(
-                    f"  {scalar} = load double, ptr {pointers[id(left)]}, align 8"
+                    f"  {scalar} = load double, ptr {pointers[_identity(left)]}, align 8"
                 )
                 entry.append(
                     f"  call void @binary_scalar_double("
-                    f"ptr {pointers[id(right)]}, double {scalar}, "
+                    f"ptr {pointers[_identity(right)]}, double {scalar}, "
                     f"ptr {destination}, i32 {result_count}, i32 {opcode}, i32 1)"
                 )
             else:
@@ -2480,7 +3404,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
                 continue
             entry.append(
                 f"  call void @matmul_double("
-                f"ptr {pointers[id(left)]}, ptr {pointers[id(right)]}, "
+                f"ptr {pointers[_identity(left)]}, ptr {pointers[_identity(right)]}, "
                 f"ptr {destination}, i32 {m}, i32 {n}, i32 {p})"
             )
             continue
@@ -2504,7 +3428,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
     ]
     llvm_ir = LLVM_SSA_MODULE.rstrip() + "\n\n" + "\n".join(wrapper) + "\n"
     selected_epsilon = None
-    if trig_solver != "libm":
+    if trig_solver:
         from .llvm_signal_math import link_llvm_trig_solver
 
         llvm_ir, signal = link_llvm_trig_solver(
@@ -2521,8 +3445,8 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
         module.verify()
     return TapeLLVMModule(
         llvm_ir=llvm_ir,
-        feed_ids=tuple(id(value) for value in feeds),
-        output_ids={name: id(value) for name, value in outputs.items()},
+        feed_ids=tuple(_identity(value) for value in feeds),
+        output_ids={name: _identity(value) for name, value in outputs.items()},
         workspace_sizes=tuple(workspace_sizes),
         shortfalls=tuple(shortfalls),
         trig_solver=str(trig_solver),
@@ -2542,6 +3466,18 @@ def extract_llvm_function(symbol: str) -> str:
     if match is None:
         raise KeyError(f"LLVM SSA symbol {symbol!r} has no function definition")
     return _extract_braced_definition(LLVM_SSA_MODULE, match)
+
+
+def extract_llvm_declaration(symbol: str) -> str:
+    """Return the canonical external declaration for ``symbol``."""
+
+    pattern = re.compile(
+        rf"(?m)^declare[^\n@]*@{re.escape(symbol)}\([^\n]*$"
+    )
+    match = pattern.search(LLVM_SSA_MODULE)
+    if match is None:
+        raise KeyError(f"LLVM SSA symbol {symbol!r} has no declaration")
+    return match.group(0)
 
 
 def _header_opcode_order() -> tuple[str, ...]:
@@ -2596,6 +3532,62 @@ def covered_operations() -> frozenset[str]:
     )
 
 
+@lru_cache(maxsize=1)
+def c_backend_repository_ssa_reference():
+    """Return the C computational core as one repository-SSA code reference.
+
+    The C functions and handwritten LLVM are provenance.  The returned object
+    contains only Turing repository SSA and canonical operation→entrypoint
+    references; it cannot execute or dispatch tensor operations.
+    """
+
+    from ....transmogrifier.tensor_ssa_reference import (
+        SSATensorCodeReference,
+        SSATensorOperationReference,
+    )
+    from .llvm_repository_ssa import import_llvm_to_repository_ssa
+
+    imported = import_llvm_to_repository_ssa(
+        LLVM_SSA_MODULE,
+        include_declarations=False,
+    )
+    if not imported.complete:
+        raise ValueError(imported.shortfall_report())
+    for symbol, output_index in C_SSA_OUTPUT_ARGUMENTS.items():
+        function = imported.module.functions[symbol]
+        output = function.args[int(output_index)]
+        function.metadata["named_outputs"] = (("out", int(output.id)),)
+        function.metadata["ssa_output_argument"] = int(output_index)
+    for symbol, argument_indices in C_SSA_I32_POINTER_ARGUMENTS.items():
+        function = imported.module.functions[symbol]
+        for argument_index in argument_indices:
+            function.args[int(argument_index)].dtype = "int32"
+    for symbol, argument_indices in C_SSA_POINTER_ARRAY_ARGUMENTS.items():
+        function = imported.module.functions[symbol]
+        for argument_index in argument_indices:
+            function.args[int(argument_index)].dtype = "ptrptr_float64"
+    entrypoints_by_op: dict[str, list[str]] = {}
+    for translation in TRANSLATIONS:
+        for operation in translation.abstract_tensor_operations:
+            entrypoints_by_op.setdefault(str(operation), []).append(
+                str(translation.llvm_symbol)
+            )
+    operations = {
+        operation: SSATensorOperationReference(
+            operation,
+            tuple(dict.fromkeys(entrypoints)),
+        )
+        for operation, entrypoints in entrypoints_by_op.items()
+    }
+    return SSATensorCodeReference(
+        "c-backend-computational-core",
+        imported.module,
+        operations,
+        "c_backend_llvm_ssa.LLVM_SSA_MODULE",
+        C_SSA_EXTERNAL_PRIMITIVES,
+    )
+
+
 def c_dispatch_operations() -> frozenset[str]:
     """Operations in the real C backend's scalar opcode dictionaries.
 
@@ -2607,6 +3599,22 @@ def c_dispatch_operations() -> frozenset[str]:
 
     binary, unary = _c_backend_operator_codes()
     return frozenset(binary) | frozenset(unary)
+
+
+def c_tensor_opcode(operation: str) -> tuple[str, int] | None:
+    """Return ``(kind, fixed opcode)`` for one scalar C tensor operation."""
+
+    binary, unary = _c_backend_operator_codes()
+    name = str(operation)
+    if name in binary:
+        opcode_name = binary[name]
+        kind = "binary"
+    elif name in unary:
+        opcode_name = unary[name]
+        kind = "unary"
+    else:
+        return None
+    return kind, C_TENSOR_OPCODE_ORDER.index(opcode_name)
 
 
 def validate_translation_table(
@@ -2648,13 +3656,20 @@ __all__ = [
     "TapeLLVMModule",
     "TapeLLVMShortfall",
     "C_TENSOR_OPCODE_ORDER",
+    "C_SSA_OUTPUT_ARGUMENTS",
+    "C_SSA_I32_POINTER_ARGUMENTS",
+    "C_SSA_POINTER_ARRAY_ARGUMENTS",
+    "C_SSA_EXTERNAL_PRIMITIVES",
     "LLVM_SSA_MODULE",
     "PRECOMPILE_INTERNAL_OPERATORS",
     "TRANSLATIONS",
     "c_dispatch_operations",
+    "c_tensor_opcode",
     "covered_operations",
+    "c_backend_repository_ssa_reference",
     "discover_c_backend_functions",
     "extract_c_function",
+    "extract_llvm_declaration",
     "extract_llvm_function",
     "lower_abstract_tensor_tape_to_llvm_ssa",
     "translations_for_operation",

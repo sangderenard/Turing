@@ -53,6 +53,16 @@ class DualIRShell:
     profile: Optional[CLaunchProfile] = None
     log_messages: tuple[str, ...] = ()
     children: tuple["DualIRShell", ...] = field(default_factory=tuple)
+    # The rest of the graph-only program description
+    # (GRAPH_DESCRIPTION_LAYER_SURVEY.md): dependency structure and
+    # scope/ownership, alongside the numeric/control pair above and the
+    # reference/memory correlation table. All three are computed by the
+    # real compile path already; this is where they stop being scattered
+    # across an untyped map_ir dict and a compiled deployment instance.
+    class_navigation: Optional[Any] = None
+    dependency_regions: Optional[Any] = None
+    reference_tables: Optional[Any] = None
+    hierarchy_plan: Optional[Any] = None
 
     def rollup_profile(self) -> Optional[CLaunchProfile]:
         """This shell's own profile combined with every descendant's,
@@ -108,6 +118,12 @@ def compose_dual_ir_shell(
         profile=profile,
         log_messages=log_messages,
         children=children,
+        class_navigation=getattr(aot, "class_navigation", None),
+        dependency_regions=getattr(aot, "dependency_regions", None),
+        reference_tables=getattr(
+            getattr(aot, "deployment", None), "reference_tables", None,
+        ),
+        hierarchy_plan=getattr(aot, "hierarchy_plan", None),
     )
 
 

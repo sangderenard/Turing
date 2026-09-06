@@ -1,0 +1,92 @@
+/*@turing.segment.v1
+id = state-tracker
+language = python
+encoding = utf-8
+outputs = tick, get_counter
+entry = main
+@end*/
+_registry = {}
+
+
+class Counter:
+    def __init__(self, name):
+        self.name = name
+        self.value = 0
+
+    def bump(self, amount):
+        self.value += amount
+        return self.value
+
+
+def get_counter(name):
+    counter = _registry.get(name)
+    if counter is None:
+        counter = Counter(name)
+        _registry[name] = counter
+    return counter
+
+
+def make_adder(counter):
+    def adder(amount):
+        nonlocal counter
+        return counter.bump(amount)
+    return adder
+
+
+def tick(name, amount):
+    counter = get_counter(name)
+    adder = make_adder(counter)
+    total = adder(amount)
+    result = total
+    return result
+
+
+result = {"tick": tick, "get_counter": get_counter}
+/*@turing.end*/
+
+/*@turing.segment.v1
+id = native-tick
+language = cpp
+encoding = utf-8
+inputs = state-tracker
+outputs = tick_native
+entry = tick
+@end*/
+#include <unordered_map>
+#include <string>
+
+struct Counter {
+    std::string name;
+    long value = 0;
+    long bump(long amount) {
+        value += amount;
+        return value;
+    }
+};
+
+std::unordered_map<std::string, Counter*> registry;
+
+Counter* get_counter(const std::string& name) {
+    auto it = registry.find(name);
+    if (it != registry.end()) {
+        return it->second;
+    }
+    Counter* counter = new Counter{name};
+    registry[name] = counter;
+    return counter;
+}
+
+long tick(const std::string& name, long amount) {
+    Counter* counter = get_counter(name);
+    long& ref = counter->value;
+    ref += amount;
+    return counter->value;
+}
+
+auto make_adder = [&registry](const std::string& name) {
+    Counter* counter = registry[name];
+    return [counter](long amount) {
+        return counter->bump(amount);
+    };
+};
+/*@turing.end*/

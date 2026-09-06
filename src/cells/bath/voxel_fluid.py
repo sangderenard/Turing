@@ -203,8 +203,26 @@ class VoxelMACFluid:
         self.__dict__.update(copy.deepcopy(saved.__dict__))
 
     def compute_metrics(self, prev_mass: float) -> Metrics:
-        max_vel = float(max(np.max(np.abs(self.u)), np.max(np.abs(self.v)), np.max(np.abs(self.w))))
-        return Metrics(max_vel=max_vel, max_flux=max_vel, div_inf=0.0, mass_err=0.0)
+        max_vel = float(max(
+            np.max(np.abs(self.u)),
+            np.max(np.abs(self.v)),
+            np.max(np.abs(self.w)),
+        ))
+        div = (
+            (self.u[1:, :, :] - self.u[:-1, :, :])
+            + (self.v[:, 1:, :] - self.v[:, :-1, :])
+            + (self.w[:, :, 1:] - self.w[:, :, :-1])
+        ) * self.inv_dx
+        div = np.where(self.solid, 0.0, div)
+        div_inf = float(np.max(np.abs(div)))
+        mass_now = float(np.sum(self.S))
+        mass_err = abs(mass_now - prev_mass) / max(abs(prev_mass), 1.0e-12)
+        return Metrics(
+            max_vel=max_vel,
+            max_flux=max_vel,
+            div_inf=div_inf,
+            mass_err=mass_err,
+        )
 
     def step_with_controller(
         self,

@@ -459,8 +459,11 @@ class PyTorchTensorOperations(AbstractTensor):
     def log_softmax_(self, dim):
         return F.log_softmax(self.data, dim=dim)
 
-    def pad_(self, pad, value=0.0):
-        return F.pad(self.data, pad, value=value)
+    def pad_(self, pad, value=0.0, mode="constant"):
+        torch_mode = "replicate" if mode == "edge" else mode
+        if torch_mode == "constant":
+            return F.pad(self.data, pad, mode=torch_mode, value=value)
+        return F.pad(self.data, pad, mode=torch_mode)
 
     def pad2d_(self, pad, value=0.0):
         return F.pad(self.data, pad, mode="constant", value=float(value))

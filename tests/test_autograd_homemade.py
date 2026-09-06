@@ -2,6 +2,7 @@
 import pytest
 import numpy as np
 from src.common.tensors import AbstractTensor
+from src.common.tensors.abstraction import tensor_identity
 
 @pytest.mark.parametrize("a, b", [([2.0, 3.0], [4.0, 5.0]), ([[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]])])
 def test_autograd_add_and_mul(a, b):
@@ -49,7 +50,7 @@ def test_autograd_records_only_for_grad_inputs():
 
     node = autograd.tape.node(z)
     assert node is not None
-    assert {pid for pid, _ in node.parents} == {id(a), id(b)}
+    assert {pid for pid, _ in node.parents} == {tensor_identity(a), tensor_identity(b)}
 
 
 def test_autograd_single_tensor_input():
@@ -110,3 +111,21 @@ def test_autograd_complex_sequence():
 
 if __name__ == "__main__":
     test_autograd_complex_sequence()
+
+def test_gather_backward_accumulates_repeated_indices():
+    """A source position gathered k times receives the sum of k gradients.
+
+    The old rule assigned ``gx[index] = g`` and kept only the last
+    contribution for a repeated index; the balloon tire's face->vertex
+    gathers repeat every vertex several times, so its whole VJP was wrong.
+    """
+
+    x = AbstractTensor.tensor([1.0, 2.0, 3.0])
+    x.requires_grad = True
+    index = AbstractTensor.tensor(np.array([0, 2, 1, 2, 0], dtype=np.int64))
+    weights = AbstractTensor.tensor([1.0, 10.0, 100.0, 1000.0, 10000.0])
+    z = (x.gather(index, dim=0) * weights).sum()
+    (x_grad,) = AbstractTensor.autograd.grad(z, [x])
+    # position 0 is read by outputs 0 and 4, position 1 by output 2,
+    # position 2 by outputs 1 and 3.
+    assert np.allclose(np.asarray(x_grad), [1.0 + 10000.0, 100.0, 10.0 + 1000.0])

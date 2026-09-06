@@ -7,7 +7,7 @@ from time import perf_counter
 
 import numpy as np
 
-from ..abstraction import AbstractTensor as AT
+from ..abstraction import AbstractTensor as AT, tensor_identity
 from ..abstract_nn import (
     FusedProgram,
     Identity,
@@ -307,7 +307,9 @@ def train_refinement_predictor(
         program, program_input_id = capture_forward_program(
             model, x_train, output_name="prediction"
         )
-        parameter_feeds = {id(parameter): parameter for parameter in params}
+        parameter_feeds = {
+            tensor_identity(parameter): parameter for parameter in params
+        }
         missing_feeds = (
             set(program.feeds)
             - {program_input_id}

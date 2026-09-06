@@ -183,7 +183,7 @@ def coefficient_events_to_entropy_symbols(
     ) == 0
     # Token zero is already present in the padded/unused region. Multiplication
     # makes the intended event/EOB ownership explicit for future translators.
-    symbols = padded_tokens * (~eob).to_dtype("int64")
+    symbols = padded_tokens * eob.logical_not().to_dtype("int64")
     ac = EntropySymbolSequence(
         symbols=symbols,
         payloads=padded_payloads,

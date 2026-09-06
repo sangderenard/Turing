@@ -10,7 +10,7 @@ from typing import Callable, Mapping
 
 
 class GLRenderThread:
-    """Run a renderer in its own thread with a frame queue and history.
+    """Run a renderer with a non-blocking latest-frame mailbox and history.
 
     Parameters
     ----------
@@ -45,7 +45,10 @@ class GLRenderThread:
         self.viewport = viewport
         maxlen = history if history > 0 else None
         self.history: deque[Mapping[str, object]] = deque(maxlen=maxlen)
-        self.queue: "queue.Queue[Mapping[str, object] | None]" = queue.Queue()
+        # A single latest-frame mailbox prevents render lag and makes submit
+        # non-blocking. Stale frames have no semantic value; history is formed
+        # only from frames the renderer actually consumes.
+        self.queue: "queue.Queue[Mapping[str, object] | None]" = queue.Queue(maxsize=1)
         norm = loop_mode.lower()
         if norm == "none":
             norm = "idle"
@@ -54,13 +57,54 @@ class GLRenderThread:
         self.loop_mode = norm
         self.ghost_trail = ghost_trail
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self.submitted_frames = 0
+        self.dropped_frames = 0
+        self.presented_frames = 0
+        self.completed_hz = 0.0
+        self._rate_started = time.perf_counter()
+        self._rate_frame = 0
+        self.last_error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, daemon=False)
         self._thread.start()
 
     # Public API -----------------------------------------------------
+    @staticmethod
+    def _release_layers(layers: Mapping[str, object] | None) -> None:
+        if layers is None:
+            return
+        for layer in layers.values():
+            release = getattr(layer, "release", None)
+            if callable(release):
+                try:
+                    release()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _has_lease(layers: Mapping[str, object]) -> bool:
+        return any(callable(getattr(layer, "release", None)) for layer in layers.values())
+
     def submit(self, layers: Mapping[str, object]) -> None:
-        """Enqueue a new frame to be drawn by the thread."""
-        self.queue.put(layers)
+        """Publish the newest frame without ever waiting for the renderer."""
+        self.submitted_frames += 1
+        try:
+            self.queue.put_nowait(layers)
+            return
+        except queue.Full:
+            pass
+        self.dropped_frames += 1
+        try:
+            superseded = self.queue.get_nowait()
+            self.queue.task_done()
+            self._release_layers(superseded)
+        except queue.Empty:
+            pass
+        try:
+            self.queue.put_nowait(layers)
+        except queue.Full:
+            # Another producer won the latest-frame slot; either frame is
+            # newer than the one currently being rendered, so never wait.
+            self._release_layers(layers)
 
     def get_submit_hook(self) -> Callable[[Mapping[str, object]], None]:
         """Return a function that enqueues frames."""
@@ -70,11 +114,14 @@ class GLRenderThread:
 
         return hook
 
-    def stop(self) -> None:
-        """Signal the thread to exit and wait for completion."""
+    def stop(self, timeout: float | None = None) -> None:
+        """Signal exit and wait for native renderer cleanup to complete."""
         self._stop.set()
-        self.queue.put(None)
-        self._thread.join()
+        try:
+            self.queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._thread.join(timeout)
 
     # Lifecycle helpers ------------------------------------------------
     def is_alive(self) -> bool:
@@ -87,11 +134,50 @@ class GLRenderThread:
 
     # Internal worker ------------------------------------------------
     def _run(self) -> None:  # pragma: no cover - thread loop
+        try:
+            self._run_frames()
+        except BaseException as exc:
+            self.last_error = exc
+            self._stop.set()
+        finally:
+            self._cleanup()
+
+    def _cleanup(self) -> None:
+        while True:
+            try:
+                pending = self.queue.get_nowait()
+            except queue.Empty:
+                break
+            self._release_layers(pending)
+            self.queue.task_done()
+        if self.renderer is not None and hasattr(self.renderer, "dispose"):
+            try:
+                self.renderer.dispose()  # type: ignore[call-arg]
+            except Exception:
+                pass
+        try:
+            import pygame
+            pygame.quit()
+        except Exception:
+            pass
+
+    def _run_frames(self) -> None:
         from .api import draw_layers, rainbow_history_points  # local import
         try:  # pragma: no cover - tolerate missing OpenGL libs
             from .renderer import PointLayer
         except Exception:  # noqa: BLE001
             PointLayer = None  # type: ignore
+
+        def _record_present() -> None:
+            self.presented_frames += 1
+            now = time.perf_counter()
+            elapsed = now - self._rate_started
+            if elapsed >= 0.5:
+                self.completed_hz = (
+                    self.presented_frames - self._rate_frame
+                ) / elapsed
+                self._rate_started = now
+                self._rate_frame = self.presented_frames
 
         def _pump_events() -> None:
             """Process pygame events and handle window closure."""
@@ -132,6 +218,7 @@ class GLRenderThread:
                         if self._stop.is_set():
                             break
                         draw_layers(self.renderer, frame, self.viewport)  # type: ignore[arg-type]
+                        _record_present()
                         time.sleep(1.0 / 60.0)
                 else:
                     _pump_events()
@@ -140,16 +227,21 @@ class GLRenderThread:
                     if self.renderer is not None and hasattr(self.renderer, "draw"):
                         try:
                             self.renderer.draw(self.viewport)  # type: ignore[call-arg]
+                            _record_present()
                         except Exception:
                             pass
                     elif self.history:
                         frame = self.history[-1]
                         draw_layers(self.renderer, frame, self.viewport)  # type: ignore[arg-type]
+                        _record_present()
                     time.sleep(1.0 / 60.0)
                 continue
 
-            # Normal frame: draw and store in history
-            self.history.append(item)
+            # A leased CUDA observation page remains alive only through the
+            # device-to-device copy. It is never retained as replay history.
+            leased = self._has_lease(item)
+            if not leased:
+                self.history.append(item)
             frame = item
             if self.ghost_trail and PointLayer is not None:
                 pts_hist = []
@@ -161,6 +253,10 @@ class GLRenderThread:
                     ghost = rainbow_history_points(pts_hist)
                     frame = dict(item)
                     frame["ghost"] = ghost
-            draw_layers(self.renderer, frame, self.viewport)  # type: ignore[arg-type]
-            self.queue.task_done()
-        time.sleep(0.01)
+            try:
+                draw_layers(self.renderer, frame, self.viewport)  # type: ignore[arg-type]
+                _record_present()
+            finally:
+                if leased:
+                    self._release_layers(item)
+                self.queue.task_done()

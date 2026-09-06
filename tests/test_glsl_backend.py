@@ -10,6 +10,7 @@ the way to the GPU, which is a documented contract, not an accident.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from src.common.tensors.accelerator_backends.glsl_backend import (
     emit_program_source,
     emit_stack_source,
     emit_topk_offsets_source,
+    execute_captured_fused_program,
     execute_program,
     fuse_elementwise,
     gl_context_info,
@@ -59,6 +61,9 @@ from src.common.tensors.accelerator_backends.glsl_backend import (
     topk_chunks,
 )
 from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
+from src.common.tensors.accelerator_backends.c_primitive_program import (
+    CapturedFusedProgram,
+)
 
 from src.common.tensors.accelerator_backends import gl_context as glctx
 
@@ -1059,6 +1064,8 @@ def test_launch_planner_auto_sizes_and_folds_flat_work(monkeypatch):
     assert folded.local_size == 128
     assert folded.groups == (4, 2, 1)
     assert np.prod(folded.groups) * folded.local_size >= folded.count
+    assert folded.deployment.backend == "glsl"
+    assert folded.deployment.compute.groups == folded.groups
 
     empty = plan_launch(0, binding_count=2)
     assert empty.skipped and empty.groups == (0, 0, 0)
@@ -1066,6 +1073,96 @@ def test_launch_planner_auto_sizes_and_folds_flat_work(monkeypatch):
         plan_launch(1, binding_count=9)
     with pytest.raises(ValueError, match="uint u_count"):
         plan_launch(0x100000000)
+
+
+def test_glsl_reads_the_prebaked_matrix_without_rewriting_it(monkeypatch):
+    from src.common.tensors.accelerator_backends import glsl_backend
+    from src.compiler.tiling_strategy import (
+        build_gemm_tile_plan,
+        prebake_gemm_launch_matrix,
+    )
+
+    limits = GLComputeLimits(
+        max_group_count=(65535, 65535, 65535),
+        max_group_size=(256, 256, 64), max_invocations=256,
+        max_ssbo_bindings=8, max_compute_ssbo_blocks=8,
+    )
+    monkeypatch.setattr(glsl_backend, "_compute_limits", lambda: limits)
+    matrix = prebake_gemm_launch_matrix(
+        build_gemm_tile_plan(192, 128, 64, 64, worker_budget=7),
+        variant_key="one-universal-gemm", parameter_ids={},
+        total_layout={}, core_layout={}, chunk_size=1,
+    )
+    interpreted = glsl_backend.plan_gemm_matrix_deployment(matrix)
+    assert interpreted.module_key == "one-universal-gemm"
+    assert interpreted.lane_count == 6
+    assert interpreted.calls_per_lane == (1,) * 6
+    assert interpreted.choice.compute.count == 6
+
+
+def test_abstract_tensor_glsl_honors_source_algorithm_contract(gl):
+    from src.common.tensors.abstraction import AbstractTensor
+    from src.compiler.work_contract import (
+        PRESETS,
+        ShaderOptimizationContract,
+        set_active_contract,
+    )
+
+    left_values = np.arange(24, dtype=np.float32).reshape(2, 3, 4) / 17.0
+    right_values = np.arange(20, dtype=np.float32).reshape(4, 5) / 13.0
+    contract = dataclasses.replace(
+        PRESETS["develop"],
+        name="source-proof",
+        shaders=ShaderOptimizationContract(blas_gemm="source_algorithm"),
+    )
+    set_active_contract(contract)
+    try:
+        with AbstractTensor.use_backend("glsl"):
+            result = AbstractTensor.tensor(left_values) @ AbstractTensor.tensor(
+                right_values
+            )
+        np.testing.assert_allclose(
+            result.numpy(),
+            np.matmul(left_values, right_values),
+            rtol=2e-5,
+            atol=2e-5,
+        )
+    finally:
+        set_active_contract(None)
+
+
+def test_captured_matmul_dispatches_through_named_glsl_blas_intrinsic(
+    monkeypatch,
+):
+    from src.common.tensors.accelerator_backends import glsl_backend
+
+    program = FusedProgram(
+        version=1,
+        feeds={10, 11},
+        steps=[OpStep(0, "matmul", [10, 11], {}, 12)],
+        outputs={"result": 12},
+        meta={
+            10: Meta(shape=(2, 3), dtype="float32", device="glsl"),
+            11: Meta(shape=(3, 4), dtype="float32", device="glsl"),
+            12: Meta(shape=(2, 4), dtype="float32", device="glsl"),
+        },
+        extras={"kernel_kind": "matmul"},
+    )
+    left, right, result = object(), object(), object()
+    observed = []
+    monkeypatch.setattr(
+        glsl_backend,
+        "glslblas_gemm",
+        lambda first, second: observed.append((first, second)) or result,
+    )
+
+    outputs = execute_captured_fused_program(
+        CapturedFusedProgram(program, {}),
+        {10: left, 11: right},
+    )
+
+    assert outputs == {"result": result}
+    assert observed == [(left, right)]
 
 
 @pytest.mark.parametrize(

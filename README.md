@@ -31,6 +31,9 @@ This project simulates a cassette-driven "survival computer" using a compile and
 - [Modules & capabilities](#modules--capabilities)
 - [Tests](#tests)
 - [Full module index](MODULES.md)
+- [Dtype, algebra & spectral domain manifesto](DTYPE_AND_SPECTRAL_DOMAIN_MANIFESTO.md) — how new number systems are declared once and generated into every backend
+- [Auto-port round trip & spectral diagnosis](docs/AUTO_PORT_ROUND_TRIP_AND_SPECTRAL_DIAGNOSIS.md) — why an unrecognized call silently vanishes during SSA lowering, bounded precisely, and where AT.eigh's real-scale ceiling is
+- [Function → deployment, backed by profiling](docs/FUNCTION_TO_DEPLOYMENT_HANDOFF.md) — the worked eigh case (521 s → 0.26 s from plain authored Python), the calling convention that will bite you, and the one open defect blocking specialisation
 
 ## Managed scientific time
 

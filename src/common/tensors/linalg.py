@@ -2,6 +2,12 @@ from __future__ import annotations
 from typing import Optional, Tuple, Union, List
 from .abstraction import AbstractTensor
 from .abstraction_methods.eigen import eigh, cholesky
+
+
+__all__ = (
+    "eye", "dot", "norm", "cross", "trace", "det", "solve", "inv",
+    "eigh", "cholesky",
+)
 # ----------------------- small helpers -----------------------
 def _axis(dim: int, nd: int) -> int:
     d = dim if dim >= 0 else dim + nd
@@ -145,6 +151,24 @@ def _swap_rows(M: AbstractTensor, i: int, j: int) -> None:
     M[..., i, :] = Mj
     M[..., j, :] = Mi
 
+
+def _masked_pivot_rows(M: AbstractTensor, k: int, pivot_mask: AbstractTensor):
+    """Swap row ``k`` with a one-hot selected row using tensor source only."""
+
+    n = M.get_shape()[-2]
+    original = M[..., k, :].clone()
+    selected = original * 0
+    for offset in range(n - k):
+        mask = pivot_mask[..., offset].to_dtype(M.get_dtype()).unsqueeze(-1)
+        selected = selected + mask * M[..., k + offset, :].clone()
+    for offset in range(n - k):
+        row = M[..., k + offset, :].clone()
+        mask = pivot_mask[..., offset].to_dtype(M.get_dtype()).unsqueeze(-1)
+        M[..., k + offset, :] = mask * original + (1 - mask) * row
+    M[..., k, :] = selected
+    parity = pivot_mask[..., 0].to_dtype(M.get_dtype()) * 2 - 1
+    return M, parity
+
 def _lu_decompose_inplace(A: AbstractTensor):
     """
     Doolittle LU with partial pivoting.
@@ -164,37 +188,8 @@ def _lu_decompose_inplace(A: AbstractTensor):
         # We take the first occurrence; implement argmax via max + equality trick
         maxv = col.max(dim=-1, keepdim=True)
         piv_rel = (col == maxv).to_dtype(A.long_dtype_)  # mask
-        # compute first index where mask==1; simple fallback: sum of prefix
-        # Build running index vector [0..]
-        idxv = type(A).arange(col.get_shape()[-1], dtype=A.long_dtype_, device=U.get_device())
-        if len(col.get_shape()) > 1:
-            idxv = idxv.reshape(
-                (1,) * (len(col.get_shape()) - 1) + (col.get_shape()[-1],)
-            ).expand(col.get_shape())
-        piv_idx_rel = (piv_rel * idxv).max(dim=-1)  # max picks the first highest index
-        piv = AbstractTensor.tensor(piv_idx_rel + k).to_dtype(A.long_dtype_)  # absolute pivot index
-        # swap rows k and piv in U
-        # We need scalar pivot per batch; for simplicity, handle only no-batch or identical pivot → if not, loop batches
-        if len(shp) == 2:
-            pk = int(piv.item())
-            if pk != k:
-                _swap_rows(U, k, pk)
-                sign = sign * -1
-        else:
-            # fallback: loop over batches (slow but correct)
-            # flatten batch dims
-            B = 1
-            for s in shp[:-2]: B *= s
-            Uv = U.reshape((B, n, n))
-            signv = sign.reshape((B,))
-            pivv = piv.reshape((B,))
-            for b in range(B):
-                pk = int(pivv[b].item())
-                if pk != k:
-                    _swap_rows(Uv[b:b+1], k, pk)
-                    signv[b:b+1] = signv[b:b+1] * -1
-            U = Uv.reshape(tuple(shp))
-            sign = signv.reshape(tuple(shp[:-2]))
+        U, parity = _masked_pivot_rows(U, k, piv_rel)
+        sign = sign * parity
         # elimination
         pivot_val = U[..., k, k]
         # guard tiny pivot: no singular handling here, you can add epsilon
@@ -261,29 +256,8 @@ def solve(A: AbstractTensor, b: AbstractTensor) -> AbstractTensor:
         col = abs(U[..., k:, k])
         maxv = col.max(dim=-1, keepdim=True)
         piv_rel = (col == maxv).to_dtype(A.long_dtype_)
-        idxv = AbstractTensor.arange(col.get_shape()[-1], dtype=A.long_dtype_, device=U.get_device())
-        if len(col.get_shape()) > 1:
-            idxv = idxv.reshape(
-                (1,) * (len(col.get_shape()) - 1) + (col.get_shape()[-1],)
-            ).expand(col.get_shape())
-        piv_idx_rel = (piv_rel * idxv).max(dim=-1)
-        if len(shp) == 2:
-            pk = int((piv_idx_rel + k).item())
-            if pk != k:
-                _swap_rows(U, k, pk)
-                _swap_rows(B, k, pk)
-        else:
-            # loop batches
-            Bt = B.reshape((-1, n, B.get_shape()[-1]))
-            Ut = U.reshape((-1, n, n))
-            pivv = (piv_idx_rel + k).reshape(-1)
-            for bi in range(pivv.shape[0]):
-                pk = int(pivv[bi])
-                if pk != k:
-                    _swap_rows(Ut[bi:bi+1], k, pk)
-                    _swap_rows(Bt[bi:bi+1], k, pk)
-            U = Ut.reshape(tuple(shp))
-            B = Bt.reshape(tuple(b.get_shape()))
+        U, _ = _masked_pivot_rows(U, k, piv_rel)
+        B, _ = _masked_pivot_rows(B, k, piv_rel)
         # elimination on U only to match pivots; not needed further
         pivot_val = U[..., k, k]
         for i in range(k+1, n):

@@ -13,6 +13,19 @@ def _to3(x):
     return (x, x, x) if isinstance(x, int) else x
 
 
+def _zeros_from(reference: AbstractTensor, shape: tuple[int, ...]) -> AbstractTensor:
+    """Allocate a different shape without losing the reference backend context."""
+
+    result = type(reference)(
+        track_time=getattr(reference, "track_time", False),
+        tape=getattr(reference, "_tape", None),
+    )
+    if hasattr(reference, "_program"):
+        result._program = reference._program
+    result.data = reference.zeros_(shape)
+    return result
+
+
 def fold2d(
     cols: AbstractTensor,
     output_size: Tuple[int, int, int, int],
@@ -30,6 +43,33 @@ def fold2d(
 
     Implemented using only AbstractTensor ops: reshape, indexing and addition.
     """
+    if hasattr(cols, "fold2d_"):
+        finalize = AbstractTensor._pre_autograd(
+            "fold2d",
+            [cols],
+            params={
+                "output_size": tuple(output_size),
+                "kernel_size": _to2(kernel_size),
+                "stride": _to2(stride),
+                "padding": _to2(padding),
+                "dilation": _to2(dilation),
+            },
+        )
+        result = type(cols)(
+            track_time=getattr(cols, "track_time", False),
+            tape=getattr(cols, "_tape", None),
+        )
+        if hasattr(cols, "_program"):
+            result._program = cols._program
+        result.data = cols.fold2d_(
+            output_size,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+        )
+        return finalize(result)
+
     kH, kW = _to2(kernel_size)
     sH, sW = _to2(stride)
     pH, pW = _to2(padding)
@@ -45,7 +85,7 @@ def fold2d(
     # (N, C, kH, kW, Hout, Wout)
     cols6 = cols.reshape(N, C, kH, kW, Hout, Wout)
 
-    ypad = AbstractTensor.zeros((N, C, Hpad, Wpad))
+    ypad = _zeros_from(cols, (N, C, Hpad, Wpad))
     for i in range(kH):
         hi = i * dH
         hi_end = hi + sH * Hout
@@ -94,7 +134,7 @@ def fold3d(
 
     cols8 = cols.reshape(N, C, kD, kH, kW, Dout, Hout, Wout)
 
-    ypad = AbstractTensor.zeros((N, C, Dpad, Hpad, Wpad))
+    ypad = _zeros_from(cols, (N, C, Dpad, Hpad, Wpad))
     for kd in range(kD):
         d0 = kd * dD
         d1 = d0 + sD * Dout
@@ -124,6 +164,31 @@ def unfold2d(
 
     Returns (N, C*kH*kW, Hout*Wout).
     """
+    if hasattr(x, "unfold2d_"):
+        finalize = AbstractTensor._pre_autograd(
+            "unfold2d",
+            [x],
+            params={
+                "kernel_size": _to2(kernel_size),
+                "stride": _to2(stride),
+                "padding": _to2(padding),
+                "dilation": _to2(dilation),
+            },
+        )
+        result = type(x)(
+            track_time=getattr(x, "track_time", False),
+            tape=getattr(x, "_tape", None),
+        )
+        if hasattr(x, "_program"):
+            result._program = x._program
+        result.data = x.unfold2d_(
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+        )
+        return finalize(result)
+
     kH, kW = _to2(kernel_size)
     sH, sW = _to2(stride)
     pH, pW = _to2(padding)
@@ -137,11 +202,11 @@ def unfold2d(
     Wout = (Wpad - eKW) // sW + 1
 
     # Zero-pad via assignment (keeps graph alive)
-    xpad = AbstractTensor.zeros((N, C, Hpad, Wpad))
+    xpad = _zeros_from(x, (N, C, Hpad, Wpad))
     xpad[:, :, pH : pH + H, pW : pW + W] = x
 
     # Allocate cols6 and fill by slicing
-    cols6 = AbstractTensor.zeros((N, C, kH, kW, Hout, Wout))
+    cols6 = _zeros_from(x, (N, C, kH, kW, Hout, Wout))
     for i in range(kH):
         hi = i * dH
         hi_end = hi + sH * Hout
@@ -180,10 +245,10 @@ def unfold3d(
     Hout = (Hpad - eKH) // sH + 1
     Wout = (Wpad - eKW) // sW + 1
 
-    xpad = AbstractTensor.zeros((N, C, Dpad, Hpad, Wpad))
+    xpad = _zeros_from(x, (N, C, Dpad, Hpad, Wpad))
     xpad[:, :, pD : pD + D, pH : pH + H, pW : pW + W] = x
 
-    cols8 = AbstractTensor.zeros((N, C, kD, kH, kW, Dout, Hout, Wout))
+    cols8 = _zeros_from(x, (N, C, kD, kH, kW, Dout, Hout, Wout))
     for kd in range(kD):
         d0 = kd * dD
         d1 = d0 + sD * Dout
@@ -197,4 +262,3 @@ def unfold3d(
                 cols8[:, :, kd, kh, kw, :, :, :] = patch
 
     return cols8.reshape(N, C * kD * kH * kW, Dout * Hout * Wout)
-

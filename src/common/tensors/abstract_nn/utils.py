@@ -44,11 +44,15 @@ def from_list_like(
     Supports requires_grad and tape propagation without creating intermediate numpy arrays.
     """
     cls = type(like)
-    t = AbstractTensor.get_tensor(
+    # Creation relative to a source-producing backend must retain more than
+    # the wrapper class: it must join the same authored program.  The
+    # backend's centralized list constructor receives ``like`` so it can
+    # preserve that ownership without abstract_nn knowing what a program is.
+    t = cls._tensor_from_list(
         data,
-        cls=cls,
         dtype=like.get_dtype(),
         device=like.get_device(),
+        like=like,
         requires_grad=requires_grad,
         tape=tape,
     )

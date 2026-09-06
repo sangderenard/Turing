@@ -25,7 +25,7 @@ from typing import Any, Dict, Tuple
 
 import networkx as nx
 
-from ..abstraction import AbstractTensor as AT
+from ..abstraction import AbstractTensor as AT, tensor_identity
 from ..autograd import autograd
 from ..autograd_process import AutogradProcess
 
@@ -154,10 +154,10 @@ class NNGraphCapsule:
             self.tensor_store[tid] = self._materialize_tensor(tref)
 
         # Keep grads for parameters if they exist
-        self.params_tids = tuple(id(p) for p in params)
+        self.params_tids = tuple(tensor_identity(p) for p in params)
         for p in params:
             if getattr(p, "grad", None) is not None:
-                self.grad_store[id(p)] = self._materialize_tensor(p.grad)
+                self.grad_store[tensor_identity(p)] = self._materialize_tensor(p.grad)
 
         # Locate and record loss tid for convenience
         self.loss_tid = getattr(proc.tape, "_loss_id", None)
@@ -286,7 +286,7 @@ class NNGraphCapsule:
             missing: list[tuple[int, str]] = []
             if bwd_graph is not None:
                 for p in params:
-                    pid = id(p)
+                    pid = tensor_identity(p)
                     if not bwd_graph.has_node(pid):
                         lbl = getattr(p, "_label", None) or getattr(p, "shape", None) or "param"
                         missing.append((pid, str(lbl)))
@@ -301,7 +301,7 @@ class NNGraphCapsule:
                     for rid, node in autograd.tape._nodes.items():
                         ctx = node.ctx
                         ins = ctx.get("inputs", [])
-                        in_ids = [id(t) for t in ins]
+                        in_ids = [tensor_identity(t) for t in ins]
                         if pid in in_ids:
                             op = node.op
                             consumers.append({
@@ -338,10 +338,10 @@ class NNGraphCapsule:
         for tid, tref in autograd.tape._tensor_refs.items():
             self.tensor_store[tid] = self._materialize_tensor(tref)
 
-        self.params_tids = tuple(id(p) for p in params)
+        self.params_tids = tuple(tensor_identity(p) for p in params)
         for p in params:
             if getattr(p, "grad", None) is not None:
-                self.grad_store[id(p)] = self._materialize_tensor(p.grad)
+                self.grad_store[tensor_identity(p)] = self._materialize_tensor(p.grad)
 
         self.loss_tid = getattr(proc.tape, "_loss_id", None)
 

@@ -141,6 +141,15 @@
             case CT_OP_NE: return a != b;
             case CT_OP_MAXIMUM: return a > b ? a : b;
             case CT_OP_MINIMUM: return a < b ? a : b;
+            case CT_OP_BITAND: return (double)((long long)a & (long long)b);
+            case CT_OP_BITOR: return (double)((long long)a | (long long)b);
+            case CT_OP_BITXOR: return (double)((long long)a ^ (long long)b);
+            case CT_OP_SHL:
+                return (double)((long long)a << ((unsigned long long)b & 63));
+            case CT_OP_SHR:
+                return (double)((long long)a >> ((unsigned long long)b & 63));
+            case CT_OP_LOGICAL_AND: return (a != 0.0) && (b != 0.0);
+            case CT_OP_LOGICAL_OR: return (a != 0.0) || (b != 0.0);
             default: return NAN;
         }
     }
@@ -162,8 +171,16 @@
         for (int i = 0; i < m; ++i) {
             for (int j = 0; j < p; ++j) {
                 double sum = 0.0;
+                double correction = 0.0;
                 for (int k = 0; k < n; ++k) {
-                    sum += a[i * n + k] * b[k * p + j];
+                    /* Compensated inner products keep cancellation-heavy
+                       operators (for example row-sum-zero Laplacians) from
+                       turning rounding residue into a material force. */
+                    double product = a[i * n + k] * b[k * p + j];
+                    double adjusted = product - correction;
+                    double next = sum + adjusted;
+                    correction = (next - sum) - adjusted;
+                    sum = next;
                 }
                 out[i * p + j] = sum;
             }
@@ -191,6 +208,17 @@
                 case CT_OP_LOGICAL_NOT:
                     out[i] = value == 0.0 ? 1.0 : 0.0; break;
                 case CT_OP_TANH: out[i] = tanh(value); break;
+                /* Branch-free stable form: exp() of a large positive argument
+                   overflows, so the sign of the input decides which way the
+                   quotient is written. Both branches are the same function. */
+                case CT_OP_SIGMOID:
+                    if (value >= 0.0) {
+                        out[i] = 1.0 / (1.0 + exp(-value));
+                    } else {
+                        double activation = exp(value);
+                        out[i] = activation / (1.0 + activation);
+                    }
+                    break;
                 case CT_OP_SIN: out[i] = sin(value); break;
                 case CT_OP_COS: out[i] = cos(value); break;
                 case CT_OP_TAN: out[i] = tan(value); break;
@@ -202,6 +230,11 @@
                 case CT_OP_ASINH: out[i] = asinh(value); break;
                 case CT_OP_ACOSH: out[i] = acosh(value); break;
                 case CT_OP_ATANH: out[i] = atanh(value); break;
+                case CT_OP_SIGN:
+                    out[i] = value > 0.0 ? 1.0 : (value < 0.0 ? -1.0 : 0.0);
+                    break;
+                case CT_OP_INVERT:
+                    out[i] = (double)(~(long long)value); break;
                 default: out[i] = value; break;
             }
         }
@@ -228,10 +261,39 @@
         }
     }
 
+    void gather_values_double(
+        const double* input,
+        double* output,
+        const int* shape,
+        int ndim,
+        int dim,
+        const double* indices,
+        int index_count) {
+        int before = 1;
+        int after = 1;
+        for (int axis = 0; axis < dim; ++axis) before *= shape[axis];
+        for (int axis = dim + 1; axis < ndim; ++axis) after *= shape[axis];
+        const int source_count = shape[dim];
+        for (int batch = 0; batch < before; ++batch) {
+            for (int item = 0; item < index_count; ++item) {
+                int source_item = (int)indices[item];
+                if (source_item < 0) source_item += source_count;
+                for (int element = 0; element < after; ++element) {
+                    const int output_index =
+                        ((batch * index_count + item) * after) + element;
+                    const int source_index =
+                        ((batch * source_count + source_item) * after) + element;
+                    output[output_index] = input[source_index];
+                }
+            }
+        }
+    }
+
     static int is_unary_op(int op) {
         return (
             (op >= CT_OP_SQRT && op <= CT_OP_LOGICAL_NOT)
-            || (op >= CT_OP_TANH && op <= CT_OP_ATANH)
+            || (op >= CT_OP_TANH && op <= CT_OP_INVERT)
+            || op == CT_OP_SIGMOID
         );
     }
 
@@ -568,6 +630,80 @@
         }
     }
 
+    void index_set_double(
+        const double* input, double* output, const int* shape, int ndim,
+        const int* axis_offsets, const int* axis_indices,
+        const double* values, int value_count) {
+        int element_count = 1;
+        for (int axis = 0; axis < ndim; ++axis)
+            element_count *= shape[axis];
+        memcpy(output, input, element_count * sizeof(double));
+        index_assign_double(
+            output, shape, ndim, axis_offsets, axis_indices,
+            values, value_count);
+    }
+
+    void unfold2d_double(
+        const double* input, double* output,
+        int n, int c, int h, int w,
+        int kernel_h, int kernel_w,
+        int stride_h, int stride_w,
+        int padding_h, int padding_w,
+        int dilation_h, int dilation_w) {
+        int effective_h = (kernel_h - 1) * dilation_h + 1;
+        int effective_w = (kernel_w - 1) * dilation_w + 1;
+        int output_h = (h + 2 * padding_h - effective_h) / stride_h + 1;
+        int output_w = (w + 2 * padding_w - effective_w) / stride_w + 1;
+        for (int batch = 0; batch < n; ++batch)
+            for (int channel = 0; channel < c; ++channel)
+                for (int kh = 0; kh < kernel_h; ++kh)
+                    for (int kw = 0; kw < kernel_w; ++kw)
+                        for (int oh = 0; oh < output_h; ++oh)
+                            for (int ow = 0; ow < output_w; ++ow) {
+                                int ih = oh * stride_h - padding_h + kh * dilation_h;
+                                int iw = ow * stride_w - padding_w + kw * dilation_w;
+                                int column = (((channel * kernel_h + kh) * kernel_w) + kw);
+                                int output_index = (
+                                    (batch * c * kernel_h * kernel_w + column)
+                                    * output_h + oh) * output_w + ow;
+                                output[output_index] = (
+                                    ih >= 0 && ih < h && iw >= 0 && iw < w
+                                ) ? input[((batch * c + channel) * h + ih) * w + iw]
+                                  : 0.0;
+                            }
+    }
+
+    void fold2d_double(
+        const double* columns, double* output,
+        int n, int c, int h, int w,
+        int kernel_h, int kernel_w,
+        int stride_h, int stride_w,
+        int padding_h, int padding_w,
+        int dilation_h, int dilation_w) {
+        int effective_h = (kernel_h - 1) * dilation_h + 1;
+        int effective_w = (kernel_w - 1) * dilation_w + 1;
+        int output_h = (h + 2 * padding_h - effective_h) / stride_h + 1;
+        int output_w = (w + 2 * padding_w - effective_w) / stride_w + 1;
+        memset(output, 0, (size_t)n * c * h * w * sizeof(double));
+        for (int batch = 0; batch < n; ++batch)
+            for (int channel = 0; channel < c; ++channel)
+                for (int kh = 0; kh < kernel_h; ++kh)
+                    for (int kw = 0; kw < kernel_w; ++kw)
+                        for (int oh = 0; oh < output_h; ++oh)
+                            for (int ow = 0; ow < output_w; ++ow) {
+                                int ih = oh * stride_h - padding_h + kh * dilation_h;
+                                int iw = ow * stride_w - padding_w + kw * dilation_w;
+                                if (ih < 0 || ih >= h || iw < 0 || iw >= w)
+                                    continue;
+                                int column = (((channel * kernel_h + kh) * kernel_w) + kw);
+                                int column_index = (
+                                    (batch * c * kernel_h * kernel_w + column)
+                                    * output_h + oh) * output_w + ow;
+                                output[((batch * c + channel) * h + ih) * w + iw]
+                                    += columns[column_index];
+                            }
+    }
+
     void sign_double(const double* input, double* output, int n) {
         for (int i = 0; i < n; ++i)
             output[i] = input[i] > 0.0 ? 1.0 : (
@@ -599,6 +735,17 @@
 
     void cast_double_to_float_values(const double* a, double* out, int n) {
         for (int i = 0; i < n; ++i) out[i] = (double)((float)a[i]);
+    }
+
+    /* double -> double is the identity over values, but it is still a cast:
+     * the reference semantics (numpy astype) always copies, so aliasing the
+     * source buffer would change behaviour under later in-place mutation. */
+    void cast_double_to_double_values(const double* a, double* out, int n) {
+        for (int i = 0; i < n; ++i) out[i] = a[i];
+    }
+
+    void cast_double_to_bool_values(const double* a, double* out, int n) {
+        for (int i = 0; i < n; ++i) out[i] = (a[i] != 0.0) ? 1.0 : 0.0;
     }
 
     void log_softmax_1d(const double* a, double* out, int n) {

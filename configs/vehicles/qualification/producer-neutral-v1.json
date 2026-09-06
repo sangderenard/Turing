@@ -1,0 +1,173 @@
+{
+  "schema": "turing.vehicle-qualification-spec.v1",
+  "identity": "producer-neutral-development-v1",
+  "description": "Reference acceptance policy for arbitrary vehicle producers; model equations and vehicle parameters remain separate authority.",
+  "hard_invariants": {
+    "finite_absolute_state_ceiling": 1000000000000.0,
+    "require_contact_ccd_before_gravity": true,
+    "require_four_live_pressure_loads_under_gravity": true,
+    "forbid_unaccounted_positive_energy": true,
+    "forbid_uncommanded_graph_disconnection": true,
+    "require_deterministic_seed_replay": true
+  },
+  "quiet_tolerances": {
+    "maximum_linear_speed_m_s": 0.03,
+    "maximum_angular_speed_rad_s": 0.03,
+    "maximum_reaction_rate_n_s": 25.0,
+    "maximum_energy_rate_w": 25.0,
+    "default_consecutive_samples": 64,
+    "gravity_consecutive_seconds": 2.0
+  },
+  "contact_tolerances": {
+    "minimum_live_force_n": 10.0,
+    "minimum_clamped_corner_load_fraction": 0.005,
+    "minimum_released_total_weight_fraction": 0.80,
+    "minimum_pressure_change_pa": 0.1,
+    "minimum_pressure_change_fraction": 0.0000001
+  },
+  "clamp_release_tolerances": {
+    "maximum_force_n": 1.0,
+    "maximum_moment_nm": 1.0,
+    "maximum_compression_speed_m_s": 0.003,
+    "required_consecutive_zero_samples": 128,
+    "maximum_release_position_jump_m": 0.0001,
+    "maximum_release_velocity_jump_m_s": 0.001,
+    "maximum_spring_rate_scale": 12.0,
+    "spring_rate_feedback_per_s": 4.0,
+    "ride_height_tire_preload_m": 0.015
+  },
+  "leveling_tolerances": {
+    "maximum_corner_pose_error_m": 0.0005,
+    "maximum_sensor_normalized_residual": 0.05,
+    "minimum_supported_corner_fraction": 1.0,
+    "minimum_supported_weight_fraction": 0.65,
+    "pose_feedback_gain_per_s": 2.5,
+    "trim_feedback_gain_per_s": 9.0,
+    "calibrated_mode_gains": {
+      "heave": 1.0,
+      "roll": 1.0,
+      "pitch": 1.0,
+      "cross_weight": 0.72
+    },
+    "falling": {
+      "default_policy_selector": 1,
+      "policies": {
+        "0": "hold-current-geometry",
+        "1": "symmetric-landing-ready-droop",
+        "2": "terrain-conformal-predicted-placement"
+      },
+      "vertical_velocity_threshold_m_s": 0.35,
+      "velocity_blend_range_m_s": 1.0,
+      "landing_ready_corner_offset_m": -0.045,
+      "maximum_unloaded_placement_rate_m_s": 0.08,
+      "disable_force-and-crossweight-hunting_while_airborne": true
+    }
+  },
+  "stationarity_tolerances": {
+    "mean_absolute_floor": 0.00001,
+    "mean_relative_fraction": 0.01,
+    "rms_absolute_floor": 0.00001,
+    "rms_relative_fraction": 0.02,
+    "standard_error_multiplier": 3.0,
+    "maximum_normalized_score": 1.0
+  },
+  "observation": {
+    "sample_hz": 64,
+    "default_stage": {
+      "window_samples": 64,
+      "evaluation_stride_samples": 16,
+      "required_stable_windows": 3,
+      "minimum_seconds": 3.0
+    },
+    "stage_overrides": {
+      "suspension-load-transfer": {
+        "window_samples": 256,
+        "evaluation_stride_samples": 64,
+        "required_stable_windows": 2,
+        "minimum_seconds": 10.0
+      },
+      "rolling-start": {
+        "window_samples": 256,
+        "evaluation_stride_samples": 64,
+        "required_stable_windows": 2,
+        "minimum_seconds": 10.0
+      },
+      "leveling-controller-program-capture": {
+        "window_samples": 128,
+        "evaluation_stride_samples": 32,
+        "required_stable_windows": 3,
+        "minimum_seconds": 20.0
+      }
+    }
+  },
+  "product_classes": {
+    "development": {
+      "description": "Physics-integrity gate used while a design is evolving.",
+      "required_hard_invariants": "all",
+      "excitation_profile": "development-mixed"
+    },
+    "play": {
+      "description": "Adds native-versus-120x3 runtime trace budgets after development qualification.",
+      "excitation_profile": "declared-vehicle-class",
+      "maximum_reference_trace_position_error_m": 0.002,
+      "maximum_reference_trace_velocity_error_m_s": 0.01,
+      "maximum_reference_energy_drift_fraction": 0.002
+    }
+  },
+  "excitation_profiles": {
+    "development-mixed": {
+      "terrain_height_amplitude_m": [0.0, 0.20],
+      "terrain_spatial_wavelength_m": [0.18, 8.0],
+      "terrain_cross_slope_degrees": [-20.0, 20.0],
+      "vehicle_speed_m_s": [0.0, 12.0],
+      "gross_mass_fraction": [0.65, 1.0],
+      "minimum_cycles_per_band": 8,
+      "includes_step_and_impulse_edges": true
+    },
+    "declared-vehicle-class": {
+      "description": "Producer supplies bounded terrain/bump amplitude, spatial spectrum, speed, payload and repetition ranges; the validator records them as test inputs.",
+      "required_fields": [
+        "terrain_height_amplitude_m",
+        "terrain_spatial_wavelength_m",
+        "terrain_cross_slope_degrees",
+        "vehicle_speed_m_s",
+        "gross_mass_fraction",
+        "minimum_cycles_per_band"
+      ]
+    }
+  },
+  "design_objective_contract": {
+    "description": "Producer-facing polar-chart targets backed by measured physical metrics.",
+    "axis_required_fields": [
+      "identity",
+      "measurement",
+      "unit",
+      "better_direction",
+      "reference_range",
+      "target",
+      "weight"
+    ],
+    "better_directions": ["higher", "lower", "target"],
+    "hard_constraints_are_not_weighted_away": true,
+    "report_fields": [
+      "measured_value",
+      "normalized_score",
+      "target_residual",
+      "uncertainty",
+      "constraint_margin"
+    ],
+    "initial_axes": [
+      "traction",
+      "stability",
+      "durability",
+      "mobility",
+      "efficiency",
+      "braking",
+      "steering_authority",
+      "payload",
+      "repairability",
+      "acoustic_signature",
+      "thermal_signature"
+    ]
+  }
+}

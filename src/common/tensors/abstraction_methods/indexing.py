@@ -176,8 +176,9 @@ def lower_basic_index(
 def unravel_index(indices: Any, shape: Tuple[int, ...]):
     """Map flat ``indices`` into coordinates for a tensor of ``shape``.
 
-    Delegates to the backend-specific implementation ``unravel_index_`` after
-    converting ``indices`` to an ``AbstractTensor`` instance.
+    Returns one tensor per axis, row-major, for scalar or array ``indices``.
+    The default ``unravel_index_`` is built from ``%`` and ``//`` alone, so
+    this works on every backend; a backend only overrides it to go faster.
     """
     from ..abstraction import AbstractTensor
     if not isinstance(indices, AbstractTensor):
@@ -185,8 +186,9 @@ def unravel_index(indices: Any, shape: Tuple[int, ...]):
             AbstractTensor.long_dtype_
         )
     return indices.unravel_index_(shape)
-    
-    
+
+
+
 def gather(x: Any, index: Any, dim: int = 0):
     """Gather elements from x along axis dim using integer indices."""
     # build index tuple
