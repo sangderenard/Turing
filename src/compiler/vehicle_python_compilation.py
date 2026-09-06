@@ -944,6 +944,7 @@ def emit_balloon_tire_managed_python_c(
     batch_size: int = BATCH_CAPACITY,
     window_duration: float = 1.0 / 120.0,
     dt_initial: float = 1.0 / 360.0,
+    trace: bool = False,
     wheel_names: tuple[str, ...] = WHEEL_NAMES,
     tire_dimensions: tuple[float, float, float, float, float, float] | None = None,
     pneumatic_mode: str | None = None,
@@ -1013,6 +1014,7 @@ def emit_balloon_tire_managed_python_c(
         lowered.module,
         lowered.root_name,
         entry_name="balloon_tire_managed_native_c",
+        trace=trace,
     )
     if diagnostic_directory is not None:
         (diagnostic_root / "module.c").write_text(artifact.source, encoding="utf-8")
@@ -1038,6 +1040,7 @@ def compile_balloon_tire_managed_python_native(
     window_duration: float = 1.0 / 120.0,
     dt_initial: float = 1.0 / 360.0,
     optimization: str = "O2",
+    trace: bool = False,
     progress=None,
 ):
     """Compile the managed Python source and real dt system to an executable."""
@@ -1053,6 +1056,7 @@ def compile_balloon_tire_managed_python_native(
         dt_initial=dt_initial,
         progress=progress,
         diagnostic_directory=directory,
+        trace=trace,
     )
     feeds_by_id = _managed_native_feeds_by_id(lowered, inputs.feeds)
     root = lowered.module.functions[lowered.root_name]

@@ -1223,12 +1223,54 @@ def _module_call_closure(module: IRModule, root: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
+_TRACE_HELPERS = (
+    "#include <stdio.h>",
+    "static FILE *turing_trace_stream = NULL;",
+    "static void turing_trace_open(void) {",
+    "    if (turing_trace_stream) return;",
+    "    const char *path = getenv(\"TURING_TRACE_FILE\");",
+    "    turing_trace_stream = fopen(path ? path : \"native-trace.log\", \"w\");",
+    "}",
+    "static void turing_trace_event(const char *fn, const char *blk, const char *text) {",
+    "    turing_trace_open(); if (!turing_trace_stream) return;",
+    "    fprintf(turing_trace_stream, \"%s | %s | %s\\n\", fn, blk, text); fflush(turing_trace_stream);",
+    "}",
+    "static void turing_trace_f64(const char *fn, const char *blk, const char *text, double v) {",
+    "    turing_trace_open(); if (!turing_trace_stream) return;",
+    "    fprintf(turing_trace_stream, \"%s | %s | %s = %.17g\\n\", fn, blk, text, v); fflush(turing_trace_stream);",
+    "}",
+    "static void turing_trace_i64(const char *fn, const char *blk, const char *text, long long v) {",
+    "    turing_trace_open(); if (!turing_trace_stream) return;",
+    "    fprintf(turing_trace_stream, \"%s | %s | %s = %lld\\n\", fn, blk, text, v); fflush(turing_trace_stream);",
+    "}",
+    "static void turing_trace_arr(const char *fn, const char *blk, const char *text, const double *p, long long n) {",
+    "    turing_trace_open(); if (!turing_trace_stream) return;",
+    "    double sum = 0.0; long long nan_count = 0;",
+    "    for (long long i = 0; i < n; ++i) { if (p[i] != p[i]) nan_count++; else sum += p[i]; }",
+    "    fprintf(turing_trace_stream, \"%s | %s | %s = [n=%lld first=%.17g,%.17g,%.17g,%.17g sum=%.17g nan=%lld]\\n\", fn, blk, text, n,",
+    "        n > 0 ? p[0] : 0.0, n > 1 ? p[1] : 0.0, n > 2 ? p[2] : 0.0, n > 3 ? p[3] : 0.0, sum, nan_count);",
+    "    fflush(turing_trace_stream);",
+    "}",
+)
+
+
+def _trace_text(text: str) -> str:
+    """A C string literal for one trace label."""
+
+    escaped = (
+        text.replace("\\", "\\\\").replace("\"", "\\\"")
+        .replace("\n", " ")
+    )
+    return "\"" + "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in escaped) + "\""
+
+
 def emit_ssa_module_to_c(
     module: IRModule,
     function_name: str,
     *,
     entry_name: str | None = None,
     watch: Sequence[int] = (),
+    trace: bool = False,
 ) -> CModuleArtifact:
     """Emit ``function_name`` and its call closure as one C module.
 
@@ -2315,8 +2357,83 @@ def emit_ssa_module_to_c(
         effect_guarded_blocks = set(
             function.metadata.get("pool_effect_guarded_blocks") or ()
         )
+        # Native execution trace (``trace=True``): every instruction's
+        # result is logged after its C statement, deferred to the start of
+        # the next instruction so every emission path (each ends in
+        # ``continue``) is covered by one hook; branches and returns flush
+        # first and log their own outcome.
+        pending_trace: list = []
+
+        def instruction_text(instruction) -> str:
+            attributes = instruction.attributes or {}
+            extra = " ".join(
+                f"{key}={str(attributes[key])[-48:]}"
+                for key in ("callee", "binding", "source_output_id", "value",
+                            "plan_callsite_id", "region_index")
+                if key in attributes
+            )
+            result = "" if instruction.res is None else f"%t{instruction.res.id} = "
+            return (
+                f"{result}{instruction.op} "
+                f"[{', '.join(str(int(a.id)) for a in instruction.args)}]"
+                + (f" {{{extra}}}" if extra else "")
+            )
+
+        def trace_lines(instruction, block_name: str) -> list[str]:
+            fn_text = _trace_text(fn)
+            blk_text = _trace_text(block_name)
+            text = _trace_text(instruction_text(instruction))
+            if instruction.res is None:
+                if instruction.op in {"Call", "call", "Store", "store"}:
+                    return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
+                return []
+            result_id = int(instruction.res.id)
+            expression = expressions.get(result_id)
+            if expression is None:
+                return []
+            if str(instruction.res.dtype or "") == "ssa.aggregate":
+                return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
+            try:
+                ctype = buffer_type(instruction.res)
+            except Exception:  # noqa: BLE001
+                return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
+            shape = tuple(instruction.res.shape or ())
+            static = all(isinstance(extent, int) for extent in shape)
+            count = 1
+            for extent in shape:
+                count *= int(extent) if isinstance(extent, int) else 1
+            pointer_result = (
+                instruction.op in {"GetElementPtr", "getelementptr"}
+                or _pointer_value_depth(instruction.res) > 0
+            )
+            if pointer_result:
+                return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
+            if not shape and ctype in {"double", "float"}:
+                return [f"        turing_trace_f64({fn_text}, {blk_text}, {text}, (double)({expression}));"]
+            if not shape and ctype in {"int64_t", "int32_t", "uint8_t", "int"}:
+                return [f"        turing_trace_i64({fn_text}, {blk_text}, {text}, (long long)({expression}));"]
+            if shape and static and ctype == "double":
+                address = addresses.get(result_id, expression)
+                return [
+                    f"        turing_trace_arr({fn_text}, {blk_text}, {text}, "
+                    f"(const double *)({address}), {count}LL);"
+                ]
+            return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
+
+        def flush_trace() -> None:
+            if not trace or not pending_trace:
+                return
+            instruction, block_name = pending_trace.pop()
+            body.extend(trace_lines(instruction, block_name))
+
+        if trace:
+            body.append(
+                f"        turing_trace_event({_trace_text(fn)}, \"entry\", "
+                f"{_trace_text('ENTER ' + fn)});"
+            )
         for block_name in block_names:
             block = function.blocks[block_name]
+            flush_trace()
             body.append(f"    {_c_label(block_name)}: (void)0;")
             block_is_guarded = block_name in effect_guarded_blocks
             if block_is_guarded:
@@ -2326,6 +2443,9 @@ def emit_ssa_module_to_c(
                 effect_guard_used[0] = True
                 body.append("        turing_pool_effect_lock();")
             for position, instruction in enumerate(block.instrs):
+                flush_trace()
+                if trace:
+                    pending_trace.append((instruction, block_name))
                 if block_is_guarded and position == len(block.instrs) - 1:
                     body.append("        turing_pool_effect_unlock();")
                 # Repository tensor intrinsics deliberately retain the generic
@@ -2448,6 +2568,12 @@ def emit_ssa_module_to_c(
                     continue
                 if op in {"Br", "br"}:
                     target = str(instruction.attributes.get("target"))
+                    if trace:
+                        pending_trace.clear()
+                        body.append(
+                            f"        turing_trace_event({_trace_text(fn)}, "
+                            f"{_trace_text(block_name)}, {_trace_text('Br -> ' + target)});"
+                        )
                     body.extend(phi_edge_assignments(block_name, target))
                     body.append(f"        goto {_c_label(target)};")
                     continue
@@ -2457,6 +2583,14 @@ def emit_ssa_module_to_c(
                     on_false = str(instruction.attributes.get("false_target"))
                     if condition is None:
                         continue
+                    if trace:
+                        pending_trace.clear()
+                        body.append(
+                            f"        turing_trace_i64({_trace_text(fn)}, "
+                            f"{_trace_text(block_name)}, "
+                            f"{_trace_text(f'CondBr %t{instruction.args[0].id} ? {on_true} : {on_false}')}, "
+                            f"(long long)({condition}));"
+                        )
                     body.append(f"        if ({condition}) {{")
                     body.extend(
                         "    " + line
@@ -2472,6 +2606,21 @@ def emit_ssa_module_to_c(
                     body.append("        }")
                     continue
                 if op in {"Ret", "ret", "Return", "return"}:
+                    if trace:
+                        pending_trace.clear()
+                        for returned in instruction.args:
+                            held = expressions.get(int(returned.id))
+                            label = _trace_text(f"RET %t{returned.id}")
+                            if held is None or tuple(returned.shape or ()):
+                                body.append(
+                                    f"        turing_trace_event({_trace_text(fn)}, "
+                                    f"{_trace_text(block_name)}, {label});"
+                                )
+                            else:
+                                body.append(
+                                    f"        turing_trace_f64({_trace_text(fn)}, "
+                                    f"{_trace_text(block_name)}, {label}, (double)({held}));"
+                                )
                     body.extend(output_publications(tuple(instruction.args)))
                     # Outputs live in caller-visible buffers already. Route
                     # every exit through the activation-storage cleanup.
@@ -3892,6 +4041,7 @@ def emit_ssa_module_to_c(
                     addresses[result_id] = f"&t{result_id}"
                 body.append("        " + declared)
 
+        flush_trace()
         # Planner regions commonly have no Ret instruction: their declared
         # output record is the terminator contract.  Publish scalar results
         # at the lexical end as well; shaped results were written directly
@@ -4219,6 +4369,8 @@ def emit_ssa_module_to_c(
         "",
         *_FLOORED_HELPERS,
         "",
+        *(_TRACE_HELPERS if trace else ()),
+        "",
         *(
             _POOL_DECLARATIONS
             if pooled_regions or effect_guard_used[0] else ()
@@ -4277,6 +4429,7 @@ def emit_ssa_to_c(
     *,
     entry_name: str | None = None,
     watch: Sequence[int] = (),
+    trace: bool = False,
 ) -> CModuleArtifact:
     """Canonical C backend entry: preserve the complete repository module.
 
@@ -4287,6 +4440,7 @@ def emit_ssa_to_c(
 
     return emit_ssa_module_to_c(
         module, function_name, entry_name=entry_name, watch=watch,
+        trace=trace,
     )
 
 

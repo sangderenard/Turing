@@ -47,14 +47,13 @@ def main() -> None:
     if arguments.managed_dt:
         if arguments.backend != "c":
             parser.error("--managed-dt currently requires --backend c")
-        if arguments.trace:
-            parser.error("--trace is not implemented for the managed C host")
         artifact = compile_balloon_tire_managed_python_native(
             arguments.output,
             batch_size=arguments.batch_size,
             window_duration=arguments.window_duration,
             dt_initial=arguments.dt_initial,
             optimization=arguments.optimization,
+            trace=arguments.trace,
             progress=progress,
         )
     else:
