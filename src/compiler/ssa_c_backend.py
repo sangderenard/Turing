@@ -2408,16 +2408,41 @@ def emit_ssa_module_to_c(
             )
             if pointer_result:
                 return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
-            if not shape and ctype in {"double", "float"}:
-                return [f"        turing_trace_f64({fn_text}, {blk_text}, {text}, (double)({expression}));"]
-            if not shape and ctype in {"int64_t", "int32_t", "uint8_t", "int"}:
-                return [f"        turing_trace_i64({fn_text}, {blk_text}, {text}, (long long)({expression}));"]
-            if shape and static and ctype == "double":
-                address = addresses.get(result_id, expression)
-                return [
-                    f"        turing_trace_arr({fn_text}, {blk_text}, {text}, "
-                    f"(const double *)({address}), {count}LL);"
-                ]
+            return value_trace_lines(fn_text, blk_text, text, instruction.res, expression, ctype)
+
+        def value_trace_lines(fn_text, blk_text, text, value, expression, ctype) -> list[str]:
+            """One trace call reading ``value`` through its recorded address.
+
+            Scalars live in locals (address ``&tN``), region/call results in
+            output or frame storage (the expression is already a pointer
+            cast), shaped values in arenas.  Reading through the address
+            covers all three without guessing which the expression is.
+            """
+
+            import re as _re
+            value_id = int(value.id)
+            shape = tuple(value.shape or ())
+            static = all(isinstance(extent, int) for extent in shape)
+            count = 1
+            for extent in shape:
+                count *= int(extent) if isinstance(extent, int) else 1
+            address = addresses.get(value_id)
+            plain_local = bool(_re.fullmatch(r"t\d+", str(expression)))
+            literal = bool(_re.fullmatch(r"-?\d+(\.\d*)?([eE][-+]?\d+)?|\d+\.\d*[eE][-+]?\d+|0x[0-9a-fA-F]+p?[-+]?\d*", str(expression)))
+            if ctype in {"double", "float"}:
+                if address is not None and (static or not shape):
+                    return [f"        turing_trace_arr({fn_text}, {blk_text}, {text}, (const double *)({address}), {count}LL);"]
+                if not shape and (plain_local or literal):
+                    return [f"        turing_trace_f64({fn_text}, {blk_text}, {text}, (double)({expression}));"]
+                if not shape and "(double *)" in str(expression):
+                    return [f"        turing_trace_arr({fn_text}, {blk_text}, {text}, (const double *)({expression}), 1LL);"]
+                return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
+            if ctype in {"int64_t", "int32_t", "uint8_t", "int"}:
+                if not shape and (plain_local or literal):
+                    return [f"        turing_trace_i64({fn_text}, {blk_text}, {text}, (long long)({expression}));"]
+                if not shape and address is not None:
+                    return [f"        turing_trace_i64({fn_text}, {blk_text}, {text}, (long long)(*(({ctype} *)({address}))));"]
+                return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
             return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
 
         def flush_trace() -> None:
@@ -2611,16 +2636,20 @@ def emit_ssa_module_to_c(
                         for returned in instruction.args:
                             held = expressions.get(int(returned.id))
                             label = _trace_text(f"RET %t{returned.id}")
-                            if held is None or tuple(returned.shape or ()):
+                            if held is None:
                                 body.append(
                                     f"        turing_trace_event({_trace_text(fn)}, "
                                     f"{_trace_text(block_name)}, {label});"
                                 )
-                            else:
-                                body.append(
-                                    f"        turing_trace_f64({_trace_text(fn)}, "
-                                    f"{_trace_text(block_name)}, {label}, (double)({held}));"
-                                )
+                                continue
+                            try:
+                                returned_type = buffer_type(returned)
+                            except Exception:  # noqa: BLE001
+                                returned_type = "void *"
+                            body.extend(value_trace_lines(
+                                _trace_text(fn), _trace_text(block_name), label,
+                                returned, held, returned_type,
+                            ))
                     body.extend(output_publications(tuple(instruction.args)))
                     # Outputs live in caller-visible buffers already. Route
                     # every exit through the activation-storage cleanup.
