@@ -7969,10 +7969,37 @@ def _schedule_loop_callsites(
             discover_arm_callsites(block.callee)
 
     discover_arm_callsites(control.root)
+    # Callsites the shell already placed at their authored position (a
+    # ``__plan_callsite_N__`` statement in the tree) are not scheduled
+    # again: authored placement wins over "before the next retained region".
+    placed_callsites: set[int] = set()
+
+    def discover_placed(block: Any) -> None:
+        if isinstance(block, StatementBlock):
+            for line in block.lines:
+                match = _CALLSITE_MARKER.fullmatch(str(line))
+                if match is not None:
+                    placed_callsites.add(int(match.group(1)))
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                discover_placed(child)
+        elif isinstance(block, ConditionalBlock):
+            discover_placed(block.body)
+            if block.orelse is not None:
+                discover_placed(block.orelse)
+        elif isinstance(block, (LoopBlock, WhileBlock)):
+            if isinstance(block, WhileBlock):
+                discover_placed(block.condition)
+            discover_placed(block.body)
+        elif isinstance(block, CallBlock):
+            discover_placed(block.callee)
+
+    discover_placed(control.root)
     arm_owned_callsites: set[int] = set()
     calls_before: dict[int, list[int]] = {}
     replaced_projection_regions: set[int] = set()
     pending: list[int] = []
+    last_call: PlanCall | None = None
 
     def is_call_projection_region(
         closure: "PlanClosure", call: PlanCall,
@@ -8002,8 +8029,10 @@ def _schedule_loop_callsites(
 
     for item in hierarchy_plan.items:
         if isinstance(item, PlanCall):
+            last_call = item
+            if int(item.callsite_id) in placed_callsites:
+                continue
             if int(item.callsite_id) in arm_callsite_candidates:
-                # Owned by a conditional arm: placed there by `rebuild`.
                 arm_owned_callsites.add(int(item.callsite_id))
                 continue
             pending.append(int(item.callsite_id))
@@ -8016,9 +8045,17 @@ def _schedule_loop_callsites(
         region = int(item.name.split("_", 1)[1])
         if region in retained_regions and pending:
             calls_before.setdefault(region, []).extend(pending)
-            if is_call_projection_region(item, planned_calls[pending[-1]]):
-                replaced_projection_regions.add(region)
             pending = []
+        if (
+            region in retained_regions
+            and last_call is not None
+            and is_call_projection_region(item, last_call)
+        ):
+            # A region that only unpacks a call's bound results is the
+            # call's projection, whether the call was placed lexically or
+            # is scheduled here; its work is the call itself.
+            replaced_projection_regions.add(region)
+            calls_before.setdefault(region, [])
     trailing_at_loop: dict[int, list[int]] = {}
     trailing_at_root: list[int] = []
     for callsite_id in pending:

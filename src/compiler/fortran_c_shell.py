@@ -5750,6 +5750,8 @@ def _nest_lexical_conditionals_in_loops(
                     int(line[len("__scheduled_region_"):-2]),
                     (1 << 30, 0, 0),
                 )
+            if line.startswith("__plan_callsite_") and line.endswith("__"):
+                return node_position(int(line[len("__plan_callsite_"):-2]))
         if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
             return node_position(int(block.source_node_id))
         if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
@@ -5901,6 +5903,225 @@ def _nest_lexical_conditionals_in_loops(
                 f"conditional {block.source_node_id} is authored inside loop "
                 f"{loop_id} but that loop is absent from the control tree"
             )
+    return replace(control, root=root)
+
+
+def _place_plan_callsites_lexically(
+    control: Any, graph: Any, hierarchy_plan: Any, dispatch_subgraphs: Iterable[Any],
+):
+    """Insert every planned callsite marker at its authored position.
+
+    The callsite scheduler placed a pending call before the next retained
+    region in hierarchy order.  When intervening control (a ``for`` loop
+    that consumes the call's results) sits between the call and that region,
+    the marker landed after that control: ``advance`` was emitted in the
+    exit block of the loop over ``targets.error_limits`` that reads the
+    metrics it publishes.  The authored position is the identity: the
+    marker goes into the innermost conditional arm that owns the call, else
+    the innermost loop whose span contains it, ordered by source position.
+    The scheduler treats a marker already present as placed.
+    """
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, LoopBlock, LoopControlBlock,
+        SequenceBlock, SequenceMutationBlock, StatementBlock, WhileBlock,
+    )
+    from .glsl_deployment_strategy import _branch_compartments
+    from .hierarchical_plan import PlanCall
+
+    if hierarchy_plan is None:
+        return control
+    callsite_ids = [
+        int(item.callsite_id)
+        for item in getattr(hierarchy_plan, "items", ())
+        if isinstance(item, PlanCall)
+    ]
+    if not callsite_ids:
+        return control
+
+    def node_position(node_id: int) -> tuple[int, int, int]:
+        data = graph.G.nodes.get(int(node_id), {})
+        expression = data.get("expr_obj")
+        span = data.get("source_span") or {}
+        return (
+            int(getattr(expression, "lineno", span.get("line", 1 << 30))
+                or (1 << 30)),
+            int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
+            int(node_id),
+        )
+
+    region_positions = {
+        int(index): min(
+            (
+                node_position(int(node_id))
+                for node_id in subgraph.G.graph.get("deployment_nodes", ())
+            ),
+            default=(1 << 30, 0, int(index)),
+        )
+        for index, subgraph in enumerate(dispatch_subgraphs)
+    }
+
+    def block_position(block) -> tuple[int, int, int]:
+        if isinstance(block, SequenceMutationBlock):
+            return node_position(int(block.mutation.effect_node_id))
+        if isinstance(block, StatementBlock) and len(block.lines) == 1:
+            line = block.lines[0]
+            if line.startswith("__scheduled_region_") and line.endswith("__"):
+                return region_positions.get(
+                    int(line[len("__scheduled_region_"):-2]),
+                    (1 << 30, 0, 0),
+                )
+            if line.startswith("__plan_callsite_") and line.endswith("__"):
+                return node_position(int(line[len("__plan_callsite_"):-2]))
+        if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
+            return node_position(int(block.source_node_id))
+        if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
+            return node_position(int(block.site_node_id))
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            source_id = getattr(block, "source_loop_node_id", None)
+            if source_id is not None:
+                return node_position(int(source_id))
+        if isinstance(block, CallBlock):
+            return node_position(int(block.callsite_id))
+        if isinstance(block, SequenceBlock) and block.blocks:
+            return min(map(block_position, block.blocks))
+        return (1 << 30, 0, 0)
+
+    def insert_ordered(block, item):
+        sequence = (
+            block if isinstance(block, SequenceBlock)
+            else SequenceBlock((block,))
+        )
+        decorated = [
+            (block_position(child), index, child)
+            for index, child in enumerate(sequence.blocks)
+        ]
+        decorated.append((block_position(item), len(decorated), item))
+        return SequenceBlock(tuple(
+            child for _position, _index, child in sorted(
+                decorated, key=lambda entry: (entry[0], entry[1])
+            )
+        ))
+
+    present: set[int] = set()
+    loop_spans: list[tuple[int, int, int]] = []
+
+    def survey(block):
+        if isinstance(block, ConditionalBlock):
+            if block.source_node_id is not None:
+                present.add(int(block.source_node_id))
+            survey(block.body)
+            if block.orelse is not None:
+                survey(block.orelse)
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                survey(child)
+        elif isinstance(block, (LoopBlock, WhileBlock)):
+            source_id = getattr(block, "source_loop_node_id", None)
+            if source_id is not None:
+                expression = graph.G.nodes.get(int(source_id), {}).get("expr_obj")
+                start = getattr(expression, "lineno", None)
+                end = getattr(expression, "end_lineno", None)
+                if start is not None and end is not None:
+                    loop_spans.append((int(start), int(end), int(source_id)))
+            survey(block.body)
+        elif isinstance(block, CallBlock):
+            survey(block.callee)
+
+    survey(control.root)
+
+    def insert_in_conditional(block, owner_id, arm, item):
+        if isinstance(block, ConditionalBlock):
+            if int(block.source_node_id or -1) == int(owner_id):
+                if str(arm) == "body":
+                    return replace(block, body=insert_ordered(block.body, item)), True
+                return replace(
+                    block,
+                    orelse=insert_ordered(block.orelse or SequenceBlock(()), item),
+                ), True
+            body, inserted = insert_in_conditional(block.body, owner_id, arm, item)
+            if inserted:
+                return replace(block, body=body), True
+            if block.orelse is not None:
+                orelse, inserted = insert_in_conditional(
+                    block.orelse, owner_id, arm, item
+                )
+                if inserted:
+                    return replace(block, orelse=orelse), True
+            return block, False
+        if isinstance(block, SequenceBlock):
+            children = []
+            inserted = False
+            for child in block.blocks:
+                projected, child_inserted = (
+                    insert_in_conditional(child, owner_id, arm, item)
+                    if not inserted else (child, False)
+                )
+                children.append(projected)
+                inserted |= child_inserted
+            return SequenceBlock(tuple(children)), inserted
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            body, inserted = insert_in_conditional(block.body, owner_id, arm, item)
+            return replace(block, body=body), inserted
+        if isinstance(block, CallBlock):
+            callee, inserted = insert_in_conditional(block.callee, owner_id, arm, item)
+            return replace(block, callee=callee), inserted
+        return block, False
+
+    def insert_into_loop(block, loop_id: int, item):
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            if int(getattr(block, "source_loop_node_id", -1) or -1) == loop_id:
+                return replace(block, body=insert_ordered(block.body, item)), True
+            body, inserted = insert_into_loop(block.body, loop_id, item)
+            return (replace(block, body=body), True) if inserted else (block, False)
+        if isinstance(block, SequenceBlock):
+            for index, child in enumerate(block.blocks):
+                projected, inserted = insert_into_loop(child, loop_id, item)
+                if inserted:
+                    return replace(block, blocks=(
+                        *block.blocks[:index], projected,
+                        *block.blocks[index + 1:],
+                    )), True
+            return block, False
+        if isinstance(block, ConditionalBlock):
+            body, inserted = insert_into_loop(block.body, loop_id, item)
+            if inserted:
+                return replace(block, body=body), True
+            if block.orelse is not None:
+                orelse, inserted = insert_into_loop(block.orelse, loop_id, item)
+                if inserted:
+                    return replace(block, orelse=orelse), True
+            return block, False
+        if isinstance(block, CallBlock):
+            callee, inserted = insert_into_loop(block.callee, loop_id, item)
+            return (replace(block, callee=callee), True) if inserted else (block, False)
+        return block, False
+
+    memberships = _branch_compartments(graph)
+    root = control.root
+    for callsite_id in sorted(callsite_ids, key=node_position):
+        if int(callsite_id) not in graph.G:
+            continue
+        marker = StatementBlock((f"__plan_callsite_{int(callsite_id)}__",))
+        guards = [
+            (int(owner), str(arm))
+            for owner, arm in memberships.get(int(callsite_id), ())
+            if str(arm) in {"body", "orelse"} and int(owner) in present
+        ]
+        inserted = False
+        if guards:
+            owner, arm = max(guards, key=lambda item: node_position(item[0]))
+            root, inserted = insert_in_conditional(root, owner, arm, marker)
+        if not inserted:
+            line = node_position(int(callsite_id))[0]
+            candidates = [
+                (end - start, loop_id) for start, end, loop_id in loop_spans
+                if start <= line <= end
+            ]
+            if candidates:
+                root, inserted = insert_into_loop(root, min(candidates)[1], marker)
+        if not inserted:
+            root = insert_ordered(root, marker)
     return replace(control, root=root)
 
 
@@ -6295,6 +6516,8 @@ def _install_lexical_sequence_mutations(
                     int(line[len("__scheduled_region_"):-2]),
                     (1 << 30, 0, 0),
                 )
+            if line.startswith("__plan_callsite_") and line.endswith("__"):
+                return node_position(int(line[len("__plan_callsite_"):-2]))
         if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
             return node_position(int(block.source_node_id))
         if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
@@ -10413,6 +10636,10 @@ def _class_surface_ssa_program(
             lowered_conditional_count = len(conditional_controls)
         control = _nest_lexical_conditionals_in_loops(
             control, graph, getattr(shell, "dispatch_subgraphs", ()),
+        )
+        control = _place_plan_callsites_lexically(
+            control, graph, getattr(shell, "hierarchy_plan", None),
+            getattr(shell, "dispatch_subgraphs", ()),
         )
         control, lexical_sequence_shortfalls = _install_lexical_sequence_mutations(
             control,
@@ -22522,11 +22749,60 @@ def _class_surface_ssa_program(
                             f"{expected_identity!r}"
                         )
                         break
-                    layout_with_dtypes = tuple(
-                        (int(value_id), str(field.dtype or "unknown"))
-                        for field in descriptor.fields
-                        for value_id in field.value_ids
-                    )
+                    # The row's columns and the append helper's formals
+                    # follow the ABI's physical column order; a record
+                    # entry lists its fields in registration order (a
+                    # constructor that names error_channels before the
+                    # defaulted fields differs).  Lay the record out by the
+                    # ABI columns, by field name, with the column's dtype.
+                    abi_record = None
+                    caller_graph = source_graphs_by_symbol.get(function_name)
+                    if caller_graph is not None:
+                        abi_records = dict(
+                            (caller_graph.graph.get("program_abi") or {}).get(
+                                "records"
+                            ) or {}
+                        )
+                        abi_record = abi_records.get(str(expected_identity)) or next(
+                            (
+                                record for identity, record in abi_records.items()
+                                if str(identity).rsplit(".", 1)[-1]
+                                == str(expected_identity).rsplit(".", 1)[-1]
+                            ),
+                            None,
+                        )
+                    fields_by_name = {
+                        field.name: field for field in descriptor.fields
+                    }
+                    layout_with_dtypes = ()
+                    if abi_record is not None:
+                        ordered = []
+                        missing = []
+                        for column_name, column_dtype in (
+                            _record_row_physical_columns(abi_record)
+                        ):
+                            field = fields_by_name.get(column_name)
+                            if field is None or len(field.value_ids) != 1:
+                                missing.append(column_name)
+                                continue
+                            ordered.append((
+                                int(field.value_ids[0]),
+                                str(column_dtype or field.dtype or "unknown"),
+                            ))
+                        if missing:
+                            reason = (
+                                "record entry lacks physical column(s) "
+                                f"{missing!r} of row column identity "
+                                f"{expected_identity!r}"
+                            )
+                            break
+                        layout_with_dtypes = tuple(ordered)
+                    else:
+                        layout_with_dtypes = tuple(
+                            (int(value_id), str(field.dtype or "unknown"))
+                            for field in descriptor.fields
+                            for value_id in field.value_ids
+                        )
                     if len(layout_with_dtypes) != int(width):
                         reason = (
                             f"record layout has {len(layout_with_dtypes)} "
