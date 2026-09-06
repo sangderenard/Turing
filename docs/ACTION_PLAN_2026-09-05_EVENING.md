@@ -1,5 +1,8 @@
 # Action plan, 2026-09-05 evening: preserve the gains, then unblock DT
 
+> Progress and the live gate table: [STATUS.md](STATUS.md). Sections 0-3
+> landed as f90b36ea (checkpoint), bb3cf3d9, e1f94cc3, e4c04407.
+
 Supersedes `ACTION_PLAN_NEXT_AGENT.md` (morning) for sequencing. The ground
 rules in that document still apply verbatim: fix the compiler not the
 sources, no heuristics, seconds-long repros before six-minute compiles,

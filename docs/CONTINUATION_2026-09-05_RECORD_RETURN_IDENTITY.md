@@ -1,5 +1,9 @@
 # DT continuation: receiver identity, 2026-09-05
 
+> FROZEN as history on 2026-09-05 (evening). Do not append here. The live
+> gate table, current blocker and next step are in [STATUS.md](STATUS.md);
+> sequencing is in [ACTION_PLAN_2026-09-05_EVENING.md](ACTION_PLAN_2026-09-05_EVENING.md).
+
 Continues `ACTION_PLAN_NEXT_AGENT.md` on `codex/recursive-reduction-bridge`,
 starting from pushed commit `bce4f5da`. That report's claims that its changes
 were uncommitted are historical; the initial working tree was clean.
