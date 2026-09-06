@@ -13,6 +13,7 @@ from collections import Counter
 import math
 from pathlib import Path
 import subprocess
+import os
 import sys
 from typing import Any, Mapping, Sequence
 
@@ -1766,6 +1767,17 @@ def emit_ssa_module_to_c(
         )
         if len(physical) == 1:
             return next(iter(physical))
+        if len(physical) > 1 and os.environ.get("TURING_DEBUG_PHYSICAL"):
+            root = physical_find((str(owner), int(value.id)))
+            members = sorted(
+                key for key in physical_parent
+                if physical_find(key) == root
+            )
+            print(
+                f"DEBUG-PHYSICAL conflict owner={owner} value={int(value.id)} "
+                f"types={sorted(physical)} members={members[:24]}",
+                file=sys.stderr, flush=True,
+            )
         from .ssa_llvm_backend import _value_llvm_type
 
         llvm_type = _value_llvm_type(value)
@@ -2058,7 +2070,11 @@ def emit_ssa_module_to_c(
                 else:
                     first_result_id = int(projections[0].value.id)
                     local_name = f"callout{first_result_id}_{slot}"
-                    element_type = buffer_type(output)
+                    # The callee's output is typed under the CALLEE: its id
+                    # is the callee's, and the caller may own an unrelated
+                    # value with the same number (a bool region output
+                    # typed a double callee result as one byte).
+                    element_type = solved_buffer_type(record.callee, output)
                     shape = tuple(output.shape or ())
                     if shape:
                         count = math.prod(shape)
@@ -3263,7 +3279,7 @@ def emit_ssa_module_to_c(
                                 output_argument = result_address
                             elif formal_position is None:
                                 local_name = f"callout{result_id}_{slot}"
-                                element_type = buffer_type(output)
+                                element_type = solved_buffer_type(callee, output)
                                 shape = tuple(output.shape or ())
                                 if shape:
                                     count = 1
