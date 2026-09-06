@@ -21071,6 +21071,19 @@ def _class_surface_ssa_program(
                     (int(output.id), str(output.dtype), tuple(output.shape or ()))
                     for output in callee_outputs
                 )
+                if os.environ.get("TURING_DEBUG_LINKED_CALLS"):
+                    print(
+                        f"DEBUG-LINK-CLASSIFY caller={caller_symbol} "
+                        f"callsite={record.callsite_id} callee={record.callee_symbol} "
+                        f"callee_outputs={[(int(o.id), str(o.dtype), tuple(o.shape or ())) for o in callee_outputs]} "
+                        f"aggregate_outputs={[int(o.id) for o in callee_aggregate_outputs]} "
+                        f"result_bindings={tuple(record.result_bindings)} "
+                        f"physical_result_bindings={tuple(physical_result_bindings)} "
+                        f"returns_value={returns_value} bound_aggregate={returns_bound_aggregate} "
+                        f"aggregate={returns_aggregate} structural={returns_structural_record} "
+                        f"void={returns_void}",
+                        file=sys.stderr, flush=True,
+                    )
                 previous_native_call = next((
                     instruction
                     for block in caller.blocks.values()

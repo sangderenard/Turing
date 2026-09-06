@@ -2571,9 +2571,18 @@ class _ControlSSABuilder:
             address,
             attributes=attributes,
         )
+        # A projection out of an ``ssa.aggregate`` handle is the region's
+        # declared value, not the handle: the aggregate's dtype on a region
+        # output typed a function's return merge as an aggregate, and the
+        # caller's native result contract then returned a handle with no
+        # scalar buffer (the managed window's ``dt_next`` read 0).
+        dtype = str(source.dtype or "unknown")
+        if dtype == "ssa.aggregate":
+            declared = self._value_from_meta(int(result_id))
+            dtype = str(declared.dtype or "unknown")
         result = self.produced_value(
             result_id,
-            dtype=str(source.dtype or "unknown"),
+            dtype=dtype,
             claim_provisional_definition=claim_provisional_definition,
         )
         self.emit(Handler.Load, [address], result, attributes=attributes)
