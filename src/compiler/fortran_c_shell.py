@@ -5719,15 +5719,7 @@ def _nest_lexical_conditionals_in_loops(
     )
 
     def node_position(node_id: int) -> tuple[int, int, int]:
-        data = graph.G.nodes.get(int(node_id), {})
-        expression = data.get("expr_obj")
-        span = data.get("source_span") or {}
-        return (
-            int(getattr(expression, "lineno", span.get("line", 1 << 30))
-                or (1 << 30)),
-            int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
-            int(node_id),
-        )
+        return _authored_node_position(graph.G, int(node_id))
 
     region_positions = {
         int(index): min(
@@ -5956,6 +5948,38 @@ def _plan_callsite_projection_ids(graph_obj: Any, hierarchy_plan: Any) -> dict[i
     return result
 
 
+def _authored_node_position(graph_obj: Any, node_id: int) -> tuple[int, int, int]:
+    """Source position of a graph node, or of the control record it left.
+
+    A conditional whose ``If`` node the structural fold removed still exists
+    as a control block naming that node; its authored position is retained
+    in the graph's source control records.  Without this fallback such a
+    block had no position, so no lexical placement could order it, and it
+    was lowered ahead of its predicate's producer.
+    """
+
+    data = graph_obj.nodes.get(int(node_id)) if int(node_id) in graph_obj else None
+    expression = None if data is None else data.get("expr_obj")
+    span = {} if data is None else (data.get("source_span") or {})
+    if data is None or (
+        getattr(expression, "lineno", None) is None and not span.get("line")
+    ):
+        from .glsl_deployment_strategy import _source_control_records
+        record = _source_control_records(graph_obj).get(int(node_id))
+        recorded = None if record is None else record.get("expression")
+        if getattr(recorded, "lineno", None) is not None:
+            return (
+                int(recorded.lineno),
+                int(getattr(recorded, "col_offset", 0) or 0),
+                int(node_id),
+            )
+    return (
+        int(getattr(expression, "lineno", span.get("line", 1 << 30)) or (1 << 30)),
+        int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
+        int(node_id),
+    )
+
+
 def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item, node_id: int):
     """Insert ``item`` at the authored position of graph node ``node_id``.
 
@@ -5972,15 +5996,7 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
     from .glsl_deployment_strategy import _branch_compartments
 
     def node_position(candidate: int) -> tuple[int, int, int]:
-        data = graph.G.nodes.get(int(candidate), {})
-        expression = data.get("expr_obj")
-        span = data.get("source_span") or {}
-        return (
-            int(getattr(expression, "lineno", span.get("line", 1 << 30))
-                or (1 << 30)),
-            int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
-            int(candidate),
-        )
+        return _authored_node_position(graph.G, int(candidate))
 
     region_positions = {
         int(index): min(
@@ -6185,15 +6201,7 @@ def _place_plan_callsites_lexically(
         return control
 
     def node_position(node_id: int) -> tuple[int, int, int]:
-        data = graph.G.nodes.get(int(node_id), {})
-        expression = data.get("expr_obj")
-        span = data.get("source_span") or {}
-        return (
-            int(getattr(expression, "lineno", span.get("line", 1 << 30))
-                or (1 << 30)),
-            int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
-            int(node_id),
-        )
+        return _authored_node_position(graph.G, int(node_id))
 
     region_positions = {
         int(index): min(
@@ -6423,15 +6431,7 @@ def _stamp_conditional_callsite_ownership(
         return control
 
     def node_position(node_id: int) -> tuple[int, int, int]:
-        data = graph.G.nodes.get(int(node_id), {})
-        expression = data.get("expr_obj")
-        span = data.get("source_span") or {}
-        return (
-            int(getattr(expression, "lineno", span.get("line", 1 << 30))
-                or (1 << 30)),
-            int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
-            int(node_id),
-        )
+        return _authored_node_position(graph.G, int(node_id))
 
     memberships = _branch_compartments(graph)
     owned: dict[tuple[int, str], set[int]] = {}
@@ -6731,14 +6731,7 @@ def _install_lexical_sequence_mutations(
     )
 
     def node_position(node_id: int) -> tuple[int, int, int]:
-        data = graph.G.nodes.get(int(node_id), {})
-        expression = data.get("expr_obj")
-        span = data.get("source_span") or {}
-        return (
-            int(getattr(expression, "lineno", span.get("line", 1 << 30)) or (1 << 30)),
-            int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
-            int(node_id),
-        )
+        return _authored_node_position(graph.G, int(node_id))
 
     region_positions = {
         int(index): min(
