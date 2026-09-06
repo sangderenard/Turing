@@ -1098,6 +1098,145 @@ def _authored_sequence_record_views(
     return views
 
 
+def _unwrap_optional_annotation(expression: ast.AST) -> ast.AST:
+    """``X | None`` and ``Optional[X]`` declare the same row as ``X``."""
+
+    while True:
+        if (
+            isinstance(expression, ast.BinOp)
+            and isinstance(expression.op, ast.BitOr)
+        ):
+            sides = (expression.left, expression.right)
+            kept = tuple(
+                side for side in sides
+                if not (isinstance(side, ast.Constant) and side.value is None)
+            )
+            if len(kept) == 1:
+                expression = kept[0]
+                continue
+            return expression
+        if (
+            isinstance(expression, ast.Subscript)
+            and (
+                (isinstance(expression.value, ast.Name)
+                 and expression.value.id == "Optional")
+                or (isinstance(expression.value, ast.Attribute)
+                    and expression.value.attr == "Optional")
+            )
+        ):
+            expression = expression.slice
+            continue
+        return expression
+
+
+def _authored_row_layout(
+    annotation: Any,
+    repository_records: Mapping[str, Mapping[str, Any]],
+) -> tuple[tuple[str, str | None, int], ...] | None:
+    """Read a fixed tuple row's physical layout from a container annotation.
+
+    ``list[tuple[float, Metrics, tuple[str, ...]]]`` declares one row of
+    three authored columns.  A column naming a repository record is not one
+    physical column: the record has no physical identity of its own, so its
+    row is its member fields, exactly as ``_record_row_physical_columns``
+    lays out a whole-record row.  Each entry is ``(kind, identity, width)``
+    with ``kind`` one of ``"scalar"``, ``"record"``, ``"value"``.
+    """
+
+    if not isinstance(annotation, str) or not annotation.strip():
+        return None
+    try:
+        outer = ast.parse(annotation, mode="eval").body
+    except SyntaxError:
+        return None
+    outer = _unwrap_optional_annotation(outer)
+    if not isinstance(outer, ast.Subscript):
+        return None
+    element = outer.slice
+    if not isinstance(element, ast.Subscript):
+        return None
+    tuple_name = element.value
+    if not (
+        isinstance(tuple_name, ast.Name) and tuple_name.id == "tuple"
+        or isinstance(tuple_name, ast.Attribute)
+        and tuple_name.attr in {"tuple", "Tuple"}
+    ):
+        return None
+    columns = (
+        tuple(element.slice.elts)
+        if isinstance(element.slice, ast.Tuple)
+        else (element.slice,)
+    )
+    if any(isinstance(column, ast.Constant) and column.value is Ellipsis
+           for column in columns):
+        return None
+    if len(columns) < 2:
+        return None
+    scalar_names = {"bool", "int", "float", "str"}
+    layout: list[tuple[str, str | None, int]] = []
+    for column in columns:
+        spelling = (
+            column.id if isinstance(column, ast.Name)
+            else column.attr if isinstance(column, ast.Attribute)
+            else ""
+        )
+        if spelling in scalar_names:
+            layout.append(("scalar", None, 1))
+            continue
+        matches = tuple(
+            (str(identity), record)
+            for identity, record in repository_records.items()
+            if str(identity) == spelling
+            or str(identity).rsplit(".", 1)[-1] == spelling
+        )
+        if spelling and len(matches) == 1:
+            identity, record = matches[0]
+            width = len(_record_row_physical_columns(record))
+            if width:
+                layout.append(("record", identity, width))
+                continue
+        layout.append(("value", None, 1))
+    return tuple(layout)
+
+
+def _sequence_row_record_slots(
+    graph_obj: Any,
+    sequence_declarations: Iterable[tuple[int, str, int, bool]],
+) -> dict[int, tuple[tuple[int, str, int], ...]]:
+    """Record-typed columns of each declared fixed-width row.
+
+    Maps a resident sequence id to ``(authored column, identity, width)``
+    triples.  A row insertion names the record by its semantic identity at
+    that column; native-call linking, which proves the record's physical
+    member fields, expands it in place (``ssa_deferred_record_slots``).
+    """
+
+    declared = {int(item[0]) for item in sequence_declarations}
+    identities = graph_obj.graph.get("identity_table") or {}
+    repository_records = dict(
+        (graph_obj.graph.get("program_abi") or {}).get("records") or {}
+    )
+    result: dict[int, tuple[tuple[int, str, int], ...]] = {}
+    for parameter_name, annotation in (
+        _current_authored_parameter_annotations(graph_obj).items()
+    ):
+        layout = _authored_row_layout(annotation, repository_records)
+        if layout is None or not any(kind == "record" for kind, _i, _w in layout):
+            continue
+        slots = tuple(
+            (position, str(identity), int(width))
+            for position, (kind, identity, width) in enumerate(layout)
+            if kind == "record"
+        )
+        # Every declared resident in the binding's history is the same
+        # authored row: the parameter, its ``[]`` replacement and the merge
+        # a mutation resolves to.
+        for value_id in identities.get(str(parameter_name), ()):
+            if int(value_id) in declared:
+                result[int(value_id)] = slots
+    return result
+
+
 def _record_row_physical_columns(
     record: Mapping[str, Any],
 ) -> tuple[tuple[str, str], ...]:
@@ -3477,38 +3616,21 @@ def _field_slot_ops(
     def fixed_row_width(annotation: Any) -> int | None:
         """Read a fixed tuple row width from an authored container annotation."""
 
-        if not isinstance(annotation, str) or not annotation.strip():
+        layout = _authored_row_layout(annotation, dict(
+            (graph_obj.graph.get("program_abi") or {}).get("records") or {}
+        ))
+        if layout is None:
             return None
-        try:
-            outer = ast.parse(annotation, mode="eval").body
-        except SyntaxError:
-            return None
-        if not isinstance(outer, ast.Subscript):
-            return None
-        element = outer.slice
-        if not isinstance(element, ast.Subscript):
-            return None
-        tuple_name = element.value
-        if not (
-            isinstance(tuple_name, ast.Name) and tuple_name.id == "tuple"
-            or isinstance(tuple_name, ast.Attribute)
-            and tuple_name.attr in {"tuple", "Tuple"}
-        ):
-            return None
-        columns = (
-            tuple(element.slice.elts)
-            if isinstance(element.slice, ast.Tuple)
-            else (element.slice,)
-        )
-        if any(isinstance(column, ast.Constant) and column.value is Ellipsis
-               for column in columns):
-            return None
-        return len(columns) if len(columns) > 1 else None
+        return sum(width for _kind, _identity, width in layout)
 
     annotated_row_widths: dict[int, int] = {}
-    for binding_name, annotation in dict(
-        graph_obj.graph.get("type_annotations") or {}
-    ).items():
+    for binding_name, annotation in (
+        *dict(graph_obj.graph.get("type_annotations") or {}).items(),
+        # A parameter's authored annotation declares its row exactly as a
+        # local annotation does; ``failures: list[tuple[float, Metrics,
+        # tuple[str, ...]]] | None`` is the physical row of ``failures``.
+        *_current_authored_parameter_annotations(graph_obj).items(),
+    ):
         width = fixed_row_width(annotation)
         if width is None:
             continue
@@ -3580,7 +3702,12 @@ def _field_slot_ops(
         sequence_declarations.append((
             sequence_id,
             "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
-            2 if aggregate_kind == "dict" else 1,
+            (
+                2 if aggregate_kind == "dict"
+                # The binding's authored annotation declares its row width;
+                # a parameter list of fixed tuples is that many columns.
+                else max(1, annotated_row_widths.get(int(sequence_id), 1))
+            ),
             aggregate_kind not in {"tuple", "bytes"},
         ))
         storage_identity = f"{binding_kind}.{binding_name}"
@@ -5571,6 +5698,116 @@ def _attach_graph_control_expressions(
     return replace(control, root=attach(control.root))
 
 
+def _stamp_conditional_callsite_ownership(
+    control: Any, graph: Any, hierarchy_plan: Any,
+):
+    """Record, on each retained conditional, the planned calls its arms own.
+
+    Conditionals overlaid on numerical regions already carry
+    ``body_callsite_ids``/``orelse_callsite_ids`` from the planner.  A
+    conditional inside a retained loop body is built by the loop composer
+    and carries none, so the callsite scheduler treated a call authored in
+    its arm as a trailing call of the loop and appended its marker after the
+    body's terminal edge, in unreachable code.  The graph's branch
+    compartments are the exact authored ownership; stamp the innermost
+    conditional present in the tree with each such callsite.
+    """
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, LoopBlock, SequenceBlock, WhileBlock,
+    )
+    from .glsl_deployment_strategy import _branch_compartments
+    from .hierarchical_plan import PlanCall
+
+    if hierarchy_plan is None:
+        return control
+    callsite_ids = {
+        int(item.callsite_id)
+        for item in getattr(hierarchy_plan, "items", ())
+        if isinstance(item, PlanCall)
+    }
+    if not callsite_ids:
+        return control
+
+    present: set[int] = set()
+
+    def collect(block):
+        if isinstance(block, ConditionalBlock):
+            if block.source_node_id is not None:
+                present.add(int(block.source_node_id))
+            collect(block.body)
+            if block.orelse is not None:
+                collect(block.orelse)
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                collect(child)
+        elif isinstance(block, (LoopBlock, WhileBlock)):
+            collect(block.body)
+        elif isinstance(block, CallBlock):
+            collect(block.callee)
+
+    collect(control.root)
+    if not present:
+        return control
+
+    def node_position(node_id: int) -> tuple[int, int, int]:
+        data = graph.G.nodes.get(int(node_id), {})
+        expression = data.get("expr_obj")
+        span = data.get("source_span") or {}
+        return (
+            int(getattr(expression, "lineno", span.get("line", 1 << 30))
+                or (1 << 30)),
+            int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
+            int(node_id),
+        )
+
+    memberships = _branch_compartments(graph)
+    owned: dict[tuple[int, str], set[int]] = {}
+    for callsite_id in callsite_ids:
+        guards = [
+            (int(owner), str(arm))
+            for owner, arm in memberships.get(int(callsite_id), ())
+            if str(arm) in {"body", "orelse"} and int(owner) in present
+        ]
+        if not guards:
+            continue
+        # The innermost owner starts last in source order.
+        owner, arm = max(guards, key=lambda item: node_position(item[0]))
+        owned.setdefault((owner, arm), set()).add(int(callsite_id))
+    if not owned:
+        return control
+
+    def stamp(block):
+        if isinstance(block, ConditionalBlock):
+            body = stamp(block.body)
+            orelse = None if block.orelse is None else stamp(block.orelse)
+            if block.source_node_id is None:
+                return replace(block, body=body, orelse=orelse)
+            source = int(block.source_node_id)
+            return replace(
+                block, body=body, orelse=orelse,
+                body_callsite_ids=tuple(sorted({
+                    *map(int, block.body_callsite_ids),
+                    *owned.get((source, "body"), ()),
+                })),
+                orelse_callsite_ids=tuple(sorted({
+                    *map(int, block.orelse_callsite_ids),
+                    *owned.get((source, "orelse"), ()),
+                })),
+            )
+        if isinstance(block, SequenceBlock):
+            return replace(
+                block, blocks=tuple(stamp(child) for child in block.blocks)
+            )
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            return replace(block, body=stamp(block.body))
+        if isinstance(block, CallBlock):
+            return replace(block, callee=stamp(block.callee))
+        return block
+
+    return replace(control, root=stamp(control.root))
+
+
 def _consume_resident_control_values(control: Any, resident: frozenset[int]):
     """Consume every region-owned value a control expression names.
 
@@ -5711,6 +5948,7 @@ def _install_lexical_sequence_mutations(
         ConditionalBlock,
         ControlExpression,
         LoopBlock,
+        LoopControlBlock,
         SequenceBlock,
         SequenceMutationBlock,
         StatementBlock,
@@ -5728,6 +5966,8 @@ def _install_lexical_sequence_mutations(
     ))
     if not mutations:
         return control, ()
+
+    memberships = _branch_compartments(graph)
 
     existing_effect_ids: set[int] = set()
 
@@ -5756,8 +5996,6 @@ def _install_lexical_sequence_mutations(
         item for item in mutations
         if int(item.effect_node_id) not in existing_effect_ids
     )
-    if not mutations:
-        return control, ()
 
     def node_position(node_id: int) -> tuple[int, int, int]:
         data = graph.G.nodes.get(int(node_id), {})
@@ -5792,6 +6030,8 @@ def _install_lexical_sequence_mutations(
                 )
         if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
             return node_position(int(block.source_node_id))
+        if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
+            return node_position(int(block.site_node_id))
         if isinstance(block, (LoopBlock, WhileBlock)):
             source_id = getattr(block, "source_loop_node_id", None)
             if source_id is not None:
@@ -5817,7 +6057,6 @@ def _install_lexical_sequence_mutations(
             )
         ))
 
-    memberships = _branch_compartments(graph)
     retained_mutation_records = (
         graph.G.graph.get("source_sequence_mutation_records") or {}
     )
@@ -5874,6 +6113,86 @@ def _install_lexical_sequence_mutations(
             )
             return replace(block, callee=callee), inserted
         return block, False
+
+    # A retained loop's effects were lowered after its body, each behind its
+    # own guard predicate.  When the body is lexical control ending in a
+    # terminal edge (break, continue, return), "after the body" is
+    # unreachable code: the effect never runs, and every value it consumes
+    # there (the guard's own operands above all) drags the call producing
+    # that value out of the body with it.  An authored effect belongs at its
+    # authored position inside the body.  When its guarding conditional is
+    # present in the tree it is installed in that arm like any other effect
+    # (the arm is its guard).  Otherwise -- the conditional owned no region
+    # and was projected away -- it keeps its composed guard and is ordered
+    # among the body's statements by source position.
+    def conditional_owner_ids(block) -> set[int]:
+        owners: set[int] = set()
+        if isinstance(block, ConditionalBlock):
+            if block.source_node_id is not None:
+                owners.add(int(block.source_node_id))
+            owners |= conditional_owner_ids(block.body)
+            if block.orelse is not None:
+                owners |= conditional_owner_ids(block.orelse)
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                owners |= conditional_owner_ids(child)
+        elif isinstance(block, (LoopBlock, WhileBlock)):
+            owners |= conditional_owner_ids(block.body)
+        elif isinstance(block, CallBlock):
+            owners |= conditional_owner_ids(block.callee)
+        return owners
+
+    arm_relocated: list = []
+
+    def relocate(block):
+        if isinstance(block, SequenceBlock):
+            return replace(
+                block, blocks=tuple(relocate(child) for child in block.blocks)
+            )
+        if isinstance(block, ConditionalBlock):
+            return replace(
+                block,
+                body=relocate(block.body),
+                orelse=None if block.orelse is None else relocate(block.orelse),
+            )
+        if isinstance(block, CallBlock):
+            return replace(block, callee=relocate(block.callee))
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            body = relocate(block.body)
+            owners = conditional_owner_ids(body)
+            kept = []
+            for item in block.sequence_mutations:
+                effect_id = int(item.effect_node_id)
+                guards = tuple(
+                    (int(owner), str(arm))
+                    for owner, arm in memberships.get(effect_id, ())
+                    if str(arm) in {"body", "orelse"} and int(owner) in owners
+                )
+                if guards:
+                    arm_relocated.append(
+                        replace(item, predicate_expression=None)
+                    )
+                    continue
+                if (
+                    effect_id in graph.G
+                    and node_position(effect_id)[0] < (1 << 30)
+                ):
+                    body = insert_ordered(body, SequenceMutationBlock(item))
+                    continue
+                kept.append(item)
+            return replace(block, body=body, sequence_mutations=tuple(kept))
+        return block
+
+    control = replace(control, root=relocate(control.root))
+    if arm_relocated:
+        relocated_ids = {int(item.effect_node_id) for item in arm_relocated}
+        mutations = (
+            *arm_relocated,
+            *(
+                item for item in mutations
+                if int(item.effect_node_id) not in relocated_ids
+            ),
+        )
 
     root = control.root
     unplaced = []
@@ -8092,22 +8411,45 @@ def _sequence_column_dtype_contracts(
         "float": "float64",
     }
     contracts: dict[int, tuple[str, ...]] = {}
+    repository_records = dict(
+        (graph_obj.graph.get("program_abi") or {}).get("records") or {}
+    )
     for parameter_name, annotation in (
         _current_authored_parameter_annotations(graph_obj).items()
     ):
-        contract = _authored_sequence_annotation_contract(annotation)
-        if contract is None:
-            continue
-        _policy, _column_count, _writable, dtypes = contract
         sequence_id = next((
             int(value_id)
             for value_id in identities.get(str(parameter_name), ())
             if int(value_id) in declared
         ), None)
-        if (
-            sequence_id is not None
-            and len(dtypes) == declared[int(sequence_id)]
+        if sequence_id is None:
+            continue
+        layout = _authored_row_layout(annotation, repository_records)
+        if layout is not None and any(
+            kind == "record" for kind, _identity, _width in layout
         ):
+            row_dtypes: list[str] = []
+            for kind, identity, _width in layout:
+                if kind == "record":
+                    record = next(
+                        record for candidate, record
+                        in repository_records.items()
+                        if str(candidate) == identity
+                    )
+                    row_dtypes.extend(
+                        dtype for _name, dtype
+                        in _record_row_physical_columns(record)
+                    )
+                else:
+                    row_dtypes.append("unknown")
+            if len(row_dtypes) == declared[int(sequence_id)]:
+                contracts[int(sequence_id)] = tuple(row_dtypes)
+            continue
+        contract = _authored_sequence_annotation_contract(annotation)
+        if contract is None:
+            continue
+        _policy, _column_count, _writable, dtypes = contract
+        if len(dtypes) == declared[int(sequence_id)]:
             contracts[int(sequence_id)] = tuple(map(str, dtypes))
     for parameter_name, record in _graph_sequence_record_abi(graph_obj).items():
         dtypes = tuple(dtype for _name, dtype in _record_row_physical_columns(record))
@@ -9816,6 +10158,9 @@ def _class_surface_ssa_program(
             control, graph_obj, resident=resident_value_ids,
         )
         control = _consume_resident_control_values(control, resident_value_ids)
+        control = _stamp_conditional_callsite_ownership(
+            control, graph, getattr(shell, "hierarchy_plan", None),
+        )
         # Query placement initially sees only predicate result ids.  Once the
         # structured expression is attached, reschedule so a conditional such
         # as ``optional_row is None`` exposes its dependency on the row handle
@@ -10884,6 +11229,9 @@ def _class_surface_ssa_program(
                     _sequence_record_identity_contracts(
                         graph_obj, sequence_declarations
                     )
+                ),
+                sequence_row_record_slots=_sequence_row_record_slots(
+                    graph_obj, sequence_declarations
                 ),
                 source_sequence_ids=_authored_source_sequence_ids(
                     graph_obj, sequence_declarations
@@ -13182,6 +13530,16 @@ def _class_surface_ssa_program(
             "ssa_deferred_record_row"
         ),)
         if deferred is not None
+    } | {
+        str(identity)
+        for function in all_functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        for deferred in (instruction.attributes.get(
+            "ssa_deferred_record_slots"
+        ),)
+        if deferred is not None
+        for _position, _semantic_id, identity, _width in deferred[1]
     }
     # Which fields a function's OWN body writes locally (a direct SetAttr).
     # ``record_field_demands`` (reads) is forwarded transitively below via
@@ -16815,7 +17173,24 @@ def _class_surface_ssa_program(
                             or len(resident.value_ids) != len(field.value_ids)
                         ):
                             raise ValueError(
-                                f"returned record formal lacks receiver field {field.name!r}"
+                                "returned record formal lacks receiver field "
+                                f"{field.name!r}: callee record "
+                                f"{root.identity!r} (record {root.record_id}, "
+                                f"result {callee_result_id}) publishes "
+                                f"storage={field.storage!r} "
+                                f"storage_identity={field.storage_identity!r} "
+                                f"value_ids={tuple(field.value_ids)!r}; caller "
+                                f"receiver {receiver_id} (result "
+                                f"{caller_result_id}) has "
+                                + (
+                                    "no such field"
+                                    if resident is None else
+                                    f"storage={resident.storage!r} "
+                                    f"storage_identity={resident.storage_identity!r} "
+                                    f"value_ids={tuple(resident.value_ids)!r}"
+                                )
+                                + f"; receiver fields="
+                                f"{sorted(receiver_fields)!r}"
                             )
                         result_storage_bindings.update(zip(
                             field.value_ids, resident.value_ids, strict=True,
@@ -18367,6 +18742,8 @@ def _class_surface_ssa_program(
                     pending.extend(caller.blocks[block_name].successors)
                 return frozenset(owned)
 
+            marker_rejections: dict[int, tuple[Any, ...]] = {}
+
             def replace_at_callsite_marker(
                 record: SSACallRecord,
                 sequence: list[Instr],
@@ -18529,6 +18906,29 @@ def _class_surface_ssa_program(
                                 for consumer_name, consumer_index in consumers
                             )
                             if consumers and not marker_dominates:
+                                marker_rejections[int(record.callsite_id)] = tuple(
+                                    (
+                                        consumer_name, consumer_index,
+                                        caller.blocks[consumer_name].instrs[
+                                            consumer_index
+                                        ].op,
+                                        (caller.blocks[consumer_name].instrs[
+                                            consumer_index
+                                        ].attributes or {}).get("callee"),
+                                        [int(argument.id) for argument in
+                                         caller.blocks[consumer_name].instrs[
+                                             consumer_index
+                                         ].args],
+                                    )
+                                    for consumer_name, consumer_index in consumers
+                                    if not (
+                                        block.name in dominators[consumer_name]
+                                        and (
+                                            block.name != consumer_name
+                                            or index < consumer_index
+                                        )
+                                    )
+                                )
                                 common_dominators = set.intersection(*(
                                     dominators[consumer_name]
                                     for consumer_name, _consumer_index
@@ -18625,19 +19025,14 @@ def _class_surface_ssa_program(
                                         target_index:target_index
                                     ] = sequence
                                     return True
-                        if (
-                            aggregate_sequence
-                            and record.enclosing_loop_ids
-                            and call_anchor_value_ids.get((
-                                str(caller_symbol), int(record.callsite_id)
-                            )) is not None
-                        ):
-                            # Let the loop-aware scheduler prove whether an
-                            # exact result consumer precedes this statement
-                            # marker in CFG order.  Splicing here would hide
-                            # that proof opportunity and can place a producer
-                            # below its break predicate.
-                            return False
+                        # Every consumer of this call's results is dominated
+                        # by the marker (checked above; a consumer preceding
+                        # the marker in CFG order, a break predicate for one,
+                        # took the relocation branch).  The marker is the
+                        # scheduler's exact position for the call, so it is
+                        # honoured here for aggregate results inside loops
+                        # too; deferring those to the post-hoc loop anchor
+                        # placed calls after the body's terminal edge.
                         block.instrs[index:index + 1] = sequence
                         if (marker_result is not None and not aggregate_sequence
                             and not any(spliced.attributes.get("forwarded_output_bindings")
@@ -20808,9 +21203,39 @@ def _class_surface_ssa_program(
                                         "plan_callsite_marker_projection": True,
                                         "plan_callsite_id": record.callsite_id,
                                     })
+                    marker_blocks = tuple(
+                        block_name
+                        for block_name, marker_block in caller.blocks.items()
+                        for marker_instruction in marker_block.instrs
+                        if (marker_instruction.attributes or {}).get(
+                            "plan_callsite_marker"
+                        )
+                        and int((marker_instruction.attributes or {}).get(
+                            "plan_callsite_id", -1
+                        )) == int(record.callsite_id)
+                    )
                     inserted = replace_at_callsite_marker(
                         record, native_sequence
-                    ) or insert_at_loop_anchor(
+                    )
+                    if not inserted and marker_blocks:
+                        # The scheduler placed this call at its marker.  A
+                        # marker that cannot be honoured means a consumer of
+                        # the call's results sits where the marker does not
+                        # dominate it: a placement defect in the control
+                        # schedule.  Relocating the call to a loop anchor or
+                        # the entry block used to hide that defect as an
+                        # effect running before its inputs exist.
+                        raise FortranEmissionError(
+                            f"planned callsite {int(record.callsite_id)} in "
+                            f"{caller_symbol!r} could not be linked at its "
+                            f"scheduled marker (block(s) {marker_blocks!r}): "
+                            "a consumer of its results is not dominated by "
+                            "the marker; fix the control schedule, do not "
+                            "relocate the call. Undominated consumers "
+                            "(block, index, op, callee, operands): "
+                            f"{marker_rejections.get(int(record.callsite_id))!r}"
+                        )
+                    inserted = inserted or insert_at_loop_anchor(
                         record, native_sequence
                     )
                     if (
@@ -21771,6 +22196,135 @@ def _class_surface_ssa_program(
                     "ssa_record_row_identity": str(expected_identity),
                 }
                 instruction.attributes.pop("ssa_deferred_record_row", None)
+        # A record named at one column of a wider tuple row.  The record's
+        # member fields, proven by native-call linking, replace that single
+        # semantic operand in place; positions are expanded last-first so
+        # earlier indices stay valid.
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                deferred = instruction.attributes.get(
+                    "ssa_deferred_record_slots"
+                )
+                if deferred is None:
+                    continue
+                row_value_offset, slots = deferred
+                arguments = list(instruction.args)
+                expanded_dtypes: dict[int, tuple[tuple[Any, str], ...]] = {}
+                reason = None
+                for position, semantic_id, expected_identity, width in sorted(
+                    slots, key=lambda slot: -int(slot[0]),
+                ):
+                    index = int(row_value_offset) + int(position)
+                    if index >= len(arguments):
+                        reason = "record slot lies outside the row arguments"
+                        break
+                    # Linking may already have rebound the semantic operand
+                    # (a returned record formal aliases its receiver); the
+                    # current operand is the record whose entry we need.
+                    operand_id = int(arguments[index].id)
+                    descriptor = None if record_table is None else (
+                        record_table.records.get(operand_id)
+                        or record_table.records.get(int(semantic_id))
+                    )
+                    if descriptor is None:
+                        reason = (
+                            f"record descriptor for value {operand_id} "
+                            "(semantic "
+                            f"{int(semantic_id)}) is unavailable after "
+                            "native linking"
+                        )
+                        break
+                    if not (
+                        str(descriptor.identity) == str(expected_identity)
+                        or (
+                            "." not in str(expected_identity)
+                            and str(descriptor.identity).rsplit(".", 1)[-1]
+                            == str(expected_identity)
+                        )
+                    ):
+                        reason = (
+                            f"record identity {descriptor.identity!r} does "
+                            "not match row column identity "
+                            f"{expected_identity!r}"
+                        )
+                        break
+                    layout_with_dtypes = tuple(
+                        (int(value_id), str(field.dtype or "unknown"))
+                        for field in descriptor.fields
+                        for value_id in field.value_ids
+                    )
+                    if len(layout_with_dtypes) != int(width):
+                        reason = (
+                            f"record layout has {len(layout_with_dtypes)} "
+                            f"column(s), row column expects {int(width)}"
+                        )
+                        break
+                    if any(
+                        value_id not in current_values
+                        for value_id, _dtype in layout_with_dtypes
+                    ):
+                        reason = (
+                            "one or more physical record fields have no "
+                            "caller value"
+                        )
+                        break
+                    replacement = []
+                    for value_id, dtype in layout_with_dtypes:
+                        value = exact_output_values.get(
+                            value_id, current_values[value_id]
+                        )
+                        if dtype not in {"", "unknown", "None"}:
+                            value.dtype = dtype
+                            value.accounting = {
+                                **dict(value.accounting or {}),
+                                "returned_record_storage": str(
+                                    expected_identity
+                                ),
+                                "physical_dtype": dtype,
+                            }
+                        replacement.append(value)
+                    arguments[index:index + 1] = replacement
+                    expanded_dtypes[index] = tuple(
+                        (value, dtype)
+                        for value, (_value_id, dtype)
+                        in zip(replacement, layout_with_dtypes)
+                    )
+                if reason is not None:
+                    unresolved_rows.append({
+                        "callee": instruction.attributes.get("callee"),
+                        "sequence_id": instruction.attributes.get(
+                            "sequence_id"
+                        ),
+                        "record_slots": tuple(slots),
+                        "reason": reason,
+                    })
+                    continue
+                instruction.args = arguments
+                callee = all_functions.get(str(
+                    instruction.attributes.get("callee") or ""
+                ))
+                if callee is not None:
+                    row_values = arguments[int(row_value_offset):]
+                    formals = callee.args[-len(row_values):]
+                    dtype_by_value = {
+                        id(value): dtype
+                        for group in expanded_dtypes.values()
+                        for value, dtype in group
+                    }
+                    for formal, value in zip(formals, row_values):
+                        dtype = dtype_by_value.get(id(value))
+                        if dtype is None or dtype in {"", "unknown", "None"}:
+                            continue
+                        formal.dtype = dtype
+                        formal.accounting = {
+                            **dict(formal.accounting or {}),
+                            "physical_dtype": dtype,
+                        }
+                instruction.attributes = {
+                    **instruction.attributes,
+                    "ssa_record_slots_expanded": tuple(slots),
+                }
+                instruction.attributes.pop("ssa_deferred_record_slots", None)
         if unresolved_rows:
             function.metadata["unresolved_record_sequence_rows"] = tuple(
                 unresolved_rows

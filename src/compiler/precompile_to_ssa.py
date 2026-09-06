@@ -873,6 +873,9 @@ class _ControlSSABuilder:
         sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
         sequence_column_dtypes: Mapping[int, tuple[str, ...]] | None = None,
         sequence_record_identities: Mapping[int, str] | None = None,
+        sequence_row_record_slots: Mapping[
+            int, tuple[tuple[int, str, int], ...]
+        ] | None = None,
         source_sequence_ids: tuple[int, ...] = (),
         sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
         table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
@@ -1012,6 +1015,17 @@ class _ControlSSABuilder:
             int(sequence_id): str(identity)
             for sequence_id, identity in (
                 sequence_record_identities or {}
+            ).items()
+        }
+        # Record-typed columns of fixed-width rows: (authored column,
+        # identity, physical width) per resident sequence.
+        self.sequence_row_record_slots = {
+            int(sequence_id): tuple(
+                (int(position), str(identity), int(width))
+                for position, identity, width in slots
+            )
+            for sequence_id, slots in (
+                sequence_row_record_slots or {}
             ).items()
         }
         self.resolved_sequence_schemas: dict[int, ResolvedSequenceSchema] = {
@@ -4777,9 +4791,43 @@ class _ControlSSABuilder:
 
         call_arguments: tuple[SSAValue, ...]
         deferred_record_row: tuple[int, str, int] | None = None
+        deferred_record_slots: tuple[tuple[int, int, str, int], ...] = ()
         if operation in {"append", "add"}:
             expected_columns = len(destination.column_value_ids)
-            if len(mutation.argument_value_ids) != expected_columns:
+            record_slots = self.sequence_row_record_slots.get(
+                int(destination.sequence_id), ()
+            )
+            if record_slots and len(
+                mutation.argument_value_ids
+            ) != expected_columns:
+                # A record named at one column of the authored row stands
+                # for its member fields.  Its physical layout is proven by
+                # native-call linking, which expands the single semantic
+                # operand in place; here the row is checked to be exactly
+                # the authored width once every record column is expanded.
+                argument_count = len(mutation.argument_value_ids)
+                applicable = tuple(
+                    (position, identity, width)
+                    for position, identity, width in record_slots
+                    if position < argument_count
+                )
+                expanded_width = argument_count + sum(
+                    width - 1 for _position, _identity, width in applicable
+                )
+                if applicable and expanded_width == expected_columns:
+                    deferred_record_slots = tuple(
+                        (
+                            int(position),
+                            int(mutation.argument_value_ids[position]),
+                            str(identity),
+                            int(width),
+                        )
+                        for position, identity, width in applicable
+                    )
+            if (
+                not deferred_record_slots
+                and len(mutation.argument_value_ids) != expected_columns
+            ):
                 record_identity = self.sequence_record_identities.get(
                     int(destination.sequence_id)
                 )
@@ -4976,12 +5024,33 @@ class _ControlSSABuilder:
                     ),
                 )
             )
-            if deferred_record_row is None:
+            if deferred_record_row is None and not deferred_record_slots:
                 for mutation_value, element_dtype in zip(
                     mutation_values, destination.column_dtypes
                 ):
                     if str(element_dtype) not in {"", "unknown", "None"}:
                         mutation_value.dtype = str(element_dtype)
+            elif deferred_record_slots:
+                # Scalar columns keep their contract; a record column's
+                # dtypes are applied by the link-time expansion.
+                slot_positions = {
+                    position for position, *_rest in deferred_record_slots
+                }
+                column_index = 0
+                for position, mutation_value in enumerate(mutation_values):
+                    slot = next((
+                        item for item in deferred_record_slots
+                        if item[0] == position
+                    ), None)
+                    if slot is not None:
+                        column_index += int(slot[3])
+                        continue
+                    if column_index < len(destination.column_dtypes):
+                        element_dtype = destination.column_dtypes[column_index]
+                        if str(element_dtype) not in {"", "unknown", "None"}:
+                            mutation_value.dtype = str(element_dtype)
+                    column_index += 1
+                del slot_positions
             call_arguments = (
                 *self.sequence_storage_values[destination.sequence_id],
                 *mutation_values,
@@ -5091,6 +5160,12 @@ class _ControlSSABuilder:
                 **({
                     "ssa_deferred_record_row": deferred_record_row,
                 } if deferred_record_row is not None else {}),
+                **({
+                    "ssa_deferred_record_slots": (
+                        len(call_arguments) - len(mutation.argument_value_ids),
+                        deferred_record_slots,
+                    ),
+                } if deferred_record_slots else {}),
                 **({
                     "extraction_identity": str(mutation.extraction_identity),
                 } if mutation.extraction_identity is not None else {}),
@@ -6974,6 +7049,9 @@ def lower_control_program_to_ssa(
     sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
     sequence_column_dtypes: Mapping[int, tuple[str, ...]] | None = None,
     sequence_record_identities: Mapping[int, str] | None = None,
+    sequence_row_record_slots: Mapping[
+        int, tuple[tuple[int, str, int], ...]
+    ] | None = None,
     source_sequence_ids: tuple[int, ...] = (),
     sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
     table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
@@ -7020,6 +7098,7 @@ def lower_control_program_to_ssa(
         sequence_declarations=sequence_declarations,
         sequence_column_dtypes=sequence_column_dtypes,
         sequence_record_identities=sequence_record_identities,
+        sequence_row_record_slots=sequence_row_record_slots,
         source_sequence_ids=source_sequence_ids,
         sequence_memberships=sequence_memberships,
         table_lookups=table_lookups,
@@ -7969,6 +8048,26 @@ def _schedule_loop_callsites(
             )
         ))
 
+    def append_before_terminal(body: Any, trailing_marker: Any) -> SequenceBlock:
+        """Append a trailing call marker ahead of the body's terminal edge.
+
+        A loop body that ends in an unconditional ``break``/``continue``/
+        ``return`` has no reachable position after that edge; a marker
+        appended there is dead code and the call it stands for never runs.
+        """
+
+        blocks = list(sequence(body).blocks)
+        index = len(blocks)
+        while (
+            index > 0
+            and isinstance(blocks[index - 1], LoopControlBlock)
+            and blocks[index - 1].predicate_value_id is None
+            and blocks[index - 1].predicate_expression is None
+        ):
+            index -= 1
+        blocks.insert(index, trailing_marker)
+        return SequenceBlock(tuple(blocks))
+
     def rebuild(block: Any) -> Any:
         region = scheduled_region(block)
         if region is not None:
@@ -7989,7 +8088,9 @@ def _schedule_loop_callsites(
             )
             trailing = trailing_at_loop.get(loop_id, ())
             if trailing:
-                rebuilt_body = sequence(rebuilt_body, marker(trailing))
+                rebuilt_body = append_before_terminal(
+                    rebuilt_body, marker(trailing)
+                )
             return replace(block, body=rebuilt_body)
         if isinstance(block, WhileBlock):
             rebuilt_condition = rebuild(block.condition)
@@ -8000,7 +8101,9 @@ def _schedule_loop_callsites(
                 (),
             )
             if trailing:
-                rebuilt_body = sequence(rebuilt_body, marker(trailing))
+                rebuilt_body = append_before_terminal(
+                    rebuilt_body, marker(trailing)
+                )
             return replace(
                 block, condition=rebuilt_condition, body=rebuilt_body
             )
@@ -8693,6 +8796,9 @@ def lower_control_sections_to_ssa(
     sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
     sequence_column_dtypes: Mapping[int, tuple[str, ...]] | None = None,
     sequence_record_identities: Mapping[int, str] | None = None,
+    sequence_row_record_slots: Mapping[
+        int, tuple[tuple[int, str, int], ...]
+    ] | None = None,
     source_sequence_ids: tuple[int, ...] = (),
     sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
     table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
@@ -10497,6 +10603,7 @@ def lower_control_sections_to_ssa(
         sequence_declarations=sequence_declarations,
         sequence_column_dtypes=sequence_column_dtypes,
         sequence_record_identities=sequence_record_identities,
+        sequence_row_record_slots=sequence_row_record_slots,
         source_sequence_ids=source_sequence_ids,
         sequence_memberships=sequence_memberships,
         table_lookups=table_lookups,
