@@ -7859,6 +7859,7 @@ def _schedule_loop_callsites(
     region_dependency_signatures: Mapping[
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
+    callsite_projection_ids: Mapping[int, tuple[int, ...]] | None = None,
 ) -> tuple[ControlProgram, dict[int, tuple[tuple[int, ...], tuple[int, ...]]]]:
     """Install this closure's PlanCalls as ordinary scheduled statements.
 
@@ -8202,6 +8203,25 @@ def _schedule_loop_callsites(
         return produced
 
 
+    def expression_value_ids(expression: Any) -> set[int]:
+        """Every value id a control expression reads, transitively.
+
+        A predicate such as ``not ok`` is a control expression over the
+        call result ``ok``; the block's own predicate id is the negation
+        node, which nothing publishes.  The dependency is on the operands.
+        """
+
+        found: set[int] = set()
+        pending = [expression]
+        while pending:
+            current = pending.pop()
+            if current is None:
+                continue
+            if getattr(current, "value_id", None) is not None:
+                found.add(int(current.value_id))
+            pending.extend(getattr(current, "operands", ()) or ())
+        return found
+
     def dependency_signature(
         block: Any,
     ) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
@@ -8215,6 +8235,7 @@ def _schedule_loop_callsites(
                       if value_id is not None}
             if block.predicate_value_id is not None:
                 inputs.add(int(block.predicate_value_id))
+            inputs |= expression_value_ids(block.predicate_expression)
             return tuple(sorted(inputs)), ()
         if isinstance(block, StatementBlock):
             region_index = scheduled_region(block)
@@ -8231,22 +8252,40 @@ def _schedule_loop_callsites(
                 callsites.append(int(match.group(1)))
             if not callsites:
                 return None
+            # A call publishes its bound results and every projection the
+            # caller takes of them (``metrics.mass_err``, ``result[1]``):
+            # those projections are what regions, loops and effects consume.
+            # Without them a loop reading the record's fields carried no
+            # dependency on the call and floated ahead of it.
             return (
                 tuple(dict.fromkeys(
                     value_id
                     for callsite_id in callsites
                     for value_id in bindings.get(callsite_id, ((), ()))[0]
                 )),
-                tuple(dict.fromkeys(
-                    value_id
-                    for callsite_id in callsites
-                    for value_id in bindings.get(callsite_id, ((), ()))[1]
-                )),
+                tuple(dict.fromkeys((
+                    *(
+                        value_id
+                        for callsite_id in callsites
+                        for value_id in bindings.get(callsite_id, ((), ()))[1]
+                    ),
+                    *(
+                        int(value_id)
+                        for callsite_id in callsites
+                        for value_id in (callsite_projection_ids or {}).get(
+                            int(callsite_id), ()
+                        )
+                    ),
+                ))),
             )
         if isinstance(block, SequenceMutationBlock):
             mutation = block.mutation
+            consumed_ids: set[int] = set(map(int, mutation.argument_value_ids))
+            consumed_ids |= expression_value_ids(mutation.predicate_expression)
+            for argument_expression in mutation.argument_expressions:
+                consumed_ids |= expression_value_ids(argument_expression)
             return (
-                tuple(map(int, mutation.argument_value_ids)),
+                tuple(sorted(consumed_ids)),
                 (
                     int(mutation.effect_node_id),
                     int(mutation.sequence_value_id),
@@ -8271,6 +8310,7 @@ def _schedule_loop_callsites(
             # Otherwise an overlaid region used as a call anchor can strand
             # that call after a branch which already consumes its result.
             consumed: set[int] = {int(block.predicate_value_id)}
+            consumed |= expression_value_ids(block.predicate_expression)
             produced: set[int] = set()
 
             def collect_arm(candidate: Any) -> bool:
@@ -8292,6 +8332,7 @@ def _schedule_loop_callsites(
             aliases = (*block.carried_aliases, *block.carried_sequence_aliases)
             external = consumed - produced
             external.add(int(block.predicate_value_id))
+            external |= expression_value_ids(block.predicate_expression)
             external.update(int(initial) for _yes, _no, initial, _merged in aliases)
             return (
                 tuple(sorted(external)),
@@ -8836,6 +8877,7 @@ def lower_control_sections_to_ssa(
     sequence_row_record_slots: Mapping[
         int, tuple[tuple[int, str, int], ...]
     ] | None = None,
+    callsite_projection_ids: Mapping[int, tuple[int, ...]] | None = None,
     source_sequence_ids: tuple[int, ...] = (),
     sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
     table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
@@ -10616,6 +10658,7 @@ def lower_control_sections_to_ssa(
         hierarchy_plan,
         region_signatures,
         region_dependency_signatures,
+        callsite_projection_ids=callsite_projection_ids,
     )
     control_function, control_shortfalls = lower_control_program_to_ssa(
         control,

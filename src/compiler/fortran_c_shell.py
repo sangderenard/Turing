@@ -5906,6 +5906,56 @@ def _nest_lexical_conditionals_in_loops(
     return replace(control, root=root)
 
 
+def _plan_callsite_projection_ids(graph_obj: Any, hierarchy_plan: Any) -> dict[int, tuple[int, ...]]:
+    """Every caller-side projection of each planned call's bound results.
+
+    A call result that is a record or tuple has no physical value of its
+    own; the caller reads it through ``GetAttr``/``Indexed`` nodes.  Those
+    nodes are the values the rest of the caller consumes, so a scheduler
+    that orders statements by value dependencies must see them as the
+    call's publications.
+    """
+
+    from .hierarchical_plan import PlanCall
+
+    if hierarchy_plan is None:
+        return {}
+    result: dict[int, tuple[int, ...]] = {}
+    for item in getattr(hierarchy_plan, "items", ()):
+        if not isinstance(item, PlanCall):
+            continue
+        roots = [
+            int(caller_id) for _callee_id, caller_id in item.result_bindings
+        ] or [int(value_id) for value_id in item.result_value_ids]
+        found: set[int] = set()
+        pending = list(roots)
+        while pending:
+            current = pending.pop()
+            if current not in graph_obj:
+                continue
+            for successor in graph_obj.successors(current):
+                data = graph_obj.nodes[successor]
+                operation = str(
+                    data.get("op") or data.get("type") or ""
+                ).casefold()
+                if operation not in {"getattr", "indexed"}:
+                    continue
+                if not any(
+                    int(parent) == current
+                    and str(role) in {"value", "base", "operand", "object"}
+                    for parent, role in data.get("parents") or ()
+                ):
+                    continue
+                value_id = int(data.get("value_id", successor))
+                if value_id in found:
+                    continue
+                found.add(value_id)
+                pending.append(int(successor))
+        if found:
+            result[int(item.callsite_id)] = tuple(sorted(found))
+    return result
+
+
 def _place_plan_callsites_lexically(
     control: Any, graph: Any, hierarchy_plan: Any, dispatch_subgraphs: Iterable[Any],
 ):
@@ -11734,6 +11784,9 @@ def _class_surface_ssa_program(
                 sequence_row_record_slots=_sequence_row_record_slots(
                     graph_obj, sequence_declarations
                 ),
+                callsite_projection_ids=_plan_callsite_projection_ids(
+                    graph_obj, getattr(shell, "hierarchy_plan", None)
+                ),
                 source_sequence_ids=_authored_source_sequence_ids(
                     graph_obj, sequence_declarations
                 ),
@@ -15662,12 +15715,21 @@ def _class_surface_ssa_program(
                     default = field.get("default")
                     value_id = next_value_id
                     next_value_id += 1
+                    # A ``None`` default keeps its semantic dtype (``is None``
+                    # folds on it) but occupies the field's declared storage:
+                    # the emitter consults ``physical_dtype`` first, and
+                    # without it the caller's slot for this output was typed
+                    # from the solver's guess (a byte), while the callee
+                    # stored a double into it.
                     value = SSAValue(
                         value_id,
                         dtype=("none" if default is None else field.get("dtype")),
                         accounting={
                             "program_abi_default": str(field_name),
                             "program_abi_record": str(record["identity"]),
+                            **({
+                                "physical_dtype": str(field.get("dtype")),
+                            } if default is None and field.get("dtype") else {}),
                         },
                     )
                     constants.append(Instr(
