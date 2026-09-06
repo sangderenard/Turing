@@ -5839,13 +5839,9 @@ def _nest_lexical_conditionals_in_loops(
         return control
 
     def insert_ordered(block, item):
-        sequence = (
-            block if isinstance(block, SequenceBlock)
-            else SequenceBlock((block,))
-        )
         decorated = [
             (block_position(child), index, child)
-            for index, child in enumerate(sequence.blocks)
+            for index, child in enumerate(_flattened_sequence_children(block))
         ]
         decorated.append((block_position(item), len(decorated), item))
         return SequenceBlock(tuple(
@@ -5948,6 +5944,25 @@ def _plan_callsite_projection_ids(graph_obj: Any, hierarchy_plan: Any) -> dict[i
     return result
 
 
+def _flattened_sequence_children(block) -> tuple:
+    """A sequence's children with nested sequences opened up.
+
+    Nested ``SequenceBlock``s are grouping only.  Ordering a sequence by
+    source position must see each authored statement on its own: a nested
+    group takes the position of its earliest member, and dragged a later
+    conditional ahead of the statement producing its predicate.
+    """
+
+    from .control_source import SequenceBlock
+
+    if not isinstance(block, SequenceBlock):
+        return (block,)
+    flat = []
+    for child in block.blocks:
+        flat.extend(_flattened_sequence_children(child))
+    return tuple(flat)
+
+
 def _authored_node_position(graph_obj: Any, node_id: int) -> tuple[int, int, int]:
     """Source position of a graph node, or of the control record it left.
 
@@ -6038,13 +6053,9 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
         return (1 << 30, 0, 0)
 
     def insert_ordered(block, candidate):
-        sequence = (
-            block if isinstance(block, SequenceBlock)
-            else SequenceBlock((block,))
-        )
         decorated = [
             (block_position(child), index, child)
-            for index, child in enumerate(sequence.blocks)
+            for index, child in enumerate(_flattened_sequence_children(block))
         ]
         decorated.append((block_position(candidate), len(decorated), candidate))
         return SequenceBlock(tuple(
@@ -6241,13 +6252,9 @@ def _place_plan_callsites_lexically(
         return (1 << 30, 0, 0)
 
     def insert_ordered(block, item):
-        sequence = (
-            block if isinstance(block, SequenceBlock)
-            else SequenceBlock((block,))
-        )
         decorated = [
             (block_position(child), index, child)
-            for index, child in enumerate(sequence.blocks)
+            for index, child in enumerate(_flattened_sequence_children(block))
         ]
         decorated.append((block_position(item), len(decorated), item))
         return SequenceBlock(tuple(
@@ -6771,10 +6778,9 @@ def _install_lexical_sequence_mutations(
         return (1 << 30, 0, 0)
 
     def insert_ordered(block, mutation_block):
-        sequence = block if isinstance(block, SequenceBlock) else SequenceBlock((block,))
         decorated = [
             (block_position(child), index, child)
-            for index, child in enumerate(sequence.blocks)
+            for index, child in enumerate(_flattened_sequence_children(block))
         ]
         decorated.append((
             block_position(mutation_block), len(decorated), mutation_block,
@@ -7195,10 +7201,9 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
         return (1 << 30, 0, 0)
 
     def insert_ordered(block, external):
-        sequence = block if isinstance(block, SequenceBlock) else SequenceBlock((block,))
         decorated = [
             (block_position(child), index, child)
-            for index, child in enumerate(sequence.blocks)
+            for index, child in enumerate(_flattened_sequence_children(block))
         ]
         decorated.append((block_position(external), len(decorated), external))
         return SequenceBlock(tuple(
