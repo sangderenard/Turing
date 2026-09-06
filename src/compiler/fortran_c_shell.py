@@ -5698,6 +5698,212 @@ def _attach_graph_control_expressions(
     return replace(control, root=attach(control.root))
 
 
+def _nest_lexical_conditionals_in_loops(
+    control: Any, graph: Any, dispatch_subgraphs: Iterable[Any],
+):
+    """Move a conditional authored inside a retained loop into that loop.
+
+    The control overlay embeds a nested conditional by replacing its region
+    span inside the parent.  A conditional that owns no numerical region
+    (its arm holds only effects or calls) has no span to replace, so it fell
+    to the root sequence after the loop: its predicate then read loop-local
+    values in ``while_exit`` and nothing it guarded ran per iteration.  The
+    authored span is the identity: a conditional whose source position lies
+    inside a retained loop's span belongs in that loop's body, ordered among
+    the body's statements by source position.
+    """
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, LoopBlock, LoopControlBlock,
+        SequenceBlock, SequenceMutationBlock, StatementBlock, WhileBlock,
+    )
+
+    def node_position(node_id: int) -> tuple[int, int, int]:
+        data = graph.G.nodes.get(int(node_id), {})
+        expression = data.get("expr_obj")
+        span = data.get("source_span") or {}
+        return (
+            int(getattr(expression, "lineno", span.get("line", 1 << 30))
+                or (1 << 30)),
+            int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
+            int(node_id),
+        )
+
+    region_positions = {
+        int(index): min(
+            (
+                node_position(int(node_id))
+                for node_id in subgraph.G.graph.get("deployment_nodes", ())
+            ),
+            default=(1 << 30, 0, int(index)),
+        )
+        for index, subgraph in enumerate(dispatch_subgraphs)
+    }
+
+    def block_position(block) -> tuple[int, int, int]:
+        if isinstance(block, SequenceMutationBlock):
+            return node_position(int(block.mutation.effect_node_id))
+        if isinstance(block, StatementBlock) and len(block.lines) == 1:
+            line = block.lines[0]
+            if line.startswith("__scheduled_region_") and line.endswith("__"):
+                return region_positions.get(
+                    int(line[len("__scheduled_region_"):-2]),
+                    (1 << 30, 0, 0),
+                )
+        if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
+            return node_position(int(block.source_node_id))
+        if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
+            return node_position(int(block.site_node_id))
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            source_id = getattr(block, "source_loop_node_id", None)
+            if source_id is not None:
+                return node_position(int(source_id))
+        if isinstance(block, CallBlock):
+            return node_position(int(block.callsite_id))
+        if isinstance(block, SequenceBlock) and block.blocks:
+            return min(map(block_position, block.blocks))
+        return (1 << 30, 0, 0)
+
+    def loop_span(block) -> tuple[int, int] | None:
+        source_id = getattr(block, "source_loop_node_id", None)
+        if source_id is None:
+            return None
+        expression = graph.G.nodes.get(int(source_id), {}).get("expr_obj")
+        start = getattr(expression, "lineno", None)
+        end = getattr(expression, "end_lineno", None)
+        if start is None or end is None:
+            return None
+        return int(start), int(end)
+
+    spans: list[tuple[int, int, int]] = []  # (start, end, loop source id)
+
+    def collect_loops(block):
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            span = loop_span(block)
+            if span is not None:
+                spans.append((span[0], span[1], int(block.source_loop_node_id)))
+            collect_loops(block.body)
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                collect_loops(child)
+        elif isinstance(block, ConditionalBlock):
+            collect_loops(block.body)
+            if block.orelse is not None:
+                collect_loops(block.orelse)
+        elif isinstance(block, CallBlock):
+            collect_loops(block.callee)
+
+    collect_loops(control.root)
+    if not spans:
+        return control
+
+    def innermost_loop(line: int) -> int | None:
+        candidates = [
+            (end - start, loop_id) for start, end, loop_id in spans
+            if start <= line <= end
+        ]
+        return min(candidates)[1] if candidates else None
+
+    misplaced: list = []
+
+    def strip(block, ancestors: tuple[int, ...]):
+        """Remove conditionals that belong in a loop not among ``ancestors``."""
+
+        if isinstance(block, SequenceBlock):
+            kept = []
+            for child in block.blocks:
+                projected = strip(child, ancestors)
+                if projected is not None:
+                    kept.append(projected)
+            return SequenceBlock(tuple(kept))
+        if isinstance(block, ConditionalBlock):
+            if block.source_node_id is not None:
+                owner = innermost_loop(
+                    node_position(int(block.source_node_id))[0]
+                )
+                if owner is not None and owner not in ancestors:
+                    misplaced.append((owner, block))
+                    return None
+            return replace(
+                block,
+                body=strip(block.body, ancestors),
+                orelse=(
+                    None if block.orelse is None
+                    else strip(block.orelse, ancestors)
+                ),
+            )
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            own = getattr(block, "source_loop_node_id", None)
+            inner = ancestors if own is None else (*ancestors, int(own))
+            return replace(block, body=strip(block.body, inner))
+        if isinstance(block, CallBlock):
+            return replace(block, callee=strip(block.callee, ancestors))
+        return block
+
+    root = strip(control.root, ())
+    if not misplaced:
+        return control
+
+    def insert_ordered(block, item):
+        sequence = (
+            block if isinstance(block, SequenceBlock)
+            else SequenceBlock((block,))
+        )
+        decorated = [
+            (block_position(child), index, child)
+            for index, child in enumerate(sequence.blocks)
+        ]
+        decorated.append((block_position(item), len(decorated), item))
+        return SequenceBlock(tuple(
+            child for _position, _index, child in sorted(
+                decorated, key=lambda entry: (entry[0], entry[1])
+            )
+        ))
+
+    def insert_into_loop(block, loop_id: int, item):
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            if int(getattr(block, "source_loop_node_id", -1) or -1) == loop_id:
+                return replace(block, body=insert_ordered(block.body, item)), True
+            body, inserted = insert_into_loop(block.body, loop_id, item)
+            return (replace(block, body=body), True) if inserted else (block, False)
+        if isinstance(block, SequenceBlock):
+            for index, child in enumerate(block.blocks):
+                projected, inserted = insert_into_loop(child, loop_id, item)
+                if inserted:
+                    return replace(block, blocks=(
+                        *block.blocks[:index], projected,
+                        *block.blocks[index + 1:],
+                    )), True
+            return block, False
+        if isinstance(block, ConditionalBlock):
+            body, inserted = insert_into_loop(block.body, loop_id, item)
+            if inserted:
+                return replace(block, body=body), True
+            if block.orelse is not None:
+                orelse, inserted = insert_into_loop(block.orelse, loop_id, item)
+                if inserted:
+                    return replace(block, orelse=orelse), True
+            return block, False
+        if isinstance(block, CallBlock):
+            callee, inserted = insert_into_loop(block.callee, loop_id, item)
+            return (replace(block, callee=callee), True) if inserted else (block, False)
+        return block, False
+
+    # Outer conditionals first, so an inner one lands inside its parent's
+    # already-placed arm by ordinary source ordering.
+    for loop_id, block in sorted(
+        misplaced,
+        key=lambda item: node_position(int(item[1].source_node_id)),
+    ):
+        root, inserted = insert_into_loop(root, loop_id, block)
+        if not inserted:
+            raise FortranEmissionError(
+                f"conditional {block.source_node_id} is authored inside loop "
+                f"{loop_id} but that loop is absent from the control tree"
+            )
+    return replace(control, root=root)
+
+
 def _stamp_conditional_callsite_ownership(
     control: Any, graph: Any, hierarchy_plan: Any,
 ):
@@ -5968,6 +6174,67 @@ def _install_lexical_sequence_mutations(
         return control, ()
 
     memberships = _branch_compartments(graph)
+
+    def enclosing_loop_span(loop_block) -> tuple[int, int] | None:
+        source_id = getattr(loop_block, "source_loop_node_id", None)
+        if source_id is None:
+            return None
+        expression = graph.G.nodes.get(int(source_id), {}).get("expr_obj")
+        start = getattr(expression, "lineno", None)
+        end = getattr(expression, "end_lineno", None)
+        if start is None or end is None:
+            return None
+        return int(start), int(end)
+
+    def insert_in_enclosing_loop(block, item_block, node_id: int):
+        """Insert ``item_block`` ordered by position inside the innermost loop
+        whose authored span contains ``node_id``; at this level otherwise.
+
+        A guard synthesized for an effect authored inside a loop body used to
+        be ordered among the ROOT statements, which put it after the loop:
+        the effect never ran and its predicate read loop-local values in
+        ``while_exit``.
+        """
+
+        line = node_position(int(node_id))[0]
+
+        def descend(candidate):
+            if isinstance(candidate, SequenceBlock):
+                for index, child in enumerate(candidate.blocks):
+                    replaced, inserted = descend(child)
+                    if inserted:
+                        return replace(
+                            candidate,
+                            blocks=(*candidate.blocks[:index], replaced,
+                                    *candidate.blocks[index + 1:]),
+                        ), True
+                return candidate, False
+            if isinstance(candidate, ConditionalBlock):
+                body, inserted = descend(candidate.body)
+                if inserted:
+                    return replace(candidate, body=body), True
+                if candidate.orelse is not None:
+                    orelse, inserted = descend(candidate.orelse)
+                    if inserted:
+                        return replace(candidate, orelse=orelse), True
+                return candidate, False
+            if isinstance(candidate, CallBlock):
+                callee, inserted = descend(candidate.callee)
+                return (replace(candidate, callee=callee), True) if inserted else (candidate, False)
+            if isinstance(candidate, (LoopBlock, WhileBlock)):
+                span = enclosing_loop_span(candidate)
+                if span is None or not (span[0] <= line <= span[1]):
+                    return candidate, False
+                body, inserted = descend(candidate.body)
+                if not inserted:
+                    body = insert_ordered(candidate.body, item_block)
+                return replace(candidate, body=body), True
+            return candidate, False
+
+        replaced, inserted = descend(block)
+        if inserted:
+            return replaced
+        return insert_ordered(block, item_block)
 
     existing_effect_ids: set[int] = set()
 
@@ -6343,11 +6610,15 @@ def _install_lexical_sequence_mutations(
                     if inserted:
                         break
                 if not inserted:
-                    root = insert_ordered(root, synthesized)
+                    root = insert_in_enclosing_loop(
+                        root, synthesized, int(mutation.effect_node_id)
+                    )
             elif guarded:
                 unplaced.append(int(mutation.effect_node_id))
             else:
-                root = insert_ordered(root, mutation_block)
+                root = insert_in_enclosing_loop(
+                    root, mutation_block, int(mutation.effect_node_id)
+                )
     return replace(control, root=root), tuple(unplaced)
 
 
@@ -10140,6 +10411,9 @@ def _class_surface_ssa_program(
                     f"{function_name!r}: {duplicates!r}"
                 )
             lowered_conditional_count = len(conditional_controls)
+        control = _nest_lexical_conditionals_in_loops(
+            control, graph, getattr(shell, "dispatch_subgraphs", ()),
+        )
         control, lexical_sequence_shortfalls = _install_lexical_sequence_mutations(
             control,
             graph,

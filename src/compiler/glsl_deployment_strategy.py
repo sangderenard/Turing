@@ -16862,12 +16862,22 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             if value is unresolved:
                 continue
             if (
-                node_id in (loop_carried_initial_ids | mutated_sequence_ids)
+                node_id in loop_carried_initial_ids
                 and not isinstance(value, _ProgramABIValueFact)
+            ) or (
+                node_id in mutated_sequence_ids
+                and isinstance(value, (
+                    list, tuple, set, frozenset, dict, bytes, bytearray,
+                ))
             ):
                 # A mutated collection's initializer is not its runtime
                 # contents. In particular, sorting a list populated by a
                 # retained append loop must not sort its initial empty list.
+                # A specialization that is NOT a collection (``None`` for a
+                # parameter the caller left at its default) protects nothing:
+                # the name never holds contents, the mutation guarded by
+                # ``name is not None`` is dead, and folding that guard is what
+                # removes the dead rows.
                 # Likewise, this literal may be the entry arm of a Phi, not an invariant
                 # fact for the loop's condition/body.  Keeping it out of the
                 # structural-known table prevents the fixed point from

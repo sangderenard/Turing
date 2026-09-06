@@ -5,9 +5,16 @@ Isolates the DT blocker from ``step_with_dt_control_used`` (dt_controller.py):
 definition, by design; the call publishes its member fields), the caller then
 
 * appends ``(float(dt), metrics, tuple(reasons))`` to ``failures`` inside the
-  retry loop (line 449), and
+  retry loop (line 449),
 * passes the record to a callee that rewrites its keyed ``error_channels``
-  field (the ``dt_unresolved`` write-back at lines 407-410 / coerce_metrics).
+  field (the ``dt_unresolved`` write-back at lines 407-410 / coerce_metrics),
+* and, under ``if attempt_log is not None`` with ``attempt_log`` left at its
+  ``None`` default by the caller (lines 312-320), appends a dict literal whose
+  values include the record.  That arm is dead in the compiled configuration:
+  no row of it may be emitted anywhere, least of all in ``entry``.
+
+The loop lives in ``step``; ``root`` calls it with the defaults, exactly as
+``run_superstep`` calls ``step_with_dt_control_used``.
 
 Lowered with the real Metrics/Targets ABI and the full-native execution
 contract.  The lowered caller must have no operand without a definition (a
@@ -53,8 +60,9 @@ def tag_unresolved(metrics, dt, attempts):
     return metrics
 
 
-def root(metrics, targets, dt,
-         failures: list[tuple[float, Metrics, tuple[str, ...]]] | None = None):
+def step(metrics, targets, dt,
+         failures: list[tuple[float, Metrics, tuple[str, ...]]] | None = None,
+         attempt_log: list[dict] | None = None):
     if failures is None:
         failures = []
     x = dt
@@ -65,13 +73,24 @@ def root(metrics, targets, dt,
             reasons.append("mass_err")
         if not ok:
             reasons.append("advance reported a physical-bound violation")
+        if attempt_log is not None:
+            attempt_log.append({
+                "dt": float(x),
+                "accepted": not reasons,
+                "metrics": m,
+                "reasons": tuple(reasons),
+            })
         if reasons:
             m = tag_unresolved(m, x, len(failures) + 1)
             failures.append((float(x), m, tuple(reasons)))
             x = x * 0.5
             continue
         break
-    return x, len(failures)
+    return x + float(len(failures))
+
+
+def root(metrics, targets, dt):
+    return step(metrics, targets, dt)
 '''
 
 
@@ -107,6 +126,10 @@ def _contract():
                 "function": "root", "parameter": "dt", "storage": "scalar",
                 "dtype": "float64", "rank": 0, "python_type": "builtins.float",
             },
+            {
+                "function": "step", "parameter": "dt", "storage": "scalar",
+                "dtype": "float64", "rank": 0, "python_type": "builtins.float",
+            },
         ],
     }).with_execution_file(CONTRACTS / "vehicle_full_native_execution.yaml")
 
@@ -128,7 +151,7 @@ def main() -> int:
     print(f"full_native_link_gate={gate}")
     ok = True
     for name, function in (getattr(module, "functions", {}) or {}).items():
-        if "root" not in name or "__planned_region_" in name:
+        if "step" not in name or "__planned_region_" in name:
             continue
         defined = {int(a.id) for a in function.args}
         defined.update(
