@@ -15957,13 +15957,42 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 for parent, role in (data.get("parents") or ())
                 if str(role).startswith("value")
             ]
-            if not values or any(
+            if not values:
+                return unresolved
+            if not any(
                 value is unresolved
                 or isinstance(value, _ProgramABIValueFact)
                 for value in values
             ):
-                return unresolved
-            return all(values) if isinstance(expression.op, ast.And) else any(values)
+                return all(values) if isinstance(expression.op, ast.And) else any(values)
+            # ``a and b and False`` is False for every ``a``/``b``; ``a or
+            # True`` is True.  Python short-circuits, so the only thing the
+            # unresolved operands could change is which falsy/truthy VALUE
+            # comes out, never the branch.  Fold only where the node is
+            # consumed as a branch test, where truthiness is the value.
+            decided = [
+                value for value in values
+                if value is not unresolved
+                and not isinstance(value, _ProgramABIValueFact)
+            ]
+            consumers = tuple(
+                str(role)
+                for successor in graph.G.successors(int(node_id))
+                for parent, role in (
+                    graph.G.nodes[successor].get("parents") or ()
+                )
+                if int(parent) == int(node_id)
+            )
+            if consumers and all(role == "test" for role in consumers):
+                if isinstance(expression.op, ast.And) and any(
+                    not bool(value) for value in decided
+                ):
+                    return False
+                if isinstance(expression.op, ast.Or) and any(
+                    bool(value) for value in decided
+                ):
+                    return True
+            return unresolved
         if not isinstance(expression, ast.Call):
             return unresolved
         name = (
