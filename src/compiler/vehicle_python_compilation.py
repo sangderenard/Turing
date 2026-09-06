@@ -949,6 +949,7 @@ def emit_balloon_tire_managed_python_c(
     pneumatic_mode: str | None = None,
     material_profile: str = "configured",
     progress=None,
+    diagnostic_directory: str | Path | None = None,
 ):
     """Emit the managed tire and repository dt system as native-only C."""
 
@@ -1000,11 +1001,25 @@ def emit_balloon_tire_managed_python_c(
                         else " (" + "; ".join(verdict.reasons)[:200] + ")"
                     )
                 )
+    if diagnostic_directory is not None:
+        import pickle
+
+        diagnostic_root = Path(diagnostic_directory)
+        diagnostic_root.mkdir(parents=True, exist_ok=True)
+        (diagnostic_root / "repository-ssa.pkl").write_bytes(pickle.dumps(
+            (lowered.module, lowered.outputs, lowered.exports), protocol=5,
+        ))
     artifact = emit_ssa_to_c(
         lowered.module,
         lowered.root_name,
         entry_name="balloon_tire_managed_native_c",
     )
+    if diagnostic_directory is not None:
+        (diagnostic_root / "module.c").write_text(artifact.source, encoding="utf-8")
+        (diagnostic_root / "shortfalls.json").write_text(json.dumps([
+            {"operation": item.operation, "reason": item.reason}
+            for item in artifact.shortfalls
+        ], indent=2), encoding="utf-8")
     if not artifact.complete:
         raise RuntimeError(
             "managed balloon tire C emission failed: "
@@ -1037,8 +1052,29 @@ def compile_balloon_tire_managed_python_native(
         window_duration=window_duration,
         dt_initial=dt_initial,
         progress=progress,
+        diagnostic_directory=directory,
     )
     feeds_by_id = _managed_native_feeds_by_id(lowered, inputs.feeds)
+    root = lowered.module.functions[lowered.root_name]
+    arguments = {int(value.id): value for value in root.args}
+    returns = [instruction.args for block in root.blocks.values()
+               for instruction in block.instrs if instruction.op == "Ret"]
+    returned = {int(value.id): value for values in returns for value in values}
+    names = {int(value_id): name for name, value_id in
+             root.metadata.get("named_outputs", ())}
+    from .ssa_c_backend import _numpy_dtype
+
+    for value_id, dtype, shape in zip(
+        artifact.buffer_order, artifact.buffer_dtypes, artifact.buffer_shapes,
+    ):
+        value_id = int(value_id)
+        if value_id not in feeds_by_id and value_id in returned and value_id not in arguments:
+            # The returned value owns the public shape. Workspace analysis may
+            # infer a larger internal view; it must not widen a scalar result.
+            shape = tuple(returned[value_id].shape or ())
+            if any(not isinstance(extent, int) or extent < 0 for extent in shape):
+                raise RuntimeError(f"unresolved native output shape: {value_id}: {shape}")
+            feeds_by_id[value_id] = np.zeros(shape or (), dtype=_numpy_dtype(dtype))
     missing = tuple(
         value_id for value_id in artifact.buffer_order
         if int(value_id) not in feeds_by_id
@@ -1051,8 +1087,6 @@ def compile_balloon_tire_managed_python_native(
     executable = artifact.compile_standalone(
         directory, feeds_by_id, optimization=optimization,
     )
-    root = lowered.module.functions[lowered.root_name]
-    arguments = {int(value.id): value for value in root.args}
     manifest = {
         "schema": "turing.balloon-tire-managed-native.v1",
         "entrypoint": artifact.name,
@@ -1065,14 +1099,18 @@ def compile_balloon_tire_managed_python_native(
     for index, (value_id, dtype) in enumerate(zip(
         artifact.buffer_order, artifact.buffer_dtypes,
     )):
-        argument = arguments[int(value_id)]
+        argument = arguments.get(int(value_id), returned.get(int(value_id)))
         accounting = dict(argument.accounting or {})
         value = np.asarray(feeds_by_id[int(value_id)])
-        parameter = str(accounting.get("program_abi_parameter") or value_id)
+        parameter = str(accounting.get("program_abi_parameter") or names.get(int(value_id)) or value_id)
         field = accounting.get("program_abi_field")
         manifest["buffers"].append({
             "index": int(index),
             "value_id": int(value_id),
+            "role": "input" if int(value_id) in arguments else "output",
+            "return_index": next((position for values in returns
+                                  for position, result in enumerate(values)
+                                  if int(result.id) == int(value_id)), None),
             "name": parameter if field is None else f"{parameter}.{field}",
             "parameter": parameter,
             "field": None if field is None else str(field),
@@ -1316,7 +1354,10 @@ def vehicle_python_compilation_inputs(
     structural_support_positions: tuple[tuple[float, float, float], ...] | None = None,
     tire_pneumatic_mode: str | None = None,
     tire_material_profile: str = "configured",
+    rig_point_count: int = RIG_POINT_COUNT,
 ) -> VehiclePythonCompilationInputs:
+    if isinstance(rig_point_count, bool) or not isinstance(rig_point_count, int) or rig_point_count < 0:
+        raise ValueError("rig_point_count must be a nonnegative integer")
     wheel_names = tuple(wheel_names)
     wheel_count = len(wheel_names)
     graph = (vehicle_native_graph_python_program()
@@ -1408,7 +1449,7 @@ def vehicle_python_compilation_inputs(
         "tire_previous_basis": np.zeros((batch_size, wheel_count, 3, 3)),
         "tire_previous_angle": np.zeros((batch_size, wheel_count)),
         "tire_previous_plane": np.zeros((batch_size, wheel_count, 2, 3)),
-        "rig_points": np.zeros((batch_size, RIG_POINT_COUNT, 21), dtype=np.float64),
+        "rig_points": np.zeros((batch_size, rig_point_count, 21), dtype=np.float64),
         "material_state": np.zeros((batch_size, edge_count, 9), dtype=np.float64),
         "node_reference": graph.constants.node_reference,
         "node_structural_support_binding": (
@@ -1481,6 +1522,7 @@ def vehicle_python_compilation_inputs(
 
 def dually_vehicle_python_compilation_inputs(
     batch_size: int = BATCH_CAPACITY,
+    *, rig_point_count: int = RIG_POINT_COUNT,
 ) -> VehiclePythonCompilationInputs:
     """Specialize the canonical compilable Python validator to the dually.
 
@@ -1509,6 +1551,7 @@ def dually_vehicle_python_compilation_inputs(
         profile.structural_support_positions,
         tire_pneumatic_mode=profile.tire_pneumatic_mode,
         tire_material_profile=profile.tire_material_profile,
+        rig_point_count=rig_point_count,
     )
     # The repository dt system owns subdivision.  One graph invocation is one
     # candidate dt, exactly as in _run_dually_python_profile.

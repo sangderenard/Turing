@@ -4,6 +4,72 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
+import math
+
+
+@dataclass(frozen=True, slots=True)
+class RigPointBinding:
+    """One identified graph connection bound to the existing 21-scalar rig ABI."""
+
+    identity: str
+    body: str
+    body_point: str
+    world_point: str
+    values: tuple[float, ...]
+
+
+def bind_placed_rig_point(document, component_identity: str, body_identity: str,
+                          command: Mapping[str, Any]) -> RigPointBinding:
+    """Resolve body/world attachment ports into the authored rig evaluator.
+
+    This operator's target is fixed in the document's world frame. Connections
+    to another moving body require a different operator, not a frozen pose copy.
+    Command force/velocity and stiffness axes use the evaluator's world frame.
+    """
+    nodes = {node.identity: node for node in document.nodes}
+    component = nodes[component_identity]
+    if component.kind != "component":
+        raise ValueError("rig binding requires a placed component")
+    representation = dict(component.properties)["placement"]["representation"]
+    if representation.get("mechanical_operator") != "vehicle_rig_points_vector":
+        raise ValueError("component does not declare the body/world rig operator")
+    ports = {}
+    for edge in document.edges:
+        if edge.source == component_identity and edge.relationship == "connected-at":
+            port = dict(edge.properties)["port"]
+            if port in ports:
+                raise ValueError("duplicate mechanical port connection")
+            ports[port] = edge.target
+    if set(ports) != {"body", "world"}:
+        raise ValueError("rig operator requires body and world ports")
+    body_point, world_point = nodes[ports["body"]], nodes[ports["world"]]
+    if body_point.kind != "attachment-point" or world_point.kind != "attachment-point":
+        raise ValueError("rig ports must refer to attachment points")
+    local, target = dict(body_point.properties), dict(world_point.properties)
+    if local["owner"] != body_identity or target["owner"] != document.identity:
+        raise ValueError("rig port owners must be the selected body and fixed world root")
+    if nodes[document.identity].kind != "world":
+        raise ValueError("rig target requires the document's explicit world node")
+    if local["coordinate_space"] != "owner-local" or target["coordinate_space"] != "owner-local":
+        raise ValueError("rig attachment frames must be owner-local")
+
+    def vector(value):
+        result = tuple(float(v) for v in value)
+        if len(result) != 3 or not all(math.isfinite(v) for v in result):
+            raise ValueError("rig vector must have three finite coordinates")
+        return result
+
+    enabled, mode = float(command["enabled"]), int(command["mode"])
+    if enabled not in (0.0, 1.0) or mode not in (0, 1, 2, 3) or mode != command["mode"]:
+        raise ValueError("invalid rig enable or control mode")
+    stiffness, damping = vector(command["stiffness"]), vector(command["damping"])
+    maximum = float(command["maximum_force"])
+    if min(*stiffness, *damping, maximum) < 0 or not math.isfinite(maximum):
+        raise ValueError("rig gains and force cap must be finite and nonnegative")
+    values = (enabled, float(mode), *vector(local["position"]), *vector(target["position"]),
+              *vector(command["target_velocity"]), *vector(command["force"]),
+              *stiffness, *damping, maximum)
+    return RigPointBinding(component_identity, body_identity, ports["body"], ports["world"], values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,5 +342,6 @@ def bearing_race_edge(
     }
 
 
-__all__ = ["BearingRuleSet", "bearing_interface_node", "bearing_race_edge",
+__all__ = ["RigPointBinding", "bind_placed_rig_point",
+           "BearingRuleSet", "bearing_interface_node", "bearing_race_edge",
            "generic_rotational_torque_port", "rotating_hub_node"]

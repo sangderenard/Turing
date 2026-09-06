@@ -482,6 +482,56 @@ def identity_specialization_table(
     }
 
 
+def world_surface_mesh_packet(objects: Iterable[WorldObject]) -> dict[str, Any]:
+    """Realize authored indexed surfaces in the existing world triangle ABI.
+
+    Object and part spans retain picking/material ownership after expansion.
+    Pose matrices are rigid local-to-world rotations; physics stays with the
+    object's declared owner, never this render projection.
+    """
+    vertices, spans, part_spans = [], [], []
+    values = tuple(objects)
+    for item in values:
+        if item.form.get("recipe") != "indexed-surface":
+            continue
+        surface = item.form["surface"]
+        positions = np.asarray(surface["positions"], dtype=np.float64)
+        normals = np.asarray(surface["normals"], dtype=np.float64)
+        indices = np.asarray(surface["triangles"])
+        rotation = np.asarray(item.transform.get("rotation_matrix", np.eye(3)), dtype=np.float64)
+        translation = np.asarray(item.transform["position"], dtype=np.float64)
+        color = np.asarray(item.form["color_rgb"], dtype=np.float64) / 255.0
+        if (positions.ndim != 2 or positions.shape[1] != 3 or normals.shape != positions.shape
+                or indices.ndim != 2 or indices.shape[1] != 3 or indices.dtype.kind not in "iu"
+                or rotation.shape != (3, 3) or translation.shape != (3,) or color.shape != (3,)):
+            raise ValueError("invalid indexed world surface or pose shape")
+        if (not all(np.isfinite(array).all() for array in (positions, normals, rotation, translation, color))
+                or not np.allclose(rotation.T @ rotation, np.eye(3))
+                or not np.isclose(np.linalg.det(rotation), 1.0)
+                or not np.allclose(np.linalg.norm(normals, axis=1), 1.0)
+                or np.any(color < 0) or np.any(color > 1)):
+            raise ValueError("world surface requires finite geometry, unit normals and a rigid pose")
+        if indices.size and (indices.min() < 0 or indices.max() >= len(positions)):
+            raise ValueError("world surface triangle index out of bounds")
+        world_positions = positions @ rotation.T + translation
+        world_normals = normals @ rotation.T
+        first = len(vertices)
+        for index in indices.reshape(-1):
+            vertices.append([*world_positions[index], *world_normals[index], *color])
+        count = len(vertices) - first
+        spans.append({"identity": item.identity, "first_vertex": first, "vertex_count": count,
+                      "material_bindings": dict(item.material_bindings)})
+        part = item.form["surface_identity"]
+        if part not in {p["identity"] for p in item.semantic_parts}:
+            raise ValueError("world surface must belong to a declared semantic part")
+        part_spans.append({"identity": part, "object_identity": item.identity,
+                           "first_vertex": first, "vertex_count": count})
+    return {"schema": WORLD_MESH_PACKET_VERSION, "topology": "triangle-list",
+            "vertex_layout": ["position.xyz", "normal.xyz", "color.rgb"],
+            "vertices": vertices, "object_spans": spans, "semantic_part_spans": part_spans,
+            "identity_specialization": identity_specialization_table(values)}
+
+
 def world_graph_model(
     system_root: str,
     geometry: Mapping[str, Any],
@@ -600,5 +650,5 @@ __all__ = [
     "WorldWasmPlugin", "compile_world_transform_wasm",
     "document_world_objects", "identity_specialization_table",
     "performance_observation_objects",
-    "pluck_placed_object", "wasm_artifact_plugin", "world_graph_model",
+    "pluck_placed_object", "wasm_artifact_plugin", "world_graph_model", "world_surface_mesh_packet",
 ]

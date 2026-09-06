@@ -2370,6 +2370,16 @@ class LoopComposer:
                         int(getattr(returned, "end_lineno", -1)),
                         int(getattr(returned, "end_col_offset", -1)),
                     ))
+                    if return_value_id is None and slot_values is not None:
+                        # Tuple containers can disappear during structural
+                        # reduction while their exact return-slot receipt and
+                        # element expressions remain. Keep the function exit,
+                        # anchored at a surviving element; assembly below
+                        # waits for every element before taking that edge.
+                        return_value_id = next((
+                            int(value_id) for value_id in reversed(slot_values)
+                            if value_id is not None and int(value_id) in graph.G
+                        ), None)
                     if return_value_id is not None and slot_values is not None:
                         return_controls.append((
                             int(return_value_id),
@@ -2403,6 +2413,30 @@ class LoopComposer:
                     continue
                 if isinstance(statement, ast.If):
                     predicate_id = graph_node_for_ast(statement.test)
+                    if predicate_id is None:
+                        # Specialization can remove the predicate and dead arm
+                        # while retaining the source AST and return-slot ledger.
+                        # A shared live slot does not resurrect that dead return.
+                        # Consult only explicit specialization values, never
+                        # Python defaults or symbolic numeric placeholders.
+                        environment = {
+                            name: value for name, value in (
+                                graph.G.graph.get("planner_specializations") or {}
+                            ).items()
+                            if value is None or type(value) in {bool, int, float, str}
+                        }
+                        try:
+                            selected = _static_predicate_expression(
+                                statement.test, environment,
+                            )
+                        except (ValueError, TypeError):
+                            pass
+                        else:
+                            collect_loop_controls(
+                                statement.body if selected else statement.orelse,
+                                guard, chain, arm=True,
+                            )
+                            continue
                     next_true = (
                         guard if predicate_id is None
                         else (int(predicate_id), True)
@@ -3869,7 +3903,7 @@ def analyze_shader_loop_reductions(
         # which have no correlated source expression.
         lexical_nodes: list[int] = []
         loop_expression = graph.G.nodes[int(loop.node_id)].get("expr_obj")
-        def source_order_walk(node: ast.AST):
+        def source_order_walk(node: ast.AST, return_value: bool = False):
             """Pre-order: a statement's descendants before its successor.
 
             ``ast.walk`` is breadth-first, so an arm's ``Break`` node sorted
@@ -3877,9 +3911,16 @@ def analyze_shader_loop_reductions(
             was taken before the value it carries was computed.
             """
 
-            yield node
+            # Return controls are keyed by Return.value, often a structural
+            # Tuple. Its element expressions must run before that key's
+            # exit edge, not after it in unreachable_return_control.
+            return_value = return_value or isinstance(node, ast.Return)
+            if not return_value:
+                yield node
             for child in ast.iter_child_nodes(node):
-                yield from source_order_walk(child)
+                yield from source_order_walk(child, return_value)
+            if return_value:
+                yield node
 
         if isinstance(loop_expression, (ast.For, ast.AsyncFor, ast.While)):
             for statement in loop_expression.body:
@@ -4648,7 +4689,11 @@ def analyze_shader_loop_reductions(
         # enclosing predicate rather than the innermost only.
         body_items.extend(
             (
-                lexical_position[node_id],
+                max((lexical_position[node_id], *(
+                    lexical_position[int(value_id)]
+                    for value_id in slot_values
+                    if value_id is not None and int(value_id) in lexical_position
+                ))),
                 LoopControlBlock(
                     "return",
                     chain[-1][0] if chain else None,

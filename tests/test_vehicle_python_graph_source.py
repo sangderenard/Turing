@@ -15,6 +15,53 @@ from src.compiler.vehicle_native_graph_program import (
 )
 
 
+def test_rig_point_law_accepts_variable_attachment_counts_and_balances_reactions():
+    from src.common.tensors import AbstractTensor
+
+    namespace = {"AbstractTensor": AbstractTensor}
+    exec(VEHICLE_NATIVE_GRAPH_VECTOR_SOURCE, namespace)
+    with AbstractTensor.use_backend("numpy"):
+        for count in (0, 1, 3, 19):
+            points = np.zeros((2, count, 21), dtype=np.float64)
+            points[:, :, 0] = 1  # Enabled force-command actuators.
+            points[:, :, 1] = 2
+            points[:, :, 2] = 2  # Local x lever arm.
+            points[:, :, 12] = 3  # World y force.
+            points[:, :, 20] = 2  # Magnitude cap.
+            zero = AbstractTensor.tensor(np.zeros((2, 3)), dtype="float64")
+            force, moment, reactions = namespace["vehicle_rig_points_vector"](
+                zero, zero, zero, zero, AbstractTensor.tensor(points, dtype="float64"))
+            force = np.asarray(force.data)
+            moment = np.asarray(moment.data)
+            reactions = np.asarray(reactions.data)
+            assert reactions.shape == (2, count, 6)
+            np.testing.assert_allclose(force, np.tile([0, 2 * count, 0], (2, 1)))
+            np.testing.assert_allclose(moment, np.tile([0, 0, 4 * count], (2, 1)))
+            np.testing.assert_allclose(reactions[:, :, :3].sum(axis=1), -force)
+            np.testing.assert_allclose(reactions[:, :, 3:].sum(axis=1), -moment)
+
+
+def test_dually_program_allocates_and_declares_requested_rig_point_count():
+    import pytest
+    from src.compiler.vehicle_python_compilation import (
+        dually_vehicle_python_compilation_inputs, vehicle_python_compilation_inputs,
+        vehicle_python_extraction_contract,
+    )
+
+    prepared = dually_vehicle_python_compilation_inputs(2, rig_point_count=19)
+    assert prepared.feeds["rig_points"].shape == (2, 19, 21)
+    eager = prepared.abstract_tensor_feeds()
+    assert eager["rig_points"].shape == (2, 19, 21)
+    eager["rig_points"][1, 18, 0] = 1
+    assert prepared.feeds["rig_points"][1, 18, 0] == 0
+    contract = vehicle_python_extraction_contract(prepared)
+    binding = next(v for v in contract.program_abi.values if v.parameter == "rig_points")
+    assert tuple(binding.field.shape) == (2, 19, 21)
+    for invalid in (-1, 1.5, True):
+        with pytest.raises(ValueError, match="nonnegative integer"):
+            vehicle_python_compilation_inputs(rig_point_count=invalid)
+
+
 def test_balloon_tire_python_source_is_topology_vectorized():
     program = balloon_tire_python_program()
     compile(program.source, "<balloon-tire-vector>", "exec")
@@ -244,7 +291,7 @@ def test_declared_rig_uses_tensor_indexing_and_native_call_outputs(tmp_path):
     shapes = {
         "body_position": (8, 3), "body_velocity": (8, 3),
         "attitude": (8, 3), "angular_velocity": (8, 3),
-        "rig_points": (8, 16, 21),
+        "rig_points": (8, 19, 21),
     }
     contract = ExtractionContract(
         Path(__file__).resolve().parents[1]

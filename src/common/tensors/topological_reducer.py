@@ -1647,9 +1647,21 @@ def _normalize_lexical_values(
             )
         return ()
 
+    restored_literal_nodes: dict[int, int] = {}
+
     def resolve_expression(expression: ast.AST | None) -> int | None:
         if expression is None:
             return None
+        if isinstance(expression, ast.Constant) and id(expression) not in graph.G:
+            # Structural reduction can remove a keyword wrapper and its leaf
+            # before lexical call binding. A live use still has the exact
+            # authored literal; materialize it, rather than drop the operand.
+            if id(expression) not in restored_literal_nodes:
+                restored_literal_nodes[id(expression)] = new_node(
+                    "Constant", repr(expression.value),
+                    attributes={"value": expression.value}, source=expression,
+                )
+            return restored_literal_nodes[id(expression)]
         if isinstance(expression, ast.NamedExpr):
             value = resolve_expression(expression.value)
             bind_target(expression.target, value)
@@ -6691,6 +6703,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             for member in included
             if (
                 member in return_values
+                # An ordered side effect remains part of its lexical body
+                # even when reduction detached its value operands.
+                or graph.G.nodes[member].get("attributes", {}).get("ordered_effect", False)
                 or any(
                     neighbor in included
                     for neighbor in graph.G.predecessors(member)
@@ -6739,7 +6754,12 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             expression = member_data.get("expr_obj")
             if not isinstance(expression, ast.Call):
                 continue
-            receipt = boundary_by_location.get((
+            # AST special-case expansion owns the generated operation's
+            # receipt. Several generated operations can share one original
+            # source location; the source ledger cannot distinguish them.
+            receipt = getattr(expression, "_extraction_contract", None) if getattr(
+                expression, "_turing_dispatch_operation", None
+            ) else boundary_by_location.get((
                 int(getattr(expression, "lineno", -1)),
                 int(getattr(expression, "col_offset", -1)),
             ))

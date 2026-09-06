@@ -66,6 +66,7 @@ def _render_managed_balloon_tire_validator_source(
     tire_dimensions: tuple[float, float, float, float, float, float] | None = None,
     pneumatic_mode: str | None = None,
     material_profile: str = "configured",
+    progress=None,
 ) -> str:
     """Expose the complete managed AbstractTensor tire through the rig ABI.
 
@@ -98,6 +99,7 @@ def _render_managed_balloon_tire_validator_source(
         tire_dimensions=tire_dimensions,
         pneumatic_mode=pneumatic_mode,
         material_profile=material_profile,
+        progress=progress,
     )
     feeds = _managed_native_feeds_by_id(lowered, inputs.feeds)
     root = lowered.module.functions[lowered.root_name]
@@ -1825,6 +1827,7 @@ def write_native_vehicle_kernels(
     directory: str | Path, *, outer_rate_hz: int | None = None,
     tire_microsteps: int = 48,
     assembly_profile: str = "default-car",
+    progress=None,
 ) -> WrittenNativeVehicleKernels:
     """Write canonical C kernels and their read-only scientific shader consumer."""
 
@@ -1840,6 +1843,8 @@ def write_native_vehicle_kernels(
         profile = dually_validator_profile()
     elif assembly_profile != "default-car":
         raise ValueError(f"unknown native validator assembly profile {assembly_profile!r}")
+    if progress is not None:
+        progress("compiling vehicle, contact, fixture, and tire laws")
     vehicle = compile_symbolic_vehicle_physics_c()
     contact = compile_wheel_contact_c()
     fixture = compile_vehicle_roller_fixture_c()
@@ -1848,6 +1853,8 @@ def write_native_vehicle_kernels(
         pneumatic_mode=(profile.tire_pneumatic_mode if profile else None),
         material_profile=(profile.tire_material_profile if profile else "configured"),
     )
+    if progress is not None:
+        progress("lowering and emitting managed tire DT system")
     managed_tire_source, deployment_receipts = (
         _render_managed_balloon_tire_validator_source(
             tire,
@@ -1857,12 +1864,15 @@ def write_native_vehicle_kernels(
             tire_dimensions=(profile.tire_dimensions if profile else None),
             pneumatic_mode=(profile.tire_pneumatic_mode if profile else None),
             material_profile=(profile.tire_material_profile if profile else "configured"),
+            progress=progress,
         )
     )
     # The managed program owns subdivision of one outer validator window.
     # Calling it through the retired host microstep loop would advance several
     # complete windows per vehicle tick.
     effective_tire_microsteps = 1
+    if progress is not None:
+        progress("managed tire C emitted; compiling auxiliary laws")
     balance = compile_brace_on_balance_c()
     wheel_balance = compile_wheel_mesh_balance_c()
     leveling_controller = compile_leveling_controller_c()
@@ -1916,10 +1926,15 @@ def write_native_vehicle_kernels(
         if profile is not None
         else vehicle_python_compilation_inputs()
     )
+    if progress is not None:
+        progress("lowering and emitting complete vehicle graph")
     shell_source = emit_vehicle_python_graph_c(
         inputs=graph_inputs,
+        progress=progress,
     ).source
     shell_path.write_text(shell_source, encoding="utf-8")
+    if progress is not None:
+        progress("vehicle graph C emitted; writing viewer and bundle")
     viewer_shell_path.write_text(
         render_native_scientific_viewer_shell(
             vehicle, contact, fixture, target_rate_hz=physics_hz,

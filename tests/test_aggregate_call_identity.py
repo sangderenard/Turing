@@ -336,6 +336,84 @@ def test_unpacked_call_results_carry_a_retained_loop(monkeypatch):
     ]
 
 
+def test_returned_record_parameter_keeps_its_field_formals():
+    source = """
+def keep(metrics):
+    metrics.max_vel = metrics.max_vel + 1.0
+    return metrics
+
+def tick(metrics):
+    same = keep(metrics)
+    return same.max_vel + metrics.max_vel
+"""
+    module, _, _ = lower_ast_source_to_ssa(
+        source, "tick", name="returned_record_parameter",
+        extraction_contract=ExtractionContract(CONTRACTS / "program_extraction.yaml"),
+        runtime_closure_only=True,
+    )
+    callees = [function for name, function in module.functions.items()
+               if name.endswith("__keep")]
+    assert len(callees) == 1
+    callee = callees[0]
+    returned = _ret_args(callee)
+    assert returned
+    assert all(any(value is formal for formal in callee.args) for value in returned), (
+        [(value.id, value.accounting) for value in returned],
+        [(value.id, value.accounting) for value in callee.args],
+    )
+    records = module.record_tables["returned_record_parameter__tick"].records
+    velocity_slots = {
+        field.value_ids
+        for record in records.values()
+        for field in record.fields
+        if field.name == "max_vel"
+    }
+    assert len(velocity_slots) == 1, records
+
+
+def test_coerce_metrics_return_keeps_caller_storage():
+    from src.common.dt_system.dt_scaler import coerce_metrics
+
+    source = """
+def tick(metrics):
+    same = coerce_metrics(metrics)
+    return same.max_vel + metrics.max_vel
+"""
+    module, _, _ = lower_ast_source_to_ssa(
+        source, "tick", name="coerce_record_parameter",
+        python_bindings={"coerce_metrics": coerce_metrics},
+        extraction_contract=ExtractionContract(CONTRACTS / "program_extraction.yaml"),
+        runtime_closure_only=True,
+    )
+    records = module.record_tables["coerce_record_parameter__tick"].records
+    slots = {field.value_ids for record in records.values()
+             for field in record.fields if field.name == "max_vel"}
+    assert len(slots) == 1, records
+
+
+def test_fresh_record_return_has_distinct_caller_storage():
+    from src.common.dt_system.dt_scaler import Metrics
+
+    source = """
+def copy(metrics):
+    return Metrics(metrics.max_vel + 1.0, 0.0, 0.0, 0.0)
+
+def tick(metrics):
+    other = copy(metrics)
+    return other.max_vel + metrics.max_vel
+"""
+    module, _, _ = lower_ast_source_to_ssa(
+        source, "tick", name="fresh_record_parameter",
+        python_bindings={"Metrics": Metrics},
+        extraction_contract=ExtractionContract(CONTRACTS / "program_extraction.yaml"),
+        runtime_closure_only=True,
+    )
+    records = module.record_tables["fresh_record_parameter__tick"].records
+    slots = {field.value_ids for record in records.values()
+             for field in record.fields if field.name == "max_vel"}
+    assert len(slots) == 2, records
+
+
 def test_process_value_ids_are_never_recycled():
     graph = nx.DiGraph()
     graph.add_node(0)

@@ -160,6 +160,48 @@ class TuringWorldRegistry {
   }
 }
 function turingCreateWorldRegistry(world) { return new TuringWorldRegistry(world); }
+function turingDecodeWorldSurfacePacket(packet) {
+  if (packet?.schema !== "abstract-ui-world-mesh-packet-v0" || packet.topology !== "triangle-list" ||
+      JSON.stringify(packet.vertex_layout) !== JSON.stringify(["position.xyz","normal.xyz","color.rgb"]) ||
+      !Array.isArray(packet.vertices) || packet.vertices.length % 3) {
+    throw new TypeError("invalid authored world triangle packet");
+  }
+  const mesh = new Float32Array(packet.vertices.length * 9);
+  packet.vertices.forEach((row, index) => {
+    if (!Array.isArray(row) || row.length !== 9 || row.some(value =>
+        typeof value !== "number" || !Number.isFinite(value) || Math.abs(value) > 3.402823466e38)) {
+      throw new TypeError("invalid authored world vertex");
+    }
+    mesh.set(row, index * 9);
+  });
+  function spans(rows, parts) {
+    if (!Array.isArray(rows)) throw new TypeError("world packet requires identity spans");
+    let next = 0;
+    const seen = new Set();
+    const result = rows.map(row => {
+      if (typeof row.identity !== "string" || !row.identity || seen.has(row.identity) ||
+          !Number.isSafeInteger(row.first_vertex) || !Number.isSafeInteger(row.vertex_count) ||
+          row.first_vertex !== next || row.vertex_count < 0 || row.vertex_count % 3 ||
+          row.first_vertex + row.vertex_count > packet.vertices.length) {
+        throw new TypeError("invalid authored world identity span");
+      }
+      seen.add(row.identity); next += row.vertex_count;
+      return {...row, firstVertex: row.first_vertex, vertexCount: row.vertex_count,
+              ...(parts ? {objectIdentity: row.object_identity} : {})};
+    });
+    if (next !== packet.vertices.length) throw new TypeError("unowned world triangles");
+    return result;
+  }
+  const objectSpans = spans(packet.object_spans, false), partSpans = spans(packet.semantic_part_spans, true);
+  for (const part of partSpans) {
+    if (!objectSpans.some(object => object.identity === part.objectIdentity &&
+        part.firstVertex >= object.firstVertex &&
+        part.firstVertex + part.vertexCount <= object.firstVertex + object.vertexCount)) {
+      throw new TypeError("world surface part has no owning object span");
+    }
+  }
+  return {mesh, objectSpans, partSpans};
+}
 """.strip()
 
 

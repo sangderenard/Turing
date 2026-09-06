@@ -1037,6 +1037,22 @@ class ExtractionContract:
                 "rejected_extraction_rule": rule_id,
             }
             rule_id = "execution:python_callbacks_reject"
+        if (
+            self.execution.require_full_native
+            and subject.classification == "native_extension"
+            and action is ExtractionAction.USE_NATIVE
+            and str(parameters.get("native_abi") or "") in {"", "cpython-c-api"}
+        ):
+            # An extension module's Python-callable entry is not proof of a
+            # linkable, Python-free ABI. Require a declared adapter rather than
+            # carrying an existing_module Python object into native execution.
+            action = ExtractionAction.REJECT
+            parameters = {
+                **dict(parameters),
+                "reason": "native_extension_requires_non_python_abi",
+                "rejected_extraction_rule": rule_id,
+            }
+            rule_id = "execution:native_extension_abi_required"
         decision = ExtractionDecision(subject, action, rule_id, parameters)
         with self._lock:
             if action is ExtractionAction.INGEST_PYTHON and subject.origin:

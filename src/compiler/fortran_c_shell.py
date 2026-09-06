@@ -340,6 +340,106 @@ def _drop_unused_root_private_formals(function: Any) -> int:
     return len(removable)
 
 
+def _intern_writable_region_outputs(function: Any, tensor_table: Any = None) -> None:
+    """Keep declared writable output storage attached to its SSA producer."""
+    tensor_outputs = {
+        int(descriptor.data_value_id)
+        for descriptor in (() if tensor_table is None else tensor_table.tensors.values())
+        if descriptor.storage == "output" and descriptor.writable
+    }
+    writable_formals = {
+        int(argument.id): argument
+        for argument in function.args
+        if bool((argument.accounting or {}).get("program_abi_mutable"))
+        and (int(argument.id) in tensor_outputs or bool((argument.accounting or {}).get(
+            "program_abi_field_written"
+        )))
+        and (argument.accounting or {}).get("program_abi_storage")
+    }
+    if not writable_formals:
+        return
+    replacements: dict[int, Any] = {}
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            result = instruction.res
+            if result is None:
+                continue
+            formal = writable_formals.get(int(result.id))
+            if formal is None or result is formal:
+                continue
+            replacements[id(result)] = formal
+            if formal.dtype in {None, "unknown"} and result.dtype:
+                formal.dtype = result.dtype
+            if not tuple(formal.shape or ()) and tuple(result.shape or ()):
+                formal.shape = tuple(result.shape)
+            formal.accounting = {
+                **dict(result.accounting or {}),
+                **dict(formal.accounting or {}),
+            }
+            instruction.res = formal
+    if not replacements:
+        return
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            instruction.args = [
+                replacements.get(id(argument), argument)
+                for argument in instruction.args
+            ]
+    function.metadata["interned_program_abi_output_ids"] = tuple(
+        sorted({int(value.id) for value in replacements.values()})
+    )
+
+
+def _retain_forwarded_aggregate_storage(call: Any, callee: Any) -> bool:
+    """A return of the exact input frame does not define that frame again."""
+
+    if call.attributes.get("result_convention") != "ssa.aggregate":
+        return False
+    outputs = tuple(call.attributes.get("output_ids", ()))
+    selected = tuple(call.attributes.get("callee_output_ids", ()))
+    if not outputs or len(outputs) != len(selected):
+        return False
+    formals = tuple(int(value.id) for value in callee.args)
+    returned = tuple(
+        int(value.id) for block in callee.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+        for value in instruction.args
+    )
+    if not returned or any(value_id not in formals for value_id in returned):
+        return False
+    declared = tuple(call.attributes.get("callee_input_ids", formals))
+    if len(declared) != len(call.args) or len(set(declared)) != len(declared):
+        return False
+    bound = dict(zip(declared, call.args))
+    if any(callee_id not in formals or callee_id not in bound
+           or int(bound[callee_id].id) != int(caller_id)
+           for callee_id, caller_id in zip(selected, outputs)):
+        return False
+    call.attributes["forwarded_output_bindings"] = tuple(zip(selected, outputs))
+    for key in ("result_convention", "output_ids", "output_positions", "output_slots", "callee_output_ids"):
+        call.attributes.pop(key, None)
+    call.res = None
+    return True
+
+
+def _resident_call_inputs(call: Any, caller_values: Mapping[int, Any]) -> dict[int, Any]:
+    """Keep exact formal-to-resident bindings through late frame expansion.
+
+    A frame record names the authored pre-loop value; the scheduled call may
+    already read its current Phi. Reconstructing every argument from that
+    record discards ordinary SSA flow. Only missing/nonresident bindings need
+    recovery from the frame record.
+    """
+    declared = tuple(call.attributes.get("callee_input_ids", ()))
+    if len(declared) != len(call.args) or len(set(declared)) != len(declared):
+        return {}
+    return {
+        int(formal): caller_values[int(actual.id)]
+        for formal, actual in zip(declared, call.args)
+        if int(actual.id) in caller_values
+    }
+
+
 def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
     """Complete every call whose callee's signature grew a frame-storage tail.
 
@@ -407,9 +507,23 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
         completed_any = False
         for callee_name, callee in functions.items():
             for owner, call in calls_into(callee_name):
+                declared = call.attributes.get("callee_input_ids")
+                if declared is not None:
+                    if len(declared) != len(call.args) or len(set(declared)) != len(declared):
+                        raise ValueError(
+                            f"invalid native input binding receipt for {owner.name} -> {callee_name}: "
+                            f"receipt={len(declared)}, operands={len(call.args)}, "
+                            f"unique_formals={len(set(declared))}"
+                        )
+                    bound = dict(zip(declared, call.args))
+                    live = [formal for formal in callee.args if int(formal.id) in bound]
+                    call.args = [bound[int(formal.id)] for formal in live]
+                    call.attributes["callee_input_ids"] = tuple(int(formal.id) for formal in live)
+                    tail = [formal for formal in callee.args if int(formal.id) not in bound]
+                else:
+                    tail = callee.args[len(call.args):]
                 if len(call.args) >= len(callee.args):
                     continue
-                tail = callee.args[len(call.args):]
                 if not all(
                     (formal.accounting or {}).get("linked_call_frame_storage")
                     or (formal.accounting or {}).get("compiler_frame_storage")
@@ -433,8 +547,14 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                     next_fresh_id += 1
                     owner.args.append(slot)
                     call.args.append(slot)
+                    if declared is not None:
+                        call.attributes["callee_input_ids"] += (int(formal.id),)
                     completed_any = True
                     appended += 1
+                if declared is not None:
+                    bound = dict(zip(call.attributes["callee_input_ids"], call.args))
+                    call.args = [bound[int(formal.id)] for formal in callee.args]
+                    call.attributes["callee_input_ids"] = tuple(int(formal.id) for formal in callee.args)
     return appended
 
 
@@ -553,7 +673,7 @@ def _prune_unused_callee_formals(
                 if index >= original_arity or index in keep_indices
             ]
             for attribute_name in (
-                "feed_ids", "feed_shapes", "feed_dtypes", "input_ids",
+                "feed_ids", "feed_shapes", "feed_dtypes", "input_ids", "callee_input_ids",
             ):
                 values = call.attributes.get(attribute_name)
                 if values is None or len(tuple(values)) != original_arity:
@@ -5775,7 +5895,7 @@ def _control_expression_value_ids(expression: Any) -> frozenset[int]:
 
 
 def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgraphs):
-    """Retain each ``use_native`` occurrence as one lexical control call.
+    """Retain native boundaries and dispatcher operations as lexical control.
 
     This is intentionally the last control transformation. Earlier region and
     hierarchy passes therefore cannot mistake an external capability for a
@@ -5783,13 +5903,50 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
     """
 
     from .control_source import (
-        CallBlock, ConditionalBlock, ExternalReferenceCallBlock, LoopBlock,
-        SequenceBlock, StatementBlock, WhileBlock,
+        CallBlock, ConditionalBlock, DispatchBlock, ExternalReferenceCallBlock, LoopBlock,
+        ResourceScopeBlock, SequenceBlock, StatementBlock, WhileBlock,
     )
-    from .glsl_deployment_strategy import _branch_compartments
+    from .glsl_deployment_strategy import _ast_source_signature, _branch_compartments
 
     graph_obj = graph.G
-    memberships = _branch_compartments(graph)
+    memberships = {node: set(owners) for node, owners in _branch_compartments(graph).items()}
+    expression_nodes = {id(data.get("expr_obj")): int(node_id)
+                        for node_id, data in graph_obj.nodes(data=True)
+                        if isinstance(data.get("expr_obj"), ast.AST)}
+    signature_nodes = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        expression = data.get("expr_obj")
+        if isinstance(expression, ast.AST) and getattr(expression, "lineno", None) is not None:
+            signature_nodes.setdefault(_ast_source_signature(expression), []).append(int(node_id))
+    resource_nodes = {
+        int(node_id): data["expr_obj"]
+        for node_id, data in graph_obj.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Try)
+        and getattr(data["expr_obj"], "_turing_resource_scope", None)
+    }
+    source_order = {}
+    node_source_order = {}
+    def index_source(node, loop_owners=()):
+        if not isinstance(node, ast.AST):
+            return
+        source_order[id(node)] = len(source_order)
+        node_id = expression_nodes.get(id(node))
+        if node_id is None and getattr(node, "lineno", None) is not None:
+            candidates = signature_nodes.get(_ast_source_signature(node), ())
+            if len(candidates) == 1:
+                node_id = candidates[0]
+        if node_id is not None:
+            node_source_order[node_id] = source_order[id(node)]
+            memberships.setdefault(node_id, set()).update(loop_owners)
+        for field, value in ast.iter_fields(node):
+            owners = loop_owners
+            if isinstance(node, (ast.For, ast.While)) and node_id is not None:
+                owners += ((node_id, field),)
+            for child in value if isinstance(value, list) else (value,):
+                if isinstance(child, ast.AST):
+                    index_source(child, owners)
+    for statement in graph_obj.graph.get("function_body", ()):
+        index_source(statement)
 
     def node_position(node_id):
         data = graph_obj.nodes.get(int(node_id), {})
@@ -5798,7 +5955,7 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
         return (
             int(getattr(expression, "lineno", span.get("line", 1 << 30)) or (1 << 30)),
             int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
-            int(node_id),
+            node_source_order.get(int(node_id), int(node_id)),
         )
 
     region_positions = {
@@ -5812,7 +5969,9 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
     }
 
     def block_position(block):
-        if isinstance(block, ExternalReferenceCallBlock):
+        if isinstance(block, ResourceScopeBlock):
+            return node_position(block.source_scope_id)
+        if isinstance(block, (ExternalReferenceCallBlock, DispatchBlock)):
             return node_position(block.callsite_id)
         if isinstance(block, StatementBlock) and len(block.lines) == 1:
             line = block.lines[0]
@@ -5847,6 +6006,11 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
         ))
 
     def insert_in_conditional(block, owner_id, arm, external):
+        if isinstance(block, ResourceScopeBlock):
+            if block.source_scope_id == owner_id and arm == "body":
+                return replace(block, body=insert_ordered(block.body, external)), True
+            body, inserted = insert_in_conditional(block.body, owner_id, arm, external)
+            return replace(block, body=body), inserted
         if isinstance(block, ConditionalBlock):
             if int(block.source_node_id or -1) == int(owner_id):
                 if arm == "body":
@@ -5875,6 +6039,11 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
                     children.extend(block.blocks[len(children):])
                     return SequenceBlock(tuple(children)), True
         elif isinstance(block, (LoopBlock, WhileBlock)):
+            if block.source_loop_node_id == owner_id:
+                if arm == "body":
+                    return replace(block, body=insert_ordered(block.body, external)), True
+                if arm == "test" and isinstance(block, WhileBlock):
+                    return replace(block, condition=insert_ordered(block.condition, external)), True
             body, inserted = insert_in_conditional(
                 block.body, owner_id, arm, external
             )
@@ -5891,6 +6060,7 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
     root = control.root
     unplaced = []
     installed = []
+    pending_dispatch = {}
     for node_id, data in sorted(graph_obj.nodes(data=True), key=lambda item: node_position(item[0])):
         expression = data.get("expr_obj")
         contract = dict(
@@ -5899,8 +6069,27 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
             or getattr(expression, "_extraction_contract", None)
             or {}
         )
-        if not isinstance(expression, ast.Call) or contract.get("action") != "use_native":
+        dispatch = (data.get("attributes") or {}).get("dispatch_operation")
+        if not isinstance(expression, ast.Call) or (
+            contract.get("action") != "use_native" and not dispatch
+        ):
             continue
+        if dispatch and (
+            any(not (
+                scope[0] in {"Try", "If"}
+                or scope[0] in {"For", "While"} and scope[2] == "body"
+                or scope[0] == "While" and scope[2] == "test"
+            ) for scope in dispatch.get("control_scopes", ()))
+            or any(
+                isinstance(graph_obj.nodes.get(owner, {}).get("expr_obj"), ast.Try)
+                and owner not in resource_nodes
+                for owner, _arm in memberships.get(int(node_id), ())
+            )
+        ):
+            raise FortranEmissionError(
+                "dispatcher operation requires retained control scope lowering: "
+                f"operation={dispatch['operation']}, scopes={dispatch['control_scopes']}"
+            )
         if os.environ.get("TURING_DEBUG_EXTERNAL_REFERENCE"):
             print(
                 "DEBUG-EXTERNAL-REFERENCE "
@@ -5912,6 +6101,15 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
             )
         parameters = dict(contract.get("parameters") or {})
         result_dtype = parameters.get("result_dtype")
+        if dispatch:
+            operation = str(dispatch["operation"])
+            result_dtype = (
+                "opaque_ref" if operation.endswith("_create") else
+                "bool" if operation in {
+                    "condition_acquire", "condition_wait", "event_wait",
+                    "event_is_set", "thread_is_alive",
+                } else "none"
+            )
         if result_dtype is None:
             unplaced.append((int(node_id), "native boundary has no recorded result_dtype"))
             continue
@@ -5936,9 +6134,18 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
             if result is not None
         )
         if len(arguments) != len(expression.args) or len(keywords) != len(expression.keywords):
+            if dispatch:
+                raise FortranEmissionError(
+                    f"dispatcher arguments lack SSA identities: {dispatch['operation']} at node {node_id}"
+                )
             unplaced.append((int(node_id), "native boundary arguments lack SSA identities"))
             continue
-        external = ExternalReferenceCallBlock(
+        external = DispatchBlock(
+            callsite_id=int(node_id), operation=str(dispatch["operation"]),
+            argument_value_ids=arguments, keyword_argument_value_ids=keywords,
+            result_value_id=int(data.get("value_id", node_id)),
+            result_dtype=str(result_dtype),
+        ) if dispatch else ExternalReferenceCallBlock(
             callsite_id=int(node_id),
             identity=str(contract["identity"]),
             argument_value_ids=arguments,
@@ -5951,6 +6158,9 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
             runtime_owner=str(parameters.get("runtime_owner") or ""),
             shell_profiles=tuple(map(str, parameters.get("shell_profiles") or ())),
         )
+        if dispatch:
+            pending_dispatch[int(node_id)] = external
+            continue
         guarded = tuple(
             (int(owner), str(arm))
             for owner, arm in memberships.get(int(node_id), ())
@@ -5968,7 +6178,88 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
             continue
         if not inserted:
             root = insert_ordered(root, external)
-        installed.append(int(node_id))
+        if not dispatch:
+            installed.append(int(node_id))
+
+    def anchors(block):
+        if isinstance(block, ResourceScopeBlock):
+            return {block.source_scope_id}
+        if isinstance(block, (DispatchBlock, ExternalReferenceCallBlock, CallBlock)):
+            return {block.callsite_id}
+        if isinstance(block, ConditionalBlock):
+            return {block.source_node_id} if block.source_node_id is not None else set()
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            return {block.source_loop_node_id} if block.source_loop_node_id is not None else set()
+        if isinstance(block, SequenceBlock):
+            return set().union(*(anchors(child) for child in block.blocks))
+        if isinstance(block, StatementBlock) and len(block.lines) == 1:
+            match = re.fullmatch(r"__scheduled_region_(\d+)__", block.lines[0])
+            if match:
+                return set(dispatch_subgraphs[int(match[1])].G.graph.get("deployment_nodes", ()))
+        return set()
+
+    def wrap_scope(block, scope_id, cleanup):
+        def owned(child):
+            nodes = anchors(child)
+            inside = {node for node in nodes if (scope_id, "body") in memberships.get(node, ())}
+            if inside and inside != nodes and not isinstance(child, SequenceBlock):
+                raise FortranEmissionError("resource scope crosses a compiled region boundary")
+            return bool(nodes) and inside == nodes
+        if owned(block):
+            return ResourceScopeBlock(block, cleanup, scope_id), True
+        if isinstance(block, SequenceBlock):
+            indices = [index for index, child in enumerate(block.blocks) if owned(child)]
+            if indices:
+                first, last = indices[0], indices[-1]
+                if indices != list(range(first, last + 1)):
+                    raise FortranEmissionError("resource scope has noncontiguous control ownership")
+                grouped = ResourceScopeBlock(SequenceBlock(block.blocks[first:last + 1]), cleanup, scope_id)
+                return SequenceBlock((*block.blocks[:first], grouped, *block.blocks[last + 1:])), True
+            for index, child in enumerate(block.blocks):
+                projected, found = wrap_scope(child, scope_id, cleanup)
+                if found:
+                    return SequenceBlock((*block.blocks[:index], projected, *block.blocks[index + 1:])), True
+        elif isinstance(block, (ConditionalBlock, LoopBlock, WhileBlock, ResourceScopeBlock)):
+            body, found = wrap_scope(block.body, scope_id, cleanup)
+            if found:
+                return replace(block, body=body), True
+            if isinstance(block, ConditionalBlock) and block.orelse is not None:
+                orelse, found = wrap_scope(block.orelse, scope_id, cleanup)
+                if found:
+                    return replace(block, orelse=orelse), True
+        return block, False
+
+    # Materialize lexical cleanup around the existing numerical/control body.
+    # Nested scopes are wrapped first; their source node anchors then belong
+    # to the enclosing scope just like any other authored body statement.
+    for scope_id, expression in sorted(resource_nodes.items(),
+                                      key=lambda item: len(memberships.get(item[0], ())), reverse=True):
+        cleanup_ids = [node_id for node_id in pending_dispatch
+                       if (scope_id, "finalbody") in memberships.get(node_id, ())]
+        if len(cleanup_ids) != 1 or pending_dispatch[cleanup_ids[0]].operation != "condition_release":
+            raise FortranEmissionError("resource scope has no exact condition release cleanup")
+        cleanup = (replace(pending_dispatch.pop(cleanup_ids[0]), result_value_id=None),)
+        root, found = wrap_scope(root, scope_id, cleanup)
+        if not found:
+            # A scope containing only dispatcher effects has no numeric marker.
+            # Root scopes can still be anchored explicitly; a missing enclosing
+            # branch/loop must not be guessed into existence here.
+            if any(owner not in resource_nodes for owner, _ in memberships.get(scope_id, ())):
+                raise FortranEmissionError("resource scope's enclosing control is not retained")
+            root = insert_ordered(root, ResourceScopeBlock(SequenceBlock(()), cleanup, scope_id))
+    for node_id, operation in pending_dispatch.items():
+        guarded = [(owner, arm) for owner, arm in memberships.get(node_id, ())
+                   if arm in {"body", "orelse", "test"}]
+        inserted = False
+        for owner, arm in sorted(guarded, key=lambda item: len(memberships.get(item[0], ())), reverse=True):
+            root, inserted = insert_in_conditional(root, owner, arm, operation)
+            # A missing inner owner cannot be replaced with an outer one:
+            # that would hoist a wait out of its loop or conditional.
+            break
+        if guarded and not inserted:
+            raise FortranEmissionError("dispatcher operation's control owner is not retained")
+        if not inserted:
+            root = insert_ordered(root, operation)
     return replace(control, root=root), tuple(installed), tuple(unplaced)
 
 
@@ -6156,7 +6447,7 @@ def _install_lexical_sequence_queries(
 
     from .control_source import (
         CallBlock, ConditionalBlock, LoopBlock, SequenceBlock,
-        SequenceQueryBlock, WhileBlock,
+        SequenceQueryBlock, StatementBlock, WhileBlock,
     )
 
     graph_obj = graph.G
@@ -6167,7 +6458,7 @@ def _install_lexical_sequence_queries(
         if not (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Name)
-            and expression.func.id in {"len", "next", "sum"}
+            and expression.func.id in {"bool", "len", "next", "sum"}
         ):
             continue
         arguments = tuple(
@@ -6198,7 +6489,15 @@ def _install_lexical_sequence_queries(
                 for parent, role in sequence_data.get("parents") or ()
                 if str(role) == "generators"
             ), None)
-        if producer_loop_node_id is None:
+        local_list_truth = (
+            expression.func.id == "bool"
+            and len(arguments) == 1
+            and sequence_data.get("type") == "List"
+            and sequence_attributes.get("aggregate_kind") == "list"
+            and sequence_attributes.get("sequence_writable") is True
+            and (data.get("attributes") or {}).get("extraction_identity") == "builtins.bool"
+        )
+        if producer_loop_node_id is None and not local_list_truth:
             continue
         identity = (data.get("attributes") or {}).get("extraction_identity")
         result_id = int(data.get("value_id", node_id))
@@ -6219,11 +6518,11 @@ def _install_lexical_sequence_queries(
                 f"aliases={result_alias_ids} sequence={sequence_id}",
                 file=sys.stderr,
             )
-        if expression.func.id == "len":
+        if expression.func.id in {"len", "bool"}:
             queries.append(SequenceQueryBlock(
                 result_value_id=result_id,
                 sequence_value_id=sequence_id,
-                operation="length",
+                operation="truth" if expression.func.id == "bool" else "length",
                 source_call_node_id=int(node_id),
                 extraction_identity=identity,
                 result_alias_ids=result_alias_ids,
@@ -6327,11 +6626,47 @@ def _install_lexical_sequence_queries(
             return replace(block, callee=callee), inserted
         return block, False
 
+    region_nodes = {
+        index: set(map(int, region.G.graph.get("deployment_nodes", ())))
+        for index, region in enumerate(dispatch_subgraphs)
+    }
+
+    def insert_at_query_region(block, query):
+        # The region marker retains the authored use position, including its
+        # enclosing branch/loop. Never hoist truth to sequence construction.
+        if isinstance(block, StatementBlock) and len(block.lines) == 1:
+            match = re.fullmatch(r"__scheduled_region_(\d+)__", block.lines[0])
+            if match and query.source_call_node_id in region_nodes.get(int(match[1]), set()):
+                return SequenceBlock((query, block)), True
+        if isinstance(block, SequenceBlock):
+            children, inserted = [], False
+            for child in block.blocks:
+                child, found = insert_at_query_region(child, query)
+                children.append(child)
+                inserted |= found
+            return replace(block, blocks=tuple(children)), inserted
+        if isinstance(block, (ConditionalBlock, LoopBlock, WhileBlock)):
+            body, inserted = insert_at_query_region(block.body, query)
+            updates = {"body": body}
+            if isinstance(block, ConditionalBlock) and block.orelse is not None:
+                updates["orelse"], found = insert_at_query_region(block.orelse, query)
+                inserted |= found
+            if isinstance(block, WhileBlock):
+                updates["condition"], found = insert_at_query_region(block.condition, query)
+                inserted |= found
+            return replace(block, **updates), inserted
+        if isinstance(block, CallBlock):
+            callee, inserted = insert_at_query_region(block.callee, query)
+            return replace(block, callee=callee), inserted
+        return block, False
+
     root = control.root
     unplaced = list(unsupported)
     for query in queries:
         if query.producer_loop_node_id is None:
-            unplaced.append(int(query.source_call_node_id))
+            root, inserted = insert_at_query_region(root, query)
+            if not inserted:
+                unplaced.append(int(query.source_call_node_id))
             continue
         root, inserted = insert_after_producer(root, query)
         if os.environ.get("TURING_DEBUG_BUILTIN_SELECTION"):
@@ -8077,13 +8412,16 @@ def _propagate_record_field_demand(all_functions: Mapping[str, Any]) -> None:
                             "program_abi_field"
                         ) is not None
                     }
+                    declared = instruction.attributes.get("callee_input_ids")
+                    if declared is not None and len(declared) != len(instruction.args):
+                        raise ValueError("native call input receipt and operands disagree")
                     for formal in callee.args:
                         formal_accounting = dict(formal.accounting or {})
                         field = formal_accounting.get("program_abi_field")
                         if field is None:
                             continue
                         key = (formal_accounting.get("program_abi_record"), field)
-                        if key in supplied:
+                        if (int(formal.id) in declared if declared is not None else key in supplied):
                             continue
                         existing = caller_fields.get(key)
                         if existing is not None:
@@ -8107,6 +8445,9 @@ def _propagate_record_field_demand(all_functions: Mapping[str, Any]) -> None:
                             caller.args.append(propagated)
                             caller_fields[key] = propagated
                             instruction.args.append(propagated)
+                        if declared is not None:
+                            declared = (*declared, int(formal.id))
+                            instruction.attributes["callee_input_ids"] = declared
                         supplied.add(key)
                         grew = True
 
@@ -8186,14 +8527,13 @@ def _harmonize_call_argument_shapes(all_functions: Mapping[str, Any]) -> None:
                 ambiguous_formal = True
                 break
             formal_positions[identity] = position
-        if ambiguous_formal:
-            # Two of the callee's OWN formals share one identity -- not a
-            # call-site problem, and not this pass's to resolve.
-            continue
         unnamed_formal_count = sum(
             1 for identity in formal_identities if identity is None
         )
-        if unnamed_formal_count == len(formal_identities):
+        if unnamed_formal_count == len(formal_identities) and not any(
+            instruction.attributes.get("callee_input_ids") is not None
+            for _caller, instruction in sites
+        ):
             # No formal on this callee carries any identity at all -- not a
             # record consumer, not one of an authored function's own named
             # parameters.  This is a compiler-synthesized positional
@@ -8203,6 +8543,19 @@ def _harmonize_call_argument_shapes(all_functions: Mapping[str, Any]) -> None:
             # as it already works.
             continue
         for caller, instruction in sites:
+            declared = instruction.attributes.get("callee_input_ids")
+            if declared is not None:
+                if len(declared) != len(instruction.args) or len(set(declared)) != len(declared):
+                    raise ValueError(f"invalid native input binding receipt for {callee_name}")
+                bound = dict(zip(declared, instruction.args))
+                formal_ids = tuple(int(formal.id) for formal in callee.args)
+                if all(value_id in bound for value_id in formal_ids):
+                    instruction.args = [bound[value_id] for value_id in formal_ids]
+                    instruction.attributes["callee_input_ids"] = formal_ids
+                # An incomplete exact binding cannot be repaired from names.
+                continue
+            if ambiguous_formal:
+                continue
             caller_names = parameter_names_of(caller)
             actual_identities = [
                 _call_argument_identity(caller, actual, caller_names)
@@ -12434,7 +12787,15 @@ def _class_surface_ssa_program(
                 "parameter_names", ()
             )
         }
-        for required_id in sorted(pending_call_feed_ids.get(symbol, ())):
+        planned_bool_feeds = {
+            int(argument.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op == "Call" and "region_index" in instruction.attributes
+            for argument in instruction.args
+            if isinstance(graph.nodes.get(int(argument.id), {}).get("expr_obj"), ast.BoolOp)
+        }
+        for required_id in sorted(set(pending_call_feed_ids.get(symbol, ())) | planned_bool_feeds):
             required_id = int(required_id)
             structural_root_ids.add(required_id)
             if required_id in values:
@@ -12452,7 +12813,8 @@ def _class_surface_ssa_program(
                 claimable = (
                     existing in function.args
                     and required_id not in authored_parameter_ids
-                    and bool(accounting.get("ssa_call_result_from"))
+                    and (bool(accounting.get("ssa_call_result_from"))
+                         or required_id in planned_bool_feeds)
                     and not accounting.get("program_abi_storage")
                     and not accounting.get("compiler_frame_storage")
                     and not accounting.get("linked_call_frame_storage")
@@ -12547,6 +12909,43 @@ def _class_surface_ssa_program(
                 if terminator in block.instrs:
                     index = block.instrs.index(terminator)
                     block.instrs[index:index] = insertions
+                    # Move a recovered expression and its recovered dependency
+                    # closure before its exact same-block consumer. Existing
+                    # calls/mutations stay ordered, and external operands must
+                    # already be defined at that position.
+                    recovered_by_id = {
+                        int(item.res.id): item for item in insertions if item.res is not None
+                    }
+                    for recovered in reversed(insertions):
+                        if recovered.res is None:
+                            continue
+                        position = block.instrs.index(recovered)
+                        use = next((
+                            offset for offset, candidate in enumerate(block.instrs[:position])
+                            if any(int(argument.id) == int(recovered.res.id)
+                                   for argument in candidate.args)
+                        ), None)
+                        if use is None:
+                            continue
+                        closure = {int(recovered.res.id)}
+                        pending = list(closure)
+                        while pending:
+                            value_id = pending.pop()
+                            for argument in recovered_by_id[value_id].args:
+                                parent_id = int(argument.id)
+                                if parent_id in recovered_by_id and parent_id not in closure:
+                                    closure.add(parent_id)
+                                    pending.append(parent_id)
+                        moving = [item for item in block.instrs
+                                  if item.res is not None and int(item.res.id) in closure]
+                        external = {int(argument.id) for item in moving for argument in item.args} - closure
+                        if any(candidate.res is not None and int(candidate.res.id) in external
+                               for candidate in block.instrs[use:position]):
+                            continue
+                        consumer = block.instrs[use]
+                        block.instrs = [item for item in block.instrs if item not in moving]
+                        use = block.instrs.index(consumer)
+                        block.instrs[use:use] = moving
                     break
             function.metadata["recovered_structural_outputs"] = tuple(
                 int(instruction.res.id) for instruction in insertions
@@ -16238,6 +16637,36 @@ def _class_surface_ssa_program(
                     caller_result_records.records
                 ):
                     continue
+                # Returning the exact record formal returns the caller's
+                # object, including when the callee writes its fields. The
+                # argument ledger proves this identity before result storage
+                # is allocated; a new result arena would split its mutations
+                # from subsequent reads through the original argument.
+                receiver_id = exact_bindings.get(int(root.record_id))
+                returned_receiver = caller_result_records.records.get(receiver_id)
+                if returned_receiver is not None:
+                    if returned_receiver.identity != root.identity:
+                        raise ValueError("returned record formal has conflicting receiver schema")
+                    receiver_fields = {
+                        field.name: field for field in returned_receiver.fields
+                    }
+                    for field in root.fields:
+                        resident = receiver_fields.get(field.name)
+                        if resident is None or (
+                            resident.storage != field.storage
+                            or resident.storage_identity != field.storage_identity
+                            or len(resident.value_ids) != len(field.value_ids)
+                        ):
+                            raise ValueError(
+                                f"returned record formal lacks receiver field {field.name!r}"
+                            )
+                        result_storage_bindings.update(zip(
+                            field.value_ids, resident.value_ids, strict=True,
+                        ))
+                    caller_result_records.register(replace(
+                        returned_receiver, record_id=int(caller_result_id),
+                    ))
+                    continue
                 source_records = {
                     int(record.record_id): record
                     for record in callee_result_records.records.values()
@@ -17854,7 +18283,7 @@ def _class_surface_ssa_program(
                             == "ssa.aggregate"
                             for spliced in sequence
                         )
-                        if aggregate_sequence:
+                        if aggregate_sequence or marker_result is not None:
                             # Only the linked call's published outputs can have
                             # consumers in the caller before this marker.  The
                             # remaining results in ``sequence`` are call-frame
@@ -18053,7 +18482,9 @@ def _class_surface_ssa_program(
                             # below its break predicate.
                             return False
                         block.instrs[index:index + 1] = sequence
-                        if marker_result is not None and not aggregate_sequence:
+                        if (marker_result is not None and not aggregate_sequence
+                            and not any(spliced.attributes.get("forwarded_output_bindings")
+                                        for spliced in sequence)):
                             rebound = False
                             for spliced in reversed(sequence):
                                 if spliced.res is None:
@@ -18598,6 +19029,7 @@ def _class_surface_ssa_program(
                                             record.callsite_id
                                         ),
                                         "late_record_surface": True,
+                                        "compiler_frame_storage": str(record.caller),
                                         "record_field_storage_identity": str(
                                             field.storage_identity
                                         ),
@@ -19315,8 +19747,25 @@ def _class_surface_ssa_program(
                 returns_void = (
                     not record.result_bindings and not callee_outputs
                 )
+                native_result_contract = tuple(
+                    (int(output.id), str(output.dtype), tuple(output.shape or ()))
+                    for output in callee_outputs
+                )
+                previous_native_call = next((
+                    instruction
+                    for block in caller.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op == "Call"
+                    and instruction.attributes.get("source_linked")
+                    and instruction.attributes.get("plan_callsite_id") == record.callsite_id
+                ), None)
+                result_contract_changed = (
+                    previous_native_call is not None
+                    and previous_native_call.attributes.get("native_result_contract")
+                    != native_result_contract
+                )
                 eligible = (
-                    was_unresolved
+                    (was_unresolved or result_contract_changed)
                     and callee is not None
                     and not record.unresolved_frame_value_ids
                     and (
@@ -19997,6 +20446,8 @@ def _class_surface_ssa_program(
                             "source_linked": True,
                             "plan_callsite_id": record.callsite_id,
                             "callee_reference": record.callee_reference,
+                            "native_result_contract": native_result_contract,
+                            "callee_input_ids": tuple(int(formal.id) for formal in callee.args),
                             **({
                                 "ssa_output_argument": int(
                                     aliased_return_argument_index
@@ -20039,8 +20490,9 @@ def _class_surface_ssa_program(
                             ) else {}),
                         },
                     )
+                    forwarded_frame_result = _retain_forwarded_aggregate_storage(native_call, callee)
                     aggregate_unpack = []
-                    if returns_aggregate and result is not None:
+                    if returns_aggregate and result is not None and not forwarded_frame_result:
                         selected_outputs = (
                             selected_callee_outputs
                             if has_exact_partial_aggregate else callee_outputs
@@ -20172,6 +20624,33 @@ def _class_surface_ssa_program(
                     # compartment.  Its eventual result consumer may live at
                     # loop exit or function Ret and is therefore not a valid
                     # execution anchor.
+                    if result_contract_changed:
+                        # Reopen this exact linked occurrence as a marker.
+                        # Retire only projections proven to derive from its
+                        # old aggregate, preserving their result objects for
+                        # the ordinary marker replacement transaction.
+                        old_result = previous_native_call.res
+                        previous_native_call.attributes["plan_callsite_marker"] = True
+                        projection_addresses = set()
+                        for old_block in caller.blocks.values():
+                            for old_instruction in old_block.instrs:
+                                if (old_result is not None
+                                    and old_instruction.op == "GetElementPtr"
+                                    and old_instruction.args
+                                    and old_instruction.args[0] is old_result
+                                    and "aggregate_index" in old_instruction.attributes):
+                                    projection_addresses.add(int(old_instruction.res.id))
+                                    old_instruction.attributes.update({
+                                        "plan_callsite_marker_projection": True,
+                                        "plan_callsite_id": record.callsite_id,
+                                    })
+                            for old_instruction in old_block.instrs:
+                                if (old_instruction.op == "Load" and old_instruction.args
+                                    and int(old_instruction.args[0].id) in projection_addresses):
+                                    old_instruction.attributes.update({
+                                        "plan_callsite_marker_projection": True,
+                                        "plan_callsite_id": record.callsite_id,
+                                    })
                     inserted = replace_at_callsite_marker(
                         record, native_sequence
                     ) or insert_at_loop_anchor(
@@ -20664,6 +21143,14 @@ def _class_surface_ssa_program(
             function = all_functions.get(function_name)
             if function is None:
                 continue
+            # Source-linked calls can publish record fields after the initial
+            # record-phi pass. Complete those merges in this same fixed point
+            # before inspecting public returns, or their semantic Phi result
+            # remains an untyped scalar instead of the returned record.
+            previous_record_count = len(record_table.records)
+            materialize_record_phis(function_name)
+            if len(record_table.records) != previous_record_count:
+                changed = True
             # Loop-carried and loop-result ports are semantic aliases of their
             # authored updated value.  When that value is a structural record,
             # publish the exact same physical field descriptor under the port
@@ -21242,47 +21729,7 @@ def _class_surface_ssa_program(
     # because those tables intentionally refer to the integer identity rather
     # than to a Python object.
     for function in all_functions.values():
-        writable_formals = {
-            int(argument.id): argument
-            for argument in function.args
-            if bool((argument.accounting or {}).get("program_abi_mutable"))
-            and bool((argument.accounting or {}).get(
-                "program_abi_field_written"
-            ))
-            and (argument.accounting or {}).get("program_abi_storage")
-        }
-        if not writable_formals:
-            continue
-        replacements: dict[int, Any] = {}
-        for block in function.blocks.values():
-            for instruction in block.instrs:
-                result = instruction.res
-                if result is None:
-                    continue
-                formal = writable_formals.get(int(result.id))
-                if formal is None or result is formal:
-                    continue
-                replacements[id(result)] = formal
-                if formal.dtype in {None, "unknown"} and result.dtype:
-                    formal.dtype = result.dtype
-                if not tuple(formal.shape or ()) and tuple(result.shape or ()):
-                    formal.shape = tuple(result.shape)
-                formal.accounting = {
-                    **dict(result.accounting or {}),
-                    **dict(formal.accounting or {}),
-                }
-                instruction.res = formal
-        if not replacements:
-            continue
-        for block in function.blocks.values():
-            for instruction in block.instrs:
-                instruction.args = [
-                    replacements.get(id(argument), argument)
-                    for argument in instruction.args
-                ]
-        function.metadata["interned_program_abi_output_ids"] = tuple(
-            sorted({int(value.id) for value in replacements.values()})
-        )
+        _intern_writable_region_outputs(function, all_tensor_tables.get(function.name))
 
     # Object/call-frame discovery precedes some ordinary SSA-producing passes.
     # Both phases allocate monotonically within the values visible at the
@@ -21898,6 +22345,7 @@ def _class_surface_ssa_program(
             refreshed = []
             constants = []
             complete = True
+            resident_inputs = _resident_call_inputs(instruction, caller_values)
             for argument in callee.args:
                 binding = binding_by_callee.get(int(argument.id))
                 if binding is None:
@@ -21907,7 +22355,9 @@ def _class_surface_ssa_program(
                 if kind in {
                     "caller_value", "caller_alias", "caller_storage"
                 }:
-                    value = final_frame_value(int(source))
+                    value = resident_inputs.get(int(argument.id))
+                    if value is None:
+                        value = final_frame_value(int(source))
                     if value is None:
                         complete = False
                         break
@@ -21964,6 +22414,7 @@ def _class_surface_ssa_program(
             if constants:
                 block.instrs[index:index] = constants
             instruction.args = refreshed
+            instruction.attributes["callee_input_ids"] = tuple(int(formal.id) for formal in callee.args)
 
     # Native call linking can create a caller-owned record descriptor and its
     # aggregate-unpack values after the earlier source-output recovery pass.
@@ -22350,6 +22801,7 @@ def _class_surface_ssa_program(
             block, index, instruction = call_site
             refreshed = []
             constants = []
+            resident_inputs = _resident_call_inputs(instruction, caller_values)
             for argument in callee.args:
                 binding = binding_by_callee.get(int(argument.id))
                 if binding is None:
@@ -22359,7 +22811,9 @@ def _class_surface_ssa_program(
                 if kind in {
                     "caller_value", "caller_alias", "caller_storage"
                 }:
-                    value = cleaned_frame_value(int(source))
+                    value = resident_inputs.get(int(argument.id))
+                    if value is None:
+                        value = cleaned_frame_value(int(source))
                     if value is None:
                         refreshed = []
                         break
@@ -22387,6 +22841,7 @@ def _class_surface_ssa_program(
             if constants:
                 block.instrs[index:index] = constants
             instruction.args = refreshed
+            instruction.attributes["callee_input_ids"] = tuple(int(formal.id) for formal in callee.args)
 
     # A table lookup on a keyed mapping walks the mapping's own declared
     # vectors.  Its descriptor was built during lowering from anonymous
@@ -22581,6 +23036,12 @@ def _class_surface_ssa_program(
                         for position, argument in enumerate(instruction.args)
                         if position not in set(dropped_positions)
                     ]
+                    declared = instruction.attributes.get("callee_input_ids")
+                    if declared is not None:
+                        instruction.attributes["callee_input_ids"] = tuple(
+                            value_id for position, value_id in enumerate(declared)
+                            if position not in set(dropped_positions)
+                        )
 
     # Reconcile public source provenance after the linked-frame fixed point.
     # Storage may be allocated during initial discovery or during a later
@@ -25494,6 +25955,41 @@ def lower_ast_source_to_ssa(
                 **full_native_failures,
             }
             if any(full_native_failures.values()):
+                _dump_spec = os.environ.get("TURING_DEBUG_DUMP_FUNCTION")
+                if _dump_spec and ":" in _dump_spec:
+                    _dump_match, _dump_path = _dump_spec.split(":", 1)
+                    _dump_keys = (
+                        "callee", "binding", "incoming_blocks", "source_control",
+                        "sequence_id", "ssa_sequence_operation",
+                        "source_effect_node_id", "region_index",
+                        "source_output_id", "callsite_id", "plan_callsite_id",
+                        "output_ids", "feed_ids", "target", "true_target",
+                        "false_target", "value",
+                    )
+                    with open(_dump_path, "w", encoding="utf-8") as _dump:
+                        for _fn_name, _fn in module.functions.items():
+                            if _dump_match not in _fn_name:
+                                continue
+                            _dump.write(f"FUNCTION {_fn_name}" + "\n")
+                            _dump.write(
+                                f"  args={[(int(a.id), str(a.dtype)) for a in _fn.args]}"
+                                + "\n"
+                            )
+                            for _block_name, _block in _fn.blocks.items():
+                                _dump.write(
+                                    f"  BLOCK {_block_name} successors={_block.successors}"
+                                    + "\n"
+                                )
+                                for _instr in _block.instrs:
+                                    _attrs = {
+                                        k: v for k, v in (_instr.attributes or {}).items()
+                                        if k in _dump_keys
+                                    }
+                                    _res = None if _instr.res is None else int(_instr.res.id)
+                                    _dump.write(
+                                        f"    {_instr.op} {[int(a.id) for a in _instr.args]} "
+                                        f"-> {_res} {_attrs}" + "\n"
+                                    )
                 if os.environ.get("TURING_DEBUG_LINKED_CALLS"):
                     for function_name, function in module.functions.items():
                         rows = tuple(

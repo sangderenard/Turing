@@ -12,9 +12,41 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .abstract_ui_world import WorldObject
+from .abstract_ui_actions import IssuedAction
+from .abstract_ui_placement import PlacementPayload, PlacementTransform, apply_component_placement_action
 
 
 VALIDATOR_RIG_SCHEMA = "abstract-ui-vehicle-validator-rig-v0"
+
+
+def place_validator_support(document, *, actor, identity, body, local_point, world_point):
+    """Install a body/world support through the same actions as a player.
+
+    The caller supplies the existing world and body identities. The resulting
+    component can be bound to the rig evaluator; placement does not imply a
+    second physics runtime or prescribe the body's motion.
+    """
+    for port, owner, position in (("body", body, local_point),
+                                  ("world", document.identity, world_point)):
+        document, _ = apply_component_placement_action(document, IssuedAction(
+            f"{identity}/mark-{port}", actor, "mark-attachment-point",
+            document.identity, "placement", 0.0,
+            (("expected_revision", document.revision),
+             ("identity", f"{identity}/{port}"), ("owner", owner),
+             ("pose", PlacementTransform(position=tuple(position)))),
+        ))
+    payload = PlacementPayload(identity, document.identity, actor, {
+        "archetype": "body-world-support",
+        "connection_ports": ("body", "world"),
+        "mechanical_operator": "vehicle_rig_points_vector",
+    })
+    document, _ = apply_component_placement_action(document, IssuedAction(
+        f"{identity}/install", actor, "connect-component", document.identity,
+        "placement", 0.0,
+        (("expected_revision", document.revision), ("payload", payload),
+         ("bindings", {"body": f"{identity}/body", "world": f"{identity}/world"})),
+    ))
+    return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,5 +367,5 @@ def validator_rig_geometry_boxes(assembly: ValidatorRigAssembly) -> tuple[dict[s
 
 __all__ = [
     "VALIDATOR_RIG_SCHEMA", "ValidatorRigAssembly", "validator_rig_assembly",
-    "validator_rig_geometry_boxes",
+    "validator_rig_geometry_boxes", "place_validator_support",
 ]

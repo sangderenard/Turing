@@ -129,6 +129,15 @@ def main() -> int:
         for merge in merges:
             print(f"  return_merge={merge}")
         print(f"  duplicate_result_ids={duplicates}")
+        for duplicate_id, _count in duplicates:
+            for block_name, block in function.blocks.items():
+                for index, instruction in enumerate(block.instrs):
+                    if instruction.res is not None and int(instruction.res.id) == duplicate_id:
+                        keys = ("binding", "incoming_blocks", "callee", "source_control", "initial_value_id", "region_index", "source_output_id")
+                        attributes = {k: v for k, v in (instruction.attributes or {}).items() if k in keys}
+                        print(f"  producer[{duplicate_id}] {block_name}: {instruction.op} {[int(a.id) for a in instruction.args]} {attributes}")
+                        for previous in block.instrs[max(0, index - 3):index]:
+                            print(f"      before: {previous.op} {[int(a.id) for a in previous.args]} -> {None if previous.res is None else int(previous.res.id)} {(previous.attributes or {}).get('callee', '')}")
         if len(rets) != 1 or rets[0][0] != "function_exit":
             ok = False
             print("  !! expected exactly one Ret in function_exit")

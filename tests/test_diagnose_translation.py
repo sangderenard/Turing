@@ -547,3 +547,20 @@ def test_live_product_is_not_clean_while_worker_is_running(tmp_path):
     snapshot = load_compilation_product(tmp_path)
 
     assert stage_0_compilation_product(snapshot) is False
+
+
+def test_whole_program_failure_receipt_routes_before_ssa(tmp_path, capsys):
+    _write_json(tmp_path / "receipt.json", {
+        "status": "failed", "authored_entrypoint": "validator.worker",
+        "execution": {"require_full_native": True},
+        "error_type": "ValueError", "error": "aggregate arity 8 != 0",
+        "failed_graph": {"function": "wheel", "levels_cover_nodes": True},
+    })
+    (tmp_path / "failed-process-graph.pkl").write_bytes(b"not loaded by stage 0")
+    snapshot = load_compilation_unit(tmp_path)
+    assert snapshot["state"] == "compile-failure"
+    assert stage_0_compilation_unit(snapshot) is False
+    output = capsys.readouterr().out
+    assert "validator.worker" in output
+    assert "aggregate arity 8 != 0" in output
+    assert "--process-graph" in output

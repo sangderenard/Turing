@@ -178,6 +178,9 @@ def load_compilation_unit(path: Path) -> dict[str, Any]:
 
     receipt = read("unit.json")
     failure = read("failure.json")
+    attempt = read("receipt.json")
+    if failure is None and attempt and attempt.get("status") == "failed":
+        failure = attempt
     progress = read("compile-progress.json")
     repository = root / "repository-ssa.pkl"
     qualified_name = next((
@@ -197,6 +200,8 @@ def load_compilation_unit(path: Path) -> dict[str, Any]:
         state = "resource-failure" if str(
             failure.get("error_type") or ""
         ) == "ResourceLimitExceeded" else "compile-failure"
+    elif attempt and attempt.get("status") == "planned":
+        state = "planned"
     elif progress is not None:
         process_id = progress.get("process_id")
         running = False
@@ -218,6 +223,7 @@ def load_compilation_unit(path: Path) -> dict[str, Any]:
         "receipt": receipt,
         "failure": failure,
         "progress": progress,
+        "attempt": attempt,
         "repository": repository if repository.is_file() else None,
     }
 
@@ -298,6 +304,16 @@ def stage_0_compilation_unit(snapshot: dict[str, Any]) -> bool:
     failure = snapshot.get("failure") or {}
     progress = snapshot.get("progress") or {}
     current = progress.get("current") or failure.get("stage") or {}
+    attempt = snapshot.get("attempt") or {}
+    if attempt.get("authored_entrypoint"):
+        _info(f"authored entrypoint: {attempt['authored_entrypoint']}")
+    if attempt.get("compiler_entrypoint"):
+        _info(f"compiler entrypoint: {attempt['compiler_entrypoint']}")
+    if attempt.get("execution"):
+        _info("execution contract: " + json.dumps(attempt["execution"], sort_keys=True))
+    if state == "planned":
+        _info("Plan-only attempt completed; no repository SSA or native binary was requested.")
+        return False
     if state == "source-only":
         receipt = snapshot.get("receipt") or {}
         _ok("unit has no numeric regions; authored source remains authoritative")
@@ -432,6 +448,12 @@ def stage_0_compilation_unit(snapshot: dict[str, Any]) -> bool:
             f"worker raised {failure.get('error_type', 'an exception')}: "
             f"{failure.get('error', 'no message')}"
         )
+        failed_graph = failure.get("failed_graph") or {}
+        if failed_graph:
+            _info("failed ProcessGraph: " + json.dumps(failed_graph, sort_keys=True))
+            graph_path = snapshot["root"] / "failed-process-graph.pkl"
+            if graph_path.is_file():
+                _info(f"Inspect exact call identities: --process-graph {graph_path}")
         if failure.get("frontier_kind") == "compilation-subdivision-required":
             for boundary in failure.get("subdivision_boundaries") or ():
                 _info(
@@ -1436,6 +1458,10 @@ def main() -> int:
             "catalogue without rebuilding it"
         ),
     )
+    inlet.add_argument(
+        "--process-graph", type=Path,
+        help="inspect calls in a trusted saved ProcessGraph without compiling it",
+    )
     parser.add_argument(
         "--entry",
         help="repository function name (exact or unique authored-name suffix)",
@@ -1443,6 +1469,10 @@ def main() -> int:
     args = parser.parse_args()
     ids = parse_id_spec(args.ids)
     wanted = set(parse_id_spec(args.stages)) if args.stages else set()
+    if args.process_graph is not None:
+        from tools.diagnose_process_graph_calls import inspect_saved_calls
+        print(json.dumps(inspect_saved_calls(args.process_graph, args.entry, ids), indent=2))
+        return 0
 
     def run(stage: int) -> bool:
         return not wanted or stage in wanted
@@ -1478,6 +1508,8 @@ def main() -> int:
                 verdict = (
                     "meta-compilation is still running; no repository SSA yet"
                 )
+            elif unit_snapshot["state"] == "planned":
+                verdict = "source plan exists; native compilation and parity remain unproven"
             elif unit_snapshot["state"] == "source-only":
                 verdict = (
                     "source-only unit is terminal and safely retained"

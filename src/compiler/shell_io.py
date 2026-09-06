@@ -23,6 +23,7 @@ class ShellIOCapability(str, Enum):
     KEYBOARD = "keyboard"
     POINTER = "pointer"
     DISPLAY = "display_double_buffer"
+    GEOMETRY_DISPLAY = "geometry_display"
     FILES = "files"
     DEVICES = "system_devices"
     # Web pages resolve only other published Turing bundles. Host-system
@@ -450,6 +451,8 @@ class ShellIOABI:
     files: FileBrokerABI = FileBrokerABI()
     external_references: ExternalReferenceABI = ExternalReferenceABI()
     schema_version: int = 1
+    # Opt-in extension; existing pixel-only hosts do not claim this capability.
+    geometry_display: bool = False
     input_event_fields: tuple[str, ...] = (
         "kind", "code", "value", "x", "y", "buttons", "modifiers",
         "timestamp_ms",
@@ -479,7 +482,7 @@ class ShellIOABI:
                 "header_fields": list(value.header_fields),
             }
 
-        return {
+        mapping = {
             "schema": "turing-shell-io-abi",
             "version": self.schema_version,
             "input_events": ring(self.input_events),
@@ -515,6 +518,26 @@ class ShellIOABI:
                 "external_completion_i32": list(self.external_completion_fields),
             },
         }
+        if self.geometry_display:
+            mapping["geometry_display"] = {
+                "schema": "TURGEOM1",
+                "header_format": "<8sQQQ7I",
+                "header_fields": [
+                    "magic", "generation", "attempt", "revision", "width", "height",
+                    "vertex_count", "index_count", "line_vertex_count",
+                    "point_count", "text_byte_count",
+                ],
+                "payload_order": [
+                    "mvp_f32_row_major_4x4", "vertices_f32_xyz_rgba",
+                    "triangle_indices_u32", "line_pairs_f32_xyz_rgba",
+                    "points_f32_xyz_rgba_diameter", "overlay_utf8",
+                ],
+                "ownership": "immutable_until_completion",
+                "completion_identity": ["generation", "attempt", "revision"],
+                "completion_status": ["presented", "closed", "failed"],
+                "acknowledgment": "after_host_presentation_completion",
+            }
+        return mapping
 
 
 def attach_shell_io_metadata(

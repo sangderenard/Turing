@@ -1,5 +1,14 @@
 # Action plan for the next agent: DT-managed compile, remaining frontier
 
+> Superseded for sequencing by [ACTION_PLAN_2026-09-05_EVENING.md](ACTION_PLAN_2026-09-05_EVENING.md)
+> (checkpoint commit first, then the return-merge regression, then the
+> record-identity blocker on the DT compile). Ground rules below still apply.
+
+> Follow-up: [record-return identity continuation](CONTINUATION_2026-09-05_RECORD_RETURN_IDENTITY.md)
+> records the September 5 resumption, the harness fix, receiver-identity
+> regression and compiler change, and current verification. The uncommitted
+> status described below predates commit `bce4f5da`.
+
 Written 2026-09-05 at the end of the session that landed control-aware result
 merging (returns and breaks) and the three planned-region identity rules.
 Read this before touching the compiler. Everything below was verified in

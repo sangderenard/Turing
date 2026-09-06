@@ -33,6 +33,8 @@ from .python_special_cases import (
     extraction_receipt,
     interpret_python_special_case,
     lower_python_shell_file_contexts,
+    lower_python_threading,
+    python_dispatch_entry_expressions,
 )
 from .python_identity_programs import resolve_python_identity
 import colorsys
@@ -1581,6 +1583,57 @@ def _expand_unresolved_ast_parents(
             call_owners[id(call)] = definition
     binding_revisions = {}
     processed_revisions = {}
+    activated_definitions = set()
+    lexical_parents = {}
+
+    def index_lexical_scopes(root, parent):
+        if isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            lexical_parents[id(root)] = parent
+            parent = root
+        for child in ast.iter_child_nodes(root):
+            index_lexical_scopes(child, parent)
+
+    index_lexical_scopes(module, module)
+
+    def lexical_definition(call, owner):
+        if not isinstance(call.func, ast.Name):
+            return None
+        name = call.func.id
+        scope = owner or module
+        while scope is not None:
+            # Class namespaces are not closures of their methods.
+            if not isinstance(scope, ast.ClassDef):
+                candidates = [statement for statement in getattr(scope, "body", ())
+                              if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+                              and statement.name == name]
+                pending = list(getattr(scope, "body", ()))
+                shadowed = False
+                arguments = getattr(scope, "args", None)
+                if arguments is not None:
+                    shadowed = any(argument.arg == name for argument in (
+                        *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                        *((arguments.vararg,) if arguments.vararg else ()),
+                        *((arguments.kwarg,) if arguments.kwarg else ()),
+                    ))
+                while pending:
+                    member = pending.pop()
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                        if member not in candidates and getattr(member, "name", None) == name:
+                            shadowed = True
+                        continue
+                    if isinstance(member, ast.Name) and isinstance(member.ctx, (ast.Store, ast.Del)) and member.id == name:
+                        shadowed = True
+                    if isinstance(member, (ast.Import, ast.ImportFrom)) and any(
+                        (alias.asname or alias.name.split(".")[0]) == name for alias in member.names
+                    ):
+                        shadowed = True
+                    pending.extend(ast.iter_child_nodes(member))
+                if shadowed:
+                    return None
+                if candidates:
+                    return candidates[0] if len(candidates) == 1 else None
+            scope = lexical_parents.get(id(scope)) if scope is not module else None
+        return None
     work_items = 0
     contract_source_limits = (
         dict(getattr(include, "limits", {}).get("python_source") or {})
@@ -1612,6 +1665,7 @@ def _expand_unresolved_ast_parents(
 
     def requeue_definition(definition):
         definition_id = id(definition)
+        activated_definitions.add(definition_id)
         binding_revisions[definition_id] = (
             binding_revisions.get(definition_id, 0) + 1
         )
@@ -1638,6 +1692,7 @@ def _expand_unresolved_ast_parents(
             return None
         definition._python_source_identity = identity
         module.body.append(definition)
+        index_lexical_scopes(definition, module)
         admitted = [definition]
         admitted.extend(
             member
@@ -1709,6 +1764,9 @@ def _expand_unresolved_ast_parents(
         target = call_target(node, call_bindings)
         identity_target = target.__func__ if inspect.ismethod(target) else target
         if not callable(identity_target):
+            definition = lexical_definition(node, owner_definition)
+            if definition is not None and id(definition) not in activated_definitions:
+                requeue_definition(definition)
             continue
         extraction_decision = (
             include.decide(identity_target)
@@ -1725,6 +1783,16 @@ def _expand_unresolved_ast_parents(
                 getattr(identity_target, "__name__", ""),
             )),
         )))
+        if extraction_decision is None or extraction_decision.action.value != "reject":
+            for entry_expression in python_dispatch_entry_expressions(node, identity_text):
+                # A dispatcher-held lexical function is a source dependency
+                # even though its invocation is implicit in Thread.start().
+                # This temporary lookup node is never inserted as a call or
+                # executed; the original target argument retains its identity.
+                entry_definition = lexical_definition(ast.Call(
+                    func=entry_expression, args=[], keywords=[]), owner_definition)
+                if entry_definition is not None and id(entry_definition) not in activated_definitions:
+                    requeue_definition(entry_definition)
         if resolve_python_identity(identity_text) is not None:
             # A declared graph-native identity is already a complete lowering
             # decision.  Retain its extraction receipt on this occurrence,
@@ -1767,7 +1835,11 @@ def _expand_unresolved_ast_parents(
             combined, bindings_changed = _merge_ast_bindings(
                 target_bindings.get(identity, {}), argument_bindings,
             )
-            if bindings_changed:
+            if bindings_changed or id(definition) not in activated_definitions:
+                # Class admission registers method identities without executing
+                # their bodies. The first reachable call must activate a method
+                # even when its receiver/arguments equal those registration
+                # bindings; a binding revision is not a reachability proof.
                 combined = _ast_local_constructor_bindings(
                     definition,
                     combined,
@@ -1959,6 +2031,7 @@ def _expand_unresolved_ast_parents(
         source_definition._python_source_identity = identity
 
         module.body.append(source_definition)
+        index_lexical_scopes(source_definition, module)
         emit(
                 f"[ast-parent] discovered definition {getattr(source_definition, 'name', identity)!r} "
                 f"from {identity[1]} work_item={work_items} "
@@ -2085,6 +2158,17 @@ def _expand_unresolved_ast_parents(
                 member_definition._python_source_identity = member_identity
                 target_definitions[member_identity] = member_definition
                 target_bindings[member_identity] = definition_bindings
+                if member_definition.name in {"__new__", "__init__"}:
+                    # Constructing the class reaches its construction methods,
+                    # even without an explicit source `instance.__init__()`
+                    # call. Other methods remain registered but inactive until
+                    # selected by an actual call.
+                    constructor_bindings = _ast_local_constructor_bindings(
+                        member_definition, definition_bindings,
+                    )
+                    target_bindings[member_identity] = constructor_bindings
+                    install_definition_bindings(member_definition, constructor_bindings)
+                    requeue_definition(member_definition)
         requeue_definition(source_definition)
         if profile_verbose:
                 print(
@@ -2155,9 +2239,7 @@ def _expand_unresolved_ast_parents(
             # method.  Owner resolution above is the only sound way to link
             # an attribute call.  Falling back by basename aliases unrelated
             # methods and routes runtime receivers into the wrong shell.
-            candidates = definitions_by_name.get(call.func.id, ())
-            if len(candidates) == 1:
-                definition = candidates[0]
+            definition = lexical_definition(call, call_owners.get(id(call)))
         if definition is not None and definition is not call:
             emit(
                 f"[ast-parent] linked parent {getattr(definition, 'name', '?')!r} -> call line={getattr(call, 'lineno', '?')}"
@@ -3341,6 +3423,10 @@ class ProcessGraph:
             # pursuit would have to guess from spelling and doing it after graph
             # construction would leave a false control-divergence ``With``.
             tree = lower_python_shell_file_contexts(tree)
+            tree = lower_python_threading(tree)
+            dispatch_operations = tuple(getattr(tree, "_turing_dispatch_operations", ()))
+            if dispatch_operations:
+                self.G.graph["dispatch_operations"] = dispatch_operations
             shell_file_contexts = tuple(
                 getattr(tree, "_turing_shell_file_contexts", ()) or ()
             )

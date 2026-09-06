@@ -22,6 +22,7 @@ from .output_publication import (
     publication_surface_plan,
 )
 from .ssa_aggregate_abi import analyze_aggregate_abi, is_storage_view
+from .string_table import string_token
 
 
 @dataclass(frozen=True, slots=True)
@@ -1251,6 +1252,15 @@ def emit_ssa_module_to_c(
     from .ssa_llvm_backend import _declared_span_rank
 
     call_array_ids = call_array_argument_ids(module.functions, reachable)
+    storage_values = {}
+    for owner in reachable:
+        function = module.functions[owner]
+        declared = {int(value.id): value for value in function.args}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.res is not None:
+                    declared.setdefault(int(instruction.res.id), instruction.res)
+        storage_values[owner] = declared
 
     # Array arguments cross the internal ABI by address. Their physical
     # element type is therefore one call-edge contract even when semantic
@@ -1303,10 +1313,13 @@ def emit_ssa_module_to_c(
                 if callee is None or callee_name not in reachable:
                     continue
                 for actual, formal in zip(instruction.args, callee.args):
-                    if (
-                        authored_array_contract(actual, caller_name)
-                        or authored_array_contract(formal, callee_name)
-                    ):
+                    # The caller's storage determines whether this edge
+                    # aliases an array. A helper's explicit double arena
+                    # must not pull a scalar bool input into that arena's
+                    # physical-type component: the scalar conversion below
+                    # creates a separate cell for precisely that call.
+                    actual = storage_values[caller_name].get(int(actual.id), actual)
+                    if authored_array_contract(actual, caller_name):
                         physical_union(
                             (caller_name, int(actual.id)),
                             (callee_name, int(formal.id)),
@@ -1747,6 +1760,7 @@ def emit_ssa_module_to_c(
     def solved_buffer_type(owner: str, value) -> str:
         """Map the working LLVM backend's authored storage-width contract."""
 
+        value = storage_values.get(owner, {}).get(int(value.id), value)
         physical = explicit_physical.get(
             physical_find((str(owner), int(value.id))), set()
         )
@@ -2384,6 +2398,11 @@ def emit_ssa_module_to_c(
                             expressions[result_id] = f"t{result_id}"
                             addresses[result_id] = f"t{result_id}"
                             continue
+                    if isinstance(held, (str, bytes)):
+                        # Keys share the runtime container token namespace;
+                        # parsing or floating-point conversion loses identity.
+                        held = string_token(held)
+                        token_value_ids.add(int(instruction.res.id))
                     if is_integer(instruction.res) or isinstance(held, int):
                         expressions[int(instruction.res.id)] = str(int(held))
                         integer_ids.add(int(instruction.res.id))
@@ -3431,7 +3450,15 @@ def emit_ssa_module_to_c(
                     # Structural None is the native record/token zero sentinel,
                     # never a retained Python object.
                     result_id = int(instruction.res.id)
-                    expressions[result_id] = "0"
+                    # Returned values need an address for publication through
+                    # the native output ABI, even for the absence singleton.
+                    # An expression-only sentinel left the caller's slot
+                    # uninitialized when a function returned None.
+                    body.append(
+                        f"        {buffer_type(instruction.res)} t{result_id} = 0;"
+                    )
+                    expressions[result_id] = f"t{result_id}"
+                    addresses[result_id] = f"&t{result_id}"
                     integer_ids.add(result_id)
                     continue
                 if instruction.res is None:
@@ -3745,11 +3772,13 @@ def emit_ssa_module_to_c(
                         f"const {kind} t{result_id} = "
                         f"({kind})({left} {_INTEGER_BINARY[op]} {right});"
                     )
-                elif op in _LOGICAL_BINARY and len(args) == 2:
+                elif op in _LOGICAL_BINARY and len(args) >= 2:
                     integer_ids.add(result_id)
+                    logical_expression = f" {_LOGICAL_BINARY[op]} ".join(
+                        f"({argument})" for argument in args)
                     declared = (
                         f"const {_scalar_c_type(instruction.res.dtype)} t{result_id} = "
-                        f"(({args[0]}) {_LOGICAL_BINARY[op]} ({args[1]}));"
+                        f"({logical_expression});"
                     )
                 elif op in {"LNot", "Not"} and len(args) == 1:
                     integer_ids.add(result_id)
@@ -3784,9 +3813,31 @@ def emit_ssa_module_to_c(
                     )
                 elif op in _C_COMPARISONS and len(args) == 2:
                     integer_ids.add(result_id)
+                    comparison = f"({args[0]} {_C_COMPARISONS[op]} {args[1]})"
+                    operand_types = tuple(str(value.dtype or "").casefold()
+                                          for value in instruction.args)
+                    scalar_types = {
+                        "none", "bool", "i1", "int", "long", "int8", "int16",
+                        "int32", "int64", "uint8", "uint16", "uint32", "uint64",
+                        "i8", "i16", "i32", "i64", "float", "float32", "float64",
+                        "f32", "f64", "double",
+                    }
+                    if (
+                        op in {"Eq", "Ne"} and "none" in operand_types
+                        and all(dtype in scalar_types for dtype in operand_types)
+                        and all((value.accounting or {}).get("program_abi_storage")
+                                not in {"reference", "record"} for value in instruction.args)
+                    ):
+                        # None's storage cell is not a numeric value. Its
+                        # equality follows the semantic SSA type, so 0.0 is
+                        # never mistaken for absence merely because both
+                        # native cells contain zero. Tagged optional/reference
+                        # representations must use their own presence tests.
+                        equal = operand_types == ("none", "none")
+                        comparison = str(int(equal if op == "Eq" else not equal))
                     declared = (
                         f"const {_scalar_c_type(instruction.res.dtype)} t{result_id} = "
-                        f"({args[0]} {_C_COMPARISONS[op]} {args[1]});"
+                        f"{comparison};"
                     )
                 elif op == "Neg" and len(args) == 1:
                     kind = (
@@ -3811,10 +3862,15 @@ def emit_ssa_module_to_c(
                     # consumers need that address, not the address of the
                     # local pointer variable which happens to hold it.
                     addresses[result_id] = f"t{result_id}"
-                elif not tuple(instruction.res.shape or ()):
+                elif not tuple(instruction.res.shape or ()) or all(
+                    isinstance(extent, int) and extent == 1
+                    for extent in instruction.res.shape
+                ):
                     # A scalar producer forwarded to a pointer formal must use
                     # the produced scalar's address, never a tensor-table tmp
-                    # that merely shares its semantic id.
+                    # that merely shares its semantic id. Singleton shaped
+                    # values emitted here also live in the scalar just declared;
+                    # their output buffer has not yet been written.
                     if declared.startswith("const "):
                         declared = declared[len("const "):]
                     addresses[result_id] = f"&t{result_id}"
@@ -4041,6 +4097,22 @@ def emit_ssa_module_to_c(
             f"({element_type} *)buffers[{index}];"
         )
         rendered_actuals.append(f"b{index}")
+    # Private sequence arenas and their capacity cells share this activation.
+    # calloc establishes empty contents, but zero is not the capacity of an
+    # allocated arena. Publish the actual column allocation bound before any
+    # native append can test it. Caller-owned descriptors retain their input.
+    root_sequences = getattr(module, "sequence_tables", {}).get(function_name)
+    allocation_counts = {name: count for _kind, name, count in root_allocations}
+    if root_sequences is not None:
+        for sequence in root_sequences.sequences.values():
+            capacity = owned_storage_names.get(int(sequence.capacity_value_id))
+            columns = [owned_storage_names.get(int(value_id))
+                       for value_id in sequence.column_value_ids]
+            if capacity is not None and columns and all(
+                column in allocation_counts for column in columns
+            ):
+                count = min(allocation_counts[column] for column in columns)
+                entry_lines.append(f"    ((int64_t *){capacity})[0] = {count};")
     # -- record-parameter relocation prologue -------------------------------
     # Record parameters are runtime cell arenas (the program mutates scalar
     # cells in place), but their private storage starts calloc-zeroed, so

@@ -82,9 +82,10 @@ MESH_FS = """
 in vec4 vColor;
 out vec4 FragColor;
 uniform vec4 uMeshColor;     // used if no per-vertex color bound
+uniform int uHasColor;
 uniform float uAlpha;        // overall alpha multiplier
 void main(){
-    vec4 base = (vColor.a > 0.0) ? vColor : uMeshColor;
+    vec4 base = (uHasColor != 0) ? vColor : uMeshColor;
     FragColor = vec4(base.rgb, clamp(base.a, 0.0, 1.0) * uAlpha);
 }
 """
@@ -291,6 +292,22 @@ class DebugRenderer:
 # Core renderer
 # ---------------------------
 
+@dataclass(frozen=True)
+class RendererHost:
+    """Services for an already-current GL context, owned by the caller.
+
+    ``present`` returns after the host accepts presentation, or raises on
+    failure. An asynchronous host must wait for its completion here. This is
+    not a guarantee of physical scanout. The caller owns events and teardown.
+    ``ticks_ms`` supplies elapsed milliseconds for shader animation/capture.
+    """
+
+    present: Callable[[], None]
+    ticks_ms: Callable[[], float]
+    draw_overlay: Optional[Callable[[tuple[str, ...], Tuple[int, int]], None]] = None
+    compatibility_point_sprites: bool = False
+
+
 class GLRenderer:
     """A minimal scene graph: Mesh → Lines → Points (draw order)."""
 
@@ -300,6 +317,7 @@ class GLRenderer:
         *,
         size: Tuple[int, int] = (640, 480),
         point_shader_sources: tuple[str, str] | None = None,
+        host: RendererHost | None = None,
     ):
         """Create a renderer and its backing window.
 
@@ -312,21 +330,31 @@ class GLRenderer:
             ``(width, height)`` of the window in pixels.  A new ``pygame``
             window is created on construction which also establishes the OpenGL
             context used for subsequent draw calls.
+        host:
+            Services for a caller-owned, current GL context. When provided,
+            construction creates no window and rendering never imports Pygame.
+            Text overlays require the host's explicit overlay implementation.
         """
 
-        # Create an OpenGL context for this renderer (pygame based).
-        import pygame
-        from pygame.locals import DOUBLEBUF, OPENGL
+        if host is None:
+            # Legacy convenience host; external contexts never import Pygame.
+            import pygame
+            from pygame.locals import DOUBLEBUF, OPENGL
 
-        pygame.init()
-        flags = DOUBLEBUF | OPENGL
-        try:  # pragma: no cover - best effort for headless environments
-            pygame.display.set_mode(size, flags)
-        except Exception:  # noqa: BLE001
-            # Fall back to dummy driver so tests can run headless.
-            import os
-            os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-            pygame.display.set_mode(size, flags)
+            pygame.init()
+            flags = DOUBLEBUF | OPENGL
+            try:  # pragma: no cover - best effort for headless environments
+                pygame.display.set_mode(size, flags)
+            except Exception:  # noqa: BLE001
+                import os
+                os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+                pygame.display.set_mode(size, flags)
+            host = RendererHost(
+                pygame.display.flip, pygame.time.get_ticks,
+                lambda lines, viewport: self._draw_pygame_overlay(),
+                compatibility_point_sprites=True,
+            )
+        self._host = host
         self._window_size = size
 
         # programs
@@ -355,8 +383,9 @@ class GLRenderer:
         # The Windows compatibility contexts created by pygame require these
         # two enables before shader point sprites become rasterized at all.
         # Without them draw calls succeed with GL_NO_ERROR but emit no pixels.
-        glEnable(GL_POINT_SPRITE)
-        glEnable(GL_POINT_SMOOTH)
+        if self._host.compatibility_point_sprites:
+            glEnable(GL_POINT_SPRITE)
+            glEnable(GL_POINT_SMOOTH)
         glCullFace(GL_BACK)
 
         self._overlay_lines: list[str] = []
@@ -410,39 +439,33 @@ class GLRenderer:
 
     # ---- Mesh API ----
     def set_mesh(self, layer: MeshLayer):
-        # build VAO / VBO / EBO
-        vao = glGenVertexArrays(1); glBindVertexArray(vao)
-
-        vbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, vbo)
-        pos = layer.positions.astype(np.float32, copy=False)
-        nrm = (layer.normals.astype(np.float32, copy=False) if layer.normals is not None else None)
-        clr = (layer.colors.astype(np.float32, copy=False)  if layer.colors  is not None else None)
-
-        # pack attributes as tightly-separated buffers (simpler updates)
-        glBufferData(GL_ARRAY_BUFFER, pos.nbytes, pos, GL_DYNAMIC_DRAW)
-        glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
-
-        nbo = None
-        if nrm is not None:
-            nbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, nbo)
-            glBufferData(GL_ARRAY_BUFFER, nrm.nbytes, nrm, GL_DYNAMIC_DRAW)
-            glEnableVertexAttribArray(1); glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
-
-        cbo = None
-        if clr is not None:
-            cbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, cbo)
-            glBufferData(GL_ARRAY_BUFFER, clr.nbytes, clr, GL_DYNAMIC_DRAW)
-            glEnableVertexAttribArray(2); glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(0))
-
-        ebo = glGenBuffers(1); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo)
-        idx = layer.indices.astype(np.uint32, copy=False).ravel()
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.nbytes, idx, GL_STATIC_DRAW)
-
+        pos = np.ascontiguousarray(layer.positions, dtype=np.float32)
+        nrm = (np.zeros_like(pos) if layer.normals is None else
+               np.ascontiguousarray(layer.normals, dtype=np.float32))
+        clr = (np.zeros((len(pos), 4), dtype=np.float32) if layer.colors is None else
+               np.ascontiguousarray(layer.colors, dtype=np.float32))
+        idx = np.ascontiguousarray(layer.indices, dtype=np.uint32).ravel()
+        if self._mesh is None:
+            vao = glGenVertexArrays(1)
+            vbo, nbo, cbo, ebo = glGenBuffers(4)
+            self._mesh = dict(vao=vao, vbo=vbo, nbo=nbo, cbo=cbo, ebo=ebo)
+            glBindVertexArray(vao)
+            for attribute, buffer, components in ((0, vbo, 3), (1, nbo, 3), (2, cbo, 4)):
+                glBindBuffer(GL_ARRAY_BUFFER, buffer)
+                glEnableVertexAttribArray(attribute)
+                glVertexAttribPointer(attribute, components, GL_FLOAT, GL_FALSE,
+                                      components * 4, ctypes.c_void_p(0))
+        else:
+            glBindVertexArray(self._mesh["vao"])
+        for key, data, target in (
+            ("vbo", pos, GL_ARRAY_BUFFER), ("nbo", nrm, GL_ARRAY_BUFFER),
+            ("cbo", clr, GL_ARRAY_BUFFER), ("ebo", idx, GL_ELEMENT_ARRAY_BUFFER),
+        ):
+            self._upload_persistent(self._mesh, buffer_key=key,
+                                    capacity_key=key + "_capacity", target=target, data=data)
         glBindVertexArray(0)
-        self._mesh = dict(vao=vao, vbo=vbo, nbo=nbo, cbo=cbo, ebo=ebo,
-                          count=idx.size,
-                          rgba=np.array(layer.rgba, np.float32),
-                          alpha=float(layer.alpha))
+        self._mesh.update(count=idx.size, rgba=np.array(layer.rgba, np.float32),
+                          alpha=float(layer.alpha), has_colors=layer.colors is not None)
 
     def update_mesh_positions(self, positions: np.ndarray):
         if not self._mesh: return
@@ -888,9 +911,8 @@ class GLRenderer:
         self.mvp = np.asarray(mvp, dtype=np.float32)
 
     def draw(self, viewport_px: Tuple[int,int]):
-        import pygame
-
         w, h = viewport_px
+        self._window_size = (int(w), int(h))
         glViewport(0, 0, int(w), int(h))
         glClearColor(0.08, 0.08, 0.1, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -903,6 +925,8 @@ class GLRenderer:
             uAlph = glGetUniformLocation(self.prog_mesh, "uAlpha")
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, self.mvp)
             glUniform4fv(uCol, 1, self._mesh["rgba"])
+            glUniform1i(glGetUniformLocation(self.prog_mesh, "uHasColor"),
+                        int(self._mesh["has_colors"]))
             glUniform1f(uAlph, self._mesh["alpha"])
             glBindVertexArray(self._mesh["vao"])
             glDrawElements(GL_TRIANGLES, self._mesh["count"], 0x1405, ctypes.c_void_p(0))  # GL_UNSIGNED_INT = 0x1405
@@ -962,7 +986,7 @@ class GLRenderer:
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, self.mvp)
             if fluxspring:
                 uTime = glGetUniformLocation(self.prog_point, "u_time")
-                glUniform1f(uTime, float(pygame.time.get_ticks()))
+                glUniform1f(uTime, float(self._host.ticks_ms()))
             elif self._point_shader_sources is None:
                 uPulse = glGetUniformLocation(self.prog_point, "uPulse")
                 glUniform1f(uPulse, self._point.get("pulse", 0.0))
@@ -972,7 +996,7 @@ class GLRenderer:
 
         if (
             self._capture_path
-            and pygame.time.get_ticks() >= self._capture_after_ms
+            and self._host.ticks_ms() >= self._capture_after_ms
             and self._point
             and self._point["count"]
         ):
@@ -998,7 +1022,7 @@ class GLRenderer:
 
         glUseProgram(0)
         self._draw_overlay()
-        pygame.display.flip()
+        self._host.present()
     # ---- disposal ----
     def dispose(self):
         if self._cuda_position_resource is not None:
@@ -1043,6 +1067,11 @@ class GLRenderer:
     def _draw_overlay(self) -> None:
         if not self._overlay_lines:
             return
+        if self._host.draw_overlay is None:
+            raise RuntimeError("renderer host does not support text overlays")
+        self._host.draw_overlay(tuple(self._overlay_lines), self._window_size)
+
+    def _draw_pygame_overlay(self) -> None:
         try:
             import pygame
             if self._font is None:

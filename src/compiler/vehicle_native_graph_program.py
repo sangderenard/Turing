@@ -37,6 +37,7 @@ def graph_norm(value):
 
 def vehicle_rig_points_vector(body_position, body_velocity, attitude,
                               angular_velocity, rig_points):
+    batch_count, point_count = rig_points.shape[0], rig_points.shape[1]
     roll, pitch, yaw = attitude[:, 0], attitude[:, 1], attitude[:, 2]
     cr, sr, cp, sp = roll.cos(), roll.sin(), pitch.cos(), pitch.sin()
     cy, sy = yaw.cos(), yaw.sin()
@@ -55,15 +56,15 @@ def vehicle_rig_points_vector(body_position, body_velocity, attitude,
     command, stiffness, damping = rig_points[:, :, 11:14], rig_points[:, :, 14:17], rig_points[:, :, 17:20]
     position_force = stiffness * (target - body_position.reshape((-1, 1, 3)) - radius) + damping * (target_velocity - point_velocity)
     velocity_force = damping * (target_velocity - point_velocity)
-    mode = rig_points[:, :, 1].reshape((-1, 16, 1))
+    mode = rig_points[:, :, 1].reshape((batch_count, point_count, 1))
     force = AbstractTensor.where(mode == 1, position_force,
         AbstractTensor.where(mode == 2, command,
         AbstractTensor.where(mode == 3, velocity_force, position_force * 0.0)))
-    force = force * rig_points[:, :, 0].reshape((-1, 16, 1))
+    force = force * rig_points[:, :, 0].reshape((batch_count, point_count, 1))
     magnitude = graph_norm(force)
     maximum = rig_points[:, :, 20]
     scale = AbstractTensor.where((maximum > 0.0) * (magnitude > maximum), maximum / magnitude, 1.0)
-    force = force * scale.reshape((-1, 16, 1))
+    force = force * scale.reshape((batch_count, point_count, 1))
     moment = graph_cross(radius, force)
     moment[:, :, 1] = -moment[:, :, 1]
     reactions = AbstractTensor.concat([-force, -moment], dim=-1)

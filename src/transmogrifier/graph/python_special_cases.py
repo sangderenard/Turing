@@ -12,7 +12,7 @@ import ast
 import copy
 from typing import Any, Mapping
 
-from .node_special_cases import SpecialCase
+from .node_special_cases import SpecialCase, context_scope_statements
 from .python_identity_programs import resolve_python_identity
 
 
@@ -517,6 +517,217 @@ def interpret_python_static_value(
     )
 
 
+_THREADING_CONSTRUCTORS = {"threading.Thread": "thread", "threading.Condition": "condition",
+                 "threading.Event": "event"}
+_THREADING_METHODS = {
+    "thread": {"start", "join", "is_alive"},
+    "condition": {"acquire", "release", "wait", "notify", "notify_all"},
+    "event": {"set", "clear", "wait", "is_set"},
+}
+
+
+def python_dispatch_entry_expressions(call: ast.Call, identity: str) -> tuple[ast.expr, ...]:
+    """Source entry references owned by a resolved Python dispatch construct."""
+    if identity != "threading.Thread":
+        return ()
+    targets = tuple(keyword.value for keyword in call.keywords if keyword.arg == "target")
+    if targets:
+        return targets
+    # Thread(group=None, target=None, ...); group is not an entry point.
+    return (call.args[1],) if len(call.args) > 1 else ()
+
+
+def lower_python_threading(tree: ast.AST) -> ast.AST:
+    class Lowerer(ast.NodeTransformer):
+        def __init__(self):
+            self.bindings = {}
+            self.records = []
+            self.counter = 0
+            self.names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+
+        def operation(self, kind, action, args, keywords, source, origin):
+            operation = f"{kind}_{action}"
+            call = ast.copy_location(ast.Call(
+                func=ast.Name(id=f"turing_dispatch_{operation}", ctx=ast.Load()),
+                args=args, keywords=keywords,
+            ), source)
+            record = {"operation": operation, "source_identity": origin,
+                      "line": getattr(source, "lineno", None),
+                      "column": getattr(source, "col_offset", None),
+                      "requires_concurrent_progress": True}
+            call._turing_dispatch_operation = record
+            call._extraction_contract = {
+                "action": "intrinsic", "identity": f"turing.dispatch.{operation}",
+                "rule_id": "python-threading-to-dispatcher",
+                "classification": "dispatcher-operation",
+                "parameters": {"lowering_namespace": "dispatcher",
+                               "operation": operation,
+                               "required_capability": "communicating_tasks"},
+            }
+            self.records.append(record)
+            return call
+
+        def visit_Call(self, node):
+            receipt = extraction_receipt(node) or {}
+            identity = receipt.get("identity")
+            # Rejected extraction decisions never become an authorized intrinsic.
+            if receipt.get("action") == "reject":
+                return self.generic_visit(node)
+            node = self.generic_visit(node)
+            if identity in _THREADING_CONSTRUCTORS:
+                return self.operation(_THREADING_CONSTRUCTORS[identity], "create", node.args,
+                                      node.keywords, node, identity)
+            # Condition installs acquire/release from its lock on the
+            # instance, so class-member source discovery cannot resolve them.
+            # A locally constructed/aliased handle is the exact receiver proof.
+            if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                kind = self.bindings.get(node.func.value.id)
+                if kind and node.func.attr in _THREADING_METHODS[kind]:
+                    return self.operation(kind, node.func.attr, [node.func.value, *node.args],
+                                          node.keywords, node,
+                                          f"threading.{kind.title()}.{node.func.attr}")
+            for kind, methods in _THREADING_METHODS.items():
+                prefix = f"threading.{kind.title()}."
+                if isinstance(identity, str) and identity.startswith(prefix):
+                    method = identity[len(prefix):]
+                    if method in methods and isinstance(node.func, ast.Attribute):
+                        return self.operation(kind, method, [node.func.value, *node.args],
+                                              node.keywords, node, identity)
+            return node
+
+        def visit_Assign(self, node):
+            node.value = self.visit(node.value)
+            record = getattr(node.value, "_turing_dispatch_operation", {})
+            operation = record.get("operation", "")
+            kind = operation[:-7] if operation.endswith("_create") else None
+            if isinstance(node.value, ast.Name):
+                kind = self.bindings.get(node.value.id)
+            for target in node.targets:
+                for member in ast.walk(target):
+                    if isinstance(member, ast.Name):
+                        self.bindings.pop(member.id, None)
+                if isinstance(target, ast.Name) and kind:
+                    self.bindings[target.id] = kind
+            return node
+
+        def visit_FunctionDef(self, node):
+            previous = self.bindings
+            self.bindings = dict(previous)
+            # Parameters and local assignments shadow outer bindings even before
+            # their first assignment. Nested definitions have their own scope.
+            pending = list(node.body)
+            locals_ = {arg.arg for arg in (*node.args.posonlyargs, *node.args.args,
+                                          *node.args.kwonlyargs)}
+            if node.args.vararg: locals_.add(node.args.vararg.arg)
+            if node.args.kwarg: locals_.add(node.args.kwarg.arg)
+            while pending:
+                member = pending.pop()
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    locals_.add(member.name)
+                    continue
+                if isinstance(member, ast.Name) and isinstance(member.ctx, ast.Store):
+                    locals_.add(member.id)
+                pending.extend(ast.iter_child_nodes(member))
+            for name in locals_: self.bindings.pop(name, None)
+            node.body = self.statements(node.body)
+            self.bindings = previous
+            return node
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def statements(self, body):
+            result = []
+            for statement in body:
+                lowered = self.visit(statement)
+                result.extend(lowered if isinstance(lowered, list) else [lowered])
+            return result
+
+        def visit_If(self, node):
+            node.test = self.visit(node.test)
+            before = dict(self.bindings)
+            node.body = self.statements(node.body)
+            yes = dict(self.bindings)
+            self.bindings = dict(before)
+            node.orelse = self.statements(node.orelse)
+            self.bindings = {name: kind for name, kind in yes.items()
+                             if self.bindings.get(name) == kind}
+            return node
+
+        def visit_With(self, node):
+            recognized = all(isinstance(item.context_expr, ast.Name)
+                             and self.bindings.get(item.context_expr.id) == "condition"
+                             for item in node.items)
+            if not recognized:
+                return self.generic_visit(node)
+            body = self.statements(node.body)
+            for item in reversed(node.items):
+                # Bind once, before entry. A body may reassign the source name;
+                # cleanup must still release the condition actually acquired.
+                while True:
+                    self.counter += 1
+                    name = f"turing_condition_scope_{self.counter}"
+                    if name not in self.names:
+                        self.names.add(name)
+                        break
+                capture = ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())],
+                                     value=copy.deepcopy(item.context_expr))
+                handle = ast.Name(id=name, ctx=ast.Load())
+                enter = self.operation("condition", "acquire", [copy.deepcopy(handle)],
+                                       [], node, "threading.Condition.__enter__")
+                acquire = (ast.Expr(value=enter) if item.optional_vars is None else
+                           ast.Assign(targets=[copy.deepcopy(item.optional_vars)], value=enter))
+                release = self.operation("condition", "release", [handle], [], node,
+                                         "threading.Condition.__exit__")
+                body = context_scope_statements(
+                    [capture, acquire], body, cleanup=[ast.Expr(value=release)],
+                )
+                scope = body[2]
+                scope._turing_resource_scope = name
+            return [ast.copy_location(statement, node) for statement in body]
+
+        def visit_For(self, node):
+            # Loop-carried/rebound receiver identities need control-aware
+            # proof. Do not promote the final syntactic assignment to a fact
+            # about every iteration or the zero-iteration exit.
+            names = {member.id for member in ast.walk(node)
+                     if isinstance(member, ast.Name) and isinstance(member.ctx, ast.Store)}
+            for name in names: self.bindings.pop(name, None)
+            node = self.generic_visit(node)
+            for name in names: self.bindings.pop(name, None)
+            return node
+
+        visit_While = visit_For
+        visit_Try = visit_For
+
+    lowerer = Lowerer()
+    tree = lowerer.visit(tree)
+    ast.fix_missing_locations(tree)
+    # Preserve lexical control ownership independently of source locations.
+    # In particular, generated acquire and finally-release share a location
+    # but must never be scheduled as adjacent straight-line calls.
+    def record_scopes(node, scopes=()):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            scopes = ()
+        operation = getattr(node, "_turing_dispatch_operation", None)
+        if operation is not None:
+            operation["control_scopes"] = scopes
+        for field, value in ast.iter_fields(node):
+            children = value if isinstance(value, list) else (value,)
+            nested = scopes
+            if isinstance(node, (ast.If, ast.IfExp, ast.For, ast.AsyncFor,
+                                 ast.While, ast.Try, ast.TryStar, ast.With,
+                                 ast.AsyncWith, ast.BoolOp, ast.comprehension,
+                                 ast.ListComp, ast.SetComp, ast.DictComp,
+                                 ast.GeneratorExp, ast.Call)):
+                nested += ((type(node).__name__, getattr(node, "lineno", None), field),)
+            for child in children:
+                if isinstance(child, ast.AST):
+                    record_scopes(child, nested)
+    record_scopes(tree)
+    tree._turing_dispatch_operations = tuple(lowerer.records)
+    return tree
+
+
 def interpret_python_special_case(node: Any) -> SpecialCase | None:
     """Classify Python syntax without performing callable source discovery.
 
@@ -533,6 +744,15 @@ def interpret_python_special_case(node: Any) -> SpecialCase | None:
 
     receipt = extraction_receipt(node)
     attributes = _receipt_attributes(receipt) if receipt is not None else {}
+    dispatch_operation = getattr(node, "_turing_dispatch_operation", None)
+    if dispatch_operation is not None:
+        attributes.update({
+            "dispatch_operation": dict(dispatch_operation),
+            "ordered_effect": True,
+            "deployment_owner": "dispatcher",
+            "required_capability": "communicating_tasks",
+        })
+        return SpecialCase("Call", attributes, None)
     spelling = _call_spelling(node)
     identity = receipt.get("identity") if receipt is not None else None
     shell_operation = (
@@ -615,4 +835,6 @@ __all__ = [
     "interpret_python_special_case",
     "interpret_python_static_value",
     "lower_python_shell_file_contexts",
+    "lower_python_threading",
+    "python_dispatch_entry_expressions",
 ]

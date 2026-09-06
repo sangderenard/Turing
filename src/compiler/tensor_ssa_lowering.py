@@ -1458,7 +1458,8 @@ def lower_tensor_calls_to_repository_ssa(
                     )
                 )
                 if (
-                    args
+                    operation in {"slice", "basic_index"}
+                    and args
                     and basic_axes is not None
                     and len(basic_axes) == len(basic_source_shape)
                     and all(

@@ -1178,6 +1178,27 @@ def test_c_truncation_and_unsigned_comparison_use_bit_patterns(tmp_path):
     assert execution.buffers[unsigned_less.id].item() == 0
 
 
+def test_c_string_constants_preserve_canonical_token_identity(tmp_path):
+    from src.compiler.string_table import string_token
+
+    words = ("power_w", b"power_w", "123")
+    results = [SSAValue(index, "int64") for index in range(len(words))]
+    function = Function("string_constants", [], {
+        "entry": BasicBlock("entry", [
+            *(Instr("Const", [], result, attributes={"value": word})
+              for result, word in zip(results, words, strict=True)),
+            Instr("Ret", results, None),
+        ]),
+    }, metadata={"output_names": ("text", "bytes", "numeric_text")})
+
+    artifact = emit_ssa_module_to_c(IRModule({function.name: function}), function.name)
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "string_constants", optimization="O0")
+    execution = artifact.prepare_execution({}).run()
+    for result, word in zip(results, words, strict=True):
+        assert execution.buffers[result.id].item() == string_token(word)
+
+
 def test_c_module_lane_publishes_shared_native_capabilities():
     scalar = supported_scalar_operations()
     tensor = supported_tensor_operations()

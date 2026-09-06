@@ -296,6 +296,84 @@ def suspicious_loop_invariant_formals(module: Any) -> list[Finding]:
     return findings
 
 
+def check_definition_dominance(module: Any) -> list[Finding]:
+    """Find reads whose known definitions cannot execute before the read.
+
+    Checks reachable CFG blocks, including Phi operands on their incoming
+    edges. Formal/storage binding validity and writes through pointers are
+    separate contracts; this does not prove memory initialization or bounds.
+    """
+    findings = []
+    for name, function in _functions(module):
+        blocks = getattr(function, "blocks", {}) or {}
+        if not blocks:
+            continue
+        entry = next(iter(blocks))
+        reachable, pending = set(), [entry]
+        predecessors = {key: set() for key in blocks}
+        while pending:
+            key = pending.pop()
+            if key in reachable:
+                continue
+            reachable.add(key)
+            for successor in blocks[key].successors:
+                if successor in blocks:
+                    predecessors[successor].add(key)
+                    pending.append(successor)
+        dominators = {key: ({entry} if key == entry else set(reachable)) for key in reachable}
+        changed = True
+        while changed:
+            changed = False
+            for key in reachable - {entry}:
+                incoming = predecessors[key] & reachable
+                common = set.intersection(*(dominators[p] for p in incoming)) if incoming else set()
+                updated = common | {key}
+                if updated != dominators[key]:
+                    dominators[key] = updated
+                    changed = True
+        formals = {int(value.id) for value in function.args}
+        definitions = {}
+        for key, block in blocks.items():
+            for index, instruction in enumerate(block.instrs):
+                if instruction.res is not None:
+                    definitions.setdefault(int(instruction.res.id), []).append((key, index))
+        for key in blocks:
+            if key not in reachable:
+                continue
+            for index, instruction in enumerate(blocks[key].instrs):
+                attributes = instruction.attributes or {}
+                phi = str(instruction.op).casefold() == "phi"
+                incoming_blocks = tuple(attributes.get("incoming_blocks", ()))
+                for position, value in enumerate(instruction.args):
+                    value_id = int(value.id)
+                    if value_id in formals or value_id not in definitions:
+                        continue
+                    if position == attributes.get("ssa_output_argument"):
+                        continue  # This operand is a destination, not a read.
+                    at_block, at_index = key, index
+                    if phi:
+                        if position >= len(incoming_blocks):
+                            continue  # Malformed Phi belongs to the shape check.
+                        at_block = incoming_blocks[position]
+                        if at_block not in reachable:
+                            continue
+                        at_index = len(blocks[at_block].instrs)
+                    available = any(
+                        producer in dominators[at_block]
+                        and (producer != at_block or definition_index < at_index)
+                        for producer, definition_index in definitions[value_id]
+                        if producer in reachable
+                    )
+                    if not available:
+                        findings.append(Finding(
+                            "definition_dominance", str(name),
+                            f"{key}[{index}] {instruction.op} reads %{value_id}; "
+                            f"definitions {definitions[value_id]} do not dominate "
+                            f"{'incoming edge ' if phi else ''}{at_block}",
+                        ))
+    return findings
+
+
 def run_all(module: Any) -> list[Finding]:
     """Every decisive check; the candidate reporter is separate on purpose.
 
@@ -310,6 +388,7 @@ def run_all(module: Any) -> list[Finding]:
         *check_id_scale(module),
         *check_output_contract_agreement(module),
         *check_record_sequence_rows(module),
+        *check_definition_dominance(module),
     ]
 
 
@@ -317,6 +396,7 @@ __all__ = [
     "ID_SCALE_THRESHOLD",
     "Finding",
     "check_dead_storage_formals",
+    "check_definition_dominance",
     "check_formal_parity",
     "check_id_scale",
     "check_output_contract_agreement",

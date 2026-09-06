@@ -4591,10 +4591,33 @@ function installVehiclePresentationMesh(mesh){
   gl.bufferData(gl.ARRAY_BUFFER,mesh,gl.DYNAMIC_DRAW);
 }
 
+function installAuthoredWorldSurfacePacket(packet) {
+  const frame = turingDecodeWorldSurfacePacket(packet), gl = shaderViewer.gl;
+  if (!gl || !shaderViewer.program) throw new Error("world renderer is not ready");
+  if (!shaderViewer.authoredWorldVao) {
+    shaderViewer.authoredWorldVao = gl.createVertexArray();
+    shaderViewer.authoredWorldBuffer = gl.createBuffer();
+    gl.bindVertexArray(shaderViewer.authoredWorldVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, shaderViewer.authoredWorldBuffer);
+    for (let attribute = 0; attribute < 3; attribute++) {
+      gl.enableVertexAttribArray(attribute);
+      gl.vertexAttribPointer(attribute, 3, gl.FLOAT, false, 9 * 4, attribute * 3 * 4);
+    }
+  } else gl.bindBuffer(gl.ARRAY_BUFFER, shaderViewer.authoredWorldBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, frame.mesh, gl.DYNAMIC_DRAW);
+  shaderViewer.authoredWorldSurface = frame;
+  // This is upload only. The caller must await actual frame presentation
+  // before acknowledging the validator's attempt/revision.
+}
+
 function drawSceneMeshes(gl){
   gl.bindVertexArray(shaderViewer.vao);gl.drawArrays(gl.TRIANGLES,0,shaderViewer.vertexCount);
   if(shaderViewer.vehicleVao&&shaderViewer.vehicleVertexCount){
     gl.bindVertexArray(shaderViewer.vehicleVao);gl.drawArrays(gl.TRIANGLES,0,shaderViewer.vehicleVertexCount);
+  }
+  if (shaderViewer.authoredWorldVao && shaderViewer.authoredWorldSurface) {
+    gl.bindVertexArray(shaderViewer.authoredWorldVao);
+    gl.drawArrays(gl.TRIANGLES, 0, shaderViewer.authoredWorldSurface.mesh.length / 9);
   }
 }
 

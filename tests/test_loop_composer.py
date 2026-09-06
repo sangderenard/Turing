@@ -420,6 +420,36 @@ def run(body: CodeBuilder):
     assert call["attributes"]["method_resolution"] == "receiver-class-ref"
 
 
+def test_grounded_method_resolution_refreshes_opaque_loop_effects():
+    graph = _function_graph(
+        "class Counter:\n"
+        "    def update(self, value):\n"
+        "        self.value = value\n\n"
+        "def run(counter, external, count):\n"
+        "    for value in range(count):\n"
+        "        counter.update(value)\n"
+        "        external.update(value)\n"
+        "    return count\n",
+        "run",
+    )
+    loop_id = next(node for node, data in graph.G.nodes(data=True)
+                   if isinstance(data.get("expr_obj"), ast.For))
+    composer = _glsl_composer()
+    assert {effect.state_name for effect in composer.describe(graph, loop_id).state_effects} == {
+        "counter", "external",
+    }
+    graph.G.graph["parameter_record_abi"] = {
+        "counter": {"identity": "Counter", "fields": {}},
+    }
+    _resolve_grounded_method_references(graph)
+
+    assert {effect.state_name for effect in composer.describe(graph, loop_id).state_effects} == {"external"}
+    linked = next(data for _, data in graph.G.nodes(data=True)
+                  if isinstance(data.get("expr_obj"), ast.Call)
+                  and ast.unparse(data["expr_obj"]) == "counter.update(value)")
+    assert linked["attributes"]["method_ref"] is not None
+
+
 def test_structural_fold_follows_declared_nested_record_schema():
     graph = _function_graph(
         "def read_flag(graph):\n"
@@ -915,6 +945,47 @@ def test_enumerate_resident_iterable_exports_projected_bindings():
     assert reduction.control_program.root.stop == (
         f"__iterable_extent_{bindings[0][0]}__"
     )
+
+
+def test_structural_fold_refreshes_retained_loop_order_after_removing_constants():
+    from src.compiler.glsl_deployment_strategy import _dependency_order
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.add_node(0, type="feedback", op="feedback", parents=[(1, "carried")], attributes={})
+    graph.G.add_node(1, type="feedback", op="feedback", parents=[(0, "next")], attributes={})
+    graph.G.add_node(2, type="Constant", op="const", parents=[], constant=False,
+                     attributes={"value": False})
+    graph.roots = [1]
+    _rebuild_graph_edges(graph)
+    assert set(graph.levels) == {0, 1, 2}
+
+    _fold_callsite_structural_values(graph)
+
+    assert 2 not in graph.G
+    assert set(_dependency_order(graph)) == {0, 1}
+    assert set(graph.levels) == set(graph.G)
+    assert graph.G.has_edge(0, 1) and graph.G.has_edge(1, 0)
+
+
+def test_populated_sequence_is_not_folded_to_its_empty_initializer():
+    graph = _function_graph(
+        "def kernel(values):\n"
+        "    rows = []\n"
+        "    for value in values:\n"
+        "        rows.append(value)\n"
+        "    total = 0\n"
+        "    for row in sorted(rows):\n"
+        "        total += row\n"
+        "    return total\n",
+        "kernel",
+    )
+    _fold_callsite_structural_values(graph)
+    plans = _glsl_composer().discover(graph)
+    sorted_plan = next(plan for plan in plans
+                       if isinstance(graph.G.nodes[plan.loop.node_id].get("expr_obj"), ast.For)
+                       and ast.unparse(graph.G.nodes[plan.loop.node_id]["expr_obj"].iter) == "sorted(rows)")
+    assert sorted_plan.loop.iterable_constant is None
+    assert sorted_plan.loop.trip_count is None
 
 
 def test_materialized_closure_iterable_binds_resident_source_identities():

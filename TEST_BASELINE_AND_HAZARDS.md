@@ -1,5 +1,80 @@
 # Test baseline and hazards — read before running any test
 
+2026-09-05: latest whole-validator lowering failed at Pygame draw loop effects
+after611.818s, session91926 terminal. Subsequent full-native extension ABI admission
+tests and existing gates:5 passed2.82s. Pygame->Abstract UI AST ingestion:5 passed
+2.66s; transformation only, not geometry backend or native execution proof.
+
+2026-09-05: authored support-stage placement/binding, component placement/law,
+and vehicle state feedback: 5 passed in3.01s. First attempt caught an editing
+indentation error in the constructor, corrected before the passing run.
+The support-stage check executes the actual AST block with19 supports/2 lanes;
+it does not initialize tires, run the whole validator, or execute native code.
+Corrected full dually allocation/ABI test completed successfully in106.92s;
+session50509 is terminal, superseding the active-run note below.
+
+2026-09-05: `test_dually_program_allocates_and_declares_requested_rig_point_count`
+requires expensive full dually preparation: first run 575.12 s, failing on a
+test-only ABI accessor typo after buffer assertions passed. Correct accessor is
+`binding.field.shape`. Corrected rerun active (see continuation); do not treat
+this as a seconds-long test or rerun for cosmetic verification.
+
+2026-09-05: variable rig-point law regression failed before generalizing the
+hard-coded 16-point reshape (3.54 s), passed after (2.95 s). Existing declared
+rig SSA/C/library compilation test passed with 19 points in 9.99 s; no native
+execution in that test. Eager checks 0/1/3/19 points and balanced reactions.
+
+2026-09-05: common player/validator placement action and stale revision regression
+passed 0.60 s; existing IssuedAction table count check passed 0.52 s.
+
+2026-09-05: general four-port attachment placement regression passed 0.58 s.
+Graph edits and routing validation only; not mechanical constraint execution.
+
+2026-09-05: authored dually vehicle feedback regression reproduced missing state
+carry (0.69 s), then passed after fix (0.59 s). Expanded actual mapping/rollback/
+replay check passed 0.60 s. Deterministic test plant, not native vehicle solver.
+
+2026-09-05: fixture mechanics test passed in 1.89 s after correcting pillar
+reaction to the actual scalar-y output shape. Previous vector fixture was not
+representative of the numerical graph output.
+
+2026-09-05: identified fixture command/reaction/pose test and authored viewer
+acknowledgment regression passed together in 2.17 s. No native physics execution.
+
+2026-09-05: selected fixture/graph geometry regression passed in 0.57 s after
+converting graph edges to identified AbstractUI objects with visibility state.
+
+2026-09-05: three selected vehicle geometry checks passed in 0.70 s:
+Abstract UI object/child identities and graph relationships across poses,
+fixture/graph geometry, and existing seven-primitive geometry after relocation.
+
+2026-09-05: `tests/test_vehicle_part_geometry.py::test_tire_geometry_preserves_winding_material_depth_and_center_surface`
+passed in 0.57 s. Numerical authored geometry only; no native/pixel parity.
+
+2026-09-05: `tests/test_vehicle_part_geometry.py::test_authored_part_geometry_preserves_shape_width_and_world_coordinates`
+passed in 0.54 s. Covers seven authored shape primitives and skipped membrane
+records; no GPU rendering or compilation involved.
+
+2026-09-05: two focused `tests/test_geometry_consumer.py` checks passed in
+0.91 s (frame completion/failure/camera/empty layers and persistent mesh buffers).
+Mesh check passed again in 0.84 s after adding explicit color-presence handling.
+GL calls mocked; actual shader output remains unverified.
+
+2026-09-05: geometry packet ownership/invalid-native-span regression in
+`tests/test_geometry_display.py` passed in 0.52 s. Geometry capability opt-in
+and rejection by pixel-only shell test plus existing shared-mailbox ABI test
+passed together in 1.91 s. These exercise codec/contracts, not rendering.
+
+2026-09-05: `tests/test_vehicle_viewer_frame_ack.py::test_viewer_does_not_acknowledge_revision_published_during_draw`
+reproduced premature revision acknowledgment (0.70 s) and passed after fixing
+the authored loop (0.57 s). Executes the production loop AST with controlled
+publication during drawing; excludes model startup and native compilation.
+
+2026-09-05: `tests/test_glrenderer_host.py::test_external_context_renders_without_pygame_and_propagates_present_failure`
+passed in 1.19 s. Mocked GL, denied Pygame import: external context host,
+overlay ordering, resize dimensions, core-context enables and presentation
+failure propagation. Does not verify pixels or native validator parity.
+
 This document exists because the same expensive mistake kept being repeated:
 an agent sees a failing test, assumes it broke it, and spends two full suite
 runs plus a stash/pop to find out the failure was already there. That costs
@@ -62,6 +137,27 @@ pre-existing and independent of the namespace/indexing fixes on top.
 
 ## The manifest — known-good at `af00599` plus the current working tree
 
+2026-09-05 focused threading/loop checks: `test_literal_seeded_counter_executes_native_iterations`
+passed in 9.17 s after repairing carried scalar region capture and C singleton
+publication. Native execution is isolated in a subprocess with a 20-second timeout;
+earlier versions hung, so keep that bound. `test_resource_wait_retains_loop_scope_and_unique_ssa_definitions`
+passed in 2.71 s with current-phi and nonidentity increment assertions. These are
+bounded regression proofs, not full-validator native parity.
+
+2026-09-05 native Event addition: `test_native_event_broadcast_clear_and_future_waits`
+passed in 2.95 s (Windows, subprocess timeout=20). The selected-loop diagnostic
+regression in `test_process_graph_call_diagnostic.py` passed in 0.55 s.
+
+2026-09-05 source pursuit fixes: focused registered-method, constructor and
+module-field receipt regressions in `test_ast_parent_ingestion.py` passed
+together (3 passed, 2.55 s). The existing reachable-root exclusion regression
+passed in 2.12 s after repairing lexical-body activation; nested-helper plus
+parameter-shadowing coverage passed in 2.27 s. No full-suite run.
+
+2026-09-05 compiler-ledger coverage: focused fingerprint regression passed in
+2.34 s after adding shared AST context, deployment, C emission and dispatcher
+runtime sources. Saved-call extraction-parameter diagnostic passed in 0.55 s.
+
 These passed on 2026-08-19 and are the cheap, high-signal set. Prefer them.
 
 | check | result | cost |
@@ -102,3 +198,113 @@ real reason — not by a run commissioned for this purpose.
 
 `strict=False` matters: these should announce themselves as XPASS when
 somebody finally fixes them, rather than failing the suite for being fixed.
+
+2026-09-05 DT control fixes: targeted native None/callable(None)/variadic Boolean
+checks3passed29.70s; independent-flag sequential branch native check1passed11.98s;
+existing equal-region nesting/shared predicate/nested conditional overlay3passed
+2.72s. Native subprocesses20s timeout. Actual DT energy-sidechain C/DLL parity
+passed for3exact dyadic dt values with optional limits disabled and emptychannels.
+Broader call with conditionally rebound input remains broken; see continuation.
+Full managed build session91655 active13:53:35, do not overlap heavy operations.
+
+2026-09-05 terminal correction: managed session91655 exited1 at C emission.
+No live heavy build. Current saved SSA/C/shortfalls in
+build/managed_dt_control_fixes_20260905. Four native call-predicate regressions
+passed30.22s after catching/fixing zero versus None equality (session15880terminal).
+
+2026-09-05 native input receipts: 2receipt+4nativepredicate checks6passed30.88s.
+Existing loop-carried record-return plus2receipt checks3passed2.89s afterlate
+record-merge refresh. Known baseline test_returned_record_fields_feed_structural_call_argument
+failed asalreadydocumented above; no testchanged. ActualDT proposal helper C
+emissionclean1.08s. Fullmanagedsession83504 TERMINALfailed receiptconsistency;
+fixedunupdatedIDs inkeyed-storage removal. Newfullbuildsession78547 PID5848 live
+14:26:24; do notoverlapheavywork; latestcontinuationhascommand/log.
+
+2026-09-05 14:37: three tests/test_native_call_input_receipts.py tests passed in2.17s, including tensor-output identity without field-name metadata. Prior full managed session78547 terminalexit1, three emission shortfalls. New full managed session90068/PID16520 active; see continuation before launching another build. Plain conditional append then bool(list) reproduces region0 arity0/1; no native execution performed.
+
+2026-09-05 14:49: tests/test_native_sequence_truth.py plus three native call
+receipt tests and two existing query scheduling tests passed6 in11.33s.
+New test first failed emission0/1, then failed native assertion due private
+capacity0; both corrected. Native test subprocess timeout20s. Session90068
+terminalexit1 (only bool(reasons) region arity failure); replacement full build
+session41778/PID19476 active, managed_dt_sequence_truth_20260905. See continuation.
+
+2026-09-05: full managed session41778 TERMINAL exit1, now zero C emission
+shortfalls. Stops before native compilation on unnamed public47/57. No live
+build. tools/managed_dt_parity.py syntax checked only. Minimal completed Boolean
+passed to float becomes extra public input12; direct return of the same Boolean
+has correct produced Select12. See continuation for exact source and next seam.
+
+2026-09-05 15:07: native Boolean intermediate regression passed12.65s; after
+native result-contract refresh, record-return physical-surface baseline test
+(run explicitly while fixing it), scalar-result-type test, and Boolean test
+passed3 in12.79s. Full managed replacement session8623/PID2844 active, directory
+managed_dt_result_contract_refresh_20260905; inspect continuation before builds.
+
+2026-09-05 15:15: test_native_scalar_index_store.py passed13.39s (actual repository
+tensor provider, C/DLL native writes and unchanged neighbor, subprocess20s).
+Fullmanaged session8623 terminalexit1: aggregate result types fail convergence;
+failed-link snapshot has coerce/advance Loads defining same fieldSSA objects.
+No full build active. See continuation before starting next expensive build.
+
+2026-09-05 15:24: native exact-forwarded-record-fields test plus existing
+record-return physical-surface test passed2 in12.31s. Native test includes
+callee mutation retained through void/inout call and downstream result.
+New fullmanaged session86224/PID15832 active, managed_dt_forwarded_fields_20260905.
+
+2026-09-05 15:39: fullmanaged session86224 terminalexit1, passed typefixedpoint,
+only Cshortfall was restoredforwardedCallres. Clearingexactone suchres in saved
+fullSSA givesCshortfalls empty. Source marker fallback corrected. No new native
+test/executable in this turn. Freshfullbuild session76288/PID16400 active,
+managed_dt_forwarded_marker_20260905. Seecontinuationbeforestartingwork.
+
+2026-09-05: tests/test_managed_native_output_contract.py: 2 passed in3.81s.
+Wrapper-only checks: allocate actual scalar return storage; reject missing root
+inputs before invoking native toolchain. Not a native execution/parity test.
+Fresh DT source build session76288 is terminal with C shortfalls=[]; wrapper
+output44/45 corrected. Native toolchain continuation session44475 remains live.
+
+2026-09-05 17:01: all earlier compile/test sessions terminal. Native cap/physical
+storage checks: 7 passed, 1 obsolete typed-C-signature assertion failed (45.84s).
+Control source tests: 20 passed (2.04s). Full fresh source DT build session43311
+active, O0, managed_dt_predicate_partition_20260905, microstep runtime fixture.
+No overlapping native jobs. See continuation before starting builds or timing.
+
+2026-09-05 17:10: full source43311 terminal0. Parity67705 terminal1: native60s
+timeout; eager setup15.446909s, stepping0.276230s, exit0. No native/build job live.
+Repeated-bounds native regression58263 passed10.22s. Remaining full cap producer
+still after loop; see continuation. Predicate AST helper filtering untested.
+
+2026-09-05 17:12: final predicate syntax refinement verified by49988 terminal0:
+25 passed,3 inapplicable parameter combinations skipped,39.05s. No live jobs.
+
+2026-09-05 17:22: atomic control dependency regression and prior control/native
+cap cases:28passed3skipped39.52s,24126terminal0. Capture15882terminal0. Full fresh
+build11416 active in managed_dt_atomic_control_order_20260905, no overlap.
+
+2026-09-05 17:34: fullbuild11416terminal0, cap producer now beforewhile in C.
+Parity45565terminal1 native60stimeout/eager0; trace48147terminal0(copy only).
+Carried-call regression86189failed then fixed;39229terminal0,5passed17.68s.
+No live jobs. Remaining fullstep returns use unproduced locals before producers
+in unreachable_return_control. See continuation before next build.
+
+2026-09-05 17:55: return-slot/planner and post-conditional call fixes:7passed
+39.92s (73613), direct-truth variants2passed17.61s (20540). All earlier jobs
+terminal. Full fresh source build75251 ACTIVE, managed_dt_return_order_20260905,
+O0 microstep fixture; no overlap. See continuation before starting another job.
+
+2026-09-05 current terminal correction: build75251 passed; parity6606 finished
+(native0/eager0, no timeout) but11 mismatches. managed_dt_return_order_20260905
+is latest full DT diagnostic; no parity/performance claim. Dominance tests3passed.
+Active lower-only trace9550 writes build/coerce-placement-trace.log; no concurrent
+heavy work. See continuation report for call460 loop-ownership contradiction.
+
+Trace9550 TERMINAL0: missing coerce460 marker/anchor precedes fallback insertion;
+late ABI refresh keeps already-wrong entry placement. New focused scheduler
+capture86652 ACTIVE (lower only), build/step-call-schedule-capture.log.
+
+18:45 scheduler capture86652 terminal0; no live jobs. Conditional call-order
+regression passes. Scheduler test file has5 pre-existing failures verified by
+in-memory baseline disabling only the new change (75pass5fail; with new test
+76pass5fail). Full saved DT plan still orders advance too late; no fullbuild or
+parity rerun. See continuation for exact evidence and replay artifact.

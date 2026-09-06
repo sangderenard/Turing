@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from ..common.tensors.fused_ir import FusedProgram, OpStep
 from .ir_string_ops import STRING_SPLIT_PART_HASH
-from .string_table import string_token as _string_token, NONE_TOKEN as _NONE_TOKEN
+from .string_table import string_token as _string_token
 
 STRING_TOKEN = "string_token"
 
@@ -59,9 +59,18 @@ def tokenize_ssa_string_constants(functions, table=None) -> None:
                 text = None
                 if is_const and not has_array:
                     if value is None:
-                        # the None literal -- the absence sentinel
-                        token = _NONE_TOKEN
-                        text = "None"
+                        # Absence has its own typed repository operation. A
+                        # string token here disagrees with NoneValue returned
+                        # by a linked function and makes `result is None` false.
+                        attributes = dict(instruction.attributes)
+                        attributes.pop("value", None)
+                        attributes.pop("constant", None)
+                        rewritten.append(dataclasses.replace(
+                            instruction, op="NoneValue", attributes=attributes,
+                        ))
+                        if instruction.res is not None:
+                            instruction.res.dtype = "none"
+                        continue
                     elif isinstance(value, (str, bytes)):
                         token = (
                             table.intern(value)

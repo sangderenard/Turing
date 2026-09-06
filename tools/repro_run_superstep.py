@@ -1,19 +1,10 @@
-"""Fast, real repro: the actual ``run_superstep`` (its real while-loop,
-calling the real ``step_with_dt_control_used``) called once, via
-``inspect.getsource`` on every real collaborator it needs -- reproducing
-the exact 4-level real call chain the full managed-tire compile reports as
-blocked: ``run_superstep -> step_with_dt_control_used -> _apply_energy_
-sidechain -> _no_exchange_observed``. tools/repro_step_with_dt_control_used.py
-(3 levels: root calls step_with_dt_control_used directly) hit a DIFFERENT,
-repro-only artifact ("opaque-state-effect"/CompilationSubdivisionRequired)
-that the real full compile never reports -- confirmed by running the real
-compile with all fixes applied and seeing the exact same, unrelated
-``unresolved_calls`` diagnostic as before. This one goes one level deeper
-(through run_superstep) to see whether that changes the region shape enough
-to reach the real remaining blocker: ``_no_exchange_observed``'s output
-getting registered as a bogus empty-fields record placeholder instead of a
-plain boolean, and ``step_with_dt_control_used``'s own 15 real outputs
-never getting bound at its call site.
+"""Lower the real ``run_superstep`` source closure with a tiny advance kernel.
+
+Use the callable's real module namespace, as the managed tire lowering does.
+Copying selected function bodies into an anonymous module loses method
+resolution and produces a harness-only ``opaque-state-effect`` for
+``ctrl.update_dt_max``. ``--diagnose-effects`` prints opaque loop effects
+without changing their classification.
 
 ``advance`` is the one fabricated collaborator here, exactly as every
 existing dt-controller unit test already fabricates one.
@@ -21,7 +12,7 @@ existing dt-controller unit test already fabricates one.
 
 from __future__ import annotations
 
-import inspect
+import ast
 import sys
 import time
 from pathlib import Path
@@ -33,13 +24,8 @@ from src.compiler.extraction_contract import ExtractionContract  # noqa: E402
 from src.compiler.vehicle_python_compilation import (  # noqa: E402
     balloon_tire_managed_extraction_contract, BalloonTireManagedState,
 )
-from src.common.dt_system.dt_controller import (  # noqa: E402
-    _restore_type, Targets, _shadow_dt_limit, _energy_time_limit,
-    _no_exchange_observed, _apply_energy_sidechain, STController,
-    _propose_dt_pen, step_with_dt_control_used, run_superstep,
-)
-from src.common.dt_system.dt_scaler import Metrics, _scalar, coerce_metrics  # noqa: E402
-from src.common.dt_system.shadow import shadow_dt_limit  # noqa: E402
+from src.common.dt_system.dt_controller import run_superstep  # noqa: E402
+from src.common.dt_system.dt_scaler import Metrics  # noqa: E402
 
 CONTRACTS = Path(__file__).resolve().parents[1] / "extraction_contracts"
 
@@ -59,19 +45,28 @@ def _base_records():
 
 
 def main() -> int:
-    real_source = "\n\n".join((
-        inspect.getsource(_scalar),
-        inspect.getsource(coerce_metrics),
-        inspect.getsource(_restore_type),
-        inspect.getsource(shadow_dt_limit),
-        inspect.getsource(_shadow_dt_limit),
-        inspect.getsource(_energy_time_limit),
-        inspect.getsource(_no_exchange_observed),
-        inspect.getsource(_apply_energy_sidechain),
-        inspect.getsource(_propose_dt_pen),
-        inspect.getsource(step_with_dt_control_used),
-        inspect.getsource(run_superstep),
-    ))
+    if "--diagnose-effects" in sys.argv:
+        from src.compiler.loop_composer import LoopComposer
+        from src.compiler.loop_ir import LoopStateEffectMode
+
+        describe = LoopComposer.describe
+
+        def describe_with_effects(self, graph, node_id):
+            loop = describe(self, graph, node_id)
+            for effect in loop.state_effects:
+                if effect.mode is not LoopStateEffectMode.OPAQUE:
+                    continue
+                data = graph.G.nodes.get(effect.effect_node_id, {})
+                expression = data.get("expr_obj")
+                print(
+                    f"OPAQUE {graph.G.graph.get('function_name')} "
+                    f"loop={node_id}: {effect} "
+                    f"source={ast.unparse(expression) if isinstance(expression, ast.AST) else None}",
+                    flush=True,
+                )
+            return loop
+
+        LoopComposer.describe = describe_with_effects
     advance_source = (
         "def advance(state, dt):\n"
         "    return True, Metrics(\n"
@@ -88,7 +83,10 @@ def main() -> int:
         "        rollback=True,\n"
         "    )\n"
     )
-    source = real_source + "\n\n" + advance_source + "\n\n" + root_source
+    # Resolve the real callable with its module globals, as the managed
+    # lowering does. Copying function text into an anonymous module loses
+    # the STController class needed to source-link its bound methods.
+    source = advance_source + "\n\n" + root_source
     base = _base_records()
     contract_abi = {
         "records": {
@@ -100,9 +98,9 @@ def main() -> int:
             ],
         },
         "bindings": [
-            {"function": "*", "parameter": "metrics", "record": "Metrics"},
-            {"function": "*", "parameter": "targets", "record": "Targets"},
-            {"function": "*", "parameter": "ctrl", "record": "STController"},
+            # Preserve the managed contract's function-scoped bindings too:
+            # coerce_metrics calls its Metrics receiver ``value``.
+            *base["bindings"],
             {
                 "function": "*", "parameter": "state",
                 "record": "BalloonTireManagedState",
@@ -118,6 +116,7 @@ def main() -> int:
     try:
         module, outputs, exports = lower_ast_source_to_ssa(
             source, "root", name="run_superstep_repro", extraction_contract=policy,
+            python_bindings={"run_superstep": run_superstep, "Metrics": Metrics},
         )
         print(f"LOWERED in {time.time()-t0:.2f}s", flush=True)
         return 0

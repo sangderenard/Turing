@@ -340,6 +340,8 @@ def bind_native_stand_ins(
 ) -> dict[str, Any]:
     """Replace selected law bindings with native stand-ins when opted in."""
 
+    from src.common.tensors.source_realization import deployed_with_authored_fallback
+
     backend = native_backend()
     if not backend:
         return bindings
@@ -348,7 +350,9 @@ def bind_native_stand_ins(
         if name not in bindings or not _law_selected(name):
             continue
         stage = NativeLawStage(name, compilation, bindings[name], backend)
-        bindings[name] = stage
+        # Cached eager bindings must still expose authored source when a
+        # whole-program compiler enters the standard realization context.
+        bindings[name] = deployed_with_authored_fallback(bindings[name], stage)
         _STAGES.append(stage)
         armed.append(name)
     _log(f"{backend} stand-ins armed for: {armed}")

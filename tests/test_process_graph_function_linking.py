@@ -1841,6 +1841,36 @@ def test_declared_record_span_is_a_planner_tensor_descriptor():
     }
 
 
+def test_single_aggregate_return_keeps_structured_tensor_descriptors():
+    from src.compiler.glsl_deployment_strategy import (
+        _propagate_callsite_tensor_specializations, _tensor_descriptor,
+    )
+
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse(
+            "def pack(values):\n"
+            "    return {'values': values, 'label': 'wheel'}\n"
+            "def root(values):\n"
+            "    return pack(values)\n"
+        ), resolve_unresolved_parents=True)
+    reduce_abstract_tensor_topology(graph)
+    caller = graph.function_table.entry("root").graph
+    for _node, data in caller.G.nodes(data=True):
+        if (data.get("attributes") or {}).get("binding_name") == "values":
+            data["tensor"] = {"shape": (3,), "dtype": "float64"}
+
+    _propagate_callsite_tensor_specializations(graph)
+
+    node_id, call = next((node_id, data) for node_id, data in caller.G.nodes(data=True)
+                         if data.get("op") == "Call")
+    assert "tensor" not in call
+    assert _tensor_descriptor(caller, node_id) is None
+    descriptors = call["attributes"]["tensor_output_descriptors"]
+    assert isinstance(descriptors[0], tuple)
+    assert {"shape": (3,), "dtype": "float64"} in descriptors[0]
+
+
 def test_callsite_shape_discards_padded_scalar_result_descriptors():
     from src.compiler.glsl_deployment_strategy import (
         _apply_callsite_tensor_descriptors,
@@ -2032,3 +2062,48 @@ def test_parameter_default_does_not_replace_later_same_name_ssa_value():
     callee = module.functions[record.callee_symbol]
     assert all(argument.id != 0 for argument in callee.args)
     assert outputs[root.name]
+
+
+def test_specialized_dictionary_argument_has_no_runtime_argument_binding():
+    module, outputs, _exports = lower_ast_source_to_ssa(
+        "def child(geometry):\n"
+        "    return dict(geometry)\n\n"
+        "def root():\n"
+        "    return child({'primitive': 'disc', 'radius': 2.0})\n",
+        "root",
+        name="specialized_dictionary",
+    )
+
+    root = module.functions["specialized_dictionary__root"]
+    call = next(iter(module.call_table[root.name]))
+    assert call.resolution == "native_call"
+    assert call.argument_bindings == ()
+    assert call.unresolved_frame_value_ids == ()
+    assert call.result_bindings
+    assert outputs[root.name]
+
+
+def test_precompile_does_not_fold_inactive_module_definitions():
+    module, outputs, _exports = lower_ast_source_to_ssa(
+        "def helper():\n"
+        "    return list(zip('xyz', range(3)))\n\n"
+        "def root(value):\n"
+        "    return value + 1\n",
+        "root",
+        name="catalogue_range",
+        runtime_closure_only=True,
+    )
+
+    root = module.functions["catalogue_range__root"]
+    assert outputs[root.name]
+    assert not module.call_table.get(root.name)
+    region_call = next(
+        instruction for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Call"
+    )
+    region = module.functions[region_call.attributes["callee"]]
+    assert any(
+        instruction.op == "Add"
+        for block in region.blocks.values()
+        for instruction in block.instrs
+    )

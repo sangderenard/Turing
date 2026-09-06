@@ -78,6 +78,30 @@ def test_default_contract_draws_python_native_and_decompile_lines():
     )
 
 
+@pytest.mark.parametrize("native_abi,expected", [
+    (None, ExtractionAction.REJECT),
+    ("cpython-c-api", ExtractionAction.REJECT),
+    ("c", ExtractionAction.USE_NATIVE),
+])
+def test_full_native_extension_requires_declared_non_python_abi(monkeypatch, native_abi, expected):
+    from src.compiler.extraction_contract import ExtractionSubject
+
+    contract = ExtractionContract(CONTRACT).with_execution_file(
+        CONTRACT.with_name("vehicle_full_native_execution.yaml"))
+    subject = ExtractionSubject("unregistered_extension", "draw", "builtin",
+                                "call", "", "native_extension", False)
+    monkeypatch.setattr(contract, "subject", lambda value: subject)
+    parameters = {"loader": "existing_module", "callbacks": "reject"}
+    if native_abi is not None:
+        parameters["native_abi"] = native_abi
+    contract.defaults["native_extension"] = (ExtractionAction.USE_NATIVE, parameters)
+    decision = contract.decide(object())
+    assert decision.action is expected
+    if expected is ExtractionAction.REJECT:
+        assert decision.parameters["reason"] == "native_extension_requires_non_python_abi"
+        assert decision.rule_id == "execution:native_extension_abi_required"
+
+
 def test_full_native_link_gate_rejects_python_and_unresolved_boundaries():
     from types import SimpleNamespace
 
@@ -93,18 +117,22 @@ def test_full_native_link_gate_rejects_python_and_unresolved_boundaries():
     module = SimpleNamespace(functions={
         "root": SimpleNamespace(
             args=[supplied],
+            metadata={},
             blocks={"entry": SimpleNamespace(instrs=[
                 Instr("Add", [supplied, missing], result),
             ])},
         ),
     })
     undefined = _undefined_repository_ssa_operands(module)
-    assert undefined == ({
+    assert len(undefined) == 1
+    assert {key: undefined[0][key] for key in (
+        "function", "block", "operation", "value_id",
+    )} == {
         "function": "root",
         "block": "entry",
         "operation": "Add",
         "value_id": 2,
-    },)
+    }
 
     failures = _full_native_link_failures(
         ({

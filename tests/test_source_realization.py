@@ -11,6 +11,30 @@ class Surface:
         return ("source", value)
 
 
+def test_native_law_binding_reveals_source_even_when_cached_before_compilation(monkeypatch):
+    import inspect
+    from src.compiler import native_law_kernels
+
+    def authored(value):
+        return ("source", value)
+
+    monkeypatch.setenv("TURING_LAW_NATIVE", "llvm")
+    monkeypatch.setenv("TURING_LAW_NATIVE_LAWS", "all")
+    monkeypatch.setenv("TURING_LAW_NATIVE_SKIP", "")
+    monkeypatch.setattr(native_law_kernels, "_STAGES", [])
+    monkeypatch.setattr(native_law_kernels, "NativeLawStage",
+                        lambda *args: lambda value: ("native", value))
+    binding = native_law_kernels.bind_native_stand_ins(
+        {"law": authored}, {"law": object()})["law"]
+
+    assert binding(3) == ("native", 3)
+    with authored_source_realization():
+        assert binding(3) == ("source", 3)
+    assert inspect.unwrap(binding) is authored
+    assert binding.__turing_authored_source_callable__ is authored
+    assert binding(3) == ("native", 3)
+
+
 def test_installed_call_uses_native_normally_and_source_during_compilation():
     authored = Surface.calculate
 

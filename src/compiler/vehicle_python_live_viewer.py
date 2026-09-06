@@ -8,11 +8,69 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from .abstract_ui_geometry import part_geometry_lines, realize_part_geometry, realize_edge_geometry, fixture_geometry, realize_fixture_geometry
+
+
+def tire_geometry_triangles(snapshot: Mapping[str, Any], camera: np.ndarray,
+                            forward: np.ndarray) -> list:
+    """Build depth-ordered center-surface triangles with fill/outline RGB."""
+    tire_position = np.asarray(snapshot["tire_position"], dtype=np.float64)
+    faces = np.asarray(snapshot["tire_faces"], dtype=np.int64)
+    face_zones = tuple(snapshot.get("tire_face_zones", ()))
+    face_material = np.asarray(snapshot.get(
+        "tire_face_material", np.zeros((len(faces), 5))),
+        dtype=np.float64)
+    tire_draw = []
+    for wheel, vertices in enumerate(tire_position):
+        depth = (vertices - camera.reshape((1, 3))) @ forward
+        for face_index, face in enumerate(faces):
+            face_depth = float(depth[face].mean())
+            if face_depth > 0.05:
+                triangle = vertices[face]
+                outward = np.cross(triangle[1] - triangle[0],
+                                   triangle[2] - triangle[0])
+                centroid = triangle.mean(axis=0)
+                exterior = float(np.dot(
+                    outward, camera - centroid)) >= 0.0
+                tire_draw.append((face_depth, wheel, face_index,
+                                  exterior, triangle))
+    exterior_colors = {
+        "tread": (70, 76, 80),
+        "sidewall": (43, 49, 54),
+        "bead": (126, 92, 48),
+        "rim-closure": (142, 151, 158),
+    }
+    interior_colors = {
+        "tread": (47, 112, 126),
+        "sidewall": (54, 137, 145),
+        "bead": (92, 151, 142),
+        "rim-closure": (92, 106, 116),
+    }
+    geometry = []
+    for _depth, wheel, face_index, exterior, triangle in sorted(
+            tire_draw, key=lambda row: row[0], reverse=True):
+        zone = (face_zones[face_index]
+                if face_index < len(face_zones) else "sidewall")
+        palette = exterior_colors if exterior else interior_colors
+        color = palette.get(zone, palette["sidewall"])
+        # The same invariant center-surface triangle is drawn once;
+        # outward winding selects its exterior or interior palette.
+        # Thickness modulates brightness and remains solver material,
+        # not a second displaced display surface.
+        thickness = (float(face_material[face_index, 0])
+                     if face_index < len(face_material) else 0.012)
+        scale = max(0.72, min(1.18, thickness / 0.014))
+        color = tuple(max(0, min(255, int(channel * scale)))
+                      for channel in color)
+        outline = ((171, 181, 188) if exterior else (112, 225, 211))
+        geometry.append((triangle, color, outline))
+    return geometry
+
 
 class PythonValidatorViewer:
     """Draw solver mesh/state without owning or approximating any physics."""
 
-    def __init__(self, model: Mapping[str, Any], *, width: int = 1280,
+    def __init__(self, model: Mapping[str, Any], *, fixture_plan, width: int = 1280,
                  height: int = 800, headless: bool = False) -> None:
         import os
         if headless:
@@ -27,6 +85,7 @@ class PythonValidatorViewer:
         self.small = pygame.font.Font(None, 19)
         self.clock = pygame.time.Clock()
         self.model = model
+        self.fixture_plan = fixture_plan
         graph = model["mechanical_graph"]
         self.nodes = tuple(graph["nodes"])
         self.node_index = {str(node["identity"]): index
@@ -103,86 +162,31 @@ class PythonValidatorViewer:
             return 1.0
         return max(0.0, min(1.0, float(progress)))
 
+    def graph_geometry_objects(self, node_position, node_depth, node_alpha, stage, progress):
+        """Return authored graph edges with stage visibility and RGB shading."""
+        geometry = []
+        for left, right, edge in sorted(
+                self.graph_edges,
+                key=lambda row: float(node_depth[row[0]] + node_depth[row[1]])):
+            edge_alpha = min(node_alpha[left], node_alpha[right],
+                             self._assembly_alpha(edge, stage, progress))
+            geometry.append(realize_edge_geometry(
+                edge, np.stack((node_position[left], node_position[right])), edge_alpha))
+        return geometry
+
     def _draw_part_geometry(self, center: np.ndarray,
                             node: Mapping[str, Any], color,
                             alpha: float) -> None:
-        """Realize renderer-neutral Abstract UI geometry at tensor position."""
-
-        geometry = node.get("geometry") or {}
-        primitive = str(geometry.get("primitive", ""))
-        if not primitive or primitive.startswith("solver-membrane"):
-            return
-        pygame = self.pygame
-        axis = np.asarray(geometry.get("axis", (0.0, 0.0, 1.0)),
-                          dtype=np.float64)
-        axis /= max(1.0e-12, float(np.linalg.norm(axis)))
-        seed = (np.asarray((0.0, 1.0, 0.0)) if abs(axis[1]) < 0.9 else
-                np.asarray((1.0, 0.0, 0.0)))
-        radial_a = np.cross(axis, seed)
-        radial_a /= max(1.0e-12, float(np.linalg.norm(radial_a)))
-        radial_b = np.cross(axis, radial_a)
-        shade = tuple(max(0, min(255, int(channel * (0.35 + 0.65 * alpha))))
-                      for channel in color)
-
-        def ring(radius: float, offset: float = 0.0, width: int = 2):
-            angles = np.linspace(0.0, 2.0 * math.pi, 41)
-            points = (center + offset * axis + radius *
-                      (np.cos(angles)[:, None] * radial_a
-                       + np.sin(angles)[:, None] * radial_b))
+        projection = realize_part_geometry(node, center, color, alpha)
+        for line in projection.model["geometry_projection"]["polylines"]:
+            points = np.asarray(line["positions"], dtype=np.float64)
+            shade, width, closed = line["color_rgb"], line["width_px"], line["closed"]
             screen, depth = self._project(points)
             if np.all(depth > 0.05):
-                pygame.draw.lines(self.screen, shade, True, screen, width)
-            return points
-
-        if primitive == "wheel-center-disc":
-            radius = float(geometry["radius_m"])
-            ring(radius, 0.0, 3)
-            spoke_angles = np.linspace(0.0, 2.0 * math.pi, 7)[:-1]
-            endpoints = np.asarray([
-                center + radius * (math.cos(angle) * radial_a
-                                   + math.sin(angle) * radial_b)
-                for angle in spoke_angles])
-            projected, depth = self._project(np.vstack((center, endpoints)))
-            for index in range(len(endpoints)):
-                if depth[0] > 0.05 and depth[index + 1] > 0.05:
-                    pygame.draw.line(self.screen, shade, projected[0],
-                                     projected[index + 1], 2)
-        elif primitive == "drop-center-rim":
-            radius = float(geometry["radius_m"])
-            bead_radius = float(geometry["bead_seat_radius_m"])
-            half = 0.5 * float(geometry["width_m"])
-            ring(bead_radius, -half, 3)
-            ring(bead_radius, half, 3)
-            ring(radius * 0.88, 0.0, 2)
-        elif primitive == "bead-ring":
-            ring(float(geometry["radius_m"]),
-                 float(geometry.get("axial_offset_m", 0.0)), 4)
-        elif primitive == "bearing-races":
-            ring(0.5 * float(geometry["outer_diameter_m"]), 0.0, 4)
-            ring(0.5 * float(geometry["bore_m"]), 0.0, 2)
-        elif primitive == "wheel-mounting-hub":
-            ring(float(geometry["flange_radius_m"]), 0.0, 4)
-            ring(float(geometry["barrel_radius_m"]), 0.0, 3)
-        elif primitive == "brake-drum":
-            half = 0.5 * float(geometry["width_m"])
-            ring(float(geometry["radius_m"]), -half, 3)
-            ring(float(geometry["radius_m"]), half, 3)
-        elif primitive == "axial-structural-casing":
-            half = 0.5 * float(geometry["length_m"])
-            tube_radius = float(geometry["tube_radius_m"])
-            left = ring(tube_radius, -half, 3)
-            right = ring(tube_radius, half, 3)
-            for angle in np.linspace(0.0, 2.0 * math.pi, 7)[:-1]:
-                left_point = (center - half * axis + tube_radius *
-                              (math.cos(angle) * radial_a
-                               + math.sin(angle) * radial_b))
-                right_point = (center + half * axis + tube_radius *
-                               (math.cos(angle) * radial_a
-                                + math.sin(angle) * radial_b))
-                screen, depth = self._project(np.vstack((left_point, right_point)))
-                if np.all(depth > 0.05):
-                    pygame.draw.line(self.screen, shade, screen[0], screen[1], 2)
-            ring(float(geometry["center_radius_m"]), 0.0, 5)
+                if closed:
+                    self.pygame.draw.lines(self.screen, shade, True, screen, width)
+                else:
+                    self.pygame.draw.line(self.screen, shade, screen[0], screen[1], width)
 
     def draw(self, snapshot: Mapping[str, Any] | None, *, stage: str,
              progress: float, sim_time: float, status: str = "running",
@@ -221,94 +225,35 @@ class PythonValidatorViewer:
             projected_nodes, node_depth = self._project(node_position)
             node_alpha = tuple(self._assembly_alpha(node, stage, progress)
                                for node in self.nodes)
-            for left, right, edge in sorted(
-                    self.graph_edges,
-                    key=lambda row: float(node_depth[row[0]] + node_depth[row[1]])):
-                edge_alpha = min(node_alpha[left], node_alpha[right],
-                                 self._assembly_alpha(edge, stage, progress))
-                if edge_alpha <= 0.0:
-                    continue
-                edge_class = edge.get("edge_class")
-                color = ((104, 185, 235) if edge_class == "drivetrain" else
-                         (94, 206, 193) if edge_class == "pneumatic" else
-                         (190, 116, 224) if edge_class == "contact-seal" else
-                         (225, 154, 72) if edge_class == "load-bearing-structure" else
-                         (132, 143, 151))
-                color = tuple(int(channel * (0.35 + 0.65 * edge_alpha))
-                              for channel in color)
-                pygame.draw.line(self.screen, color,
-                                 projected_nodes[left], projected_nodes[right], 3)
+            for edge_object in self.graph_geometry_objects(
+                    node_position, node_depth, node_alpha, stage, progress):
+                for line in edge_object.model["geometry_projection"]["polylines"]:
+                    endpoints = np.asarray(line["positions"], dtype=np.float64)
+                    projected, _ = self._project(endpoints)
+                    pygame.draw.line(self.screen, line["color_rgb"], projected[0],
+                                     projected[1], line["width_px"])
 
-            faces = np.asarray(snapshot["tire_faces"], dtype=np.int64)
-            face_zones = tuple(snapshot.get("tire_face_zones", ()))
-            face_material = np.asarray(snapshot.get(
-                "tire_face_material", np.zeros((len(faces), 5))),
-                dtype=np.float64)
-            camera, _right, _up, _forward = self._camera()
-            tire_draw = []
-            for wheel, vertices in enumerate(tire_position):
-                projected, depth = self._project(vertices)
-                for face_index, face in enumerate(faces):
-                    face_depth = float(depth[face].mean())
-                    if face_depth > 0.05:
-                        triangle = vertices[face]
-                        outward = np.cross(triangle[1] - triangle[0],
-                                           triangle[2] - triangle[0])
-                        centroid = triangle.mean(axis=0)
-                        exterior = float(np.dot(
-                            outward, camera - centroid)) >= 0.0
-                        tire_draw.append((face_depth, wheel, face_index,
-                                          exterior, projected[face]))
-            exterior_colors = {
-                "tread": (70, 76, 80),
-                "sidewall": (43, 49, 54),
-                "bead": (126, 92, 48),
-                "rim-closure": (142, 151, 158),
-            }
-            interior_colors = {
-                "tread": (47, 112, 126),
-                "sidewall": (54, 137, 145),
-                "bead": (92, 151, 142),
-                "rim-closure": (92, 106, 116),
-            }
-            for _depth, wheel, face_index, exterior, polygon in sorted(
-                    tire_draw, key=lambda row: row[0], reverse=True):
-                zone = (face_zones[face_index]
-                        if face_index < len(face_zones) else "sidewall")
-                palette = exterior_colors if exterior else interior_colors
-                color = palette.get(zone, palette["sidewall"])
-                # The same invariant center-surface triangle is drawn once;
-                # outward winding selects its exterior or interior palette.
-                # Thickness modulates brightness and remains solver material,
-                # not a second displaced display surface.
-                thickness = (float(face_material[face_index, 0])
-                             if face_index < len(face_material) else 0.012)
-                scale = max(0.72, min(1.18, thickness / 0.014))
-                color = tuple(max(0, min(255, int(channel * scale)))
-                              for channel in color)
+            camera, _right, _up, forward = self._camera()
+            for triangle, color, outline in tire_geometry_triangles(snapshot, camera, forward):
+                polygon, _depth = self._project(triangle)
                 pygame.draw.polygon(self.screen, color, polygon)
-                outline = ((171, 181, 188) if exterior else (112, 225, 211))
                 pygame.draw.polygon(self.screen, outline, polygon, 1)
 
-            pillar_pose = np.asarray(snapshot["pillar_pose"], dtype=np.float64)
-            pillar_alpha = np.asarray(snapshot["pillar_alpha"], dtype=np.float64)
-            fixture = np.asarray(snapshot["fixture_wheel"], dtype=np.float64)
-            anchor = np.asarray(snapshot["roller_anchor"], dtype=np.float64)
-            for wheel in range(len(pillar_pose)):
-                top = pillar_pose[wheel]
-                bottom = np.asarray((top[0], -0.75, top[2]))
-                line, _ = self._project(np.stack((bottom, top)))
-                color = (220, 173, 61) if pillar_alpha[wheel] > 0.01 else (85, 91, 96)
-                pygame.draw.line(self.screen, color, line[0], line[1], 5)
-                carriage_y = fixture[wheel, 0]
-                roller_points = np.asarray([
-                    (anchor[wheel, 0] - 0.18, carriage_y, anchor[wheel, 1]),
-                    (anchor[wheel, 0] + 0.18, carriage_y, anchor[wheel, 1]),
-                ])
-                roller_screen, roller_depth = self._project(roller_points)
-                for point, depth_value in zip(roller_screen, roller_depth):
-                    if depth_value > 0.05:
-                        pygame.draw.circle(self.screen, (196, 202, 207), point, 8, 2)
+            for pillar_object, roller_object in realize_fixture_geometry(self.fixture_plan, snapshot):
+                for support in pillar_object.model["geometry_projection"]["polylines"]:
+                    line, _ = self._project(np.asarray(support["positions"]))
+                    pygame.draw.line(self.screen, support["color_rgb"], line[0], line[1],
+                                     support["width_px"])
+                for solid in roller_object.model["geometry_projection"]["solids"]:
+                    # Legacy preview projects the same solid surface supplied
+                    # to the game; it no longer substitutes a circle marker.
+                    vertices = np.asarray(solid["surface"]["positions"]) + solid["position"]
+                    screen, depth = self._project(vertices)
+                    faces = sorted(solid["surface"]["triangles"],
+                                   key=lambda face: float(np.mean(depth[face])), reverse=True)
+                    for face in faces:
+                        if np.all(depth[face] > 0.05):
+                            pygame.draw.polygon(self.screen, solid["material"]["base_color_rgb"], screen[face])
 
             for index, node in enumerate(self.nodes):
                 alpha = node_alpha[index]

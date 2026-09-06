@@ -24,6 +24,29 @@ can.
 
 ## 1. The decision tree
 
+September 5 update: before branch 1, audit the actual compiler entry,
+execution overlay, and authored-source realization. Then inspect the exact
+pre-SSA failure graph if no SSA was published. The maintained instructions and
+saved-call inspector are in
+[TRANSLATION_DEBUGGING.md](../tools/TRANSLATION_DEBUGGING.md#start-before-ssa-invocation-source-coverage-and-the-failing-graph).
+This early branch distinguishes a wrong invocation or missing source coverage
+from a compiler invariant failure; none of those is a binary-runtime diagnosis.
+
+For a native DT hang or zero progress, time fixture preparation separately and
+run the same eager input under a bound. If eager terminates, trace the initial
+loop-carried value to its producer through region scheduling and SSA dominance.
+Check both the flat region DAG and the overlaid control tree. A producer can
+precede its individual consumer yet follow the first region of the consumer's
+loop; inserting the entire loop there breaks the original dependency. Preserve
+the DAG across grouping and keep unrelated post-loop effects in their order.
+The September 5 cap reproduction moved bounds calculations behind the loop
+because initialization and the repeated predicate shared one region. Preserve
+the execution contract's symbolic policy while reducing the reproduction;
+zeroed workspace is not evidence that the authored input was zero. For a crash
+at a numeric helper call, also check the caller's actual scalar storage width
+against stale operand metadata. Native regression pointers are maintained in
+`tools/TRANSLATION_DEBUGGING.md`.
+
 Start from what you can already say about the wrong value. Each branch names
 the instrument, what its verdict means, and where to fall through when the
 verdict is "this layer is clean."

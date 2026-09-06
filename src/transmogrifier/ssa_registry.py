@@ -195,6 +195,10 @@ class Handler(Enum):
     Trap          = "Trap"
     Ret           = "Ret"
     Call          = "Call"
+    # Ordered coordination owned by the dispatcher. Unlike Deploy/Join,
+    # these operations can require another task to make concurrent progress;
+    # a backend must not erase them as serial deployment receipts.
+    Dispatch      = "Dispatch"
     Deploy        = "Deploy"
     Join          = "Join"
 

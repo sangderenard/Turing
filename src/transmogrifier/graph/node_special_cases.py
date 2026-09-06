@@ -476,13 +476,21 @@ class _ContextInliner(ast.NodeTransformer):
             self.inlined.append(ast.unparse(call))
         body = list(node.body)
         for setup, success, cleanup, epilogue in reversed(templates):
-            protected = body + success
-            if cleanup:
-                protected = [ast.Try(
-                    body=protected, handlers=[], orelse=[], finalbody=cleanup,
-                )]
-            body = setup + protected + epilogue
+            body = context_scope_statements(setup, body, success, cleanup, epilogue)
         return body
+
+
+def context_scope_statements(setup, body, success=(), cleanup=(), epilogue=()):
+    """Compose the ordered entry/body/cleanup structure for AST contexts.
+
+    Both readable generator contexts and language-specific context adapters
+    use this construction; neither introduces a separate region mechanism.
+    Setup stays outside the protected body so failed entry never runs cleanup.
+    """
+    protected = [*body, *success]
+    if cleanup:
+        protected = [ast.Try(body=protected, handlers=[], orelse=[], finalbody=list(cleanup))]
+    return [*setup, *protected, *epilogue]
 
 
 def inline_context_managers(tree: ast.AST, resolver) -> ast.AST:

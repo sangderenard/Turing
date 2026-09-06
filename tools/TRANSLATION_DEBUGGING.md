@@ -1,6 +1,104 @@
 # Why isn't this translating? — a decision tree
 
+## Start before SSA: invocation, source coverage, and the failing graph
+
+For end-to-end Python compilation, establish these facts in order:
+
+1. **Entrypoint and execution contract.** Record the actual source path and
+   authored function, extraction policy and execution overlay. A thin wrapper,
+   law-only lowering entry, or opportunistic Python-host contract does not
+   establish whole-program native compilation. The project route is
+   `compile_project_call`; it preserves imports and imported record contracts.
+   The full-native vehicle overlay requires whole-program dispatch and rejects
+   Python callbacks and unlowered remainder. Do not weaken it to clear a gate.
+2. **Authored source authority.** Ingestion runs inside
+   `authored_source_realization`. Eager installed native replacements must expose
+   `__turing_authored_source_callable__` and honor that context, including cached
+   bindings. Inspect the actual retained program and eventual linked call graph:
+   a planned function list alone does not prove reachable DT or generated tick
+   source was lowered. An `external_callee_ref` may still have a real callable
+   binding and resolve later; its marker alone does not prove missing source.
+3. **First failed representation.** Before repository SSA publication, inspect
+   the durable failure and exact saved ProcessGraph. Do not run backend or
+   numerical diagnostics against an absent artifact. Preserve the failing
+   function's graph, source spans, dependency metadata and original traceback.
+4. **Localize and reproduce.** Use exact source/record identities and aggregate
+   ledgers to locate the violated invariant. Reproduce that invariant in a small
+   authored program, then rerun the complete original entry after the fix.
+   Do not rewrite the validator to avoid the language construct.
+5. **Advance the evidence.** Planning, complete linked SSA, emitted source,
+   built binary, full-program eager/native parity, and equivalent performance
+   measurements are separate gates. Law-level frame parity cannot prove the DT
+   retry/rollback window or outer feedback loop. A generic shell consumes the
+   emitted whole-program ABI; it must not take over scientific orchestration.
+
+Read a whole-program attempt using the existing Stage 0 inlet:
+
+```powershell
+python tools/diagnose_translation.py --compilation-unit build/vehicle_validator_project_entry_order_fix
+python tools/diagnose_translation.py --process-graph build/vehicle_validator_project_entry_order_fix/failed-process-graph.pkl --ids 480
+python tools/diagnose_translation.py --process-graph build/vehicle_validator_project_entry_order_fix/resolved-process-graph.pkl --entry '_run_dually_python_profile.<locals>.worker'
+```
+
+`--compilation-unit` understands the diagnostic driver's `receipt.json` failure
+as well as catalogue `failure.json`. `--process-graph` reads a **trusted local
+pickle** without invoking specialization or compilation. It prints the artifact
+hash, exact function/callsite/source correlation, extraction decisions, Python
+binding availability, argument identities and missing aggregate leaves. `--entry`
+selects an exact function-table qualified name; `--ids` selects local callsite
+IDs in this snapshot. These IDs may change after recompilation. The inspector
+does not claim final native closure or assess numerical correctness.
+
+Useful discriminators found in the complete vehicle program:
+
+| Symptom | Inspect at the owning boundary |
+| --- | --- |
+| Aggregate arity N versus zero | Has the callee formal already become a `structural_specialization` constant? That exact identity no longer accepts a runtime argument. Otherwise inspect aggregate descriptor propagation and member formals; never ignore the mismatch. |
+| `dict(tuple)` error in tensor specialization | A single return may contain a structured aggregate descriptor. Only a tensor descriptor mapping belongs in `tensor`. |
+| Populated collection folded to its empty initializer | Check the exact `source_sequence_mutation_records` identity before propagating static contents. |
+| Cycle after a structural fold | Compare live node IDs with `levels` and retained recursion metadata. A real feedback region needs its canonical dependency metadata refreshed after node deletion; do not drop feedback edges. |
+| Missing value inside nested retained loops | Preserve the owner graph and follow removal/materialization provenance before adding missing-node guards. |
+| Missing region node in a graph with no function name | Check whether a late pass folded expressions inside the raw module definition catalogue. Function specializations and the module's AST catalogue have distinct ownership; compare the fold boundary with hierarchy construction before modifying region membership. |
+| Returned record receiver gains storage | Compare the caller receiver binding and callee returned record identity; a fresh construction and returning the same mutated parameter have different storage semantics. |
+
+Run only one expensive compiler/build/parity operation at a time on this
+workstation. Read saved artifacts while it runs; avoid repeated full ingestion
+just to recover the same traceback. A stopped or crashed process is not a
+successful compilation, even if its last progress line names a late phase.
+
 ## Managed multi-result calls: a control value disappears beside a record
+
+For DT C failures, retain the repository SSA before emission. The managed
+balloon build now writes `repository-ssa.pkl`, `module.c`, and `shortfalls.json`
+in its output directory even when C emission fails. The pickle holds
+`(module, outputs, exports)` and is a trusted local diagnostic artifact.
+
+For an energy-sidechain failure, use the actual source closure and managed ABI:
+
+```powershell
+python tools/repro_apply_energy_sidechain.py --output build/dt-sidechain-diagnostic
+```
+
+Check these invariants before measuring performance:
+
+- A call producing a branch predicate must dominate the predicate, including
+  scalar and None-valued calls. A statement marker inside the selected arm
+  does not satisfy this requirement.
+- A returned `NoneValue` must publish the same native absence representation
+  used by its caller. C emission without a shortfall can still leave a return
+  slot uninitialized; execute a bounded native regression.
+- Known `callable(None)` is false. Retaining its dead arm can manufacture a
+  zero-argument tensor `item` operation from a local variable's spelling.
+- Sequential branches depend on the state their unselected arms forward.
+  Inspect `ConditionalBlock.carried_aliases`, not just numeric region order.
+  A missing branch merge can surface as an anonymous public workspace input.
+- Passing a conditionally rebound variable to a subsequent call also requires
+  the merged value in that call's argument frame. This remains an independently
+  observed defect; ordering the conditional blocks alone does not prove it fixed.
+
+The September 5 sidechain native parity covers disabled optional energy/shadow
+limits and empty channels only. It is not proof of enabled optional limits,
+the complete DT window, or whole-vehicle performance.
 
 Use this branch when the full-native gate reports one undefined scalar or
 predicate after a source-linked call that also returns a record. A typical
@@ -1505,6 +1603,41 @@ Notes toward it:
 * **Per-backend traps belong in one table**, in the spirit of the gfortran
   silent-failure note above: each is cheap to write down and expensive to
   rediscover.
+* **Threading must survive every representation as ordered coordination.**
+  Check AST special-case operations, reduced function receiver edges, control
+  scopes, and actual SSA instructions separately. A graph-level dispatcher
+  receipt is not evidence that SSA retained a wait or notification. Preserve
+  acquire/body/finally-release order, including return and exceptional exits.
+  A serial fallback requires a progress and semantic-equivalence proof:
+  independent work may qualify, but a condition handshake waiting for another
+  task cannot be serialized into blocking calls. Keep communicating-task
+  requirements explicit through backend selection; GLSL numerical eligibility
+  does not grant a shader the ability to run native coordination. Require a
+  concrete backend implementation or a lowering shortfall.
+  Reuse the existing dual IR: `ControlProgram` owns ordered coordination and
+  its numerical regions own arithmetic. `ControlDeploymentRegion` permissions
+  for independent lanes are not proof that communicating tasks can serialize.
+  For a wait inside a carried loop, inspect the region call's current-phi
+  argument, the actual update instruction, and its output publication. A
+  literal initial value is not a compile-time constant across iterations.
+  A singleton shaped result computed in a scalar local still needs publication
+  to caller storage. Prove iteration behavior with bounded native execution.
+  Backend admission must also provide checked runtime status, nested-call
+  propagation, exceptional scope cleanup, and handle/capture lifetimes. A void
+  call returning normally is insufficient evidence that synchronization worked;
+  never convert a negative runtime error into a successful boolean result.
+* **Class registration is not reachable-body traversal.** A class catalogue may
+  already contain a method before its first invocation. Queue that method's
+  dependencies on first use even if argument bindings have not changed. A
+  reachable construction also reaches its authored `__new__`/`__init__` bodies;
+  unrelated sibling methods remain unvisited. Missing extraction receipts on
+  resolvable `local = self.module; local.operation(...)` calls can indicate this
+  worklist omission, not a missing module-field resolver or backend operator.
+  Once receipts appear, inspect their parameters: `use_native` alone grants no
+  result layout or calling convention. Source-less extension callables can
+  still require an interpreter object ABI. A plain native host needs a real
+  implementation or an explicit display/system port lowering, not a symbol
+  name guessed from the Python call spelling.
 * **`emit_module` cannot fix what SSA got wrong.** Its loops only unify
   *metadata* on an already-fixed, positionally-paired `Call.args` tuple —
   it can never change how many arguments a call passes. The document should
@@ -1535,3 +1668,124 @@ Notes toward it:
   C/LLVM carrier, not a Fortran data structure.** Legalize the complete group
   to native array-section stack/concat statements; do not synthesize a pointer
   table in Fortran.
+
+* **A list truth test is a resident length read, not an element cast.** If
+  `bool(reasons)` creates an input-less region with a `sequence_arena` formal,
+  inspect where the empty-list allocation and later mutations were placed.
+  The arena must exist before append, and truth must read length after the
+  preceding mutations. An arbitrary buffer input can hide the arity failure
+  while returning false for a nonempty list containing zero. Use the existing
+  lexical SequenceQueryBlock mechanism; preserve the source occurrence and
+  sequence descriptor identity. Minimal reproducer: initialize `reasons=[]`,
+  conditionally append `0.0`, return `bool(reasons)`.
+* **Writable tensor output identity survives record-field metadata removal.**
+  Before freshening a result that shares a formal ID, consult the function's
+  tensor output descriptor and explicit in/out storage contract. Freshening
+  only the producer while leaving Ret and the tensor table on the old ID
+  disconnects publication. Mutability alone does not prove the alias.
+
+* **Native append returning capacity-exhausted on a freshly allocated private
+  list can be an initialization defect.** Inspect the generated wrapper's
+  arena allocation AND its capacity cell. Zeroed memory establishes empty
+  contents and length, not the usable capacity. Capacity must reflect the
+  actual column allocations; passing feeds for hidden private cells has no
+  effect. A list containing zero distinguishes a correct length-based truth
+  query from a first-element numerical cast. The regression is
+  `tests/test_native_sequence_truth.py`, with bounded native execution.
+
+* **Zero C shortfalls does not prove the public ABI is valid.** Compare each
+  public input against authored parameter/record bindings. A Boolean expression
+  passed to a later numeric region can become an anonymous public input even
+  when returning that expression directly works. Inspect structural producer
+  recovery for planned-region feeds as well as source-call feeds, and require
+  the recovered producer to dominate its actual consumer. Do not zero-fill an
+  unbound intermediate merely to obtain an executable.
+
+* **A record descriptor can exist before its fields are produced in the caller.**
+  Compare the source-linked Call result receipt with the callee's current
+  physical Ret contract. If a previously linked three-result call now returns
+  thirteen physical fields, refresh that same call and its owned projections
+  as one transaction. Rebinding a field read to an allocated but unproduced
+  field slot only replaces an unnamed-input failure with wrong data.
+
+* **Check indexed writes with the actual tensor provider.** A scalar dropped-axis
+  shortcut must distinguish reads from stores. The generic lowering can retain
+  Store while repository tensor lowering accidentally produces Load for the
+  same source; compare the provider used by the real program. Regression:
+  `tests/test_native_scalar_index_store.py`.
+* **A result-type fixed point that alternates is often an identity conflict.**
+  Inspect all defining instructions for each changing ID, including whether
+  they share the same SSAValue object. Two calls publishing the same forwarded
+  record fields can overwrite each other's types indefinitely. Increasing the
+  iteration limit or choosing the last dtype conceals duplicate producers.
+
+* **Separate returned output storage from missing input bindings.** A complete
+  native artifact can expose Ret values that are not formal parameters. Allocate
+  those from their resolved physical dtype/shape and identify their returned
+  position in the host manifest. Continue rejecting every missing formal input;
+  do not blanket-zero unknown public buffers. Regression:
+  `tests/test_managed_native_output_contract.py` (wrapper validation only).
+* **Compare direct calls with callback-specialized calls for source ordering.**
+  Deferred callback resolution can create a source-backed Call node after later
+  statements. A dependency sort tied by node ID does not preserve source order
+  for independent field reads/writes around it. Inspect source spans, semantic
+  parents, region membership, hierarchy call order and final SSA. The direct
+  call can pass while the specialized version reports before calling. Do not
+  infer that sorting SSA instructions alone fixes missing mutation dependencies
+  or regions that already combine both sides of the call.
+
+* **For zero progress in a native while loop, trace the initial carried value's
+  producer before blaming configuration or symbolic inputs.** Inspect scheduled
+  region membership and control overlays before SSA: a region combining pre-loop
+  initialization with the while predicate can make the overlay move intervening
+  bounds calculations after the loop. Predicate syntax needs its own control
+  partition, since it is evaluated again at the latch. Use the actual extraction
+  contract and runtime numeric bounds in the reproduction. Regression:
+  `tests/test_native_pruned_cap_initialization.py`.
+  Also check dependency order AFTER overlaying atomic controls: a flat schedule
+  `body-start, cap-producer, body-consumer` is valid dataflow but becomes invalid
+  when the whole loop replaces `body-start`. Preserve the region dependency DAG
+  through the overlay and schedule prerequisites before their consuming control,
+  within the same scope. Do not hoist unrelated post-loop reports along with the
+  prerequisite. Regression: `tests/test_control_region_dependencies.py`.
+* **For scalar corruption at a tensor helper boundary, inspect actual storage
+  definitions, not only operand copies.** A Boolean formal can have a stale
+  float64/ranked copy at its use. The helper's array contract must not make the
+  caller read eight bytes from one-byte scalar storage. Resolve physical storage
+  from the caller's defining value before choosing conversions or unifying
+  array storage types. Regression: `tests/test_native_scalar_storage_dtype.py`.
+* **For a loop call using the first iteration's value repeatedly, inspect late
+  frame refresh as well as initial scheduling.** The scheduled call's exact
+  formal-to-actual binding can already point to the correct Phi, then be
+  overwritten by a refresh using the original authored frame value. Preserve
+  resident bindings by callee formal identity while completing new frame slots.
+  Regression: `tests/test_native_loop_call_argument.py`.
+* **A return can dominate its own producers incorrectly.** If tracing changes
+  a hang into zero returned values, inspect uninitialized locals and whether
+  their producers appear only in `unreachable_return_control`. Zero-filling
+  storage does not repair source ordering; inspect return anchoring and planned
+  call placement before interpreting the returned numbers as controller policy.
+  A tuple return is evaluated element by element before exiting. The tuple
+  container can be structurally reduced away while the exact return-slot receipt
+  survives; retain the exit and place it after its element computations. Expose
+  return value dependencies to scheduled-call ordering, including a trailing
+  source call used only by the return. Test skipped branches too: a post-branch
+  call must read the dominating merge, not a value defined only in one arm.
+  Regression: `tests/test_native_return_after_call.py`.
+* **Separate symbolic placeholders from executed results.** Inspect the actual
+  extraction policy, execution overlay, and ProgramABI before interpreting a
+  graph's literal-looking value. Trace runtime inputs through their physical
+  bindings. A zero returned by the executed native program still needs comparison
+  with eager execution from the same fixture; symbolic promotion does not excuse
+  a runtime mismatch.
+* **Check definition dominance before instrumenting native values.**
+  `src.compiler.ssa_self_check.check_definition_dominance(module)` checks known
+  SSA definitions, same-block order, and Phi predecessor edges. It is also in
+  `run_all`. Findings describe structural CFG validity: constant branch edges
+  are not pruned, and this does not check pointer initialization or array bounds.
+  Distinguish a syntactic unreachable exit from an executed read-before-producer.
+  When a source-linked call fails, compare its `SSACallRecord.enclosing_loop_ids`
+  with its final block and trace marker replacement and late frame refresh.
+  Forwarded record storage may retain identity while still requiring the call's
+  mutation to execute at the authored position. Regression for the diagnostic:
+  `tests/test_ssa_definition_dominance.py`.

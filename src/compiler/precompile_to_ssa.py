@@ -20,6 +20,8 @@ from .control_source import (
     ControlExpression,
     ControlProgram,
     ControlSequenceMutation,
+    DispatchBlock,
+    ResourceScopeBlock,
     ExternalReferenceCallBlock,
     LoopControlBlock,
     LoopBlock,
@@ -924,6 +926,7 @@ class _ControlSSABuilder:
         # ``external_value`` mints, never invented as an ABI input.
         self.constant_value_ids = set(map(int, constant_value_ids))
         self.output_value_ids = tuple(map(int, output_value_ids))
+        self.resource_scopes: list[tuple[ResourceScopeBlock, int]] = []
         # (block, per-slot values) for every source ``return`` lowered below
         # the top level; merged per slot in `function_exit_block` by `finish`.
         self.function_return_edges: list[
@@ -2694,6 +2697,31 @@ class _ControlSSABuilder:
         arguments = [
             self.external_value(int(value_id)) for value_id in argument_ids
         ]
+        for index, value in enumerate(arguments):
+            if self._value_dominates_current_edge(value):
+                continue
+            # A source-call record can retain an arm's assigned value ID
+            # after the conditional has published its merge. Only a unique
+            # dominating Phi that explicitly consumes that value can repair
+            # the binding; unrelated live values or names are not evidence.
+            merges = {
+                int(instruction.res.id): instruction.res
+                for emitted in self.blocks.values()
+                for instruction in emitted.instrs
+                if instruction.op == "Phi"
+                and instruction.res is not None
+                and instruction.attributes.get("binding") == "conditional_carried"
+                and any(argument is value for argument in instruction.args)
+                and self._value_dominates_current_edge(instruction.res)
+            }
+            if len(merges) == 1:
+                arguments[index] = next(iter(merges.values()))
+            elif len(merges) > 1:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "ambiguous-call-conditional-merge", location,
+                    f"callsite {callsite_id} argument {value.id} has multiple "
+                    f"dominating conditional merges {sorted(merges)}",
+                ))
         marker_attributes = {
             "callee": f"__plan_callsite_{int(callsite_id)}__",
             "plan_callsite_marker": True,
@@ -3482,6 +3510,13 @@ class _ControlSSABuilder:
         finally:
             self._evolution_source = previous
 
+    def _emit_resource_cleanup(self, action: str, path: str) -> None:
+        for scope, loop_depth in reversed(self.resource_scopes):
+            if action != "return" and loop_depth < len(self.loop_targets):
+                continue  # This exit stays inside a scope surrounding the loop.
+            for index, operation in enumerate(scope.cleanup):
+                self.lower(operation, path=f"{path}.cleanup[{scope.source_scope_id}:{index}]")
+
     def _pure_region_index(self, child: "ControlBlock") -> int | None:
         """The region a child emits, when reordering it is provably safe.
 
@@ -3643,6 +3678,15 @@ class _ControlSSABuilder:
         if isinstance(block, WhileBlock):
             self.lower_while(block, path=path)
             return
+        if isinstance(block, ResourceScopeBlock):
+            self.resource_scopes.append((block, len(self.loop_targets)))
+            try:
+                self.lower(block.body, path=f"{path}.resource_body")
+            finally:
+                self.resource_scopes.pop()
+            for index, operation in enumerate(block.cleanup):
+                self.lower(operation, path=f"{path}.resource_cleanup[{index}]")
+            return
         if isinstance(block, LoopControlBlock) and block.action == "return":
             # A source ``return`` below the function's top level: capture
             # this return's own slot values on the edge and branch to the
@@ -3675,6 +3719,7 @@ class _ControlSSABuilder:
             if block.predicate_value_id is None and (
                 block.predicate_expression is None
             ):
+                self._emit_resource_cleanup("return", path)
                 self.function_return_edges.append((self.current, edge_values))
                 self.branch(exit_block)
                 self.current.instrs[-1].attributes["source_control"] = "return"
@@ -3698,11 +3743,29 @@ class _ControlSSABuilder:
                 )
                 self.current.instrs[-1].attributes["source_control"] = "return"
                 self.current = returning
+                self._emit_resource_cleanup("return", path)
                 self.function_return_edges.append((self.current, edge_values))
                 self.branch(exit_block)
                 self.current = fallthrough
             return
         if isinstance(block, LoopControlBlock):
+            if self.resource_scopes and (
+                block.predicate_value_id is not None or block.predicate_expression is not None
+            ):
+                predicate = (
+                    self.lower_control_expression(block.predicate_expression)
+                    if block.predicate_expression is not None else
+                    self.external_value(block.predicate_value_id, dtype="bool")
+                )
+                leaving = self.new_block("resource_exit")
+                fallthrough = self.new_block("resource_exit_next")
+                self.conditional_branch(predicate,
+                                        leaving if block.expect_true else fallthrough,
+                                        fallthrough if block.expect_true else leaving)
+                self.current = leaving
+                self.lower(replace(block, predicate_value_id=None, predicate_expression=None), path=path)
+                self.current = fallthrough
+                return
             if not self.loop_targets:
                 raise ValueError(
                     f"{block.action} appears outside a loop "
@@ -3710,6 +3773,7 @@ class _ControlSSABuilder:
                 )
             latch, exit_block = self.loop_targets[-1]
             target = exit_block if block.action == "break" else latch
+            self._emit_resource_cleanup(block.action, path)
             if self.loop_exit_contexts and block.site_node_id is not None:
                 self.loop_exit_contexts[-1]["sites_seen"].add(
                     int(block.site_node_id)
@@ -3819,6 +3883,27 @@ class _ControlSSABuilder:
             # CallBlock is lexical organization around the nested compiled
             # control, not an additional runtime invocation.
             self.lower(block.callee, path=f"{path}.callee")
+            return
+        if isinstance(block, DispatchBlock):
+            arguments = [self.external_value(value_id)
+                         for value_id in block.argument_value_ids]
+            arguments.extend(self.external_value(value_id)
+                             for _name, value_id in block.keyword_argument_value_ids)
+            result = None if block.result_value_id is None else SSAValue(
+                int(block.result_value_id), dtype=str(block.result_dtype)
+            )
+            self.emit(Handler.Dispatch, arguments, result, attributes={
+                "dispatch_operation": str(block.operation),
+                "source_callsite_id": int(block.callsite_id),
+                "keyword_names": tuple(name for name, _ in block.keyword_argument_value_ids),
+                "deployment_owner": "dispatcher",
+                "required_capability": "communicating_tasks",
+                "effectful": True,
+                "ordered_effect": True,
+                "extraction_identity": "turing.dispatch." + str(block.operation),
+            })
+            if result is not None:
+                self.external_values[int(result.id)] = result
             return
         if isinstance(block, ExternalReferenceCallBlock):
             arguments = [
@@ -4235,17 +4320,17 @@ class _ControlSSABuilder:
         }
         length = self.fresh_value(dtype="int64")
         self.emit(Handler.Load, [length_address], length, attributes=attributes)
-        if query.operation == "length":
+        if query.operation in {"length", "truth"}:
             result = self.produced_value(
                 int(query.result_value_id),
-                dtype="int64",
+                dtype="bool" if query.operation == "truth" else "int64",
                 claim_provisional_definition=True,
             )
             self.emit(
-                Handler.Cast,
-                [length],
+                Handler.Gt if query.operation == "truth" else Handler.Cast,
+                [length, self.constant_value(0)] if query.operation == "truth" else [length],
                 result,
-                attributes={**attributes, "target_dtype": "int64"},
+                attributes={**attributes, "target_dtype": result.dtype},
             )
             self.external_values[int(query.result_value_id)] = result
             for alias_id in query.result_alias_ids:
@@ -6228,7 +6313,14 @@ class _ControlSSABuilder:
             self.external_values[initial_id] = self.external_values.get(
                 updated_id, updated
             )
-        self.external_values[int(loop.predicate_value_id)] = next_predicate
+        # A retained numeric condition and its explicit scalar expression can
+        # both publish the predicate. They must not define the same SSA id.
+        # The expression owns the backedge value; numeric projection gets a
+        # separate result when both representations are present.
+        self.external_values[int(loop.predicate_value_id)] = (
+            self.fresh_value(dtype="bool")
+            if loop.predicate_expression is not None else next_predicate
+        )
         preserved_before = set(self.preserved_region_output_ids)
         self.preserved_region_output_ids.update(
             int(initial_id) for _updated_id, initial_id, *_rest in carried
@@ -7975,6 +8067,15 @@ def _schedule_loop_callsites(
     ) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
         """Return exact straight-line inputs and publications for a block."""
 
+        if isinstance(block, LoopControlBlock):
+            # A tuple return may be the sole consumer of a trailing source
+            # call. Keep its value dependencies visible so that call is
+            # scheduled before the function exit, not in unreachable code.
+            inputs = {int(value_id) for value_id in block.return_value_ids
+                      if value_id is not None}
+            if block.predicate_value_id is not None:
+                inputs.add(int(block.predicate_value_id))
+            return tuple(sorted(inputs)), ()
         if isinstance(block, StatementBlock):
             region_index = scheduled_region(block)
             if region_index is not None:
@@ -8024,6 +8125,37 @@ def _schedule_loop_callsites(
                     int(block.result_value_id),
                     *map(int, block.result_alias_ids),
                 ))),
+            )
+        if isinstance(block, ConditionalBlock):
+            # Keep the branch atomic, but expose its external dependencies.
+            # Otherwise an overlaid region used as a call anchor can strand
+            # that call after a branch which already consumes its result.
+            consumed: set[int] = {int(block.predicate_value_id)}
+            produced: set[int] = set()
+
+            def collect_arm(candidate: Any) -> bool:
+                if isinstance(candidate, SequenceBlock):
+                    return all(collect_arm(child) for child in candidate.blocks)
+                signature = dependency_signature(candidate)
+                if signature is None:
+                    return False
+                consumed.update(map(int, signature[0]))
+                produced.update(map(int, signature[1]))
+                return True
+
+            if not collect_arm(block.body) or (
+                block.orelse is not None and not collect_arm(block.orelse)
+            ):
+                return None
+            # Arm-local values do not become unconditional publications.
+            # Only the control IR's explicit merges cross this boundary.
+            aliases = (*block.carried_aliases, *block.carried_sequence_aliases)
+            external = consumed - produced
+            external.add(int(block.predicate_value_id))
+            external.update(int(initial) for _yes, _no, initial, _merged in aliases)
+            return (
+                tuple(sorted(external)),
+                tuple(sorted({int(merged) for _yes, _no, _initial, merged in aliases})),
             )
         if isinstance(block, (LoopBlock, WhileBlock)):
             # A loop is one scheduling unit, but it is not dependency-free.
@@ -9087,11 +9219,13 @@ def lower_control_sections_to_ssa(
                     )
 
     sequence_query_result_ids: set[int] = set()
+    sequence_query_arena_ids: set[int] = set()
 
     def collect_sequence_query_results(block: ControlBlock) -> None:
         if isinstance(block, SequenceQueryBlock):
             sequence_query_result_ids.add(int(block.result_value_id))
             sequence_query_result_ids.update(map(int, block.result_alias_ids))
+            sequence_query_arena_ids.add(int(block.sequence_value_id))
         elif isinstance(block, SequenceBlock):
             for child in block.blocks:
                 collect_sequence_query_results(child)
@@ -9301,7 +9435,13 @@ def lower_control_sections_to_ssa(
             instructions = [
                 instruction for instruction in instructions
                 if instruction.res is None
-                or int(instruction.res.id) not in sequence_query_result_ids
+                or (int(instruction.res.id) not in sequence_query_result_ids
+                    and not (
+                        instruction.op == "Const"
+                        and int(instruction.res.id) in sequence_query_arena_ids
+                        and isinstance(instruction.attributes.get("value", instruction.attributes.get("constant")), list)
+                        and not instruction.attributes.get("value", instruction.attributes.get("constant"))
+                    ))
             ]
             row_loads = tuple(
                 row_load_by_result[int(instruction.res.id)]
@@ -10193,6 +10333,16 @@ def lower_control_sections_to_ssa(
             section_outputs[region_name] = tuple(
                 typed_region_value(vid) for vid in outputs
             )
+            if not any(instruction.op in {"Ret", "Br", "CondBr", "Switch", "IndirectBr"}
+                       for instruction in instructions):
+                # Region output maps serve legacy emitters, but repository
+                # SSA consumers need an explicit publication terminator too.
+                # Without it, C computes the result and returns without ever
+                # writing the caller's output storage.
+                definitions = {int(value.id): value for value in arguments}
+                definitions.update({int(instruction.res.id): instruction.res
+                                    for instruction in instructions if instruction.res is not None})
+                instructions.append(Instr("Ret", [definitions[int(vid)] for vid in outputs], None))
             # Do NOT gate region ops on the repository ``Handler`` enum here: that
             # is the LLVM/repository vocabulary, but this path emits through the
             # selected target (Fortran), whose op set is broader -- e.g. it

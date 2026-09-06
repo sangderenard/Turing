@@ -54,6 +54,8 @@ class RollerCoveragePlan:
     hub_identities: tuple[str, ...]
     articulation: str
     reason: str
+    roller_radius_m: float = 0.18
+    roller_length_m: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,7 +294,9 @@ def negotiate_wheel_fixture(model: Mapping[str, Any]) -> WheelFixturePlan:
         hub_identities=(group_for_wheel[identity][0],),
         articulation="vertical-mount-detent",
         reason="independent-rim-and-bead-seat-service",
-    ) for identity in wheel_ids)
+        roller_length_m=(float(wheel["section_width_m"])
+                         if "section_width_m" in wheel else None),
+    ) for identity, wheel in zip(wheel_ids, wheels))
 
     ordered_groups: list[tuple[str, tuple[str, ...]]] = []
     seen_hubs: set[str] = set()

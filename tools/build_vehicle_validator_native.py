@@ -94,6 +94,7 @@ def main() -> int:
             output,
             outer_rate_hz=args.rate_hz,
             assembly_profile=args.assembly_profile,
+            progress=lambda message: print(f"[emit] {message}", flush=True),
         )
 
     viewer_source = output / "vehicle_scientific_viewer.c"

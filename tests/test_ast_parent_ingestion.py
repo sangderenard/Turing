@@ -28,6 +28,138 @@ def _source_helper(value):
     return value * 2 + 1
 
 
+class _RegisteredMethodOwner:
+    def run(self):
+        return _source_helper(3)
+
+    def unused(self):
+        return _recursive_source_helper(4)
+
+
+class _ConstructorDependencyOwner:
+    def __init__(self):
+        self.value = _dependency_middle(3)
+
+    def unused(self):
+        return _recursive_source_helper(4)
+
+
+class _ModuleFieldOwner:
+    def __init__(self):
+        import math
+        self.module = math
+
+    def run(self):
+        module = self.module
+        return module.sin(0.0)
+
+
+def test_registered_method_module_field_retains_extraction_receipt():
+    from pathlib import Path
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.transmogrifier.graph.graph_express2 import _expand_unresolved_ast_parents
+
+    contract = ExtractionContract(
+        Path(__file__).resolve().parents[1] / "extraction_contracts/program_extraction.yaml"
+    )
+    tree, _links, _unresolved, _bindings = _expand_unresolved_ast_parents(
+        ast.parse("def entry():\n    owner = _ModuleFieldOwner()\n    return owner.run()\n"),
+        {"_ModuleFieldOwner": _ModuleFieldOwner},
+        include=contract, pursuit_roots=("entry",),
+    )
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Attribute) and node.func.attr == "sin"]
+    assert len(calls) == 1
+    assert calls[0]._extraction_contract["identity"] == "math.sin"
+
+
+def test_reachable_constructor_pursues_initialization_dependencies():
+    from src.transmogrifier.graph.graph_express2 import _expand_unresolved_ast_parents
+
+    tree, links, _unresolved, _bindings = _expand_unresolved_ast_parents(
+        ast.parse("def entry():\n    return _ConstructorDependencyOwner()\n"),
+        {"_ConstructorDependencyOwner": _ConstructorDependencyOwner},
+        include=_source_dependency_is_not_tensor_primitive,
+        pursuit_roots=("entry",),
+    )
+    discovered = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    assert {"_dependency_middle", "_dependency_leaf"} <= discovered
+    assert "_recursive_source_helper" not in discovered
+    assert any(definition.name == "_dependency_middle" for definition, _call in links)
+
+
+def test_reachable_registered_method_pursues_body_without_new_bindings():
+    from src.transmogrifier.graph.graph_express2 import _expand_unresolved_ast_parents
+
+    tree, links, _unresolved, _bindings = _expand_unresolved_ast_parents(
+        ast.parse("def entry():\n    owner = _RegisteredMethodOwner()\n    return owner.run()\n"),
+        {"_RegisteredMethodOwner": _RegisteredMethodOwner},
+        include=_source_dependency_is_not_tensor_primitive,
+        pursuit_roots=("entry",),
+    )
+    discovered = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    assert "_source_helper" in discovered
+    assert "_recursive_source_helper" not in discovered
+    assert any(definition.name == "_source_helper" for definition, _call in links)
+
+
+def test_lexical_pursuit_follows_nested_helpers_but_respects_parameter_shadowing():
+    from src.transmogrifier.graph.graph_express2 import _expand_unresolved_ast_parents
+
+    tree, links, _unresolved, _bindings = _expand_unresolved_ast_parents(
+        ast.parse("""
+def callback():
+    return _recursive_source_helper(4)
+def entry(callback):
+    def leaf():
+        return _source_helper(3)
+    def middle():
+        return leaf()
+    callback()
+    return middle()
+"""),
+        {"_source_helper": _source_helper, "_recursive_source_helper": _recursive_source_helper},
+        include=_source_dependency_is_not_tensor_primitive,
+        pursuit_roots=("entry",),
+    )
+    linked_names = {definition.name for definition, _call in links}
+    assert {"middle", "leaf", "_source_helper"} <= linked_names
+    assert "callback" not in linked_names
+    assert not any(isinstance(node, ast.FunctionDef) and node.name == "_recursive_source_helper"
+                   for node in tree.body)
+
+
+@pytest.mark.parametrize("construction", ["threading.Thread(target=worker)", "threading.Thread(None, worker)"])
+def test_thread_target_source_dependencies_are_pursued_without_python_callback(construction):
+    import threading
+    from pathlib import Path
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.transmogrifier.graph.graph_express2 import _expand_unresolved_ast_parents
+
+    contract = ExtractionContract(Path(__file__).resolve().parents[1] /
+                                  "extraction_contracts/program_extraction.yaml").with_execution_file(
+        Path(__file__).resolve().parents[1] / "extraction_contracts/vehicle_full_native_execution.yaml")
+    tree, links, _, _ = _expand_unresolved_ast_parents(ast.parse('''
+def entry():
+    def unused():
+        return _recursive_source_helper(4)
+    def stage():
+        return _source_helper(3)
+    def worker():
+        return stage()
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    return 0
+'''.replace("threading.Thread(target=worker)", construction)), {"threading": threading, "_source_helper": _source_helper,
+       "_recursive_source_helper": _recursive_source_helper},
+        include=contract, pursuit_roots=("entry",))
+    discovered = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    assert "_source_helper" in discovered
+    assert "_recursive_source_helper" not in discovered
+    assert any(definition.name == "_source_helper" for definition, _ in links)
+
+
 def _recursive_source_helper(value):
     if value <= 0:
         return 0

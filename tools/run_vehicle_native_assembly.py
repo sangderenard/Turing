@@ -29,6 +29,11 @@ from src.common.tensors import AbstractTensor
 from src.common.dt_system.dt_controller import STController, Targets, run_superstep
 from src.common.dt_system.dt_scaler import Metrics
 from src.compiler.vehicle_validator_profiles import dually_validator_profile
+from src.compiler.abstract_ui_archetypes import LivingDocument, LivingNode
+from src.compiler.abstract_ui_validator_rig import place_validator_support
+from src.compiler.mechanical_ports import bind_placed_rig_point
+from src.compiler.abstract_ui_geometry import realize_fixture_geometry, fixture_world_objects
+from src.compiler.abstract_ui_world import world_surface_mesh_packet
 from src.compiler.vehicle_python_live_viewer import PythonValidatorViewer
 from src.compiler.vehicle_native_assembly import (
     assembled_point_mass_properties, compile_brace_on_balance_c,
@@ -145,7 +150,8 @@ class _PythonVehicleMaterial:
                  machine_operator="configured-vehicle",
                  structural_support_positions=None,
                  tire_pneumatic_mode=None,
-                 tire_material_profile="configured", prepared=None):
+                 tire_material_profile="configured", prepared=None, fixture_plan=None):
+        self.fixture_plan = fixture_plan
         self.wheel_names = tuple(wheel_names)
         if prepared is None:
             prepared = vehicle_python_compilation_inputs(
@@ -172,6 +178,8 @@ class _PythonVehicleMaterial:
                 for name, value in eager_feeds.items()
             }
         self.vehicle_names = tuple(vehicle_names)
+        self.rig_component_identities = tuple(
+            "" for _ in range(self.feeds["rig_points"].shape[1]))
         self.output_names = tuple(output_names)
         self.contact_names = tuple(contact_names)
         self.fixture_names = tuple(fixture_names)
@@ -364,6 +372,17 @@ class _PythonVehicleMaterial:
     def clear_rig_point(self, slot):
         self.feeds["rig_points"].data[0, int(slot), :] = 0.0
 
+    def install_rig_binding(self, slot, binding):
+        index = int(slot)
+        if index != slot or not 0 <= index < len(self.rig_component_identities):
+            raise ValueError("rig binding slot is outside the allocated point count")
+        identities = list(self.rig_component_identities)
+        if binding.identity in identities and identities[index] != binding.identity:
+            raise ValueError("rig component is already bound to another slot")
+        self.feeds["rig_points"].data[:, index, :] = binding.values
+        identities[index] = binding.identity
+        self.rig_component_identities = tuple(identities)
+
     def tick(self, vehicle_in, contact_in, fixture_in, vehicle_out,
              publish_visual=True):
         self.feeds["vehicle_input"].data[:, :] = tuple(vehicle_in)
@@ -458,6 +477,7 @@ class _PythonVehicleMaterial:
                 self.feeds["node_reference"],
                 self.feeds["node_structural_support_binding"])
         snapshot = {
+            "rig_component_identities": self.rig_component_identities,
             "tire_fidelity_mode": float(np.asarray(self._data(result[4]))[
                 0, self.tire_input_index["tire_fidelity_mode"]]),
             "tire_position": self._data(result[5])[0, :, :, 0:3].copy(),
@@ -475,7 +495,15 @@ class _PythonVehicleMaterial:
             "pillar_alpha": self._data(self.feeds["pillar_alpha"])[0].copy(),
             "roller_anchor": self._data(result[11])[0].copy(),
             "fixture_wheel": self._data(result[2])[0].copy(),
+            "fixture_command": self._data(self.feeds["fixture_wheel"])[0].copy(),
+            "pillar_reaction_force": self._data(result[12])[0].copy(),
+            "rig_reactions": self._data(result[8])[0].copy(),
         }
+        if self.fixture_plan is not None:
+            world_objects = fixture_world_objects(
+                realize_fixture_geometry(self.fixture_plan, snapshot), "validator:world")
+            snapshot["world_objects"] = tuple(item.to_data() for item in world_objects)
+            snapshot["world_mesh_packet"] = world_surface_mesh_packet(world_objects)
         with self._visual_lock:
             if publish_visual:
                 self._visual_snapshot = snapshot
@@ -652,6 +680,9 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
     fixture_names = tuple(compile_vehicle_roller_fixture_ssa().function.metadata["argument_names"])
     vi = {name: index for index, name in enumerate(vehicle_names)}
     fi = {name: index for index, name in enumerate(fixture_names)}
+    state_feedback = tuple(
+        (index, vi[name[:-5]]) for index, name in enumerate(output_names)
+        if name.endswith("_next") and name[:-5] in vi)
 
     defaults = {name: 0.0 for name in vehicle_names}
     mass = profile.mass_properties
@@ -704,14 +735,15 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
         fixture_defaults[f"mode_{corner}"] = 1.0
 
     prepared = dually_vehicle_python_compilation_inputs(
-        batch_size=max(1, int(args.lanes)))
+        batch_size=max(1, int(args.lanes)),
+        rig_point_count=len(profile.structural_support_positions))
     material = _PythonVehicleMaterial(
         vehicle_names, output_names, contact_names, fixture_names,
         profile.wheel_names, profile.fixture_plan.wheel_to_structural_support,
         profile.graph_constants, profile.tire_dimensions,
         "structural-machine", profile.structural_support_positions,
         profile.tire_pneumatic_mode, profile.tire_material_profile,
-        prepared=prepared)
+        prepared=prepared, fixture_plan=profile.fixture_plan)
     # The outer repository dt controller owns all subdivision in live mode so
     # every accepted physical substep can be published to the viewer.
     material.feeds["microstep_count"] = 1
@@ -762,12 +794,17 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
     visual_revision = [0]
     displayed_visual_revision = [0]
     stage_seconds = max(frame_dt, float(args.dually_stage_seconds))
-    rig_record = ctypes.c_double * 19
+    rig_world_identity = f"{profile.identity}/world"
+    rig_body_identity = str(profile.model["identity"])
+    rig_document = LivingDocument(rig_world_identity, nodes=(
+        LivingNode(rig_world_identity, "world", "Validator world"),
+        LivingNode(rig_body_identity, "object", "Vehicle"),
+    ))
     grasp_configured = False
     tire_mesh_initialized = False
 
     def apply_stage(stage: str, progress: float, dt_value: float) -> None:
-        nonlocal grasp_configured, tire_mesh_initialized
+        nonlocal grasp_configured, tire_mesh_initialized, rig_document
         transfer_stage = profile.stages[7]
         wheel_alpha = (progress if stage == transfer_stage else
                        1.0 if profile.stages.index(stage) > 7 else 0.0)
@@ -829,11 +866,17 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
                     status_lock.wait(timeout=0.1)
         if stage == profile.stages[4] and not grasp_configured:
             for slot, support in enumerate(profile.structural_support_positions):
-                material.configure_rig_point(slot, 1, rig_record(
-                    *support, *support, 0.0, 0.0, 0.0,
-                    0.0, 0.0, 0.0,
-                    80_000.0, 120_000.0, 80_000.0,
-                    800.0, 1_200.0, 800.0, 60_000.0))
+                identity = f"{rig_world_identity}/supports/{slot}"
+                rig_document = place_validator_support(
+                    rig_document, actor=profile.identity, identity=identity,
+                    body=rig_body_identity, local_point=support, world_point=support)
+                binding = bind_placed_rig_point(
+                    rig_document, identity, rig_body_identity, dict(
+                        enabled=1, mode=1, target_velocity=(0.0, 0.0, 0.0),
+                        force=(0.0, 0.0, 0.0),
+                        stiffness=(80_000.0, 120_000.0, 80_000.0),
+                        damping=(800.0, 1_200.0, 800.0), maximum_force=60_000.0))
+                material.install_rig_binding(slot, binding)
             grasp_configured = True
 
     _tick_profile_budget = [int(os.environ.get("TURING_PROFILE_TICKS", "0") or 0)]
@@ -875,6 +918,10 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
             material.tick(vehicle_in, contact_in, fixture_in, vehicle_out,
                           publish_visual=False)
         tick_seconds[0] += time.perf_counter() - tick_started
+        # Carry declared next-state publications into the following physical
+        # attempt. The DT state's existing snapshot/restore owns this buffer.
+        for output_index, input_index in state_feedback:
+            vehicle_in[input_index] = vehicle_out[output_index]
         tire_state = material._data(material.feeds["tire_state"])[0]
         position = tire_state[..., 0:3]
         velocity = tire_state[..., 3:6]
@@ -1107,7 +1154,7 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
                             error=traceback.format_exc())
 
     viewer = PythonValidatorViewer(
-        profile.model, headless=args.headless_frame is not None)
+        profile.model, fixture_plan=profile.fixture_plan, headless=args.headless_frame is not None)
     thread = threading.Thread(target=worker, name="dually-validator", daemon=True)
     thread.start()
     running = True
@@ -1116,10 +1163,12 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
             running = viewer.events()
             with status_lock:
                 current = dict(live)
+                current_visual_revision = visual_revision[0]
+                current_snapshot = material.visual_snapshot(prefer_pending=True)
             # During a rejected proposal this is the exact pending graph frame,
             # held stable by the acknowledgement barrier below. Accepted
             # proposals have already promoted the same snapshot to committed.
-            viewer.draw(material.visual_snapshot(prefer_pending=True),
+            viewer.draw(current_snapshot,
                         stage=current["stage"],
                         progress=current["progress"],
                         sim_time=current["sim_time"], status=current["status"],
@@ -1138,7 +1187,7 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
                 displayed_attempt[0] = max(
                     displayed_attempt[0], int(current["substep_index"]))
                 displayed_visual_revision[0] = max(
-                    displayed_visual_revision[0], visual_revision[0])
+                    displayed_visual_revision[0], current_visual_revision)
                 status_lock.notify_all()
             if args.headless_frame is not None and current["finished"]:
                 viewer.save(args.headless_frame.resolve())

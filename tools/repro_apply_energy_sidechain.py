@@ -1,16 +1,15 @@
-"""Fast, real repro: the actual ``_apply_energy_sidechain`` calling the real
-``_no_exchange_observed`` inside an ``if`` (not returned directly), via
-``inspect.getsource`` -- reproducing the exact caller shape from
-dt_controller.py that the isolated ``root() -> _no_exchange_observed(...)``
-repro does not exercise (there the boolean is directly returned; here it
-only steers a branch), to find why the full managed-tire compile still
-shows ``_no_exchange_observed``'s output classified as a record with an
-empty layout instead of a plain boolean value.
+"""Lower the real DT energy-sidechain closure and retain C emission failures.
+
+Uses the callable's actual globals and the complete managed record ABI under
+native-only execution. Saves repository SSA so emitter fixes can be checked
+without repeating source lowering. This is a focused diagnostic, not DT parity.
 """
 
 from __future__ import annotations
 
-import inspect
+import argparse
+import json
+import pickle
 import sys
 import time
 from pathlib import Path
@@ -22,12 +21,7 @@ from src.compiler.extraction_contract import ExtractionContract  # noqa: E402
 from src.compiler.vehicle_python_compilation import (  # noqa: E402
     balloon_tire_managed_extraction_contract, BalloonTireManagedState,
 )
-from src.common.dt_system.dt_controller import (  # noqa: E402
-    _apply_energy_sidechain, _no_exchange_observed, _energy_time_limit,
-    _shadow_dt_limit,
-)
-from src.common.dt_system.dt_scaler import _scalar  # noqa: E402
-from src.common.dt_system.shadow import shadow_dt_limit  # noqa: E402
+from src.common.dt_system.dt_controller import _apply_energy_sidechain, _propose_dt_pen  # noqa: E402
 
 CONTRACTS = Path(__file__).resolve().parents[1] / "extraction_contracts"
 
@@ -47,42 +41,50 @@ def _base_records():
 
 
 def main() -> int:
-    real_source = "\n\n".join((
-        inspect.getsource(_scalar),
-        inspect.getsource(shadow_dt_limit),
-        inspect.getsource(_shadow_dt_limit),
-        inspect.getsource(_energy_time_limit),
-        inspect.getsource(_no_exchange_observed),
-        inspect.getsource(_apply_energy_sidechain),
-    ))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--entry", choices=("sidechain", "proposal"), default="sidechain")
+    args = parser.parse_args()
+    args.output.mkdir(parents=True, exist_ok=True)
     root_source = (
         "def root(dt_next, dt_tensor, metrics, targets):\n"
         "    return _apply_energy_sidechain(dt_next, dt_tensor, metrics, targets)\n"
     )
-    source = real_source + "\n\n" + root_source
+    bindings = {"_apply_energy_sidechain": _apply_energy_sidechain}
+    if args.entry == "proposal":
+        root_source = (
+            "def root(metrics, targets, dx):\n"
+            "    return _propose_dt_pen(metrics, targets, dx, None)\n"
+        )
+        bindings = {"_propose_dt_pen": _propose_dt_pen}
+    source = root_source
     base = _base_records()
-    contract_abi = {
-        "records": {
-            "Metrics": base["records"]["Metrics"],
-            "Targets": base["records"]["Targets"],
-        },
-        "bindings": [
+    contract_abi = {**base,
+        "bindings": [*base.get("bindings", []),
             {"function": "*", "parameter": "metrics", "record": "Metrics"},
             {"function": "*", "parameter": "targets", "record": "Targets"},
         ],
-        "values": [],
     }
     policy = ExtractionContract(
         CONTRACTS / "program_extraction.yaml"
-    ).with_program_abi(contract_abi)
+    ).with_program_abi(contract_abi).with_execution_file(
+        CONTRACTS / "vehicle_full_native_execution.yaml")
 
     t0 = time.time()
     try:
         module, outputs, exports = lower_ast_source_to_ssa(
             source, "root", name="sidechain", extraction_contract=policy,
+            python_bindings=bindings,
         )
+        (args.output / "repository-ssa.pkl").write_bytes(pickle.dumps((module, outputs, exports), protocol=5))
+        from src.compiler.ssa_c_backend import emit_ssa_to_c
+        artifact = emit_ssa_to_c(module, exports[0], entry_name="sidechain_native")
+        (args.output / "module.c").write_text(artifact.source, encoding="utf-8")
+        failures = [{"operation": item.operation, "reason": item.reason} for item in artifact.shortfalls]
+        (args.output / "shortfalls.json").write_text(json.dumps(failures, indent=2), encoding="utf-8")
+        print(json.dumps(failures, indent=2), flush=True)
         print(f"LOWERED in {time.time()-t0:.2f}s", flush=True)
-        return 0
+        return 0 if artifact.complete else 1
     except Exception as error:
         print(f"FAILED after {time.time()-t0:.2f}s: {type(error).__name__}: "
               f"{str(error)[:1500]}", flush=True)

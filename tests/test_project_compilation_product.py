@@ -52,6 +52,13 @@ def test_compiler_toolchain_fingerprint_is_deterministic_and_auditable():
     assert paths == sorted(paths)
     assert "src/compiler/precompile_to_ssa.py" in paths
     assert "src/common/tensors/topological_reducer.py" in paths
+    assert {
+        "src/transmogrifier/graph/node_special_cases.py",
+        "src/compiler/glsl_deployment_strategy.py",
+        "src/compiler/ssa_c_backend.py",
+        "src/common/tensors/accelerator_backends/c_backend/turing_pool.c",
+        "src/common/tensors/accelerator_backends/c_backend/turing_pool.h",
+    } <= set(paths)
 
 
 def test_authored_call_discovery_excludes_declarations_without_python_jobs():

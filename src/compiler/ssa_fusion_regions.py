@@ -19,7 +19,7 @@ CONTROL_BARRIERS = frozenset({
     "Ret", "Br", "CondBr", "Switch", "Phi", "Call", "Invoke",
 })
 EFFECT_BARRIERS = frozenset({
-    "Store", "SetAttr", "SetItem", "Publish", "Raise", "Yield",
+    "Store", "SetAttr", "SetItem", "Publish", "Raise", "Yield", "Dispatch",
 })
 
 

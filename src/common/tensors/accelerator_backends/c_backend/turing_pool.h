@@ -75,6 +75,48 @@ void turing_pool_stop(void);
 void turing_pool_effect_lock(void);
 void turing_pool_effect_unlock(void);
 
+// Dispatcher-owned communicating task, independent of the numerical frame
+// pool. The entry is compiled native code and context is its captured frame.
+// No serial fallback: start either creates a concurrent task or returns NULL.
+typedef struct turing_dispatch_task turing_dispatch_task;
+typedef void (*turing_task_fn)(void* context);
+turing_dispatch_task* turing_task_start(turing_task_fn fn, void* context);
+// Wait for completion: timeout_ms < 0 means indefinitely. Returns 1 when
+// complete, 0 on timeout, -1 on invalid/OS error, -2 for a self-wait.
+int turing_task_wait(turing_dispatch_task* task, long timeout_ms);
+// Join and free the handle. Caller must own its lifetime exclusively; captured
+// storage must remain alive until this succeeds. Returns 0, or a negative error.
+int turing_task_destroy(turing_dispatch_task* task);
+
+// Dispatcher condition with an owned recursive lock (Python Condition's
+// default). Waiting releases ALL recursive acquisitions and restores their
+// depth before returning. notify requires ownership and does not release it.
+// This is communicating-task synchronization, never a numerical pool barrier.
+typedef struct turing_dispatch_condition turing_dispatch_condition;
+turing_dispatch_condition* turing_dispatch_condition_create(void);
+int turing_dispatch_condition_acquire(turing_dispatch_condition* condition);
+int turing_dispatch_condition_release(turing_dispatch_condition* condition);
+// timeout_ms < 0 means indefinite; 0 polls. Returns 1 when notified, 0 on
+// timeout, -1 on invalid ownership/OS error. The frontend maps Python's
+// negative timeout to zero and None to the indefinite sentinel.
+int turing_dispatch_condition_wait(turing_dispatch_condition* condition, long timeout_ms);
+int turing_dispatch_condition_notify(turing_dispatch_condition* condition, long count);
+int turing_dispatch_condition_notify_all(turing_dispatch_condition* condition);
+// Exclusive lifetime ownership required; refuses an acquired/waited-on lock.
+int turing_dispatch_condition_destroy(turing_dispatch_condition* condition);
+
+// Manual-reset event. set wakes every current waiter; clear affects future
+// waits and does not revoke notifications already delivered. Predicate/wait
+// results are 0 or 1, with negative values reserved for runtime errors.
+typedef struct turing_dispatch_event turing_dispatch_event;
+turing_dispatch_event* turing_dispatch_event_create(void);
+int turing_dispatch_event_set(turing_dispatch_event* event);
+int turing_dispatch_event_clear(turing_dispatch_event* event);
+int turing_dispatch_event_is_set(turing_dispatch_event* event);
+int turing_dispatch_event_wait(turing_dispatch_event* event, long timeout_ms);
+// As with Condition, exclusive lifetime ownership is required.
+int turing_dispatch_event_destroy(turing_dispatch_event* event);
+
 #ifdef __cplusplus
 }
 #endif

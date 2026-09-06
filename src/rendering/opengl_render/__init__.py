@@ -13,10 +13,10 @@ from .threaded import GLRenderThread
 
 try:  # pragma: no cover - best effort in headless CI
     from .renderer import (
-        CudaGraphLayer, GLRenderer, MeshLayer, LineLayer, PointLayer, DebugRenderer,
+        CudaGraphLayer, GLRenderer, RendererHost, MeshLayer, LineLayer, PointLayer, DebugRenderer,
     )
 except Exception:  # noqa: BLE001 - tolerate missing OpenGL libs
-    CudaGraphLayer = GLRenderer = MeshLayer = LineLayer = PointLayer = DebugRenderer = None  # type: ignore
+    CudaGraphLayer = GLRenderer = RendererHost = MeshLayer = LineLayer = PointLayer = DebugRenderer = None  # type: ignore
 
 try:  # pragma: no cover - best effort in headless CI
     from .api import (
@@ -37,6 +37,7 @@ except Exception:  # noqa: BLE001 - tolerate missing OpenGL libs
 
 __all__ = [
     "GLRenderer",
+    "RendererHost",
     "GLRenderThread",
     "DebugRenderer",
     "MeshLayer",

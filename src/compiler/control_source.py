@@ -341,6 +341,42 @@ class CallBlock:
 
 
 @dataclass(frozen=True)
+class ResourceScopeBlock:
+    """Lexical resource cleanup, including nonlocal return/break/continue.
+
+    Cleanup operations consume captured handles and have no published result.
+    This represents generated context-manager cleanup, not Python exception
+    handlers or a general finally body which can override a pending exit.
+    """
+
+    body: "ControlBlock"
+    cleanup: tuple["DispatchBlock", ...]
+    source_scope_id: int
+
+    def __post_init__(self):
+        if any(not isinstance(operation, DispatchBlock)
+               or operation.result_value_id is not None for operation in self.cleanup):
+            raise ValueError("resource cleanup requires result-free dispatcher operations")
+
+
+@dataclass(frozen=True)
+class DispatchBlock:
+    """An ordered dispatcher operation with explicit SSA handle/value ports.
+
+    The operation is semantic (for example condition_wait), not a C symbol.
+    Backend admission must resolve its synchronization and lifetime contract.
+    This block grants no permission to serialize communicating tasks.
+    """
+
+    callsite_id: int
+    operation: str
+    argument_value_ids: tuple[int, ...] = ()
+    keyword_argument_value_ids: tuple[tuple[str, int], ...] = ()
+    result_value_id: int | None = None
+    result_dtype: str = "opaque_ref"
+
+
+@dataclass(frozen=True)
 class ExternalReferenceCallBlock:
     """One authored call through the shell external-reference capability."""
 
@@ -398,7 +434,7 @@ class SequenceQueryBlock:
 
     def __post_init__(self) -> None:
         if self.operation not in {
-            "length", "first_or_default", "lookup",
+            "length", "truth", "first_or_default", "lookup",
         }:
             raise ValueError("unknown resident sequence query")
         if self.operation == "first_or_default" and self.default_value_id is None:
@@ -434,6 +470,8 @@ ControlBlock = (
     | StateMachineTick
     | ParallelDeployment
     | CallBlock
+    | DispatchBlock
+    | ResourceScopeBlock
     | ExternalReferenceCallBlock
     | ValidationBlock
     | SequenceMutationBlock
@@ -568,12 +606,18 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
                 values.add(int(block.count_value_id))
             if block.predicate_value_id is not None:
                 values.add(int(block.predicate_value_id))
-        elif isinstance(block, ExternalReferenceCallBlock):
+        elif isinstance(block, (ExternalReferenceCallBlock, DispatchBlock)):
             values.update(int(value_id) for value_id in block.argument_value_ids)
             values.update(
                 int(value_id)
                 for _name, value_id in block.keyword_argument_value_ids
             )
+            if isinstance(block, DispatchBlock) and block.result_value_id is not None:
+                values.add(int(block.result_value_id))
+        elif isinstance(block, ResourceScopeBlock):
+            visit(block.body)
+            for operation in block.cleanup:
+                visit(operation)
         elif isinstance(block, SequenceBlock):
             for child in block.blocks:
                 visit(child)
@@ -903,6 +947,11 @@ def render_control_block(
         # A target renderer therefore sees the callee as ordinary nested
         # control, not as a host-language function call.
         return render_control_block(block.callee, target)
+    if isinstance(block, (DispatchBlock, ResourceScopeBlock)):
+        raise ValueError(
+            "dispatcher coordination must lower through SSA and a backend "
+            "synchronization implementation; source rendering cannot erase it"
+        )
     if isinstance(block, ExternalReferenceCallBlock):
         if target is not ControlTarget.PYTHON:
             raise ValueError(
@@ -945,6 +994,11 @@ def render_control_block(
             f"turing_sequence_{mutation.operator}(value_{int(mutation.sequence_value_id)});",
         )
     if isinstance(block, SequenceQueryBlock):
+        if block.operation == "truth":
+            return (
+                f"value_{int(block.result_value_id)} = "
+                f"(turing_sequence_length(value_{int(block.sequence_value_id)}) > 0);",
+            )
         if block.operation == "length":
             return (
                 f"value_{int(block.result_value_id)} = "
@@ -994,6 +1048,79 @@ def _region_marker(block: StatementBlock) -> int | None:
     if not marker.startswith(prefix) or not marker.endswith("__"):
         return None
     return int(marker[len(prefix):-2])
+
+
+def order_control_region_dependencies(
+    program: "ControlProgram", dependencies: Iterable[tuple[int, int]],
+) -> "ControlProgram":
+    """Preserve region dependencies when lexical controls become atomic.
+
+    A valid flat order can interleave a loop body with its initial-value
+    producer. Replacing the body's first marker by the entire loop then puts
+    that producer after its consumer. Move prerequisites before the enclosing
+    control, keeping each operation in its original lexical scope. Visit
+    prerequisites on demand so unrelated post-loop effects remain post-loop.
+    """
+    edges = tuple((int(a), int(b)) for a, b in dependencies if a != b)
+
+    def visit(block):
+        if isinstance(block, StatementBlock):
+            region = _region_marker(block)
+            return block, set() if region is None else {region}
+        if isinstance(block, SequenceBlock):
+            children, memberships = [], []
+            for child in block.blocks:
+                rewritten, regions = visit(child)
+                children.append(rewritten)
+                memberships.append(regions)
+            owners = {}
+            for index, regions in enumerate(memberships):
+                for region in regions:
+                    if region in owners:
+                        raise ValueError(f"region {region} has multiple sequential control owners")
+                    owners[region] = index
+            prerequisites = {i: set() for i in range(len(children))}
+            for producer, consumer in edges:
+                left, right = owners.get(producer), owners.get(consumer)
+                if left is not None and right is not None and left != right:
+                    prerequisites[right].add(left)
+            ordered, active, complete = [], set(), set()
+
+            def schedule(index):
+                if index in complete:
+                    return
+                if index in active:
+                    raise ValueError(
+                        "region dependencies cross atomic control boundaries cyclically: "
+                        f"regions={sorted(set().union(*(memberships[i] for i in active)))}"
+                    )
+                active.add(index)
+                for predecessor in sorted(prerequisites[index]):
+                    schedule(predecessor)
+                active.remove(index)
+                complete.add(index)
+                ordered.append(children[index])
+
+            for index in range(len(children)):
+                schedule(index)
+            return replace(block, blocks=tuple(ordered)), set(owners)
+        fields = (
+            ("condition", "body") if isinstance(block, WhileBlock)
+            else ("body", "orelse") if isinstance(block, ConditionalBlock)
+            else ("body",) if isinstance(block, (LoopBlock, ResourceScopeBlock))
+            else ("callee",) if isinstance(block, CallBlock)
+            else ()
+        )
+        changes, regions = {}, set()
+        for field in fields:
+            child = getattr(block, field)
+            if child is not None:
+                changes[field], members = visit(child)
+                regions.update(members)
+        return replace(block, **changes) if changes else block, regions
+
+    root, _regions = visit(program.root)
+    return replace(program, root=root)
 
 
 def _anchored_control(control: "ControlProgram") -> bool:
@@ -1271,7 +1398,9 @@ def compose_region_code(
                 block.argument_bindings,
                 block.result_bindings,
             )
-        if isinstance(block, ExternalReferenceCallBlock):
+        if isinstance(block, ResourceScopeBlock):
+            return replace(block, body=substitute(block.body) or SequenceBlock(()))
+        if isinstance(block, (ExternalReferenceCallBlock, DispatchBlock)):
             return block
         if isinstance(block, ValidationBlock):
             if (
@@ -1428,14 +1557,18 @@ def project_control_regions(
         if isinstance(block, WhileBlock):
             condition = project(block.condition)
             body = project(block.body)
-            if body is None or (
+            # An authored while can own carried scalar updates or ordered
+            # operations installed after numeric-region projection. An empty
+            # numeric body is not proof that its iterations are unobservable.
+            if (body is None and block.source_loop_node_id is None
+                    and not block.carried_aliases and not block.sequence_mutations) or (
                 condition is None and block.predicate_expression is None
             ):
                 return None
             return WhileBlock(
                 block.predicate_value_id,
                 condition or SequenceBlock(()),
-                body,
+                body or SequenceBlock(()),
                 carried_aliases=tuple(
                     (updated, initial)
                     for updated, initial in block.carried_aliases
@@ -1507,6 +1640,10 @@ def project_control_regions(
                 block.argument_bindings,
                 block.result_bindings,
             )
+        if isinstance(block, ResourceScopeBlock):
+            return replace(block, body=project(block.body) or SequenceBlock(()))
+        if isinstance(block, DispatchBlock):
+            return block
         if isinstance(block, ValidationBlock):
             return block
         if isinstance(block, SequenceMutationBlock):
@@ -1639,6 +1776,58 @@ def project_control_regions(
         ),
         program.specialized_conditional_node_ids,
     )
+
+
+def _order_conditional_state_dependencies(block: ControlBlock) -> ControlBlock:
+    """Respect carried state between adjacent conditional regions.
+
+    Flat numeric regions can be independent while their owning branches are
+    not: an unselected arm still forwards its incoming state. That dependency
+    is declared by carried_aliases and must survive region scheduling. Other
+    statements are barriers; this pass never moves a branch across them.
+    """
+    from dataclasses import replace
+
+    if isinstance(block, ConditionalBlock):
+        return replace(
+            block, body=_order_conditional_state_dependencies(block.body),
+            orelse=(None if block.orelse is None else
+                    _order_conditional_state_dependencies(block.orelse)),
+        )
+    if not isinstance(block, SequenceBlock):
+        return block
+    children = []
+    for child in block.blocks:
+        child = _order_conditional_state_dependencies(child)
+        children.extend(child.blocks if isinstance(child, SequenceBlock) else (child,))
+    start = 0
+    while start < len(children):
+        if not isinstance(children[start], ConditionalBlock):
+            start += 1
+            continue
+        stop = start + 1
+        while stop < len(children) and isinstance(children[stop], ConditionalBlock):
+            stop += 1
+        run = children[start:stop]
+        producers = {int(alias[3]): index for index, child in enumerate(run)
+                     for alias in child.carried_aliases}
+        dependencies = {
+            index: {producers[int(alias[2])] for alias in child.carried_aliases
+                    if int(alias[2]) in producers and producers[int(alias[2])] != index}
+            for index, child in enumerate(run)
+        }
+        pending = list(range(len(run)))
+        ordered = []
+        while pending:
+            ready = next((index for index in pending
+                          if not dependencies[index].intersection(pending)), None)
+            if ready is None:
+                raise ValueError("cyclic carried state between sequential conditionals")
+            pending.remove(ready)
+            ordered.append(run[ready])
+        children[start:stop] = ordered
+        start = stop
+    return replace(block, blocks=tuple(children))
 
 
 def overlay_scheduled_control(
@@ -2173,7 +2362,7 @@ def overlay_scheduled_control(
         return tuple(unique)
 
     return ControlProgram(
-        root=SequenceBlock(tuple(blocks)),
+        root=_order_conditional_state_dependencies(SequenceBlock(tuple(blocks))),
         region_indices=order,
         uniforms=tuple(dict.fromkeys(uniforms)),
         value_aliases=tuple(dict.fromkeys(aliases)),
@@ -2452,6 +2641,8 @@ __all__ = [
     "ControlSequenceMutation",
     "CallBlock",
     "ExternalReferenceCallBlock",
+    "DispatchBlock",
+    "ResourceScopeBlock",
     "ValidationBlock",
     "ControlProgram",
     "ControlTarget",

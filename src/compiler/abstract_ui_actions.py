@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Sequence
+from typing import Any, Sequence
 
 
 ABSTRACT_UI_ACTION_VERSION = "abstract-ui-action-edges-v0"
@@ -17,6 +17,7 @@ class IssuedAction:
     destination: str
     edge: str
     issued_at: float
+    parameters: tuple[tuple[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
