@@ -194,16 +194,12 @@ class _ArrivalTrace:
 
 
 def _declare_optional_targets(targets_record: dict) -> dict:
-    """The real ``Targets`` receipt plus its two optional float fields.
+    """Explicitly restate the two optional ``Targets`` float fields.
 
-    ``balloon_tire_managed_extraction_contract`` declares only the four
-    ``Targets`` fields the tire program reads.  Declaring
-    ``energy_exchange_fraction``/``shadow_growth_max`` the exact way the same
-    receipt already declares ``Metrics.dt_limit`` (``scalar float64``,
-    ``default None``) is what a program using the energy side-chain would
-    carry; without it every ``getattr(targets, <field>, None)`` folds to the
-    ``None`` default and the functions under test collapse to ``return None``
-    before any BoolOp operand exists.
+    The base ABI now declares ``energy_exchange_fraction`` and
+    ``shadow_growth_max``.  This switch remains useful as an idempotence check
+    for the historical audit command and deliberately produces the same
+    schema as the default path.
     """
 
     import copy

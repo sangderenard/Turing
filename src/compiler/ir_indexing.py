@@ -193,8 +193,13 @@ def _propagate_scalar_dtypes(functions) -> None:
                 inferred = None
                 if instruction.op == "Const":
                     literal = instruction.attributes.get("value")
+                    declared = str(instruction.res.dtype or "")
                     inferred = (
-                        "bool" if isinstance(literal, bool)
+                        # A typed pointer literal (including null) is an
+                        # address value, not an integer inferred from its
+                        # Python spelling. Preserve that physical contract.
+                        declared if "ptr" in declared.casefold()
+                        else "bool" if isinstance(literal, bool)
                         else "int64" if isinstance(literal, int)
                         else "float64" if isinstance(literal, float)
                         else None

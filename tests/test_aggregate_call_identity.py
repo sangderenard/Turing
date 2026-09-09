@@ -140,6 +140,53 @@ def _flat_calls(items):
             yield from _flat_calls(item.items)
 
 
+def test_singleton_call_result_preserves_tensor_member_natively(tmp_path):
+    import pickle
+    import subprocess
+    import sys
+
+    from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+
+    module, outputs, _ = _lower('''
+def capture(array):
+    return (array.copy(),)
+
+def recover(saved):
+    return saved[0]
+
+def tick(array):
+    saved = capture(array)
+    return recover(saved)
+''', 'singleton_snapshot', {'array': np.zeros((2, 3))})
+    root = module.functions['singleton_snapshot__tick']
+    result = outputs[root.name][0]
+    assert len(root.args) == 1  # Only the authored array, no saved/result input.
+    assert result.dtype == 'float64'
+    assert tuple(result.shape) == (2, 3)
+    recover = module.functions['singleton_snapshot__recover']
+    assert len(recover.args) == 1
+    assert tuple(recover.args[0].shape) == (2, 3)
+    assert _ret_args(recover)[0].id == recover.args[0].id
+
+    artifact = emit_ssa_module_to_c(module, root.name)
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / 'singleton_snapshot')
+    payload = tmp_path / 'artifact.pkl'
+    payload.write_bytes(pickle.dumps((artifact, root.args[0].id, result.id)))
+    probe = subprocess.run([sys.executable, '-c', '''
+import pickle, sys
+import numpy as np
+with open(sys.argv[1], 'rb') as stream:
+    artifact, input_id, result_id = pickle.load(stream)
+expected = np.array([[2.0, -3.0, 4.0], [11.0, 17.0, -23.0]])
+result = artifact.prepare_execution({input_id: expected.copy()}).run()
+actual = np.asarray(result.buffers[result_id])
+assert actual.shape == expected.shape, (actual.shape, expected.shape)
+assert np.array_equal(actual, expected), (actual, expected)
+''', str(payload)], capture_output=True, text=True, timeout=20)
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+
+
 def _capture_plans(monkeypatch):
     captured = []
     original = planner._build_shell_hierarchy_plan
@@ -256,6 +303,11 @@ def test_nested_call_result_projections_are_typed_call_outputs():
         )
     )
     assert len(linked.attributes["output_ids"]) == 4
+    callee = module.functions[linked.attributes["callee"]]
+    declared = {value_id for _name, value_id in callee.metadata['parameter_names']}
+    declared.update(entry['value_id'] for entry in callee.metadata['parameter_member_formals'])
+    assert {value.id for value in callee.args} == declared
+    assert {entry['parameter'] for entry in callee.metadata['parameter_member_formals']} == {'history'}
     loads = {
         int(instruction.res.id): tuple(instruction.res.shape or ())
         for block in root.blocks.values()

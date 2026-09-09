@@ -64,6 +64,33 @@ def test_superstep_runs_until_the_requested_window_is_complete():
 
 
 @pytest.mark.dt
+@pytest.mark.parametrize("collapsed_limit", [0.0, -0.1])
+def test_superstep_dead_ends_before_advancing_a_collapsed_proposal(collapsed_limit):
+    state = CountingState()
+    attempted: list[float] = []
+
+    def advance(state_local: CountingState, dt: float):
+        attempted.append(float(dt))
+        state_local.value += float(dt)
+        return True, Metrics(0.0, 0.0, 0.0, 0.0, dt_limit=collapsed_limit)
+
+    advanced, _dt_next, metrics = run_superstep(
+        state,
+        1.0,
+        0.25,
+        1.0,
+        Targets(1.0, 1.0, 1.0),
+        STController(),
+        advance,
+    )
+
+    assert attempted == [0.25]
+    assert advanced == pytest.approx(0.25)
+    assert state.value == pytest.approx(0.25)
+    assert metrics.error_channels["superstep_window_remaining_s"] == pytest.approx(0.75)
+
+
+@pytest.mark.dt
 def test_soft_error_band_retains_state_and_steers_next_dt():
     state = CountingState()
     attempts: list[dict] = []
@@ -96,6 +123,37 @@ def test_soft_error_band_retains_state_and_steers_next_dt():
     assert attempts[0]["accepted"] is True
     assert attempts[0]["reasons"] == ()
     assert "shape_error" in attempts[0]["soft_reasons"][0]
+
+
+@pytest.mark.dt
+def test_builtin_error_reasons_are_stable_rule_tokens():
+    def run(mass_err: float, div_inf: float, rollback_scale: float):
+        attempts: list[dict] = []
+
+        def advance(state_local: CountingState, dt: float):
+            state_local.value += float(dt)
+            return True, Metrics(1.0, 1.0, div_inf, mass_err)
+
+        step_with_dt_control_used(
+            CountingState(),
+            0.1,
+            1.0,
+            Targets(1.0, 1.0, 1.0),
+            STController(),
+            advance,
+            attempt_log=attempts,
+            rollback_threshold_multiplier=rollback_scale,
+            rollback=False,
+        )
+        return attempts[0]
+
+    soft = run(1.5, 15.0, 2.0)
+    assert soft["soft_reasons"] == ("mass_err", "div_inf")
+    hard = run(2.5, 25.0, 2.0)
+    assert hard["reasons"] == (
+        "mass_err rollback limit",
+        "div_inf rollback limit",
+    )
 
 
 @pytest.mark.dt
@@ -280,6 +338,89 @@ def test_superstep_allows_increase_when_enabled():
     # With increases allowed, sequence should contain at least one growth
     grew = any(attempted[i] > attempted[i - 1] + 1e-12 for i in range(1, len(attempted)))
     assert grew, f"expected a dt increase in sequence when allowed; seq={attempted}"
+
+
+@pytest.mark.dt
+@pytest.mark.fast
+def test_superstep_schedule_lattice_stabilizes_low_bit_proposal_noise():
+    def run(metric_scale: float):
+        attempted: list[float] = []
+        state = FakeState()
+
+        def advance(state_local: FakeState, dt: float):
+            attempted.append(float(dt))
+            state_local.t += float(dt)
+            velocity = (2.0 + state_local.t) * metric_scale
+            return True, Metrics(velocity, velocity, 0.0, 0.0)
+
+        result = run_superstep_plan(
+            state,
+            SuperstepPlan(
+                round_max=0.6,
+                dt_init=0.05,
+                allow_increase_mid_round=True,
+                schedule_lattice_steps=1 << 20,
+            ),
+            1.0,
+            Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6),
+            STController(dt_min=1e-6),
+            advance,
+        )
+        return result, attempted
+
+    incumbent, incumbent_attempts = run(1.0)
+    perturbed, perturbed_attempts = run(1.0 + 1e-12)
+
+    assert incumbent_attempts == perturbed_attempts
+    assert incumbent.advanced == perturbed.advanced == pytest.approx(0.6)
+    quantum = 0.6 / (1 << 20)
+    # The caller-authored opener and exact final remainder are not adaptive
+    # follow-up decisions. Every interior proposal between them is.
+    for dt in incumbent_attempts[1:-1]:
+        lattice_index = dt / quantum
+        assert lattice_index == pytest.approx(round(lattice_index), abs=1e-9)
+
+
+@pytest.mark.dt
+@pytest.mark.fast
+def test_superstep_rejects_a_negative_schedule_lattice():
+    with pytest.raises(ValueError, match="schedule_lattice_steps"):
+        run_superstep(
+            FakeState(),
+            0.1,
+            0.1,
+            1.0,
+            Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6),
+            STController(),
+            make_advance(lambda _time: 1.0),
+            schedule_lattice_steps=-1,
+        )
+
+
+@pytest.mark.dt
+@pytest.mark.fast
+def test_superstep_schedule_lattice_never_raises_a_subquantum_proposal():
+    attempted: list[float] = []
+
+    def advance(state_local: FakeState, dt: float):
+        attempted.append(float(dt))
+        state_local.t += float(dt)
+        return True, Metrics(1.0, 1.0, 0.0, 0.0, dt_limit=1e-8)
+
+    run_superstep(
+        FakeState(),
+        1e-3,
+        1e-4,
+        1.0,
+        Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6),
+        STController(),
+        advance,
+        allow_increase_mid_round=True,
+        schedule_lattice_steps=1024,
+        max_iters=2,
+    )
+
+    assert attempted == pytest.approx([1e-4, 1e-8])
 
 
 @pytest.mark.dt

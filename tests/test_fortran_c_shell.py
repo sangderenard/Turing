@@ -28,7 +28,17 @@ from src.compiler.fortran_c_shell import emit_fortran_c_shell_source
 from src.compiler.fortran_c_shell import (
     _drop_unused_private_sequences,
     _drop_unused_root_private_formals,
+    _place_plan_callsites_lexically,
     _prune_unused_callee_formals,
+    _rehome_structured_while_predicate_regions,
+    _recover_late_source_literals,
+    _recover_late_source_slice_offsets,
+    _recover_module_late_source_literals,
+    _reconcile_region_local_view_shortfalls,
+    _region_resident_value_ids,
+    _resolved_source_graphs_by_symbol,
+    _resolved_source_literals_by_symbol,
+    _source_graph_for_lowered_function,
 )
 from src.compiler.ssa_fortran_backend import FortranModule, fortran_compiler
 from src.compiler.ssa_fortran_backend import FortranEmissionError
@@ -40,6 +50,372 @@ from src.compiler.shell_io import (
 
 def test_fortran_shell_name_is_alias_of_backend_neutral_native_renderer():
     assert emit_fortran_c_shell_source is emit_native_c_shell_source
+
+
+def test_region_residency_contains_only_values_published_to_the_coordinator():
+    region = SimpleNamespace(G=SimpleNamespace(graph={
+        "deployment_nodes": (10, 11, 12),
+        "deployment_outputs": (12,),
+    }))
+
+    assert _region_resident_value_ids((region,)) == frozenset({12})
+
+
+def test_structured_while_operand_region_moves_from_flat_schedule_to_condition():
+    from src.compiler.control_source import (
+        ControlExpression,
+        ControlProgram,
+        SequenceBlock,
+        StatementBlock,
+        WhileBlock,
+    )
+
+    predicate = ControlExpression(
+        "gt",
+        (
+            ControlExpression(
+                "item",
+                (ControlExpression(
+                    "sub",
+                    (
+                        ControlExpression("value", value_id=1),
+                        ControlExpression("value", value_id=2),
+                    ),
+                    value_id=3,
+                ),),
+                value_id=4,
+            ),
+            ControlExpression("const", value_id=5, literal=0.0),
+        ),
+        value_id=6,
+    )
+    loop = WhileBlock(
+        predicate_value_id=6,
+        condition=SequenceBlock(()),
+        body=SequenceBlock(()),
+        predicate_expression=predicate,
+        source_loop_node_id=20,
+    )
+    control = ControlProgram(
+        SequenceBlock((
+            StatementBlock(("__scheduled_region_0__",)),
+            loop,
+        )),
+        region_indices=(0,),
+    )
+    region = SimpleNamespace(G=SimpleNamespace(graph={
+        "deployment_nodes": (3,),
+    }))
+
+    rewritten, receipts = _rehome_structured_while_predicate_regions(
+        control, (region,)
+    )
+
+    rewritten_loop = rewritten.root.blocks[0]
+    assert isinstance(rewritten_loop, WhileBlock)
+    assert rewritten_loop.condition == SequenceBlock((
+        StatementBlock(("__scheduled_region_0__",)),
+    ))
+    assert receipts == ((
+        20, 0, (3,), "structured_while_predicate_operation",
+    ),)
+
+
+def test_plan_call_uses_exact_comprehension_loop_owner_without_source_span():
+    import networkx as nx
+
+    from src.compiler.control_source import (
+        ControlProgram,
+        LoopBlock,
+        SequenceBlock,
+        StatementBlock,
+    )
+    from src.compiler.hierarchical_plan import PlanCall, PlanClosure
+
+    graph = SimpleNamespace(G=nx.DiGraph())
+    graph.G.add_node(9, source_span={
+        "line": 13, "column": 19, "end_line": 13, "end_column": 35,
+    })
+    # Persisted comprehension controls can lack an AST source span entirely.
+    graph.G.add_node(68, expr_obj=object())
+    graph.G.add_node(67, source_span={
+        "line": 13, "column": 8, "end_line": 13, "end_column": 35,
+    })
+    loop = LoopBlock(
+        induction="iteration_68",
+        start="0",
+        stop="4",
+        step="1",
+        body=SequenceBlock((
+            StatementBlock(("__scheduled_region_0__",)),
+        )),
+        source_loop_node_id=68,
+    )
+    control = ControlProgram(loop, region_indices=(0,))
+    plan = PlanClosure(
+        "root",
+        (),
+        (PlanCall(
+            9,
+            PlanClosure("scalar", (), ()),
+            enclosing_loop_ids=(68,),
+        ),),
+    )
+    region = SimpleNamespace(G=SimpleNamespace(graph={
+        "deployment_nodes": (67,),
+    }))
+
+    placed = _place_plan_callsites_lexically(
+        control, graph, plan, (region,)
+    )
+
+    assert isinstance(placed.root, LoopBlock)
+    assert any(
+        isinstance(block, StatementBlock)
+        and block.lines == ("__plan_callsite_9__",)
+        for block in placed.root.body.blocks
+    )
+
+
+def test_region_local_reshape_receipt_closes_only_one_proven_internal_view():
+    import networkx as nx
+
+    from src.transmogrifier.ssa import (
+        BasicBlock,
+        Function,
+        Instr,
+        SSATensorDescriptor,
+        SSATensorTable,
+        SSAValue,
+    )
+
+    graph = nx.DiGraph()
+    graph.add_node(7, op="reshape", type="reshape")
+    wrapper = Function(
+        "root", [], {"entry": BasicBlock("entry", [Instr("Ret", [], None)])}
+    )
+    storage = SSAValue(5, "float64", shape=(6,))
+    region = Function(
+        "root__planned_region_0",
+        [],
+        {"entry": BasicBlock("entry", [
+            Instr("Call", [], storage, attributes={"callee": "fill_double"}),
+            Instr("Ret", [storage], None),
+        ])},
+    )
+    table = SSATensorTable(tensors={
+        5: SSATensorDescriptor(
+            tensor_id=5,
+            data_value_id=5,
+            dtype="float64",
+            shape=(6,),
+            byte_size=48,
+        ),
+        7: SSATensorDescriptor(
+            tensor_id=7,
+            data_value_id=5,
+            dtype="float64",
+            shape=(2, 3),
+            storage="view",
+            arena_id=5,
+            allocation_owner=5,
+            owns_allocation=False,
+            byte_size=48,
+            alias_of=5,
+        ),
+    })
+    functions = {wrapper.name: wrapper, region.name: region}
+    tables = {region.name: table}
+
+    remaining, receipts = _reconcile_region_local_view_shortfalls(
+        wrapper.name,
+        graph,
+        wrapper,
+        functions,
+        tables,
+        ((7, "reshape", "operator"), (7, "reshape", "operator")),
+        (),
+    )
+    assert remaining == ()
+    assert receipts == ((
+        7, "reshape", region.name, 5, (2, 3),
+    ),)
+
+    # A public output still needs a wrapper definition. If two regions claim
+    # the same scoped identity, equal evidence also retains the open finding.
+    public, _ = _reconcile_region_local_view_shortfalls(
+        wrapper.name,
+        graph,
+        wrapper,
+        functions,
+        tables,
+        ((7, "reshape", "operator"),),
+        (7,),
+    )
+    assert public == ((7, "reshape", "operator"),)
+    peer_name = "root__planned_region_1"
+    functions[peer_name] = Function(
+        peer_name, region.args, region.blocks,
+    )
+    tables[peer_name] = table
+    tied, _ = _reconcile_region_local_view_shortfalls(
+        wrapper.name,
+        graph,
+        wrapper,
+        functions,
+        tables,
+        ((7, "reshape", "operator"),),
+        (),
+    )
+    assert tied == ((7, "reshape", "operator"),)
+
+
+def test_scalar_control_item_records_identity_instead_of_a_new_formal():
+    from src.compiler.control_source import (
+        ControlExpression,
+        ControlProgram,
+        SequenceBlock,
+    )
+    from src.compiler.precompile_to_ssa import _ControlSSABuilder
+    from src.transmogrifier.ssa import SSAValue
+
+    builder = _ControlSSABuilder(
+        ControlProgram(SequenceBlock(())),
+        function_name="scalar_control_item",
+        first_value_id=100,
+        region_callees={},
+        region_signatures={},
+    )
+    resident = SSAValue(71, dtype="float64", shape=())
+    builder.external_values[71] = resident
+    expression = ControlExpression(
+        "item",
+        (ControlExpression("value", value_id=71),),
+        value_id=73,
+    )
+
+    result = builder.lower_control_expression(expression)
+
+    assert result is resident
+    assert builder.external_values[73] is resident
+    assert builder.control_identity_receipts == [
+        (73, 71, "scalar_item_identity")
+    ]
+    assert builder.arguments == []
+    assert not any(block.instrs for block in builder.blocks.values())
+
+
+def test_resolved_source_graph_index_uses_local_and_qualified_names():
+    function_graph = SimpleNamespace(G=SimpleNamespace(graph={
+        "function_name": "step",
+    }))
+    entry = SimpleNamespace(
+        name="step",
+        qualified_name="package.controller.step",
+        graph=function_graph,
+    )
+    resolved = SimpleNamespace(function_table=(entry,))
+
+    indexed = _resolved_source_graphs_by_symbol(resolved)
+
+    assert indexed["step"] is function_graph.G
+    assert indexed["package.controller.step"] is function_graph.G
+
+
+def test_module_literal_recovery_uses_specialized_source_receipt():
+    import ast
+    import networkx as nx
+
+    from src.transmogrifier.ssa import BasicBlock, Function, SSAValue
+
+    # _recover_late_source_literals indexes and addresses the graph like a
+    # networkx graph, so use the same minimal real container as production.
+    source = nx.DiGraph()
+    source.add_node(
+        8, value_id=8, type="Constant", op="const",
+        expr_obj=ast.Constant("reason"),
+    )
+    entry = SimpleNamespace(
+        name="step", qualified_name="package.step",
+        graph=SimpleNamespace(G=source),
+    )
+    resolved = SimpleNamespace(function_table=(entry,))
+    function = Function(
+        "artifact__step__specialized_deadbeef",
+        [SSAValue(8, dtype="unknown")],
+        {"entry": BasicBlock("entry", [])},
+        metadata={"source_qualified_name": "package.step"},
+    )
+    module = SimpleNamespace(
+        functions={function.name: function}, metadata={},
+    )
+
+    recovered = _recover_module_late_source_literals(module, resolved)
+
+    assert [(name, value_id) for name, value_id, _ in recovered] == [
+        (function.name, 8),
+    ]
+    assert function.args == []
+    assert function.blocks["entry"].instrs[0].op == "string_token"
+    assert module.metadata["final_recovered_source_literals"] == (
+        (function.name, 8),
+    )
+
+
+def test_specialized_source_graph_lookup_follows_qualified_name_receipt():
+    graph = object()
+    function = SimpleNamespace(metadata={
+        "source_qualified_name": "package.controller.step",
+    })
+
+    resolved = _source_graph_for_lowered_function(
+        {
+            "step": graph,
+            "package.controller.step": graph,
+        },
+        "artifact__step__specialized_deadbeef",
+        function,
+    )
+
+    assert resolved is graph
+
+
+def test_module_literal_recovery_survives_destroyed_deployment_graph():
+    import ast
+    import networkx as nx
+
+    from src.transmogrifier.ssa import BasicBlock, Function, SSAValue
+
+    source = nx.DiGraph()
+    source.add_node(
+        8, value_id=8, type="Constant", op="const",
+        expr_obj=ast.Constant("reason"),
+    )
+    entry = SimpleNamespace(
+        name="step", qualified_name="package.step",
+        graph=SimpleNamespace(G=source),
+    )
+    resolved = SimpleNamespace(function_table=(entry,))
+    catalogue = _resolved_source_literals_by_symbol(resolved)
+    source.clear()
+    function = Function(
+        "artifact__step__specialized_deadbeef",
+        [SSAValue(8, dtype="unknown")],
+        {"entry": BasicBlock("entry", [])},
+        metadata={"source_qualified_name": "package.step"},
+    )
+    module = SimpleNamespace(
+        functions={function.name: function}, metadata={},
+    )
+
+    recovered = _recover_module_late_source_literals(
+        module, source_literals_by_symbol=catalogue,
+    )
+
+    assert [(name, value_id) for name, value_id, _ in recovered] == [
+        (function.name, 8),
+    ]
+    assert function.args == []
 
 
 def test_native_object_section_records_mixed_link_language(tmp_path):
@@ -189,6 +565,129 @@ def test_unused_anonymous_formal_does_not_reach_root_abi():
     assert [argument.id for argument in function.args] == [9]
 
 
+def test_late_source_literal_is_defined_internally_instead_of_becoming_input():
+    import ast
+    import networkx as nx
+    from src.compiler.string_table import string_token
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    literal = SSAValue(8)
+    function = Function("root", [literal], {
+        "entry": BasicBlock("entry", [Instr("Ret", [literal], None)]),
+    }, metadata={"parameter_names": (), "authored_parameters": ()})
+    graph = nx.DiGraph()
+    expression = ast.Constant("failure detail")
+    graph.add_node(8, value_id=8, type="Constant", op="const",
+                   expr_obj=expression, attributes={"value": "failure detail"})
+
+    recovered = _recover_late_source_literals(function, graph)
+
+    assert recovered == ((8, "failure detail"),)
+    assert function.args == []
+    instruction = function.blocks["entry"].instrs[0]
+    assert instruction.op == "string_token"
+    assert instruction.res.id == 8
+    assert instruction.attributes == {
+        "token": string_token("failure detail"), "text": "failure detail",
+    }
+
+
+def test_late_source_literal_prefers_its_exact_node_over_an_earlier_alias():
+    import ast
+    import networkx as nx
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    literal = SSAValue(8)
+    function = Function("root", [literal], {
+        "entry": BasicBlock("entry", [Instr("Ret", [literal], None)]),
+    }, metadata={"parameter_names": (), "authored_parameters": ()})
+    graph = nx.DiGraph()
+    graph.add_node(3, value_id=8, type="Alias", op="alias")
+    graph.add_node(8, value_id=8, type="Constant", op="const",
+                   expr_obj=ast.Constant("authored"),
+                   attributes={"value": "authored"})
+
+    assert _recover_late_source_literals(function, graph) == ((8, "authored"),)
+    assert function.args == []
+    assert function.blocks["entry"].instrs[0].op == "string_token"
+
+
+def test_late_source_literal_uses_specialized_constant_ledger_after_graph_rewrite():
+    import networkx as nx
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    literal = SSAValue(8)
+    function = Function("root", [literal], {
+        "entry": BasicBlock("entry", [Instr("Ret", [literal], None)]),
+    }, metadata={
+        "parameter_names": (),
+        "authored_parameters": (),
+        "authored_constant_values": ((8, "specialized authored value"),),
+    })
+    rewritten_graph = nx.DiGraph()
+    rewritten_graph.add_node(8, value_id=8, type="Call", op="Call")
+
+    recovered = _recover_late_source_literals(function, rewritten_graph)
+
+    assert recovered == ((8, "specialized authored value"),)
+    assert function.args == []
+    assert function.blocks["entry"].instrs[0].op == "string_token"
+
+
+def test_late_static_slice_selectors_become_integer_base_offsets():
+    import ast
+    import networkx as nx
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    full = SSAValue(8)
+    bounded = SSAValue(9)
+    dynamic = SSAValue(10)
+    function = Function("root", [full, bounded, dynamic], {
+        "entry": BasicBlock("entry", [
+            Instr("Call", [full, bounded, dynamic], SSAValue(20),
+                  attributes={"callee": "region"}),
+            Instr("Ret", [], None),
+        ]),
+    }, metadata={"parameter_names": (), "authored_parameters": ()})
+    graph = nx.DiGraph()
+    graph.add_node(8, value_id=8, type="Slice", expr_obj=ast.Slice(),
+                   children=[(30, "index")])
+    graph.add_node(
+        9, value_id=9, type="Slice",
+        expr_obj=ast.Slice(ast.Constant(3), ast.Constant(6)),
+        children=[(31, "index")],
+    )
+    graph.add_node(
+        10, value_id=10, type="Slice",
+        expr_obj=ast.Slice(ast.Name("start"), ast.Constant(6)),
+        children=[(32, "index")],
+    )
+
+    recovered = _recover_late_source_slice_offsets(function, graph)
+
+    assert recovered == ((8, 0, None, 1), (9, 3, 6, 1))
+    assert function.args == [dynamic]
+    first, second = function.blocks["entry"].instrs[:2]
+    assert (first.op, first.res, first.attributes) == (
+        "Const", full,
+        {
+            "value": 0,
+            "static_slice_bounds": (0, None, 1),
+            "source_slice_value_id": 8,
+        },
+    )
+    assert (second.op, second.res, second.attributes) == (
+        "Const", bounded,
+        {
+            "value": 3,
+            "static_slice_bounds": (3, 6, 1),
+            "source_slice_value_id": 9,
+        },
+    )
+    assert full.dtype == bounded.dtype == "int64"
+    assert full.accounting["authored_static_slice"] is True
+
+
 def test_locally_defined_call_result_does_not_remain_a_root_formal():
     from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
 
@@ -212,7 +711,9 @@ def test_dead_callee_formal_and_matching_region_operand_are_pruned_together():
     from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
 
     live = SSAValue(10, dtype="float64")
-    dead = SSAValue(11, dtype="float64")
+    dead = SSAValue(11, dtype="float64", accounting={
+        "unbound_variant_source_id": 103, "variant_column": "row",
+    })
     result = SSAValue(12, dtype="float64")
     callee = Function("region", [live, dead], {
         "entry": BasicBlock("entry", [
@@ -220,6 +721,7 @@ def test_dead_callee_formal_and_matching_region_operand_are_pruned_together():
             Instr("Ret", [], None),
         ], []),
     }, metadata={
+        "sequence_array_argument_ids": (dead.id,),
         "source_region_integral": {
             "capture_value_ids": (live.id, dead.id),
         },
@@ -251,6 +753,7 @@ def test_dead_callee_formal_and_matching_region_operand_are_pruned_together():
     assert callee.metadata["source_region_integral"]["capture_value_ids"] == (
         live.id,
     )
+    assert callee.metadata["sequence_array_argument_ids"] == ()
 
 
 def test_dead_pure_structural_value_is_removed_but_public_value_is_kept():
@@ -423,6 +926,10 @@ def test_linked_sequence_argument_binds_its_complete_physical_descriptor():
     assert _bind_sequence_storage_members(bindings, callee, caller)
     assert bindings == {0: 191, 10: 370, 11: 371, 12: 372, 13: 373}
 
+    incumbent = {0: 90, 10: 91, 11: 92, 12: 93, 13: 94}
+    assert _bind_sequence_storage_members(incumbent, callee, caller)
+    assert incumbent == {0: 90, 10: 91, 11: 92, 12: 93, 13: 94}
+
 
 def test_authored_text_parameter_declares_its_utf8_sequence_view():
     from src.compiler.fortran_c_shell import (
@@ -582,6 +1089,38 @@ def test_sequence_query_scheduler_repairs_a_query_separated_before_its_loop():
     assert scheduled.blocks == (producer, query, consumer, tail)
 
 
+def test_starred_generator_max_is_a_resident_ordered_reduction():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    module, outputs, _exports = lower_ast_source_to_ssa(
+        "def root(initial, values, suffix):\n"
+        "    return max(initial, *(value * 2.0 for value in values), suffix)\n",
+        "root",
+        name="starred_generator_max",
+    )
+    function = module.functions["starred_generator_max__root"]
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+
+    assert outputs[function.name]
+    assert any(
+        instruction.attributes.get("binding")
+        == "ssa_sequence_maximum_accumulator"
+        for instruction in instructions
+    )
+    assert sum(
+        instruction.attributes.get("binding")
+        == "ssa_sequence_ordered_maximum"
+        for instruction in instructions
+    ) == 2
+    assert not any(
+        instruction.op == "Max" for instruction in instructions
+    )
+
+
 def test_joined_inline_list_recovers_dynamic_elements_from_consuming_call():
     import ast
     import networkx as nx
@@ -685,6 +1224,42 @@ def test_retained_control_expression_recursively_keeps_bitwise_masks():
     assert expression.operands[0].operands[0].value_id == 0
     assert expression.operands[0].operands[1].op == "const"
     assert expression.operands[0].operands[1].literal == 0x40
+
+
+def test_retained_control_expression_lowers_item_cast_and_isfinite():
+    import ast
+    import networkx as nx
+
+    from src.compiler.fortran_c_shell import _graph_control_expression
+
+    graph = nx.DiGraph()
+    graph.add_node(0, type="Input", parents=())
+    graph.add_node(
+        1, type="item", op="item",
+        expr_obj=ast.parse("value.item()").body[0].value,
+        parents=((0, "operand"),),
+    )
+    graph.add_node(
+        2, type="float", op="float",
+        expr_obj=ast.parse("float(value.item())").body[0].value,
+        parents=((1, "arg:0"),),
+    )
+    graph.add_node(
+        3, type="isfinite", op="isfinite",
+        expr_obj=ast.parse("math.isfinite(float(value.item()))").body[0].value,
+        parents=((2, "arg:0"),),
+    )
+
+    expression = _graph_control_expression(graph, 3)
+
+    assert expression.op == "isfinite"
+    assert expression.operands[0].op == "float"
+    assert expression.operands[0].operands[0].op == "item"
+    assert expression.operands[0].operands[0].operands[0].value_id == 0
+
+    from src.transmogrifier.ssa_registry import Handler
+
+    assert Handler.IsFinite.value == "isfinite"
 
 
 class _ArenaState:
@@ -1569,6 +2144,41 @@ def test_nested_if_threads_inner_phi_into_outer_phi():
     assert outer.args[0].id == inner.res.id
     assert outputs[function.name] == (outer.res,)
     assert not function.metadata.get("structural_output_shortfalls")
+
+
+def test_outer_if_threads_inner_only_assignment_phi():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    module, outputs, _exports = lower_ast_source_to_ssa(
+        "def nested(x, outer, inner):\n"
+        "    value = x\n"
+        "    if outer:\n"
+        "        if inner:\n"
+        "            value = x + 1.0\n"
+        "    return value\n",
+        "nested",
+        name="inner_only_conditional",
+    )
+    function = module.functions["inner_only_conditional__nested"]
+    phis = [
+        (block.name, instruction)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Phi"
+        and instruction.attributes.get("binding") == "conditional_carried"
+    ]
+
+    assert len(phis) == 2
+    inner = next(
+        instruction for block_name, instruction in phis
+        if block_name.startswith("if_merge.1")
+    )
+    outer = next(
+        instruction for block_name, instruction in phis
+        if block_name == "if_merge"
+    )
+    assert outer.args[0] is inner.res
+    assert outputs[function.name] == (outer.res,)
 
 
 def test_iterable_loop_target_is_accounted_as_coordinator_lowered():

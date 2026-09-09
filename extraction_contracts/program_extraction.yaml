@@ -62,6 +62,8 @@ program_abi:
         cfl: {storage: scalar, dtype: float64, mutable: false}
         div_max: {storage: scalar, dtype: float64, mutable: false}
         mass_max: {storage: scalar, dtype: float64, mutable: false}
+        energy_exchange_fraction: {storage: scalar, dtype: float64, mutable: false, optional: true}
+        shadow_growth_max: {storage: scalar, dtype: float64, mutable: false, optional: true}
         # Keyed by scientific channel name. The keys are words, so they lower
         # to the repository's universal string tokens rather than to one
         # opaque handle; a constant channel name and one derived at run time
@@ -74,8 +76,8 @@ program_abi:
         Ki: {storage: scalar, dtype: float64, mutable: false}
         A: {storage: scalar, dtype: float64, mutable: false}
         shrink: {storage: scalar, dtype: float64, mutable: false}
-        dt_min: {storage: scalar, dtype: float64, mutable: false}
-        dt_max: {storage: scalar, dtype: float64, mutable: true}
+        dt_min: {storage: scalar, dtype: float64, mutable: false, optional: true}
+        dt_max: {storage: scalar, dtype: float64, mutable: true, optional: true}
         acc: {storage: scalar, dtype: float64, mutable: true}
         max_vel_ever: {storage: scalar, dtype: float64, mutable: true}
         clamp_events: {storage: scalar, dtype: int64, mutable: true}
@@ -94,6 +96,12 @@ program_abi:
         error_channels: {storage: keyed, dtype: float64, mutable: true}
         hard_failure: {storage: scalar, dtype: bool, mutable: true, default: false}
         advanced_dt: {storage: scalar, dtype: float64, mutable: true, default: null}
+        unresolved_report:
+          storage: table
+          rank: 1
+          mutable: true
+          columns:
+            - {name: token, dtype: int64}
     # Compiler bootstrap boundary.  The graph and its nested DiGraph are
     # structural records; their deterministic SSA/node identities are never
     # renumbered at this boundary.  ``nodes`` and graph metadata remain named

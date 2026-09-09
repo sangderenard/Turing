@@ -90,3 +90,125 @@ See `HANDOFF_2026-09-06.md` (narrative, evidence, tools, open defects).
 3. Resolve the `targets`/`ctrl` projection receivers in step, then rebuild
    and rerun parity.  Then section 5 of the evening plan
    (`DESIGN_DISPATCHER_THREADS_2026-09-05.md`, regressions before code).
+
+## Current resumption (after d50015b4, uncommitted)
+
+The full-native gate now checks formal provenance using check_formal_parity.
+Re-auditing saved trace3 SSA rejects unaccounted formals in five functions,
+including step's fabricated saved46. Three targeted provenance cases pass;
+return-merge repro stays green. No fresh full lowering or native/parity run.
+The previous trace3 build finished and its executable exists. See the handoff's
+resumption section for snapshot semantic mismatch and projection-metadata caveat.
+
+Subsequent targeted work retains call-only branches and conditional-expression
+result merges; native branch/result regressions pass. Record span `copy()` now
+preserves shape (native 2x3 check passes). The authored snapshot diagnostic no
+longer fabricates saved, but remains incorrect: restore's IndexedStore is present
+before SSA and absent from both its region and control program; snapshot effect
+ordering and the production normalizer's field selection remain open. The record
+row effects repro also fails the new provenance gate for step value55, independently
+of the IfExp addition. Full DT parity has not been rerun.
+
+Latest: the lost slice store is fixed at dispatch classification and normalized
+index metadata. Native 2x3 restore passes with DT's repository tensor provider.
+The combined snapshot now executes but remains red: rollback produces [7,garbage]
+instead of [2,3]. Its conditional payload is still scalar and capture follows
+mutation. Earlier diagnostic harnesses omitted the tensor provider; the current
+snapshot driver includes it. See the handoff's latest section for exact evidence.
+
+2026-09-06 further producer audit: structural recovery no longer turns graph
+loop inputs into function parameters. Exact aggregate-parameter member receipts
+are accepted by the native provenance gate; local names/view labels are not,
+and explicitly zero-argument source functions are audited. Seven gate cases
+pass (1.87 s). Singleton tuple/call round-trip compiled native execution passes
+(2x3, six distinct values); nested call-output shape/formal regression passes
+(4.13 s), return merge repro passes (1.75 s). Authored conditional rollback still
+has capture ordering and optional aggregate representation defects. Full DT
+parity and performance remain unverified. Details in the latest handoff section.
+
+2026-09-06 call-only conditional ordering: planner now publishes the existing
+source anchor, preventing empty-region branches from being appended at the end.
+Native capture-before-mutation regression passes (10.60 s); authored snapshot
+SSA now orders capture, mutation, restore, final read. Optional snapshot tuple
+representation remains open; no full DT parity or performance claim.
+
+2026-09-06 method-container follow-up: descriptor propagation now includes
+resolved methods and derives results from their declared record ABI. Native
+method tuple capture/recover regression passes (10.18 s, six 2x3 values, no extra
+inputs). Optional snapshot now fails the provenance gate at capture aggregate
+id 3: its IfExp still expects a scalar handle. This is the next representation
+defect, not a reason to admit another input. Full DT parity remains unverified.
+
+2026-09-06 array-merge prerequisite: fixed matching-shape conditional result
+metadata and C Phi lowering, which previously selected only an array's first
+scalar. Native 2x3 selection and selection feeding compiled multiplication pass;
+scalar conditional-call regression remains green. Optional tuple presence/member
+representation is still open, and DT parity/performance remain unverified.
+
+2026-09-06 optional representation audit: full-native now rejects bare mixed
+None/payload Phis with an explicit presence/payload diagnostic. Four focused
+gate cases and a real Python-source rejection test pass. This is a safeguard,
+not optional support. DT restore is guarded by rejected, while snapshot creation
+uses rollback; optional presence cannot be inferred from matching branch guards.
+
+2026-09-06 authored snapshot semantics: removed the snapshot-specific AST rewrite
+that captured/restored all mutable ABI fields. Ordinary compiled methods now
+perform the exact authored operations. Direct capture/mutate/restore matches
+eager execution of the same source for state, telemetry and return (10.51 s).
+The conditional snapshot still fails at optional merge Phi 5/container input 3;
+full DT parity and performance remain unverified.
+
+2026-09-06 tuple merge progress: conditional tuples now merge matching members
+individually under compiled control. Mixed array/scalar tuples from calls and
+literal arms match eager execution natively (10.46/10.96 s), with no invented
+inputs. Authored scalar shape survives padded helper views; plain array selection
+still passes (10.43 s). None/presence handling is still the next frontier.
+
+2026-09-06 guarded optional snapshot now native/eager verified in either arm
+(10.63/10.98 s), including both flag outcomes and telemetry preservation. Exact
+presence/payload receipts prevent invented inputs; three unsafe consumer cases
+are rejected (4.08 s). General optional ABI/None tests and DT's early-return
+presence proof remain open. Full DT parity/performance are still unverified.
+
+2026-09-06 early-return optional snapshot now matches eager execution for both
+runtime branches, including state, telemetry and return (10.79 s). Source
+fallthrough facts establish presence; source-placed calls no longer get reordered
+by flat hierarchy rank. Inactive span nulls retain pointer dtype through scalar
+inference and C emission. Unsafe guard cases still reject (3.95 s). This is a
+bounded regression, not a whole-DT parity or performance result.
+
+2026-09-06 evening full audit: the strict provenance gate started at 29 illegal
+internal formals and is now at 25. General late recovery supplies native tensor
+`all` and loop-current scalar `item` producers. Terminal `continue` bindings now
+create exact loop-carried state, restoring the step retry loop's `dt_tensor` and
+`retries` Phis. Saved SSA proves scalar reads consume the current header Phis,
+not entry values. A competing BoolOp overlay (32 findings) and an incorrect
+entry-hoist (25 but stale loop values) were both removed. Five functions remain
+red. The final focused gate is 13 passed; the last full audit preceded only a
+metadata-key rename. No native build/parity/performance run, commit, or push.
+See the handoff's "full formal frontier 29 -> 25" section for IDs, evidence, and
+next order.
+
+Latest continuation: the authoritative full driver saved 24 unaccounted
+formals after a general loop-aware scalar expression closure reconstructed
+step's current-dt `item() * 0.5`. A tested nested-conditional incoming-edge
+repair removes run_superstep's fabricated loop initializer from that saved
+module, giving an effective 23; a fresh full driver run has not yet certified
+that count. The current frontier is general record-field SSA state versioning
+for Metrics assignments. See `CONTINUATION_2026-09-06_FULL_NATIVE_FRONTIER.md`.
+
+Correction after the next full driver: 23 is now authoritative, with zero
+undefined operands. The nested conditional is fixed upstream: reducer-authored
+Phis carry their exact incoming value and ordinary control lowering consumes
+those exact Phi parents. The post-link repair and historical fixture were
+removed. A narrower record-field branch-state implementation is experimental;
+it has reducer coverage and lowers the bounded step repro, but is not accepted
+until native/eager whole-record return proves that its selected field version
+reaches physical record storage. The concise continuation document supersedes
+the stale “effective 23” wording above.
+
+The continuation now ends with a read-only second-opinion brief covering the
+formal audit, possible disconnected existing definitions, record-field SSA
+semantics, and opportunities to collapse the 23 findings into general compiler
+mechanisms. It points directly at the four saved evidence artifacts and authored
+source functions.

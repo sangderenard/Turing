@@ -15,6 +15,8 @@ from math import prod
 from typing import Any, Mapping
 import re
 
+from .ssa_aggregate_abi import _constant_integer
+
 
 @dataclass(frozen=True, slots=True)
 class SSAStorageRequirement:
@@ -85,9 +87,9 @@ def module_storage_requirements(
                     and instruction.res is not None
                 ):
                     attributes = getattr(instruction, "attributes", {}) or {}
-                    constant = attributes.get("constant", attributes.get("value"))
-                    if isinstance(constant, (bool, int, float)):
-                        integer_constants[int(instruction.res.id)] = int(constant)
+                    constant = _constant_integer(instruction)
+                    if constant is not None:
+                        integer_constants[int(instruction.res.id)] = constant
                     else:
                         literal = attributes.get("llvm_literal")
                         match = (
@@ -134,6 +136,16 @@ def module_storage_requirements(
                 shapes[function_name].setdefault(value_id, set()).add(shape)
 
     tensor_tables = dict(getattr(module, "tensor_tables", {}) or {})
+    for function_name, table in (getattr(module, "sequence_tables", {}) or {}).items():
+        function = functions.get(function_name)
+        if function is None:
+            continue
+        for sequence_id, count in function.metadata.get("static_mapping_capacity_bounds", {}).items():
+            descriptor = table.sequences.get(int(sequence_id))
+            if descriptor is None:
+                continue
+            for column_id in descriptor.column_value_ids:
+                shapes[function_name].setdefault(int(column_id), set()).add((max(1, int(count)),))
     for function_name, table in tensor_tables.items():
         function_name = str(function_name)
         if function_name not in functions:
@@ -165,6 +177,19 @@ def module_storage_requirements(
         changed = False
         for caller_name, caller in functions.items():
             caller_name = str(caller_name)
+            sequence_table = (getattr(module, "sequence_tables", {}) or {}).get(caller_name)
+            for sequence_id, source_id in caller.metadata.get("sequence_capacity_sources", ()):
+                descriptor = None if sequence_table is None else sequence_table.sequences.get(int(sequence_id))
+                if descriptor is None:
+                    continue
+                # A retained comprehension emits at most one row per input
+                # element. Filtering/deduplication can only reduce that count.
+                bounds = {(max(1, shape[0]),) for shape in shapes[caller_name].get(int(source_id), ()) if shape}
+                for column_id in descriptor.column_value_ids:
+                    column_shapes = shapes[caller_name].setdefault(int(column_id), set())
+                    if not bounds.issubset(column_shapes):
+                        column_shapes.update(bounds)
+                        changed = True
             for block in getattr(caller, "blocks", {}).values():
                 instructions = tuple(getattr(block, "instrs", ()))
                 for call in instructions:

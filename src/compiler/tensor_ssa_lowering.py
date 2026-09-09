@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+from hashlib import sha256
 from math import prod
 from typing import Any, Iterable
 
@@ -23,6 +24,7 @@ from ..transmogrifier.ssa import (
 from ..transmogrifier.ssa_registry import Handler
 from ..transmogrifier.tensor_ssa_reference import SSATensorCodeReference
 from .ssa_aggregate_abi import (
+    _constant_integer,
     legalize_aggregate_adapters,
     legalize_aggregate_output_views,
 )
@@ -416,7 +418,7 @@ def settle_canonical_value_metadata(module: IRModule) -> bool:
                         ).append(value)
     changed = False
     excluded = {"ssa.aggregate", "ptr", "pointer", "ptrptr_float64"}
-    for occurrences in values.values():
+    for identity, occurrences in values.items():
         numerical = [
             value for value in occurrences
             if str(value.dtype or "") not in excluded
@@ -436,6 +438,15 @@ def settle_canonical_value_metadata(module: IRModule) -> bool:
                 value.shape = shape
                 if value.dtype is None and dtype is not None:
                     value.dtype = dtype
+                value.accounting = {
+                    **dict(value.accounting or {}),
+                    "shape_settlement_provenance": (
+                        "canonical_identity_unanimous",
+                        identity[0],
+                        identity[1],
+                    ),
+                    "shape_settlement_tie_policy": "incumbent",
+                }
                 changed = True
     return changed
 
@@ -708,9 +719,9 @@ def propagate_repository_ssa_call_metadata(
             for instruction in block.instrs:
                 if instruction.op != "Const" or instruction.res is None:
                     continue
-                payload = _constant_payload(instruction)
-                if isinstance(payload, (int, float)):
-                    result[int(instruction.res.id)] = int(payload)
+                payload = _constant_integer(instruction)
+                if payload is not None:
+                    result[int(instruction.res.id)] = payload
         constant_indices_cache[key] = result
         return result
 
@@ -745,6 +756,51 @@ def propagate_repository_ssa_call_metadata(
         projection_cache[key] = result
         return result
 
+    def fixed_point_state() -> tuple[Any, ...]:
+        """Snapshot exactly the facts this fixed point may change."""
+
+        def aggregate_item_state(item: Any) -> tuple[Any, ...]:
+            if hasattr(item, "id"):
+                return (
+                    "value", int(item.id), item.dtype,
+                    tuple(item.shape or ()),
+                )
+            if isinstance(item, int):
+                return ("value_id", int(item))
+            return ("opaque", type(item).__name__, repr(item))
+
+        value_state = tuple(
+            (
+                str(function_name), occurrence, int(value.id), value.dtype,
+                tuple(value.shape or ()),
+                (value.accounting or {}).get("physical_dtype"),
+                tuple(
+                    aggregate_item_state(item)
+                    for item in (value.accounting or {}).get(
+                        "ssa_aggregate_outputs", ()
+                    )
+                ),
+            )
+            for function_name, function in module.functions.items()
+            for occurrence, value in enumerate(values(function))
+        )
+        descriptor_state = tuple(
+            (
+                str(function_name), int(tensor_id), descriptor.dtype,
+                tuple(descriptor.shape), tuple(descriptor.strides),
+                (
+                    None if descriptor.byte_size is None
+                    else int(descriptor.byte_size)
+                ),
+                str(descriptor.metadata_state),
+            )
+            for function_name, table in getattr(
+                module, "tensor_tables", {}
+            ).items()
+            for tensor_id, descriptor in sorted(table.tensors.items())
+        )
+        return value_state, descriptor_state
+
     changed = True
     settle_exact_formals = True
     # Authoritative return metadata is a settling phase, not a permanent
@@ -754,7 +810,15 @@ def propagate_repository_ssa_call_metadata(
     # fact enters the module.  Apply the exact return contract once, then let
     # the ordinary fill-only propagation carry those settled facts outward.
     settle_exact_returns = bool(authoritative_returns)
+    initial_state = fixed_point_state()
+    seen_states = {initial_state: 0}
+    state_receipts = [{
+        "round": 0,
+        "digest": sha256(repr(initial_state).encode("utf-8")).hexdigest(),
+    }]
+    fixed_point_round = 0
     while changed:
+        fixed_point_round += 1
         changed = False
         for function_name, function in module.functions.items():
             # Elementwise/reduction results inherit a shaped numerical input;
@@ -971,7 +1035,27 @@ def propagate_repository_ssa_call_metadata(
                                             )
         settle_exact_formals = False
         settle_exact_returns = False
+        state = fixed_point_state()
+        state_receipts.append({
+            "round": fixed_point_round,
+            "digest": sha256(repr(state).encode("utf-8")).hexdigest(),
+        })
+        if changed and state in seen_states:
+            first_round = seen_states[state]
+            module.metadata["call_metadata_fixed_point_receipts"] = tuple(
+                state_receipts
+            )
+            raise RuntimeError(
+                "repository SSA call metadata fixed point repeated state "
+                f"from round {first_round} at round {fixed_point_round} "
+                "while a pass still reported change"
+            )
+        seen_states.setdefault(state, fixed_point_round)
         changed_any |= changed
+    module.metadata["call_metadata_fixed_point_rounds"] = fixed_point_round
+    module.metadata["call_metadata_fixed_point_receipts"] = tuple(
+        state_receipts
+    )
     return changed_any
 
 
@@ -1499,6 +1583,9 @@ def lower_tensor_calls_to_repository_ssa(
                 if (
                     len(args) == 2
                     and operation in {"min", "max"}
+                    and _attribute(
+                        instruction.attributes, "axis", "dim"
+                    ) is None
                     and all(_known_count(argument) == 1 for argument in args)
                     and _known_count(result) == 1
                 ):
@@ -1526,7 +1613,13 @@ def lower_tensor_calls_to_repository_ssa(
                 # normalize them here, after call arity is known, so they use
                 # the existing broadcast/scalar repository kernels.  Do not
                 # rewrite one-argument iterable reductions.
-                if len(args) == 2 and operation in {"min", "max"}:
+                if (
+                    len(args) == 2
+                    and operation in {"min", "max"}
+                    and _attribute(
+                        instruction.attributes, "axis", "dim"
+                    ) is None
+                ):
                     operation = {
                         "min": "minimum",
                         "max": "maximum",
@@ -1591,8 +1684,18 @@ def lower_tensor_calls_to_repository_ssa(
                             rank_value, rank_def = constant(
                                 len(source_shape), "int32"
                             )
+                            known_value_count = _known_count(value)
+                            if known_value_count is None:
+                                shortfalls.append(TensorSSALoweringShortfall(
+                                    function.name,
+                                    block.name,
+                                    operation,
+                                    "index assignment value extent is unknown",
+                                ))
+                                rewritten.append(instruction)
+                                continue
                             value_count, value_count_def = constant(
-                                prod(len(indices) for indices, _drop in axes),
+                                known_value_count,
                                 "int32",
                             )
                             result.shape = source_shape
@@ -1823,6 +1926,34 @@ def lower_tensor_calls_to_repository_ssa(
                     and int(argument.id) in constants
                 ]
                 source = data_args[0] if data_args else (args[0] if args else None)
+                # An earlier instruction in this same rewrite can establish
+                # the physical descriptor for a value whose later occurrence
+                # was captured before shape settlement.  Use that resident
+                # descriptor only to fill a missing occurrence shape.  An
+                # already shaped occurrence remains the incumbent, including
+                # an equal-priority view spelling.
+                for operand in data_args:
+                    if tuple(operand.shape or ()):
+                        continue
+                    incumbent = tensor_table.by_id(int(operand.id))
+                    if (
+                        incumbent is None
+                        or incumbent.metadata_state != "static"
+                        or not tuple(incumbent.shape or ())
+                    ):
+                        continue
+                    operand.shape = tuple(incumbent.shape)
+                    if operand.dtype is None and incumbent.dtype:
+                        operand.dtype = incumbent.dtype
+                    operand.accounting = {
+                        **dict(operand.accounting or {}),
+                        "shape_settlement_provenance": (
+                            "resident_descriptor_incumbent",
+                            function_name,
+                            int(operand.id),
+                        ),
+                        "shape_settlement_tie_policy": "incumbent",
+                    }
                 tensor_opcode = c_tensor_opcode(operation)
                 if (
                     tensor_opcode is not None

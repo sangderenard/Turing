@@ -66,6 +66,22 @@ def test_default_contract_draws_python_native_and_decompile_lines():
     assert dt_abi.field.storage == "scalar"
     assert dt_abi.field.dtype == "float64"
     assert dt_abi.python_type == "builtins.float"
+    report = contract.program_abi.records["Metrics"].fields[
+        "unresolved_report"
+    ]
+    assert report.storage == "table"
+    assert report.rank == 1
+    assert report.mutable is True
+    assert report.table_columns == ({"name": "token", "dtype": "int64"},)
+    targets = contract.program_abi.records["Targets"]
+    assert targets.fields["energy_exchange_fraction"].optional is True
+    assert targets.fields["shadow_growth_max"].optional is True
+    assert targets.fields["energy_exchange_fraction"].dtype == "float64"
+    controller = contract.program_abi.records["STController"]
+    assert controller.fields["dt_min"].optional is True
+    assert controller.fields["dt_max"].optional is True
+    assert controller.fields["Kp"].optional is False
+    assert controller.receipt()["fields"]["dt_min"]["optional"] is True
 
     assert contract.decide(Adam).action is ExtractionAction.INGEST_PYTHON
     assert contract.decide(range).action is ExtractionAction.INTRINSIC

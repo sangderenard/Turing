@@ -17,6 +17,8 @@ source from dt_controller.py.
 from __future__ import annotations
 
 import inspect
+import os
+import pickle
 import sys
 import time
 from pathlib import Path
@@ -115,7 +117,12 @@ def main() -> int:
     try:
         module, outputs, exports = lower_ast_source_to_ssa(
             source, "root", name="step_used", extraction_contract=policy,
+            retain=(BalloonTireManagedState, STController, Metrics, Targets),
         )
+        if os.environ.get("TURING_REPRO_SSA"):
+            output = Path(os.environ["TURING_REPRO_SSA"])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(pickle.dumps(module))
         print(f"LOWERED in {time.time()-t0:.2f}s", flush=True)
         return 0
     except Exception as error:

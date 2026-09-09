@@ -17,6 +17,7 @@ from src.compiler.control_source import (
     SequenceBlock,
     SequenceMutationBlock,
     SequenceQueryBlock,
+    ScalarFieldWriteBlock,
     StatementBlock,
     StateMachineTick,
     WhileBlock,
@@ -41,6 +42,7 @@ from src.compiler.precompile_to_ssa import (
     resolve_sequence_schemas,
 )
 from src.compiler.ssa_fortran_backend import emit_module
+from src.compiler.ssa_self_check import check_definition_dominance
 from src.compiler.shell_reference_tables import (
     ClassNavigationMember,
     ClassNavigationRecord,
@@ -239,6 +241,7 @@ def test_control_wrapper_materializes_authored_constants_outside_its_abi():
     assert instruction.res.id == 1
     assert instruction.res.dtype == "int"
     assert instruction.attributes == {"value": 8}
+    assert function.metadata["authored_constant_values"] == ((1, 8),)
 
 
 def test_repeat_lowers_as_native_fortran_axis_tiling():
@@ -2601,6 +2604,118 @@ def test_while_result_port_is_an_exact_exit_phi():
     assert 3 not in {argument.id for argument in function.args}
 
 
+def test_while_result_port_read_inside_body_uses_live_updated_value():
+    control = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=StatementBlock(("__scheduled_region_0__",)),
+            body=SequenceBlock((
+                StatementBlock(("__scheduled_region_1__",)),
+                StatementBlock(("__scheduled_region_2__",)),
+            )),
+            carried_aliases=((2, 1),),
+            result_ports=((3, 1, 2),),
+        ),
+        region_indices=(0, 1, 2),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={
+            0: ((1,), (10,)),
+            1: ((1,), (2,)),
+            # The source graph retained the post-loop spelling for a lexical
+            # read still inside the body.
+            2: ((3,), (4,)),
+        },
+    )
+
+    assert shortfalls == ()
+    second_call = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call" and instruction.attributes["region_index"] == 2
+    )
+    assert [argument.id for argument in second_call.args] == [2]
+    result_phi = next(
+        instruction
+        for instruction in function.blocks["while_exit"].instrs
+        if instruction.attributes.get("binding") == "loop_result_port"
+    )
+    assert result_phi.res.id == 3
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
+def test_while_result_port_storage_spelling_uses_live_updated_value_in_body():
+    control = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=StatementBlock(("__scheduled_region_0__",)),
+            body=SequenceBlock((
+                StatementBlock(("__scheduled_region_1__",)),
+                StatementBlock(("__scheduled_region_2__",)),
+            )),
+            carried_aliases=((2, 1),),
+            result_ports=((3, 1, 2),),
+        ),
+        region_indices=(0, 1, 2),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={
+            0: ((1,), (10,)),
+            1: ((1,), (2,)),
+            2: ((5,), (4,)),
+        },
+        value_aliases={3: 5},
+    )
+
+    assert shortfalls == ()
+    second_call = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call" and instruction.attributes["region_index"] == 2
+    )
+    assert [argument.id for argument in second_call.args] == [2]
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
+def test_while_result_port_versions_an_already_defined_body_identity():
+    control = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=StatementBlock(("__scheduled_region_0__",)),
+            body=StatementBlock(("__scheduled_region_1__",)),
+            carried_aliases=((2, 1),),
+            result_ports=((2, 1, 2),),
+        ),
+        region_indices=(0, 1),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={
+            0: ((1,), (10,)),
+            1: ((1,), (2,)),
+        },
+    )
+
+    assert shortfalls == ()
+    result_phi = next(
+        instruction
+        for instruction in function.blocks["while_exit"].instrs
+        if instruction.attributes.get("binding") == "loop_result_port"
+    )
+    assert result_phi.res.id != 2
+    assert result_phi.res.accounting["source_value_id"] == 2
+    assert result_phi.res.accounting["tie_policy"] == "incumbent_body_definition"
+    assert function.metadata["carried_port_values"][2] is result_phi.res
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
 def test_while_result_port_selects_the_value_visible_on_a_break_edge():
     control = ControlProgram(
         WhileBlock(
@@ -2786,6 +2901,75 @@ def test_while_carried_phi_uses_conditional_merge_as_backedge_definition():
     )
 
 
+def test_predicated_continue_completes_partial_updates_with_incumbent():
+    """A continue edge carries its update only on paths that define it."""
+
+    control = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=StatementBlock(("__scheduled_region_0__",)),
+            body=SequenceBlock((
+                StatementBlock(("__scheduled_region_2__",)),
+                ConditionalBlock(
+                    predicate_value_id=11,
+                    body=StatementBlock(("__scheduled_region_1__",)),
+                    orelse=SequenceBlock(()),
+                    predicate_expression=ControlExpression("value", value_id=11),
+                ),
+                LoopControlBlock(
+                    "continue",
+                    predicate_value_id=11,
+                    site_node_id=99,
+                ),
+            )),
+            carried_aliases=((2, 1),),
+            control_site_ids=(99,),
+        ),
+        region_indices=(0, 1, 2),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={
+            0: ((1,), (10,)),
+            1: ((1,), (2,)),
+            2: ((1,), (11,)),
+        },
+        region_value_meta={
+            1: Meta((), "float64"),
+            2: Meta((), "float64"),
+            10: Meta((), "bool"),
+            11: Meta((), "bool"),
+        },
+    )
+
+    assert shortfalls == ()
+    module = IRModule({function.name: function})
+    assert check_definition_dominance(module) == []
+    continue_phi = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "loop_continue_carried"
+    )
+    carried_phi = next(
+        instruction
+        for instruction in function.blocks["while_header"].instrs
+        if instruction.attributes.get("binding") == "loop_carried"
+    )
+    latch_phi = next(
+        instruction
+        for instruction in function.blocks["while_latch"].instrs
+        if instruction.attributes.get("binding") == "loop_latch_carried"
+    )
+    assert continue_phi.attributes["tie_policy"] == "incumbent"
+    assert carried_phi.res in continue_phi.args
+    assert any(value.id == 2 for value in continue_phi.args)
+    assert continue_phi.res in latch_phi.args
+    assert carried_phi.res in latch_phi.args
+    assert carried_phi.args[1] is latch_phi.res
+
+
 def test_while_identity_assignment_is_a_defined_phi_backedge():
     control = ControlProgram(WhileBlock(
         predicate_value_id=10,
@@ -2871,6 +3055,40 @@ def test_terminal_loop_return_runs_after_predicated_sequence_effects():
     assert 12 not in {value.id for value in function.args}
 
 
+def test_constant_true_while_does_not_create_a_synthetic_return_path():
+    """The false header edge of ``while True`` cannot supply function results."""
+
+    control = ControlProgram(WhileBlock(
+        predicate_value_id=20,
+        condition=SequenceBlock(()),
+        body=SequenceBlock((
+            StatementBlock(("__scheduled_region_1__",)),
+            LoopControlBlock("return", return_value_ids=(2,)),
+        )),
+        predicate_expression=ControlExpression(
+            "const", value_id=20, literal=True,
+        ),
+    ), region_indices=(1,))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={1: ((1,), (2,))},
+        region_value_meta={
+            1: Meta((), "float64"),
+            2: Meta((), "float64"),
+            20: Meta((), "bool"),
+        },
+        output_value_ids=(2,),
+    )
+
+    assert shortfalls == ()
+    assert function.blocks["while_header"].successors == ["while_body"]
+    header_branch = function.blocks["while_header"].instrs[-1]
+    assert header_branch.attributes["constant_predicate"] is True
+    assert header_branch.attributes["source_value_id"] == 20
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
 def test_lexical_sequence_mutation_block_stays_inside_conditional_arm():
     mutation = ControlSequenceMutation(
         sequence_value_id=30,
@@ -2900,6 +3118,238 @@ def test_lexical_sequence_mutation_block_stays_inside_conditional_arm():
     )
     assert append_site[0].startswith("if_true")
     assert append_site[1].attributes["ssa_sequence_operation"] == "append"
+
+
+def test_scalar_field_write_effect_versions_feed_conditional_merge():
+    """SetAttr identities denote the scalar value committed at that site."""
+
+    control = ControlProgram(SequenceBlock((
+        ScalarFieldWriteBlock(
+            field_value_id=30,
+            value_expression=ControlExpression("value", value_id=12),
+            dtype="int64",
+            effect_node_id=40,
+        ),
+        ConditionalBlock(
+            predicate_value_id=10,
+            body=SequenceBlock((ScalarFieldWriteBlock(
+                field_value_id=30,
+                value_expression=ControlExpression("value", value_id=13),
+                dtype="int64",
+                effect_node_id=41,
+            ),)),
+            orelse=SequenceBlock(()),
+            predicate_expression=ControlExpression("value", value_id=10),
+            carried_aliases=((41, 40, 40, 42),),
+            source_node_id=50,
+        ),
+    )))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_value_meta={
+            10: Meta((), "bool"),
+            12: Meta((), "int64"),
+            13: Meta((), "int64"),
+            30: Meta((), "int64"),
+        },
+    )
+
+    assert shortfalls == ()
+    carried = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "conditional_carried"
+    )
+    assert [value.id for value in carried.args] == [13, 12]
+    assert {40, 41}.isdisjoint(value.id for value in function.args)
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
+def test_inplace_scalar_field_effect_uses_resident_incumbent_on_false_arm():
+    control = ControlProgram(ConditionalBlock(
+        predicate_value_id=10,
+        body=SequenceBlock((ScalarFieldWriteBlock(
+            field_value_id=30,
+            value_expression=ControlExpression("value", value_id=12),
+            dtype="int64",
+            effect_node_id=40,
+        ),)),
+        orelse=SequenceBlock(()),
+        predicate_expression=ControlExpression("value", value_id=10),
+        carried_aliases=((40, 40, 40, 42),),
+        source_node_id=50,
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_value_meta={
+            10: Meta((), "bool"),
+            12: Meta((), "int64"),
+            30: Meta((), "int64"),
+        },
+    )
+
+    assert shortfalls == ()
+    carried = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "conditional_carried"
+    )
+    assert [value.id for value in carried.args] == [12, 30]
+    assert 40 not in {value.id for value in function.args}
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
+def test_sequential_conditional_uses_prior_merge_for_reused_arm_identity():
+    """A later if sees the first if's merge, not its true-arm temporary."""
+
+    control = ControlProgram(SequenceBlock((
+        ConditionalBlock(
+            predicate_value_id=10,
+            body=SequenceBlock((ScalarFieldWriteBlock(
+                field_value_id=30,
+                value_expression=ControlExpression("value", value_id=12),
+                dtype="int64",
+                effect_node_id=40,
+            ),)),
+            orelse=SequenceBlock(()),
+            predicate_expression=ControlExpression("value", value_id=10),
+            carried_aliases=((40, 30, 30, 42),),
+            source_node_id=50,
+        ),
+        ConditionalBlock(
+            predicate_value_id=11,
+            body=SequenceBlock((ScalarFieldWriteBlock(
+                field_value_id=30,
+                value_expression=ControlExpression("value", value_id=13),
+                dtype="int64",
+                effect_node_id=41,
+            ),)),
+            orelse=SequenceBlock(()),
+            predicate_expression=ControlExpression("value", value_id=11),
+            carried_aliases=((41, 40, 40, 43),),
+            source_node_id=51,
+        ),
+    )))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_value_meta={
+            10: Meta((), "bool"),
+            11: Meta((), "bool"),
+            12: Meta((), "int64"),
+            13: Meta((), "int64"),
+            30: Meta((), "int64"),
+        },
+    )
+
+    assert shortfalls == ()
+    carried = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "conditional_carried"
+    ]
+    assert len(carried) == 2
+    assert [value.id for value in carried[0].args] == [12, 30]
+    assert [value.id for value in carried[1].args] == [13, carried[0].res.id]
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
+def test_conditional_versions_join_when_graph_reuses_arm_identity():
+    control = ControlProgram(ConditionalBlock(
+        predicate_value_id=10,
+        body=ConditionalBlock(
+            predicate_value_id=11,
+            body=SequenceBlock((ScalarFieldWriteBlock(
+                field_value_id=30,
+                value_expression=ControlExpression("value", value_id=12),
+                dtype="int64",
+                effect_node_id=41,
+            ),)),
+            orelse=SequenceBlock(()),
+            predicate_expression=ControlExpression("value", value_id=11),
+            carried_aliases=((41, 41, 41, 40),),
+            source_node_id=51,
+        ),
+        orelse=SequenceBlock(()),
+        predicate_expression=ControlExpression("value", value_id=10),
+        carried_aliases=((40, 30, 30, 40),),
+        source_node_id=50,
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_value_meta={
+            10: Meta((), "bool"),
+            11: Meta((), "bool"),
+            12: Meta((), "int64"),
+            30: Meta((), "int64"),
+        },
+    )
+
+    assert shortfalls == ()
+    carried = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "conditional_carried"
+        and instruction.res.accounting.get("ssa_conditional_write_version")
+    )
+    assert [value.id for value in carried.args] == [40, 30]
+    assert carried.res.id == 100
+    assert carried.res.accounting == {
+        "source_value_id": 40,
+        "ssa_conditional_write_version": True,
+    }
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
+def test_local_record_scalar_state_versions_need_no_storage_formal():
+    control = ControlProgram(SequenceBlock((
+        ScalarFieldWriteBlock(
+            field_value_id=None,
+            value_expression=ControlExpression(
+                "const", value_id=12, literal=False,
+            ),
+            dtype="bool",
+            effect_node_id=40,
+        ),
+        ConditionalBlock(
+            predicate_value_id=10,
+            body=SequenceBlock((ScalarFieldWriteBlock(
+                field_value_id=None,
+                value_expression=ControlExpression(
+                    "const", value_id=13, literal=True,
+                ),
+                dtype="bool",
+                effect_node_id=41,
+            ),)),
+            orelse=SequenceBlock(()),
+            predicate_expression=ControlExpression("value", value_id=10),
+            carried_aliases=((41, 40, 40, 42),),
+            source_node_id=50,
+        ),
+    )))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_value_meta={10: Meta((), "bool")},
+    )
+
+    assert shortfalls == ()
+    assert not any(
+        instruction.op == "Store"
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+    assert {40, 41}.isdisjoint(value.id for value in function.args)
+    assert check_definition_dominance(IRModule({function.name: function})) == []
 
 
 def test_conditional_sequence_assignment_replaces_one_resident_arena():
@@ -2942,7 +3392,7 @@ def test_conditional_sequence_assignment_replaces_one_resident_arena():
         if instruction.attributes.get("plan_callsite_id") == 99
     )
     assert planned_call[0].startswith("if_true")
-    assert any(
+    assert not any(
         instruction.attributes.get("binding")
         == "ssa_sequence_replace_clear"
         for block in function.blocks.values()
@@ -2993,6 +3443,91 @@ def test_sequence_first_or_default_query_is_resident_and_receipted():
     assert query_phi.attributes["extraction_identity"] == "builtins.next"
     assert 50 not in {value.id for value in function.args}
     assert 51 not in {value.id for value in function.args}
+
+
+def test_sequence_maximum_query_carries_order_and_retains_incumbent_on_ties():
+    control = ControlProgram(SequenceBlock((
+        SequenceMutationBlock(ControlSequenceMutation(
+            sequence_value_id=30,
+            operator="append",
+            argument_value_ids=(12,),
+            effect_node_id=40,
+            policy="duplicates",
+        )),
+        SequenceQueryBlock(
+            result_value_id=50,
+            sequence_value_id=30,
+            operation="maximum",
+            source_call_node_id=41,
+            extraction_identity="builtins.max",
+            result_alias_ids=(51,),
+            reduction_prefix_value_ids=(10,),
+            reduction_suffix_value_ids=(11,),
+        ),
+    )))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_value_meta={
+            10: Meta((), "float64"),
+            11: Meta((), "float64"),
+            12: Meta((), "float64"),
+        },
+        sequence_initializations=((30, "duplicates", 1),),
+        sequence_declarations=((30, "duplicates", 1, True),),
+        sequence_column_dtypes={30: ("float64",)},
+    )
+
+    assert shortfalls == ()
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+    ordered = [
+        instruction for instruction in instructions
+        if instruction.attributes.get("binding")
+        == "ssa_sequence_ordered_maximum"
+    ]
+    assert len(ordered) == 2
+    assert all(instruction.op == "Phi" for instruction in ordered)
+    accumulator = next(
+        candidate.res for candidate in instructions
+        if candidate.attributes.get("binding")
+        == "ssa_sequence_maximum_accumulator"
+    )
+    loop_comparison = next(
+        instruction for instruction in instructions
+        if instruction.op == "Gt" and instruction.args[1] is accumulator
+    )
+    loop_choice = ordered[0]
+    assert loop_choice.args == [loop_comparison.args[0], accumulator]
+    assert ordered[1].args[1] is not loop_comparison.args[0]
+    assert 50 not in {value.id for value in function.args}
+    assert 51 not in {value.id for value in function.args}
+
+    descriptor = function.metadata["sequence_table"].sequences[30]
+    arena_id = int(descriptor.column_value_ids[0])
+    append = next(
+        instruction for instruction in instructions
+        if instruction.attributes.get("ssa_sequence_operation") == "append"
+    )
+    maximum_read = next(
+        instruction for instruction in instructions
+        if instruction.op == "GetElementPtr"
+        and instruction.attributes.get("binding") == "ssa_sequence_maximum"
+    )
+    assert arena_id == 30
+    assert int(append.args[0].id) == arena_id
+    assert int(append.args[-1].id) == 12
+    assert append.args[0] is not append.args[-1]
+    assert int(maximum_read.args[0].id) == arena_id
+    arena = next(value for value in function.args if int(value.id) == arena_id)
+    assert arena.accounting["compiler_frame_sequence_id"] == 30
+    assert arena.accounting["transformation_priority"] == (
+        "compiler_storage_identity"
+    )
+    assert arena.accounting["transformation_tie_policy"] == "incumbent"
 
 
 def test_fixed_width_sequence_append_passes_every_row_column():

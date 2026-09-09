@@ -100,6 +100,8 @@ def compiler_toolchain_fingerprint() -> dict[str, Any]:
         "src/compiler/ssa_features.py",
         "src/compiler/ssa_c_backend.py",
         "src/compiler/ssa_fortran_backend.py",
+        "src/compiler/ssa_record_return_state.py",
+        "src/compiler/ssa_reachability.py",
         "src/compiler/string_table.py",
         "src/compiler/topology_catalogue.py",
         "src/transmogrifier/function_table.py",

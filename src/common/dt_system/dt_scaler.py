@@ -37,6 +37,11 @@ class Metrics:
     error_channels: dict[str, float] = field(default_factory=dict)
     hard_failure: bool = False
     advanced_dt: float | None = None
+    # Stable diagnostic tokens attached by the controller when it proceeds
+    # unresolved.  This is a total record field: ordinary and hard-failure
+    # metrics carry the empty report, so native record state never has to
+    # encode Python's dynamic-attribute absence as an anonymous input.
+    unresolved_report: list[str] = field(default_factory=list)
 
 
 def _scalar(value, default: float = 0.0) -> float:
@@ -87,6 +92,7 @@ def coerce_metrics(value) -> Metrics:
         error_channels=channels,
         hard_failure=bool(getattr(value, "hard_failure", False)),
         advanced_dt=None if advanced_dt is None else _scalar(advanced_dt),
+        unresolved_report=list(getattr(value, "unresolved_report", ())),
     )
     if isinstance(value, Metrics):
         # Keep the caller's object identity (diagnostics such as

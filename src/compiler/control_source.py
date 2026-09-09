@@ -99,6 +99,9 @@ class ConditionalBlock:
     # the arm that owns them.
     body_callsite_ids: tuple[int, ...] = ()
     orelse_callsite_ids: tuple[int, ...] = ()
+    # (true-arm value, false-arm value, expression result). Unlike a carried
+    # assignment, an expression has no pre-branch value to snapshot or rebind.
+    result_aliases: tuple[tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -412,6 +415,22 @@ class SequenceMutationBlock:
 
 
 @dataclass(frozen=True)
+class ScalarFieldWriteBlock:
+    """Publish a scalar field version at its authored effect site.
+
+    ``field_value_id`` names resident parameter storage when the receiver has a
+    physical in/out ABI.  A local or returned record has no such cell in this
+    control function; ``None`` still publishes the exact field-state version
+    for conditional joins and later record-return materialization.
+    """
+
+    field_value_id: int | None
+    value_expression: ControlExpression
+    dtype: str
+    effect_node_id: int
+
+
+@dataclass(frozen=True)
 class SequenceQueryBlock:
     """Read one scalar fact from a resident sequence at lexical position."""
 
@@ -431,16 +450,24 @@ class SequenceQueryBlock:
     # integer row handle.  The default arm uses -1 and subsequent source
     # ``is [not] None`` tests consume that tag.
     row_handle: bool = False
+    # Ordered scalar operands surrounding a starred resident sequence. For
+    # ``max(a, *items, b)`` these are ``(a,)`` and ``(b,)``. Keeping the two
+    # sides distinct preserves Python's left-to-right comparison semantics,
+    # including equal values and NaNs retaining the incumbent.
+    reduction_prefix_value_ids: tuple[int, ...] = ()
+    reduction_suffix_value_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.operation not in {
-            "length", "truth", "first_or_default", "lookup",
+            "length", "truth", "first_or_default", "lookup", "maximum",
         }:
             raise ValueError("unknown resident sequence query")
         if self.operation == "first_or_default" and self.default_value_id is None:
             raise ValueError("first_or_default requires an explicit default")
         if self.operation == "lookup" and not self.key_value_ids:
             raise ValueError("lookup requires at least one exact key identity")
+        if self.operation == "maximum" and not self.reduction_prefix_value_ids:
+            raise ValueError("maximum requires an incumbent before the starred sequence")
 
 
 @dataclass(frozen=True)
@@ -476,6 +503,7 @@ ControlBlock = (
     | ValidationBlock
     | SequenceMutationBlock
     | SequenceQueryBlock
+    | ScalarFieldWriteBlock
     | StreamPublishBlock
 )
 
@@ -593,11 +621,24 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
             expression_values(block.predicate_expression)
         elif isinstance(block, SequenceMutationBlock):
             mutation_values((block.mutation,))
+        elif isinstance(block, ScalarFieldWriteBlock):
+            if block.field_value_id is not None:
+                values.add(int(block.field_value_id))
+            values.add(int(block.effect_node_id))
+            expression_values(block.value_expression)
         elif isinstance(block, SequenceQueryBlock):
             values.add(int(block.result_value_id))
             values.update(int(value_id) for value_id in block.result_alias_ids)
             values.add(int(block.sequence_value_id))
             values.update(int(value_id) for value_id in block.key_value_ids)
+            values.update(
+                int(value_id) for value_id
+                in block.reduction_prefix_value_ids
+            )
+            values.update(
+                int(value_id) for value_id
+                in block.reduction_suffix_value_ids
+            )
             if block.default_value_id is not None:
                 values.add(int(block.default_value_id))
         elif isinstance(block, StreamPublishBlock):
@@ -993,6 +1034,17 @@ def render_control_block(
         return (
             f"turing_sequence_{mutation.operator}(value_{int(mutation.sequence_value_id)});",
         )
+    if isinstance(block, ScalarFieldWriteBlock):
+        suffix = "" if target in {ControlTarget.PYTHON, ControlTarget.FORTRAN} else ";"
+        destination_id = (
+            int(block.effect_node_id)
+            if block.field_value_id is None
+            else int(block.field_value_id)
+        )
+        return (
+            f"value_{destination_id} = "
+            f"{_render_expression(block.value_expression, target)}{suffix}",
+        )
     if isinstance(block, SequenceQueryBlock):
         if block.operation == "truth":
             return (
@@ -1012,6 +1064,20 @@ def render_control_block(
                 f"value_{int(block.result_value_id)} = "
                 f"turing_sequence_lookup(value_{int(block.sequence_value_id)}, "
                 f"{keys});",
+            )
+        if block.operation == "maximum":
+            prefix = ", ".join(
+                f"value_{int(value_id)}"
+                for value_id in block.reduction_prefix_value_ids
+            )
+            suffix = ", ".join(
+                f"value_{int(value_id)}"
+                for value_id in block.reduction_suffix_value_ids
+            )
+            return (
+                f"value_{int(block.result_value_id)} = "
+                f"turing_sequence_maximum(value_{int(block.sequence_value_id)}, "
+                f"{{{prefix}}}, {{{suffix}}});",
             )
         return (
             f"value_{int(block.result_value_id)} = "
@@ -1329,15 +1395,10 @@ def compose_region_code(
         if isinstance(block, SequenceBlock):
             return SequenceBlock(tuple(substitute(child) for child in block.blocks))
         if isinstance(block, ConditionalBlock):
-            return ConditionalBlock(
-                block.predicate_value_id,
-                substitute(block.body),
-                None if block.orelse is None else substitute(block.orelse),
-                block.expect_true,
-                block.predicate_expression,
-                block.carried_aliases,
-                block.source_node_id,
-                block.carried_sequence_aliases,
+            return replace(
+                block,
+                body=substitute(block.body),
+                orelse=None if block.orelse is None else substitute(block.orelse),
             )
         if isinstance(block, LoopBlock):
             return LoopBlock(
@@ -1376,7 +1437,7 @@ def compose_region_code(
             )
         if isinstance(block, LoopControlBlock):
             return block
-        if isinstance(block, SequenceMutationBlock):
+        if isinstance(block, (SequenceMutationBlock, ScalarFieldWriteBlock)):
             return block
         if isinstance(block, SequenceQueryBlock):
             return block
@@ -1477,7 +1538,7 @@ def project_control_regions(
             orelse = (
                 None if block.orelse is None else project(block.orelse)
             )
-            if body is None and orelse is None:
+            if body is None and orelse is None and not block.result_aliases:
                 return None
             return ConditionalBlock(
                 block.predicate_value_id,
@@ -1502,6 +1563,10 @@ def project_control_regions(
                         for value_id in carried
                     )
                 ),
+                entry_record_projections=block.entry_record_projections,
+                body_callsite_ids=block.body_callsite_ids,
+                orelse_callsite_ids=block.orelse_callsite_ids,
+                result_aliases=block.result_aliases,
             )
         if isinstance(block, LoopBlock):
             body = project(block.body)
@@ -1514,6 +1579,7 @@ def project_control_regions(
                 body is None
                 and not block.sequence_mutations
                 and not has_structural_body
+                and block.source_loop_node_id is None
             ):
                 return None
             return LoopBlock(
@@ -1646,7 +1712,7 @@ def project_control_regions(
             return block
         if isinstance(block, ValidationBlock):
             return block
-        if isinstance(block, SequenceMutationBlock):
+        if isinstance(block, (SequenceMutationBlock, ScalarFieldWriteBlock)):
             return block
         if isinstance(block, SequenceQueryBlock):
             return block
@@ -2300,6 +2366,7 @@ def overlay_scheduled_control(
             and (
                 bool(control.root.sequence_mutations)
                 or str(control.root.induction) in call_only_inductions
+                or control.root.source_loop_node_id is not None
             )
             or isinstance(control.root, WhileBlock)
             and bool(control.root.sequence_mutations)
@@ -2639,6 +2706,7 @@ __all__ = [
     "ControlDeploymentRegion",
     "ControlExpression",
     "ControlSequenceMutation",
+    "ScalarFieldWriteBlock",
     "CallBlock",
     "ExternalReferenceCallBlock",
     "DispatchBlock",

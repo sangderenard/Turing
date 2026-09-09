@@ -119,3 +119,5 @@ def test_tire_publishes_a_positive_energy_time_scale():
     assert energy > 0.0 and power > 0.0, (energy, power)
     assert prepared.feeds["targets"].energy_exchange_fraction == 0.1
     assert material.dt_limit_hint() == 2.44140625e-4
+    assert metrics.advanced_dt == 2.44140625e-4
+    assert metrics.dt_limit == 1.7976931348623157e308

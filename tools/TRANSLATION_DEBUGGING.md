@@ -1,5 +1,58 @@
 # Why isn't this translating? — a decision tree
 
+## Fresh source and reusable lowering checkpoints
+
+`python tools/checkpoint_managed_ssa.py --output build/managed-checkpoint`
+lowers the real managed controller without compiling C. It saves the resolved
+source graph, the pre-frame-link arguments, and completed repository SSA before
+the native gate runs. Checkpoints are atomic and no execution deadline is set.
+
+Replay current linker changes with
+`python tools/replay_ssa_checkpoint.py build/managed-checkpoint/pre-frame-link.pkl --output build/managed-replay/repository-ssa.pkl`.
+Replay skips extraction/planning but cannot validate reducer edits newer than
+the checkpoint. Only load trusted local compiler pickle artifacts.
+
+## An authored local becomes an extra function input
+
+Audit `check_formal_parity` at the full-native linked boundary. Definedness
+alone cannot detect this: the fabricated argument makes every use look defined.
+Classify inputs by evidence: source parameters, their declared physical record
+fields, and explicitly declared workspace may be formals. A local call result,
+conditional result or region output needs its actual producer, not a new input.
+
+For the September 6 snapshot reproduction, `saved=5` is still an `IfExp` in
+the post-reduction ProcessGraph, with predicate `rollback=1`, call result `3`
+and `None=4`. The control program originally omitted both that expression and
+the `if rollback: restore(saved)` branch. `emit_plan_callsite` then requested
+value 5 through `ControlSSABuilder.external_value`, whose unseen-value fallback
+appends a provisional function argument. No subsequent producer claimed it.
+This is upstream control loss; late call-frame propagation is not its origin.
+
+Do not reject every first request in `external_value`: valid forward references
+and internal region dependencies also use it. Check whether the exact source
+producer survives into control/region IR, whether its definition reaches the
+consumer, and whether `produced_value` retires its provisional argument. At the
+authored-function boundary, an unclaimed local must fail provenance validation.
+Never label it workspace merely to silence the gate.
+
+The ordinary-if builder now retains branches containing resolved method calls
+even without numerical regions, using graph call references and lexical branch
+membership. `tests/test_native_call_only_conditional.py::test_record_method_call_retains_runtime_conditional`
+checks the retained runtime branch and native state for both flag values.
+Conditional expressions now publish `ConditionalBlock.result_aliases` with
+true/false/result IDs, without inventing a pre-branch variable. The SSA builder
+defines a `conditional_result` Phi and removes any provisional formal for that
+result. Call-link dominance must interpret each Phi operand at its incoming
+edge; treating the merge block as the use site relocates arm calls incorrectly.
+`tests/test_native_conditional_call_result.py::test_conditional_call_result_has_producer`
+checks the exact root inputs and native results for both arms.
+
+The diagnostic authored snapshot now lowers and emits but is still incorrect:
+its C copies one scalar, restore has no write-back, and mutation regions precede
+snapshot capture. Removing an invented formal does not prove aggregate storage
+or effect order. The production snapshot normalizer's field selection is also
+still wrong. These remain prerequisites to full DT parity.
+
 ## Start before SSA: invocation, source coverage, and the failing graph
 
 For end-to-end Python compilation, establish these facts in order:
@@ -1789,3 +1842,106 @@ Notes toward it:
   Forwarded record storage may retain identity while still requiring the call's
   mutation to execute at the authored position. Regression for the diagnostic:
   `tests/test_ssa_definition_dominance.py`.
+
+* **Do not confuse graph Input with authored function parameter.** Loop targets
+  are also Input nodes, marked `binding_kind="loop"`. Structural recovery must
+  not append them to the function ABI when their local producer is unavailable.
+  Trace the missing control/region producer; record
+  `missing-local-producer:<binding_kind>` instead. A
+  `source_parameter_view_root` label by itself proves neither parameter origin
+  nor correct scope.
+* **Distinguish valid aggregate expansion from invented formals.** Inspect
+  `authored_parameters` and `parameter_member_formals`: each physical member
+  must name an authored parameter and exact index path. The full-native formal
+  audit admits this receipt, record field ABI receipts and declared workspace,
+  while rejecting local-variable receipts, including in zero-argument functions.
+  Focused gate: `tests/test_native_formal_provenance.py::test_full_native_gate_checks_formal_provenance`.
+* **One result slot does not imply one scalar/tensor return.** Compare
+  `return_container_kinds` with `return_slot_values` at the exact source span.
+  `(array.copy(),)` must remain a tuple containing an array; `saved[0]` is a
+  member projection, not row selection. Check aggregate member IDs, hierarchy
+  result bindings, and return ledgers after aliasing. Native regression:
+  `tests/test_aggregate_call_identity.py::test_singleton_call_result_preserves_tensor_member_natively`.
+  Also check marker replacement and loop exit Phi definitions: keeping an SSA
+  identity while dropping its shape silently changes the native calling contract.
+* **A conditional containing only calls still needs a schedule position.**
+  Inspect the planner's `ControlProgram.anchor_region`, not only the final call
+  markers. Empty region sets with no following-region anchor are appended at
+  scope end by overlay, moving a capture past mutation. Publish the existing
+  anchor when ordinary conditional controls are first planned; do not rely on
+  a later shell reconstruction running. Regression:
+  `tests/test_native_call_only_conditional.py::test_conditional_capture_precedes_later_mutation_natively`.
+  Verify final reads too: correct capture ordering alone does not prove rollback
+  representation, restore writes or return timing.
+* **Check both resolved call references when propagating return structure.**
+  Methods carry `method_ref`, ordinary functions carry `callee_ref`. A method
+  with no positional tensor arguments can still have fully determined results
+  from its declared record ABI. Regression:
+  `tests/test_native_method_return_container.py::test_record_method_tuple_result_preserves_member_natively`.
+  If correcting a method's tuple descriptor exposes an unaccounted conditional
+  operand, inspect the merge's container/member distinction. The old scalar
+  result may have hidden a representation error rather than been correct.
+* **Typed array Phi does not prove array storage survives native lowering.**
+  In C, an array merge must select the incoming span address. Declaring a scalar
+  Phi local and assigning `scalar_operand` retains only element zero, even if
+  the SSA shape is correct. Keep the pointer-local declaration separate from
+  the element type of addressed storage, and pass that span to subsequent
+  numerical calls. Test every slot and both branches, including a downstream
+  tensor consumer: `tests/test_native_conditional_tensor_result.py` (one node
+  per invocation). Optional aggregate tags remain a separate semantic requirement.
+* **None mixed with a payload requires an optional representation.** A bare Phi
+  with one NoneValue input and one scalar/span/aggregate payload cannot stand in
+  for presence plus payload. `check_optional_merges` is in run_all and the
+  full-native gate. An array-pointer Phi alone is not a None tag. Check actual
+  source guards: DT snapshots under rollback and restores under rejected, so
+  guard-name coincidence is not a proof of present payload. Rejection tests:
+  `tests/test_native_optional_merge_contract.py` (one node per invocation).
+* **A record's mutable fields are not its snapshot definition.** Compile the
+  actual copy_shallow/restore methods. Substituting every mutable ABI field can
+  undo telemetry or copy fields intentionally excluded by the author. The old
+  snapshot AST normalizer has been removed. Production native/eager regression:
+  `tests/test_native_authored_snapshot.py::test_native_snapshot_restores_only_authored_fields`.
+  Proving a conditional snapshot present may require following early returns;
+  the immediate restore guard's spelling is insufficient in either direction.
+* **Merge tuple members by declared position, not one container scalar.**
+  Inspect `conditional_member_bindings` on IfExp and `conditional_result_of` on
+  member values. Members belong to control, must survive graph cleanup through
+  explicit edges, and should reach consumers via the aggregate ledger. Preserve
+  semantic scalar shape even if a numerical helper returns a padded (1,1,1)
+  view. Native/eager regression:
+  `tests/test_native_conditional_tuple_result.py` (one parameterized node per run).
+  Matching tuple layouts do not establish an optional representation for None.
+* **Local optional payloads require a presence proof, not a value default.**
+  The planner records optional_presence and final source_optional_values receipts:
+  exact predicate, polarity, consumers and payload identities. Inactive scalar
+  cells/null spans are usable only as dormant storage; they do not represent
+  Python None numerically. Reject payload consumers outside the proven guard.
+  Follow Not by operand identity and reject rebindings of the predicate.
+  Native/eager coverage: `test_native_authored_snapshot.py` [then]/[else];
+  negative guard coverage: `test_native_optional_merge_contract.py`.
+  Presence across an early-return path needs a control-flow proof beyond a
+  directly enclosing branch; optional escape needs its own ABI.
+
+* **An early exit can prove a later payload present.** The source fallthrough
+  analysis tracks exact predicate identities, intersects facts at joins, and
+  removes terminated paths. It does not export new loop/exception facts.
+  `test_native_authored_snapshot.py` [early_return] checks both runtime paths.
+* **Check source control placement before trusting flat hierarchy rank.**
+  An effect-only restore has no result edge to a following state read. In the
+  early-return regression, Control IR correctly placed restore before the read,
+  but `_schedule_loop_callsites` reversed them using hierarchy rank. Authored
+  call markers now retain their source placement in the stable dependency sort.
+* **A pointer-typed zero must remain a pointer through inference and emission.**
+  `_propagate_scalar_dtypes` formerly retyped explicit null pointers to int64;
+  C then selected an integer cell's address as an inactive span. Preserve the
+  pointer contract and emit a null pointer. This is dormant optional payload
+  storage, never a numerical interpretation of Python None.
+# Replaying frame-link changes (2026-09-07)
+
+For a trusted local `pre-frame-link.pkl` checkpoint from the patch-sequence
+diagnostic, run `python tools/replay_ssa_checkpoint.py CHECKPOINT --output OUTPUT`.
+This reuses planned source and reruns SSA/frame lowering with the current compiler.
+It prints frame-round progress, saves SSA even when structural checks find
+shortfalls, and returns nonzero for those findings. It performs no DLL compile
+and imposes no execution deadline. A checkpoint predating reducer changes is
+useful for linker diagnosis but cannot establish current-source parity.

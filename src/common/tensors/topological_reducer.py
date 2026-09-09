@@ -1080,6 +1080,9 @@ def _normalize_lexical_values(
     class_field_mapping_contracts: Mapping[
         tuple[str, str], Mapping[str, Any]
     ] | None = None,
+    class_field_sequence_dtypes: Mapping[
+        tuple[str, str], tuple[str, ...]
+    ] | None = None,
 ) -> None:
     """Resolve unique lexical occurrences into a monotonic value DAG.
 
@@ -1107,6 +1110,10 @@ def _normalize_lexical_values(
     # the read is ordered after the write instead of depending only on the
     # unchanged receiver node (see the read side in ``resolve_expression``).
     attribute_effect_nodes: dict[tuple[int, str], int] = {}
+    # Current field value, separate from the ordered write event. Explicit
+    # GetAttr nodes remain in the graph for record-ABI projection; this ledger
+    # only supplies exact incoming values when source control joins a write.
+    attribute_value_nodes: dict[tuple[int, str], int] = {}
     parameter_names = set(function_parameter_names(statement))
     # A parameter annotated with a locally-defined class name gives a
     # receiver a real, known class identity at ingestion -- enough to
@@ -1535,8 +1542,14 @@ def _normalize_lexical_values(
 
         key = (id(reference.value), reference.path)
         existing = static_reference_nodes.get(key)
-        if existing is not None:
-            return existing
+        if existing is not None and existing in graph.G:
+            cached = graph.G.nodes[existing]
+            if (cached.get("type") == "StaticReference" and
+                    (cached.get("attributes") or {}).get("static_python_reference") == reference.path):
+                return existing
+        # Lexical normalization can remove an already-resolved reference
+        # projection. Recreate its compiler symbol from the real reference;
+        # the cache must never publish a removed or repurposed graph node.
         target = reference.value
         target_name = str(getattr(target, "__name__", ""))
         class_descriptor = graph.G.graph.get("class_table", {}).get(
@@ -1732,8 +1745,30 @@ def _normalize_lexical_values(
                     ),
                     "sequence_writable": True,
                 })
-            if isinstance(expression, (ast.ListComp, ast.SetComp)):
-                value_id = resolve_expression(expression.elt)
+            if isinstance(expression, (ast.ListComp, ast.SetComp, ast.DictComp)):
+                if isinstance(expression, ast.DictComp):
+                    key_id = resolve_expression(expression.key)
+                    item_id = resolve_expression(expression.value)
+                    attributes = graph.G.nodes[node_id].setdefault("attributes", {})
+                    value_id = attributes.get("sequence_row_value_id")
+                    if value_id is None and isinstance(key_id, int) and isinstance(item_id, int):
+                        value_id = new_node(
+                            "Tuple", "dictionary comprehension row",
+                            parents=((key_id, "elts"), (item_id, "elts")),
+                            attributes={"producer_kind": "aggregate", "aggregate_kind": "tuple",
+                                "aggregate_leaf_value_ids": (key_id, item_id),
+                                "sequence_column_count": 2, "sequence_writable": False},
+                            source=expression,
+                        )
+                        attributes["sequence_row_value_id"] = value_id
+                    if isinstance(value_id, int):
+                        _replace_inputs(graph, node_id, tuple(
+                            (int(parent), role)
+                            for parent, role in graph.G.nodes[node_id].get("parents", ())
+                            if role not in {"key", "value", "elt"}
+                        ) + ((value_id, "elt"),))
+                else:
+                    value_id = resolve_expression(expression.elt)
                 if (
                     isinstance(value_id, int)
                     and value_id in graph.G
@@ -2155,6 +2190,12 @@ def _normalize_lexical_values(
                 # correctly but never reported back that it did, severing
                 # the receiver as a dependency for anything built from this
                 # expression (a method call, a chained attribute, ...).
+                # Observation does not assign a new field version. Preserve
+                # the last RHS/merge in the ledger while keeping this read's
+                # own node and effect dependency for lexical scheduling.
+                attribute_value_nodes.setdefault(
+                    (receiver, expression.attr), int(attribute_id)
+                )
                 return attribute_id
 
         if isinstance(expression, ast.Call):
@@ -2842,6 +2883,7 @@ def _normalize_lexical_values(
                     (id(static_receiver.value), target.attr)
                 ] = value
             attribute_effect_nodes[(receiver, target.attr)] = node_id
+            attribute_value_nodes[(receiver, target.attr)] = int(value)
             # A plain-named receiver (``counter.value = ...``) gets its own
             # identity binding the same way a bare ``ast.Name`` target does
             # above -- the field write is already a real, correctly wired
@@ -2970,6 +3012,9 @@ def _normalize_lexical_values(
                 outer_receiver = resolve_expression(target.value.value)
                 if isinstance(outer_receiver, int):
                     attribute_effect_nodes[
+                        (outer_receiver, target.value.attr)
+                    ] = node_id
+                    attribute_value_nodes[
                         (outer_receiver, target.value.attr)
                     ] = node_id
             return
@@ -3255,12 +3300,36 @@ def _normalize_lexical_values(
             # docs/PLAN_CONTROL_AWARE_RESULT_MERGING.md). Key by source span:
             # AST object ids do not survive reduction, spans do.
             if returned is not None and getattr(returned, "lineno", None) is not None:
-                graph.G.graph.setdefault("return_slot_values", {})[(
+                return_span = (
                     int(returned.lineno),
                     int(getattr(returned, "col_offset", -1)),
                     int(getattr(returned, "end_lineno", -1)),
                     int(getattr(returned, "end_col_offset", -1)),
-                )] = tuple(slot_values)
+                )
+                graph.G.graph.setdefault("return_slot_values", {})[
+                    return_span
+                ] = tuple(slot_values)
+                # Record correlation alone does not describe the field state
+                # at this return. Keep the exact receiver/value identities;
+                # the linker may use only values physically available on the
+                # corresponding return edge, never the final global ledger.
+                graph.G.graph.setdefault("return_record_field_states", {})[
+                    return_span
+                ] = tuple(
+                    (int(receiver), str(field), int(value))
+                    for (receiver, field), value in attribute_value_nodes.items()
+                    if receiver in slot_values
+                )
+                # Physical output slots alone cannot distinguish `return x`
+                # from `return (x,)`. Preserve authored container semantics
+                # beside the same exact return-site receipt before flattening.
+                graph.G.graph.setdefault("return_container_kinds", {})[
+                    return_span
+                ] = (
+                    "tuple" if isinstance(returned, ast.Tuple)
+                    else "list" if isinstance(returned, ast.List)
+                    else "value"
+                )
             if len(expressions) == 1:
                 value = resolved[0] if resolved else None
                 if value is not None:
@@ -3345,21 +3414,39 @@ def _normalize_lexical_values(
             # Reduce lexical occurrences within each arm without pretending
             # that either arm executed unconditionally.
             before = dict(environment)
+            before_attribute_effects = dict(attribute_effect_nodes)
+            before_attribute_values = dict(attribute_value_nodes)
             body_environment = dict(before)
             environment.clear()
             environment.update(body_environment)
+            attribute_effect_nodes.clear()
+            attribute_effect_nodes.update(before_attribute_effects)
+            attribute_value_nodes.clear()
+            attribute_value_nodes.update(before_attribute_values)
             body_result = None
             for nested in body_statement.body:
                 body_result = reduce_statement(nested)
             body_environment = dict(environment)
+            body_attribute_effects = dict(attribute_effect_nodes)
+            body_attribute_values = dict(attribute_value_nodes)
             environment.clear()
             environment.update(before)
+            attribute_effect_nodes.clear()
+            attribute_effect_nodes.update(before_attribute_effects)
+            attribute_value_nodes.clear()
+            attribute_value_nodes.update(before_attribute_values)
             else_result = None
             for nested in body_statement.orelse:
                 else_result = reduce_statement(nested)
             else_environment = dict(environment)
+            else_attribute_effects = dict(attribute_effect_nodes)
+            else_attribute_values = dict(attribute_value_nodes)
             environment.clear()
             environment.update(before)
+            attribute_effect_nodes.clear()
+            attribute_effect_nodes.update(before_attribute_effects)
+            attribute_value_nodes.clear()
+            attribute_value_nodes.update(before_attribute_values)
 
             def terminal_branch(statements: list[ast.stmt]) -> bool:
                 if not statements:
@@ -3398,8 +3485,16 @@ def _normalize_lexical_values(
             # merge and let the single reachable arm's environment stand.
             if body_terminal and not else_terminal:
                 environment.update(else_environment)
+                attribute_effect_nodes.clear()
+                attribute_effect_nodes.update(else_attribute_effects)
+                attribute_value_nodes.clear()
+                attribute_value_nodes.update(else_attribute_values)
             elif else_terminal and not body_terminal:
                 environment.update(body_environment)
+                attribute_effect_nodes.clear()
+                attribute_effect_nodes.update(body_attribute_effects)
+                attribute_value_nodes.clear()
+                attribute_value_nodes.update(body_attribute_values)
             else:
                 for name in set(before) | set(body_environment) | set(
                     else_environment
@@ -3418,6 +3513,9 @@ def _normalize_lexical_values(
                         merged_attributes = {
                             "binding_name": name,
                             "source_conditional_id": id(body_statement),
+                            **({
+                                "initial_value_id": int(before[name]),
+                            } if isinstance(before.get(name), int) else {}),
                         }
                         body_attributes = (
                             graph.G.nodes[body_value].get("attributes") or {}
@@ -3465,6 +3563,178 @@ def _normalize_lexical_values(
                         identity_bindings.setdefault(name, []).append(
                             merged_value
                         )
+
+                # A record field is state just as a local name is.  Its
+                # explicit GetAttr projection is the incoming SSA value, while
+                # SetAttr contributes its RHS rather than its effect node.
+                # First observation in an arm still names the receiver's
+                # physical field. Seed the other edge from that projection,
+                # never from an invented scalar Input or a read-history Phi.
+                for field_key in (body_attribute_values.keys() | else_attribute_values.keys()):
+                    if field_key in before_attribute_values:
+                        continue
+                    receiver_id, attribute_name = field_key
+                    receiver_attributes = (
+                        graph.G.nodes[int(receiver_id)].get("attributes") or {}
+                    )
+                    receiver_class = receiver_attributes.get(
+                        "result_class_ref",
+                        receiver_attributes.get("class_ref"),
+                    )
+                    if receiver_class is None:
+                        effect_classes = {
+                            str(slot[0])
+                            for effect_id in (
+                                body_attribute_effects.get(field_key),
+                                else_attribute_effects.get(field_key),
+                            )
+                            if effect_id is not None
+                            and int(effect_id) in graph.G
+                            for slot in ((
+                                graph.G.nodes[int(effect_id)].get(
+                                    "attributes"
+                                ) or {}
+                            ).get("attribute_slot"),)
+                            if (
+                                isinstance(slot, tuple)
+                                and len(slot) == 2
+                            )
+                        }
+                        if len(effect_classes) == 1:
+                            receiver_class = next(iter(effect_classes))
+                    field_kind = (
+                        (class_field_aggregate_kinds or {}).get((
+                            str(receiver_class), str(attribute_name)
+                        ))
+                        if receiver_class is not None else None
+                    )
+                    initial_attributes = {
+                        "attribute": attribute_name,
+                        "initial_record_field_state": True,
+                    }
+                    if field_kind is not None:
+                        mapping_contract = dict(
+                            (class_field_mapping_contracts or {}).get((
+                                str(receiver_class), str(attribute_name)
+                            )) or {}
+                        )
+                        sequence_dtypes = tuple(
+                            (class_field_sequence_dtypes or {}).get((
+                                str(receiver_class), str(attribute_name)
+                            )) or ()
+                        )
+                        initial_attributes.update({
+                            "producer_kind": "record_field",
+                            "aggregate_kind": field_kind,
+                            "sequence_key_columns": (
+                                (0,) if field_kind in {"set", "dict"} else ()
+                            ),
+                            "sequence_column_count": (
+                                2 if field_kind == "dict" else 1
+                            ),
+                            "sequence_writable": field_kind != "tuple",
+                            "record_field": (
+                                str(receiver_class), str(attribute_name)
+                            ),
+                            **({
+                                "sequence_column_dtypes": sequence_dtypes,
+                            } if sequence_dtypes else {}),
+                            **mapping_contract,
+                        })
+                    initial = new_node(
+                        "GetAttr", f"getattr[{attribute_name}]",
+                        attributes=initial_attributes,
+                        parents=((int(receiver_id), "value"),),
+                    )
+                    before_attribute_values[field_key] = initial
+                    for branch_values, branch_effects in (
+                        (body_attribute_values, body_attribute_effects),
+                        (else_attribute_values, else_attribute_effects),
+                    ):
+                        if field_key not in branch_effects:
+                            branch_values[field_key] = initial
+                for field_key, initial_value in (
+                    before_attribute_values.items()
+                ):
+                    body_value = body_attribute_values.get(
+                        field_key, initial_value
+                    )
+                    else_value = else_attribute_values.get(
+                        field_key, initial_value
+                    )
+                    if body_value == else_value:
+                        attribute_value_nodes[field_key] = int(body_value)
+                        continue
+                    if not isinstance(test_value, int):
+                        continue
+                    receiver_id, attribute_name = field_key
+                    branch_effect_ids = tuple(
+                        int(effect_id)
+                        for effect_id in (
+                            body_attribute_effects.get(field_key),
+                            else_attribute_effects.get(field_key),
+                        )
+                        if effect_id is not None and int(effect_id) in graph.G
+                    )
+                    authored_field_names = {
+                        f"{effect.value.id}.{effect.attr}"
+                        for effect_id in branch_effect_ids
+                        for effect in (graph.G.nodes[effect_id].get("expr_obj"),)
+                        if isinstance(effect, ast.Attribute)
+                        and isinstance(effect.value, ast.Name)
+                    }
+                    binding_name = (
+                        next(iter(authored_field_names))
+                        if len(authored_field_names) == 1 else
+                        f"field:{receiver_id}.{attribute_name}"
+                    )
+                    body_attributes = (
+                        graph.G.nodes[int(body_value)].get("attributes") or {}
+                    )
+                    else_attributes = (
+                        graph.G.nodes[int(else_value)].get("attributes") or {}
+                    )
+                    merged_attributes = {
+                        "binding_name": binding_name,
+                        "source_conditional_id": id(body_statement),
+                        "initial_value_id": int(initial_value),
+                        "record_field_state": (
+                            int(receiver_id), str(attribute_name)
+                        ),
+                    }
+                    body_kind = body_attributes.get("aggregate_kind")
+                    if (
+                        body_kind is not None
+                        and body_kind == else_attributes.get("aggregate_kind")
+                    ):
+                        merged_attributes.update({
+                            key: body_attributes[key]
+                            for key in (
+                                "aggregate_kind",
+                                "sequence_key_columns",
+                                "sequence_column_count",
+                                "sequence_writable",
+                                "record_field",
+                            )
+                            if key in body_attributes
+                        })
+                        merged_attributes["producer_kind"] = "aggregate_phi"
+                    merged_value = new_node(
+                        "Phi",
+                        binding_name,
+                        attributes=merged_attributes,
+                        parents=(
+                            (int(test_value), "test"),
+                            (int(body_value), "body"),
+                            (int(else_value), "orelse"),
+                        ),
+                        source=body_statement,
+                    )
+                    identity_bindings.setdefault(binding_name, []).append(
+                        merged_value
+                    )
+                    attribute_value_nodes[field_key] = merged_value
+                    attribute_effect_nodes[field_key] = merged_value
 
             if (
                 isinstance(test_value, int)
@@ -3841,6 +4111,41 @@ def _normalize_lexical_values(
                         )
                     )
                 }
+                # A terminal ``continue`` arm does not reach the conditional's
+                # ordinary fallthrough environment, by design.  Its bindings
+                # nevertheless reach the loop latch and are therefore genuine
+                # recurrence.  The control-site ledger captured that exact
+                # environment when the Continue statement was reduced.  Use it
+                # when every continue edge agrees on one updated identity; if
+                # different edges carry different values, a latch Phi must be
+                # constructed explicitly and this source-level pass must not
+                # guess which value wins.
+                loop_start = int(getattr(body_statement, "lineno", -1))
+                continue_sites = tuple(
+                    site
+                    for site_span, site in (
+                        graph.G.graph.get("loop_control_site_bindings") or {}
+                    ).items()
+                    if (
+                        site.get("loop_id") is None
+                        and site.get("action") == "continue"
+                        and loop_start <= int(site_span[0]) <= loop_end
+                    )
+                )
+                for name, initial in before_loop.items():
+                    if name in loop_carried_bindings or not continue_sites:
+                        continue
+                    continuation_values = {
+                        int(site.get("bindings", {}).get(name, initial))
+                        for site in continue_sites
+                    }
+                    if (
+                        len(continuation_values) == 1
+                        and next(iter(continuation_values)) != int(initial)
+                    ):
+                        loop_carried_bindings[name] = (
+                            int(initial), next(iter(continuation_values)),
+                        )
                 loop_attributes["loop_carried_bindings"] = (
                     loop_carried_bindings
                 )
@@ -3854,7 +4159,6 @@ def _normalize_lexical_values(
                 # rebinds it) yet still needs a post-loop identity: its
                 # continuation is the last break site's value, which the loop
                 # port materialization rewires onto a LoopResult port.
-                loop_start = int(getattr(body_statement, "lineno", -1))
                 loop_break_sites: dict[tuple[int, int, int, int], dict[int, int]] = {}
                 loop_break_bindings: dict[str, tuple[int, int]] = {}
                 for site_span, site in (
@@ -4390,6 +4694,16 @@ def _normalize_lexical_values(
         ).items()
     }
     # Ingestion spelling and SSA definition numbering are separate domains.
+    graph.G.graph["return_record_field_states"] = {
+        span: tuple(
+            (mapping[receiver], field, mapping[value])
+            for receiver, field, value in states
+            if receiver in mapping and value in mapping
+        )
+        for span, states in (
+            graph.G.graph.get("return_record_field_states") or {}
+        ).items()
+    }
     # ``identity_table`` remains the compact compatibility map used by older
     # lowering code.  This ledger preserves the original common spelling and
     # its authored rebinding version before any SSA-only phi/capture/temp
@@ -4466,6 +4780,16 @@ def _normalize_lexical_values(
                 attributes["source_conditional_id"] = mapping[
                     source_conditional_id
                 ]
+        if "initial_value_id" in attributes:
+            initial_value_id = attributes["initial_value_id"]
+            if initial_value_id in mapping:
+                attributes["initial_value_id"] = mapping[initial_value_id]
+        if "record_field_state" in attributes:
+            receiver_id, attribute_name = attributes["record_field_state"]
+            if receiver_id in mapping:
+                attributes["record_field_state"] = (
+                    mapping[receiver_id], attribute_name,
+                )
         if "terminal_return_values" in attributes:
             attributes["terminal_return_values"] = tuple(
                 mapping[value_id]
@@ -4550,6 +4874,61 @@ def _normalize_lexical_values(
                 root for root in graph.roots if root not in branch_values
             ]
             graph.roots.append(merge_id)
+
+
+def normalize_python_attribute_special_cases(graph: Any) -> None:
+    """Canonicalize Python attribute loads on a graph already in the table.
+
+    Dependency linking can attach a previously extracted Python function
+    after the root reduction pass. Apply the same AST special-case overlay to
+    those graphs before deployment so linked functions cannot retain raw
+    ``ast.Attribute`` nodes that backends would mistake for external values.
+    """
+
+    if str(getattr(graph, "source_language", "")).casefold() != "python":
+        return
+    for node_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        augmented_target_read = bool(
+            isinstance(expression, ast.Attribute)
+            and isinstance(expression.ctx, ast.Store)
+            and any(
+                str(role) == "lhs"
+                and child_id in graph.G
+                and isinstance(
+                    graph.G.nodes[child_id].get("expr_obj"), ast.AugAssign,
+                )
+                for child_id, role in data.get("children") or ()
+            )
+        )
+        if not (
+            isinstance(expression, ast.Attribute)
+            and (
+                isinstance(expression.ctx, ast.Load)
+                or augmented_target_read
+            )
+        ):
+            continue
+        special_expression = expression
+        if augmented_target_read:
+            # Python gives an AugAssign target Store context, but the operation
+            # is read-modify-write. This graph node supplies the read operand;
+            # the reducer's separate SetAttr node owns the write effect.
+            special_expression = copy.deepcopy(expression)
+            special_expression.ctx = ast.Load()
+        special = interpret_python_special_case(special_expression)
+        if special is None:
+            continue
+        data["type"] = special.type
+        data["op"] = special.type
+        data["attributes"] = {
+            **dict(data.get("attributes") or {}),
+            **dict(special.attributes),
+        }
+        data["extra_args"] = {
+            **dict(data.get("extra_args") or {}),
+            **dict(special.attributes),
+        }
 
 
 def reduce_abstract_tensor_topology(graph: Any) -> Any:
@@ -4738,6 +5117,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     class_field_mapping_contracts: dict[
         tuple[str, str], dict[str, Any]
     ] = {}
+    class_field_sequence_dtypes: dict[
+        tuple[str, str], tuple[str, ...]
+    ] = {}
 
     def _annotation_storage(annotation: ast.AST) -> dict[str, Any]:
         """Return the exact scalar/record handle stated by one annotation."""
@@ -4809,6 +5191,45 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             "mapping_value_optional": bool(value.get("optional", False)),
         }
 
+    def _sequence_annotation_dtypes(
+        annotation: ast.AST | str | Any,
+    ) -> tuple[str, ...]:
+        if not isinstance(annotation, ast.AST):
+            try:
+                annotation = ast.parse(str(annotation), mode="eval").body
+            except SyntaxError:
+                return ()
+        if not isinstance(annotation, ast.Subscript):
+            return ()
+        container = (
+            annotation.value.id
+            if isinstance(annotation.value, ast.Name)
+            else annotation.value.attr
+            if isinstance(annotation.value, ast.Attribute)
+            else ""
+        )
+        if container not in {
+            "Sequence", "Iterable", "Collection", "List", "list",
+            "Tuple", "tuple", "Set", "set", "FrozenSet", "frozenset",
+        }:
+            return ()
+        columns = (
+            tuple(annotation.slice.elts)
+            if isinstance(annotation.slice, ast.Tuple)
+            else (annotation.slice,)
+        )
+        if (
+            len(columns) == 2
+            and isinstance(columns[1], ast.Constant)
+            and columns[1].value is Ellipsis
+        ):
+            columns = columns[:1]
+        if len(columns) != 1:
+            return ()
+        storage = _annotation_storage(columns[0])
+        dtype = storage.get("dtype")
+        return (str(dtype),) if dtype is not None else ()
+
     # AST ingestion normalizes an annotated assignment into its executable
     # assignment form, but MapIR deliberately retains the authored annotation
     # as schema data.  Read that durable copy; it is the exact cross-function
@@ -4832,6 +5253,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 class_field_mapping_contracts[(
                     class_name, str(field_record.get("name") or ""),
                 )] = contract
+            dtypes = _sequence_annotation_dtypes(annotation_node)
+            if dtypes:
+                class_field_sequence_dtypes[(
+                    class_name, str(field_record.get("name") or ""),
+                )] = dtypes
 
     for class_name, definition in class_definitions.items():
         for member in definition.body:
@@ -4862,6 +5288,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     class_field_mapping_contracts[
                         (str(class_name), str(field_name))
                     ] = contract
+                dtypes = _sequence_annotation_dtypes(declaration.annotation)
+                if dtypes:
+                    class_field_sequence_dtypes[
+                        (str(class_name), str(field_name))
+                    ] = dtypes
     # The FunctionTable's retained method definitions are the authoritative
     # source bodies.  Some ingestion paths retain a skeletal ClassDef while
     # storing the complete method AST separately, so survey those definitions
@@ -4882,6 +5313,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 class_field_mapping_contracts[
                     (str(class_name), str(declaration.target.attr))
                 ] = contract
+            dtypes = _sequence_annotation_dtypes(declaration.annotation)
+            if dtypes:
+                class_field_sequence_dtypes[
+                    (str(class_name), str(declaration.target.attr))
+                ] = dtypes
 
     # Imported dataclasses are legitimate authored record contracts even when
     # their class bodies are intentionally outside this compilation unit.
@@ -4900,10 +5336,21 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 for kind in (list, set, dict, tuple)
                 if factory is kind
             ), None)
+            if aggregate_kind is None:
+                aggregate_kind = next((
+                    kind.__name__
+                    for kind in (list, set, dict, tuple)
+                    if type(declared_field.default) is kind
+                ), None)
             if aggregate_kind is not None:
                 class_field_aggregate_kinds.setdefault(
                     (str(binding_name), str(declared_field.name)),
                     aggregate_kind,
+                )
+            dtypes = _sequence_annotation_dtypes(declared_field.type)
+            if dtypes:
+                class_field_sequence_dtypes.setdefault(
+                    (str(binding_name), str(declared_field.name)), dtypes,
                 )
 
     def aggregate_expression_kind(expression: ast.AST | None) -> str | None:
@@ -5907,6 +6354,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         lexical_functions_by_owner.setdefault(
             int(parent_reference.address), {}
         )[child_definition.name] = child_reference
+
+    # Function extraction and structural rewrites can copy an authored Python
+    # Attribute after its original ingestion overlay was applied. Reassert the
+    # language special case at this AST-to-shared-graph seam.
+    normalize_python_attribute_special_cases(graph)
 
     for _node_id, data in graph.G.nodes(data=True):
         source_type = data.get("type")
@@ -7018,6 +7470,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             method_owner=method_owners.get(node_id),
             class_field_aggregate_kinds=class_field_aggregate_kinds,
             class_field_mapping_contracts=local_mapping_contracts,
+            class_field_sequence_dtypes=class_field_sequence_dtypes,
         )
         generator_yields = tuple(
             node_id
@@ -7055,8 +7508,13 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     # Reuse that exact provenance propagation now that every callee body is
     # available, so a call in a function body retains its returned class.
     for entry in function_table:
-        entry_graph = getattr(getattr(entry, "graph", None), "G", None)
+        entry_wrapper = getattr(entry, "graph", None)
+        entry_graph = getattr(entry_wrapper, "G", None)
         if entry_graph is not None:
+            # AugAssign read-modify-write structure and child roles are final
+            # only after lexical normalization. Canonicalize its attribute
+            # read at this post-extraction seam as well as on the root graph.
+            normalize_python_attribute_special_cases(entry_wrapper)
             propagate_returned_receiver_types(entry_graph)
     # External call references and static Python bindings are two views of the
     # same compile-time environment.  Join them once after every call has been
@@ -7084,4 +7542,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     return graph
 
 
-__all__ = ["reduce_abstract_tensor_topology"]
+__all__ = [
+    "normalize_python_attribute_special_cases",
+    "reduce_abstract_tensor_topology",
+]

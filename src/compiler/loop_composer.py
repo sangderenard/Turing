@@ -159,6 +159,11 @@ class LoopDescriptor:
     stop_node: int | None = None
     step_node: int | None = None
     iterable_node: int | None = None
+    # Expressions consumed entirely by the loop domain. Their numerical
+    # regions remain in the plan for provenance but must not also execute as
+    # flat runtime work (for example the Indexed/Slice pair in ``items[2:]``
+    # after it becomes a resident iterable with start=2).
+    domain_node_ids: tuple[int, ...] = ()
     iterable_constant: tuple[object, ...] | None = None
     trip_count: int | None = None
     yield_nodes: tuple[int, ...] = ()
@@ -230,6 +235,10 @@ class LoopShaderReduction:
     # as a predicated resident append).  They remain compilation artifacts for
     # provenance, but the outer shell must not schedule them a second time.
     structurally_owned_region_indices: tuple[int, ...] = ()
+    # Numerical regions consumed while constructing the structured iteration
+    # domain. Unlike body/predicate ownership, this replacement remains valid
+    # even when another body effect prevents emitting the complete loop.
+    domain_region_indices: tuple[int, ...] = ()
 
 
 def planned_collection_bindings(
@@ -822,6 +831,18 @@ def evaporate_unrolled_loops(
             continue
         selected_plans = group or (plan,)
         loop = selected_plans[0].loop
+        # Cloning value producers does not clone authored calls or terminal
+        # edges. Keep their iterative owner until an unroller can publish
+        # both the call occurrences and the guarded break/continue edges.
+        if any(
+            member.loop.control_sites or any(
+                any((graph.G.nodes[node_id].get("attributes") or {}).get(key)
+                    is not None for key in ("callee_ref", "method_ref", "constructor_ref"))
+                for node_id in member.loop.body_nodes if node_id in graph.G
+            )
+            for member in selected_plans
+        ):
+            continue
         # Collection mutations are resident memory effects, not values that can
         # be replaced by cloning the loop body's numerical producer cone. The
         # evaporator expands indexed publications and comprehension
@@ -1675,6 +1696,14 @@ def materialize_retained_loop_ports(
             materializer_attributes = dict(
                 materializer.get("attributes") or {}
             )
+            graph.G.nodes[collection_id]["attributes"].update({
+                key: materializer_attributes[key]
+                for key in ("aggregate_kind", "sequence_key_columns",
+                            "sequence_column_count", "sequence_writable")
+                if key in materializer_attributes
+            })
+            if loop.iterable_node is not None:
+                graph.G.nodes[collection_id]["attributes"]["collection_iterable_value_id"] = int(loop.iterable_node)
             materializer_attributes.update({
                 # A comprehension owns resident sequence storage.  Its
                 # elements are collected by the retained producer loop; it
@@ -2709,6 +2738,121 @@ class LoopComposer:
             if recovered_iterable is not None and recovered_iterable in graph.G:
                 iterable_node = int(recovered_iterable)
 
+        def resident_sequence(value_id: int) -> bool:
+            """Prove a loop iterable owns repository sequence storage."""
+
+            data = graph.G.nodes.get(int(value_id), {})
+            data_attributes = data.get("attributes") or {}
+            if data_attributes.get("aggregate_kind") in {
+                "list", "set", "tuple", "bytes", "bytearray", "dict",
+            }:
+                return True
+            if str(data.get("type") or data.get("op") or "").casefold() != "getattr":
+                return False
+            field_name = str(data_attributes.get("attribute") or "")
+            receiver_id = next((
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) in {"value", "object", "base", "receiver"}
+                and int(parent) in graph.G
+            ), None)
+            if receiver_id is None:
+                return False
+            receiver = graph.G.nodes[receiver_id]
+            if str(receiver.get("type") or receiver.get("op") or "").casefold() not in {
+                "indexed", "load",
+            }:
+                return False
+            row_sequence_id = next((
+                int(parent)
+                for parent, role in receiver.get("parents") or ()
+                if str(role) == "base" and int(parent) in graph.G
+            ), None)
+            if row_sequence_id is None:
+                return False
+            identities = graph.G.graph.get("identity_table") or {}
+            binding = next((
+                str(name)
+                for name, history in identities.items()
+                if row_sequence_id in set(map(int, history))
+            ), None)
+            annotation = (
+                None if binding is None
+                else (graph.G.graph.get("type_annotations") or {}).get(binding)
+            )
+            try:
+                authored = ast.parse(str(annotation), mode="eval").body
+            except SyntaxError:
+                return False
+            if not isinstance(authored, ast.Subscript):
+                return False
+            element = authored.slice
+            record_name = (
+                element.id if isinstance(element, ast.Name)
+                else element.attr if isinstance(element, ast.Attribute)
+                else ""
+            )
+            records = dict(
+                (graph.G.graph.get("program_abi") or {}).get("records") or {}
+            )
+            matches = tuple(
+                record
+                for identity, record in records.items()
+                if str(identity) == str(record_name)
+                or str(identity).rsplit(".", 1)[-1] == str(record_name)
+                or str(record.get("identity") or "").rsplit(".", 1)[-1]
+                == str(record_name)
+            )
+            if len(matches) != 1:
+                return False
+            field = dict(matches[0].get("fields") or {}).get(field_name)
+            return bool(
+                isinstance(field, Mapping)
+                and str(field.get("storage") or "") == "table"
+            )
+
+        resident_tail_start: int | None = None
+        resident_tail_domain_nodes: tuple[int, ...] = ()
+        if (
+            iterator_kind != "arithmetic_sequence"
+            and iterable_node is not None
+            and isinstance(iterator_expression, ast.Subscript)
+            and isinstance(iterator_expression.slice, ast.Slice)
+            and iterator_expression.slice.upper is None
+            and (
+                iterator_expression.slice.step is None
+                or isinstance(iterator_expression.slice.step, ast.Constant)
+                and iterator_expression.slice.step.value == 1
+            )
+        ):
+            lower = iterator_expression.slice.lower
+            lower_value = 0 if lower is None else (
+                lower.value if isinstance(lower, ast.Constant) else None
+            )
+            indexed = graph.G.nodes[int(iterable_node)]
+            base_id = next((
+                int(parent)
+                for parent, role in indexed.get("parents") or ()
+                if str(role) == "base" and int(parent) in graph.G
+            ), None)
+            if (
+                isinstance(lower_value, int)
+                and not isinstance(lower_value, bool)
+                and lower_value >= 0
+                and base_id is not None
+                and resident_sequence(base_id)
+            ):
+                resident_tail_domain_nodes = tuple(dict.fromkeys((
+                    int(iterable_node),
+                    *(
+                        int(parent)
+                        for parent, _role in indexed.get("parents") or ()
+                        if int(parent) in graph.G and int(parent) != int(base_id)
+                    ),
+                )))
+                iterable_node = int(base_id)
+                resident_tail_start = int(lower_value)
+
         # Numeric bounds belong only to source arithmetic sequences.  Graph
         # ingestion may annotate an ordinary iterable loop with the iteration
         # observed while discovering the program (often ``stop=1`` for one
@@ -2722,7 +2866,7 @@ class LoopComposer:
             stop = attributes.get("stop")
             step = attributes.get("step")
         else:
-            start = 0
+            start = 0 if resident_tail_start is None else resident_tail_start
             stop = None
             step = 1
         if iterator_kind == "arithmetic_sequence":
@@ -2999,6 +3143,7 @@ class LoopComposer:
                 else None
             ),
             iterable_node=iterable_node,
+            domain_node_ids=resident_tail_domain_nodes,
             iterable_constant=iterable_constant,
             trip_count=count,
             yield_nodes=yield_nodes,
@@ -3595,6 +3740,11 @@ def analyze_shader_loop_reductions(
             "item": "item", "float": "float",
             "int": "int", "bool": "bool",
         }.get(op)
+        if operation is None and isinstance(expression, ast.Compare) and len(expression.ops) == 1:
+            operation = {
+                ast.Lt: "lt", ast.LtE: "le", ast.Gt: "gt", ast.GtE: "ge",
+                ast.Eq: "eq", ast.NotEq: "ne",
+            }.get(type(expression.ops[0]))
         if operation is None and isinstance(expression, ast.Call):
             if isinstance(expression.func, ast.Name):
                 operation = {
@@ -4126,25 +4276,48 @@ def analyze_shader_loop_reductions(
                 ),
             ))
         condition = set(map(int, loop.condition_nodes))
-        structurally_owned_region_indices: tuple[int, ...] = ()
+
+        def expression_value_ids(expression: ControlExpression | None):
+            """Computed graph identities retained inside one expression.
+
+            Leaf ``value`` nodes are captures whose producers keep their
+            ordinary lexical ownership.  Non-leaf identities are operations
+            represented structurally by the expression; a planned region
+            producing one of them belongs at the expression's evaluation
+            site.
+            """
+
+            if expression is None or expression.op == "value":
+                return frozenset()
+            found = {
+                int(expression.value_id)
+                for _ in (0,)
+                if expression.value_id is not None
+            }
+            for operand in expression.operands:
+                found.update(expression_value_ids(operand))
+            return frozenset(found)
+
+        # Domain expressions replaced by the structured loop bounds have no
+        # second runtime evaluation. Exclude their complete numerical regions
+        # from the flat schedule just as we do for a comprehension predicate
+        # emitted inside structured control.
+        domain_nodes = frozenset(map(int, loop.domain_node_ids))
+        domain_regions = {
+            index
+            for index, nodes in enumerate(regions)
+            if domain_nodes.intersection(map(int, nodes))
+            and frozenset(map(int, nodes)).issubset(domain_nodes)
+        }
+        structurally_owned_region_indices: tuple[int, ...] = tuple(
+            sorted(domain_regions)
+        )
         if loop.iteration_outputs and condition:
             # A retained comprehension publishes through a predicated append
             # below. Its filter is evaluated inside the loop from the loaded
             # target row. Leaving the same predicate region in the flat
             # schedule executes it outside the loop and can give a later
             # reduction/validation false ownership of the loop's region.
-            def expression_value_ids(expression: ControlExpression | None):
-                if expression is None:
-                    return frozenset()
-                found = {
-                    int(expression.value_id)
-                    for _ in (0,)
-                    if expression.value_id is not None
-                }
-                for operand in expression.operands:
-                    found.update(expression_value_ids(operand))
-                return frozenset(found)
-
             structurally_owned_values = frozenset().union(*(
                 expression_value_ids(structured_control_expression(node_id))
                 for node_id in sorted(condition)
@@ -4157,7 +4330,9 @@ def analyze_shader_loop_reductions(
                     structurally_owned_values
                 )
             }
-            structurally_owned_region_indices = tuple(sorted(predicate_regions))
+            structurally_owned_region_indices = tuple(sorted(
+                domain_regions | predicate_regions
+            ))
             body_region_indices = tuple(
                 index for index in body_region_indices
                 if index not in predicate_regions
@@ -4180,10 +4355,21 @@ def analyze_shader_loop_reductions(
                 f"region_members={ {i: tuple(regions[i]) for i in body_region_indices} }",
                 file=_sys.stderr,
             )
+        while_predicate_expression = (
+            structured_control_expression(loop.condition_nodes[0])
+            if loop.source_type == "While" and loop.condition_nodes
+            else None
+        )
+        predicate_operation_values = expression_value_ids(
+            while_predicate_expression
+        )
         condition_region_indices = tuple(
             index
             for index, nodes in enumerate(regions)
-            if condition.intersection(nodes)
+            if (
+                condition.intersection(map(int, nodes))
+                or predicate_operation_values.intersection(map(int, nodes))
+            )
             and index not in body_region_indices
             and not loop.iteration_outputs
         )
@@ -4191,11 +4377,6 @@ def analyze_shader_loop_reductions(
             *condition_region_indices,
             *body_region_indices,
         )))
-        while_predicate_expression = (
-            structured_control_expression(loop.condition_nodes[0])
-            if loop.source_type == "While" and loop.condition_nodes
-            else None
-        )
         sequence_mutations = []
         expression_nodes = {
             id(data.get("expr_obj")): int(node_id)
@@ -4432,11 +4613,11 @@ def analyze_shader_loop_reductions(
         sequence_mutations.extend(
             ControlSequenceMutation(
                 sequence_value_id=int(output.result_value_id),
-                operator="append",
+                operator=("update" if kind == "dict" else "add" if kind == "set" else "append"),
                 argument_value_ids=expanded_row_arguments((output.value_id,)),
                 effect_node_id=int(output.materializer_node_id),
-                policy="duplicates",
-                argument_kind="value",
+                policy="unique" if kind in {"dict", "set"} else "duplicates",
+                argument_kind="mapping_items" if kind == "dict" else "value",
                 predicate_expression=output_predicate,
                 argument_expressions=tuple(
                     structured_control_expression(int(value_id))
@@ -4444,6 +4625,7 @@ def analyze_shader_loop_reductions(
                 ),
             )
             for output in loop.iteration_outputs
+            for kind in ((graph.G.nodes[int(output.materializer_node_id)].get("attributes") or {}).get("aggregate_kind"),)
         )
         sequence_mutations = tuple(sequence_mutations)
         represented_effect_nodes = {
@@ -5049,6 +5231,7 @@ def analyze_shader_loop_reductions(
             structurally_owned_region_indices=(
                 structurally_owned_region_indices
             ),
+            domain_region_indices=tuple(sorted(domain_regions)),
         ))
     return tuple(reductions)
 

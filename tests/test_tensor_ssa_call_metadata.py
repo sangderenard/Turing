@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import pytest
+
 from src.compiler.tensor_ssa_lowering import (
     legalize_aggregate_adapters,
     legalize_aggregate_output_views,
     propagate_repository_ssa_call_metadata,
+    settle_canonical_value_metadata,
     settle_repository_ssa_static_extent_operands,
     wire_repository_ssa_region_products,
     lower_tensor_calls_to_repository_ssa,
@@ -175,6 +178,113 @@ def test_python_binary_min_max_keep_operands_in_repository_ssa():
     ]
 
 
+@pytest.mark.parametrize(("spelling", "dimension"), (
+    ("dim", 2),
+    ("axis", 1),
+))
+def test_min_with_explicit_axis_is_a_reduction(spelling, dimension):
+    source = SSAValue(0, "float64", shape=(2, 3, 4))
+    axis = SSAValue(1, "int64")
+    result = SSAValue(2, "float64")
+    function = Function("explicit_axis_min", [source], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], axis, attributes={"value": dimension}),
+            Instr(
+                "Call", [source, axis], result,
+                attributes={
+                    "tensor_candidate": "min",
+                    spelling: dimension,
+                },
+            ),
+            Instr("Ret", [result], None),
+        ]),
+    })
+    module = IRModule({function.name: function})
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference(),
+    ) == ()
+
+    reduction = next(
+        instruction for instruction in function.blocks["entry"].instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("callee") == "reduce_dim_double"
+    )
+    assert reduction.args[0] is source
+    assert reduction.res is result
+    assert result.shape == tuple(
+        extent for index, extent in enumerate(source.shape)
+        if index != dimension
+    )
+
+
+def test_later_elementwise_use_inherits_shape_settled_earlier_in_rewrite():
+    source = SSAValue(0, "float64", shape=(2, 2))
+    produced = SSAValue(1, "float64")
+    stale_use = SSAValue(1, "float64")
+    reciprocal = SSAValue(2, "float64")
+    function = Function("sequential_shape_settlement", [source], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Call", [source], produced,
+                attributes={"tensor_operation": "neg"},
+            ),
+            Instr(
+                "Call", [stale_use], reciprocal,
+                attributes={
+                    "tensor_operation": "pow",
+                    "right_scalar": -1.0,
+                },
+            ),
+            Instr("Ret", [reciprocal], None),
+        ]),
+    })
+    module = IRModule({function.name: function})
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference(),
+    ) == ()
+
+    scalar_call = next(
+        instruction
+        for instruction in function.blocks["entry"].instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("callee") == "binary_scalar_double"
+    )
+    count = scalar_call.args[3]
+    count_definition = next(
+        instruction
+        for instruction in function.blocks["entry"].instrs
+        if instruction.res is count
+    )
+    assert stale_use.shape == (2, 2)
+    assert reciprocal.shape == (2, 2)
+    assert count_definition.attributes["constant"] == 4
+
+
+def test_canonical_shape_settlement_records_provenance_and_keeps_incumbent():
+    incumbent = SSAValue(1, "float64", shape=(2, 2))
+    missing = SSAValue(1, "float64")
+    function = Function("canonical_shape_provenance", [], {
+        "entry": BasicBlock("entry", [
+            Instr("Produce", [], incumbent),
+            Instr("Consume", [missing], None),
+        ]),
+    })
+    module = IRModule({function.name: function})
+
+    assert settle_canonical_value_metadata(module)
+
+    assert incumbent.shape == (2, 2)
+    assert missing.shape == (2, 2)
+    assert missing.accounting["shape_settlement_tie_policy"] == "incumbent"
+    assert missing.accounting["shape_settlement_provenance"] == (
+        "canonical_identity_unanimous",
+        function.name,
+        missing.id,
+    )
+
+
 def test_indexed_store_versions_the_same_resident_arena_in_place():
     source = SSAValue(0, "float64", shape=(4,))
     value = SSAValue(1, "float64")
@@ -205,6 +315,57 @@ def test_indexed_store_versions_the_same_resident_arena_in_place():
     assert descriptor is not None
     assert descriptor.alias_of == source.id
     assert not descriptor.owns_allocation
+
+
+@pytest.mark.parametrize(
+    ("value_shape", "expected_value_count"),
+    [
+        ((), 1),
+        ((1, 1, 1), 1),
+        ((8,), 8),
+    ],
+)
+def test_indexed_store_value_count_describes_rhs_storage(
+    value_shape,
+    expected_value_count,
+):
+    source = SSAValue(0, "float64", shape=(8, 199))
+    value = SSAValue(1, "float64", shape=value_shape)
+    result = SSAValue(2, "float64", shape=source.shape)
+    function = Function("resident_column_store", [source, value], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "IndexedStore", [source, value], result,
+                attributes={
+                    "basic_index_axes": (
+                        (tuple(range(8)), False),
+                        ((0,), True),
+                    ),
+                    "basic_index_source_shape": source.shape,
+                },
+            ),
+            Instr("Ret", [result], None),
+        ]),
+    })
+    module = IRModule({function.name: function})
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference(),
+    ) == ()
+
+    call = next(
+        instruction
+        for instruction in function.blocks["entry"].instrs
+        if instruction.op == "Call"
+    )
+    value_count = call.args[-1]
+    definition = next(
+        instruction
+        for instruction in function.blocks["entry"].instrs
+        if instruction.res is value_count
+    )
+    assert call.attributes["callee"] == "index_assign_double"
+    assert definition.attributes["constant"] == expected_value_count
 
 
 def test_fixed_integer_index_lowers_to_scalar_load_not_tensor_selection():
@@ -367,6 +528,50 @@ def test_empty_call_operand_does_not_guess_between_reshape_views():
 
     assert formal.shape == ()
     assert formal.dtype is None
+
+
+def test_call_metadata_projection_scan_ignores_infinite_numeric_constant():
+    returned = SSAValue(1, "float64")
+    callee = Function("callee", [], {
+        "entry": BasicBlock("entry", [Instr("Ret", [returned], None)]),
+    })
+    aggregate = SSAValue(10, "ssa.aggregate")
+    infinity = SSAValue(
+        11, "float64", accounting={"ssa_aggregate_outputs": (1,)},
+    )
+    index = SSAValue(12, "float64")
+    address = SSAValue(13, "ptr")
+    projected = SSAValue(1)
+    call = Instr("Call", [], aggregate, attributes={
+        "callee": "callee", "output_ids": (1,),
+    })
+    caller = Function("caller", [], {
+        "entry": BasicBlock("entry", [
+            call,
+            Instr("Const", [], infinity, attributes={"value": float("inf")}),
+            Instr("Const", [], index, attributes={"value": 0.0}),
+            Instr("GetElementPtr", [aggregate, index], address),
+            Instr("Load", [address], projected),
+            Instr("Ret", [projected], None),
+        ]),
+    })
+
+    module = IRModule({
+        caller.name: caller,
+        callee.name: callee,
+    })
+    legalize_aggregate_output_views(module)
+    propagate_repository_ssa_call_metadata(module)
+
+    assert projected.dtype == "float64"
+    receipts = module.metadata["call_metadata_fixed_point_receipts"]
+    assert receipts[-1]["round"] == module.metadata[
+        "call_metadata_fixed_point_rounds"
+    ]
+    assert len({receipt["digest"] for receipt in receipts[:-1]}) == len(
+        receipts[:-1]
+    )
+    assert receipts[-1]["digest"] == receipts[-2]["digest"]
 
 
 def test_region_product_rewire_preserves_consumers_ordered_view_contract():
@@ -754,6 +959,11 @@ def test_aggregate_output_view_of_formal_rebinds_to_caller_actual():
     assert legalize_aggregate_output_views(module)
     assert call.attributes["output_ids"] == ()
     assert call.attributes["callee_output_ids"] == ()
+    assert call.attributes["aggregate_output_passthrough_bindings"] == ((
+        0, 20, 10, 5,
+        "exact_callee_output_formal",
+        "incumbent_on_equal_priority",
+    ),)
     assert use.args[0].id == actual.id
     assert use.args[0].shape == (2, 4)
 

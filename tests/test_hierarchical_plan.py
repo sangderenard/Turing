@@ -5,6 +5,7 @@ import textwrap
 from types import SimpleNamespace
 
 import networkx as nx
+import pytest
 
 from src.compiler.hierarchical_plan import (
     HierarchyValueTable,
@@ -846,7 +847,7 @@ def test_sequence_concat_uses_constant_singleton_scalar_leaf():
     )
     _fold_callsite_structural_values(packet)
 
-    operations, _aliases = _sequence_concat_ops(packet.G)
+    operations, _aliases, _materializations = _sequence_concat_ops(packet.G)
 
     assert len(operations) == 1
     _result, _payload, singleton, kind, lhs_scalar, rhs_scalar = operations[0]
@@ -859,6 +860,38 @@ def test_sequence_concat_uses_constant_singleton_scalar_leaf():
         if int(data.get("value_id", -1)) == rhs_scalar
     )
     assert leaf_data.get("constant") == 11
+
+
+@pytest.mark.parametrize('operator,left,right,expected', [
+    ('or', 7, 9, 7), ('or', 0, 9, 9),
+    ('and', 7, 9, 9), ('and', 0, 9, 0),
+])
+def test_structural_boolean_fold_returns_selected_operand(operator, left, right, expected):
+    from types import SimpleNamespace
+    process = nx.DiGraph()
+    process.add_node(0, type='Constant', attributes={'value': left})
+    process.add_node(1, type='Constant', attributes={'value': right})
+    process.add_node(2, type='BoolOp', parents=((0, 'value:0'), (1, 'value:1')),
+                     expr_obj=ast.parse(f'a {operator} b', mode='eval').body, attributes={})
+    process.add_edges_from(((0, 2), (1, 2)))
+    _fold_callsite_structural_values(SimpleNamespace(G=process, roots=[2]))
+    assert process.nodes[2]['attributes']['value'] == expected
+
+
+@pytest.mark.parametrize('operator,constant', [('and', False), ('or', True)])
+def test_later_boolean_constant_cannot_erase_unknown_operand(operator, constant):
+    from types import SimpleNamespace
+    process = nx.DiGraph()
+    process.add_node(0, type='Call', attributes={},
+                     expr_obj=ast.parse('effect()', mode='eval').body)
+    process.add_node(1, type='Constant', attributes={'value': constant})
+    process.add_node(2, type='BoolOp', parents=((0, 'value:0'), (1, 'value:1')),
+                     expr_obj=ast.parse(f'effect() {operator} flag', mode='eval').body, attributes={})
+    process.add_node(3, type='If', parents=((2, 'test'),), attributes={})
+    process.add_edges_from(((0, 2), (1, 2), (2, 3)))
+    _fold_callsite_structural_values(SimpleNamespace(G=process, roots=[3]))
+    assert process.nodes[2]['type'] == 'BoolOp'
+    assert process.has_edge(0, 2)
 
 
 def test_sequence_kind_crosses_pursued_call_before_concat_lowering():

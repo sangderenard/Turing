@@ -513,6 +513,255 @@ def lower_sequence_append(
     )
 
 
+def lower_record_sequence_append_with_child_copy(
+    destination: SSASequenceDescriptor,
+    source: SSASequenceDescriptor,
+    *,
+    function_name: str | None = None,
+    first_value_id: int | None = None,
+) -> SSASequenceLowering:
+    """Append one outer row while snapshotting its single child sequence.
+
+    The outer row's child-table column stores the destination row index.  The
+    source sequence is copied into that row's fixed-stride slice before the
+    outer length is published, so a later mutation of the returned record does
+    not rewrite rows already appended to the destination.
+    """
+
+    unsupported = _unsupported_destination(destination, "append_child_copy")
+    if unsupported is not None:
+        return unsupported
+    pool = destination.child_table_pool
+    if pool is None:
+        raise ValueError("child-copy append requires a destination child pool")
+    if destination.key_columns:
+        raise ValueError("child-copy append does not support outer key dedup")
+    if source.child_table_pool is not None:
+        raise ValueError("child-copy append requires a leaf source sequence")
+    if (
+        len(pool.column_value_ids) != len(source.column_value_ids)
+        or tuple(pool.column_dtypes) != tuple(source.column_dtypes)
+        or tuple(pool.key_columns) != tuple(source.key_columns)
+    ):
+        raise ValueError("child-copy append requires matching child row storage")
+    if not pool.writable:
+        raise ValueError("child-copy append requires a writable child pool")
+
+    destination_storage = _storage_values(destination)
+    pool_storage = (
+        *(SSAValue(value_id, dtype=dtype) for value_id, dtype in zip(
+            pool.column_value_ids, pool.column_dtypes
+        )),
+        SSAValue(pool.length_value_id, dtype="int64"),
+        SSAValue(pool.capacity_value_id, dtype="int64"),
+        SSAValue(pool.row_stride_value_id, dtype="int64"),
+        *((SSAValue(pool.status_value_id, dtype="int"),)
+          if pool.status_value_id is not None else ()),
+        *((SSAValue(pool.live_flags_value_id, dtype="bool"),)
+          if pool.live_flags_value_id is not None else ()),
+    )
+    source_storage = _storage_values(source)
+    storage = tuple({
+        int(value.id): value
+        for value in (*destination_storage, *pool_storage, *source_storage)
+    }.values())
+    builder = _Builder(_first_fresh_identity(
+        destination, source, values=storage, pools=(pool,),
+        minimum=first_value_id,
+    ))
+    handle_column = int(pool.handle_column)
+    row_values = tuple(
+        builder.fresh(dtype)
+        for index, dtype in enumerate(destination.column_dtypes)
+        if index != handle_column
+    )
+    destination_columns = tuple(
+        SSAValue(value_id, dtype=dtype)
+        for value_id, dtype in zip(
+            destination.column_value_ids, destination.column_dtypes
+        )
+    )
+    child_columns = tuple(
+        SSAValue(value_id, dtype=dtype)
+        for value_id, dtype in zip(pool.column_value_ids, pool.column_dtypes)
+    )
+    source_columns = tuple(
+        SSAValue(value_id, dtype=dtype)
+        for value_id, dtype in zip(
+            source.column_value_ids, source.column_dtypes
+        )
+    )
+
+    entry = builder.block("entry")
+    copy_header = builder.block("copy_header")
+    copy_body = builder.block("copy_body")
+    copy_latch = builder.block("copy_latch")
+    publish_child = builder.block("publish_child")
+    full = builder.block("capacity_exhausted")
+    inserted = builder.block("inserted")
+    result_block = builder.block("result")
+    zero = builder.const(entry, 0)
+    one = builder.const(entry, 1)
+
+    outer_length_slot = builder.fresh("ptr")
+    outer_length = builder.fresh("int64")
+    builder.emit(entry, "GetElementPtr", [
+        SSAValue(destination.length_address_id, dtype="int64", shape=(1,)),
+        zero,
+    ], outer_length_slot)
+    builder.emit(entry, "Load", [outer_length_slot], outer_length)
+    outer_has_capacity = builder.fresh("bool")
+    builder.emit(entry, "Lt", [
+        outer_length,
+        SSAValue(destination.capacity_value_id, dtype="int64"),
+    ], outer_has_capacity)
+
+    source_length_slot = builder.fresh("ptr")
+    source_length = builder.fresh("int64")
+    builder.emit(entry, "GetElementPtr", [
+        SSAValue(source.length_address_id, dtype="int64", shape=(1,)), zero,
+    ], source_length_slot)
+    builder.emit(entry, "Load", [source_length_slot], source_length)
+    child_fits_stride = builder.fresh("bool")
+    builder.emit(entry, "Le", [
+        source_length, SSAValue(pool.row_stride_value_id, dtype="int64"),
+    ], child_fits_stride)
+    next_outer_length = builder.fresh("int64")
+    row_end = builder.fresh("int64")
+    builder.emit(entry, "Add", [outer_length, one], next_outer_length)
+    builder.emit(entry, "Mul", [
+        next_outer_length, SSAValue(pool.row_stride_value_id, dtype="int64"),
+    ], row_end)
+    child_pool_fits = builder.fresh("bool")
+    builder.emit(entry, "Le", [
+        row_end, SSAValue(pool.capacity_value_id, dtype="int64"),
+    ], child_pool_fits)
+    capacity_ok = builder.fresh("bool")
+    all_capacity_ok = builder.fresh("bool")
+    builder.emit(entry, "LAnd", [
+        outer_has_capacity, child_fits_stride,
+    ], capacity_ok)
+    builder.emit(entry, "LAnd", [
+        capacity_ok, child_pool_fits,
+    ], all_capacity_ok)
+    builder.cond(entry, all_capacity_ok, copy_header, full)
+
+    copy_index = builder.fresh("int64")
+    next_copy_index = builder.fresh("int64")
+    builder.emit(copy_header, "Phi", [zero, next_copy_index], copy_index,
+                 attributes={"incoming_blocks": (entry.name, copy_latch.name)})
+    copy_continues = builder.fresh("bool")
+    builder.emit(copy_header, "Lt", [
+        copy_index, source_length,
+    ], copy_continues)
+    builder.cond(copy_header, copy_continues, copy_body, publish_child)
+
+    row_offset = builder.fresh("int64")
+    destination_index = builder.fresh("int64")
+    builder.emit(copy_body, "Mul", [
+        outer_length, SSAValue(pool.row_stride_value_id, dtype="int64"),
+    ], row_offset)
+    builder.emit(copy_body, "Add", [
+        row_offset, copy_index,
+    ], destination_index)
+    for source_column, child_column in zip(source_columns, child_columns):
+        source_address = builder.fresh("ptr")
+        source_value = builder.fresh(source_column.dtype)
+        destination_address = builder.fresh("ptr")
+        builder.emit(copy_body, "GetElementPtr", [
+            source_column, copy_index,
+        ], source_address)
+        builder.emit(copy_body, "Load", [source_address], source_value)
+        builder.emit(copy_body, "GetElementPtr", [
+            child_column, destination_index,
+        ], destination_address)
+        builder.emit(copy_body, "Store", [
+            source_value, destination_address,
+        ])
+    if pool.live_flags_value_id is not None:
+        child_live_address = builder.fresh("ptr")
+        child_live_value = one
+        if source.live_flags_value_id is not None:
+            source_live_address = builder.fresh("ptr")
+            child_live_value = builder.fresh("bool")
+            builder.emit(copy_body, "GetElementPtr", [
+                SSAValue(source.live_flags_value_id, dtype="bool"), copy_index,
+            ], source_live_address)
+            builder.emit(copy_body, "Load", [
+                source_live_address,
+            ], child_live_value)
+        builder.emit(copy_body, "GetElementPtr", [
+            SSAValue(pool.live_flags_value_id, dtype="bool"),
+            destination_index,
+        ], child_live_address)
+        builder.emit(copy_body, "Store", [
+            child_live_value, child_live_address,
+        ])
+    builder.branch(copy_body, copy_latch)
+    builder.emit(copy_latch, "Add", [copy_index, one], next_copy_index)
+    builder.branch(copy_latch, copy_header)
+
+    child_length_slot = builder.fresh("ptr")
+    builder.emit(publish_child, "GetElementPtr", [
+        SSAValue(pool.length_value_id, dtype="int64"), outer_length,
+    ], child_length_slot)
+    builder.emit(publish_child, "Store", [source_length, child_length_slot])
+    if pool.status_value_id is not None:
+        child_status_slot = builder.fresh("ptr")
+        builder.emit(publish_child, "GetElementPtr", [
+            SSAValue(pool.status_value_id, dtype="int"), outer_length,
+        ], child_status_slot)
+        builder.emit(publish_child, "Store", [zero, child_status_slot])
+
+    row_value_iter = iter(row_values)
+    for index, column in enumerate(destination_columns):
+        value = outer_length if index == handle_column else next(row_value_iter)
+        address = builder.fresh("ptr")
+        builder.emit(publish_child, "GetElementPtr", [
+            column, outer_length,
+        ], address)
+        builder.emit(publish_child, "Store", [value, address])
+    if destination.live_flags_value_id is not None:
+        live_address = builder.fresh("ptr")
+        builder.emit(publish_child, "GetElementPtr", [
+            SSAValue(destination.live_flags_value_id, dtype="bool"),
+            outer_length,
+        ], live_address)
+        builder.emit(publish_child, "Store", [one, live_address])
+    builder.emit(publish_child, "Store", [
+        next_outer_length, outer_length_slot,
+    ])
+    builder.branch(publish_child, inserted)
+
+    inserted_status = _status_branch(builder, inserted, 1, result_block)
+    full_status = _status_branch(builder, full, 2, result_block)
+    status_result = builder.fresh("int")
+    builder.emit(result_block, "Phi", [inserted_status, full_status],
+                 status_result,
+                 attributes={"incoming_blocks": (inserted.name, full.name)})
+    builder.emit(result_block, "Ret", [status_result])
+
+    name = function_name or (
+        f"ssa_sequence_{destination.sequence_id}_append_child_"
+        f"{source.sequence_id}"
+    )
+    function = Function(
+        name,
+        [*storage, *row_values],
+        builder.blocks,
+        metadata={
+            "ssa_sequence_operation": "append_child_copy",
+            "sequence_id": int(destination.sequence_id),
+            "child_source_sequence_id": int(source.sequence_id),
+            "child_handle_column": handle_column,
+            "fixed_capacity": True,
+            "status_values": {"inserted": 1, "capacity_exhausted": 2},
+            "named_outputs": (("status", int(status_result.id)),),
+        },
+    )
+    return SSASequenceLowering((function,))
+
+
 def lower_sequence_add(
     descriptor: SSASequenceDescriptor,
     *,
@@ -2082,6 +2331,104 @@ def lower_child_table_delete(
     ),))
 
 
+def lower_sequence_replace(
+    destination: SSASequenceDescriptor,
+    source: SSASequenceDescriptor,
+    *,
+    function_name: str | None = None,
+    first_value_id: int | None = None,
+) -> SSASequenceLowering:
+    """Copy a compatible resident arena, publishing its length last.
+
+    Capacity failure leaves the destination intact. Identical storage is
+    valid: source length is captured before writing, and rows retain their
+    positions. This operation preserves keyed rows rather than reinserting
+    them under a potentially different uniqueness policy.
+    """
+    unsupported = _unsupported_destination(destination, "replace")
+    if unsupported is not None:
+        return unsupported
+    if (len(destination.column_value_ids) != len(source.column_value_ids)
+            or destination.column_dtypes != source.column_dtypes
+            or destination.key_columns != source.key_columns
+            or (destination.live_flags_value_id is None) != (source.live_flags_value_id is None)):
+        raise ValueError("sequence replacement requires matching row storage and key policy")
+    if destination.child_table_pool is not None or source.child_table_pool is not None:
+        raise ValueError("nested sequence replacement requires child ownership lowering")
+    dst_columns = list(zip(destination.column_value_ids, destination.column_dtypes
+                           or ("unknown",) * len(destination.column_value_ids)))
+    src_columns = list(zip(source.column_value_ids, source.column_dtypes
+                           or ("unknown",) * len(source.column_value_ids)))
+    if destination.live_flags_value_id is not None:
+        dst_columns.append((destination.live_flags_value_id, "bool"))
+        src_columns.append((source.live_flags_value_id, "bool"))
+    if any(dst == other for index, (dst, _) in enumerate(dst_columns)
+           for other_index, (other, _) in enumerate(src_columns) if index != other_index):
+        raise ValueError("sequence replacement cannot overlap different columns")
+    storage = tuple({value.id: value for value in (
+        *_storage_values(destination), *_storage_values(source)
+    )}.values())
+    builder = _Builder(_first_fresh_identity(destination, source, values=storage, minimum=first_value_id))
+    entry = builder.block("entry")
+    header = builder.block("replace_header")
+    body = builder.block("replace_body")
+    latch = builder.block("replace_latch")
+    complete = builder.block("complete")
+    exhausted = builder.block("capacity_exhausted")
+    result = builder.block("result")
+    zero = builder.const(entry, 0)
+    one = builder.const(entry, 1)
+    source_address = builder.fresh("ptr")
+    length = builder.fresh("int64")
+    builder.emit(entry, "GetElementPtr", [SSAValue(source.length_address_id, dtype="int64"), zero], source_address)
+    builder.emit(entry, "Load", [source_address], length)
+    nonnegative, source_fits, destination_fits = (builder.fresh("bool") for _ in range(3))
+    builder.emit(entry, "Ge", [length, zero], nonnegative)
+    builder.emit(entry, "Le", [length, SSAValue(source.capacity_value_id, dtype="int64")], source_fits)
+    builder.emit(entry, "Le", [length, SSAValue(destination.capacity_value_id, dtype="int64")], destination_fits)
+    valid_source, fits = builder.fresh("bool"), builder.fresh("bool")
+    builder.emit(entry, "And", [nonnegative, source_fits], valid_source)
+    builder.emit(entry, "And", [valid_source, destination_fits], fits)
+    builder.cond(entry, fits, header, exhausted)
+    index, next_index = builder.fresh("int64"), builder.fresh("int64")
+    builder.emit(header, "Phi", [zero, next_index], index,
+                 attributes={"incoming_blocks": (entry.name, latch.name)})
+    continues = builder.fresh("bool")
+    builder.emit(header, "Lt", [index, length], continues)
+    builder.cond(header, continues, body, complete)
+    for (dst, dtype), (src, _) in zip(dst_columns, src_columns):
+        src_address, dst_address = builder.fresh("ptr"), builder.fresh("ptr")
+        value = builder.fresh(dtype)
+        builder.emit(body, "GetElementPtr", [SSAValue(src, dtype=dtype), index], src_address)
+        builder.emit(body, "Load", [src_address], value)
+        builder.emit(body, "GetElementPtr", [SSAValue(dst, dtype=dtype), index], dst_address)
+        builder.emit(body, "Store", [value, dst_address])
+    builder.branch(body, latch)
+    builder.emit(latch, "Add", [index, one], next_index)
+    builder.branch(latch, header)
+    dst_length_address = builder.fresh("ptr")
+    builder.emit(complete, "GetElementPtr", [SSAValue(destination.length_address_id, dtype="int64"), zero], dst_length_address)
+    builder.emit(complete, "Store", [length, dst_length_address])
+    success = _status_branch(builder, complete, 1, result)
+    failure = _status_branch(builder, exhausted, 2, result)
+    status = builder.fresh("int")
+    builder.emit(result, "Phi", [success, failure], status,
+                 attributes={"incoming_blocks": (complete.name, exhausted.name)})
+    builder.emit(result, "Ret", [status])
+    function = Function(function_name or f"ssa_sequence_{destination.sequence_id}_replace_{source.sequence_id}",
+                        list(storage), builder.blocks, metadata={
+        "ssa_sequence_operation": "replace",
+        "destination_sequence_id": destination.sequence_id,
+        "source_sequence_id": source.sequence_id,
+        "sequence_array_argument_ids": tuple(dict.fromkeys((
+            *(column for column, _ in dst_columns), destination.length_address_id,
+            *(column for column, _ in src_columns), source.length_address_id,
+        ))),
+        "named_outputs": (("status", int(status.id)),),
+    })
+    return SSASequenceLowering((function,))
+
+
 def lower_sequence_extend(
     destination: SSASequenceDescriptor,
     source: SSASequenceDescriptor,
@@ -2351,6 +2698,7 @@ __all__ = [
     "lower_sequence_fill",
     "lower_sequence_aggregate_constants",
     "lower_sequence_append",
+    "lower_record_sequence_append_with_child_copy",
     "lower_sequence_contains",
     "lower_sequence_extend",
     "lower_sequence_insert",

@@ -41,6 +41,7 @@ from src.compiler.control_source import (
     LoopBlock,
     LoopControlBlock,
     SequenceBlock,
+    StatementBlock,
     StreamPublishBlock,
     ValidationBlock,
     WhileBlock,
@@ -775,6 +776,45 @@ def test_iterable_loop_recovers_authored_attribute_after_parent_edge_loss():
     assert graph.G.nodes[plan.loop.iterable_node]["type"] == "GetAttr"
 
 
+def test_resident_tail_slice_becomes_loop_start_without_slice_value():
+    graph = _function_graph(
+        "def kernel(items: list[int]):\n"
+        "    total = 0\n"
+        "    for item in items[2:]:\n"
+        "        total = total + item\n"
+        "    return total\n",
+        "kernel",
+    )
+    loop_id = next(
+        node_id
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    sliced_id = next(
+        parent
+        for parent, role in graph.G.nodes[loop_id]["parents"]
+        if str(role) in {"iterable", "iter"}
+    )
+    base_id = next(
+        parent
+        for parent, role in graph.G.nodes[sliced_id]["parents"]
+        if str(role) == "base"
+    )
+
+    plan, = _glsl_composer(unroll_limit=0).compose(graph)
+
+    assert plan.loop.iterable_node == base_id
+    assert sliced_id in plan.loop.domain_node_ids
+    assert plan.loop.start == 2
+    assert plan.loop.stop is None
+    assert plan.loop.step == 1
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.domain_node_ids,)
+    )
+    assert reduction.structurally_owned_region_indices == (0,)
+    assert reduction.domain_region_indices == (0,)
+
+
 def test_parameter_default_does_not_evaporate_runtime_iterable():
     graph = _function_graph(
         "def kernel(items=()):\n"
@@ -1043,8 +1083,25 @@ def test_tuple_generator_materialization_owns_publication_storage():
 
     assert reduction.collapsible
     assert reduction.control_program is not None
-    binding, = reduction.control_program.collection_bindings
-    collection_id = binding[1]
+    output, = plan.loop.iteration_outputs
+    collection_id = output.result_value_id
+    # Collection publication now uses the resident append ABI so filtered
+    # rows advance logical length only when accepted. Verify its real owner
+    # and writer rather than the obsolete induction-indexed binding list.
+    def mutations(block):
+        yield from getattr(block, "sequence_mutations", ())
+        if hasattr(block, "mutation"):
+            yield block.mutation
+        for child in getattr(block, "blocks", ()):
+            yield from mutations(child)
+        for name in ("body", "orelse", "condition", "callee"):
+            child = getattr(block, name, None)
+            if child is not None:
+                yield from mutations(child)
+    writer, = (mutation for mutation in mutations(reduction.control_program.root)
+               if mutation.sequence_value_id == collection_id)
+    assert writer.operator == "append"
+    assert writer.argument_value_ids == (output.value_id,)
     assert collection_id != tuple_id
     assert graph.G.nodes[collection_id]["type"] == "LoopResult"
     assert graph.G.nodes[tuple_id]["attributes"]["collection_owner_id"] == (
@@ -1690,6 +1747,42 @@ def test_while_condition_and_break_become_planner_control_edges():
     assert loop.predicate_value_id == plan.loop.condition_nodes[0]
     assert any(
         isinstance(block, LoopControlBlock) and block.action == "break"
+        for block in loop.body.blocks
+    )
+
+
+def test_while_condition_owns_region_for_structured_operand_operation():
+    graph = _function_graph(
+        "def kernel(limit):\n"
+        "    total = AbstractTensor.tensor(0.0)\n"
+        "    while (limit - total).item() > 0.0:\n"
+        "        total = total + 1.0\n"
+        "    return total\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+    subtraction = next(
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.BinOp)
+        and isinstance(data["expr_obj"].op, ast.Sub)
+    )
+
+    reduction, = analyze_shader_loop_reductions(
+        graph,
+        (plan,),
+        ((subtraction,), plan.loop.body_nodes),
+    )
+
+    assert reduction.collapsible
+    loop = reduction.control_program.root
+    assert isinstance(loop, WhileBlock)
+    assert loop.condition == SequenceBlock((
+        StatementBlock(("__scheduled_region_0__",)),
+    ))
+    assert not any(
+        isinstance(block, StatementBlock)
+        and "__scheduled_region_0__" in block.lines
         for block in loop.body.blocks
     )
 

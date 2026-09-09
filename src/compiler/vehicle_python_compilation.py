@@ -357,7 +357,11 @@ class BalloonTireManagedState:
     declared_dt_s: float = 0.0
 
     def dt_limit_hint(self):
-        return float(self.declared_dt_s) if float(self.declared_dt_s) > 0.0 else None
+        # The controller accepts a hint only when it is finite and positive.
+        # Use zero as the inactive scalar value so this native-facing method
+        # has one physical return contract instead of a payload/None union.
+        declared = float(self.declared_dt_s)
+        return declared if declared > 0.0 else 0.0
 
     def copy_shallow(self):
         return (
@@ -449,6 +453,11 @@ def balloon_tire_managed_advance(material, dt):
             "energy_j": stored_energy.max(),
             "power_w": exchange_power.max(),
         },
+        # This core has no additional post-step ceiling. The largest finite
+        # float is the neutral value for the controller's minimum clamp while
+        # retaining one physical scalar ABI across the returned record.
+        dt_limit=1.7976931348623157e308,
+        advanced_dt=dt,
     )
 
 
@@ -470,6 +479,7 @@ def balloon_tire_managed_window(
         allow_unresolved=False,
         max_retries=None,
         rollback_threshold_multiplier=2.0,
+        schedule_lattice_steps=1048576,
     )
     completed_window = (
         float(advanced) >= float(window_duration) - 1.0e-15
@@ -608,6 +618,9 @@ def balloon_tire_managed_extraction_contract(
             },
             "last_maximum_velocity_m_s": {
                 "storage": "scalar", "dtype": "float64", "mutable": True,
+            },
+            "declared_dt_s": {
+                "storage": "scalar", "dtype": "float64", "mutable": False,
             },
         },
     }
@@ -855,6 +868,11 @@ def lower_balloon_tire_managed_python_ssa(
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         linked_process_graphs=inputs.linked_process_graphs,
         extraction_contract=balloon_tire_managed_extraction_contract(material),
+        # The ProgramABI declares the physical fields, while the retained
+        # authored class supplies the methods which operate on those fields.
+        # Without this, state.copy_shallow()/restore() have a record layout but
+        # no same-program method body and can only appear as opaque effects.
+        retain=(BalloonTireManagedState,),
         runtime_closure_only=True,
         name="balloon_tire_managed_python",
         progress=progress,
@@ -886,6 +904,14 @@ def _managed_native_feeds_by_id(
         int(value_id): str(name)
         for name, value_id in root.metadata.get("parameter_names", ())
     }
+    optional_presence_fields = {
+        (
+            str((argument.accounting or {}).get("program_abi_parameter")),
+            str((argument.accounting or {}).get("program_abi_field")),
+        )
+        for argument in root.args
+        if (argument.accounting or {}).get("program_abi_optional_presence")
+    }
     physical: dict[int, Any] = {}
     for argument in root.args:
         value_id = int(argument.id)
@@ -895,6 +921,28 @@ def _managed_native_feeds_by_id(
         if parameter is None:
             parameter = parameter_names.get(value_id)
         if parameter not in feeds:
+            if (
+                accounting.get("linked_call_frame_storage")
+                and not accounting.get("linked_parameter_provenance")
+            ):
+                # Result-record storage hoisted from a linked call frame is
+                # private workspace even though C exposes it as a root buffer.
+                # It has no authored root parameter from which to obtain an
+                # initial value, so materialize its defined zero state here.
+                from .ssa_c_backend import _numpy_dtype
+
+                shape = tuple(argument.shape or ())
+                if any(
+                    not isinstance(extent, int) or extent < 0
+                    for extent in shape
+                ):
+                    raise ValueError(
+                        "linked call-frame storage has unresolved shape: "
+                        f"{value_id}: {shape}"
+                    )
+                physical[value_id] = np.zeros(
+                    shape or (), dtype=_numpy_dtype(argument.dtype),
+                )
             continue
         value = feeds[str(parameter)]
         if field is None:
@@ -919,21 +967,39 @@ def _managed_native_feeds_by_id(
                 held = held[member]
             else:
                 held = getattr(held, member)
-        # The current scalar ProgramABI has no separate optional-presence limb.
-        # Use operation-neutral native representatives for the dt system's
-        # numeric optionals: its None floor is 1e-30, while an absent upper
-        # bound/limit is positive infinity.  Unlike the former blanket zero,
-        # these preserve every guarded min/max and finiteness test and still
-        # allow dt_max to become a finite controller-owned value after the first
-        # accepted step.
+        if accounting.get("program_abi_optional_presence"):
+            present = held is not None
+            physical[value_id] = (
+                present
+                if accounting.get(
+                    "program_abi_optional_present_when", True
+                )
+                else not present
+            )
+            continue
+        # A numeric sentinel cannot preserve Python identity/presence tests.
+        # For example an absent floor and a tiny numeric floor take different
+        # rejection-exhaustion paths. Require a real optional ABI rather than
+        # silently changing the authored object's state at the native boundary.
+        optional_key = (str(parameter), str(field))
+        if held is None and optional_key in optional_presence_fields:
+            # Frame linking can expose additional physical storage for the
+            # same authored optional field.  Those exact field aliases do not
+            # become new ProgramABI payload declarations, but they still need
+            # a defined filler value while the shared presence bit is false.
+            dtype = str(argument.dtype or "float64").casefold()
+            physical[value_id] = (
+                False if dtype in {"bool", "i1", "uint8", "u8"}
+                else 0 if dtype in {"int", "int32", "i32", "int64", "i64"}
+                else 0.0
+            )
+            continue
         if held is None and str(argument.dtype or "").casefold() not in {
             "none", "ssa.aggregate",
         }:
-            leaf = path[-1] if path else ""
-            held = (
-                1.0e-30 if leaf == "dt_min"
-                else float("inf") if leaf in {"dt_max", "dt_limit"}
-                else 0
+            raise ValueError(
+                f"native input {parameter}.{field} is None but its ABI declares "
+                f"{argument.dtype!r} without optional presence storage"
             )
         physical[value_id] = held
     return physical

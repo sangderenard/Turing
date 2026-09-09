@@ -260,16 +260,10 @@ def step_with_dt_control_used(state,
         # frame corrects dt without paying for state restoration and recreation.
         soft_reasons: list[str] = []
         if metrics.mass_err > targets.mass_max:
-            soft_reasons.append(
-                f"mass_err {float(metrics.mass_err):.3e} > "
-                f"{float(targets.mass_max):.3e}"
-            )
+            soft_reasons.append("mass_err")
         div_rollback_limit = float(targets.div_max) * 10.0
         if metrics.div_inf > div_rollback_limit:
-            soft_reasons.append(
-                f"div_inf {float(metrics.div_inf):.3e} > "
-                f"{div_rollback_limit:.3e}"
-            )
+            soft_reasons.append("div_inf")
         for name, limit in targets.error_limits.items():
             channel_error = float(metrics.error_channels.get(name, 0.0))
             if channel_error > float(limit):
@@ -287,15 +281,9 @@ def step_with_dt_control_used(state,
         if bool(metrics.hard_failure):
             reasons.append("hard_failure")
         if metrics.mass_err > targets.mass_max * rollback_scale:
-            reasons.append(
-                f"mass_err {float(metrics.mass_err):.3e} > "
-                f"{float(targets.mass_max) * rollback_scale:.3e} rollback limit"
-            )
+            reasons.append("mass_err rollback limit")
         if metrics.div_inf > div_rollback_limit * rollback_scale:
-            reasons.append(
-                f"div_inf {float(metrics.div_inf):.3e} > "
-                f"{div_rollback_limit * rollback_scale:.3e} rollback limit"
-            )
+            reasons.append("div_inf rollback limit")
         for name, limit in targets.error_limits.items():
             channel_error = float(metrics.error_channels.get(name, 0.0))
             channel_rollback_limit = float(limit) * rollback_scale
@@ -412,16 +400,12 @@ def step_with_dt_control_used(state,
             # pinned audio-rate interior this runs thousands of times a frame, and
             # printing each one buries the very thing it is reporting.
             lines = [
-                "timestep controller proceeded unresolved after "
-                f"{len(failures) + 1} attempt(s):"
+                "timestep controller proceeded unresolved after recorded attempts"
             ]
             for index, (dt_f, m, why) in enumerate(
                 (*failures, (float(dt_for_advance), metrics, tuple(reasons))), 1,
             ):
-                lines.append(
-                    f"  attempt {index}: dt={dt_f:.6g} mass_err={m.mass_err:.3e} "
-                    f"div_inf={m.div_inf:.3e} max_vel={m.max_vel:.3e}"
-                )
+                lines.append("  attempt rejected")
                 lines.append("      rejected by recorded rule")
             if max_retries == 0:
                 lines.append(
@@ -440,7 +424,7 @@ def step_with_dt_control_used(state,
                     "so subdividing further could not have resolved it."
                 )
             channels["dt_unresolved_report"] = 0.0
-            metrics.unresolved_report = tuple(lines)
+            metrics.unresolved_report = list(lines)
             # Fall through to the ordinary accepted path so the proposal for the
             # next step is computed the same way it always is.
             rejected = False
@@ -449,12 +433,9 @@ def step_with_dt_control_used(state,
             failures.append((float(dt_for_advance), metrics, tuple(reasons)))
             if retries_exhausted:
                 ctrl.clamp_events += 1
-                lines = [f"timestep controller failed after {len(failures)} attempts:"]
+                lines = ["timestep controller failed after recorded attempts"]
                 for i, (dt_f, m, why) in enumerate(failures, 1):
-                    lines.append(
-                        f"  attempt {i}: dt={dt_f:.6g} mass_err={m.mass_err:.3e} "
-                        f"div_inf={m.div_inf:.3e} max_vel={m.max_vel:.3e}"
-                    )
+                    lines.append("  attempt rejected")
                     lines.append("      rejected by recorded rule")
                 if max_retries == 0:
                     lines.append(
@@ -548,6 +529,7 @@ def run_superstep(state,
                   rollback_threshold_multiplier: float = 1.0,
                   rollback: bool = True,
                   distribution=None,
+                  schedule_lattice_steps: int = 0,
                   max_iters: int = 100_000):
     if rollback_threshold_multiplier < 1.0:
         raise ValueError("rollback_threshold_multiplier must be >= 1.0")
@@ -556,6 +538,8 @@ def run_superstep(state,
             f"unknown substep interior {substep!r}; expected 'pinned' or "
             "'steered'"
         )
+    if schedule_lattice_steps < 0:
+        raise ValueError("schedule_lattice_steps must be non-negative")
     if substep == "pinned":
         if substep_dt is None or float(substep_dt) <= 0.0:
             raise ValueError("a pinned interior requires a positive substep_dt")
@@ -591,7 +575,11 @@ def run_superstep(state,
     # This is that same "quiet, non-throwing incomplete window" record used
     # below when the loop truly never advances, just built up front instead
     # of only on demand.
-    last_metrics = Metrics(0.0, 0.0, 0.0, 0.0, hard_failure=True)
+    last_metrics = Metrics(
+        0.0, 0.0, 0.0, 0.0,
+        hard_failure=True,
+        unresolved_report=[],
+    )
     boundary_values = tuple(sorted({
         float(value)
         for value in event_boundaries
@@ -624,6 +612,13 @@ def run_superstep(state,
                     AbstractTensor.tensor(boundary - total_value),
                 )
                 break
+        # A collapsed controller proposal cannot advance simulated time.  Do
+        # not call physics with zero or a negative value: authored kernels
+        # commonly divide by dt, and doing so only corrupts state before the
+        # existing incomplete-window path reports no progress.
+        dt_try_value = float(dt_try.item())
+        if dt_try_value <= 0.0:
+            break
         metrics, dt_next, dt_used = step_with_dt_control_used(
             state,
             dt_try,
@@ -658,6 +653,18 @@ def run_superstep(state,
                 dt_cap = AbstractTensor.maximum(ctrl.dt_min, dt_cap)
             if ctrl.dt_max is not None:
                 dt_cap = AbstractTensor.minimum(ctrl.dt_max, dt_cap)
+            if schedule_lattice_steps > 0:
+                # Adaptive proposals are decisions, and decisions need a
+                # backend-independent boundary. Choose the greatest lattice
+                # point no larger than the fully clamped proposal. A proposal
+                # below the first point remains unchanged rather than being
+                # raised above a safety limit. Remainder/event clamps happen
+                # on dt_try, so exact authored landing points remain exact.
+                lattice_quantum = round_max_t / float(schedule_lattice_steps)
+                lattice_count = (dt_cap / lattice_quantum).floor()
+                lattice_value = lattice_count * lattice_quantum
+                if lattice_value.item() > 0.0:
+                    dt_cap = lattice_value
         last_dt_next = dt_next
 
     if unresolved:
@@ -710,6 +717,7 @@ def run_superstep_plan(state,
         rollback_threshold_multiplier=plan.rollback_threshold_multiplier,
         rollback=plan.rollback,
         distribution=distribution,
+        schedule_lattice_steps=plan.schedule_lattice_steps,
     )
     total_val = float(total.item() if isinstance(total, AbstractTensor) else total)
     dt_next_val = float(dt_next.item() if isinstance(dt_next, AbstractTensor) else dt_next)

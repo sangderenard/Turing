@@ -68,3 +68,23 @@ def test_tensor_output_ownership_survives_loss_of_record_field_name():
     assert producer.args[0] is formal
     assert ret.args[0] is formal
     assert table.tensors[7].data_value_id == formal.id
+
+
+def test_declared_region_inout_interns_its_producer_without_field_metadata():
+    formal = SSAValue(7, 'float64')
+    result = SSAValue(7, 'float64')
+    producer = Instr('max', [SSAValue(6, 'float64', shape=(4,))], result)
+    ret = Instr('Ret', [formal], None)
+    function = Function(
+        'region', [formal], {'entry': BasicBlock('entry', [producer, ret])},
+        metadata={'source_region_integral': {
+            'capture_value_ids': (6, 7),
+            'output_value_ids': (7,),
+        }},
+    )
+
+    _intern_writable_region_outputs(function)
+
+    assert producer.res is formal
+    assert ret.args[0] is formal
+    assert function.metadata['interned_program_abi_output_ids'] == (7,)

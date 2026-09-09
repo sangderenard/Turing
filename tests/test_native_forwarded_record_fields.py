@@ -3,8 +3,58 @@ import subprocess
 import sys
 
 from src.compiler.fortran_c_shell import _retain_forwarded_aggregate_storage
+from src.compiler.ssa_record_return_state import reconcile_forwarded_record_results
 from src.compiler.ssa_c_backend import emit_ssa_to_c
-from src.transmogrifier.ssa import SSAValue, Instr, Function, BasicBlock, IRModule
+from src.transmogrifier.ssa import (
+    SSAValue, Instr, Function, BasicBlock, IRModule,
+    SSACallRecord, SSARecordDescriptor, SSARecordFieldDescriptor, SSARecordTable,
+)
+
+
+def test_forwarded_record_result_tracks_the_settled_input_frame():
+    left, right = SSAValue(100, "float64"), SSAValue(101, "float64")
+    callee = Function("forward", [left, right], {
+        "entry": BasicBlock("entry", [Instr("Ret", [left, right], None)]),
+    }, metadata={"record_return_layouts": ((5, (100, 101)),)})
+    actual_left, actual_right = SSAValue(0, "float64"), SSAValue(1, "float64")
+    stale_left, stale_right = SSAValue(10, "float64"), SSAValue(11, "float64")
+    call = Instr("Call", [actual_left, actual_right], None, attributes={
+        "callee": "forward",
+        "source_linked": True,
+        "plan_callsite_id": 7,
+        "callee_input_ids": (100, 101),
+        "forwarded_output_bindings": ((100, 10), (101, 11)),
+    })
+    result = SSAValue(12, "float64")
+    caller = Function("root", [actual_left, actual_right, stale_left, stale_right], {
+        "entry": BasicBlock("entry", [
+            call,
+            Instr("Sub", [stale_left, stale_right], result),
+            Instr("Ret", [result], None),
+        ]),
+    })
+    module = IRModule({"root": caller, "forward": callee})
+    module.record_tables["root"] = SSARecordTable(records={
+        20: SSARecordDescriptor(20, "Pair", (
+            SSARecordFieldDescriptor("left", "scalar", value_ids=(10,), dtype="float64"),
+            SSARecordFieldDescriptor("right", "scalar", value_ids=(11,), dtype="float64"),
+        )),
+    })
+    module.call_table["root"] = (SSACallRecord(
+        "root", 7, None, "forward", "forward",
+        result_bindings=((5, 20),), resolution="native_call",
+    ),)
+
+    assert reconcile_forwarded_record_results(module) == 2
+    assert reconcile_forwarded_record_results(module) == 0
+    assert call.attributes["forwarded_output_bindings"] == ((100, 0), (101, 1))
+    assert [value.id for value in caller.blocks["entry"].instrs[1].args] == [0, 1]
+    assert [
+        field.value_ids for field in module.record_tables["root"].records[20].fields
+    ] == [(0,), (1,)]
+    receipts = module.metadata["forwarded_record_result_receipts"]
+    assert all(item["priority"] == "exact_settled_forwarded_input" for item in receipts)
+    assert all(item["tie_policy"] == "incumbent" for item in receipts)
 
 
 def test_forwarded_field_frame_keeps_call_effects_without_new_results(tmp_path):

@@ -1,8 +1,8 @@
 """Compare a built managed DT executable with its eager authored window.
 
-No compilation is performed. Both executions are bounded subprocesses and run
-sequentially. The initial native buffer file must match the recreated fixture
-before either result can count as parity evidence.
+No compilation is performed. Both executions run sequentially to completion.
+The initial native buffer file must match the recreated fixture before either
+result can count as parity evidence.
 """
 
 from __future__ import annotations
@@ -17,6 +17,24 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+
+def checkpoint_path(directory: Path, manifest: dict) -> Path:
+    """Resolve either a colocated checkpoint or the builder's exact source."""
+
+    local = directory / 'repository-ssa.pkl'
+    if local.is_file():
+        return local
+    recorded = manifest.get('checkpoint')
+    if recorded:
+        path = Path(recorded)
+        if not path.is_absolute():
+            path = directory / path
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f'no repository SSA checkpoint for parity in {directory}'
+    )
 
 
 def eager_worker(directory: Path, frames: int) -> None:
@@ -64,14 +82,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory', type=Path)
     parser.add_argument('--frames', type=int, default=1)
-    parser.add_argument('--timeout', type=float, default=180)
     parser.add_argument('--rtol', type=float, default=1e-8)
     parser.add_argument('--atol', type=float, default=1e-10)
     parser.add_argument('--eager-worker', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     directory = args.directory.resolve()
-    if args.frames < 1 or args.timeout <= 0:
-        parser.error('frames and timeout must be positive')
+    if args.frames < 1:
+        parser.error('frames must be positive')
     if args.eager_worker:
         eager_worker(directory, args.frames)
         return 0
@@ -84,7 +101,9 @@ def main() -> int:
     )
 
     manifest = json.loads((directory / 'balloon_tire_managed.manifest.json').read_text())
-    module, outputs, exports = pickle.loads((directory / 'repository-ssa.pkl').read_bytes())
+    module, outputs, exports = pickle.loads(
+        checkpoint_path(directory, manifest).read_bytes()
+    )
     root = next(name for name in module.functions if name.endswith('__balloon_tire_managed_window'))
     lowered = VehiclePythonSSALowering(module, root, outputs, exports)
     inputs = balloon_tire_managed_python_compilation_inputs(
@@ -123,16 +142,13 @@ def main() -> int:
         ('eager', [sys.executable, str(Path(__file__).resolve()), str(directory),
                    '--frames', str(args.frames), '--eager-worker']),
     ):
-        print(f'Running {label}, timeout={args.timeout}s', flush=True)
-        try:
-            result = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=args.timeout)
-        except subprocess.TimeoutExpired as error:
-            (directory / f'parity-{label}.log').write_text(f'TIMEOUT after {args.timeout}s\n{error}', encoding='utf-8')
-            executions.append({'mode': label, 'timeout': True, 'returncode': None})
-            continue
+        print(f'Running {label} to completion', flush=True)
+        result = subprocess.run(
+            command, cwd=directory, capture_output=True, text=True,
+        )
         (directory / f'parity-{label}.log').write_text(result.stdout + result.stderr, encoding='utf-8')
-        executions.append({'mode': label, 'timeout': False, 'returncode': result.returncode})
-    if any(item['timeout'] or item['returncode'] != 0 for item in executions):
+        executions.append({'mode': label, 'returncode': result.returncode})
+    if any(item['returncode'] != 0 for item in executions):
         (directory / 'managed-dt-parity.json').write_text(json.dumps({
             'passed': False, 'frames': args.frames, 'optimization': manifest['optimization'],
             'executions': executions, 'comparisons': [],

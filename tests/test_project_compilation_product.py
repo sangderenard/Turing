@@ -51,6 +51,7 @@ def test_compiler_toolchain_fingerprint_is_deterministic_and_auditable():
     paths = [item["path"] for item in first["files"]]
     assert paths == sorted(paths)
     assert "src/compiler/precompile_to_ssa.py" in paths
+    assert "src/compiler/ssa_record_return_state.py" in paths
     assert "src/common/tensors/topological_reducer.py" in paths
     assert {
         "src/transmogrifier/graph/node_special_cases.py",

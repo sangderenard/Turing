@@ -101,6 +101,10 @@ class Handler(Enum):
     MatMul        = "MatMul"
     Neg           = "Neg"
     Abs           = "Abs"
+    # Scalar IEEE finiteness predicate. Tensor frontends may also use this
+    # spelling elementwise; control lowering needs the scalar result as an
+    # ordinary repository instruction rather than a Python ``math`` call.
+    IsFinite      = "isfinite"
 
     # Bitwise
     And           = "And"

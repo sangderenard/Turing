@@ -5239,6 +5239,34 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
             "pneumatic-valve-to-closed-volume", "annular-bearing-pneumatic-rotary-seal",
             "traditional-rim-service-valve", "tube-stem-to-rim-valve-install-binding",
             "hydraulic-caliper-service-port",
+            # engine-domain routed lines: carry a flow/tension state, not a
+            # structural joint, so they belong in this set on the same
+            # grounds as the hydraulic/pneumatic/electrical lines above --
+            # they just hadn't been added yet
+            "routed-tension-cable", "routed-energy-line",
+            "intake-flow-path", "exhaust-flow-path",
+            # genuinely low-pressure air (crankcase ventilation, vacuum
+            # lines) -- distinct from pressure-rated-air-line/flexible-
+            # air-line/rigid-pneumatic-hard-line above, which are the
+            # real high-pressure brake/suspension pneumatic system; a
+            # turbo/supercharger's own boost tract is not modeled at
+            # this pressure-rated-line fidelity either, so this is for
+            # the genuinely low-pressure side only
+            "low-pressure-air-line",
+            # coolant/oil: distinct from the hydraulic set above because
+            # their carried state is thermal (+ flow, + pressure for
+            # oil), not force/pressure -- real, separate
+            # medium_rate_state shapes from a structural brake/suspension
+            # hydraulic line
+            "coolant-line", "oil-line",
+            # a declared energy-flow path, not a physical pipe -- no
+            # bushing joint to fabricate for it either
+            "heat-exchange-path",
+            # a real high-pressure liquid delivery line -- nitrous is
+            # stored and delivered as a liquid until it flashes to gas at
+            # the nozzle, the same incompressible-until-the-orifice
+            # behavior as a real hydraulic line, just a different fluid
+            "nitrous-delivery-line",
         }
         # Each physical edge owns the compliance and loss at both of its
         # junctions.  These are endpoint bushings, not an extra force applied
@@ -5648,6 +5676,16 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
         "rear_junction": [-half_length * .58, .18, 0.0],
         "starter": [float(powertrain["engine_position"][0]) + .08,
                     float(powertrain["engine_position"][1]), -.16],
+        # The ground return, as real hardware: a single-point ground
+        # strap lug on the engine block (the battery negative lands
+        # here -- the starter's and ignition's return current is the
+        # heaviest in the vehicle and lives on the block) plus a
+        # block-to-frame strap so chassis-mounted loads share the same
+        # reference. Every insulated-copper-wire route above is a feed
+        # only; without these two the harness had no return path at all.
+        "engine_ground": [float(powertrain["engine_position"][0]) - .06,
+                          float(powertrain["engine_position"][1]) - .04, -.14],
+        "frame_ground": [.22, .12, -.24],
         "alternator": [float(powertrain["engine_position"][0]) - .10,
                        float(powertrain["engine_position"][1]) + .08, .16],
         "alternator_cvt": [float(powertrain["engine_position"][0]) - .05,
@@ -5737,10 +5775,12 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
         ("powertrain_can", "electrical.ecu", "electrical.tcu", "engine-transmission-can", 2.0),
         ("starter_feed", "electrical.fusebox", "electrical.starter", "starter-solenoid", 180.0),
         ("alternator_charge", "electrical.alternator", "electrical.battery", "alternator-charge", 95.0),
+        # ground return: battery negative -> engine block lug, block -> frame
+        ("battery_ground_strap", "electrical.battery", "electrical.engine_ground", "chassis-ground-return", 180.0),
+        ("engine_to_frame_ground", "electrical.engine_ground", "electrical.frame_ground", "chassis-ground-return", 80.0),
         ("front_harness", "electrical.fusebox", "electrical.front_junction", "front-lighting-horn", 20.0),
         ("rear_harness", "electrical.fusebox", "electrical.rear_junction", "rear-lighting", 12.0),
         ("horn_branch", "electrical.front_junction", "electrical.horn", "horn", 12.0),
-        ("ignition_command", "electrical.ecu", "electrical.ignition_driver", "crank-cam-timed-ignition", 8.0),
         ("imu_bus", "electrical.imu", "electrical.ecu", "pitch-rate-and-acceleration-can", 1.0),
         ("brake_switch_bus", "electrical.brake_switch", "electrical.ecu", "brake-light-request", 1.0),
         ("light_switch_bus", "electrical.light_switch", "electrical.ecu", "lighting-request", 1.0),
@@ -5751,6 +5791,12 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
         ("headlamp_right", "electrical.front_junction", "lighting.headlamp.right.center", "headlight", 8.0),
         ("tail_left", "electrical.rear_junction", "lighting.tail.left.center", "tail-brake-light", 4.0),
         ("tail_right", "electrical.rear_junction", "lighting.tail.right.center", "tail-brake-light", 4.0),
+        # ignition_command and starter_feed used to be single flat wires
+        # here -- they're real engine-bay/cabin boundary crossings, so
+        # they're now built as two-segment routes through
+        # electrical.firewall_pass_through below instead (see
+        # firewall_crossing_routes), same as every other wire that
+        # actually crosses that boundary.
     )
     for name, a, b, circuit, maximum_current in wire_routes:
         edge(f"electrical.wire.{name}", a, b, "insulated-copper-wire", radius=.0035,
@@ -5759,6 +5805,97 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
              routing="relaxed-multi-segment-harness", bundle_kind="electrical-loom",
              slack_ratio=1.08, bend_relaxation=.78, relaxation_rate_hz=4.0,
              minimum_bend_radius_m=.018)
+
+    # The firewall: the one real structural bulkhead separating the engine
+    # bay from the cabin, and the one place every connector that actually
+    # crosses that boundary passes through -- a real bundle of gauge
+    # signals from the ECU, the ignition command, and any starter/
+    # accessory feed that needs to reach bay-side hardware, instead of
+    # each wire privately penetrating the sheet metal wherever it likes.
+    #
+    # Deliberately NOT derived from engine_position or
+    # engine_orientation_degrees: a transverse, longitudinal, front-,
+    # mid-, or rear-mounted engine all still cross the SAME chassis-fixed
+    # plane to reach the cabin, so this stays a correct default no matter
+    # how the engine ends up mounted -- a structural reference for the
+    # eventual outer-body union, not a lock on engine placement. Reuses
+    # the x=.30 plane the throttle cable's own guide_firewall node already
+    # informally treated as "the firewall" (see throttle_points below,
+    # now driven from this same firewall_x); this is that assumption made
+    # into a real, load-bearing component.
+    firewall_x = .30
+    firewall_half_height, firewall_half_width = .17, half_width * .34
+    firewall_points = {
+        "body.firewall.upper_left": [firewall_x, .21 + firewall_half_height, -firewall_half_width],
+        "body.firewall.upper_right": [firewall_x, .21 + firewall_half_height, firewall_half_width],
+        "body.firewall.lower_left": [firewall_x, .21 - firewall_half_height, -firewall_half_width],
+        "body.firewall.lower_right": [firewall_x, .21 - firewall_half_height, firewall_half_width],
+        "body.firewall.center": [firewall_x, .21, 0.0],
+    }
+    for identity, position in firewall_points.items():
+        is_center = identity == "body.firewall.center"
+        node(identity, position,
+             "structural-bulkhead-reference" if is_center else "structural-bulkhead-corner",
+             fixed_to="chassis",
+             # A real disclosed stamped-steel firewall panel mass, carried
+             # on the center reference node only (so the four corners
+             # remain pure geometry, same convention as frame/chassis
+             # corner nodes elsewhere). mass_in_total is False because the
+             # existing body-shell mass estimate this compiler already
+             # produces almost certainly already includes bulkhead sheet
+             # metal -- this is a real declared component for the graph
+             # and validator to find, not a claim of NEW vehicle mass.
+             mass_kg=(3.4 if is_center else 0.0), mass_in_total=False)
+    for name, a, b in (
+        ("upper", "body.firewall.upper_left", "body.firewall.upper_right"),
+        ("lower", "body.firewall.lower_left", "body.firewall.lower_right"),
+        ("left", "body.firewall.upper_left", "body.firewall.lower_left"),
+        ("right", "body.firewall.upper_right", "body.firewall.lower_right"),
+    ):
+        edge(f"body.firewall.frame.{name}", a, b, "rigid-bulkhead-frame-rail", radius=.010,
+             load_path="body-union-perimeter-to-chassis")
+    for corner in ("upper_left", "upper_right", "lower_left", "lower_right"):
+        edge(f"body.firewall.spoke.{corner}", "body.firewall.center", f"body.firewall.{corner}",
+             "rigid-bulkhead-panel-spoke", radius=.008)
+
+    # The real electrical bulkhead connector: every wire that crosses from
+    # engine-bay electrics to cabin electrics passes through here, one
+    # grommeted pass-through rather than a dozen private penetrations --
+    # the real automotive convention (and, not incidentally, also a
+    # natural home for accessory relays/switches as those circuits get
+    # real electrical modeling -- electrical.fusebox already sits on this
+    # same plane and is the real accessory-state switching hardware
+    # today; this connector is the literal boundary crossing next to it).
+    node("electrical.firewall_pass_through", [firewall_x, .21, -firewall_half_width * .5],
+         "electrical-bulkhead-connector", fixed_to="chassis", circuit_role="firewall_pass_through")
+    edge("body.firewall.pass_through_mount", "body.firewall.center", "electrical.firewall_pass_through",
+         "rigid-bulkhead-panel-spoke", radius=.006)
+    node("dash.instrument_cluster", [.10, .32, 0.0], "instrument-cluster-module",
+         fixed_to="chassis", mass_kg=1.6, mass_in_total=False)
+    # Real crossings only: ignition command and starter feed are the
+    # existing bay-side circuits split into two segments through the
+    # connector above; gauge_data_bus is new -- a single real CAN-style
+    # data bus carrying whatever the ECU already knows (rpm, coolant/oil
+    # temp, fuel level, ...) to one cluster module, the honest modern-
+    # automotive shape (one digital bus, not one analog sender wire per
+    # gauge, since no sender hardware exists in this graph yet).
+    firewall_crossing_routes = (
+        ("ignition_command", "electrical.ecu", "electrical.ignition_driver", "crank-cam-timed-ignition", 8.0),
+        ("starter_feed", "electrical.fusebox", "electrical.starter", "starter-solenoid", 180.0),
+        ("gauge_data_bus", "electrical.ecu", "dash.instrument_cluster", "instrument-cluster-data-can", 1.0),
+    )
+    for name, a, b, circuit, maximum_current in firewall_crossing_routes:
+        for index, (seg_a, seg_b) in enumerate((
+            (a, "electrical.firewall_pass_through"),
+            ("electrical.firewall_pass_through", b),
+        )):
+            edge(f"electrical.wire.{name}_{index}", seg_a, seg_b, "insulated-copper-wire", radius=.0035,
+                 palette="active", circuit=circuit, maximum_current_a=maximum_current,
+                 electrical_authority="vehicle-computer-fusebox-relay-dispatch",
+                 routing="relaxed-multi-segment-harness", bundle_kind="electrical-loom",
+                 slack_ratio=1.08, bend_relaxation=.78, relaxation_rate_hz=4.0,
+                 minimum_bend_radius_m=.018)
+
     guard_points = {
         "lower_left": [lamp_x + .018, .015, -.29],
         "upper_left": [lamp_x + .018, .19, -.29],
@@ -6388,144 +6525,11 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
          failure_response="manual-column-remains-connected")
 
     engine_position = [float(value) for value in powertrain["engine_position"]]
-    power_nodes = {
-        "powertrain.engine": engine_position,
-        "powertrain.clutch": [engine_position[0] + .15, engine_position[1], 0.0],
-        "powertrain.pre_clutch_flywheel_wrench": [engine_position[0] + .09,
-                                                    engine_position[1], 0.0],
-        "powertrain.transmission": [engine_position[0] + .29, engine_position[1] - .015, 0.0],
-        "powertrain.transfer_case": [engine_position[0] + .39, engine_position[1] - .035, 0.0],
-        "powertrain.direct_drive_bypass": [engine_position[0] + .34, engine_position[1] - .025, .045],
-        "powertrain.center_shaft": [-.12, .06, 0.0],
-        "powertrain.front_differential": [axle_offset + wheelbase, .065, 0.0],
-        "powertrain.rear_differential": [axle_offset - wheelbase, .065, 0.0],
-        "powertrain.front_differential_brake": [axle_offset + wheelbase + .105, .065, 0.0],
-        "powertrain.rear_differential_brake": [axle_offset - wheelbase - .105, .065, 0.0],
-        "mount.engine_left": [engine_position[0], .075, -half_width * .58],
-        "mount.engine_right": [engine_position[0], .075, half_width * .58],
-        "mount.transmission_left": [engine_position[0] + .28, .055, -half_width * .52],
-        "mount.transmission_right": [engine_position[0] + .28, .055, half_width * .52],
-        "mount.transfer_case_left": [engine_position[0] + .39, .045, -half_width * .45],
-        "mount.transfer_case_right": [engine_position[0] + .39, .045, half_width * .45],
-    }
-    graph_mass_names = {
-        "powertrain.engine": "engine", "powertrain.transmission": "transmission",
-        "powertrain.transfer_case": "transfer_case",
-        "powertrain.front_differential": "front_differential",
-        "powertrain.rear_differential": "rear_differential",
-    }
-    for identity, position in power_nodes.items():
-        differential_brake = identity.endswith("_differential_brake")
-        node(identity, position, "powertrain-mount" if identity.startswith("mount.") else
-             "pre-clutch-rotating-six-axis-wrench-port"
-             if identity.endswith("pre_clutch_flywheel_wrench") else
-             "differential-driveline-brake" if identity.endswith("_differential_brake") else "rotating-mass",
-             fixed_to="chassis" if identity.startswith("mount.") else None,
-             mass_kg=(22.0 if differential_brake else
-                      component_masses.get(graph_mass_names.get(identity, ""), 0.0)),
-             mass_in_total=identity in graph_mass_names,
-             polar_inertia_kg_m2=(
-                 float(drivetrain["differential_brake_rotor_inertia_kg_m2"])
-                 if differential_brake else None),
-             inertia_axis="axle-input-shaft" if differential_brake else None,
-             mass_integration_status=(
-                 "declared-part-budget-existing-lumped-vehicle-mass-remains-authoritative"
-                 if differential_brake else None))
-    edge("drivetrain.engine_to_alternator_cvt", "powertrain.engine",
-         "electrical.alternator_cvt", "direct-torque-shaft", radius=.009,
-         palette="drivetrain-black",
-         torque_channels=["alternator_reaction_torque_nm",
-                          "accessory_motor_engine_reaction_torque_nm",
-                          "compressor_engine_reaction_torque_nm"],
-         torque_reduction="signed-sum-at-shared-accessory-block-shaft",
-         drive="no-belt")
-    edge("drivetrain.engine_to_pre_clutch_flywheel_wrench", "powertrain.engine",
-         "powertrain.pre_clutch_flywheel_wrench", "torque-shaft-wrench-extension",
-         radius=.018, palette="drivetrain-black", frame="engine-crank-before-main-clutch",
-         inertia_coordinate="external_engine_flywheel_inertia",
-         transfer="force-moment-angular-position-and-angular-velocity")
-    edge("electrical.wire.tcu_bypass_actuator", "electrical.tcu",
-         "powertrain.direct_drive_bypass", "relaxed-insulated-copper-control-harness",
-         radius=.0025, palette="drivetrain-black",
-         command_coordinate="direct_drive_bypass_command",
-         interlock_feedback=["engine_angular_speed", "differential_wrench_shaft_omega_front",
-                             "differential_wrench_shaft_omega_rear", "clutch_torque"],
-         reaction="electrical-command-only-mechanical-wrench-remains-in-dog-clutch-edge")
-    edge("drivetrain.alternator_cvt_to_bank", "electrical.alternator_cvt",
-         "electrical.alternator", "continuously-variable-torque-shaft", radius=.008,
-         palette="drivetrain-black", ratio_coordinate="alternator_cvt_ratio_state",
-         efficiency=float(electrical["alternator_cvt_efficiency"]),
-         wear_coordinate="alternator_cvt_wear", glaze_coordinate="alternator_cvt_glaze",
-         torque_channels=["alternator_reaction_torque_nm",
-                          "accessory_motor_shaft_torque_nm",
-                          "compressor_shaft_reaction_torque_nm"],
-         bidirectional_motor_bus="accessory-battery-cube")
-    for axle, sign in (("front", 1.0), ("rear", -1.0)):
-        brake_position = next(item["reference_position"] for item in nodes
-                              if item["identity"] == f"powertrain.{axle}_differential_brake")
-        wrench_position = [brake_position[0] + sign * .14,
-                           brake_position[1], brake_position[2]]
-        node(f"powertrain.{axle}_differential_brake_wrench", wrench_position,
-             "rotating-six-axis-drivetrain-wrench-port",
-             generalized_coordinate=f"{axle}_differential_brake_shaft_angle",
-             accepts="drivetrain-or-accessory-six-axis-wrench",
-             frame="rotating-differential-brake-output-shaft",
-             maximum_torque_nm=float(drivetrain["differential_brake_torque_nm"]),
-             future_loadout_port=True)
-        edge(f"drivetrain.{axle}_differential_brake_shaft_extension",
-             f"powertrain.{axle}_differential_brake",
-             f"powertrain.{axle}_differential_brake_wrench",
-             "torque-shaft-wrench-extension", radius=.016, palette="drivetrain-black",
-             torque_channel=f"{axle}_differential_brake_torque",
-             transfer="force-moment-angular-position-and-angular-velocity",
-             torsional_yield_torque_nm=5200.0, torsional_fracture_torque_nm=7600.0)
-    torque_edges = (
-        ("engine_to_clutch", "powertrain.engine", "powertrain.clutch", "engine_torque"),
-        ("clutch_to_transmission", "powertrain.clutch", "powertrain.transmission", "clutch_torque"),
-        ("transmission_to_transfer_case", "powertrain.transmission", "powertrain.transfer_case", "transmission_output_torque"),
-        ("transfer_case_to_shaft", "powertrain.transfer_case", "powertrain.center_shaft", "driveline_torque"),
-        ("shaft_to_front_diff", "powertrain.center_shaft", "powertrain.front_differential", "front_differential_torque"),
-        ("shaft_to_rear_diff", "powertrain.center_shaft", "powertrain.rear_differential", "rear_differential_torque"),
+    _vehicle_powertrain_graph(
+        node, edge, nodes, engine_position=engine_position,
+        axle_offset=axle_offset, wheelbase=wheelbase, half_width=half_width,
+        component_masses=component_masses, drivetrain=drivetrain, electrical=electrical,
     )
-    for name, a, b, channel in torque_edges:
-        edge(f"drivetrain.{name}", a, b, "torque-shaft", radius=.011,
-             palette="drivetrain-black", torque_channel=channel)
-    edge("drivetrain.direct_drive_bypass", "powertrain.engine", "powertrain.transmission",
-         "synchronized-positive-dog-clutch-bypass", radius=.013, palette="drivetrain-black",
-         engagement_coordinate="direct_drive_bypass_engagement",
-         command_coordinate="direct_drive_bypass_command",
-         tooth_health_coordinate="direct_drive_bypass_tooth_health",
-         torque_channel="direct_drive_bypass_torque_nm",
-         interlock="low-relative-speed-and-unloaded-dog-teeth-before-engagement",
-         bypasses="main-friction-clutch-slip-path")
-    for axle in ("front", "rear"):
-        edge(f"drivetrain.{axle}_differential_brake",
-             f"powertrain.{axle}_differential", f"powertrain.{axle}_differential_brake",
-             "friction-brake-torque-couple", radius=.018, palette="suspension-yellow",
-             torque_channel=f"{axle}_differential_brake_torque",
-             command=f"{axle}_differential_brake",
-             modulation="abs-authority-before-axle-differential",
-             reaction_path="differential-housing-to-axle-and-chassis",
-             rotor_radius_m=.082, rotor_mass_kg=22.0,
-             rotor_polar_inertia_kg_m2=float(
-                 drivetrain["differential_brake_rotor_inertia_kg_m2"]),
-             angular_velocity_coordinate=f"({axle}_left_wheel_omega+{axle}_right_wheel_omega)/2",
-             momentum_integration_status="integrated-live-in-canonical-driveline-mass-matrix")
-    for axle in ("front", "rear"):
-        for lateral in ("left", "right"):
-            corner = f"{axle}_{lateral}"
-            edge(f"drivetrain.{corner}_halfshaft", f"powertrain.{axle}_differential",
-                 f"suspension.{corner}.halfshaft_joint", "constant-velocity-torque-shaft", radius=.009,
-                 palette="drivetrain-black", torque_channel=f"wheel_torque_{corner}",
-                 torsional_yield_torque_nm=4200.0, torsional_fracture_torque_nm=6500.0,
-                 failure_response="open-halfshaft-requiring-locker-to-route-torque-to-intact-side")
-    for component, mounts in (("engine", ("engine_left", "engine_right")),
-                              ("transmission", ("transmission_left", "transmission_right")),
-                              ("transfer_case", ("transfer_case_left", "transfer_case_right"))):
-        for mount in mounts:
-            edge(f"mount.{component}.{mount}", f"powertrain.{component}", f"mount.{mount}",
-                 "six-axis-compliant-mount", radius=.012, palette="drivetrain-black",
-                 transfer="force-and-moment-to-chassis")
 
     # A reusable routed tension actuator. The cable does not pretend to be a
     # rigid tie rod: its fixed guides define a bendable route, the inner cable
@@ -6535,7 +6539,7 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
     throttle_points = {
         "controls.throttle.pedal": [.03, .23, -half_width * .25],
         "controls.throttle.guide_cabin": [.18, .24, -half_width * .31],
-        "controls.throttle.guide_firewall": [.30, .20, -half_width * .27],
+        "controls.throttle.guide_firewall": [firewall_x, .20, -half_width * .27],
         "powertrain.intake.plenum": [engine_position[0] - .015, .205, 0.0],
         "powertrain.intake.throttle_body": [engine_position[0] + .075, .205, -half_width * .13],
         "powertrain.intake.throttle_lever": [engine_position[0] + .075, .225, -half_width * .18],
@@ -6667,6 +6671,26 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
             "pose_policy": "plane-is-reconstructed-from-current-solved-corner-positions",
             "deformation_policy": "identities-do-not-move-to-a-different-node-when-frame-yields",
         },
+        # The firewall bulkhead's own reference frame, same shape as
+        # chassis_reference_plane above -- a named, persistent set of
+        # corner identities an outer-body union can grasp, independent of
+        # engine_position/engine_orientation_degrees (see the firewall's
+        # own build comment). Not fed into
+        # vehicle_native_assembly.infer_structural_grasp_frame's
+        # structural_mount_points -- that mechanism selects the whole
+        # vehicle's own lift/tow grasp frame by load capacity and access,
+        # a different real purpose than a body panel's own mounting
+        # reference, so this stays its own discoverable block instead of
+        # overloading that one.
+        "firewall_reference_plane": {
+            "corner_identities": ["body.firewall.upper_left", "body.firewall.upper_right",
+                                  "body.firewall.lower_left", "body.firewall.lower_right"],
+            "center_identity": "body.firewall.center",
+            "pass_through_identity": "electrical.firewall_pass_through",
+            "identity_policy": "persistent-authored-hardpoints",
+            "pose_policy": "plane-is-reconstructed-from-current-solved-corner-positions",
+            "engine_placement_policy": "position-is-chassis-fixed-and-independent-of-engine-position-or-orientation",
+        },
         "wrench_attachment_api": {
             "schema": "generic-six-axis-wrench-attachment-v1",
             "attachment_identities": [f"attachment.{corner}" for corner in WHEEL_NAMES],
@@ -6713,6 +6737,13 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
                     "terminals": [f"suspension.{corner}.alignment_service_port"
                                   for corner in WHEEL_NAMES],
                     "medium": "alignment-hydraulic-pressure",
+                },
+                "gauge_data": {
+                    "source": "electrical.ecu",
+                    "route": "engine-bay-side-ecu-through-firewall-pass-through-to-cabin-cluster",
+                    "terminals": ["dash.instrument_cluster"],
+                    "medium": "instrument-cluster-data-can",
+                    "device_policy": "cluster-decodes-whatever-signals-the-fitted-ecu-actually-publishes",
                 },
             },
             "mass_accounting": "hard-lines-are-sprung-service-loops-unions-valves-and-terminals-are-unsprung",
@@ -6850,6 +6881,761 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
             "chassis": "sum-node-force-and-position-cross-force-plus-node-moment",
         },
     }
+
+
+
+
+# Real construction materials for fluid lines and vessels, so a thermal
+# pass can derive each circuit's heat capacity from what it is actually
+# made of and what it actually holds, instead of counting a radiator's
+# aluminium as if it were water. Per-run: every coolant-line / oil-line
+# edge and every wetted vessel node names its material (and, for lines,
+# wall thickness); a consumer computes wall mass from radius x length x
+# wall and fluid mass from the bore (or a vessel's declared fluid
+# volume). Values are handbook properties.
+FLUID_LINE_MATERIALS: dict[str, dict[str, float]] = {
+    "epdm-rubber-hose":   {"density_kg_m3": 1150.0, "specific_heat_j_kg_k": 1700.0, "conductivity_w_m_k": 0.25, "wall_thickness_m": 0.0045},
+    "steel-pipe":         {"density_kg_m3": 7850.0, "specific_heat_j_kg_k": 490.0,  "conductivity_w_m_k": 50.0, "wall_thickness_m": 0.0015},
+    "cupronickel-tube":   {"density_kg_m3": 8900.0, "specific_heat_j_kg_k": 377.0,  "conductivity_w_m_k": 40.0, "wall_thickness_m": 0.0015},
+    "aluminium-tube":     {"density_kg_m3": 2700.0, "specific_heat_j_kg_k": 900.0,  "conductivity_w_m_k": 205.0, "wall_thickness_m": 0.0015},
+    "aluminium-casting":  {"density_kg_m3": 2700.0, "specific_heat_j_kg_k": 900.0,  "conductivity_w_m_k": 150.0},
+    "cast-iron-casting":  {"density_kg_m3": 7200.0, "specific_heat_j_kg_k": 460.0,  "conductivity_w_m_k": 50.0},
+    "pressed-steel":      {"density_kg_m3": 7850.0, "specific_heat_j_kg_k": 490.0,  "conductivity_w_m_k": 50.0},
+    "brass-copper-core":  {"density_kg_m3": 8500.0, "specific_heat_j_kg_k": 380.0,  "conductivity_w_m_k": 110.0},
+    "titanium-plate":     {"density_kg_m3": 4500.0, "specific_heat_j_kg_k": 520.0,  "conductivity_w_m_k": 17.0},
+}
+FLUID_MEDIA: dict[str, dict[str, float]] = {
+    "coolant-water-glycol": {"density_kg_m3": 1070.0, "specific_heat_j_kg_k": 3500.0},   # 50/50 ethylene glycol
+    "engine-oil":           {"density_kg_m3": 870.0,  "specific_heat_j_kg_k": 2000.0},
+    "seawater":             {"density_kg_m3": 1025.0, "specific_heat_j_kg_k": 3990.0},
+}
+# Heat-exchanger sizing, the real design rule: UA = rated heat rejection /
+# design temperature difference. Jacket water runs ~85-90 degC; a road
+# vehicle's radiator sees ~45 degC engine-bay air at rated load; a marine
+# central-cooling exchanger is designed against 32 degC seawater (the
+# class-society design point), giving a bigger delta and a titanium/
+# cupronickel plate exchanger with a seawater pump instead of a fan.
+RADIATOR_DESIGN_DELTA_T_K = 45.0
+SEAWATER_EXCHANGER_DESIGN_DELTA_T_K = 55.0
+JACKET_TEMPERATURE_RISE_K = 8.0              # real coolant temperature rise across the engine at rated load (6-10 K)
+# Passive loss through a line's own wall, parametric in its material and
+# dimensions (cylindrical conduction between an inner forced-liquid film
+# and an outer still-air film): the two film coefficients are the real
+# handbook order-of-magnitude values; everything else comes off the edge.
+LINE_INNER_FILM_W_M2K = 1500.0     # forced liquid flow inside a small pipe/hose
+LINE_OUTER_FILM_W_M2K = 12.0       # natural convection + radiation to still engine-bay air
+COOLANT_SHARE_OF_WASTE_HEAT = 0.55           # the thermal.engine_to_coolant edge's own heat_share_frac
+RADIATOR_MASS_KG_PER_W_PER_K = 4.5 / 140.0   # the reference car core's own mass-to-UA ratio
+RADIATOR_FLUID_L_PER_W_PER_K = 2.0 / 140.0   # ... and its coolant content per UA
+PLATE_EXCHANGER_MASS_KG_PER_W_PER_K = 1.2 / 140.0   # compact brazed/gasketed plate stacks are far lighter per UA
+PLATE_EXCHANGER_FLUID_L_PER_W_PER_K = 0.6 / 140.0
+# How an engine is turned over to start, and where the starting torque
+# enters. The electric starter engages a pinion into the flywheel ring
+# gear; everything else is a real drive attachment on the crank nose
+# (the same nose the accessory belt drive rides on): a hex/dog for an
+# external cart starter, a starting-air distributor for a slow-speed
+# marine diesel (air admitted straight into the cylinders -- the
+# "attachment" is the air manifold on the heads), the clutch face of a
+# hand-wound inertia starter, a recoil rope drum, or a crank-handle dog.
+# Real battery modules a bank is built from (handbook figures: SAE cold-
+# cranking amps at -18 degC, 20 h capacity, mass, warm internal
+# resistance, case size). A vehicle's battery is N of one of these in
+# series (12 V per string) and parallel, chosen for the system voltage
+# and the cold-crank current its starter really draws -- never one
+# imaginary battery of whatever size the maths asks for.
+BATTERY_MODULES: dict[str, dict[str, float | list[float]]] = {
+    "sla-12v-7ah":       {"nominal_v": 12.0, "capacity_ah": 7.0,   "cca_a": 80.0,   "mass_kg": 2.3,
+                          "internal_resistance_ohm": 0.030, "half_extent_m": [0.076, 0.033, 0.048]},
+    "agm-12v-20ah":      {"nominal_v": 12.0, "capacity_ah": 20.0,  "cca_a": 300.0,  "mass_kg": 6.5,
+                          "internal_resistance_ohm": 0.012, "half_extent_m": [0.090, 0.042, 0.085]},
+    "group-35-lead-acid": {"nominal_v": 12.0, "capacity_ah": 55.0, "cca_a": 550.0,  "mass_kg": 17.0,
+                           "internal_resistance_ohm": 0.0055, "half_extent_m": [0.115, 0.088, 0.100]},
+    "group-31-lead-acid": {"nominal_v": 12.0, "capacity_ah": 100.0, "cca_a": 900.0, "mass_kg": 27.0,
+                           "internal_resistance_ohm": 0.0040, "half_extent_m": [0.165, 0.086, 0.120]},
+    "8d-lead-acid":      {"nominal_v": 12.0, "capacity_ah": 245.0, "cca_a": 1400.0, "mass_kg": 62.0,
+                          "internal_resistance_ohm": 0.0025, "half_extent_m": [0.265, 0.138, 0.125]},
+}
+# Compressed-air hardware kinds (see engine_toy engines.PneumaticSystem)
+PNEUMATIC_COMPONENTS = {
+    "compressors": {
+        "belt-piston":            {"drive": "crank-belt", "stages": 1, "typical_pressure_pa": 827_000.0},
+        "electric-piston":        {"drive": "electric-motor", "stages": 1, "typical_pressure_pa": 827_000.0},
+        "starting-air-compressor": {"drive": "external-switchboard", "stages": 2, "typical_pressure_pa": 3_000_000.0},
+    },
+    "tanks": {
+        "reserve-tank":          {"working_pressure_pa": 827_000.0, "material": "pressed-steel"},
+        "starting-air-receiver": {"working_pressure_pa": 3_000_000.0, "material": "pressed-steel"},
+    },
+    "regulator": {"kind": "pressure-switch-unloader", "cut_in_frac": 0.84, "cut_out_frac": 1.0},
+}
+STARTING_SYSTEMS = {
+    "electric-starter": {"engages": "flywheel-ring-gear", "drive": "series-dc-motor-bendix-pinion",
+                         "energy": "vehicle-12v-bus"},
+    "external-starter": {"engages": "crank-nose-hex", "drive": "geared-dc-motor-on-cart",
+                         "energy": "external-supply"},
+    "air-start":        {"engages": "cylinder-heads-air-distributor", "drive": "starting-air-admission",
+                         "energy": "starting-air-receiver"},
+    "air-motor-starter": {"engages": "flywheel-ring-gear", "drive": "pneumatic-vane-motor-bendix-pinion",
+                          "energy": "starting-air-receiver"},
+    "inertia-starter":  {"engages": "crank-nose-clutch-face", "drive": "hand-wound-flywheel-through-reduction",
+                         "energy": "operator"},
+    "recoil-pull":      {"engages": "crank-nose-ratchet-drum", "drive": "rope-pull", "energy": "operator"},
+    "hand-crank":       {"engages": "crank-nose-dog", "drive": "crank-handle", "energy": "operator"},
+    "flywheel-bar":     {"engages": "flywheel-rim-spoke-socket", "drive": "pry-bar", "energy": "operator"},
+}
+
+
+def _vehicle_powertrain_graph(
+    node, edge, nodes: list[dict[str, Any]], *, engine_position: list[float],
+    axle_offset: float = 0.0, wheelbase: float = 0.0, half_width: float = 0.0,
+    component_masses: Mapping[str, float] | None = None,
+    drivetrain: Mapping[str, Any] | None = None,
+    electrical: Mapping[str, Any] | None = None,
+    include_wheel_output: bool = True,
+    use_belt_accessories: bool = False,
+    peak_torque_nm: float = 100.0,
+    has_water_pump: bool = True,
+    has_oil_pan: bool = True,
+    has_mechanical_fan: bool = True,
+    include_cooling_stack: bool = False,
+    has_nitrous: bool = False,
+    has_turbo: bool = False,
+    displacement_l: float = 1.5,
+    redline_rpm: float = 6000.0,
+    cylinder_positions: tuple[tuple[float, float, float], ...] = (),
+    rated_power_w: float = 0.0,
+    combustion_efficiency: float = 0.0,
+    cooling_medium: str = "air",
+    starting_system: str = "electric-starter",
+) -> None:
+    """One engine's own powertrain subunit: crank -> clutch -> transmission
+    -> transfer case -> (front/rear differential -> halfshaft), plus its
+    accessory takeoff and its structural mounts. Appends directly to
+    `node`/`edge`/`nodes` (the same closures and list a caller already has
+    open, e.g. _vehicle_mechanical_graph's) so a caller building a whole
+    vehicle gets identical behavior to before this was split out.
+
+    Callable as a genuine subunit, not just a slice of a whole-car build:
+    `component_masses`/`drivetrain`/`electrical` default to empty/zero
+    rather than requiring a full VehicleConfiguration, and
+    `include_wheel_output=False` skips the differential/halfshaft half
+    entirely (which needs `suspension.{corner}.halfshaft_joint` nodes
+    from a real chassis/suspension build already present in `nodes`) --
+    an engine-only caller with no wheels at all just gets the engine
+    through its accessory drive and mounts.
+
+    `use_belt_accessories=True` is a real, additive alternative to the
+    default car's no-belt direct-shaft-plus-CVT alternator takeoff: a
+    genuine accessory-drive-belt edge instead, plus a camshaft on its own
+    geared-timing-drive off the crank -- neither existed in this function
+    before; both are new real capability, not a toy's copy of it.
+    """
+    component_masses = component_masses or {}
+    drivetrain = drivetrain or {}
+    electrical = electrical or {}
+    differential_brake_rotor_inertia = float(drivetrain.get("differential_brake_rotor_inertia_kg_m2", 0.9))
+    differential_brake_torque_nm = float(drivetrain.get("differential_brake_torque_nm", 2200.0))
+    alternator_cvt_efficiency = float(electrical.get("alternator_cvt_efficiency", 0.93))
+
+    power_nodes = {
+        "powertrain.engine": engine_position,
+        "powertrain.clutch": [engine_position[0] + .15, engine_position[1], 0.0],
+        "powertrain.pre_clutch_flywheel_wrench": [engine_position[0] + .09,
+                                                    engine_position[1], 0.0],
+        "powertrain.transmission": [engine_position[0] + .29, engine_position[1] - .015, 0.0],
+        "powertrain.transfer_case": [engine_position[0] + .39, engine_position[1] - .035, 0.0],
+        "powertrain.direct_drive_bypass": [engine_position[0] + .34, engine_position[1] - .025, .045],
+        "mount.engine_left": [engine_position[0], .075, -half_width * .58],
+        "mount.engine_right": [engine_position[0], .075, half_width * .58],
+        "mount.transmission_left": [engine_position[0] + .28, .055, -half_width * .52],
+        "mount.transmission_right": [engine_position[0] + .28, .055, half_width * .52],
+        "mount.transfer_case_left": [engine_position[0] + .39, .045, -half_width * .45],
+        "mount.transfer_case_right": [engine_position[0] + .39, .045, half_width * .45],
+    }
+    if include_wheel_output:
+        power_nodes.update({
+            "powertrain.center_shaft": [-.12, .06, 0.0],
+            "powertrain.front_differential": [axle_offset + wheelbase, .065, 0.0],
+            "powertrain.rear_differential": [axle_offset - wheelbase, .065, 0.0],
+            "powertrain.front_differential_brake": [axle_offset + wheelbase + .105, .065, 0.0],
+            "powertrain.rear_differential_brake": [axle_offset - wheelbase - .105, .065, 0.0],
+        })
+    graph_mass_names = {
+        "powertrain.engine": "engine", "powertrain.transmission": "transmission",
+        "powertrain.transfer_case": "transfer_case",
+        "powertrain.front_differential": "front_differential",
+        "powertrain.rear_differential": "rear_differential",
+    }
+    for identity, position in power_nodes.items():
+        differential_brake = identity.endswith("_differential_brake")
+        node(identity, position, "powertrain-mount" if identity.startswith("mount.") else
+             "pre-clutch-rotating-six-axis-wrench-port"
+             if identity.endswith("pre_clutch_flywheel_wrench") else
+             "differential-driveline-brake" if identity.endswith("_differential_brake") else "rotating-mass",
+             fixed_to="chassis" if identity.startswith("mount.") else None,
+             mass_kg=(22.0 if differential_brake else
+                      component_masses.get(graph_mass_names.get(identity, ""), 0.0)),
+             mass_in_total=identity in graph_mass_names,
+             polar_inertia_kg_m2=(
+                 differential_brake_rotor_inertia if differential_brake else None),
+             inertia_axis="axle-input-shaft" if differential_brake else None,
+             mass_integration_status=(
+                 "declared-part-budget-existing-lumped-vehicle-mass-remains-authoritative"
+                 if differential_brake else None))
+
+    if use_belt_accessories:
+        node("powertrain.camshaft",
+             [engine_position[0] + .09, engine_position[1] + .03, 0.0],
+             "rotating-mass", mass_kg=max(component_masses.get("engine", 20.0) * 0.02, 0.05),
+             camshaft_timing_ratio=0.5)
+        edge("powertrain.camshaft_front_bearing", "powertrain.engine", "powertrain.camshaft",
+             "rotational-bearing", radius=.010)
+        edge("powertrain.camshaft_rear_bearing", "powertrain.engine", "powertrain.camshaft",
+             "rotational-bearing", radius=.010)
+        edge("drivetrain.engine_to_camshaft_timing_belt", "powertrain.engine", "powertrain.camshaft",
+             "geared-timing-drive", radius=.006, ratio_coordinate="camshaft_timing_ratio",
+             ratio=0.5, backlash_coordinate="camshaft_timing_backlash_rad",
+             stiffness_nm_per_rad=peak_torque_nm * 600.0,
+             damping_nm_per_rad_s=peak_torque_nm * 2.0,
+             max_torque_nm=peak_torque_nm * 0.5, backlash_rad=0.0015)
+        node("electrical.alternator", [engine_position[0] - .06, engine_position[1], .05],
+             "rotating-mass", mass_kg=3.0)
+        edge("drivetrain.engine_to_alternator_belt", "powertrain.engine", "electrical.alternator",
+             "accessory-drive-belt", radius=.007, ratio_coordinate="alternator_belt_ratio",
+             ratio=2.6, backlash_coordinate="alternator_belt_backlash_rad",
+             stiffness_nm_per_rad=peak_torque_nm * 35.0,
+             damping_nm_per_rad_s=peak_torque_nm * 0.25,
+             max_torque_nm=peak_torque_nm * 0.18, backlash_rad=0.0045,
+             torque_channels=["alternator_reaction_torque_nm",
+                              "accessory_motor_engine_reaction_torque_nm",
+                              "compressor_engine_reaction_torque_nm"],
+             torque_reduction="signed-sum-at-shared-belt")
+    else:
+        edge("drivetrain.engine_to_alternator_cvt", "powertrain.engine",
+             "electrical.alternator_cvt", "direct-torque-shaft", radius=.009,
+             palette="drivetrain-black",
+             torque_channels=["alternator_reaction_torque_nm",
+                              "accessory_motor_engine_reaction_torque_nm",
+                              "compressor_engine_reaction_torque_nm"],
+             torque_reduction="signed-sum-at-shared-accessory-block-shaft",
+             drive="no-belt")
+        edge("drivetrain.alternator_cvt_to_bank", "electrical.alternator_cvt",
+             "electrical.alternator", "continuously-variable-torque-shaft", radius=.008,
+             palette="drivetrain-black", ratio_coordinate="alternator_cvt_ratio_state",
+             efficiency=alternator_cvt_efficiency,
+             wear_coordinate="alternator_cvt_wear", glaze_coordinate="alternator_cvt_glaze",
+             torque_channels=["alternator_reaction_torque_nm",
+                              "accessory_motor_shaft_torque_nm",
+                              "compressor_shaft_reaction_torque_nm"],
+             bidirectional_motor_bus="accessory-battery-cube")
+    edge("drivetrain.engine_to_pre_clutch_flywheel_wrench", "powertrain.engine",
+         "powertrain.pre_clutch_flywheel_wrench", "torque-shaft-wrench-extension",
+         radius=.018, palette="drivetrain-black", frame="engine-crank-before-main-clutch",
+         inertia_coordinate="external_engine_flywheel_inertia",
+         transfer="force-moment-angular-position-and-angular-velocity")
+
+    torque_edges = [
+        ("engine_to_clutch", "powertrain.engine", "powertrain.clutch", "engine_torque"),
+        ("clutch_to_transmission", "powertrain.clutch", "powertrain.transmission", "clutch_torque"),
+        ("transmission_to_transfer_case", "powertrain.transmission", "powertrain.transfer_case", "transmission_output_torque"),
+    ]
+    if include_wheel_output:
+        torque_edges += [
+            ("transfer_case_to_shaft", "powertrain.transfer_case", "powertrain.center_shaft", "driveline_torque"),
+            ("shaft_to_front_diff", "powertrain.center_shaft", "powertrain.front_differential", "front_differential_torque"),
+            ("shaft_to_rear_diff", "powertrain.center_shaft", "powertrain.rear_differential", "rear_differential_torque"),
+        ]
+    for name, a, b, channel in torque_edges:
+        edge(f"drivetrain.{name}", a, b, "torque-shaft", radius=.011,
+             palette="drivetrain-black", torque_channel=channel)
+    edge("drivetrain.direct_drive_bypass", "powertrain.engine", "powertrain.transmission",
+         "synchronized-positive-dog-clutch-bypass", radius=.013, palette="drivetrain-black",
+         engagement_coordinate="direct_drive_bypass_engagement",
+         command_coordinate="direct_drive_bypass_command",
+         tooth_health_coordinate="direct_drive_bypass_tooth_health",
+         torque_channel="direct_drive_bypass_torque_nm",
+         interlock="low-relative-speed-and-unloaded-dog-teeth-before-engagement",
+         bypasses="main-friction-clutch-slip-path")
+
+    if include_wheel_output:
+        for axle, sign in (("front", 1.0), ("rear", -1.0)):
+            brake_position = next(item["reference_position"] for item in nodes
+                                  if item["identity"] == f"powertrain.{axle}_differential_brake")
+            wrench_position = [brake_position[0] + sign * .14,
+                               brake_position[1], brake_position[2]]
+            node(f"powertrain.{axle}_differential_brake_wrench", wrench_position,
+                 "rotating-six-axis-drivetrain-wrench-port",
+                 generalized_coordinate=f"{axle}_differential_brake_shaft_angle",
+                 accepts="drivetrain-or-accessory-six-axis-wrench",
+                 frame="rotating-differential-brake-output-shaft",
+                 maximum_torque_nm=differential_brake_torque_nm,
+                 future_loadout_port=True)
+            edge(f"drivetrain.{axle}_differential_brake_shaft_extension",
+                 f"powertrain.{axle}_differential_brake",
+                 f"powertrain.{axle}_differential_brake_wrench",
+                 "torque-shaft-wrench-extension", radius=.016, palette="drivetrain-black",
+                 torque_channel=f"{axle}_differential_brake_torque",
+                 transfer="force-moment-angular-position-and-angular-velocity",
+                 torsional_yield_torque_nm=5200.0, torsional_fracture_torque_nm=7600.0)
+        for axle in ("front", "rear"):
+            edge(f"drivetrain.{axle}_differential_brake",
+                 f"powertrain.{axle}_differential", f"powertrain.{axle}_differential_brake",
+                 "friction-brake-torque-couple", radius=.018, palette="suspension-yellow",
+                 torque_channel=f"{axle}_differential_brake_torque",
+                 command=f"{axle}_differential_brake",
+                 modulation="abs-authority-before-axle-differential",
+                 reaction_path="differential-housing-to-axle-and-chassis",
+                 rotor_radius_m=.082, rotor_mass_kg=22.0,
+                 rotor_polar_inertia_kg_m2=differential_brake_rotor_inertia,
+                 angular_velocity_coordinate=f"({axle}_left_wheel_omega+{axle}_right_wheel_omega)/2",
+                 momentum_integration_status="integrated-live-in-canonical-driveline-mass-matrix")
+        for axle in ("front", "rear"):
+            for lateral in ("left", "right"):
+                corner = f"{axle}_{lateral}"
+                edge(f"drivetrain.{corner}_halfshaft", f"powertrain.{axle}_differential",
+                     f"suspension.{corner}.halfshaft_joint", "constant-velocity-torque-shaft", radius=.009,
+                     palette="drivetrain-black", torque_channel=f"wheel_torque_{corner}",
+                     torsional_yield_torque_nm=4200.0, torsional_fracture_torque_nm=6500.0,
+                     failure_response="open-halfshaft-requiring-locker-to-route-torque-to-intact-side")
+
+    for component, mounts in (("engine", ("engine_left", "engine_right")),
+                              ("transmission", ("transmission_left", "transmission_right")),
+                              ("transfer_case", ("transfer_case_left", "transfer_case_right"))):
+        for mount in mounts:
+            edge(f"mount.{component}.{mount}", f"powertrain.{component}", f"mount.{mount}",
+                 "six-axis-compliant-mount", radius=.012, palette="drivetrain-black",
+                 transfer="force-and-moment-to-chassis")
+
+    if use_belt_accessories:
+        # a real block port: crankcase ventilation, always low-pressure
+        # (vacuum-drawn, not the high-pressure pneumatic system) --
+        # blow-by gas returns to the engine's own intake side rather
+        # than venting to atmosphere. Named block-port convention so
+        # other real, low-pressure engine-block connections (oil
+        # pressure sender, coolant sender) have somewhere consistent to
+        # attach later, instead of each inventing its own node shape.
+        node("powertrain.engine_block_port.pcv",
+             [engine_position[0] - .03, engine_position[1] + .05, .02],
+             "engine-block-port", port_kind="crankcase-ventilation")
+        edge("powertrain.pcv_line", "powertrain.engine_block_port.pcv", "powertrain.engine",
+             "low-pressure-air-line", radius=.005, circuit_identity="crankcase-vent",
+             medium_rate_state="blow-by-gas-flow-and-crankcase-pressure")
+
+        # the starting-torque attachment, real for every starting system
+        # (STARTING_SYSTEMS above): the electric starter's pinion at the
+        # ring gear on the flywheel end, every other kind's drive on the
+        # crank nose. Physics-inert to a torque solver -- the starting
+        # torque itself is applied by the starter box that owns it
+        # (engine_toy/starter.py).
+        starting = STARTING_SYSTEMS.get(starting_system, STARTING_SYSTEMS["electric-starter"])
+        on_ring_gear = starting["engages"] == "flywheel-ring-gear"
+        node("powertrain.starter_drive",
+             [engine_position[0] + (.12 if on_ring_gear else -.14),
+              engine_position[1] - (.06 if on_ring_gear else 0.0), (-.16 if on_ring_gear else 0.0)],
+             "starter-drive-attachment", starting_system=starting_system,
+             engages=starting["engages"], drive=starting["drive"], energy=starting["energy"])
+        edge("powertrain.starter_drive_to_crank", "powertrain.starter_drive", "powertrain.engine",
+             "starter-drive-engagement", radius=.004, engagement="overrunning-when-caught")
+
+        if has_water_pump:
+            # Real coolant ports on the block, same block-port convention
+            # as the PCV port above, plus a real belt-driven water pump
+            # (the same "belt-driven accessories: water pump, fan,
+            # alternator" this toy's own geometry model already names).
+            # The external circuit (hoses, radiator) is lumped into one
+            # coolant-line edge back to the block -- a real
+            # simplification, not a fabricated radiator node pretending
+            # to be chassis-mounted infrastructure this engine-only
+            # subunit has no business inventing. An air-cooled engine
+            # genuinely has none of this -- gated, not zeroed.
+            # The pump is SIZED like a real one: design flow carries the
+            # coolant's share of rated waste heat across the real jacket
+            # temperature rise (JACKET_TEMPERATURE_RISE_K) at the pump's
+            # rated speed (crank redline through its drive ratio); flow
+            # scales with speed below that (centrifugal). A caller with no
+            # rated power gets the old car-scale relation as its design
+            # point so an older graph still runs.
+            pump_ratio = 1.1
+            pump_rated_omega = redline_rpm * pump_ratio * 2 * math.pi / 60.0
+            coolant_heat_rated_w = (COOLANT_SHARE_OF_WASTE_HEAT * rated_power_w * (1.0 / combustion_efficiency - 1.0)
+                                    if rated_power_w > 0.0 and 0.0 < combustion_efficiency < 1.0 else 0.0)
+            coolant = FLUID_MEDIA["coolant-water-glycol"]
+            if coolant_heat_rated_w > 0.0:
+                design_flow_lpm = (coolant_heat_rated_w
+                                   / (coolant["density_kg_m3"] * coolant["specific_heat_j_kg_k"] * JACKET_TEMPERATURE_RISE_K)
+                                   * 60_000.0)
+            else:
+                design_flow_lpm = 0.35 * pump_rated_omega
+            node("powertrain.water_pump",
+                 [engine_position[0] - .05, engine_position[1] - .02, .04],
+                 "rotating-mass", mass_kg=max(2.2, design_flow_lpm * 0.01), pump_ratio=pump_ratio,
+                 design_flow_lpm=design_flow_lpm, rated_omega_rad_s=pump_rated_omega,
+                 material="cast-iron-casting", fluid="coolant-water-glycol",
+                 fluid_volume_l=max(0.3, design_flow_lpm * 0.002))
+            edge("drivetrain.engine_to_water_pump_belt", "powertrain.engine", "powertrain.water_pump",
+                 "accessory-drive-belt", radius=.006, ratio_coordinate="water_pump_belt_ratio",
+                 ratio=1.1, backlash_coordinate="water_pump_belt_backlash_rad",
+                 stiffness_nm_per_rad=peak_torque_nm * 30.0,
+                 damping_nm_per_rad_s=peak_torque_nm * 0.2,
+                 max_torque_nm=peak_torque_nm * 0.12, backlash_rad=0.004)
+            node("powertrain.engine_block_port.coolant_inlet",
+                 [engine_position[0] + .02, engine_position[1] + .04, -.03],
+                 "engine-block-port", port_kind="coolant-inlet")
+            node("powertrain.engine_block_port.coolant_outlet",
+                 [engine_position[0] - .02, engine_position[1] + .04, .03],
+                 "engine-block-port", port_kind="coolant-outlet")
+            # A real declared heat-exchange path, not a hardcoded
+            # heat-share guess made up on the toy side: real engine heat
+            # balance splits roughly a third to coolant, a third to
+            # exhaust, the rest to oil/friction/radiation -- heat_share_
+            # frac here is that real fraction, on a real edge, for any
+            # consumer of this graph to read directly.
+            edge("thermal.engine_to_coolant", "powertrain.engine", "powertrain.water_pump",
+                 "heat-exchange-path", radius=.003, heat_share_frac=0.55,
+                 medium_rate_state="rejected-heat-flow-w")
+            edge("powertrain.coolant_pump_to_block", "powertrain.water_pump",
+                 "powertrain.engine_block_port.coolant_inlet", "coolant-line", radius=.010,
+                 circuit_identity="coolant", medium_rate_state="coolant-flow-and-temperature",
+                 pump_driven=True, material="epdm-rubber-hose", fluid="coolant-water-glycol")
+            # The real wax-pellet thermostat at the block outlet: a flow-
+            # proportional valve, not a switch. The wax charge starts to
+            # melt and lift the valve at opening_start_k, is fully open
+            # by full_open_k, and the pellet's own thermal mass gives the
+            # motion a real first-order lag (wax_time_constant_s). Flow
+            # the valve doesn't pass to the radiator returns through the
+            # bypass to the pump, so block circulation is never starved --
+            # only radiator rejection is gated. Real values: an 82 degC
+            # start / 95 degC full-open automotive thermostat.
+            node("powertrain.coolant_thermostat",
+                 [engine_position[0] - .06, engine_position[1] + .06, .05],
+                 "wax-pellet-thermostat-valve", mass_kg=.25,
+                 opening_start_k=355.15, full_open_k=368.15, wax_time_constant_s=15.0,
+                 bypass="returns-unpassed-flow-to-pump",
+                 material="aluminium-casting", fluid="coolant-water-glycol", fluid_volume_l=0.1)
+            edge("powertrain.coolant_outlet_to_thermostat",
+                 "powertrain.engine_block_port.coolant_outlet", "powertrain.coolant_thermostat",
+                 "coolant-line", radius=.010, circuit_identity="coolant",
+                 medium_rate_state="coolant-flow-and-temperature",
+                 material="epdm-rubber-hose", fluid="coolant-water-glycol")
+
+            if include_cooling_stack:
+                # The real front-of-car heat-exchanger stack, in real
+                # physical order (fan pulls air through the condenser
+                # first, then the radiator behind it): condenser here is
+                # real structure with a real port for a future refrigerant
+                # circuit to actually drive -- nothing pumps refrigerant
+                # through it yet, so it does no heat rejection on its own
+                # right now, same honest boundary as the PCV port. The
+                # radiator is real and live: it's now actually IN the
+                # coolant circuit's path, not a lumped label on the return
+                # edge.
+                # The exchanger is SIZED, not one car-sized number for every
+                # engine: UA = coolant share of rated waste heat / design
+                # delta-T (the real design rule; see RADIATOR_DESIGN_DELTA_T_K
+                # above). The reference 140 W/K car core stays the fallback
+                # for a caller that declares no rated power at all. A marine
+                # unit gets a seawater-cooled plate exchanger (titanium
+                # plates, seawater pump, no fan or condenser) -- what a real
+                # slow-speed diesel's central cooling system actually is; a
+                # fan-blown radiator could never reject megawatts.
+                rated_waste_w = (rated_power_w * (1.0 / combustion_efficiency - 1.0)
+                                 if rated_power_w > 0.0 and 0.0 < combustion_efficiency < 1.0 else 0.0)
+                seawater = cooling_medium == "seawater"
+                design_delta_t = SEAWATER_EXCHANGER_DESIGN_DELTA_T_K if seawater else RADIATOR_DESIGN_DELTA_T_K
+                exchanger_ua = (COOLANT_SHARE_OF_WASTE_HEAT * rated_waste_w / design_delta_t
+                                if rated_waste_w > 0.0 else 140.0)
+                if seawater:
+                    node("powertrain.radiator",
+                         [engine_position[0] - .55, engine_position[1] + .05, 0.0],
+                         "engine-block-component",
+                         mass_kg=max(1.0, exchanger_ua * PLATE_EXCHANGER_MASS_KG_PER_W_PER_K),
+                         heat_exchange_w_per_k=exchanger_ua,
+                         exchanger_kind="seawater-plate-heat-exchanger", cooling_medium="seawater",
+                         secondary_fluid="seawater", secondary_pump="powertrain.seawater_pump",
+                         material="titanium-plate", fluid="coolant-water-glycol",
+                         fluid_volume_l=max(0.5, exchanger_ua * PLATE_EXCHANGER_FLUID_L_PER_W_PER_K))
+                    node("powertrain.seawater_pump",
+                         [engine_position[0] - .62, engine_position[1] - .02, .06],
+                         "rotating-mass", mass_kg=max(2.0, exchanger_ua * 0.004),
+                         material="cast-iron-casting", fluid="seawater", fluid_volume_l=0.5,
+                         drive="electric-or-engine-driven-centrifugal")
+                    edge("powertrain.seawater_suction", "powertrain.seawater_pump", "powertrain.radiator",
+                         "coolant-line", radius=.030, circuit_identity="seawater",
+                         medium_rate_state="seawater-flow-and-temperature",
+                         material="cupronickel-tube", fluid="seawater", sea_chest="hull-inlet")
+                else:
+                    node("powertrain.radiator",
+                         [engine_position[0] - .55, engine_position[1] + .05, 0.0],
+                         "engine-block-component",
+                         mass_kg=max(0.5, exchanger_ua * RADIATOR_MASS_KG_PER_W_PER_K),
+                         heat_exchange_w_per_k=exchanger_ua,
+                         exchanger_kind="fin-and-tube-radiator", cooling_medium="air",
+                         material="aluminium-casting", fluid="coolant-water-glycol",
+                         fluid_volume_l=max(0.3, exchanger_ua * RADIATOR_FLUID_L_PER_W_PER_K))
+                    node("powertrain.condenser",
+                         [engine_position[0] - .60, engine_position[1] + .05, 0.0],
+                         "engine-block-component", mass_kg=2.0,
+                         heat_exchange_w_per_k=90.0, material="aluminium-casting")
+                    node("powertrain.engine_block_port.condenser_refrigerant",
+                         [engine_position[0] - .60, engine_position[1] + .06, .02],
+                         "engine-block-port", port_kind="ac-refrigerant-tap")
+                    node("powertrain.cooling_fan",
+                         [engine_position[0] - .45, engine_position[1] + .05, 0.0],
+                         "rotating-mass", mass_kg=1.1, fan_airflow_m3_s_per_rad_s=0.02)
+                edge("powertrain.thermostat_to_radiator",
+                     "powertrain.coolant_thermostat", "powertrain.radiator",
+                     "coolant-line", radius=(.030 if seawater else .010), circuit_identity="coolant",
+                     medium_rate_state="coolant-flow-and-temperature",
+                     thermostat_gated=True,
+                     material=("steel-pipe" if seawater else "epdm-rubber-hose"), fluid="coolant-water-glycol")
+                edge("powertrain.radiator_to_pump", "powertrain.radiator", "powertrain.water_pump",
+                     "coolant-line", radius=(.030 if seawater else .010), circuit_identity="coolant",
+                     medium_rate_state="coolant-flow-and-temperature",
+                     material=("steel-pipe" if seawater else "epdm-rubber-hose"), fluid="coolant-water-glycol")
+                if has_mechanical_fan and not seawater:
+                    edge("drivetrain.engine_to_fan_belt", "powertrain.engine", "powertrain.cooling_fan",
+                         "accessory-drive-belt", radius=.006, ratio_coordinate="fan_belt_ratio",
+                         ratio=1.0, backlash_coordinate="fan_belt_backlash_rad",
+                         stiffness_nm_per_rad=peak_torque_nm * 15.0,
+                         damping_nm_per_rad_s=peak_torque_nm * 0.1,
+                         max_torque_nm=peak_torque_nm * 0.05, backlash_rad=0.005)
+            else:
+                edge("powertrain.coolant_return_circuit", "powertrain.coolant_thermostat",
+                     "powertrain.water_pump", "coolant-line", radius=.010, thermostat_gated=True,
+                     circuit_identity="coolant", medium_rate_state="coolant-flow-and-temperature",
+                     external_circuit="hoses-and-radiator-lumped",
+                     material="epdm-rubber-hose", fluid="coolant-water-glycol")
+
+        # Real low-pressure air port for the intake charge: heat soak
+        # from the hot engine bay genuinely raises intake air temperature
+        # above ambient (lower charge density, real horsepower loss in
+        # stop-and-go traffic) -- a real, commonly-measured automotive
+        # quantity (IAT sensor), not fabricated.
+        node("powertrain.intake_plenum",
+             [engine_position[0] - .10, engine_position[1] + .10, 0.0],
+             "engine-block-component", mass_kg=0.6,
+             heat_soak_w_per_k=0.9)
+        # A real physical ceiling: the valve curtain/port cross-section
+        # can only pass so much air regardless of how much pressure is
+        # stacked upstream of it (a supercharger, nitrous) -- this is the
+        # real reason a naturally-aspirated engine's volumetric
+        # efficiency falls off at high rpm at all, not a fudge factor.
+        # Calibrated off the engine's own real, boost-independent
+        # geometry -- 100%-VE mass flow at redline (density * swept
+        # volume per two crank revs) -- NOT peak_torque_nm: a boosted
+        # engine's peak_torque_nm already bakes in the supercharger/
+        # turbo's own contribution, so calibrating the ceiling off it
+        # created a feedback loop where a bigger charger raised
+        # peak_torque_nm, which raised the ceiling meant to bound it,
+        # letting even more boost through unchecked -- exactly backwards.
+        # Displacement/redline are fixed hardware, unaffected by boost.
+        # (An 1500cc/7000rpm engine's absolute 100%-VE flow limit is
+        # ~0.1 kg/s, matching this formula almost exactly.) When real
+        # per-cylinder ports exist below, THEY carry this capacity
+        # (split per runner, real per-cylinder choke); this shared edge
+        # only carries it when there's no per-cylinder topology at all,
+        # so the two paths never double-count the same physical limit.
+        total_flow_capacity_kg_s = (displacement_l / 1000.0) * (redline_rpm / 120.0) * 1.2
+        edge("powertrain.intake_plenum_port", "powertrain.engine", "powertrain.intake_plenum",
+             "low-pressure-air-line", radius=.014, circuit_identity="intake-air",
+             medium_rate_state="intake-air-flow-and-temperature",
+             flow_capacity_kg_s=0.0 if cylinder_positions else total_flow_capacity_kg_s)
+
+        if cylinder_positions:
+            # A real per-cylinder breathing topology: each cylinder has
+            # its own intake and exhaust port (a real intake runner and
+            # exhaust primary, not the engine treated as one opaque
+            # breathing point), gathering at the same real plenum node
+            # above and a real exhaust manifold below -- exactly the
+            # physical arrangement of an actual engine, and the real
+            # anchor point for genuine multi-node mass-conserving flow
+            # and per-cylinder combustion chemistry (a distinct, larger
+            # next phase -- these ports are the topology it needs to
+            # exist on, not that physics itself yet).
+            node("powertrain.exhaust_manifold",
+                 [engine_position[0], engine_position[1] + .06, .10],
+                 "engine-block-component", mass_kg=3.5, heat_soak_w_per_k=4.0)
+            # exhaust gas genuinely carries the largest single share of
+            # combustion waste heat of any real engine circuit -- real,
+            # alongside the coolant/oil shares already declared above,
+            # not double-counting them (0.55 + 0.12 + 0.25 = 0.92,
+            # leaving a real remainder for radiation/friction/etc.)
+            edge("thermal.engine_to_exhaust", "powertrain.engine", "powertrain.exhaust_manifold",
+                 "heat-exchange-path", radius=.006, heat_share_frac=0.25,
+                 medium_rate_state="rejected-heat-flow-w")
+            n_cyl = max(1, len(cylinder_positions))
+            per_cyl_flow_capacity = total_flow_capacity_kg_s / n_cyl
+            # The same real choke reasoning as the intake side, mirrored,
+            # and the same boost-independent displacement/redline
+            # calibration (see intake_plenum_port's own reasoning above --
+            # peak_torque_nm would create the identical feedback loop
+            # here). Exhaust gas carries the real fuel mass added by
+            # combustion on top of the intake air mass (~6.8% at a
+            # stoichiometric ~14.7:1 AFR), hence the small multiplier
+            # over the intake side's identical base formula.
+            total_exhaust_flow_capacity_kg_s = (
+                (displacement_l / 1000.0) * (redline_rpm / 120.0) * 1.2 * 1.068)
+            per_cyl_exhaust_flow_capacity = total_exhaust_flow_capacity_kg_s / n_cyl
+            for i, pos in enumerate(cylinder_positions):
+                intake_port = f"powertrain.cylinder_{i}.intake_port"
+                exhaust_port = f"powertrain.cylinder_{i}.exhaust_port"
+                node(intake_port, [pos[0], pos[1] + .03, pos[2] - .02],
+                     "engine-block-port", port_kind="cylinder-intake-runner")
+                node(exhaust_port, [pos[0], pos[1] + .03, pos[2] + .02],
+                     "engine-block-port", port_kind="cylinder-exhaust-primary")
+                edge(f"powertrain.cylinder_{i}.intake_runner", "powertrain.intake_plenum",
+                     intake_port, "low-pressure-air-line", radius=.008,
+                     circuit_identity="intake-air",
+                     medium_rate_state="intake-air-flow-and-temperature",
+                     flow_capacity_kg_s=per_cyl_flow_capacity)
+                edge(f"powertrain.cylinder_{i}.exhaust_primary", exhaust_port,
+                     "powertrain.exhaust_manifold", "exhaust-flow-path", radius=.009,
+                     circuit_identity="exhaust",
+                     medium_rate_state="exhaust-pulse-pressure-and-temperature",
+                     flow_capacity_kg_s=per_cyl_exhaust_flow_capacity)
+
+        if has_nitrous:
+            # A real wet nitrous kit: a high-pressure bottle (liquid N2O,
+            # ~6.2 MPa / ~900 psi saturated vapor pressure at room temp),
+            # a nitrous solenoid and a separate fuel solenoid opening
+            # together (wet kits enrich fuel at the same instant, to keep
+            # the mixture from going dangerously lean under the extra
+            # oxidizer), both electrically commanded off the same real
+            # control wire, delivering into the same nozzle at the real
+            # intake plenum already declared above -- not a separate,
+            # fabricated injection point.
+            node("powertrain.nitrous_bottle",
+                 [engine_position[0] - .30, engine_position[1] - .02, .10],
+                 "high-pressure-canister", mass_kg=6.8, capacity_kg=2.3,
+                 fill_level_frac=1.0, bottle_pressure_pa=6_200_000.0)
+            node("electrical.nitrous_controller",
+                 [engine_position[0] - .05, engine_position[1] + .15, -.10],
+                 "control-module", armed=False)
+            node("powertrain.nitrous_solenoid",
+                 [engine_position[0] - .15, engine_position[1] + .02, .06],
+                 "electro-mechanical-valve", solenoid_open_coordinate="nitrous_solenoid_command")
+            node("powertrain.nitrous_fuel_solenoid",
+                 [engine_position[0] - .13, engine_position[1] + .02, .03],
+                 "electro-mechanical-valve", solenoid_open_coordinate="nitrous_solenoid_command")
+            node("powertrain.nitrous_nozzle",
+                 [engine_position[0] - .09, engine_position[1] + .09, .01],
+                 "injection-nozzle")
+            edge("powertrain.nitrous_bottle_to_solenoid", "powertrain.nitrous_bottle",
+                 "powertrain.nitrous_solenoid", "nitrous-delivery-line", radius=.006,
+                 circuit_identity="nitrous", medium_rate_state="nitrous-flow-and-pressure")
+            edge("powertrain.nitrous_solenoid_to_nozzle", "powertrain.nitrous_solenoid",
+                 "powertrain.nitrous_nozzle", "nitrous-delivery-line", radius=.004,
+                 circuit_identity="nitrous", medium_rate_state="nitrous-flow-and-pressure")
+            edge("powertrain.nitrous_fuel_solenoid_to_nozzle", "powertrain.nitrous_fuel_solenoid",
+                 "powertrain.nitrous_nozzle", "routed-energy-line", radius=.003,
+                 circuit_identity="nitrous-fuel",
+                 medium_rate_state="fuel-pressure-flow-or-voltage-current")
+            edge("powertrain.nitrous_nozzle_to_intake", "powertrain.nitrous_nozzle",
+                 "powertrain.intake_plenum", "nitrous-delivery-line", radius=.005,
+                 circuit_identity="nitrous", medium_rate_state="nitrous-flow-and-pressure")
+            edge("electrical.wire.nitrous_solenoid_command", "electrical.nitrous_controller",
+                 "powertrain.nitrous_solenoid", "insulated-copper-wire", radius=.0015,
+                 command_coordinate="nitrous_solenoid_command",
+                 interlock_feedback=["engine_angular_speed", "wide_open_throttle"],
+                 reaction="electrical-command-only-mechanical-wrench-remains-in-solenoid-edge")
+            edge("electrical.wire.nitrous_fuel_solenoid_command", "electrical.nitrous_controller",
+                 "powertrain.nitrous_fuel_solenoid", "insulated-copper-wire", radius=.0015,
+                 command_coordinate="nitrous_solenoid_command",
+                 reaction="electrical-command-only-mechanical-wrench-remains-in-solenoid-edge")
+
+        if has_oil_pan:
+            # A real thermal mass, not a fabricated one -- an oil pan
+            # genuinely does reject heat passively (convection off its
+            # finned/cast surface to the air stream underneath the car),
+            # no water pump or forced flow required for that part. Given
+            # as a node attribute (declared, not yet solved by anything --
+            # organized structure, same honest boundary as the PCV port)
+            # so a future thermal pass has a real number to read instead
+            # of inventing one. The port is what makes an oil cooler, a
+            # larger remote reservoir, or a total-loss bypass all genuinely
+            # pluggable later: attach a new node to this one port instead
+            # of restructuring the block.
+            node("powertrain.oil_pan",
+                 [engine_position[0], engine_position[1] - .09, 0.0],
+                 "engine-block-component",
+                 mass_kg=max(1.0, component_masses.get("engine", 20.0) * 0.04),
+                 passive_heat_loss_w_per_k=6.5,
+                 # a pressed-steel sump holding the real oil charge: ~1 L
+                 # per litre of displacement is the real road-engine norm
+                 material="pressed-steel", fluid="engine-oil",
+                 fluid_volume_l=max(0.3, displacement_l * 1.0))
+            node("powertrain.engine_block_port.oil_pan",
+                 [engine_position[0] + .01, engine_position[1] - .10, .02],
+                 "engine-block-port", port_kind="oil-sump-drain-and-cooler-tap")
+            edge("powertrain.oil_pan_port", "powertrain.oil_pan",
+                 "powertrain.engine_block_port.oil_pan", "oil-line", radius=.008,
+                 circuit_identity="oil", medium_rate_state="oil-flow-and-temperature-and-pressure",
+                 default_termination="capped-plug-until-something-connects-here",
+                 material="steel-pipe", fluid="engine-oil")
+
+            # A real oil pump -- gear-driven directly off the crank (the
+            # stock arrangement on most engines, not a belt), pulling from
+            # the pan and feeding the gallery under regulation from a
+            # relief valve, exactly what sets the oil pressure gauge
+            # reading a real driver watches.
+            node("powertrain.oil_pump",
+                 [engine_position[0] + .04, engine_position[1] - .06, 0.0],
+                 "rotating-mass", mass_kg=1.4,
+                 material="cast-iron-casting", fluid="engine-oil", fluid_volume_l=0.05)
+            edge("thermal.engine_to_oil", "powertrain.engine", "powertrain.oil_pump",
+                 "heat-exchange-path", radius=.003, heat_share_frac=0.12,
+                 medium_rate_state="rejected-heat-flow-w")
+            edge("drivetrain.engine_to_oil_pump_gear", "powertrain.engine", "powertrain.oil_pump",
+                 "geared-timing-drive", radius=.005, ratio_coordinate="oil_pump_gear_ratio",
+                 ratio=1.0, backlash_coordinate="oil_pump_gear_backlash_rad",
+                 stiffness_nm_per_rad=peak_torque_nm * 400.0,
+                 damping_nm_per_rad_s=peak_torque_nm * 1.0,
+                 max_torque_nm=peak_torque_nm * 0.08, backlash_rad=0.001)
+            edge("powertrain.oil_pan_to_pump", "powertrain.oil_pan", "powertrain.oil_pump",
+                 "oil-line", radius=.009, circuit_identity="oil",
+                 medium_rate_state="oil-flow-and-temperature-and-pressure",
+                 material="steel-pipe", fluid="engine-oil")
+            edge("powertrain.oil_pump_to_gallery", "powertrain.oil_pump", "powertrain.engine",
+                 "oil-line", radius=.007, circuit_identity="oil",
+                 medium_rate_state="oil-flow-and-temperature-and-pressure",
+                 regulated_by="oil-pressure-relief-valve",
+                 relief_pressure_pa=420_000.0,
+                 material="cast-iron-casting", fluid="engine-oil")
+
+            if has_turbo and cylinder_positions:
+                # A real turbocharger: unlike every other accessory in this
+                # subunit, it is NOT mechanically coupled to the crank at
+                # all -- a single rigid shaft carrying a turbine wheel
+                # spun by real exhaust gas energy (the exhaust flow
+                # topology just declared above) and a compressor wheel
+                # feeding the real intake plenum, one rotating mass, no
+                # torque-shaft edge back to the engine. Its bearings are
+                # real, shared engine-oil-circuit lines -- the standard
+                # automotive turbo design -- which is exactly why this is
+                # gated on has_oil_pan/has_turbo together and never
+                # offered to a supercharger: a Roots/screw supercharger
+                # carries its own independent gear-oil sump in real life
+                # and deliberately gets no oil-line here.
+                node("powertrain.turbocharger",
+                     [engine_position[0] + .05, engine_position[1] + .12, .12],
+                     "rotating-mass", mass_kg=1.1, inertia_kg_m2=0.00004)
+                node("powertrain.turbocharger.oil_feed",
+                     [engine_position[0] + .05, engine_position[1] + .13, .11],
+                     "engine-block-port", port_kind="turbo-bearing-oil-feed")
+                node("powertrain.turbocharger.oil_drain",
+                     [engine_position[0] + .05, engine_position[1] + .10, .13],
+                     "engine-block-port", port_kind="turbo-bearing-oil-drain")
+                edge("powertrain.turbo_oil_feed", "powertrain.oil_pump",
+                     "powertrain.turbocharger.oil_feed", "oil-line", radius=.003,
+                     circuit_identity="oil",
+                     medium_rate_state="oil-flow-and-temperature-and-pressure")
+                edge("powertrain.turbo_oil_drain", "powertrain.turbocharger.oil_drain",
+                     "powertrain.oil_pan", "oil-line", radius=.005, circuit_identity="oil",
+                     medium_rate_state="oil-flow-and-temperature-and-pressure",
+                     gravity_drain=True)
+                edge("thermal.exhaust_to_turbine", "powertrain.exhaust_manifold",
+                     "powertrain.turbocharger", "heat-exchange-path", radius=.004,
+                     heat_share_frac=0.30, medium_rate_state="rejected-heat-flow-w")
 
 
 def vehicle_slot_model(root: str, actor: str) -> dict[str, Any]:
@@ -7527,6 +8313,13 @@ def vehicle_slot_model(root: str, actor: str) -> dict[str, Any]:
         {"identity": "diesel-injection-governor", "label": "diesel injection timing",
          "advance_degrees": 12.0, "rpm_advance_degrees": 4.0, "load_retard_degrees": 1.0,
          "dispatch": "compression-injection", "default": False},
+        # a real small-engine flywheel magneto (string trimmers, hit-and-
+        # miss stationary engines, outboards): fixed timing off a magnet
+        # in the flywheel, no battery in the ignition circuit at all --
+        # mechanical-magneto dispatch, single fixed advance
+        {"identity": "flywheel-magneto", "label": "flywheel magneto timing",
+         "advance_degrees": 22.0, "rpm_advance_degrees": 0.0, "load_retard_degrees": 0.0,
+         "dispatch": "mechanical-magneto", "default": False},
     ]
     driving_modes = [
         {"identity": "trail", "label": "trail / crawl", "throttle_exponent": 2.15,
@@ -7710,8 +8503,11 @@ def vehicle_slot_model(root: str, actor: str) -> dict[str, Any]:
                              "computer-and-ignition", "front-lighting-horn", "rear-lighting",
                              "tail-brake-light", "sensor-bus", "steering-assist-power",
                              "transmission-control", "engine-transmission-can",
-                             "direct-drive-bypass-actuator"],
+                             "direct-drive-bypass-actuator", "chassis-ground-return",
+                             "cooling-fan", "battery-interconnect"],
                 "protection": "fusebox-and-relay-dispatch",
+                "ground_reference": "single-point-engine-block-strap-plus-block-to-frame-strap",
+                "ground_nodes": ["electrical.engine_ground", "electrical.frame_ground"],
             },
             "alternator_bank": {
                 "count": int(config.source["electrical"]["alternator_count"]),

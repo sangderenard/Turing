@@ -72,3 +72,24 @@ def test_llvm_literal_indices_are_storage_evidence():
     )[function.name][values.id]
 
     assert requirement.shape == (8,)
+
+
+def test_nonfinite_constant_is_not_treated_as_an_address_index():
+    values = SSAValue(0, "float64")
+    infinity = SSAValue(1, "float64")
+    address = SSAValue(2, "ptr")
+    function = Function(
+        "nonfinite_projection", [values],
+        {"entry": BasicBlock("entry", [
+            Instr("Const", [], infinity, attributes={"value": float("inf")}),
+            Instr("GetElementPtr", [values, infinity], address),
+            Instr("Ret", [], None),
+        ], [])},
+    )
+
+    requirement = module_storage_requirements(
+        IRModule({function.name: function})
+    )[function.name][values.id]
+
+    assert requirement.shape == ()
+    assert requirement.element_count is None

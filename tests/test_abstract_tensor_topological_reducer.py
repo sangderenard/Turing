@@ -59,6 +59,7 @@ def classify(value):
     )
     assert all(type(value) is int for value in graph.python_bindings["OPCODES"])
 
+
     from src.compiler.project_compilation_product import (
         _dump_resolved_process_graph,
     )
@@ -190,6 +191,17 @@ def retry(value, stable, rejected):
     )
 
     assert conditional_phis == ()
+    loop = next(
+        data
+        for _node_id, data in executable.nodes(data=True)
+        if data.get("type") == "While"
+    )
+    carried = (loop.get("attributes") or {}).get(
+        "loop_carried_bindings", {}
+    )
+    assert "value" in carried
+    initial, updated = carried["value"]
+    assert initial != updated
 
 
 def test_optional_typed_list_parameter_retains_sequence_mutation_policy():
@@ -1078,6 +1090,56 @@ class Builder:
     assert tombstone_sequence_ids == (external_values,)
 
 
+def test_sequence_record_metadata_does_not_replace_method_receiver_fields():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Controller:
+    gain: float = 1.0
+
+    def update(self, samples):
+        self.gain = self.gain + 1.0
+        return self.gain
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    executable = graph.function_table.entry("update").graph.G
+    executable.graph["parameter_record_abi"] = {
+        "self": {
+            "identity": "Controller",
+            "fields": {
+                "gain": {
+                    "storage": "scalar", "dtype": "float64", "mutable": True,
+                },
+            },
+        },
+    }
+    executable.graph["parameter_sequence_record_abi"] = {
+        "samples": {
+            "identity": "Metrics",
+            "fields": {
+                "stiff_flag": {
+                    "storage": "scalar", "dtype": "bool", "mutable": False,
+                },
+                "proc_ms": {
+                    "storage": "scalar", "dtype": "float64", "mutable": False,
+                },
+            },
+        },
+    }
+
+    from src.compiler.fortran_c_shell import _field_slot_ops
+
+    contract = _field_slot_ops(executable)
+
+    assert contract[4] == ("gain",)
+    assert contract[5] == "Controller"
+
+
 def test_descendant_loop_owns_its_sequence_mutation_effect():
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(
@@ -1250,6 +1312,56 @@ def kernel(values):
         for _node_id, data in function_graph.G.nodes(data=True)
         if data.get("type") == "Input"
     ] == ["values"]
+
+
+def test_static_reference_cache_recovers_after_projection_eviction(monkeypatch):
+    class StaticTensorAPI:
+        @staticmethod
+        def stack(values):
+            raise AssertionError('compiler must not execute static methods')
+
+        @staticmethod
+        def cat(values):
+            raise AssertionError('compiler must not execute static methods')
+
+    original_add = nx.DiGraph.add_node
+    evicted = []
+
+    def add_and_evict(graph, node, **data):
+        original_add(graph, node, **data)
+        if ((data.get('attributes') or {}).get('static_python_reference')
+                != 'StaticTensorAPI.cat' or evicted):
+            return
+        for reference, attrs in list(graph.nodes(data=True)):
+            if ((attrs.get('attributes') or {}).get('static_python_reference')
+                    == 'StaticTensorAPI.stack' and attrs.get('type') == 'StaticReference'):
+                # Simulate removal of an already resolved callee projection
+                # before a later call reuses that compiler symbol.
+                for child in list(graph.successors(reference)):
+                    graph.nodes[child]['parents'] = [
+                        pair for pair in graph.nodes[child].get('parents', ())
+                        if pair[0] != reference
+                    ]
+                graph.remove_node(reference)
+                evicted.append(reference)
+                break
+
+    monkeypatch.setattr(nx.DiGraph, 'add_node', add_and_evict)
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {'StaticTensorAPI': StaticTensorAPI}
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse('''
+def kernel(values):
+    first = StaticTensorAPI.stack(values)
+    second = StaticTensorAPI.cat(first)
+    return StaticTensorAPI.stack(second)
+'''))
+    reduce_abstract_tensor_topology(graph)
+    assert evicted
+    executable = graph.function_table.entry('kernel').graph.G
+    assert sum(data.get('type') == 'stack' for _, data in executable.nodes(data=True)) == 2
+    assert [data['label'] for _, data in executable.nodes(data=True)
+            if data.get('type') == 'Input'] == ['values']
 
 
 def test_static_python_reference_alias_uses_integer_wrapper_node():
@@ -1777,6 +1889,188 @@ def convert(value):
         and (data.get("attributes") or {}).get("binding_name") == "numeric"
         for _node_id, data in function_graph.G.nodes(data=True)
     )
+
+
+def test_conditional_attribute_write_phis_rhs_with_existing_projection():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse("""
+def update(box, enabled):
+    prior = box.value
+    if enabled:
+        box.value = 2.0
+    return box.value
+"""))
+
+    reduce_abstract_tensor_topology(graph)
+    executable = graph.function_table.entry("update").graph.G
+    set_attr_id, set_attr = next(
+        (node_id, data) for node_id, data in executable.nodes(data=True)
+        if data.get("type") == "SetAttr"
+    )
+    stored = next(
+        parent for parent, role in set_attr["parents"] if role == "value"
+    )
+    merged_id, merged = next(
+        (node_id, data) for node_id, data in executable.nodes(data=True)
+        if data.get("type") == "Phi"
+        and (data.get("attributes") or {}).get("record_field_state")
+    )
+    parents = dict((role, parent) for parent, role in merged["parents"])
+
+    assert parents["body"] == stored
+    assert parents["body"] != set_attr_id
+    assert executable.nodes[parents["orelse"]]["type"] == "GetAttr"
+    assert merged["attributes"]["initial_value_id"] == parents["orelse"]
+    final_read = next(
+        data for _node_id, data in executable.nodes(data=True)
+        if data.get("type") == "GetAttr"
+        and (merged_id, "after_write") in data.get("parents", ())
+    )
+    assert final_read["attributes"]["attribute"] == "value"
+
+
+def test_synthesized_record_field_seed_keeps_declared_aggregate_contract():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse("""
+class Box:
+    def __init__(self):
+        self.report: list[str] = []
+
+def update(box: Box, rows, enabled):
+    if enabled:
+        box.report = list(rows)
+    return box
+"""))
+
+    reduce_abstract_tensor_topology(graph)
+    executable = graph.function_table.entry("update").graph.G
+    initial_id, initial = next(
+        (node_id, data)
+        for node_id, data in executable.nodes(data=True)
+        if (data.get("attributes") or {}).get(
+            "initial_record_field_state"
+        )
+    )
+
+    assert initial["attributes"] == {
+        "attribute": "report",
+        "initial_record_field_state": True,
+        "producer_kind": "record_field",
+        "aggregate_kind": "list",
+        "sequence_key_columns": (),
+        "sequence_column_count": 1,
+        "sequence_writable": True,
+        "record_field": ("Box", "report"),
+        "sequence_column_dtypes": ("int64",),
+    }
+
+    from src.compiler.fortran_c_shell import (
+        _field_slot_ops,
+        _sequence_column_dtype_contracts,
+    )
+
+    declarations = _field_slot_ops(executable)[8]
+    contracts = _sequence_column_dtype_contracts(executable, declarations)
+    merged_id, merged = next(
+        (node_id, data)
+        for node_id, data in executable.nodes(data=True)
+        if data.get("type") == "Phi"
+        and (data.get("attributes") or {}).get("aggregate_kind") == "list"
+    )
+    body_id = next(
+        parent_id for parent_id, role in merged["parents"] if role == "body"
+    )
+    assert contracts[initial_id] == ("int64",)
+    assert contracts[merged_id] == ("int64",)
+    assert contracts[body_id] == ("int64",)
+
+
+def test_record_return_receipts_preserve_each_sites_field_state():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse('''
+def update(box, enabled, leave):
+    prior = box.value
+    if leave:
+        return box
+    if enabled:
+        box.value = 2.0
+    return box
+'''))
+    reduce_abstract_tensor_topology(graph)
+    executable = graph.function_table.entry('update').graph.G
+    receipts = executable.graph['return_record_field_states']
+    assert len(receipts) == 2
+    early, late = [states for _span, states in sorted(receipts.items())]
+    assert len(early) == len(late) == 1
+    assert early[0][:2] == late[0][:2]
+    assert executable.nodes[early[0][2]]['type'] == 'GetAttr'
+    assert executable.nodes[late[0][2]]['type'] == 'Phi'
+    assert all(receiver in executable and value in executable
+               for states in receipts.values() for receiver, _field, value in states)
+
+
+def test_augassign_attribute_load_keeps_python_getattr_special_case():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def increment(ctrl, enabled):
+    if enabled:
+        ctrl.clamp_events += 1
+    return ctrl.clamp_events
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("increment").graph.G
+    loads = [
+        data
+        for _node_id, data in function_graph.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+        and isinstance(data["expr_obj"].ctx, ast.Load)
+        and data["expr_obj"].attr == "clamp_events"
+    ]
+
+    assert loads
+    assert all(data.get("type") == "GetAttr" for data in loads)
+    assert all(data.get("op") == "GetAttr" for data in loads)
+    assert all(
+        (data.get("attributes") or {}).get("attribute") == "clamp_events"
+        for data in loads
+    )
+    augmented_targets = [
+        data
+        for _node_id, data in function_graph.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+        and isinstance(data["expr_obj"].ctx, ast.Store)
+        and data["expr_obj"].attr == "clamp_events"
+        and any(str(role) == "lhs" for _child, role in data.get("children") or ())
+    ]
+    assert len(augmented_targets) == 1
+    assert augmented_targets[0]["type"] == "GetAttr"
+    assert augmented_targets[0]["op"] == "GetAttr"
+    assert augmented_targets[0]["attributes"]["attribute"] == "clamp_events"
+
+
+def test_late_linked_python_graph_normalizes_attribute_load():
+    from src.common.tensors.topological_reducer import (
+        normalize_python_attribute_special_cases,
+    )
+
+    linked = ProcessGraph(materialize_memory=False, source_language="python")
+    expression = ast.parse("ctrl.clamp_events", mode="eval").body
+    linked.G.add_node(144, type="Attribute", op=None, expr_obj=expression)
+
+    normalize_python_attribute_special_cases(linked)
+
+    data = linked.G.nodes[144]
+    assert data["type"] == "GetAttr"
+    assert data["op"] == "GetAttr"
+    assert data["attributes"]["attribute"] == "clamp_events"
 
 
 def test_try_else_consumes_the_successful_body_value_before_path_merge():

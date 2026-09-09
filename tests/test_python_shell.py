@@ -240,6 +240,138 @@ def test_disagreeing_output_contracts_are_a_finding():
     assert findings and "another call site projects" in findings[0].detail
 
 
+def test_linked_calls_may_use_distinct_caller_projection_identities():
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    def call(outputs, result_id):
+        return Instr(
+            "Call", [SSAValue(0)], SSAValue(result_id),
+            attributes={
+                "callee": "source_function",
+                "output_ids": outputs,
+                "callee_output_ids": (10, 11),
+            },
+        )
+
+    class _Module:
+        functions = {
+            "a": Function("a", [], {
+                "entry": BasicBlock("entry", [call((1, 2), 5)]),
+            }),
+            "b": Function("b", [], {
+                "entry": BasicBlock("entry", [call((20, 21), 6)]),
+            }),
+        }
+
+    assert check_output_contract_agreement(_Module()) == []
+
+
+def test_recursive_structural_probe_only_fails_when_its_identity_stays_live():
+    from src.compiler.fortran_c_shell import (
+        _settle_nonlive_structural_shortfalls,
+    )
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    live = SSAValue(10, "float64")
+    function = Function("root", [], {
+        "entry": BasicBlock("entry", [Instr("Ret", [live], None)]),
+    })
+    shortfalls = (
+        (8, "call", "call-result-unavailable"),
+        (10, "call", "call-result-unavailable"),
+        (11, "call", "call-result-unavailable"),
+    )
+
+    retained = _settle_nonlive_structural_shortfalls(
+        function,
+        shortfalls,
+        authoritative_output_ids=(11,),
+    )
+
+    assert retained == shortfalls[1:]
+    assert function.metadata["settled_nonlive_structural_shortfalls"] == ({
+        "value_id": 8,
+        "operation": "call",
+        "reason": "call-result-unavailable",
+        "resolution": "absent_from_final_ssa",
+        "priority": "exact_live_value_surface",
+        "tie_policy": "incumbent",
+    },)
+
+
+def test_recorded_scalar_identity_rebinds_all_stale_operands_once():
+    import networkx as nx
+
+    from src.compiler.fortran_c_shell import (
+        _rebind_recorded_scalar_identities,
+    )
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    source = SSAValue(1, "float64")
+    stale_call = SSAValue(8, "float64")
+    stale_return = SSAValue(8, "float64")
+    call = Instr(
+        "Call", [stale_call], SSAValue(9, "float64"),
+        attributes={"callee": "child", "feed_ids": (8,)},
+    )
+    returned = Instr("Ret", [stale_return], None)
+    function = Function(
+        "root", [source],
+        {"entry": BasicBlock("entry", [call, returned])},
+        metadata={"control_identity_receipts": (
+            (8, 1, "scalar_item_identity"),
+        )},
+    )
+
+    source_graph = nx.DiGraph()
+    source_graph.add_node(
+        1, value_id=1,
+        attributes={"binding_kind": "parameter", "binding_name": "value"},
+    )
+    changes = _rebind_recorded_scalar_identities(function, source_graph)
+
+    assert call.args == [source]
+    assert call.attributes["feed_ids"] == (1,)
+    assert returned.args == [source]
+    assert len(changes) == 2
+    assert function.metadata["structural_identity_rebindings"] == changes
+    assert all(change["tie_policy"] == "incumbent" for change in changes)
+    assert function.metadata["parameter_names"] == (("value", 1),)
+    assert function.metadata["recovered_structural_parameter_names"] == ({
+        "name": "value",
+        "value_id": 1,
+        "priority": "exact_source_parameter_identity",
+        "tie_policy": "incumbent",
+    },)
+
+
+def test_recorded_scalar_identity_retains_incumbent_when_target_is_ambiguous():
+    from src.compiler.fortran_c_shell import (
+        _rebind_recorded_scalar_identities,
+    )
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    first = SSAValue(1, "float64")
+    second = SSAValue(1, "float64")
+    stale = SSAValue(8, "float64")
+    returned = Instr("Ret", [stale], None)
+    function = Function(
+        "root", [],
+        {"entry": BasicBlock("entry", [
+            Instr("Const", [], first, attributes={"value": 1.0}),
+            Instr("Const", [], second, attributes={"value": 2.0}),
+            returned,
+        ])},
+        metadata={"control_identity_receipts": (
+            (8, 1, "scalar_item_identity"),
+        )},
+    )
+
+    assert _rebind_recorded_scalar_identities(function) == ()
+    assert returned.args == [stale]
+    assert "structural_identity_rebindings" not in function.metadata
+
+
 def test_unexpanded_record_sequence_row_is_a_hard_finding():
     from src.transmogrifier.ssa import BasicBlock, Function
 

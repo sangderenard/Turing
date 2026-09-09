@@ -268,6 +268,11 @@ _UNARY_FOLDED = {
     key.casefold(): value for key, value in _UNARY.items()
     if value is not None
 }
+_UNARY_PREDICATES = {
+    "isfinite": "isfinite",
+    "isinf": "isinf",
+    "isnan": "isnan",
+}
 
 
 #: Operator spellings differ in case between the source vocabularies and the
@@ -485,6 +490,8 @@ def emit_ssa_function_to_c(
                 rendered = _series_sin_c(args[0], shift)
         elif op.casefold() in _UNARY_FOLDED and len(args) == 1:
             rendered = f"{_UNARY_FOLDED[op.casefold()]}({args[0]})"
+        elif op.casefold() in _UNARY_PREDICATES and len(args) == 1:
+            rendered = f"{_UNARY_PREDICATES[op.casefold()]}({args[0]})"
         elif op == "Pow" and len(args) == 2:
             exponent = constants.get(int(instruction.args[1].id))
             # Exact spellings only; the sqrt-family reductions change bits and
@@ -1712,6 +1719,11 @@ def emit_ssa_module_to_c(
             extent_order.append(key)
         return extent_slots[key]
     shortfalls: list[CEmissionShortfall] = []
+    for conflict in (getattr(module, "metadata", {}) or {}).get("call_result_type_conflicts", ()):
+        if str(conflict["caller"]) in reachable:
+            shortfalls.append(CEmissionShortfall(
+                "call_result_contract", str(conflict),
+            ))
     shortfalls.extend(
         CEmissionShortfall(
             "precision_section",
@@ -1943,6 +1955,18 @@ def emit_ssa_module_to_c(
             int(formal.id): f"v{formal.id}"
             for formal in function.args
         }
+        # Integer ids preserve authored identity and may therefore occur on
+        # distinct SSAValue objects in different conditional versions.  Keep
+        # exact-object bindings for values whose native storage is known here;
+        # edge copies must not let a later same-id projection shadow a Phi.
+        object_expressions: dict[int, str] = {
+            id(formal): expressions[int(formal.id)]
+            for formal in function.args
+        }
+        object_addresses: dict[int, str] = {
+            id(formal): addresses[int(formal.id)]
+            for formal in function.args
+        }
         address_buffer_types: dict[int, str] = {
             int(formal.id): _value_buffer_c_type(formal)
             for formal in function.args
@@ -1970,6 +1994,21 @@ def emit_ssa_module_to_c(
             int(output.id): output_destinations[int(output.id)]
             for output in native_outputs[fn]
         })
+        locally_defined_objects = {
+            id(instruction.res)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
+        for output in native_outputs[fn]:
+            if id(output) in locally_defined_objects:
+                # A returned value remains a local SSA definition until Ret
+                # publishes it.  Binding that exact object to outN here makes
+                # an earlier internal consumer read the caller's stale output
+                # buffer even after expressions[N] has advanced to tN.
+                continue
+            object_expressions[id(output)] = expressions[int(output.id)]
+            object_addresses[id(output)] = addresses[int(output.id)]
         address_buffer_types.update({
             int(output.id): _value_buffer_c_type(output)
             for output in native_outputs[fn]
@@ -2047,6 +2086,38 @@ def emit_ssa_module_to_c(
                 storage = activation_array(element_type, count)
                 expressions[value_id] = storage
                 addresses[value_id] = storage
+        # Explicit output-pointer helpers consume their destination as an
+        # argument. Private results therefore need storage before arguments
+        # are rendered, including representation-conversion temporaries.
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                position = instruction.attributes.get("ssa_output_argument")
+                if (instruction.op not in {"Call", "call"}
+                        or position is None or instruction.res is None
+                        or not 0 <= int(position) < len(instruction.args)):
+                    continue
+                output = instruction.args[int(position)]
+                value_id = int(output.id)
+                if value_id != int(instruction.res.id) or value_id in addresses:
+                    continue
+                shape = tuple(output.shape or ())
+                if any(not isinstance(extent, int) or extent < 0 for extent in shape):
+                    shortfalls.append(CEmissionShortfall(
+                        "call_output_storage",
+                        f"explicit output %t{value_id} has no static storage bound in {fn}",
+                    ))
+                    continue
+                element_type = buffer_type(output)
+                if shape:
+                    storage = activation_array(element_type, math.prod(shape))
+                    expressions[value_id] = storage
+                    addresses[value_id] = storage
+                else:
+                    storage = f"helperout{value_id}"
+                    local_tensor_declarations.append(f"    {element_type} {storage};")
+                    expressions[value_id] = storage
+                    addresses[value_id] = f"&{storage}"
+                address_buffer_types[value_id] = element_type
         # Aggregate projections may be consumed in a merge/header block that
         # is emitted textually before the branch/body containing their Call.
         # Allocate each call-output slot in the function frame up front and
@@ -2142,6 +2213,8 @@ def emit_ssa_module_to_c(
                 ] = (projected_expression, projected_address)
                 for projection in projections:
                     projection_id = int(projection.value.id)
+                    object_expressions[id(projection.value)] = projected_expression
+                    object_addresses[id(projection.value)] = projected_address
                     # Planner/callee namespaces may reuse an integer id that
                     # is already one of this function's native output ports.
                     # That port's caller-owned destination is authoritative;
@@ -2160,12 +2233,20 @@ def emit_ssa_module_to_c(
             if _is_integer_dtype(formal.dtype)
         }
         phi_declarations: dict[int, str] = {}
+        phi_buffer_types: dict[int, str] = {}
+        span_phi_ids: set[int] = set()
         for block in function.blocks.values():
             for instruction in block.instrs:
                 if str(instruction.op) in {"Phi", "phi"} and instruction.res is not None:
-                    phi_declarations[int(instruction.res.id)] = buffer_type(
-                        instruction.res
-                    )
+                    result_id = int(instruction.res.id)
+                    kind = buffer_type(instruction.res)
+                    phi_buffer_types[result_id] = kind
+                    if tuple(instruction.res.shape or ()) or _declared_span_rank(instruction.res) > 0:
+                        # Array SSA values denote spans. A merge selects the
+                        # incoming storage, not its first scalar element.
+                        span_phi_ids.add(result_id)
+                        kind += " *"
+                    phi_declarations[result_id] = kind
         # Every Phi declaration is function-scoped and every incoming edge may
         # reference another Phi in a loop/conditional cycle. Publish all names
         # before visiting any block so textual block order cannot manufacture
@@ -2174,9 +2255,20 @@ def emit_ssa_module_to_c(
             int(phi_id): f"t{phi_id}" for phi_id in phi_declarations
         })
         addresses.update({
-            int(phi_id): f"&t{phi_id}" for phi_id in phi_declarations
+            int(phi_id): f"t{phi_id}" if phi_id in span_phi_ids else f"&t{phi_id}"
+            for phi_id in phi_declarations
         })
-        address_buffer_types.update(phi_declarations)
+        address_buffer_types.update(phi_buffer_types)
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if str(instruction.op) not in {"Phi", "phi"} or instruction.res is None:
+                    continue
+                result_id = int(instruction.res.id)
+                object_expressions[id(instruction.res)] = f"t{result_id}"
+                object_addresses[id(instruction.res)] = (
+                    f"t{result_id}" if result_id in span_phi_ids
+                    else f"&t{result_id}"
+                )
 
         def is_integer(value) -> bool:
             return (
@@ -2185,7 +2277,7 @@ def emit_ssa_module_to_c(
             )
 
         def operand(value) -> str | None:
-            held = expressions.get(int(value.id))
+            held = object_expressions.get(id(value), expressions.get(int(value.id)))
             if held is None:
                 shortfalls.append(CEmissionShortfall(
                     "operand", f"%t{value.id} is unavailable in {fn}",
@@ -2193,7 +2285,10 @@ def emit_ssa_module_to_c(
             return held
 
         def address_operand(value) -> str | None:
-            held = addresses.get(int(value.id), expressions.get(int(value.id)))
+            held = object_addresses.get(
+                id(value),
+                addresses.get(int(value.id), expressions.get(int(value.id))),
+            )
             if held is None:
                 shortfalls.append(CEmissionShortfall(
                     "operand", f"%t{value.id} has no address in {fn}",
@@ -2206,7 +2301,7 @@ def emit_ssa_module_to_c(
             held = operand(value)
             if held is None or _pointer_value_depth(value) > 0:
                 return held
-            home = addresses.get(int(value.id))
+            home = object_addresses.get(id(value), addresses.get(int(value.id)))
             pointer_view = (
                 home is not None
                 and (
@@ -2243,7 +2338,15 @@ def emit_ssa_module_to_c(
                     if str(origin) == source_block and position < len(
                         instruction.args
                     ):
-                        value = scalar_operand(instruction.args[position])
+                        if int(instruction.res.id) in span_phi_ids:
+                            source = instruction.args[position]
+                            address = (operand(source) if _pointer_value_depth(source) > 0
+                                       else address_operand(source))
+                            value = None if address is None else (
+                                f"({phi_declarations[int(instruction.res.id)]})({address})"
+                            )
+                        else:
+                            value = scalar_operand(instruction.args[position])
                         if value is not None:
                             assignments.append(
                                 f"        t{instruction.res.id} = {value};"
@@ -2354,6 +2457,7 @@ def emit_ssa_module_to_c(
         }
 
         block_names = list(function.blocks)
+        emitted_scalar_locals: set[int] = set()
         effect_guarded_blocks = set(
             function.metadata.get("pool_effect_guarded_blocks") or ()
         )
@@ -2531,6 +2635,19 @@ def emit_ssa_module_to_c(
                             f"{instruction.res.id} carries None in {fn}; "
                             "None must use the explicit NoneValue operation",
                         ))
+                        continue
+                    pointer_depth = _pointer_value_depth(instruction.res)
+                    if pointer_depth:
+                        if not isinstance(held, int) or held != 0:
+                            shortfalls.append(CEmissionShortfall(
+                                op, f"pointer Const requires an explicit null literal in {fn}",
+                            ))
+                            continue
+                        result_id = int(instruction.res.id)
+                        pointer_type = buffer_type(instruction.res) + " *" * pointer_depth
+                        body.append(f"        {pointer_type}t{result_id} = 0;")
+                        expressions[result_id] = f"t{result_id}"
+                        addresses[result_id] = f"t{result_id}"
                         continue
                     if isinstance(held, (list, tuple)):
                         try:
@@ -3799,6 +3916,49 @@ def emit_ssa_module_to_c(
                     if loaded_type in {"int32_t", "int64_t"}:
                         integer_ids.add(result_id)
                 elif op in {"Cast", "CastLike"} and len(args) >= 1:
+                    shape = tuple(instruction.res.shape or ())
+                    if shape:
+                        if shape != tuple(instruction.args[0].shape or ()) or any(
+                            not isinstance(extent, int) or extent < 0 for extent in shape
+                        ):
+                            shortfalls.append(CEmissionShortfall(op, f"array cast requires a matching static shape in {fn}"))
+                            continue
+                        source_address = address_operand(instruction.args[0])
+                        if source_address is None:
+                            continue
+                        count = math.prod(shape)
+                        target_type = buffer_type(instruction.res)
+                        source_type = buffer_type(instruction.args[0])
+                        storage = activation_array(target_type, count)
+                        element = f"((const {source_type} *)({source_address}))[cast_i_{result_id}]"
+                        converted = f"({element} != 0)" if instruction.res.dtype == "bool" else f"({target_type})({element})"
+                        body.append(f"        for (size_t cast_i_{result_id} = 0; cast_i_{result_id} < {count}; ++cast_i_{result_id}) "
+                                    f"{storage}[cast_i_{result_id}] = {converted};")
+                        expressions[result_id] = storage
+                        addresses[result_id] = storage
+                        address_buffer_types[result_id] = target_type
+                        continue
+                    result_type = _scalar_c_type(instruction.res.dtype)
+                    if _is_integer_dtype(instruction.res.dtype):
+                        integer_ids.add(result_id)
+                    cast_source = f"(({args[0]}) != 0)" if instruction.res.dtype == "bool" else args[0]
+                    declared = (
+                        f"const {result_type} t{result_id} = "
+                        f"({result_type})({cast_source});"
+                    )
+                elif (
+                    op.casefold() == "item"
+                    and len(args) == 1
+                    and not tuple(instruction.args[0].shape or ())
+                    and not tuple(instruction.res.shape or ())
+                ):
+                    # A scalar ``item()`` has already crossed the tensor
+                    # boundary during target-neutral lowering.  Its retained
+                    # Cast carries ``tensor_operation=item`` for provenance,
+                    # so semantic dispatch reaches this branch instead of the
+                    # ordinary Cast spelling.  Preserve the exact scalar value
+                    # with the declared result type; shaped extraction remains
+                    # an explicit unsupported tensor operation.
                     result_type = _scalar_c_type(instruction.res.dtype)
                     if _is_integer_dtype(instruction.res.dtype):
                         integer_ids.add(result_id)
@@ -3983,7 +4143,7 @@ def emit_ssa_module_to_c(
                         f"const {_scalar_c_type(instruction.res.dtype)} t{result_id} = "
                         f"({logical_expression});"
                     )
-                elif op in {"LNot", "Not"} and len(args) == 1:
+                elif op in {"LNot", "Not", "logical_not"} and len(args) == 1:
                     integer_ids.add(result_id)
                     declared = (
                         f"const {_scalar_c_type(instruction.res.dtype)} t{result_id} = (!({args[0]}));"
@@ -4047,6 +4207,16 @@ def emit_ssa_module_to_c(
                         _scalar_c_type(instruction.res.dtype)
                     )
                     declared = f"const {kind} t{result_id} = (-{args[0]});"
+                elif (
+                    op.casefold() in _UNARY_PREDICATES
+                    and len(args) == 1
+                ):
+                    integer_ids.add(result_id)
+                    declared = (
+                        f"const {_scalar_c_type(instruction.res.dtype)} "
+                        f"t{result_id} = "
+                        f"{_UNARY_PREDICATES[op.casefold()]}({args[0]});"
+                    )
                 elif op.casefold() in _UNARY_FOLDED and len(args) == 1:
                     declared = (
                         f"const double t{result_id} = "
@@ -4077,6 +4247,25 @@ def emit_ssa_module_to_c(
                     if declared.startswith("const "):
                         declared = declared[len("const "):]
                     addresses[result_id] = f"&t{result_id}"
+                if (
+                    result_id in emitted_scalar_locals
+                    and not tuple(instruction.res.shape or ())
+                    and _pointer_value_depth(instruction.res) == 0
+                ):
+                    # Mutable source identities can be loaded repeatedly
+                    # after stores while retaining one SSA/storage id.  C has
+                    # one function scope around all emitted labels, so the
+                    # incumbent local is assigned on later definitions rather
+                    # than redeclared.  This also makes branch/loop replay a
+                    # finite overwrite of one physical scalar cell.
+                    separator = declared.find("=")
+                    if separator >= 0:
+                        declared = f"t{result_id} {declared[separator:]}"
+                elif (
+                    not tuple(instruction.res.shape or ())
+                    and _pointer_value_depth(instruction.res) == 0
+                ):
+                    emitted_scalar_locals.add(result_id)
                 body.append("        " + declared)
 
         flush_trace()
@@ -4270,6 +4459,7 @@ def emit_ssa_module_to_c(
         )
         rendered_actuals.append(f"b{index}")
     root_formal_ids = {int(formal.id) for formal in root.args}
+    watched_private_copies = []
     for output in native_outputs[function_name]:
         output_id = int(output.id)
         if is_structural_abi_value(output) and output_id not in set(map(int, watch)):
@@ -4283,7 +4473,9 @@ def emit_ssa_module_to_c(
                 entry_lines.append(f"    {element_type} {owned} = 0;")
                 rendered_actuals.append(f"&{owned}")
             continue
-        if output_id in root_formal_ids:
+        if output_id in root_formal_ids and output_id not in owned_storage_names:
+            continue
+        if output_id in root_formal_ids and output_id not in set(map(int, watch)):
             continue
         if output_id in buffer_order:
             rendered_actuals.append(f"b{buffer_order.index(output_id)}")
@@ -4300,7 +4492,16 @@ def emit_ssa_module_to_c(
             f"    {element_type} *b{index} = "
             f"({element_type} *)buffers[{index}];"
         )
-        rendered_actuals.append(f"b{index}")
+        if output_id in root_formal_ids:
+            # A private frame formal is already passed to the function. Watch
+            # copies its final contents out without changing its initialization
+            # or lifetime, and without adding another function argument.
+            count = math.prod(buffer_shapes[-1]) if buffer_shapes[-1] else 1
+            watched_private_copies.append(
+                f"    memcpy(b{index}, {owned_storage_names[output_id]}, sizeof(*b{index}) * {count});"
+            )
+        else:
+            rendered_actuals.append(f"b{index}")
     # Private sequence arenas and their capacity cells share this activation.
     # calloc establishes empty contents, but zero is not the capacity of an
     # allocated arena. Publish the actual column allocation bound before any
@@ -4364,6 +4565,7 @@ def emit_ssa_module_to_c(
             *(("extents",) if function_name in extent_users else ()),
         )) + ");"
     )
+    entry_lines.extend(watched_private_copies)
     entry_lines = [
         *(
             f"    {element_type} *{storage_name} = NULL;"

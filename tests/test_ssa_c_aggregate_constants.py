@@ -98,6 +98,39 @@ def test_c_converts_scalar_use_view_from_address_bound_storage(tmp_path):
         flag.id: np.array([True], dtype=np.bool_),
     }).run()
     assert execution.buffers[result.id].item() == 1.0
+
+
+def test_c_reassigns_reloaded_mutable_scalar_identity(tmp_path):
+    source = SSAValue(0, "float64", (2,))
+    zero = SSAValue(1, "int64")
+    one = SSAValue(2, "int64")
+    first_address = SSAValue(3, "ptr")
+    second_address = SSAValue(4, "ptr")
+    reloaded = SSAValue(5, "float64")
+    function = Function("reload_mutable_scalar", [source], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], zero, attributes={"value": 0}),
+            Instr("Const", [], one, attributes={"value": 1}),
+            Instr("GetElementPtr", [source, zero], first_address),
+            Instr("Load", [first_address], reloaded),
+            Instr("GetElementPtr", [source, one], second_address),
+            Instr("Load", [second_address], reloaded),
+            Instr("Ret", [reloaded], None),
+        ]),
+    }, metadata={"output_names": ("result",)})
+
+    artifact = emit_ssa_to_c(
+        IRModule({function.name: function}), function.name,
+    )
+
+    assert artifact.complete, artifact.shortfalls
+    assert artifact.source.count("double t5 =") == 1
+    assert "t5 = (double)(*((double *)(t4)));" in artifact.source
+    artifact.compile(tmp_path / "reload_mutable_scalar")
+    execution = artifact.prepare_execution({
+        source.id: np.asarray([3.0, 7.5]),
+    }).run()
+    assert execution.buffers[reloaded.id].item() == 7.5
 from src.compiler.tensor_ssa_lowering import lower_tensor_calls_to_repository_ssa
 from src.compiler.ir_identities import drop_dead_pure_structural_instructions
 from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
@@ -543,6 +576,81 @@ def test_c_aggregate_projection_cannot_rebind_unrelated_formal_id():
     assert artifact.complete, artifact.shortfalls
     assert "impl_scalar_region(&callout13_0);" in artifact.source
     assert "impl_scalar_region(v13);" not in artifact.source
+
+
+def test_c_phi_edge_distinguishes_same_id_projection_from_incumbent():
+    region_output = SSAValue(7, "float64")
+    region = Function(
+        "same_id_region", [],
+        {"entry": BasicBlock("entry", [])},
+        metadata={"named_outputs": (("value", region_output.id),)},
+    )
+    initial = SSAValue(0, "float64")
+    first_predicate = SSAValue(1, "bool")
+    second_predicate = SSAValue(2, "bool")
+    carried = SSAValue(7, "float64")
+    aggregate = SSAValue(10, "ssa.aggregate")
+    index = SSAValue(11, "int64")
+    address = SSAValue(12, "ptr")
+    projection = SSAValue(7, "float64")
+    result = SSAValue(9, "float64")
+    root = Function("same_id_phi_root", [
+        initial, first_predicate, second_predicate,
+    ], {
+        "entry": BasicBlock("entry", [
+            Instr("CondBr", [first_predicate], None, attributes={
+                "true_target": "first_true", "false_target": "first_false",
+            }),
+        ], ["first_true", "first_false"]),
+        "first_true": BasicBlock("first_true", [
+            Instr("Br", [], None, attributes={"target": "first_merge"}),
+        ], ["first_merge"]),
+        "first_false": BasicBlock("first_false", [
+            Instr("Br", [], None, attributes={"target": "first_merge"}),
+        ], ["first_merge"]),
+        "first_merge": BasicBlock("first_merge", [
+            Instr("Phi", [initial, initial], carried, attributes={
+                "binding": "conditional_carried",
+                "incoming_blocks": ("first_true", "first_false"),
+            }),
+            Instr("CondBr", [second_predicate], None, attributes={
+                "true_target": "call_true", "false_target": "call_false",
+            }),
+        ], ["call_true", "call_false"]),
+        "call_true": BasicBlock("call_true", [
+            Instr("Call", [], aggregate, attributes={
+                "callee": region.name,
+                "result_convention": "ssa.aggregate",
+                "output_ids": (region_output.id,),
+            }),
+            Instr("Const", [], index, attributes={"value": 0}),
+            Instr("GetElementPtr", [aggregate, index], address, attributes={
+                "aggregate_index": 0, "source_output_id": 7,
+            }),
+            Instr("Load", [address], projection, attributes={
+                "aggregate_index": 0, "source_output_id": 7,
+            }),
+            Instr("Br", [], None, attributes={"target": "final_merge"}),
+        ], ["final_merge"]),
+        "call_false": BasicBlock("call_false", [
+            Instr("Br", [], None, attributes={"target": "final_merge"}),
+        ], ["final_merge"]),
+        "final_merge": BasicBlock("final_merge", [
+            Instr("Phi", [projection, carried], result, attributes={
+                "binding": "conditional_carried",
+                "incoming_blocks": ("call_true", "call_false"),
+            }),
+            Instr("Ret", [result], None),
+        ]),
+    })
+
+    artifact = emit_ssa_module_to_c(
+        IRModule({root.name: root, region.name: region}), root.name,
+    )
+
+    assert artifact.complete, artifact.shortfalls
+    assert "t9 = callout7_0;" in artifact.source
+    assert "t9 = t7;" in artifact.source
 
 
 def test_c_inout_projection_publishes_into_source_formal_storage():
@@ -1146,6 +1254,72 @@ def test_c_module_lane_emits_preselected_scalar_aggregate_projection(tmp_path):
         selected_leaf.id: np.array([37], dtype=np.int64),
     }).run()
     assert execution.buffers[projected.id].item() == 37
+
+
+def test_c_module_lane_emits_scalar_item_and_finiteness(tmp_path):
+    source = SSAValue(0, "float64")
+    item = SSAValue(1, "float64")
+    finite = SSAValue(2, "bool")
+    function = Function("scalar_item_finite", [source], {
+        "entry": BasicBlock("entry", [
+            Instr("Cast", [source], item, attributes={
+                "tensor_operation": "item",
+                "structural_operation": "scalar_item",
+                "target_dtype": "float64",
+            }),
+            Instr("isfinite", [item], finite),
+            Instr("Ret", [item, finite], None),
+        ]),
+    }, metadata={"output_names": ("item", "finite")})
+
+    artifact = emit_ssa_to_c(
+        IRModule({function.name: function}), function.name,
+    )
+
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "scalar_item_finite")
+    for value, expected in (
+        (3.5, (3.5, True)),
+        (float("inf"), (float("inf"), False)),
+        (float("nan"), (float("nan"), False)),
+    ):
+        execution = artifact.prepare_execution({
+            source.id: np.array([value], dtype=np.float64),
+        }).run()
+        observed_item = execution.buffers[item.id].item()
+        if np.isnan(value):
+            assert np.isnan(observed_item)
+        else:
+            assert observed_item == expected[0]
+        assert bool(execution.buffers[finite.id].item()) is expected[1]
+
+
+def test_c_internal_consumer_reads_local_returned_boolean(tmp_path):
+    left = SSAValue(0, "bool")
+    right = SSAValue(1, "bool")
+    both = SSAValue(2, "bool")
+    negated = SSAValue(3, "bool")
+    function = Function("consume_before_boolean_publication", [left, right], {
+        "entry": BasicBlock("entry", [
+            Instr("LAnd", [left, right], both),
+            Instr("LNot", [both], negated),
+            Instr("Ret", [both, negated], None),
+        ]),
+    }, metadata={"output_names": ("both", "negated")})
+
+    artifact = emit_ssa_to_c(
+        IRModule({function.name: function}), function.name,
+    )
+
+    assert artifact.complete, artifact.shortfalls
+    assert "uint8_t t3 = (!(t2));" in artifact.source
+    artifact.compile(tmp_path / "returned_boolean_consumer", optimization="O0")
+    execution = artifact.prepare_execution({
+        left.id: np.array([True], dtype=np.bool_),
+        right.id: np.array([True], dtype=np.bool_),
+    }).run()
+    assert bool(execution.buffers[both.id].item()) is True
+    assert bool(execution.buffers[negated.id].item()) is False
 
 
 def test_c_truncation_and_unsigned_comparison_use_bit_patterns(tmp_path):

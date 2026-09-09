@@ -224,6 +224,10 @@ class ProgramABIField:
     # under a keyed value record, the deterministic row identity selects a
     # slice from each flattened column arena.
     table_columns: tuple[Mapping[str, Any], ...] | None = None
+    # Optional values cross a native boundary as an explicit Boolean presence
+    # cell plus the ordinary typed payload cell.  The payload is never used to
+    # infer absence, so zero, NaN, and every finite value remain valid data.
+    optional: bool = False
 
     @classmethod
     def from_mapping(cls, location: str, raw: Any) -> "ProgramABIField":
@@ -237,6 +241,7 @@ class ProgramABIField:
             "token_vocabulary",
             "value_identity",
             "columns",
+            "optional",
         }
         extra = sorted(set(raw) - allowed)
         if extra:
@@ -408,6 +413,15 @@ class ProgramABIField:
             raise ExtractionContractError(
                 f"{location}.mutable must be boolean"
             )
+        optional = raw.get("optional", False)
+        if not isinstance(optional, bool):
+            raise ExtractionContractError(
+                f"{location}.optional must be boolean"
+            )
+        if optional and storage not in {"scalar", "reference", "record"}:
+            raise ExtractionContractError(
+                f"{location}.optional requires scalar, reference, or record storage"
+            )
         raw_shape = raw.get("shape")
         shape: tuple[int, ...] | None = None
         if raw_shape is not None:
@@ -455,6 +469,7 @@ class ProgramABIField:
             token_vocabulary,
             value_identity,
             table_columns,
+            optional,
         )
 
     def receipt(self) -> dict[str, Any]:
@@ -492,6 +507,8 @@ class ProgramABIField:
                 }
                 for column in self.table_columns
             ]
+        if self.optional:
+            result["optional"] = True
         return result
 
 

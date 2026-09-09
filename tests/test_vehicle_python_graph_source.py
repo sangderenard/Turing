@@ -15,6 +15,15 @@ from src.compiler.vehicle_native_graph_program import (
 )
 
 
+def test_balloon_tire_dt_limit_hint_has_one_scalar_contract():
+    from src.compiler.vehicle_python_compilation import BalloonTireManagedState
+
+    material = object.__new__(BalloonTireManagedState)
+    for declared, expected in ((0.0, 0.0), (-1.0, 0.0), (2.5e-4, 2.5e-4)):
+        material.declared_dt_s = declared
+        assert material.dt_limit_hint() == expected
+
+
 def test_rig_point_law_accepts_variable_attachment_counts_and_balances_reactions():
     from src.common.tensors import AbstractTensor
 

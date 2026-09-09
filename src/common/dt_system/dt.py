@@ -67,6 +67,13 @@ class SuperstepPlan:
         not, and only ``dt`` itself is steered by the metrics. This is the
         "no-save" configuration for a real-time frame budget where the
         copy/restore cost is what can't be afforded, not the physics.
+    schedule_lattice_steps:
+        When positive, choose each interior adaptive timestep from this many
+        equal subdivisions of ``round_max``. Proposals are rounded downward,
+        so the lattice cannot exceed a controller safety limit. The final
+        remainder still lands exactly on the requested window. This makes the
+        discrete schedule reproducible when numerically equivalent backends
+        differ in low floating-point bits.
     """
     round_max: float | AbstractTensor
     dt_init: float | AbstractTensor
@@ -75,6 +82,7 @@ class SuperstepPlan:
     event_boundaries: tuple[float, ...] = ()
     rollback: bool = True
     rollback_threshold_multiplier: float = 1.0
+    schedule_lattice_steps: int = 0
 
 
 @dataclass

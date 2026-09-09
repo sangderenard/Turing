@@ -81,6 +81,17 @@ def check_formal_parity(module: Any) -> list[Finding]:
             int(entry["value_id"])
             for entry in metadata.get("storage_formals") or ()
         )
+        # Tuple/list parameters expand to physical member inputs just as
+        # records expand to fields. Admit only the graph's exact member
+        # receipt rooted in an authored parameter, never a local variable
+        # name or the generic source_parameter_view_root annotation.
+        accounted.update(
+            int(entry["value_id"])
+            for entry in metadata.get("parameter_member_formals") or ()
+            if entry.get("parameter") in (metadata.get("authored_parameters") or ())
+            and entry.get("path")
+            and all(isinstance(index, int) and index >= 0 for index in entry["path"])
+        )
         # A schema-expanded record parameter has no independent source-level
         # name per physical field.  Its parameter/field receipt is the ABI
         # name, just as ``storage_formals`` is the name of leased workspace.
@@ -103,18 +114,51 @@ def check_formal_parity(module: Any) -> list[Finding]:
         unnamed = [value for value in formals if value not in accounted]
         # Planned regions and generated sequence helpers deliberately have no
         # source parameter names: their complete signature is an internal call
-        # contract.  This check audits drift from an authored function
-        # signature, so only functions which publish at least one source name
-        # are in its domain.
-        if named and unnamed:
+        # contract. An explicit authored signature is auditable even when
+        # empty or when every parameter has expanded into member formals.
+        # Retain the name-based check for older serialized products.
+        if (named or "authored_parameters" in metadata) and unnamed:
             findings.append(Finding(
                 "formal_parity", str(name),
-                f"{len(formals)} formals but only {len(accounted)} named or "
+                f"{len(formals)} formals but only {len(set(formals) & accounted)} named or "
                 "ABI-accounted; "
                 f"unnamed value ids {unnamed} -- no caller can know what to "
                 "pass. If one is also in a region's output_ids, this is the "
                 "formal/region-output collision.",
             ))
+    return findings
+
+
+def check_optional_merges(module: Any) -> list[Finding]:
+    """Reject scalar-shaped Phi conventions for a value-or-None union.
+
+    NoneValue is absence, not numeric zero or a tensor address. An optional
+    representation must lower its presence and payload separately before the
+    native boundary; a bare mixed Phi provides neither contract.
+    """
+    findings = []
+    for name, function in _functions(module):
+        instructions = tuple(_instructions(function))
+        absent = {
+            int(instruction.res.id)
+            for instruction in instructions
+            if instruction.res is not None and instruction.op == "NoneValue"
+        }
+        for instruction in instructions:
+            if instruction.op not in {"Phi", "phi"} or instruction.res is None:
+                continue
+            absent_arms = tuple(
+                int(value.id) in absent or str(value.dtype or "").casefold() == "none"
+                for value in instruction.args
+            )
+            if any(absent_arms) and not all(absent_arms):
+                findings.append(Finding(
+                    "optional_merge", str(name),
+                    f"Phi %{instruction.res.id} mixes None and payload values "
+                    f"{tuple(int(value.id) for value in instruction.args)}; "
+                    "native execution requires explicit presence and payload "
+                    "representation, not a scalar/array Phi coercion",
+                ))
     return findings
 
 
@@ -219,7 +263,12 @@ def check_output_contract_agreement(module: Any) -> list[Finding]:
             declared = attributes.get("output_ids")
             if not callee or declared is None:
                 continue
-            outputs = tuple(int(each) for each in declared)
+            # Caller-local projection identities naturally differ between
+            # call sites. Once linking records the callee's physical return
+            # identities, those are the contract that must agree; `output_ids`
+            # remains the fallback for planned regions which publish no Ret.
+            contract_ids = attributes.get("callee_output_ids", declared)
+            outputs = tuple(int(each) for each in contract_ids)
             existing = contracts.setdefault(callee, outputs)
             if existing != outputs:
                 findings.append(Finding(
@@ -374,6 +423,20 @@ def check_definition_dominance(module: Any) -> list[Finding]:
     return findings
 
 
+def check_structural_outputs(module: Any) -> list[Finding]:
+    """Missing source results are failures even when Ret is well formed."""
+    findings = []
+    for conflict in (getattr(module, "metadata", {}) or {}).get("call_result_type_conflicts", ()):
+        findings.append(Finding("call_result_contract", str(conflict["caller"]), str(conflict)))
+    for name, function in _functions(module):
+        metadata = getattr(function, "metadata", {}) or {}
+        for shortfall in metadata.get("structural_output_shortfalls", ()):
+            findings.append(Finding("structural_output", str(name), str(shortfall)))
+        for shortfall in metadata.get("unresolved_required_source_values", ()):
+            findings.append(Finding("required_source_value", str(name), str(shortfall)))
+    return findings
+
+
 def run_all(module: Any) -> list[Finding]:
     """Every decisive check; the candidate reporter is separate on purpose.
 
@@ -384,11 +447,13 @@ def run_all(module: Any) -> list[Finding]:
 
     return [
         *check_formal_parity(module),
+        *check_optional_merges(module),
         *check_dead_storage_formals(module),
         *check_id_scale(module),
         *check_output_contract_agreement(module),
         *check_record_sequence_rows(module),
         *check_definition_dominance(module),
+        *check_structural_outputs(module),
     ]
 
 
@@ -397,7 +462,9 @@ __all__ = [
     "Finding",
     "check_dead_storage_formals",
     "check_definition_dominance",
+    "check_structural_outputs",
     "check_formal_parity",
+    "check_optional_merges",
     "check_id_scale",
     "check_output_contract_agreement",
     "check_record_sequence_rows",

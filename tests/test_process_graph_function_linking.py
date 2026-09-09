@@ -3,24 +3,49 @@ import contextlib
 import io
 import _pickle
 from pathlib import Path
+from types import SimpleNamespace
 
+import networkx as nx
 import sympy
 
 from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
 from src.common.dt_system.dt_scaler import Metrics, coerce_metrics
 from src.compiler.process_graph_function_linking import link_process_graph_functions
 from src.compiler.fortran_c_shell import (
+    _dispatch_region_completion_positions,
     _frame_binding_value_ids,
+    _lower_planned_region_record_projection_captures,
+    _linked_sequence_propagation_kind,
+    _linked_frame_physical_shape,
+    _linked_frame_storage_role,
+    _linked_frame_storage_owner,
     _monotonic_ssa_ids,
+    _preferred_linked_field_candidates,
+    _prune_dead_entry_field_aliases,
+    _prune_unused_callee_formals,
     _rebind_linked_storage_alias,
+    _reconcile_post_aggregate_record_results,
+    _resolve_repeated_aggregate_output_positions,
     _retained_parameter_identity,
+    _static_mapping_capacity_bounds,
     lower_ast_source_to_ssa,
 )
 from src.compiler.symbolic_equation_compiler import compile_sympy_equations
 from src.compiler.ssa_reference_evaluator import SSAReferenceEvaluator
 from src.compiler.ssa_aggregate_abi import is_storage_view
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
-from src.transmogrifier.ssa import SSAValue
+from src.transmogrifier.ssa import (
+    BasicBlock,
+    Function,
+    IRModule,
+    Instr,
+    SSACallRecord,
+    SSARecordDescriptor,
+    SSARecordFieldDescriptor,
+    SSARecordFieldStorage,
+    SSARecordTable,
+    SSAValue,
+)
 
 
 CONTRACT = (
@@ -28,6 +53,420 @@ CONTRACT = (
     / "extraction_contracts"
     / "program_extraction.yaml"
 )
+
+
+def test_duplicate_record_result_position_uses_first_physical_incumbent():
+    resolved, receipts = _resolve_repeated_aggregate_output_positions(
+        (307, 295, 295, 154, 155),
+        {0: 367, 1: 1660, 3: 1661, 4: 1662},
+    )
+
+    assert resolved == {0: 367, 1: 1660, 2: 1660, 3: 1661, 4: 1662}
+    assert receipts == ((
+        2, 295, 1660,
+        "exact_repeated_callee_result_identity",
+        "incumbent_on_equal_priority",
+    ),)
+
+
+def test_frame_owner_uses_optional_program_abi_identity_before_local_id():
+    common = {
+        "program_abi_record": "package.STController",
+        "program_abi_field": "dt_max",
+        "program_abi_storage": "scalar",
+        "program_abi_rank": 0,
+        "program_abi_optional_presence": True,
+    }
+    direct = SSAValue(95, "bool", accounting={
+        **common, "program_abi_parameter": "self",
+    })
+    propagated = SSAValue(1784, "bool", accounting={
+        **common, "program_abi_parameter": "ctrl",
+        "linked_call_frame_storage": "update_dt_max",
+    })
+    payload = SSAValue(1637, "float64", accounting={
+        "program_abi_record": "package.STController",
+        "program_abi_field": "dt_max",
+        "program_abi_storage": "scalar",
+        "program_abi_rank": 0,
+        "program_abi_optional_payload": True,
+    })
+    propagated_payload = SSAValue(1776, "float64", accounting={
+        "program_abi_record": "package.STController",
+        "program_abi_parameter": "ctrl",
+        "program_abi_field": "dt_max",
+        "program_abi_storage": "scalar",
+        "program_abi_rank": 0,
+        "linked_call_frame_storage": "step",
+    })
+
+    direct_owner = _linked_frame_storage_owner(
+        direct, "package.STController.dt_max.__present", "pi_update", 95,
+    )
+    propagated_owner = _linked_frame_storage_owner(
+        propagated, None, "update_dt_max", 37,
+    )
+
+    assert propagated_owner == direct_owner
+    assert _linked_frame_storage_owner(
+        payload, "package.STController.dt_max", "step", 1637,
+    ) != direct_owner
+    assert _linked_frame_storage_role(payload.accounting) == "payload"
+    assert _linked_frame_storage_role(propagated_payload.accounting) == "payload"
+    assert _linked_frame_storage_owner(
+        payload, "package.STController.dt_max", "step", 1637,
+    ) == _linked_frame_storage_owner(
+        propagated_payload, None, "step", 1776,
+    )
+    ordinary = SSAValue(300, "float64", accounting={
+        "program_abi_record": "package.State",
+        "program_abi_field": "values",
+    })
+    # Ordinary fields and aggregate members still require a descriptor or a
+    # callee-local identity; parameter accounting alone is insufficient to
+    # merge distinct object instances.
+    assert _linked_frame_storage_owner(
+        ordinary, None, "first", 300,
+    ) != _linked_frame_storage_owner(
+        ordinary, None, "second", 300,
+    )
+    scalar = SSAValue(301, "float64", accounting={
+        "program_abi_record": "package.STController",
+        "program_abi_field": "acc",
+        "program_abi_storage": "scalar",
+        "program_abi_rank": 0,
+    })
+    stale_singleton = SSAValue(302, "float64", (1,), accounting={
+        **scalar.accounting,
+        "linked_call_frame_storage": "step",
+    })
+    assert _linked_frame_physical_shape(stale_singleton) == ()
+    assert _linked_frame_storage_owner(
+        scalar, "package.STController.acc", "run", 301,
+    ) == _linked_frame_storage_owner(
+        stale_singleton, None, "step", 302,
+    )
+    table_handle = SSAValue(303, "int64", accounting={
+        "program_abi_record": "package.Metrics",
+        "program_abi_field": "error_channels",
+        "program_abi_storage": "keyed",
+        "program_abi_rank": 0,
+    })
+    assert _linked_frame_storage_owner(
+        table_handle, None, "first", 303,
+    ) != _linked_frame_storage_owner(
+        table_handle, None, "second", 303,
+    )
+
+
+def test_linked_field_candidate_priority_retains_equal_incumbent():
+    common = {
+        "program_abi_record": "package.STController",
+        "program_abi_parameter": "controller",
+        "program_abi_field": "dt_max",
+        "program_abi_storage": "scalar",
+        "program_abi_rank": 0,
+    }
+    first_read_only = SSAValue(10, "float64", accounting=dict(common))
+    second_read_only = SSAValue(11, "float64", accounting=dict(common))
+    generated_writable = SSAValue(12, "float64", accounting={
+        **common,
+        "program_abi_field_written": True,
+        "callsite_id": 7,
+    })
+    canonical_writable = SSAValue(13, "float64", accounting={
+        **common,
+        "program_abi_field_written": True,
+    })
+
+    assert _preferred_linked_field_candidates([
+        first_read_only, second_read_only,
+    ]) == [first_read_only]
+    assert _preferred_linked_field_candidates([
+        first_read_only, canonical_writable, generated_writable,
+    ]) == [canonical_writable]
+    first_span = SSAValue(14, "float64", (4,), accounting={
+        **common,
+        "program_abi_storage": "span",
+    })
+    second_span = SSAValue(15, "float64", (4,), accounting={
+        **common,
+        "program_abi_storage": "span",
+        "program_abi_field_written": True,
+    })
+    assert _preferred_linked_field_candidates([
+        first_span, second_span,
+    ]) == [first_span, second_span]
+
+
+def test_dead_entry_field_alias_pruning_preserves_live_and_distinct_storage():
+    common = {
+        "program_abi_record": "package.STController",
+        "program_abi_parameter": "controller",
+        "program_abi_field": "dt_max",
+        "program_abi_storage": "scalar",
+        "program_abi_rank": 0,
+    }
+    canonical = SSAValue(120, "float64", accounting={
+        **common,
+        "program_abi_field_written": True,
+    })
+    dead_generated = SSAValue(386, "float64", accounting={
+        **common,
+        "callsite_id": 43,
+        "linked_call_frame_storage": "run_superstep",
+    })
+    live_generated = SSAValue(435, "float64", accounting={
+        **common,
+        "callsite_id": 228,
+        "linked_call_frame_storage": "run_superstep",
+    })
+    receipt_generated = SSAValue(436, "float64", accounting={
+        **common,
+        "callsite_id": 229,
+        "linked_call_frame_storage": "run_superstep",
+    })
+    distinct_parameter = SSAValue(500, "float64", accounting={
+        **common,
+        "program_abi_parameter": "fallback_controller",
+        "linked_call_frame_storage": "run_superstep",
+    })
+    root = Function("root", [
+        canonical, dead_generated, live_generated, receipt_generated,
+        distinct_parameter,
+    ], {
+        "entry": BasicBlock("entry", [Instr("Ret", [canonical, live_generated], None)]),
+    })
+    receipt = SSACallRecord(
+        "root", 229, None, "callee", "callee",
+        frame_bindings=((1, "caller_storage", 436),),
+        resolution="native_call",
+    )
+
+    assert _prune_dead_entry_field_aliases({"root": root}, {"root": [receipt]}) == 1
+    assert [argument.id for argument in root.args] == [120, 435, 436, 500]
+    assert root.metadata["pruned_dead_entry_field_aliases"] == (386,)
+
+
+def test_post_aggregate_passthrough_rebinds_record_and_following_frame():
+    first = SSAValue(100, "float64")
+    second = SSAValue(101, "float64")
+    producer = Function("producer", [first, second], {
+        "entry": BasicBlock("entry", [Instr("Ret", [first, second], None)]),
+    }, metadata={"record_return_layouts": ((5, (100, 101)),)})
+    actual = SSAValue(1, "float64")
+    stale_first = SSAValue(10, "float64")
+    stale_second = SSAValue(11, "float64")
+    aggregate = SSAValue(12, "ssa.aggregate")
+    produced = Instr("Call", [actual, actual], aggregate, attributes={
+        "callee": "producer",
+        "plan_callsite_id": 7,
+        "result_convention": "ssa.aggregate",
+        "native_result_contract": (
+            (100, "float64", ()), (101, "float64", ()),
+        ),
+        "output_positions": (),
+        "output_ids": (),
+        "aggregate_output_passthrough_bindings": (
+            (0, 10, 100, 1, "exact_callee_output_formal",
+             "incumbent_on_equal_priority"),
+            (1, 11, 101, 1, "exact_callee_output_formal",
+             "incumbent_on_equal_priority"),
+        ),
+    })
+    consumer_left = SSAValue(200, "float64")
+    consumer_right = SSAValue(201, "float64")
+    consumer = Function("consumer", [consumer_left, consumer_right], {
+        "entry": BasicBlock("entry", []),
+    })
+    root = Function("root", [actual, stale_first, stale_second], {
+        "entry": BasicBlock("entry", [produced]),
+    })
+    module = IRModule({
+        "root": root, "producer": producer, "consumer": consumer,
+    })
+    module.record_tables["producer"] = SSARecordTable(records={
+        5: SSARecordDescriptor(5, "Pair", (
+            SSARecordFieldDescriptor(
+                "left", "scalar", storage_identity="Pair.left",
+                value_ids=(100,), dtype="float64",
+            ),
+            SSARecordFieldDescriptor(
+                "right", "scalar", storage_identity="Pair.right",
+                value_ids=(101,), dtype="float64",
+            ),
+        )),
+    })
+    module.record_tables["consumer"] = SSARecordTable(records={
+        6: SSARecordDescriptor(6, "Pair", (
+            SSARecordFieldDescriptor(
+                "left", "scalar", storage_identity="Pair.left",
+                value_ids=(200,), dtype="float64",
+            ),
+            SSARecordFieldDescriptor(
+                "right", "scalar", storage_identity="Pair.right",
+                value_ids=(201,), dtype="float64",
+            ),
+        )),
+    })
+    module.record_tables["root"] = SSARecordTable(records={
+        20: SSARecordDescriptor(20, "Pair", (
+            SSARecordFieldDescriptor(
+                "left", "scalar", storage_identity="Pair.left",
+                value_ids=(10,), dtype="float64",
+            ),
+            SSARecordFieldDescriptor(
+                "right", "scalar", storage_identity="Pair.right",
+                value_ids=(11,), dtype="float64",
+            ),
+        )),
+    })
+    module.call_table["root"] = (
+        SSACallRecord(
+            "root", 7, None, "producer", "producer",
+            result_bindings=((5, 20),), resolution="native_call",
+        ),
+        SSACallRecord(
+            "root", 8, None, "consumer", "consumer",
+            argument_bindings=((20, 6),),
+            frame_bindings=(
+                (200, "caller_storage", 10),
+                (201, "caller_storage", 11),
+            ),
+            resolution="native_call",
+        ),
+    )
+
+    receipts = _reconcile_post_aggregate_record_results(module)
+
+    assert receipts
+    assert [
+        field.value_ids
+        for field in module.record_tables["root"].records[20].fields
+    ] == [(1,), (1,)]
+    assert module.call_table["root"][1].frame_bindings == (
+        (200, "caller_storage", 1),
+        (201, "caller_storage", 1),
+    )
+    assert all(item["tie_policy"] == "incumbent" for item in receipts)
+
+
+def test_atomic_region_uses_its_completion_position_for_field_effect_order():
+    graph = nx.DiGraph()
+    early, middle, late = ast.parse(
+        "first = 1\nsecond = 2\nthird = 3\n"
+    ).body
+    graph.add_node(10, expr_obj=early)
+    graph.add_node(20, expr_obj=middle)
+    graph.add_node(30, expr_obj=late)
+    spanning = nx.DiGraph()
+    spanning.graph["deployment_nodes"] = (10, 30)
+    middle_only = nx.DiGraph()
+    middle_only.graph["deployment_nodes"] = (20,)
+
+    positions = _dispatch_region_completion_positions(
+        graph,
+        (SimpleNamespace(G=spanning), SimpleNamespace(G=middle_only)),
+    )
+
+    assert positions[0][:2] == (3, 0)
+    assert positions[1][:2] == (2, 0)
+    assert positions[1] < positions[0]
+
+
+def test_planned_region_captures_proven_incumbent_record_scalar_once():
+    owner_name = "controller"
+    region_name = "controller__planned_region_0"
+    dt = SSAValue(9, dtype="float64")
+    record = SSAValue(7, dtype="ssa.aggregate")
+    clamp_events = SSAValue(124, dtype="int64")
+    call_result = SSAValue(680, dtype="ssa.aggregate")
+    call = Instr(
+        "Call", [dt, record], call_result,
+        attributes={
+            "callee": region_name,
+            "feed_ids": (9, 7),
+            "feed_shapes": ((), ()),
+            "feed_dtypes": ("float64", "ssa.aggregate"),
+            "output_ids": (43, 311, 312),
+            "result_convention": "ssa.aggregate",
+        },
+    )
+    owner = Function(
+        owner_name,
+        [dt, record, clamp_events],
+        {"entry": BasicBlock("entry", [call])},
+        metadata={"value_aliases": {311: 124, 312: 124}},
+    )
+
+    region_dt = SSAValue(9, dtype="float64")
+    region_record = SSAValue(7, dtype="ssa.aggregate")
+    converted_dt = SSAValue(43, dtype="float64")
+    first_projection = SSAValue(311, dtype="int64")
+    second_projection = SSAValue(312, dtype="int64")
+    region = Function(
+        region_name,
+        [region_dt, region_record],
+        {"entry": BasicBlock("entry", [
+            Instr("Cast", [region_dt], converted_dt),
+            Instr(
+                "getattr", [region_record], first_projection,
+                attributes={
+                    "attribute": "clamp_events",
+                    "initial_record_field_state": True,
+                },
+            ),
+            Instr(
+                "getattr", [region_record], second_projection,
+                attributes={
+                    "attribute": "clamp_events",
+                    "initial_record_field_state": True,
+                },
+            ),
+            Instr("Ret", [converted_dt, first_projection, second_projection], None),
+        ])},
+        metadata={"source_region_integral": {
+            "owner": owner_name,
+            "capture_value_ids": (9, 7),
+            "output_value_ids": (43, 311, 312),
+        }},
+    )
+    records = SSARecordTable()
+    records.register(SSARecordDescriptor(
+        7,
+        "STController",
+        fields=(SSARecordFieldDescriptor(
+            "clamp_events",
+            SSARecordFieldStorage.SCALAR,
+            storage_identity="STController.clamp_events",
+            value_ids=(124, 328, 126),
+            dtype="int64",
+        ),),
+    ))
+    functions = {owner_name: owner, region_name: region}
+
+    assert _lower_planned_region_record_projection_captures(
+        functions, {owner_name: records},
+    ) == 2
+    assert [value.id for value in region.args] == [9, 7, 124]
+    assert [value.id for value in call.args] == [9, 7, 124]
+    projections = region.blocks["entry"].instrs[1:3]
+    assert [instruction.op for instruction in projections] == ["Cast", "Cast"]
+    assert [instruction.args[0].id for instruction in projections] == [124, 124]
+    assert region.metadata["source_region_integral"]["capture_value_ids"] == (
+        9, 124,
+    )
+    assert region.metadata["lowered_record_projection_captures"] == (
+        (311, "clamp_events", 7, 124),
+        (312, "clamp_events", 7, 124),
+    )
+
+    assert _prune_unused_callee_formals(functions) == 1
+    assert [value.id for value in region.args] == [9, 124]
+    assert [value.id for value in call.args] == [9, 124]
+    assert call.attributes["feed_ids"] == (9, 124)
+    assert call.attributes["feed_shapes"] == ((), ())
+    assert call.attributes["feed_dtypes"] == ("float64", "int64")
 
 
 def _pursued_tail_retry(value):
@@ -357,6 +796,35 @@ def test_record_field_assignment_is_a_real_inout_value():
     )
 
 
+def test_write_only_scalar_record_field_materializes_its_exact_value():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def update(state, value):\n"
+        "    state.last_wave_speed = (value * value).sqrt()\n"
+        "    return value\n\n"
+        "def root(state, value):\n"
+        "    return update(state, value)\n",
+        "root",
+        name="write_only_record_field_inout",
+        extraction_contract=CONTRACT,
+    )
+
+    update = module.functions["write_only_record_field_inout__update"]
+    record = next(
+        item for item in module.record_tables[update.name].records.values()
+        if item.identity.endswith(".SymbolicFluidGridState")
+    )
+    field = next(
+        item for item in record.fields if item.name == "last_wave_speed"
+    )
+    formal = next(
+        argument for argument in update.args
+        if int(argument.id) in set(map(int, field.value_ids))
+    )
+    assert field.writable is True
+    assert formal.accounting["program_abi_field_written"] is True
+    assert formal.accounting["program_abi_field"] == "last_wave_speed"
+
+
 def test_consecutive_scalar_record_writes_share_the_parameter_owner():
     module, _outputs, _exports = lower_ast_source_to_ssa(
         "def update(state, value):\n"
@@ -457,6 +925,275 @@ def test_callsite_specializes_generic_state_parameter_to_caller_record():
     ]
     assert len(metric_arguments) == 1
     assert int(metric_arguments[0].id) == int(field.value_ids[0])
+
+
+def test_optional_record_field_materializes_presence_and_payload_slots(tmp_path):
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {
+                "Limits": {
+                    "identity": "tests.Limits",
+                    "fields": {
+                        "floor": {
+                            "storage": "scalar",
+                            "dtype": "float64",
+                            "optional": True,
+                        },
+                    },
+                },
+            },
+            "bindings": [{
+                "function": "root",
+                "parameter": "limits",
+                "record": "Limits",
+            }],
+            "values": [],
+        })
+    )
+    resolved = []
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def root(limits):\n"
+        "    if limits.floor is None:\n"
+        "        return 1.0\n"
+        "    return limits.floor\n",
+        "root",
+        name="optional_record_boundary",
+        extraction_contract=contract,
+        resolved_process_graph_sink=resolved.append,
+    )
+
+    from src.compiler.process_graph_value_ids import next_process_value_id
+
+    resolved_root = next(
+        entry.graph
+        for entry in resolved[0].function_table
+        if entry.name == "root"
+    )
+    reserved_id = next_process_value_id(resolved_root)
+    assert reserved_id not in resolved_root.G
+
+    root = module.functions["optional_record_boundary__root"]
+    payloads = [
+        argument for argument in root.args
+        if (argument.accounting or {}).get("program_abi_optional_payload")
+    ]
+    presences = [
+        argument for argument in root.args
+        if (argument.accounting or {}).get("program_abi_optional_presence")
+    ]
+    assert len(payloads) == len(presences) == 1
+    assert payloads[0].dtype == "float64"
+    assert presences[0].dtype == "bool"
+    assert presences[0].accounting["physical_dtype"] == "bool"
+    assert presences[0].accounting["physical_dtype_provenance"] == (
+        "program_abi_optional_presence"
+    )
+    assert presences[0].accounting["physical_dtype_tie_policy"] == "incumbent"
+    record = next(
+        descriptor
+        for descriptor in module.record_tables[root.name].records.values()
+        if descriptor.identity == "tests.Limits"
+    )
+    fields = {field.name: field for field in record.fields}
+    assert fields["floor"].value_ids == (payloads[0].id,)
+    assert fields["floor.__present"].value_ids == (presences[0].id,)
+
+    from types import SimpleNamespace
+    import numpy as np
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.vehicle_python_compilation import (
+        VehiclePythonSSALowering,
+        _managed_native_feeds_by_id,
+    )
+
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "optional_record_boundary", optimization="O0")
+    lowered = VehiclePythonSSALowering(module, root.name, outputs, exports)
+    result_id = outputs[root.name][0].id
+    for value, expected in ((None, 1.0), (0.0, 0.0), (2.5, 2.5)):
+        feeds = _managed_native_feeds_by_id(
+            lowered, {"limits": SimpleNamespace(floor=value)},
+        )
+        execution = artifact.prepare_execution(feeds).run()
+        assert np.asarray(execution.buffers[result_id]).item() == expected
+
+
+def test_missing_aggregate_leaf_repair_is_exact_and_idempotent():
+    from src.compiler.glsl_deployment_strategy import (
+        _repair_missing_aggregate_leaf_projections,
+    )
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.add_node(
+        0,
+        type="Call",
+        op="call",
+        value_id=0,
+        parents=[],
+        children=[],
+        attributes={
+            "producer_kind": "aggregate",
+            "aggregate_kind": "tuple",
+            "aggregate_leaf_value_ids": (4, 6),
+            "tensor_output_descriptors": (
+                {"shape": (), "dtype": "float64"},
+                {"shape": (), "dtype": "bool"},
+            ),
+        },
+    )
+
+    assert _repair_missing_aggregate_leaf_projections(graph) == 2
+    leaves = tuple(
+        graph.G.nodes[0]["attributes"]["aggregate_leaf_value_ids"]
+    )
+    assert len(leaves) == 2
+    assert all(leaf in graph.G for leaf in leaves)
+    assert [graph.G.nodes[leaf]["tensor"]["dtype"] for leaf in leaves] == [
+        "float64", "bool",
+    ]
+    receipt = graph.G.nodes[0]["attributes"][
+        "aggregate_leaf_republication"
+    ]
+    assert receipt["replacements"] == ((4, leaves[0]), (6, leaves[1]))
+    assert receipt["tie_policy"] == "incumbent"
+    assert _repair_missing_aggregate_leaf_projections(graph) == 0
+    assert tuple(
+        graph.G.nodes[0]["attributes"]["aggregate_leaf_value_ids"]
+    ) == leaves
+
+
+def test_mutable_optional_record_write_marks_presence_before_later_test(tmp_path):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.vehicle_python_compilation import (
+        VehiclePythonSSALowering,
+        _managed_native_feeds_by_id,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {
+                "State": {
+                    "identity": "tests.State",
+                    "fields": {
+                        "limit": {
+                            "storage": "scalar",
+                            "dtype": "float64",
+                            "optional": True,
+                            "mutable": True,
+                        },
+                    },
+                },
+            },
+            "bindings": [{
+                "function": "root",
+                "parameter": "state",
+                "record": "State",
+            }],
+            "values": [{
+                "function": "root",
+                "parameter": "value",
+                "storage": "scalar",
+                "dtype": "float64",
+                "rank": 0,
+                "python_type": "builtins.float",
+            }],
+        })
+    )
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def root(state, value):\n"
+        "    state.limit = value\n"
+        "    if state.limit is not None:\n"
+        "        return state.limit\n"
+        "    return -1.0\n",
+        "root",
+        name="mutable_optional_record_boundary",
+        extraction_contract=contract,
+    )
+
+    root = module.functions["mutable_optional_record_boundary__root"]
+    presence_writes = [
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("optional_presence_write")
+    ]
+    assert any(instruction.op == "Const" for instruction in presence_writes)
+    assert any(instruction.op == "Store" for instruction in presence_writes)
+    presence_arguments = [
+        argument
+        for argument in root.args
+        if (argument.accounting or {}).get(
+            "program_abi_optional_presence"
+        )
+    ]
+    assert len(presence_arguments) == 1
+    assert presence_arguments[0].accounting["physical_dtype"] == "bool"
+    assert all(
+        instruction.res is None
+        or instruction.res is presence_arguments[0]
+        or int(instruction.res.id) != int(presence_arguments[0].id)
+        for block in root.blocks.values()
+        for instruction in block.instrs
+    )
+    assert root.metadata["optional_program_abi_materializations"] == ({
+        "parameter": "state",
+        "field": "limit",
+        "payload_value_ids": tuple(
+            argument.id
+            for argument in root.args
+            if (argument.accounting or {}).get(
+                "program_abi_optional_payload"
+            )
+        ),
+        "requested_presence_value_ids": tuple(
+            argument.id
+            for argument in root.args
+            if (argument.accounting or {}).get(
+                "program_abi_optional_presence"
+            )
+        ),
+        "presence_value_ids": tuple(
+            argument.id
+            for argument in root.args
+            if (argument.accounting or {}).get(
+                "program_abi_optional_presence"
+            )
+        ),
+        "mutable": True,
+        "field_written": True,
+        "presence_write_count": 1,
+    },)
+
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(
+        tmp_path / "mutable_optional_record_boundary",
+        optimization="O0",
+    )
+    lowered = VehiclePythonSSALowering(module, root.name, outputs, exports)
+    result_id = outputs[root.name][0].id
+    for initial, assigned in ((None, 2.5), (0.0, 3.5)):
+        feeds = _managed_native_feeds_by_id(lowered, {
+            "state": SimpleNamespace(limit=initial),
+            "value": assigned,
+        })
+        execution = artifact.prepare_execution(feeds).run()
+        assert np.asarray(execution.buffers[result_id]).item() == assigned
 
 
 def test_loop_carried_record_callback_writes_caller_field_storage():
@@ -717,7 +1454,7 @@ def test_linked_record_result_expands_as_typed_sequence_row():
         "mass_err=value, osc_flag=value, stiff_flag=value, sim_frame=value, "
         "proc_ms=value, dt_limit=value, "
         "error_channels={'residual': value}, hard_failure=value, "
-        "advanced_dt=value)\n\n"
+        "advanced_dt=value, unresolved_report=[])\n\n"
         "def root(value):\n"
         "    rows: list[Metrics] = []\n"
         "    metrics = make(value)\n"
@@ -735,12 +1472,75 @@ def test_linked_record_result_expands_as_typed_sequence_row():
         instruction
         for block in root.blocks.values()
         for instruction in block.instrs
-        if instruction.attributes.get("ssa_sequence_operation") == "append"
+        if instruction.attributes.get("ssa_sequence_operation")
+        == "append_child_copy"
     )
-    assert len(append.args) == len(module.functions["ssa_sequence_1_append"].args)
-    assert len(append.args) == 30
+    helper = module.functions[append.attributes["callee"]]
+    assert len(append.args) == len(helper.args)
+    assert append.attributes["ssa_sequence_operation"] == "append_child_copy"
+    destination = module.sequence_tables[root.name].by_id(1)
+    assert destination.child_table_pool is not None
+    assert destination.child_table_pool.handle_column == 14
     assert "ssa_deferred_record_row" not in append.attributes
     assert append.attributes["ssa_record_row_identity"] == "Metrics"
+
+
+def test_linked_returned_record_mapping_keeps_authored_capacity():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def make(value):\n"
+        "    return Metrics(max_vel=value, max_flux=value, div_inf=value, "
+        "mass_err=value, osc_flag=value, stiff_flag=value, sim_frame=value, "
+        "proc_ms=value, dt_limit=value, "
+        "error_channels={'residual': value}, "
+        "hard_failure=value, advanced_dt=value, unresolved_report=[])\n\n"
+        "def root(value):\n"
+        "    metrics = make(value)\n"
+        "    return metrics.error_channels.get('residual', 0.0)\n",
+        "root",
+        name="linked_returned_mapping_capacity",
+        python_bindings={"Metrics": Metrics},
+        extraction_contract=CONTRACT,
+    )
+
+    make = module.functions["linked_returned_mapping_capacity__make"]
+    root = module.functions["linked_returned_mapping_capacity__root"]
+    make_bounds = dict(make.metadata["static_mapping_capacity_bounds"])
+    assert 1 in make_bounds.values()
+
+    assert module.sequence_tables[root.name].sequences
+
+
+def test_exact_returned_record_sequence_is_propagation_source():
+    columns = tuple(
+        SSAValue(index, accounting={
+            "program_abi_record": "Metrics",
+            "program_abi_field": f"error_channels.{part}",
+            "returned_record_storage": "advance",
+        })
+        for index, part in enumerate(("keys", "values"), start=1)
+    )
+    assert _linked_sequence_propagation_kind(columns) == (
+        "exact_returned_record_storage"
+    )
+    assert _linked_sequence_propagation_kind((SSAValue(3),)) is None
+
+
+def test_record_packaging_call_preserves_exact_mapping_capacity():
+    graph = nx.DiGraph()
+    mapping = ast.parse("{'first': 1.0, 'second': 2.0, 'third': 3.0}").body[
+        0
+    ].value
+    call = ast.parse("Metrics(error_channels=channels)").body[0].value
+    graph.add_node(1, type="Aggregate", op="aggregate", expr_obj=mapping)
+    graph.add_node(
+        2, type="Call", op="call", expr_obj=call,
+        parents=((1, "kw:error_channels"),),
+    )
+
+    assert _static_mapping_capacity_bounds(graph) == {}
+    assert _static_mapping_capacity_bounds(
+        graph, nonmutating_call_ids=(2,),
+    ) == {1: 3}
 
 
 def test_record_return_call_refreshes_completed_physical_field_surface():
@@ -895,6 +1695,36 @@ def test_late_record_result_rebinds_aliased_fields_in_following_call_frame():
     assert physical[fields["max_vel"].value_ids[0]] == physical[
         fields["max_flux"].value_ids[0]
     ]
+    linked_read = next(
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("callee") == read.name
+    )
+    max_vel_position = next(
+        position
+        for position, argument in enumerate(read.args)
+        if (argument.accounting or {}).get("program_abi_field") == "max_vel"
+    )
+    max_flux_position = next(
+        position
+        for position, argument in enumerate(read.args)
+        if (argument.accounting or {}).get("program_abi_field") == "max_flux"
+    )
+    assert linked_read.args[max_vel_position].id == physical[
+        fields["max_vel"].value_ids[0]
+    ]
+    assert linked_read.args[max_flux_position].id == physical[
+        fields["max_flux"].value_ids[0]
+    ]
+    assert linked_read.attributes["post_aggregate_frame_reconciled"]
+    descriptor_receipts = root.metadata[
+        "returned_record_descriptor_reconciliations"
+    ]
+    assert descriptor_receipts[0][-2:] == (
+        "exact_aggregate_position", "incumbent_on_equal_priority",
+    )
     aliases = set(map(int, root.metadata.get("value_aliases", {})))
     assert not any(
         int(argument.id) in aliases
@@ -1091,10 +1921,15 @@ def test_keyed_mapping_lowers_to_token_and_value_vectors():
     # The key vector is token identities, never the words themselves.
     assert slots["error_channels.keys"].dtype == "int64"
     assert slots["error_channels.values"].dtype == "float64"
+    assert slots["error_channels.length"].accounting["physical_dtype"] == "int64"
+    assert slots["error_channels.keys"].accounting["physical_dtype"] == "int64"
+    assert slots["error_channels.values"].accounting["physical_dtype"] == "float64"
     for name in ("error_channels.keys", "error_channels.values"):
         accounting = slots[name].accounting or {}
         assert accounting["program_abi_storage"] == "span"
         assert int(accounting["program_abi_rank"]) == 1
+        assert accounting["physical_dtype_provenance"] == "program_abi_keyed_member"
+        assert accounting["physical_dtype_tie_policy"] == "incumbent"
 
     record = module.record_tables[root.name].records[
         next(iter(module.record_tables[root.name].records))
@@ -1323,6 +2158,66 @@ def test_mapping_iteration_walks_its_own_key_and_value_vectors():
     )
 
 
+def test_defensive_mapping_items_reuse_declared_slots_and_key_tokens():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(metrics):\n"
+        "    return {\n"
+        "        str(name): channel\n"
+        "        for name, channel in (metrics.error_channels or {}).items()\n"
+        "    }\n",
+        "root",
+        name="defensive_mapping_iteration",
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["defensive_mapping_iteration__root"]
+    slots = {
+        (value.accounting or {}).get("program_abi_keyed_part"): int(value.id)
+        for value in root.args
+        if (value.accounting or {}).get("program_abi_keyed_owner")
+        == "error_channels"
+    }
+    instructions = [
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+    ]
+    projected = {
+        int(instruction.attributes["projection"]): (
+            int(instruction.args[0].id), int(instruction.res.id)
+        )
+        for instruction in instructions
+        if instruction.op == "GetElementPtr"
+        and instruction.attributes.get("binding") == "projected_iterable"
+    }
+    store = next(
+        instruction for instruction in instructions
+        if instruction.attributes.get("ssa_sequence_operation")
+        == "table_store"
+    )
+
+    assert projected[0][0] == slots["keys"]
+    assert projected[1][0] == slots["values"]
+    key_load = next(
+        instruction for instruction in instructions
+        if instruction.op == "Load"
+        and int(instruction.args[0].id) == projected[0][1]
+    )
+    assert int(store.args[-2].id) == int(key_load.res.id)
+    assert not any(
+        (value.accounting or {}).get("projected_row_source_id") is not None
+        for value in root.args
+    )
+    assert any(
+        receipt[-1] == "declared_keyed_mapping_iterable"
+        for receipt in root.metadata["keyed_iterable_identity_receipts"]
+    )
+    assert any(
+        receipt[-1] == "string_token_str_identity"
+        for receipt in root.metadata["keyed_iterable_identity_receipts"]
+    )
+
+
 def test_comprehension_element_is_evaluated_inside_its_own_loop():
     """A generator's element expression is loop-owned work, not a prologue.
 
@@ -1489,6 +2384,91 @@ def test_declared_mapping_or_default_keeps_the_mapping():
     assert selection[0].res.dtype != "bool"
 
 
+def test_declared_mapping_or_empty_get_uses_resident_lookup_with_default():
+    module, outputs, _exports = lower_ast_source_to_ssa(
+        "def root(metrics):\n"
+        "    return float((metrics.error_channels or {}).get(\n"
+        "        'dt_unresolved', 0.0\n"
+        "    ))\n",
+        "root",
+        name="reference_default_get",
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["reference_default_get__root"]
+    lookups = [
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation") == "lookup"
+    ]
+    assert outputs[root.name]
+    assert len(lookups) == 1
+    assert str(lookups[0].attributes.get("callee")).endswith(
+        "_lookup_or_default"
+    )
+    helper = module.functions[str(lookups[0].attributes["callee"])]
+    assert helper.args[0].accounting["physical_dtype"] == "int64"
+    key_loads = [
+        instruction
+        for block in helper.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Load"
+        and instruction.res is not None
+        and instruction.res.dtype == "int64"
+    ]
+    assert key_loads
+    assert any(
+        instruction.op == "Const"
+        and instruction.attributes.get("value") == 0.0
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+    assert not root.metadata.get("structural_output_shortfalls")
+    assert not root.metadata.get("unresolved_call_diagnostics")
+
+
+def test_declared_mapping_lookup_owned_only_by_source_call_is_materialized():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def scalar(value):\n"
+        "    return value\n\n"
+        "def root(metrics):\n"
+        "    channels = metrics.error_channels or {}\n"
+        "    return scalar(channels['power_w'])\n",
+        "root",
+        name="reference_call_lookup",
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["reference_call_lookup__root"]
+    lookups = [
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation") == "lookup"
+    ]
+    assert len(lookups) == 1
+    lookup = lookups[0]
+    assert lookup.attributes["ssa_lookup_ownership"] == "source_call"
+    assert lookup.attributes["ssa_lookup_owner_ids"]
+    assert lookup.res.id not in {argument.id for argument in root.args}
+    assert (
+        lookup.res.id,
+        "source_call",
+        lookup.attributes["ssa_lookup_owner_ids"],
+    ) in root.metadata["table_lookup_ownership_receipts"]
+    assert any(
+        instruction.op == "Call"
+        and instruction.attributes.get("callee")
+        == "reference_call_lookup__scalar"
+        and lookup.res.id in {argument.id for argument in instruction.args}
+        for block in root.blocks.values()
+        for instruction in block.instrs
+    )
+
+
 def test_record_field_storage_identity_crosses_the_call_frame():
     """A declared span keeps its field identity into every callee it reaches.
 
@@ -1532,6 +2512,29 @@ def test_record_field_storage_identity_crosses_the_call_frame():
         # call time, so naming symbolic axes there would corrupt every buffer
         # size derived from it.
         assert tuple(value.shape or ()) == (), name
+
+
+def test_distinct_record_fields_do_not_label_one_generic_callee_formal():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def inner(grid, i, j):\n"
+        "    return grid[i][j]\n\n"
+        "def root(state, i, j):\n"
+        "    return (inner(state.height, i, j)\n"
+        "            + inner(state.momentum_x, i, j))\n",
+        "root",
+        name="ambiguous_span_cross",
+        extraction_contract=CONTRACT,
+    )
+
+    inner = module.functions["ambiguous_span_cross__inner"]
+    field_formals = [
+        value for value in inner.args
+        if (value.accounting or {}).get("program_abi_field") is not None
+    ]
+    assert field_formals == []
+    assert inner.args[0].dtype == "float64"
+    assert (inner.args[0].accounting or {})["program_abi_storage"] == "span"
+    assert int((inner.args[0].accounting or {})["program_abi_rank"]) == 2
 
 
 def test_exact_record_span_shape_reaches_callee_before_region_lowering():
@@ -1692,6 +2695,15 @@ def test_indexed_record_field_write_keeps_one_resident_call_frame():
     ]
     assert len(indexed_assigns) == 1
     assert indexed_assigns[0].args[0].id == resident.id
+    value_count = indexed_assigns[0].args[-1]
+    value_count_definition = next(
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is value_count
+    )
+    assert value_count_definition.attributes["constant"] == 1
     store_region = next(
         function.name
         for function in module.functions.values()
@@ -1970,6 +2982,66 @@ def test_returned_record_fields_feed_structural_call_argument():
     assert any(
         instruction.op == "LOr"
         and instruction.attributes.get("call_feed") is True
+        for block in root.blocks.values()
+        for instruction in block.instrs
+    )
+    boolop = next(
+        instruction.res
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "LOr"
+        and instruction.attributes.get("call_feed") is True
+    )
+    assert boolop is not None
+    assert boolop.id not in {argument.id for argument in root.args}
+
+
+def test_late_returned_record_with_sequence_publishes_scalar_field_to_caller():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def leaf(value):\n"
+        "    return Metrics(max_vel=value, max_flux=value, div_inf=value, "
+        "mass_err=value, hard_failure=value > 0.0, "
+        "unresolved_report=[])\n\n"
+        "def middle(value):\n"
+        "    metrics = leaf(value)\n"
+        "    return value, metrics\n\n"
+        "def root(value):\n"
+        "    advanced, metrics = middle(value)\n"
+        "    return advanced + float(metrics.hard_failure)\n",
+        "root",
+        name="late_sequence_record_result",
+        python_bindings={"Metrics": Metrics},
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["late_sequence_record_result__root"]
+    call_record = next(iter(module.call_table[root.name]))
+    returned_id = int(call_record.result_bindings[1][1])
+    returned = module.record_tables[root.name].records[returned_id]
+    fields = {field.name: field for field in returned.fields}
+
+    assert root.metadata["late_returned_record_materializations"] == [(
+        int(call_record.callsite_id),
+        int(call_record.result_bindings[1][0]),
+        returned_id,
+    )]
+    assert fields["unresolved_report"].sequence_id is not None
+    hard_failure_id = int(fields["hard_failure"].value_ids[0])
+    assert hard_failure_id not in {
+        int(argument.id)
+        for argument in root.args
+        if not (argument.accounting or {})
+    }
+    assert any(
+        instruction.op == "Call"
+        and instruction.attributes.get("region_index") == 1
+        and any(
+            int(value.id) == hard_failure_id
+            or int((value.accounting or {}).get(
+                "call_input_conversion", (None, -1)
+            )[1]) == hard_failure_id
+            for value in instruction.args
+        )
         for block in root.blocks.values()
         for instruction in block.instrs
     )

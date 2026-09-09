@@ -20,6 +20,7 @@ import gc
 import hashlib
 import operator
 import os
+import re
 import sys
 import time
 import traceback
@@ -2390,7 +2391,9 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     collect_caller_projections(projection_path, int(successor))
 
             collect_caller_projections((), int(node_id))
-            if tuple(child_output_paths) == ((0,),):
+            if tuple(child_output_paths) == ((0,),) and not (
+                graph.G.nodes[int(node_id)].get("attributes") or {}
+            ).get("authored_return_container"):
                 result_bindings = (
                     (child_output_paths[(0,)], int(node_id)),
                 )
@@ -6344,6 +6347,10 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
 
 def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
     data = graph.G.nodes[node_id]
+    if (data.get("attributes") or {}).get("bound_method_ref") is not None:
+        return True
+    if (data.get("attributes") or {}).get("conditional_result_of") is not None:
+        return True
     node_type = str(data.get("type"))
     expression = data.get("expr_obj")
     parents = tuple(data.get("parents") or ())
@@ -6386,13 +6393,31 @@ def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
         )
     )
     non_numeric_constant_operand = False
-    for parent, _role in parents:
+    def basic_index_literal(value):
+        if value is None or isinstance(value, int):
+            return True
+        if isinstance(value, slice):
+            return all(part is None or isinstance(part, int)
+                       for part in (value.start, value.stop, value.step))
+        if isinstance(value, tuple):
+            return all(basic_index_literal(part) for part in value)
+        return False
+
+    for parent, role in parents:
         if parent not in graph.G:
             continue
         parent_data = graph.G.nodes[parent]
         if str(parent_data.get("type")) not in {
             "Const", "const", "Constant",
         }:
+            continue
+        # A slice tuple is index metadata for a numerical load/store, not
+        # a non-numeric data operand that makes the operation coordinator-only.
+        if (
+            node_type in {"Indexed", "IndexedStore"}
+            and str(role) == "index"
+            and basic_index_literal(_constant_value(parent_data))
+        ):
             continue
         try:
             flatten_tensor_constant(parent_data.get("constant"))
@@ -6981,17 +7006,20 @@ def _dispatch_subgraph(
     return subgraph
 
 
-def _ast_source_signature(expression: ast.AST) -> tuple[Any, ...]:
-    """Stable authored-occurrence key for reduced/copied AST nodes."""
-
+def _ast_source_location(expression: ast.AST) -> tuple[Any, ...]:
     return (
         type(expression),
         getattr(expression, "lineno", None),
         getattr(expression, "col_offset", None),
         getattr(expression, "end_lineno", None),
         getattr(expression, "end_col_offset", None),
-        ast.dump(expression, include_attributes=False),
     )
+
+
+def _ast_source_signature(expression: ast.AST) -> tuple[Any, ...]:
+    """Stable authored-occurrence key for reduced/copied AST nodes."""
+
+    return (*_ast_source_location(expression), ast.dump(expression, include_attributes=False))
 
 
 def _retain_source_control_records(graph_obj: Any) -> None:
@@ -7063,26 +7091,29 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
             ),
         }
     controls = dict(graph_obj.graph.get("source_control_records") or {})
+    effect_signatures = {
+        int(effect_id): _ast_source_signature(record["expression"])
+        for effect_id, record in records.items()
+        if isinstance(record.get("expression"), ast.AST)
+    }
+    effect_locations = {signature[:-1] for signature in effect_signatures.values()}
+    memberships_by_signature = {}
+    for control_id, control_record in controls.items():
+        conditional = control_record.get("expression")
+        if not isinstance(conditional, ast.If):
+            continue
+        for arm, statements in (("body", conditional.body), ("orelse", conditional.orelse)):
+            for statement in statements:
+                for member in ast.walk(statement):
+                    if _ast_source_location(member) in effect_locations:
+                        memberships_by_signature.setdefault(_ast_source_signature(member), []).append(
+                            (int(control_id), arm))
     for effect_id, record in records.items():
         expression = record.get("expression")
         if not isinstance(expression, ast.AST):
             continue
-        effect_signature = _ast_source_signature(expression)
-        memberships = []
-        for control_id, control_record in controls.items():
-            conditional = control_record.get("expression")
-            if not isinstance(conditional, ast.If):
-                continue
-            for arm, statements in (
-                ("body", conditional.body),
-                ("orelse", conditional.orelse),
-            ):
-                if any(
-                    _ast_source_signature(member) == effect_signature
-                    for statement in statements
-                    for member in ast.walk(statement)
-                ):
-                    memberships.append((int(control_id), arm))
+        effect_signature = effect_signatures[int(effect_id)]
+        memberships = memberships_by_signature.get(effect_signature, ())
         record["branch_memberships"] = tuple(dict.fromkeys(memberships))
     if records:
         graph_obj.graph["source_sequence_mutation_records"] = records
@@ -7145,6 +7176,95 @@ def _retained_control_value_id(
     return None
 
 
+def _optional_presence_control_expression(
+    graph_obj: Any,
+    expression: ast.AST | None,
+) -> ControlExpression | None:
+    """Recover an erased ``optional_record_field is [not] None`` test.
+
+    ProgramABI splits an optional scalar field into a typed payload and an
+    explicit Boolean presence slot. Structural folding can remove the Python
+    ``None`` comparison after the effective local name has become the field
+    payload. The payload's existence is not proof that the value is present:
+    absent values deliberately retain a typed filler. Recover only the exact
+    one-name, one-field, one-presence-slot relation and leave every ambiguous
+    case to the incumbent unresolved behavior.
+    """
+
+    if not (
+        isinstance(expression, ast.Compare)
+        and len(expression.ops) == 1
+        and isinstance(expression.ops[0], (ast.Is, ast.IsNot))
+        and len(expression.comparators) == 1
+        and isinstance(expression.comparators[0], ast.Constant)
+        and expression.comparators[0].value is None
+        and isinstance(expression.left, ast.Name)
+    ):
+        return None
+    histories = graph_obj.graph.get("identity_table") or {}
+    payload_ids = tuple(dict.fromkeys(
+        int(value_id)
+        for value_id in histories.get(expression.left.id, ())
+        if int(value_id) in graph_obj
+    ))
+    if len(payload_ids) != 1:
+        return None
+    payload_id = payload_ids[0]
+    payload = graph_obj.nodes[payload_id]
+    if str(payload.get("type") or payload.get("op") or "").casefold() != "getattr":
+        return None
+    field = (payload.get("attributes") or {}).get("attribute")
+    receiver_ids = tuple(dict.fromkeys(
+        int(parent)
+        for parent, role in payload.get("parents") or ()
+        if str(role) in {"value", "object", "base", "receiver"}
+        and int(parent) in graph_obj
+    ))
+    if field is None or len(receiver_ids) != 1:
+        return None
+    receiver = graph_obj.nodes[receiver_ids[0]]
+    parameter = (receiver.get("attributes") or {}).get("binding_name")
+    if parameter is None:
+        return None
+    presence = tuple(
+        (int(node_id), attributes)
+        for node_id, data in graph_obj.nodes(data=True)
+        for attributes in (data.get("attributes") or {},)
+        if attributes.get("program_abi_optional_presence")
+        and str(attributes.get("program_abi_parameter")) == str(parameter)
+        and str(attributes.get("program_abi_field")) == str(field)
+    )
+    if len(presence) != 1:
+        return None
+    presence_id, attributes = presence[0]
+    present_when = bool(attributes.get(
+        "program_abi_optional_present_when", True,
+    ))
+    is_not_none = isinstance(expression.ops[0], ast.IsNot)
+    direct = present_when == is_not_none
+    predicate = ControlExpression("value", value_id=presence_id)
+    if not direct:
+        predicate = ControlExpression("not", (predicate,), value_id=presence_id)
+    receipt = {
+        "name": str(expression.left.id),
+        "payload_value_id": int(payload_id),
+        "presence_value_id": int(presence_id),
+        "parameter": str(parameter),
+        "field": str(field),
+        "comparison": "is_not_none" if is_not_none else "is_none",
+        "predicate": "presence" if direct else "not_presence",
+        "priority": "exact_program_abi_optional_presence",
+        "tie_policy": "incumbent",
+    }
+    receipts = list(graph_obj.graph.get(
+        "optional_presence_control_receipts", ()
+    ))
+    if receipt not in receipts:
+        receipts.append(receipt)
+        graph_obj.graph["optional_presence_control_receipts"] = tuple(receipts)
+    return predicate
+
+
 def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
     """Map every node to the conditional branches that guard it.
 
@@ -7174,13 +7294,25 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
         for node_id, data in graph.G.nodes(data=True)
         if source_positioned(data.get("expr_obj"))
     }
-    signature_nodes: dict[tuple[Any, ...], set[int]] = {}
+    location_nodes = {}
+    signatures = {}
+
+    def signature(expression):
+        key = id(expression)
+        if key not in signatures:
+            signatures[key] = _ast_source_signature(expression)
+        return signatures[key]
+    effect_span_nodes: dict[tuple[Any, ...], set[int]] = {}
     for node_id, data in graph.G.nodes(data=True):
         expression = data.get("expr_obj")
-        if source_positioned(expression):
-            signature_nodes.setdefault(
-                _ast_source_signature(expression), set()
-            ).add(int(node_id))
+        for source_expression in (expression, data.get("authored_expr_obj")):
+            if source_positioned(source_expression):
+                location_nodes.setdefault(_ast_source_location(source_expression), []).append((source_expression, int(node_id)))
+        if not source_positioned(expression) and str(data.get("type") or "").casefold() == "setattr":
+            span = data.get("source_span") or {}
+            if span.get("line") is not None:
+                effect_span_nodes.setdefault(tuple(span.get(key) for key in
+                    ("line", "column", "end_line", "end_column")), set()).add(int(node_id))
     memberships: dict[int, set[tuple[int, str]]] = {}
     for control_id, record in _source_control_records(graph.G).items():
         expression = record.get("expression")
@@ -7219,10 +7351,13 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
                     guarded_nodes = (
                         (int(expression_nodes[id(member)]),)
                         if id(member) in expression_nodes
-                        else tuple(sorted(signature_nodes.get(
-                            _ast_source_signature(member), (),
-                        )))
+                        else tuple(sorted({candidate_id
+                            for candidate, candidate_id in location_nodes.get(_ast_source_location(member), ())
+                            if signature(candidate) == signature(member)}))
                     )
+                    guarded_nodes = (*guarded_nodes, *effect_span_nodes.get(
+                        (member.lineno, member.col_offset,
+                         getattr(member, "end_lineno", None), getattr(member, "end_col_offset", None)), ()))
                     for guarded in guarded_nodes:
                         if guarded != control_id:
                             memberships.setdefault(guarded, set()).add(
@@ -7249,16 +7384,58 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
     }
 
 
+def _record_field_state_keys(
+    graph: Any,
+    node_by_value: Mapping[int, int],
+    value_ids: Iterable[int],
+) -> frozenset[tuple[int, str]]:
+    """Return exact receiver/field identities represented by graph values."""
+
+    keys: set[tuple[int, str]] = set()
+    for value_id in value_ids:
+        node_id = node_by_value.get(int(value_id))
+        if node_id is None or node_id not in graph:
+            continue
+        data = graph.nodes[node_id]
+        attributes = data.get("attributes") or {}
+        state = attributes.get("record_field_state")
+        if (
+            isinstance(state, (tuple, list))
+            and len(state) == 2
+            and state[0] is not None
+            and state[1] is not None
+        ):
+            keys.add((int(state[0]), str(state[1])))
+        operation = str(data.get("type") or data.get("op") or "").casefold()
+        attribute = attributes.get("attribute")
+        if operation not in {"getattr", "setattr"} or attribute is None:
+            continue
+        receiver_roles = (
+            {"object", "base", "receiver"}
+            if operation == "setattr"
+            else {"value", "object", "base", "receiver"}
+        )
+        receiver = next((
+            int(parent)
+            for parent, role in data.get("parents") or ()
+            if str(role) in receiver_roles
+        ), None)
+        if receiver is not None:
+            keys.add((receiver, str(attribute)))
+    return frozenset(keys)
+
+
 def _ordinary_conditional_control_programs(
     graph: Any,
     retained_regions: Iterable[int],
     dispatch_subgraphs: Iterable[Any],
 ) -> tuple[ControlProgram, ...]:
-    """Preserve ordinary source ``if`` arms and their lexical SSA merges."""
+    """Preserve source conditional arms and their lexical SSA merges."""
 
     from .control_source import ConditionalBlock, LoopControlBlock
 
-    retained = frozenset(map(int, retained_regions))
+    retained_regions = tuple(map(int, retained_regions))
+    retained = frozenset(retained_regions)
     subgraphs = tuple(dispatch_subgraphs)
     memberships = _branch_compartments(graph)
     node_by_value = {
@@ -7269,18 +7446,46 @@ def _ordinary_conditional_control_programs(
     programs = []
     for control_id, record in _source_control_records(graph.G).items():
         expression = record.get("expression")
-        if not isinstance(expression, ast.If):
+        if not isinstance(expression, (ast.If, ast.IfExp)):
             continue
+        is_expression = isinstance(expression, ast.IfExp)
+        body_statements = (expression.body,) if is_expression else expression.body
+        else_statements = (expression.orelse,) if is_expression else expression.orelse
+        result_aliases = ()
+        if is_expression:
+            data = graph.G.nodes.get(int(control_id))
+            if data is None:
+                continue
+            parents = dict((str(role), int(parent))
+                           for parent, role in data.get("parents", ()))
+            if not all(parents.get(role) in graph.G for role in ("body", "orelse")):
+                continue
+            result_aliases = (data.get("attributes") or {}).get("conditional_member_bindings") or ((
+                int(graph.G.nodes[parents["body"]].get("value_id", parents["body"])),
+                int(graph.G.nodes[parents["orelse"]].get("value_id", parents["orelse"])),
+                int(data.get("value_id", control_id)),
+            ),)
         predicate_id = _retained_control_value_id(
             graph.G,
             record.get("predicate_id"),
             expression.test,
         )
+        predicate_expression = None
         if predicate_id is None:
-            continue
-        predicate_value_id = int(
-            graph.G.nodes[predicate_id].get("value_id", predicate_id)
-        )
+            predicate_expression = _optional_presence_control_expression(
+                graph.G, expression.test,
+            )
+            if predicate_expression is None:
+                continue
+            predicate_value_id = int(predicate_expression.value_id)
+            predicate_id = predicate_value_id
+        else:
+            predicate_value_id = int(
+                graph.G.nodes[predicate_id].get("value_id", predicate_id)
+            )
+            predicate_expression = ControlExpression(
+                "value", value_id=int(predicate_value_id)
+            )
         body_regions = tuple(
             region_index
             for region_index, subgraph in enumerate(subgraphs)
@@ -7482,13 +7687,33 @@ def _ordinary_conditional_control_programs(
             )
 
         body_return_control = (
-            arm_return_control(expression.body)
-            or arm_loop_control(expression.body, "body")
+            arm_return_control(body_statements)
+            or arm_loop_control(body_statements, "body")
         )
         else_return_control = (
-            arm_return_control(expression.orelse)
-            or arm_loop_control(expression.orelse, "orelse")
+            arm_return_control(else_statements)
+            or arm_loop_control(else_statements, "orelse")
         )
+        def arm_callsites(arm):
+            return tuple(sorted(
+                int(node_id)
+                for node_id, roles in memberships.items()
+                if (int(control_id), arm) in roles
+                and int(node_id) in graph.G
+                for data in (graph.G.nodes[int(node_id)],)
+                if str(data.get("op") or data.get("type") or "").casefold() == "call"
+                or (
+                    isinstance(data.get("expr_obj"), ast.Call)
+                    and any((data.get("attributes") or {}).get(key) is not None
+                            for key in ("method_ref", "callee_ref"))
+                )
+            ))
+
+        # A resolved method keeps its method name as the graph operation.
+        # Its lexical control ownership does not depend on numerical regions
+        # or on the generic operation spelling "call".
+        body_callsites = arm_callsites("body")
+        else_callsites = arm_callsites("orelse")
         if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
             terminal_spans = [
                 (
@@ -7497,7 +7722,7 @@ def _ordinary_conditional_control_programs(
                     int(getattr(arm[-1].value, "end_lineno", -1)),
                     int(getattr(arm[-1].value, "end_col_offset", -1)),
                 )
-                for arm in (expression.body, expression.orelse)
+                for arm in (body_statements, else_statements)
                 if arm and isinstance(arm[-1], ast.Return)
                 and arm[-1].value is not None
             ]
@@ -7521,7 +7746,7 @@ def _ordinary_conditional_control_programs(
                     and isinstance(member.func, ast.Attribute)
                     and member.func.attr in {"append", "add", "extend"}
                 )
-                for statement in (*expression.body, *expression.orelse)
+                for statement in (*body_statements, *else_statements)
                 for member in ast.walk(statement)
             )
         )
@@ -7530,6 +7755,9 @@ def _ordinary_conditional_control_programs(
             and not else_regions
             and body_return_control is None
             and else_return_control is None
+            and not body_callsites
+            and not else_callsites
+            and not result_aliases
             and not (predicate_regions and has_structural_branch_effect)
         ):
             if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
@@ -7544,7 +7772,68 @@ def _ordinary_conditional_control_programs(
                 )
             continue
 
+        # The reducer already owns the path-specific SSA values for an
+        # authored assignment merge.  Consume those Phi parents directly
+        # whenever it published the pre-branch identity.  Reconstructing the
+        # same relation from a flat spelling history loses nesting and, for
+        # attribute assignments, used to confuse SetAttr event ids with the
+        # values they store.
         carried = []
+        direct_phi_bindings: set[str] = set()
+        direct_phi_record_fields: set[tuple[int, str]] = set()
+        for phi_node_id, phi_data in graph.G.nodes(data=True):
+            phi_attributes = phi_data.get("attributes") or {}
+            if (
+                str(phi_data.get("type") or phi_data.get("op") or "")
+                .casefold() != "phi"
+                or int(phi_attributes.get("source_conditional_id", -1))
+                != int(control_id)
+            ):
+                continue
+            phi_parents = {
+                str(role): int(graph.G.nodes[parent].get(
+                    "value_id", parent
+                ))
+                for parent, role in phi_data.get("parents") or ()
+                if parent in graph.G
+            }
+            if not {"body", "orelse"}.issubset(phi_parents):
+                continue
+            merged_id = int(phi_data.get("value_id", phi_node_id))
+            binding_name = phi_attributes.get("binding_name")
+            if (
+                binding_name is not None
+                and str(binding_name).startswith("__turing_single_exit_result")
+            ):
+                # Guard-return normalization creates a fresh result only in
+                # the two arms.  Its reducer Phi may name the first arm as an
+                # ``initial_value_id`` compatibility fallback, but there is
+                # no incumbent value before the branch.  Lower it through
+                # the exact conditional-result path so each arm resolves its
+                # own source identity instead of the missing arm falling
+                # back to the first arm's constant.
+                result_aliases = (*result_aliases, (
+                    int(phi_parents["body"]),
+                    int(phi_parents["orelse"]),
+                    merged_id,
+                ))
+                direct_phi_bindings.add(str(binding_name))
+                continue
+            if phi_attributes.get("initial_value_id") is None:
+                continue
+            carried.append((
+                int(phi_parents["body"]),
+                int(phi_parents["orelse"]),
+                int(phi_attributes["initial_value_id"]),
+                merged_id,
+            ))
+            if binding_name is not None:
+                direct_phi_bindings.add(str(binding_name))
+            direct_phi_record_fields.update(
+                _record_field_state_keys(
+                    graph.G, node_by_value, (merged_id,),
+                )
+            )
         positional_output_names = set(
             graph.G.graph.get("positional_output_names") or ()
         )
@@ -7560,11 +7849,22 @@ def _ordinary_conditional_control_programs(
                 # Return sites merge at the function exit instead
                 # (control-aware result merging).
                 continue
+            if str(name) in direct_phi_bindings:
+                continue
             ordered = tuple(
                 int(value_id) for value_id in history
                 if int(value_id) in node_by_value
             )
             if not ordered:
+                continue
+            # The reducer's record-field Phi is the exact state transition for
+            # this receiver slot.  A dotted attribute identity history also
+            # contains its SetAttr event ids; reconstructing that flat history
+            # creates a second carried chain whose pre-branch "value" is an
+            # effect node with no definition.  The exact field-state Phi wins.
+            if direct_phi_record_fields.intersection(
+                _record_field_state_keys(graph.G, node_by_value, ordered)
+            ):
                 continue
             # An arm that ends in return/break/continue never reaches the
             # merge point: the values it binds leave through its own edge
@@ -7650,7 +7950,7 @@ def _ordinary_conditional_control_programs(
                     if else_return_control is not None else ()
                 ),
             ))
-            if else_regions or else_return_control is not None else None
+            if else_regions or else_return_control is not None or else_callsites else None
         )
         arm_regions = tuple(dict.fromkeys((*body_regions, *else_regions)))
         split_regions = set(predicate_regions).intersection(arm_regions)
@@ -7683,44 +7983,160 @@ def _ordinary_conditional_control_programs(
             ),
             ConditionalBlock(
                 int(predicate_value_id), body, orelse,
-                predicate_expression=ControlExpression(
-                    "value", value_id=int(predicate_value_id)
-                ),
+                predicate_expression=predicate_expression,
                 carried_aliases=tuple(carried),
                 source_node_id=int(control_id),
                 # Call nodes lexically inside each arm: the callsite
                 # scheduler anchors a planned call on numerical regions,
                 # which an arm consisting only of a call does not have.
-                body_callsite_ids=tuple(sorted(
-                    int(node_id)
-                    for node_id, roles in memberships.items()
-                    if (int(control_id), "body") in roles
-                    and int(node_id) in graph.G
-                    and str(
-                        graph.G.nodes[int(node_id)].get("op")
-                        or graph.G.nodes[int(node_id)].get("type") or ""
-                    ).casefold() == "call"
-                )),
-                orelse_callsite_ids=tuple(sorted(
-                    int(node_id)
-                    for node_id, roles in memberships.items()
-                    if (int(control_id), "orelse") in roles
-                    and int(node_id) in graph.G
-                    and str(
-                        graph.G.nodes[int(node_id)].get("op")
-                        or graph.G.nodes[int(node_id)].get("type") or ""
-                    ).casefold() == "call"
-                )),
+                body_callsite_ids=body_callsites,
+                orelse_callsite_ids=else_callsites,
+                result_aliases=result_aliases,
             ),
         ))
+        anchor_region = None
+        if not owned_predicate_regions and not arm_regions:
+            control_end = (
+                int(getattr(expression, "end_lineno", expression.lineno)),
+                int(getattr(expression, "end_col_offset", expression.col_offset)),
+            )
+            for region_index in retained_regions:
+                positions = []
+                for node_id in subgraphs[region_index].G.graph.get("deployment_nodes", ()):
+                    span = graph.G.nodes[int(node_id)].get("source_span") or {}
+                    if span.get("line") is not None:
+                        positions.append((int(span["line"]), int(span.get("column", 0))))
+                if positions and min(positions) > control_end:
+                    anchor_region = region_index
+                    break
         programs.append(ControlProgram(
             root=root,
             region_indices=tuple(dict.fromkeys((
                 *owned_predicate_regions,
                 *arm_regions,
             ))),
+            # A call-only arm has no numerical marker to replace. Its source
+            # position must still precede later mutation/read regions. Publish
+            # the existing overlay anchor at planning time, rather than relying
+            # on a later shell reconstruction to happen to rebuild this branch.
+            anchor_region=anchor_region,
         ))
     return tuple(programs)
+
+
+def _repair_missing_phi_initial_identities(graph_obj):
+    """Recover a removed conditional incumbent from exact dataflow identity.
+
+    Reduction may remove an intermediate spelling while a surviving Phi still
+    carries that spelling in ``initial_value_id``. Treating the absent integer
+    as an external value fabricates a function formal. Recovery is legal only
+    when one resident value in the Phi binding's identity history is the unique
+    nearest common dataflow ancestor of both authored arms. A resident initial
+    is the incumbent and is never challenged; equal nearest candidates remain
+    unresolved.
+    """
+    import networkx as nx
+
+    node_by_value = {
+        int(data.get("value_id", node_id)): node_id
+        for node_id, data in graph_obj.nodes(data=True)
+    }
+    dataflow = nx.DiGraph()
+    dataflow.add_nodes_from(graph_obj.nodes)
+    for node_id, data in graph_obj.nodes(data=True):
+        for parent, _role in data.get("parents") or ():
+            if parent in graph_obj:
+                dataflow.add_edge(parent, node_id)
+    identity_table = graph_obj.graph.get("identity_table") or {}
+    receipts = []
+    for phi_node_id, phi_data in graph_obj.nodes(data=True):
+        if str(phi_data.get("type") or phi_data.get("op") or "").casefold() != "phi":
+            continue
+        attributes = phi_data.get("attributes") or {}
+        initial_value_id = attributes.get("initial_value_id")
+        binding_name = attributes.get("binding_name")
+        if (
+            initial_value_id is None
+            or int(initial_value_id) in node_by_value
+            or binding_name is None
+        ):
+            continue
+        parents = {
+            str(role): parent
+            for parent, role in phi_data.get("parents") or ()
+            if parent in graph_obj
+        }
+        if not {"body", "orelse"}.issubset(parents):
+            continue
+        body_node = parents["body"]
+        orelse_node = parents["orelse"]
+        common = (
+            nx.ancestors(dataflow, body_node) | {body_node}
+        ) & (
+            nx.ancestors(dataflow, orelse_node) | {orelse_node}
+        )
+        candidates = []
+        for ordinal, value_id in enumerate(
+            identity_table.get(str(binding_name), ())
+        ):
+            value_id = int(value_id)
+            candidate = node_by_value.get(value_id)
+            if candidate not in common or candidate == phi_node_id:
+                continue
+            try:
+                distance = (
+                    nx.shortest_path_length(dataflow, candidate, body_node)
+                    + nx.shortest_path_length(
+                        dataflow, candidate, orelse_node
+                    )
+                )
+            except nx.NetworkXNoPath:
+                continue
+            candidates.append((int(distance), int(ordinal), value_id))
+        if not candidates:
+            continue
+        nearest_distance = min(item[0] for item in candidates)
+        nearest = [
+            item for item in candidates if item[0] == nearest_distance
+        ]
+        nearest_value_ids = tuple(dict.fromkeys(
+            item[2] for item in nearest
+        ))
+        if len(nearest_value_ids) != 1:
+            unresolved = {
+                "phi_value_id": int(phi_data.get(
+                    "value_id", phi_node_id
+                )),
+                "binding_name": str(binding_name),
+                "missing_initial_value_id": int(initial_value_id),
+                "candidate_value_ids": nearest_value_ids,
+                "reason": "equal_priority_candidates",
+                "tie_policy": "incumbent",
+            }
+            ledger = graph_obj.graph.setdefault(
+                "unresolved_phi_initial_identities", []
+            )
+            if unresolved not in ledger:
+                ledger.append(unresolved)
+            continue
+        replacement = nearest_value_ids[0]
+        attributes["initial_value_id"] = int(replacement)
+        attributes["recovered_initial_value_id"] = int(initial_value_id)
+        receipts.append({
+            "phi_value_id": int(phi_data.get("value_id", phi_node_id)),
+            "binding_name": str(binding_name),
+            "missing_initial_value_id": int(initial_value_id),
+            "resident_initial_value_id": int(replacement),
+            "dataflow_distance": int(nearest_distance),
+            "priority": "exact_common_dataflow_ancestor",
+            "tie_policy": "incumbent",
+        })
+    if receipts:
+        graph_obj.graph["phi_initial_identity_repairs"] = tuple((
+            *graph_obj.graph.get("phi_initial_identity_repairs", ()),
+            *receipts,
+        ))
+    return tuple(receipts)
 
 
 def _ordinary_conditional_nesting(
@@ -7761,7 +8177,9 @@ def _ordinary_conditional_nesting(
             descendants = {
                 id(member)
                 for statement in (
-                    *parent_expression.body, *parent_expression.orelse
+                    (parent_expression.body, parent_expression.orelse)
+                    if isinstance(parent_expression, ast.IfExp)
+                    else (*parent_expression.body, *parent_expression.orelse)
                 )
                 for member in ast.walk(statement)
             }
@@ -7888,7 +8306,66 @@ def _overlay_control_or_require_subdivision(
             known_nesting=nesting,
         )
         return order_control_region_dependencies(program, region_dependencies)
-    except ControlOverlayScopeError as error:
+    except ValueError as error:
+        if not isinstance(error, ControlOverlayScopeError):
+            implicated_regions = {
+                int(value)
+                for value in re.findall(r"\d+", str(error))
+            }
+
+            def source_nodes(block):
+                from .control_source import (
+                    CallBlock, ConditionalBlock, LoopBlock, SequenceBlock,
+                    WhileBlock,
+                )
+                found = []
+                if isinstance(block, ConditionalBlock):
+                    if block.source_node_id is not None:
+                        found.append(int(block.source_node_id))
+                    found.extend(source_nodes(block.body))
+                    if block.orelse is not None:
+                        found.extend(source_nodes(block.orelse))
+                elif isinstance(block, (LoopBlock, WhileBlock)):
+                    if block.source_loop_node_id is not None:
+                        found.append(int(block.source_loop_node_id))
+                    if isinstance(block, WhileBlock):
+                        found.extend(source_nodes(block.condition))
+                    found.extend(source_nodes(block.body))
+                elif isinstance(block, SequenceBlock):
+                    for child in block.blocks:
+                        found.extend(source_nodes(child))
+                elif isinstance(block, CallBlock):
+                    found.extend(source_nodes(block.callee))
+                return tuple(dict.fromkeys(found))
+
+            catalogue = []
+            for control_index, control in enumerate((
+                *loop_controls, *conditional_controls,
+            )):
+                regions = tuple(map(int, control.region_indices))
+                if implicated_regions and not implicated_regions.intersection(
+                    regions
+                ):
+                    continue
+                nodes = source_nodes(control.root)
+                catalogue.append({
+                    "index": control_index,
+                    "regions": regions,
+                    "source_nodes": nodes,
+                    "source": tuple(
+                        ast.unparse(expression)
+                        for node_id in nodes
+                        for expression in (
+                            _source_control_expression(graph.G, node_id),
+                        )
+                        if isinstance(expression, ast.AST)
+                    ),
+                })
+            raise ValueError(
+                f"{error}; function="
+                f"{graph.G.graph.get('function_name', '?')!r}; "
+                f"controls={catalogue!r}"
+            ) from error
         conflict_regions = frozenset(map(int, error.region_indices))
         overlapping = tuple(
             (reduction, control)
@@ -14644,6 +15121,194 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
             )[parameter] = first
 
 
+def _source_fallthrough_predicate_facts(graph: Any, controls, predicate_fact):
+    """Facts reaching source expressions, excluding paths which already exit.
+
+    Predicates are graph value identities. Loop exits and exception handlers
+    do not export newly inferred facts; nested function bodies are separate
+    scopes. Unknown control remains conservative rather than guessing a path.
+    """
+    body = graph.G.graph.get("function_body")
+    if not body:
+        return None
+    expressions = {}
+    for node_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        if isinstance(expression, ast.AST):
+            expressions.setdefault(_ast_source_signature(expression), []).append(int(node_id))
+    predicates = {}
+    for record in controls.values():
+        if record.get("predicate_id") in graph.G:
+            predicates[_ast_source_signature(record["expression"])] = int(record["predicate_id"])
+    reached = {}
+
+    def observed(node, facts):
+        for node_id in expressions.get(_ast_source_signature(node), ()):
+            reached[node_id] = facts if node_id not in reached else reached[node_id] & facts
+
+    def branch_facts(node, facts, truth):
+        predicate = predicates.get(_ast_source_signature(node))
+        return facts if predicate is None else facts | {predicate_fact(predicate, truth)}
+
+    def expression(node, facts):
+        if node is None or isinstance(node, (ast.Lambda, ast.GeneratorExp)):
+            return
+        observed(node, facts)
+        if isinstance(node, ast.IfExp):
+            expression(node.test, facts)
+            expression(node.body, branch_facts(node, facts, True))
+            expression(node.orelse, branch_facts(node, facts, False))
+        else:
+            for child in ast.iter_child_nodes(node):
+                if not isinstance(child, ast.stmt):
+                    expression(child, facts)
+
+    def sequence(statements, facts):
+        for statement in statements:
+            if facts is None:
+                break
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            observed(statement, facts)
+            if isinstance(statement, ast.If):
+                expression(statement.test, facts)
+                left = sequence(statement.body, branch_facts(statement, facts, True))
+                right = sequence(statement.orelse, branch_facts(statement, facts, False))
+                facts = right if left is None else left if right is None else left & right
+            elif isinstance(statement, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+                for child in ast.iter_child_nodes(statement):
+                    expression(child, facts)
+                facts = None
+            elif isinstance(statement, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
+                for child in ast.iter_child_nodes(statement):
+                    if not isinstance(child, ast.stmt):
+                        expression(child, facts)
+                sequence(statement.body, facts)
+                sequence(getattr(statement, "orelse", ()), facts)
+            elif isinstance(statement, (ast.Try, ast.TryStar)):
+                sequence(statement.body, facts)
+                sequence(statement.orelse, facts)
+                sequence(statement.finalbody, facts)
+                for handler in statement.handlers:
+                    sequence(handler.body, facts)
+            else:
+                expression(statement, facts)
+        return facts
+
+    sequence(body, frozenset())
+    return reached
+
+
+def _publish_conditional_tuple_members(graph: Any) -> bool:
+    """Publish position-matched tuple members as control-owned merge values."""
+    changed = False
+    memberships = _branch_compartments(graph)
+    controls = _source_control_records(graph.G)
+
+    def predicate_fact(value_id, truth):
+        data = graph.G.nodes.get(int(value_id), {})
+        if isinstance(data.get("expr_obj"), ast.UnaryOp) and isinstance(data["expr_obj"].op, ast.Not):
+            operand = next((int(parent) for parent, role in data.get("parents", ())
+                            if str(role) == "operand"), None)
+            if operand is not None:
+                return predicate_fact(operand, not truth)
+        return int(value_id), bool(truth)
+
+    fallthrough_facts = _source_fallthrough_predicate_facts(graph, controls, predicate_fact)
+    for node_id, data in tuple(graph.G.nodes(data=True)):
+        if not isinstance(data.get("expr_obj"), ast.IfExp):
+            continue
+        attributes = dict(data.get("attributes") or {})
+        if attributes.get("conditional_member_bindings"):
+            continue
+        parents = {str(role): int(parent) for parent, role in data.get("parents", ())}
+        if not all(parents.get(role) in graph.G for role in ("test", "body", "orelse")):
+            continue
+        arms = [graph.G.nodes[parents[role]].get("attributes") or {}
+                for role in ("body", "orelse")]
+        leaves = [_authored_aggregate_leaves(graph, parents[role]) for role in ("body", "orelse")]
+        optional = None
+        absent_arms = [
+            graph.G.nodes[parents[role]].get("type") in {"Constant", "Const", "const"}
+            and _constant_value(graph.G.nodes[parents[role]]) is None
+            for role in ("body", "orelse")
+        ]
+        if sum(absent_arms) == 1:
+            present_arm = 1 if absent_arms[0] else 0
+            if arms[present_arm].get("aggregate_kind") != "tuple" or not leaves[present_arm]:
+                continue
+            descriptors = [_tensor_descriptor(graph, leaf) for leaf in leaves[present_arm]]
+            if any(item is None for item in descriptors):
+                continue
+            required = predicate_fact(parents["test"], present_arm == 0)
+            consumers = tuple(graph.G.successors(node_id))
+            guarded = []
+            for consumer in consumers:
+                facts = {
+                    predicate_fact(controls[control]["predicate_id"], arm == "body")
+                    for control, arm in memberships.get(int(consumer), ())
+                    if control in controls and controls[control].get("predicate_id") in graph.G
+                    and arm in {"body", "orelse"}
+                }
+                if fallthrough_facts is not None:
+                    facts = fallthrough_facts.get(int(consumer), frozenset())
+                if required not in facts:
+                    raise ValueError(
+                        f"optional tuple {node_id} consumer {consumer} has no proven presence guard"
+                    )
+                guarded.append(int(consumer))
+            if not consumers or any(node_id in values for values in
+                                    (graph.G.graph.get("return_slot_values") or {}).values()):
+                raise ValueError(f"optional tuple {node_id} escapes without a presence ABI")
+            inactive = []
+            for descriptor in descriptors:
+                value_id = next_process_value_id(graph)
+                graph.G.add_node(value_id, type="Constant", op="const", value_id=value_id,
+                                 constant=0, parents=[], children=[],
+                                 tensor={"shape": (), "dtype": "ptr" if descriptor["shape"] else descriptor["dtype"]},
+                                 attributes={"value": 0, "conditional_result_of": int(node_id),
+                                             "optional_inactive_payload": True})
+                inactive.append(value_id)
+            leaves[1 - present_arm] = tuple(inactive)
+            optional = {"predicate_id": required[0], "present_when": required[1],
+                        "guarded_consumers": tuple(guarded), "inactive_value_ids": tuple(inactive)}
+            descriptors = [descriptors, descriptors]
+        else:
+            if any(arm.get("aggregate_kind") != "tuple" for arm in arms):
+                continue
+            descriptors = [[_tensor_descriptor(graph, leaf) for leaf in arm] for arm in leaves]
+        if not leaves[0] or len(leaves[0]) != len(leaves[1]):
+            continue
+        if descriptors[0] != descriptors[1] or any(item is None for item in descriptors[0]):
+            continue
+        bindings = []
+        for left, right, descriptor in zip(*leaves, descriptors[0]):
+            member = next_process_value_id(graph)
+            edges = [(left, "body"), (right, "orelse"), (parents["test"], "test")]
+            graph.G.add_node(member, type="Phi", op="Phi", value_id=member,
+                             parents=edges, children=[], tensor=copy.deepcopy(descriptor),
+                             attributes={"conditional_result_of": int(node_id)})
+            for parent, role in edges:
+                graph.G.add_edge(parent, member, role=role)
+                graph.G.nodes[parent].setdefault("children", []).append((member, role))
+            graph.G.add_edge(member, int(node_id), role="elts")
+            graph.G.nodes[member]["children"].append((int(node_id), "elts"))
+            data.setdefault("parents", []).append((member, "elts"))
+            bindings.append((int(left), int(right), member))
+        attributes.update({
+            "producer_kind": "aggregate", "aggregate_kind": "tuple",
+            "aggregate_leaf_value_ids": tuple(item[2] for item in bindings),
+            "tensor_output_descriptors": tuple(copy.deepcopy(descriptors[0])),
+            "conditional_member_bindings": tuple(bindings),
+        })
+        if optional is not None:
+            attributes["optional_presence"] = optional
+        data["attributes"] = attributes
+        data.pop("tensor", None)
+        changed = True
+    return changed
+
+
 def _propagate_callsite_tensor_specializations(graph: Any) -> None:
     """Carry consistent tensor descriptors through the function table.
 
@@ -14661,6 +15326,57 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
     graphs.extend(
         entry.graph for entry in function_table if entry.graph is not None
     )
+
+    def publish_return_members(caller, node_id, descriptors, kind):
+        data = caller.G.nodes[node_id]
+        attributes = dict(data.get("attributes") or {})
+        incumbent_leaves = tuple(map(
+            int, attributes.get("aggregate_leaf_value_ids") or (),
+        ))
+        if incumbent_leaves and all(
+            leaf_id in caller.G for leaf_id in incumbent_leaves
+        ):
+            return False
+        stale_leaves = tuple(
+            leaf_id for leaf_id in incumbent_leaves
+            if leaf_id not in caller.G
+        )
+        # Materialize exact member projections of the authored return. These
+        # are call results, never extra caller inputs or copies of the payload.
+        leaves = []
+        for index, descriptor in enumerate(descriptors):
+            index_id = next_process_value_id(caller)
+            caller.G.add_node(index_id, type="Constant", op="const",
+                              value_id=index_id, constant=index,
+                              attributes={"value": index}, parents=[], children=[])
+            member_id = next_process_value_id(caller)
+            caller.G.add_node(
+                member_id, type="Indexed", op="Indexed", value_id=member_id,
+                parents=[(node_id, "base"), (index_id, "index")], children=[],
+                attributes={"authored_call_result_projection": True},
+                tensor={} if descriptor is None else copy.deepcopy(dict(descriptor)),
+            )
+            caller.G.add_edge(node_id, member_id, role="base")
+            caller.G.add_edge(index_id, member_id, role="index")
+            data.setdefault("children", []).append((member_id, "base"))
+            caller.G.nodes[index_id]["children"].append((member_id, "index"))
+            leaves.append(member_id)
+        attributes.update({
+            "authored_return_container": kind,
+            "producer_kind": "aggregate", "aggregate_kind": kind,
+            "aggregate_leaf_value_ids": tuple(leaves),
+            "tensor_output_descriptors": tuple(copy.deepcopy(descriptors)),
+        })
+        if stale_leaves:
+            attributes["aggregate_leaf_republication"] = {
+                "replaced_missing_value_ids": stale_leaves,
+                "replacement_value_ids": tuple(map(int, leaves)),
+                "rule": "exact-stored-output-descriptors",
+                "tie_policy": "incumbent",
+            }
+        data["attributes"] = attributes
+        data.pop("tensor", None)
+        return True
 
     def call_result_descriptor(
         caller: Any,
@@ -14721,7 +15437,7 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
         ).items():
             if str(parameter) not in bound_parameters:
                 specializations[str(parameter)] = copy.deepcopy(default)
-        if not descriptors and not aggregate_descriptors:
+        if not descriptors and not aggregate_descriptors and not callee.G.graph.get("parameter_record_abi"):
             return ()
         specialized = extract_clean_process_subgraph(callee, callee.G)
         specialized.G.graph["planner_specializations"] = copy.deepcopy(
@@ -14785,9 +15501,12 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                 _fold_callsite_structural_values(caller)
         candidates: dict[tuple[int, str], list[dict[str, Any]]] = {}
         for caller in graphs:
-            for _node_id, data in caller.G.nodes(data=True):
+            changed |= _publish_conditional_tuple_members(caller)
+            for _node_id, data in tuple(caller.G.nodes(data=True)):
                 attributes = data.get("attributes") or {}
                 reference = attributes.get("callee_ref")
+                if reference is None:
+                    reference = attributes.get("method_ref")
                 if reference is None:
                     continue
                 try:
@@ -14800,7 +15519,19 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                     result_descriptors = call_result_descriptor(
                         caller, int(_node_id), callee
                     )
-                    if len(result_descriptors) == 1 and isinstance(
+                    return_kinds = set((callee.G.graph.get("return_container_kinds") or {}).values())
+                    if (
+                        len(return_kinds) == 1
+                        and return_kinds <= {"tuple", "list"}
+                        and result_descriptors
+                        and all(item is None or isinstance(item, Mapping)
+                                for item in result_descriptors)
+                    ):
+                        changed |= publish_return_members(
+                            caller, int(_node_id), result_descriptors,
+                            next(iter(return_kinds)),
+                        )
+                    elif len(result_descriptors) == 1 and isinstance(
                         result_descriptors[0], Mapping
                     ):
                         # A single returned aggregate still has a nested
@@ -14867,6 +15598,75 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
             # folded below by ``_callsite_specialized_shell_type`` after both
             # descriptor and literal arguments have been collected.
             changed = True
+
+
+def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
+    """Restore only aggregate leaves removed by structural branch folding.
+
+    Aggregate leaf IDs are metadata edges.  A selected producer can survive
+    while a projection associated with the rejected source arm is removed,
+    leaving the producer's exact output descriptor but a dangling leaf ID.
+    Keep every resident incumbent and recreate only missing positions from
+    those stored descriptors.  A second visit is therefore a no-op.
+    """
+
+    repaired = 0
+    for node_id, data in tuple(graph.G.nodes(data=True)):
+        attributes = dict(data.get("attributes") or {})
+        leaves = tuple(map(
+            int, attributes.get("aggregate_leaf_value_ids") or (),
+        ))
+        if not leaves or all(leaf_id in graph.G for leaf_id in leaves):
+            continue
+        descriptors = tuple(
+            attributes.get("tensor_output_descriptors") or (),
+        )
+        if len(descriptors) != len(leaves):
+            continue
+        replacements = []
+        replaced = []
+        for index, (leaf_id, descriptor) in enumerate(zip(
+            leaves, descriptors,
+        )):
+            if leaf_id in graph.G:
+                replacements.append(int(leaf_id))
+                continue
+            index_id = next_process_value_id(graph)
+            graph.G.add_node(
+                index_id, type="Constant", op="const", value_id=index_id,
+                constant=index, attributes={"value": index},
+                parents=[], children=[],
+            )
+            member_id = next_process_value_id(graph)
+            graph.G.add_node(
+                member_id,
+                type="Indexed", op="Indexed", value_id=member_id,
+                parents=[(int(node_id), "base"), (index_id, "index")],
+                children=[],
+                attributes={
+                    "authored_call_result_projection": True,
+                    "aggregate_leaf_republication": True,
+                },
+                tensor=(
+                    {} if descriptor is None
+                    else copy.deepcopy(dict(descriptor))
+                ),
+            )
+            graph.G.add_edge(int(node_id), member_id, role="base")
+            graph.G.add_edge(index_id, member_id, role="index")
+            data.setdefault("children", []).append((member_id, "base"))
+            graph.G.nodes[index_id]["children"].append((member_id, "index"))
+            replacements.append(member_id)
+            replaced.append((int(leaf_id), int(member_id)))
+            repaired += 1
+        attributes["aggregate_leaf_value_ids"] = tuple(replacements)
+        attributes["aggregate_leaf_republication"] = {
+            "replacements": tuple(replaced),
+            "rule": "exact-stored-output-descriptors",
+            "tie_policy": "incumbent",
+        }
+        data["attributes"] = attributes
+    return repaired
 
 
 def _resolve_bound_function_references(graph: Any) -> None:
@@ -15250,7 +16050,7 @@ def _tensor_descriptor(
         # argument without inspecting any runtime payload.
         if operation in {
             "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
-            "tanh", "clone", "identity",
+            "tanh", "clone", "copy", "identity",
         }:
             parents = tuple(
                 int(parent) for parent, role in data.get("parents") or ()
@@ -15422,6 +16222,8 @@ def _fold_callsite_structural_values(graph: Any) -> None:
     # the exact branch tree in each function shell.
     _retain_source_control_records(graph.G)
     _retain_source_sequence_mutation_records(graph.G)
+    # Resolve capability before getattr(..., default) can select its default.
+    _resolve_grounded_method_references(graph)
 
     unresolved = _UNRESOLVED_STRUCTURAL_VALUE
     known: dict[int, Any] = {}
@@ -15700,6 +16502,8 @@ def _fold_callsite_structural_values(graph: Any) -> None:
         )
 
     def evaluate(node_id: int, data: Mapping[str, Any]) -> Any:
+        if (data.get("attributes") or {}).get("bound_method_ref") is not None:
+            return unresolved
         node_type = str(data.get("type") or "")
         operation = str(data.get("op") or node_type).casefold()
         expression = data.get("expr_obj")
@@ -15964,34 +16768,20 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 or isinstance(value, _ProgramABIValueFact)
                 for value in values
             ):
-                return all(values) if isinstance(expression.op, ast.And) else any(values)
-            # ``a and b and False`` is False for every ``a``/``b``; ``a or
-            # True`` is True.  Python short-circuits, so the only thing the
-            # unresolved operands could change is which falsy/truthy VALUE
-            # comes out, never the branch.  Fold only where the node is
-            # consumed as a branch test, where truthiness is the value.
-            decided = [
-                value for value in values
-                if value is not unresolved
-                and not isinstance(value, _ProgramABIValueFact)
-            ]
-            consumers = tuple(
-                str(role)
-                for successor in graph.G.successors(int(node_id))
-                for parent, role in (
-                    graph.G.nodes[successor].get("parents") or ()
-                )
-                if int(parent) == int(node_id)
-            )
-            if consumers and all(role == "test" for role in consumers):
-                if isinstance(expression.op, ast.And) and any(
-                    not bool(value) for value in decided
-                ):
-                    return False
-                if isinstance(expression.op, ast.Or) and any(
-                    bool(value) for value in decided
-                ):
-                    return True
+                # Python returns the selected operand, including non-Boolean
+                # values. Preserve source order and stop at the first decision.
+                for value in values[:-1]:
+                    if bool(value) != isinstance(expression.op, ast.And):
+                        return value
+                return values[-1]
+            # A later constant can determine the branch but cannot erase
+            # evaluation of an earlier unknown operand (which may mutate or
+            # raise). Fold only a proven constant prefix's selected operand.
+            for value in values[:-1]:
+                if value is unresolved or isinstance(value, _ProgramABIValueFact):
+                    break
+                if bool(value) != isinstance(expression.op, ast.And):
+                    return value
             return unresolved
         if not isinstance(expression, ast.Call):
             return unresolved
@@ -16004,6 +16794,10 @@ def _fold_callsite_structural_values(graph: Any) -> None:
         )
         arguments = positional(data)
         values = tuple(known.get(argument, unresolved) for argument in arguments)
+        if (name == "callable" and len(arguments) == 1
+                and (data.get("attributes") or {}).get("extraction_identity") == "builtins.callable"
+                and (graph.G.nodes[arguments[0]].get("attributes") or {}).get("bound_method_ref") is not None):
+            return True
         if (
             name == "callable"
             and len(values) == 1
@@ -16079,7 +16873,8 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             )
             if values[0] is not unresolved and accepted is not None:
                 return isinstance(values[0], accepted)
-        if any(value is unresolved for value in values):
+        if any(value is unresolved or isinstance(value, _ProgramABIValueFact)
+               for value in values):
             return unresolved
         try:
             if name in {"bool", "int", "float"}:
@@ -16115,6 +16910,8 @@ def _fold_callsite_structural_values(graph: Any) -> None:
         data = graph.G.nodes[int(node_id)]
         topology_changed |= bool(data.get("parents"))
         source_attributes = data.get("attributes") or {}
+        if isinstance(data.get("expr_obj"), ast.AST):
+            data.setdefault("authored_expr_obj", data["expr_obj"])
         for parent, _role in tuple(data.get("parents") or ()):
             if graph.G.has_edge(int(parent), int(node_id)):
                 graph.G.remove_edge(int(parent), int(node_id))
@@ -16230,6 +17027,12 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             source_id if int(root) == node_id else int(root)
             for root in graph.roots
         ]
+        if graph.G.graph.get("return_slot_values"):
+            graph.G.graph["return_slot_values"] = {
+                site: tuple(source_id if value is not None and int(value) == node_id else value
+                            for value in slots)
+                for site, slots in graph.G.graph["return_slot_values"].items()
+            }
         # Cached copies of the aliased id live on nodes that are not its
         # successors too (a loop node's carried initial, a tuple's leaf
         # ledger); move every one before the id disappears.
@@ -16319,6 +17122,17 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             return tuple(basic_index(item) for item in node.elts)
         raise ValueError("index is not a basic literal")
 
+    def retained_basic_index(data, expression):
+        # Structural reduction may fold an authored ndim-driven index while
+        # retaining the original AST. Consume that exact graph constant first.
+        indices = [int(parent) for parent, role in data.get("parents", ())
+                   if str(role) == "index" and int(parent) in graph.G]
+        if len(indices) == 1:
+            index = graph.G.nodes[indices[0]]
+            if str(index.get("type")) in {"Constant", "Const", "const"}:
+                return _constant_value(index)
+        return basic_index(expression.slice)
+
     changed = True
     while changed:
         changed = False
@@ -16363,6 +17177,7 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                         and isinstance(index_value, int)
                         and not isinstance(index_value, bool)
                         and -len(leaves) <= index_value < len(leaves)
+                        and int(node_id) != leaves[index_value % len(leaves)]
                     ):
                         replace_alias(
                             node_id, leaves[index_value % len(leaves)]
@@ -16377,7 +17192,7 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 and (
                     operation in {
                         "neg", "abs", "sin", "cos", "tan", "exp", "log",
-                        "sqrt", "tanh", "clone", "identity", "indexedstore",
+                        "sqrt", "tanh", "clone", "copy", "identity", "indexedstore",
                         "index_set", "setitem", "indexed", "getitem",
                         "subscript",
                     }
@@ -16488,7 +17303,7 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                                 if len(index_values) == 1 else tuple(index_values)
                             )
                         else:
-                            normalized_index = basic_index(expression.slice)
+                            normalized_index = retained_basic_index(data, expression)
                         _axes, result_shape = normalize_basic_index(
                             normalized_index,
                             tuple(source_descriptor["shape"]),
@@ -16535,7 +17350,7 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                         )
 
                         axes, _selection_shape = normalize_basic_index(
-                            basic_index(expression.slice),
+                            retained_basic_index(data, expression),
                             tuple(source_descriptor["shape"]),
                         )
                     except (
@@ -17061,8 +17876,8 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                     matches = tuple(
                         int(node_id)
                         for node_id, data in graph.G.nodes(data=True)
-                        if isinstance(data.get("expr_obj"), ast.AST)
-                        and _ast_source_signature(data["expr_obj"])
+                        if isinstance(data.get("authored_expr_obj", data.get("expr_obj")), ast.AST)
+                        and _ast_source_signature(data.get("authored_expr_obj", data["expr_obj"]))
                         == returned_signature
                     )
                     if len(matches) == 1:
@@ -17144,6 +17959,18 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                     identities[str(output_name)] = (
                         int(selected_return_id),
                     )
+                if source_index is not None:
+                    # The source return ledger is also an output authority.
+                    # A proven top-level terminal arm makes later return
+                    # sites unreachable; retaining their slots can otherwise
+                    # restore the rejected fallback during SSA publication.
+                    return_slots = dict(graph.G.graph.get("return_slot_values") or {})
+                    selected_sites = {
+                        site: slots for site, slots in return_slots.items()
+                        if tuple(slots) == (int(selected_return_id),)
+                    }
+                    if selected_sites:
+                        graph.G.graph["return_slot_values"] = selected_sites
             graph.G.graph["identity_table"] = {
                 str(name): tuple(
                     int(value_id) for value_id in history
@@ -17219,6 +18046,14 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             for name, history in identities.items()
         }
 
+
+    # A fold is not complete while a surviving aggregate producer names
+    # projections removed with a rejected arm.  Enforce the ledger invariant
+    # here so every caller of this fixed-point pass, including recursive
+    # callsite specialization, returns a self-contained graph.
+    topology_changed |= bool(
+        _repair_missing_aggregate_leaf_projections(graph)
+    )
 
     if topology_changed:
         # Folding can run again when hierarchy construction freezes shapes,
@@ -17302,6 +18137,18 @@ def _retarget_all_cached_value_ids(
     alias just removed; the evaporator then seeds clones from a dead id.
     """
 
+    if graph.G.graph.get("return_record_field_states"):
+        graph.G.graph["return_record_field_states"] = {
+            span: tuple(
+                (
+                    int(source_id) if int(receiver) == int(replaced_id) else receiver,
+                    field,
+                    int(source_id) if int(value) == int(replaced_id) else value,
+                )
+                for receiver, field, value in states
+            )
+            for span, states in graph.G.graph["return_record_field_states"].items()
+        }
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes")
         if not isinstance(attributes, dict):
@@ -17362,6 +18209,16 @@ def _alias_projection_to_member(
     # initial) caches the projection id without being its successor; move
     # every cached copy before the node is gone.
     _retarget_all_cached_value_ids(graph, projection, leaf_id)
+    graph.roots = [leaf_id if int(root) == projection else int(root)
+                   for root in graph.roots]
+    graph.G.graph["return_value_nodes"] = {
+        site: leaf_id if value == projection else value
+        for site, value in (graph.G.graph.get("return_value_nodes") or {}).items()
+    }
+    graph.G.graph["return_slot_values"] = {
+        site: tuple(leaf_id if value == projection else value for value in values)
+        for site, values in (graph.G.graph.get("return_slot_values") or {}).items()
+    }
     graph.G.remove_node(projection)
     for index_id in index_ids:
         if (
@@ -17921,6 +18778,78 @@ def _resolve_grounded_method_references(graph: Any) -> None:
             )
         return next(iter(candidates)) if len(candidates) == 1 else None
 
+    bound_selectors = {}
+    for node_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+        receiver_id, method_name, receiver_expression = None, None, None
+        if isinstance(expression, ast.Attribute):
+            receiver_id = roles.get("value", roles.get("operand"))
+            method_name, receiver_expression = expression.attr, expression.value
+        elif (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name)
+              and expression.func.id == "getattr" and len(expression.args) >= 2
+              and isinstance(expression.args[1], ast.Constant)
+              and isinstance(expression.args[1].value, str)
+              and (data.get("attributes") or {}).get("extraction_identity") == "builtins.getattr"):
+            receiver_id = roles.get("arg:0")
+            method_name, receiver_expression = expression.args[1].value, expression.args[0]
+        if receiver_id is None or method_name is None:
+            continue
+        class_identity = receiver_class(receiver_id)
+        reference = (class_table.get(class_identity, {}).get("methods", {}).get(method_name)
+                     if class_identity is not None else None)
+        binding_name = (graph.G.nodes[receiver_id].get("attributes") or {}).get("binding_name")
+        if method_name in (parameter_records.get(str(binding_name), {}).get("fields") or {}):
+            continue  # An instance field can shadow a method.
+        if reference is None:
+            continue
+        data.setdefault("attributes", {}).update({
+            "bound_method_ref": int(reference), "bound_receiver_id": int(receiver_id),
+            "receiver_class_ref": class_identity,
+        })
+        bound_selectors[int(node_id)] = (int(reference), int(receiver_id), method_name, receiver_expression)
+
+    for node_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name)):
+            continue
+        selectors = {int(parent) for parent, role in data.get("parents") or ()
+                     if str(role) in {"callee", "func", "function"} and int(parent) in bound_selectors}
+        if not selectors:
+            # Source linking may already have consumed the callee edge. A
+            # single retained lexical binding still proves the saved selector.
+            history = tuple((graph.G.graph.get("identity_table") or {}).get(expression.func.id, ()))
+            if len(history) == 1 and int(history[0]) in bound_selectors:
+                selectors.add(int(history[0]))
+        if len(selectors) != 1:
+            continue
+        selector = next(iter(selectors))
+        reference, receiver_id, method_name, receiver_expression = bound_selectors[selector]
+        rewritten = copy.deepcopy(expression)
+        rewritten.func = ast.copy_location(ast.Attribute(
+            value=copy.deepcopy(receiver_expression), attr=method_name, ctx=ast.Load()), expression.func)
+        data.setdefault("authored_expr_obj", expression)
+        data["expr_obj"] = rewritten
+        data["type"], data["op"] = "Call", "call"
+        attrs = dict(data.get("attributes") or {})
+        for key in ("callee_ref", "external_ref", "extraction_identity", "intrinsic_identity",
+                    "extraction_contract", "extraction_action", "extraction_rule", "extraction_classification",
+                    "backend_intrinsic_candidate", "static_python_reference"):
+            attrs.pop(key, None)
+        attrs.update({"method_ref": reference, "bound_selector_id": selector,
+                      "method_resolution": "bound-receiver-class-ref"})
+        data["attributes"] = attrs
+        parents = [(int(parent), str(role)) for parent, role in data.get("parents") or ()
+                   if str(role) not in {"callee", "func", "function", "operand", "receiver"}]
+        parents.append((receiver_id, "operand"))
+        data["parents"] = parents
+        if graph.G.has_edge(selector, node_id):
+            graph.G.remove_edge(selector, node_id)
+        graph.G.add_edge(receiver_id, node_id)
+        graph.G.nodes[selector]["children"] = [(child, role) for child, role in graph.G.nodes[selector].get("children") or ()
+                                                 if int(child) != int(node_id)]
+        graph.G.nodes[receiver_id].setdefault("children", []).append((int(node_id), "operand"))
+
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}
         if (
@@ -18151,6 +19080,10 @@ class ProcessGraphGLSLDeployment:
         self.memory_references = self.reference_tables.memory
         self.recursion_references = self.reference_tables.recursion
         self.reference_correlations = self.reference_tables.correlations
+        # Specialization can prove additional method callees. Keep the
+        # growing registry on this deployment, not on its cached class.
+        self.function_shell_types = dict(self.function_shell_types)
+        self.specialized_dependency_extensions = []
         self.function_shells = {
             reference: shell_type(**tuning)
             for reference, shell_type in self.function_shell_types.items()
@@ -18182,6 +19115,37 @@ class ProcessGraphGLSLDeployment:
                     continue
                 reference = int(reference)
                 shell_type = self.function_shell_types.get(reference)
+                if shell_type is None and self._owns_function_shells:
+                    # A receiver class can first become known at this exact
+                    # callsite. The initial catalogue closure cannot include
+                    # that method yet; extend it once by function identity.
+                    table = owner.process_graph.function_table
+                    entry = table.entry(reference)
+                    if (entry.graph is not None
+                            and entry.metadata.get("host_ssa_module") is None
+                            and entry.metadata.get("implementation_kind") != "authored-source-fallback"):
+                        function_graph = extract_clean_process_subgraph(entry.graph, entry.graph.G)
+                        function_graph.G.graph.setdefault("loop_settings", dict(
+                            owner.process_graph.G.graph.get("loop_settings") or {}))
+                        shell_type = strategize_shell_deployment(
+                            function_graph,
+                            max_nodes_per_dispatch=self.max_nodes_per_dispatch,
+                            _function_table_stack=(id(table),),
+                        )
+                        self.function_shell_types[reference] = shell_type
+                        shared = shell_type(**tuning)
+                        shared.function_shells = self.function_shells
+                        shared._owns_function_shells = False
+                        self.function_shells[reference] = shared
+                        self.planned_function_references = tuple(sorted({
+                            *self.planned_function_references, reference}))
+                        self.specialized_dependency_extensions.append({
+                            "caller": owner.process_graph.G.graph.get("qualified_name")
+                                      or owner.process_graph.G.graph.get("function_name"),
+                            "callsite_id": int(node_id),
+                            "callee_reference": reference,
+                            "provenance": "callsite_specialization",
+                        })
                 if shell_type is None or reference in active_references:
                     continue
                 shell_type = _callsite_specialized_shell_type(
@@ -18568,6 +19532,10 @@ class ProcessGraphGLSLDeployment:
                 int(region)
                 for reduction in considered_reductions
                 for region in reduction.structurally_owned_region_indices
+            ) | frozenset(
+                int(region)
+                for reduction in target.loop_shader_reductions
+                for region in reduction.domain_region_indices
             )
             runtime_regions = tuple(
                 int(region) for region in complete_regions
@@ -18597,6 +19565,37 @@ class ProcessGraphGLSLDeployment:
                 )
             )
             if orphaned:
+                loop_descriptors = {
+                    int(plan.loop.node_id): plan.loop
+                    for plan in target.loop_plans
+                }
+
+                def opaque_effects(reduction):
+                    descriptor = loop_descriptors.get(int(reduction.loop_node_id))
+                    if descriptor is None:
+                        return ()
+                    details = []
+                    for effect in descriptor.state_effects:
+                        if effect.mode is not LoopStateEffectMode.OPAQUE:
+                            continue
+                        data = target.process_graph.G.nodes.get(
+                            int(effect.effect_node_id), {}
+                        )
+                        expression = data.get("expr_obj")
+                        details.append({
+                            "effect_node_id": int(effect.effect_node_id),
+                            "state_name": str(effect.state_name),
+                            "operator": str(effect.operator),
+                            "source": (
+                                ast.unparse(expression)
+                                if isinstance(expression, ast.AST) else None
+                            ),
+                            "method_ref": (
+                                data.get("attributes") or {}
+                            ).get("method_ref"),
+                        })
+                    return tuple(details)
+
                 owner_reference = target.process_graph.G.graph.get(
                     "function_ref"
                 )
@@ -18620,6 +19619,7 @@ class ProcessGraphGLSLDeployment:
                         int, sorted(reduction.region_indices),
                     )),
                     "blockers": list(map(str, reduction.blockers)),
+                    "opaque_effects": list(opaque_effects(reduction)),
                     **({
                         "function_reference": int(owner_reference),
                     } if owner_reference is not None else {}),
@@ -18635,7 +19635,8 @@ class ProcessGraphGLSLDeployment:
                     + "; ".join(
                         f"loop_node={reduction.loop_node_id} "
                         f"regions={tuple(sorted(reduction.region_indices))} "
-                        f"blockers={reduction.blockers}"
+                        f"blockers={reduction.blockers} "
+                        f"opaque_effects={opaque_effects(reduction)!r}"
                         for reduction in orphaned
                     ),
                     boundaries=boundaries,
@@ -20480,6 +21481,10 @@ class ProcessGraphGLSLDeployment:
                 int(region)
                 for reduction in considered_reductions
                 for region in reduction.structurally_owned_region_indices
+            ) | frozenset(
+                int(region)
+                for reduction in self.loop_shader_reductions
+                for region in reduction.domain_region_indices
             )
             runtime_regions = tuple(
                 int(region) for region in complete_regions
@@ -21374,6 +22379,14 @@ def strategize_shell_deployment(
         # shape-only expression decidable.  The structural fixed point is
         # idempotent and still executes no numerical source code.
         _fold_callsite_structural_values(graph)
+        # Branch folding can remove synthesized call-result projections while
+        # retaining the aggregate producer selected by the surviving arm.
+        # The fold itself now repairs that ledger invariant before returning,
+        # including for recursive callsite specializations.
+    # Loop discovery snapshots state effects into immutable descriptors. Link
+    # methods before that snapshot so an authored record mutation is owned by
+    # its compiled callee instead of remaining a second opaque callsite effect.
+    _resolve_grounded_method_references(graph)
     canonical_value_ids = bool(
         graph.G.graph.get("canonical_value_ids")
     )
@@ -21421,9 +22434,18 @@ def strategize_shell_deployment(
             )
             if (
                 plan.strategy in {LoopStrategy.UNROLL, LoopStrategy.CONSTANT}
-                and any(
-                    effect.mode is LoopStateEffectMode.SEQUENCE_MUTATION
-                    for effect in plan.loop.state_effects
+                and (
+                    bool(plan.loop.control_sites)
+                    or any(
+                        effect.mode in {LoopStateEffectMode.SEQUENCE_MUTATION,
+                                        LoopStateEffectMode.MAPPING_MUTATION}
+                        for effect in plan.loop.state_effects
+                    )
+                    or any(
+                        any((graph.G.nodes[node_id].get("attributes") or {}).get(key) is not None
+                            for key in ("callee_ref", "method_ref", "constructor_ref"))
+                        for node_id in plan.loop.body_nodes if node_id in graph.G
+                    )
                 )
             )
             else plan

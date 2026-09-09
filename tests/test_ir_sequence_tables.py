@@ -12,6 +12,7 @@ from src.compiler.ir_sequence_tables import (
     lower_sequence_fill,
     lower_sequence_aggregate_constants,
     lower_sequence_append,
+    lower_record_sequence_append_with_child_copy,
     lower_sequence_append_slice,
     lower_sequence_pack_bits,
     lower_sequence_prepend,
@@ -639,6 +640,58 @@ def test_nested_table_pool_is_structural_and_validated_against_function_values()
     assert descriptor.to_mapping()["child_table_pool"] == pool.to_mapping()
 
 
+def test_record_append_snapshots_leaf_sequence_before_publishing_handle():
+    pool = SSAChildTablePoolDescriptor(
+        handle_column=2,
+        column_value_ids=(90,),
+        length_value_id=91,
+        capacity_value_id=92,
+        row_stride_value_id=93,
+        status_value_id=94,
+        column_dtypes=("int64",),
+        key_columns=(),
+    )
+    destination = SSASequenceDescriptor(
+        sequence_id=80,
+        column_value_ids=(81, 82, 83),
+        length_address_id=84,
+        capacity_value_id=85,
+        column_dtypes=("float64", "bool", "int64"),
+        child_table_pool=pool,
+    )
+    source = SSASequenceDescriptor(
+        sequence_id=100,
+        column_value_ids=(101,),
+        length_address_id=102,
+        capacity_value_id=103,
+        column_dtypes=("int64",),
+    )
+
+    lowering = lower_record_sequence_append_with_child_copy(
+        destination, source
+    )
+
+    assert lowering.complete
+    function = lowering.functions[0]
+    assert function.metadata["ssa_sequence_operation"] == "append_child_copy"
+    assert function.metadata["child_handle_column"] == 2
+    assert set(function.blocks) >= {
+        "entry", "copy_header", "copy_body", "publish_child",
+        "capacity_exhausted", "inserted", "result",
+    }
+    assert {"Phi", "Le", "LAnd", "Load", "Store"} <= set(_ops(function))
+    assert sum(
+        instruction.op == "Store"
+        for instruction in function.blocks["copy_body"].instrs
+    ) == 1
+    # Child length/status, all three outer columns, and the outer length are
+    # published only after the snapshot loop completes.
+    assert sum(
+        instruction.op == "Store"
+        for instruction in function.blocks["publish_child"].instrs
+    ) == 6
+
+
 def test_extend_uses_destination_insert_policy_not_source_policy():
     destination = _sequence(3, 30, key_columns=(0,))
     source = _sequence(4, 40)
@@ -808,7 +861,12 @@ def test_compiled_retained_loop_mutates_caller_sequence_record(tmp_path):
     length = ctypes.c_int64(0)
     status = ctypes.c_int32(-1)
     assert artifact.entrypoint == "planned_control"
-    assert artifact.c_source_path.read_text(encoding="utf-8") == ""
+    # Libraries export both the typed Fortran entry and its packed-pointer
+    # ABI adapter. The C file owns that adapter and has no executable main.
+    from src.compiler.fortran_c_shell import emit_fortran_packed_library_source
+    expected_shim, packed_symbol = emit_fortran_packed_library_source(entry)
+    assert artifact.c_source_path.read_text(encoding="utf-8") == expected_shim
+    assert getattr(library, packed_symbol) is not None
     extent_parameters = tuple(
         parameter for parameter in entry.parameters
         if parameter.role == "extent"

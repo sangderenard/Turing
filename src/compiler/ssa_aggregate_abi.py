@@ -282,7 +282,9 @@ def _constant_integer(instruction: Instr) -> int | None:
         return None
     for key in ("constant", "value", "data"):
         value = instruction.attributes.get(key)
-        if isinstance(value, (bool, int, float)):
+        if isinstance(value, (bool, int)):
+            return int(value)
+        if isinstance(value, float) and value.is_integer():
             return int(value)
     return None
 
@@ -729,6 +731,7 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     function, call.res,
                 )
                 retained: list[int] = []
+                passthrough_bindings = []
                 removed: set[int] = set()
                 constant_candidates: list[SSAValue] = []
                 for index, (caller_id, callee_id, output_position) in enumerate(
@@ -790,6 +793,12 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     _replace_exact_uses(
                         function, projection.value, replacement,
                     )
+                    passthrough_bindings.append((
+                        int(output_position), int(caller_id),
+                        int(callee_id), int(actual.id),
+                        "exact_callee_output_formal",
+                        "incumbent_on_equal_priority",
+                    ))
                     removed.update((
                         id(projection.address), id(projection.load),
                     ))
@@ -822,6 +831,10 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     changed = True
                 if settled != authored or len(retained) != len(caller_ids):
                     call.attributes["aggregate_output_views_legalized"] = True
+                if passthrough_bindings:
+                    call.attributes[
+                        "aggregate_output_passthrough_bindings"
+                    ] = tuple(passthrough_bindings)
                 if debug_this_call:
                     print(
                         "DEBUG-AGGREGATE-AFTER "
