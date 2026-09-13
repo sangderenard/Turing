@@ -50,6 +50,45 @@ from .transformation_priority import frame_transformation_ledger
 _UNCOPYABLE_LITERAL_TYPES: set[str] = set()
 
 
+def _debug_loop_carried_operands(
+    functions: Mapping[str, Any], stage: str,
+) -> None:
+    """Report loop-carried operand object provenance at selected shell stages."""
+
+    if not os.environ.get("TURING_DEBUG_LOOP_ALIAS_PUBLICATION"):
+        return
+    for function_name, function in functions.items():
+        if "run_superstep__specialized" not in str(function_name):
+            continue
+        rows = []
+        for block_name, block in function.blocks.items():
+            for instruction_index, instruction in enumerate(block.instrs):
+                attributes = dict(instruction.attributes or {})
+                if (
+                    instruction.op != "Phi"
+                    or attributes.get("binding") != "loop_carried"
+                    or attributes.get("updated_value_id") not in {274, 286}
+                ):
+                    continue
+                rows.append((
+                    str(block_name),
+                    int(instruction_index),
+                    int(instruction.res.id),
+                    tuple((
+                        int(argument.id),
+                        id(argument),
+                        tuple(sorted(dict(argument.accounting or {}).items())),
+                    ) for argument in instruction.args),
+                    int(attributes["updated_value_id"]),
+                ))
+        if rows:
+            print(
+                f"DEBUG-LOOP-CARRIED-STAGE {stage} {function_name}: {rows!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
 def _copy_literal_payload(payload: Any) -> Any:
     """Deep-copy a literal payload captured off a graph node, if it can be.
 
@@ -13883,7 +13922,26 @@ def _class_surface_ssa_program(
             getattr(shell, "dispatch_subgraphs", ()),
         )
         if represented_conditionals:
-            from .control_source import ConditionalBlock, SequenceBlock
+            from .control_source import (
+                ConditionalBlock, SequenceBlock,
+                enrich_represented_conditionals,
+            )
+
+            control, enrichment_receipts = enrich_represented_conditionals(
+                control,
+                conditional_controls,
+                enrich_loop_continuations=False,
+            )
+            if enrichment_receipts:
+                enrichment_ledger = list(graph_obj.graph.get(
+                    "conditional_control_enrichment_receipts", ()
+                ))
+                for receipt in enrichment_receipts:
+                    if receipt not in enrichment_ledger:
+                        enrichment_ledger.append(receipt)
+                graph_obj.graph[
+                    "conditional_control_enrichment_receipts"
+                ] = tuple(enrichment_ledger)
 
             def represented(program):
                 return any(
@@ -14144,6 +14202,27 @@ def _class_surface_ssa_program(
         control = _nest_lexical_conditionals_in_loops(
             control, graph, getattr(shell, "dispatch_subgraphs", ()),
         )
+        # Loop recurrence selection needs the complete conditional topology.
+        # Some conditionals already live in the source loop and are enriched
+        # above, while others are ordinary controls inserted by the overlay.
+        # Running the finite continuation walk before that overlay truncates a
+        # legal chain at the last pre-existing conditional.  Defer this one
+        # operation until every conditional has been nested, then derive the
+        # unique terminal continuation once from the complete graph.
+        from .control_source import enrich_represented_conditionals
+        control, continuation_receipts = enrich_represented_conditionals(
+            control, (), enrich_loop_continuations=True,
+        )
+        if continuation_receipts:
+            enrichment_ledger = list(graph_obj.graph.get(
+                "conditional_control_enrichment_receipts", ()
+            ))
+            for receipt in continuation_receipts:
+                if receipt not in enrichment_ledger:
+                    enrichment_ledger.append(receipt)
+            graph_obj.graph[
+                "conditional_control_enrichment_receipts"
+            ] = tuple(enrichment_ledger)
         control = _place_plan_callsites_lexically(
             control, graph, getattr(shell, "hierarchy_plan", None),
             getattr(shell, "dispatch_subgraphs", ()),
@@ -15501,6 +15580,9 @@ def _class_surface_ssa_program(
             from .precompile_to_ssa import debug_region_output_loads as _probe_loads
             for _probe_function in module_ir.functions.values():
                 _probe_loads(_probe_function, "shell-after-sections")
+        _debug_loop_carried_operands(
+            module_ir.functions, "shell-after-control-sections",
+        )
         if external_reference_callsites:
             module_ir.metadata["external_reference_callsites"] = tuple(
                 external_reference_callsites
@@ -21253,6 +21335,9 @@ def _class_surface_ssa_program(
             dict.fromkeys(receipts)
         )
 
+    _debug_loop_carried_operands(
+        all_functions, "shell-before-record-materialization",
+    )
     for source_symbol, source_graph in source_graphs_by_symbol.items():
         materialize_parameter_record_abi(source_symbol, source_graph)
 
@@ -23859,6 +23944,9 @@ def _class_surface_ssa_program(
                 ),
             )
 
+    _debug_loop_carried_operands(
+        all_functions, "shell-before-call-frame-fixed-point",
+    )
     # Materialize the first ordinary repository-SSA call frames.  Eligibility
     # is contract based: every callee argument is explained, exactly one
     # planner result is bound, the callee's authored conditional catalogue is
@@ -29281,6 +29369,9 @@ def _class_surface_ssa_program(
                 unresolved_rows
             )
 
+    _debug_loop_carried_operands(
+        all_functions, "shell-after-call-linking-before-alias-settlement",
+    )
     # Late record-result discovery can prove that a provisional GetAttr formal
     # is the exact field output of a source-linked call after another call has
     # already captured that provisional value in its frame.  The alias ledger
@@ -29328,6 +29419,9 @@ def _class_surface_ssa_program(
             or int(argument.id) not in aliases
         ]
 
+    _debug_loop_carried_operands(
+        all_functions, "shell-after-alias-settlement",
+    )
     # ProgramABI ownership carried by an exact call operand must reach the
     # callee formal before collision resolution.  The historical late pass
     # below is still useful after fixed-point frame growth, but running this
@@ -34053,17 +34147,44 @@ def lower_ast_source_to_ssa(
     extraction_policy = extraction_contract
     if extraction_policy is None:
         # The work contract may embed the whole extraction policy; a
-        # per-call argument still wins. None from both preserves the
-        # historical (gate-disabled) behavior.
+        # per-call argument still wins.
         extraction_policy = work_contract.extraction
-    if extraction_policy is not None:
-        from .extraction_contract import ExtractionContract
-        if isinstance(extraction_policy, (str, os.PathLike)):
-            extraction_policy = ExtractionContract(extraction_policy)
-        elif not hasattr(extraction_policy, "decide"):
-            raise TypeError(
-                "extraction_contract must be a path or ExtractionContract"
-            )
+    if extraction_policy is None:
+        # ---- THERE IS NO GATE-DISABLED PATH ANY MORE -----------------
+        # None from both used to mean "run with the machine-
+        # decompilation gate off", and that was an escape hatch nobody
+        # chose on purpose: it is simply what you get by not passing the
+        # argument. A lowering with no contract has no declared ABI for
+        # the records crossing its boundary, so every receiver it cannot
+        # see becomes an opaque effect and the failures it reports are
+        # about the missing declaration rather than about the program.
+        # Hours get spent reading those as though they were real, and a
+        # gate-off run has already cost this project a crash.
+        #
+        # The contract is not paperwork. It is where the storage, dtype,
+        # rank, shape and mutability of every crossing field are stated,
+        # which is the whole basis on which the compiler decides what it
+        # is allowed to do with them. Not stating it is not a default;
+        # it is a question the caller has declined to answer.
+        raise ValueError(
+            "lower_ast_source_to_ssa requires an extraction_contract: "
+            "pass one, or set it on the active work contract. Lowering "
+            "with no contract disables the machine-decompilation gate, "
+            "so every record crossing the boundary is undeclared and "
+            "every unresolved receiver reports as 'opaque-state-effect' "
+            "-- a diagnosis of the missing contract, not of the program. "
+            "See native_law_kernels.batch_contract for the smallest "
+            "real example, and vehicle_python_compilation."
+            "balloon_tire_managed_extraction_contract for one that "
+            "declares a whole state record's fields."
+        )
+    from .extraction_contract import ExtractionContract
+    if isinstance(extraction_policy, (str, os.PathLike)):
+        extraction_policy = ExtractionContract(extraction_policy)
+    elif not hasattr(extraction_policy, "decide"):
+        raise TypeError(
+            "extraction_contract must be a path or ExtractionContract"
+        )
     interchange = interchange_reduction_loops(
         source, licensed=bool(work_contract.inexact_identities),
     )
