@@ -1162,6 +1162,10 @@ class _ControlSSABuilder:
         # can follow a carried update which has not traversed the latch yet.
         # The exit therefore needs its own edge-aware Phi.
         self.loop_exit_contexts: list[dict[str, Any]] = []
+        # A source value may seed several logical loop bindings.  Conditional
+        # alias publication must not overwrite one binding's update merely
+        # because another binding assigned that value as its RHS.
+        self.protected_loop_alias_sources: list[frozenset[int]] = []
         self.deployment_records: list[dict[str, Any]] = [
             {
                 "region_id": int(region.region_id),
@@ -3297,6 +3301,19 @@ class _ControlSSABuilder:
                         "updated_value_id": int(updated_id),
                         "tie_policy": "incumbent",
                     },
+                )
+            if os.environ.get("TURING_DEBUG_LOOP_ALIAS_PUBLICATION"):
+                print(
+                    "DEBUG-LOOP-LATCH-CHOICE "
+                    f"fn={self.function_name} "
+                    f"updated={int(updated_id)} initial={int(initial_id)} "
+                    f"candidate={int(candidate.id)} "
+                    f"incumbent={int(incumbent.id)} "
+                    f"incoming_blocks={incoming_blocks!r} "
+                    f"incoming={tuple(int(value.id) for value in incoming_values)!r} "
+                    f"completed={int(completed.id)}",
+                    file=sys.stderr,
+                    flush=True,
                 )
             carried_phis[int(updated_id)].args[1] = completed
             carried_updates[int(updated_id)] = completed
@@ -5958,12 +5975,34 @@ class _ControlSSABuilder:
             # branch-local arm value here makes a following conditional read
             # a value that does not dominate it (and silently skips the first
             # conditional on the opposite arm).
-            self.external_values.update({
-                int(true_value_id): merged,
-                int(false_value_id): merged,
-                int(initial_value_id): merged,
-                int(merged_value_id): merged,
-            })
+            protected_sources = frozenset().union(
+                *self.protected_loop_alias_sources
+            ) if self.protected_loop_alias_sources else frozenset()
+            published = {int(merged_value_id): merged}
+            if int(initial_value_id) not in protected_sources:
+                published[int(initial_value_id)] = merged
+            for arm_value_id in (true_value_id, false_value_id):
+                if int(arm_value_id) not in protected_sources:
+                    published[int(arm_value_id)] = merged
+            if (
+                os.environ.get("TURING_DEBUG_LOOP_ALIAS_PUBLICATION")
+                and protected_sources
+                and protected_sources.intersection({
+                    int(true_value_id), int(false_value_id),
+                    int(initial_value_id), int(merged_value_id),
+                })
+            ):
+                print(
+                    "DEBUG-LOOP-ALIAS-PUBLICATION "
+                    f"fn={self.function_name} path={path} "
+                    f"alias={(int(true_value_id), int(false_value_id), int(initial_value_id), int(merged_value_id))!r} "
+                    f"protected={tuple(sorted(protected_sources))!r} "
+                    f"published={tuple(sorted(published))!r} "
+                    f"merged_ssa={int(merged.id)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            self.external_values.update(published)
         for _true_id, _false_id, initial_id, merged_id in (
             conditional.carried_sequence_aliases
         ):
@@ -5981,6 +6020,7 @@ class _ControlSSABuilder:
             tuple[BasicBlock, tuple[SSAValue, ...], tuple[SSAValue, ...]], ...
         ],
         break_bound: tuple[tuple[int, int], ...] = (),
+        break_bound_initials: Mapping[int, SSAValue] | None = None,
     ) -> None:
         """Define authored LoopResult ids with edge-correct exit Phis."""
 
@@ -6083,7 +6123,10 @@ class _ControlSSABuilder:
         # A break-bound name: zero-trip / fall-through exits keep the
         # pre-loop value; each break edge carries the value its site bound.
         for bound_index, (port_id, initial_id) in enumerate(break_bound):
-            normal_value = self.external_value(int(initial_id))
+            normal_value = (
+                (break_bound_initials or {}).get(int(initial_id))
+                or self.external_value(int(initial_id))
+            )
             incoming_blocks = [header.name]
             incoming_values = [normal_value]
             for predecessor, _edge_values, bound_values in break_edges:
@@ -6288,6 +6331,7 @@ class _ControlSSABuilder:
             },
         )
         carried_phis: dict[int, Instr] = {}
+        bound_initial_ids: set[int] = set()
         for (
             updated_id,
             initial_id,
@@ -6308,7 +6352,15 @@ class _ControlSSABuilder:
                 },
             )
             carried_phis[updated_id] = self.current.instrs[-1]
-            self.external_values[initial_id] = current_value
+            if initial_id not in bound_initial_ids:
+                self.external_values[initial_id] = current_value
+                bound_initial_ids.add(initial_id)
+        break_bound_initials = {
+            int(initial_id): self.external_value(int(initial_id))
+            for _port_id, initial_id, updated_id
+            in getattr(loop, "result_ports", ())
+            if int(updated_id) == int(initial_id)
+        }
         result_port_aliases = self._bind_loop_result_ports_inside_body(loop)
         condition = self.fresh_value(dtype="bool")
         self.emit(
@@ -6660,6 +6712,17 @@ class _ControlSSABuilder:
                 },
             )
         blocks_before_body = {id(existing) for existing in self.blocks.values()}
+        initial_counts: dict[int, int] = {}
+        for _updated_id, initial_id, *_rest in carried:
+            initial_counts[int(initial_id)] = (
+                initial_counts.get(int(initial_id), 0) + 1
+            )
+        protected_alias_sources = frozenset(
+            int(updated_id)
+            for updated_id, initial_id, *_rest in carried
+            if initial_counts[int(initial_id)] > 1
+        )
+        self.protected_loop_alias_sources.append(protected_alias_sources)
         try:
             self.lower(loop.body, path=f"{path}.body")
             for mutation in loop.sequence_mutations:
@@ -6667,6 +6730,7 @@ class _ControlSSABuilder:
             for terminal in loop.terminal_controls:
                 self.lower(terminal, path=f"{path}.terminal")
         finally:
+            self.protected_loop_alias_sources.pop()
             self.loop_exit_contexts.pop()
             self.loop_targets.pop()
         body_blocks = [
@@ -6686,6 +6750,14 @@ class _ControlSSABuilder:
             carried_updates[updated_id] = published
             if published is not reserved:
                 carried_phis[updated_id].args[1] = published
+        if os.environ.get("TURING_DEBUG_LOOP_ALIAS_PUBLICATION"):
+            print(
+                "DEBUG-LOOP-CARRIED-UPDATES "
+                f"fn={self.function_name} path={path} "
+                f"updates={tuple((int(updated_id), int(value.id)) for updated_id, value in carried_updates.items())!r}",
+                file=sys.stderr,
+                flush=True,
+            )
         # Producers are counted in the BODY's blocks only, as the shortfall
         # message has always claimed. Scanning every block would let the
         # preheader seed above stand in for a producer, silently accepting a
@@ -6799,8 +6871,11 @@ class _ControlSSABuilder:
             self.local_control_values.pop(loop.induction, None)
         else:
             self.local_control_values[loop.induction] = previous_induction
+        settled_initial_ids: set[int] = set()
         for updated_id, initial_id, _initial, _updated, current in carried:
-            self.external_values[initial_id] = current
+            if initial_id not in settled_initial_ids:
+                self.external_values[initial_id] = current
+                settled_initial_ids.add(initial_id)
             self.external_values[updated_id] = current
         for missing_site in sorted(
             set(exit_context["expected_sites"]) - exit_context["sites_seen"]
@@ -6821,6 +6896,7 @@ class _ControlSSABuilder:
             carried=carried,
             break_edges=tuple(exit_context["break_edges"]),
             break_bound=tuple(exit_context["break_bound"]),
+            break_bound_initials=break_bound_initials,
         )
         if deployment_id is not None:
             self.emit_deployment_boundary(Handler.Join, record)
@@ -6901,6 +6977,7 @@ class _ControlSSABuilder:
         )
         self.external_values[int(loop.predicate_value_id)] = current_predicate
         carried_phis: dict[int, Instr] = {}
+        bound_initial_ids: set[int] = set()
         for updated_id, initial_id, initial, updated, current in carried:
             self.emit(
                 Handler.Phi,
@@ -6915,7 +6992,15 @@ class _ControlSSABuilder:
                 },
             )
             carried_phis[updated_id] = self.current.instrs[-1]
-            self.external_values[initial_id] = current
+            if initial_id not in bound_initial_ids:
+                self.external_values[initial_id] = current
+                bound_initial_ids.add(initial_id)
+        break_bound_initials = {
+            int(initial_id): self.external_value(int(initial_id))
+            for _port_id, initial_id, updated_id
+            in getattr(loop, "result_ports", ())
+            if int(updated_id) == int(initial_id)
+        }
         result_port_aliases = self._bind_loop_result_ports_inside_body(loop)
         if constant_predicate is None:
             self.conditional_branch(current_predicate, body, exit_block)
@@ -6956,6 +7041,17 @@ class _ControlSSABuilder:
             int(initial_id) for _updated_id, initial_id, *_rest in carried
         )
         blocks_before_body = {id(existing) for existing in self.blocks.values()}
+        initial_counts: dict[int, int] = {}
+        for _updated_id, initial_id, *_rest in carried:
+            initial_counts[int(initial_id)] = (
+                initial_counts.get(int(initial_id), 0) + 1
+            )
+        protected_alias_sources = frozenset(
+            int(updated_id)
+            for updated_id, initial_id, *_rest in carried
+            if initial_counts[int(initial_id)] > 1
+        )
+        self.protected_loop_alias_sources.append(protected_alias_sources)
         try:
             self.lower(loop.body, path=f"{path}.body")
             for mutation in loop.sequence_mutations:
@@ -6963,6 +7059,7 @@ class _ControlSSABuilder:
             for terminal in loop.terminal_controls:
                 self.lower(terminal, path=f"{path}.terminal")
         finally:
+            self.protected_loop_alias_sources.pop()
             self.preserved_region_output_ids = preserved_before_body
             self.loop_exit_contexts.pop()
             self.loop_targets.pop()
@@ -6977,6 +7074,14 @@ class _ControlSSABuilder:
             carried_updates[updated_id] = published
             if published is not reserved:
                 carried_phis[updated_id].args[1] = published
+        if os.environ.get("TURING_DEBUG_LOOP_ALIAS_PUBLICATION"):
+            print(
+                "DEBUG-WHILE-CARRIED-UPDATES "
+                f"fn={self.function_name} path={path} "
+                f"updates={tuple((int(updated_id), int(value.id)) for updated_id, value in carried_updates.items())!r}",
+                file=sys.stderr,
+                flush=True,
+            )
         produced_results = {
             id(instruction.res)
             for basic_block in body_blocks
@@ -7028,7 +7133,11 @@ class _ControlSSABuilder:
         # and runs the loop once too often (scorecard level 17: the
         # compiled while halved 1.0 to 0.5 where the authored loop stops).
         latch_restore = []
+        latch_initial_ids: set[int] = set()
         for updated_id, initial_id, _initial, updated, _current in carried:
+            if initial_id in latch_initial_ids:
+                continue
+            latch_initial_ids.add(initial_id)
             latch_restore.append(
                 (initial_id, self.external_values.get(initial_id))
             )
@@ -7096,8 +7205,11 @@ class _ControlSSABuilder:
                 "domain": "condition",
                 "source_loop_node_id": loop.source_loop_node_id,
             })
+        settled_initial_ids: set[int] = set()
         for updated_id, initial_id, _initial, _updated, current in carried:
-            self.external_values[initial_id] = current
+            if initial_id not in settled_initial_ids:
+                self.external_values[initial_id] = current
+                settled_initial_ids.add(initial_id)
             self.external_values[updated_id] = current
         self.external_values[int(loop.predicate_value_id)] = current_predicate
         for missing_site in sorted(
@@ -7119,6 +7231,7 @@ class _ControlSSABuilder:
             carried=carried,
             break_edges=tuple(exit_context["break_edges"]),
             break_bound=tuple(exit_context["break_bound"]),
+            break_bound_initials=break_bound_initials,
         )
 
     def lower_state_machine(

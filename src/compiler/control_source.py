@@ -1203,6 +1203,388 @@ def _anchored_control(control: "ControlProgram") -> bool:
     return any(isinstance(block, ConditionalBlock) for block in blocks)
 
 
+def enrich_represented_conditionals(
+    program: "ControlProgram",
+    candidates: "Iterable[ControlProgram]",
+    *,
+    enrich_loop_continuations: bool = True,
+) -> tuple["ControlProgram", tuple[dict[str, object], ...]]:
+    """Fill missing metadata on conditionals already nested in ``program``.
+
+    Loop composition can preserve a source conditional before the ordinary
+    conditional pass discovers its carried aliases.  Source identity proves
+    that both blocks describe the same branch, but replacing the loop-owned
+    block would discard its lexical body.  Merge only keyed metadata instead:
+    the resident entry wins every equal-key tie and a candidate contributes
+    only a key the resident does not yet contain.
+    """
+
+    from dataclasses import replace
+
+    candidate_by_source: dict[int, ConditionalBlock] = {}
+    for candidate in candidates:
+        roots = (
+            candidate.root.blocks
+            if isinstance(candidate.root, SequenceBlock)
+            else (candidate.root,)
+        )
+        for block in roots:
+            if (
+                isinstance(block, ConditionalBlock)
+                and block.source_node_id is not None
+            ):
+                candidate_by_source.setdefault(int(block.source_node_id), block)
+    receipts: list[dict[str, object]] = []
+
+    def can_fall_through(block: ControlBlock | None) -> bool:
+        """Whether an arm has a path to its enclosing conditional merge.
+
+        Only an unconditional loop-control instruction closes that path.
+        A conditional loop-control instruction retains its untaken path, and
+        controls inside a nested loop leave that loop rather than the arm we
+        are inspecting.  This is deliberately an existential query: one
+        surviving path is enough for branch-carried state to reach the merge.
+        """
+
+        if block is None:
+            return True
+        if isinstance(block, LoopControlBlock):
+            return block.predicate_value_id is not None
+        if isinstance(block, SequenceBlock):
+            return all(can_fall_through(child) for child in block.blocks)
+        if isinstance(block, ConditionalBlock):
+            return (
+                can_fall_through(block.body)
+                or can_fall_through(block.orelse)
+            )
+        if isinstance(block, ResourceScopeBlock):
+            return can_fall_through(block.body)
+        if isinstance(block, StateMachineTick):
+            return (
+                block.default is None
+                or can_fall_through(block.default)
+                or any(can_fall_through(body) for _value, body in block.cases)
+            )
+        # A loop may execute zero times.  Its break/continue instructions are
+        # internal edges and therefore do not close the containing arm.
+        return True
+
+    def reachable_carried_aliases(
+        source_node_id: int,
+        field: str,
+        proposed: tuple,
+        body: ControlBlock,
+        orelse: ControlBlock | None,
+    ) -> tuple:
+        """Discard aliases whose only authored update leaves before merge."""
+
+        body_reaches_merge = can_fall_through(body)
+        orelse_reaches_merge = can_fall_through(orelse)
+        reachable: list[tuple] = []
+        for item in proposed:
+            true_value, false_value, initial_value, merged_value = item
+            terminal_updates = tuple(
+                arm for arm, value, reaches_merge in (
+                    ("body", true_value, body_reaches_merge),
+                    ("orelse", false_value, orelse_reaches_merge),
+                )
+                if not reaches_merge and value != initial_value
+            )
+            reachable_updates = tuple(
+                arm for arm, value, reaches_merge in (
+                    ("body", true_value, body_reaches_merge),
+                    ("orelse", false_value, orelse_reaches_merge),
+                )
+                if reaches_merge and value != initial_value
+            )
+            if terminal_updates and not reachable_updates:
+                receipt = {
+                    "source_conditional_id": int(source_node_id),
+                    "field": str(field),
+                    "key": merged_value,
+                    "incumbent": None,
+                    "candidate": item,
+                    "outcome": "terminal_only_update_not_merged",
+                    "terminal_arms": terminal_updates,
+                    "priority": "exact_lexical_fallthrough",
+                    "tie_policy": "incumbent",
+                }
+                if receipt not in receipts:
+                    receipts.append(receipt)
+                continue
+            reachable.append(item)
+        return tuple(reachable)
+
+    def merge_keyed(
+        source_node_id: int,
+        field: str,
+        incumbent: tuple,
+        proposed: tuple,
+        key_index: int,
+    ) -> tuple:
+        settled = list(incumbent)
+        by_key = {item[key_index]: item for item in incumbent}
+        for item in proposed:
+            key = item[key_index]
+            resident = by_key.get(key)
+            if resident is None:
+                settled.append(item)
+                by_key[key] = item
+                outcome = "candidate_added"
+            elif resident == item:
+                outcome = "equal_incumbent_retained"
+            else:
+                outcome = "conflicting_incumbent_retained"
+            receipt = {
+                "source_conditional_id": int(source_node_id),
+                "field": str(field),
+                "key": key,
+                "incumbent": resident,
+                "candidate": item,
+                "outcome": outcome,
+                "priority": "exact_source_conditional_identity",
+                "tie_policy": "incumbent",
+            }
+            if receipt not in receipts:
+                receipts.append(receipt)
+        return tuple(settled)
+
+    def visit(block: ControlBlock) -> ControlBlock:
+        if isinstance(block, SequenceBlock):
+            return replace(block, blocks=tuple(map(visit, block.blocks)))
+        if isinstance(block, ConditionalBlock):
+            body = visit(block.body)
+            orelse = None if block.orelse is None else visit(block.orelse)
+            candidate = (
+                None
+                if block.source_node_id is None
+                else candidate_by_source.get(int(block.source_node_id))
+            )
+            if candidate is None:
+                return replace(block, body=body, orelse=orelse)
+            source_node_id = int(block.source_node_id)
+            carried_aliases = reachable_carried_aliases(
+                source_node_id,
+                "carried_aliases",
+                candidate.carried_aliases,
+                body,
+                orelse,
+            )
+            carried_sequence_aliases = reachable_carried_aliases(
+                source_node_id,
+                "carried_sequence_aliases",
+                candidate.carried_sequence_aliases,
+                body,
+                orelse,
+            )
+            return replace(
+                block,
+                body=body,
+                orelse=orelse,
+                predicate_expression=(
+                    block.predicate_expression
+                    if block.predicate_expression is not None
+                    else candidate.predicate_expression
+                ),
+                carried_aliases=merge_keyed(
+                    source_node_id, "carried_aliases",
+                    block.carried_aliases, carried_aliases, 3,
+                ),
+                carried_sequence_aliases=merge_keyed(
+                    source_node_id, "carried_sequence_aliases",
+                    block.carried_sequence_aliases,
+                    carried_sequence_aliases, 3,
+                ),
+                result_aliases=merge_keyed(
+                    source_node_id, "result_aliases",
+                    block.result_aliases, candidate.result_aliases, 2,
+                ),
+                entry_record_projections=tuple(dict.fromkeys((
+                    *block.entry_record_projections,
+                    *candidate.entry_record_projections,
+                ))),
+                body_callsite_ids=tuple(dict.fromkeys((
+                    *block.body_callsite_ids, *candidate.body_callsite_ids,
+                ))),
+                orelse_callsite_ids=tuple(dict.fromkeys((
+                    *block.orelse_callsite_ids,
+                    *candidate.orelse_callsite_ids,
+                ))),
+            )
+        if isinstance(block, WhileBlock):
+            return replace(
+                block, condition=visit(block.condition), body=visit(block.body),
+            )
+        if isinstance(block, (LoopBlock, ResourceScopeBlock)):
+            return replace(block, body=visit(block.body))
+        if isinstance(block, CallBlock):
+            return replace(block, callee=visit(block.callee))
+        if isinstance(block, StateMachineTick):
+            return replace(
+                block,
+                cases=tuple((value, visit(body)) for value, body in block.cases),
+                default=(
+                    None if block.default is None else visit(block.default)
+                ),
+            )
+        if isinstance(block, ParallelDeployment):
+            return replace(block, lanes=tuple(map(visit, block.lanes)))
+        return block
+
+    def conditional_aliases(block: ControlBlock):
+        """Yield aliases in this loop body, excluding nested loop scopes."""
+
+        if isinstance(block, ConditionalBlock):
+            yield from block.carried_aliases
+            yield from conditional_aliases(block.body)
+            if block.orelse is not None:
+                yield from conditional_aliases(block.orelse)
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                yield from conditional_aliases(child)
+        elif isinstance(block, ResourceScopeBlock):
+            yield from conditional_aliases(block.body)
+        elif isinstance(block, StateMachineTick):
+            for _value, body in block.cases:
+                yield from conditional_aliases(body)
+            if block.default is not None:
+                yield from conditional_aliases(block.default)
+        elif isinstance(block, ParallelDeployment):
+            for lane in block.lanes:
+                yield from conditional_aliases(lane)
+
+    def enrich_loop_carries(block: ControlBlock) -> ControlBlock:
+        if isinstance(block, SequenceBlock):
+            return replace(
+                block,
+                blocks=tuple(enrich_loop_carries(child)
+                             for child in block.blocks),
+            )
+        if isinstance(block, ConditionalBlock):
+            return replace(
+                block,
+                body=enrich_loop_carries(block.body),
+                orelse=(
+                    None if block.orelse is None
+                    else enrich_loop_carries(block.orelse)
+                ),
+            )
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            body = enrich_loop_carries(block.body)
+            condition = (
+                enrich_loop_carries(block.condition)
+                if isinstance(block, WhileBlock) else None
+            )
+            successors: dict[int, set[int]] = {}
+            for _true, _false, initial, merged in conditional_aliases(body):
+                if int(initial) != int(merged):
+                    successors.setdefault(int(initial), set()).add(int(merged))
+            snapshot_updates = {
+                int(updated)
+                for _port, _initial, updated in block.result_ports
+            }
+            incumbent = list(block.carried_aliases)
+            additions: list[tuple[int, int]] = []
+            for updated, initial in incumbent:
+                updated = int(updated)
+                initial = int(initial)
+                if updated not in snapshot_updates:
+                    continue
+                chain = [updated]
+                seen = {updated}
+                while True:
+                    choices = tuple(sorted(successors.get(chain[-1], ())))
+                    if not choices:
+                        break
+                    if len(choices) != 1:
+                        receipt = {
+                            "source_loop_node_id": block.source_loop_node_id,
+                            "snapshot_updated_value_id": updated,
+                            "initial_value_id": initial,
+                            "candidate_value_ids": choices,
+                            "outcome": "ambiguous_incumbent_retained",
+                            "priority": "conditional_continuation_chain",
+                            "tie_policy": "incumbent",
+                        }
+                        if receipt not in receipts:
+                            receipts.append(receipt)
+                        chain = [updated]
+                        break
+                    successor = int(choices[0])
+                    if successor in seen:
+                        receipt = {
+                            "source_loop_node_id": block.source_loop_node_id,
+                            "snapshot_updated_value_id": updated,
+                            "initial_value_id": initial,
+                            "cycle_value_id": successor,
+                            "outcome": "cyclic_incumbent_retained",
+                            "priority": "conditional_continuation_chain",
+                            "tie_policy": "incumbent",
+                        }
+                        if receipt not in receipts:
+                            receipts.append(receipt)
+                        chain = [updated]
+                        break
+                    seen.add(successor)
+                    chain.append(successor)
+                continued = chain[-1]
+                pair = (continued, initial)
+                if continued == updated or pair in incumbent or pair in additions:
+                    continue
+                additions.append(pair)
+                receipt = {
+                    "source_loop_node_id": block.source_loop_node_id,
+                    "snapshot_updated_value_id": updated,
+                    "continued_updated_value_id": continued,
+                    "initial_value_id": initial,
+                    "continuation_chain": tuple(chain),
+                    "outcome": "unique_continuation_added",
+                    "priority": "unique_conditional_continuation",
+                    "tie_policy": "incumbent",
+                }
+                if receipt not in receipts:
+                    receipts.append(receipt)
+            carried_aliases = tuple((*additions, *incumbent))
+            if isinstance(block, WhileBlock):
+                return replace(
+                    block,
+                    condition=condition,
+                    body=body,
+                    carried_aliases=carried_aliases,
+                )
+            return replace(
+                block, body=body, carried_aliases=carried_aliases,
+            )
+        if isinstance(block, ResourceScopeBlock):
+            return replace(block, body=enrich_loop_carries(block.body))
+        if isinstance(block, CallBlock):
+            return replace(block, callee=enrich_loop_carries(block.callee))
+        if isinstance(block, StateMachineTick):
+            return replace(
+                block,
+                cases=tuple((value, enrich_loop_carries(body))
+                            for value, body in block.cases),
+                default=(
+                    None if block.default is None
+                    else enrich_loop_carries(block.default)
+                ),
+            )
+        if isinstance(block, ParallelDeployment):
+            return replace(
+                block,
+                lanes=tuple(enrich_loop_carries(lane)
+                            for lane in block.lanes),
+            )
+        return block
+
+    visited_root = visit(program.root)
+    enriched_root = (
+        enrich_loop_carries(visited_root)
+        if enrich_loop_continuations else visited_root
+    )
+    return replace(program, root=enriched_root), tuple(receipts)
+
+
 def _insert_before_marker(
     block: "ControlBlock", anchor: int | None, inserted: "ControlBlock",
 ) -> tuple["ControlBlock", bool]:
@@ -1503,6 +1885,7 @@ def project_control_regions(
     retained_region_indices: Iterable[int],
     *,
     retained_value_ids: Iterable[int] | None = None,
+    preserve_source_loop_carries: bool = False,
 ) -> ControlProgram:
     """Project compiled control onto regions that still require runtime work.
 
@@ -1519,6 +1902,50 @@ def project_control_regions(
         if retained_value_ids is None
         else frozenset(int(value) for value in retained_value_ids)
     )
+
+    control_defined_values: set[int] = set()
+
+    def collect_control_definitions(block: ControlBlock) -> None:
+        if isinstance(block, ConditionalBlock):
+            control_defined_values.update(
+                int(alias[3]) for alias in block.carried_aliases
+            )
+            control_defined_values.update(
+                int(alias[3]) for alias in block.carried_sequence_aliases
+            )
+            control_defined_values.update(
+                int(alias[2]) for alias in block.result_aliases
+            )
+            collect_control_definitions(block.body)
+            if block.orelse is not None:
+                collect_control_definitions(block.orelse)
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                collect_control_definitions(child)
+        elif isinstance(block, WhileBlock):
+            collect_control_definitions(block.condition)
+            collect_control_definitions(block.body)
+        elif isinstance(block, (LoopBlock, ResourceScopeBlock)):
+            collect_control_definitions(block.body)
+        elif isinstance(block, CallBlock):
+            collect_control_definitions(block.callee)
+        elif isinstance(block, StateMachineTick):
+            for _value, body in block.cases:
+                collect_control_definitions(body)
+            if block.default is not None:
+                collect_control_definitions(block.default)
+        elif isinstance(block, ParallelDeployment):
+            for lane in block.lanes:
+                collect_control_definitions(lane)
+
+    collect_control_definitions(program.root)
+
+    def value_survives_projection(value_id: int) -> bool:
+        return (
+            retained_values is None
+            or int(value_id) in retained_values
+            or int(value_id) in control_defined_values
+        )
 
     def project(block: ControlBlock) -> ControlBlock | None:
         if isinstance(block, StatementBlock):
@@ -1548,20 +1975,14 @@ def project_control_regions(
                 block.predicate_expression,
                 tuple(
                     carried for carried in block.carried_aliases
-                    if retained_values is None
-                    or all(
-                        int(value_id) in retained_values
-                        for value_id in carried
-                    )
+                    if all(value_survives_projection(value_id)
+                           for value_id in carried)
                 ),
                 block.source_node_id,
                 tuple(
                     carried for carried in block.carried_sequence_aliases
-                    if retained_values is None
-                    or all(
-                        int(value_id) in retained_values
-                        for value_id in carried
-                    )
+                    if all(value_survives_projection(value_id)
+                           for value_id in carried)
                 ),
                 entry_record_projections=block.entry_record_projections,
                 body_callsite_ids=block.body_callsite_ids,
@@ -1599,6 +2020,11 @@ def project_control_regions(
                     # retention: the loop itself declares the continuation.
                     if retained_values is None
                     or int(updated) in retained_values
+                    or int(updated) in control_defined_values
+                    or (
+                        preserve_source_loop_carries
+                        and block.source_loop_node_id is not None
+                    )
                     or any(
                         int(updated) == int(port_updated)
                         for _port, _init, port_updated in block.result_ports
@@ -1646,6 +2072,11 @@ def project_control_regions(
                     # retention: the loop itself declares the continuation.
                     if retained_values is None
                     or int(updated) in retained_values
+                    or int(updated) in control_defined_values
+                    or (
+                        preserve_source_loop_carries
+                        and block.source_loop_node_id is not None
+                    )
                     or any(
                         int(updated) == int(port_updated)
                         for _port, _init, port_updated in block.result_ports

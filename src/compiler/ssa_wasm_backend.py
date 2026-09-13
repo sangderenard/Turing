@@ -54,6 +54,17 @@ class SSAWasmArtifact:
         return wat_path, wasm_path
 
 
+#: How far a whole-number exponent is unrolled into multiplies.
+#: Eight covers every power that appears in section properties,
+#: modal frequencies and contact laws; past that the instruction
+#: count stops being worth it and a shortfall is more honest.
+_MAX_UNROLLED_POWER = 8
+
+#: SSA comparison names to the f64 opcode that spells each.
+_F64_COMPARISONS = {"Lt": "lt", "Le": "le", "Gt": "gt",
+                    "Ge": "ge", "Eq": "eq", "Ne": "ne"}
+
+
 def emit_ssa_function_to_wasm(
     module: IRModule, function_name: str, *, entry_name: str | None = None,
     trig_solver: str = "lut", trig_epsilon: float | None = None,
@@ -305,6 +316,38 @@ def emit_ssa_function_to_wasm(
         elif op in {"Abs", "Sqrt", "Neg"} and len(args) == 1:
             get(args[0]); builder.op(op.lower())
             wat_operation = f"local.get $t{args[0]} f64.{op.lower()}"
+        elif str(op) in _F64_COMPARISONS and len(args) == 2:
+            # A COMPARISON IS AN INSTRUCTION HERE, not a missing feature.
+            # WebAssembly has f64.le and the whole family; the table in
+            # wasm_binary has carried their opcodes all along and this
+            # emitter simply never reached for them, so any law
+            # containing a Piecewise -- steel softening with temperature,
+            # a contact that switches on, a limit that saturates -- came
+            # back as "no direct scalar WASM spelling" and could not be
+            # published as a component at all.
+            #
+            # The result is i32; everything else on this stack is f64, so
+            # it is converted back the same way the mask reaches i1 in
+            # the LLVM lane: by its truthiness, not by a special type.
+            get(args[0]); get(args[1])
+            builder.op(_F64_COMPARISONS[str(op)])
+            builder.op("convert_i32_u")
+            wat_operation = (f"local.get $t{args[0]} local.get $t{args[1]} "
+                             f"f64.{_F64_COMPARISONS[str(op)]} "
+                             f"f64.convert_i32_u")
+        elif str(op) in {"Select", "where"} and len(args) == 3:
+            # Select(mask, when_true, when_false) -- the same order the
+            # LLVM lane uses, so one SSA program means one thing on both
+            # targets. WASM's own `select` pops (val1, val2, condition)
+            # and keeps val1 when the condition is non-zero, so the two
+            # values go on in that order and the mask is reduced to i32
+            # by comparing it against zero.
+            get(args[1]); get(args[2]); get(args[0])
+            builder.value_const(0.0)
+            builder.op("ne")
+            builder.select()
+            wat_operation = (f"local.get $t{args[1]} local.get $t{args[2]} "
+                             f"local.get $t{args[0]} f64.const 0 f64.ne select")
         elif op == "Pow" and len(args) == 2:
             exponent = constants.get(args[1])
             if exponent == 2.0:
@@ -313,6 +356,38 @@ def emit_ssa_function_to_wasm(
             elif exponent == -1.0:
                 builder.value_const(1.0); get(args[0]); builder.op("div")
                 wat_operation = f"f64.const 0x1.0000000000000p+0 local.get $t{args[0]} f64.div"
+            elif (exponent is not None and float(exponent).is_integer()
+                  and 2 <= abs(int(exponent)) <= _MAX_UNROLLED_POWER):
+                # A WHOLE-NUMBER POWER IS REPEATED MULTIPLICATION, and
+                # that is not a reduction, an identity or a policy
+                # choice -- it is what the exponent MEANS. Scalar WASM
+                # has no pow instruction, so multiplication is not a
+                # cheaper way of getting there, it is the only way; and
+                # x**2 was already being spelled exactly like this three
+                # lines up. Stopping at 2 meant a second moment of area
+                # -- pi/4 (ro^4 - ri^4), the most ordinary expression in
+                # beam theory there is -- could not lower to the game
+                # engine's own target at all, under any contract.
+                #
+                # Left-to-right, so the association is the one the
+                # source would have had if it were written out, and the
+                # rounding is therefore the rounding a reader expects.
+                n = abs(int(exponent))
+                get(args[0])
+                for _ in range(n - 1):
+                    get(args[0])
+                    builder.op("mul")
+                chain = " ".join([f"local.get $t{args[0]}"]
+                                 + [f"local.get $t{args[0]} f64.mul"] * (n - 1))
+                if int(exponent) < 0:
+                    # 1/x^n rather than x^-n, for the same reason -1.0
+                    # above is spelled as a divide
+                    builder.local_set(temp := builder.temp())
+                    builder.value_const(1.0)
+                    builder.local_get(temp)
+                    builder.op("div")
+                    chain = (f"f64.const 0x1.0000000000000p+0 {chain} f64.div")
+                wat_operation = chain
             elif exponent == -2.0 and contract.inexact_identities:
                 builder.value_const(1.0); get(args[0]); get(args[0]); builder.op("mul"); builder.op("div")
                 wat_operation = (

@@ -7443,6 +7443,18 @@ def _ordinary_conditional_control_programs(
         for node_id, data in graph.G.nodes(data=True)
         if isinstance(data.get("value_id", node_id), int)
     }
+    reducer_phi_record_fields = _record_field_state_keys(
+        graph.G,
+        node_by_value,
+        (
+            int(data.get("value_id", node_id))
+            for node_id, data in graph.G.nodes(data=True)
+            if str(data.get("type") or data.get("op") or "").casefold()
+            == "phi"
+            and (data.get("attributes") or {}).get("record_field_state")
+            is not None
+        ),
+    )
     programs = []
     for control_id, record in _source_control_records(graph.G).items():
         expression = record.get("expression")
@@ -7862,9 +7874,32 @@ def _ordinary_conditional_control_programs(
             # contains its SetAttr event ids; reconstructing that flat history
             # creates a second carried chain whose pre-branch "value" is an
             # effect node with no definition.  The exact field-state Phi wins.
-            if direct_phi_record_fields.intersection(
-                _record_field_state_keys(graph.G, node_by_value, ordered)
-            ):
+            ordered_record_fields = _record_field_state_keys(
+                graph.G, node_by_value, ordered,
+            )
+            authoritative_record_fields = (
+                direct_phi_record_fields | reducer_phi_record_fields
+            ).intersection(ordered_record_fields)
+            if authoritative_record_fields:
+                receipt = {
+                    "source_conditional_id": int(control_id),
+                    "binding_name": str(name),
+                    "candidate_value_ids": ordered,
+                    "record_field_keys": tuple(sorted(
+                        authoritative_record_fields
+                    )),
+                    "outcome": "exact_field_state_phi_retained",
+                    "priority": "exact_reducer_record_field_state",
+                    "tie_policy": "incumbent",
+                }
+                receipts = list(graph.G.graph.get(
+                    "suppressed_flat_record_field_alias_receipts", ()
+                ))
+                if receipt not in receipts:
+                    receipts.append(receipt)
+                    graph.G.graph[
+                        "suppressed_flat_record_field_alias_receipts"
+                    ] = tuple(receipts)
                 continue
             # An arm that ends in return/break/continue never reaches the
             # merge point: the values it binds leave through its own edge
@@ -7893,11 +7928,16 @@ def _ordinary_conditional_control_programs(
             )
             first_branch = min(branch_positions)
             last_branch = max(branch_positions)
-            initial = next((
+            initial_candidate = next((
                 ordered[position]
                 for position in range(first_branch - 1, -1, -1)
                 if ordered[position] not in {*body_values, *else_values}
-            ), ordered[0])
+            ), None)
+            initial = (
+                ordered[0]
+                if initial_candidate is None
+                else int(initial_candidate)
+            )
             # Deterministic identity order is the authoritative Phi
             # correlation.  Nested conditionals are completed inside-out by
             # the frontend, and older ``source_conditional_id`` annotations
@@ -7924,6 +7964,45 @@ def _ordinary_conditional_control_programs(
                     ) or {}).get("source_conditional_id", -1))
                     == int(control_id)
                 ), None)
+            if (
+                merged is None
+                and initial_candidate is not None
+                and (body_values or else_values)
+            ):
+                # A source alias assignment can replace a local name without
+                # creating a separately numbered reducer Phi.  The identity
+                # history then ends at the branch-local value even though the
+                # untouched arm must retain the pre-branch incumbent.  Use
+                # the authored arm value as the merge spelling; conditional
+                # SSA lowering sees that it is already defined in an arm and
+                # allocates a fresh join version.  This is finite (one choice
+                # from the ordered history), and an equal-priority untouched
+                # arm keeps its incumbent.
+                merged = int(
+                    body_values[-1] if body_values else else_values[-1]
+                )
+                receipt = {
+                    "source_conditional_id": int(control_id),
+                    "binding_name": str(name),
+                    "body_value_id": int(
+                        body_values[-1] if body_values else initial
+                    ),
+                    "orelse_value_id": int(
+                        else_values[-1] if else_values else initial
+                    ),
+                    "initial_value_id": int(initial),
+                    "merge_spelling_value_id": int(merged),
+                    "priority": "exact_ordered_identity_history",
+                    "tie_policy": "incumbent",
+                }
+                receipts = list(graph.G.graph.get(
+                    "synthesized_conditional_merge_receipts", ()
+                ))
+                if receipt not in receipts:
+                    receipts.append(receipt)
+                    graph.G.graph[
+                        "synthesized_conditional_merge_receipts"
+                    ] = tuple(receipts)
             if merged is None:
                 continue
             carried.append((
@@ -7932,6 +8011,182 @@ def _ordinary_conditional_control_programs(
                 initial,
                 merged,
             ))
+        represented_binding_names = {
+            str(binding) for binding in direct_phi_bindings
+        }
+        represented_binding_names.update(
+            str(receipt["binding_name"])
+            for receipt in graph.G.graph.get(
+                "synthesized_conditional_merge_receipts", ()
+            )
+            if int(receipt.get("source_conditional_id", -1))
+            == int(control_id)
+            and receipt.get("binding_name") is not None
+        )
+
+        def direct_name_assignments(
+            statements: Iterable[ast.stmt],
+        ) -> dict[str, int]:
+            """Return exact retained RHS values for direct alias assignments."""
+
+            assignments: dict[str, int] = {}
+            for statement in statements:
+                targets: tuple[ast.expr, ...]
+                if isinstance(statement, ast.Assign):
+                    targets = tuple(statement.targets)
+                    value_expression = statement.value
+                elif isinstance(statement, ast.AnnAssign):
+                    targets = (statement.target,)
+                    value_expression = statement.value
+                else:
+                    continue
+                if value_expression is None:
+                    continue
+                rhs_node_id = _retained_control_value_id(
+                    graph.G, None, value_expression,
+                )
+                if rhs_node_id is not None and rhs_node_id in graph.G:
+                    rhs_value_id = int(graph.G.nodes[rhs_node_id].get(
+                        "value_id", rhs_node_id,
+                    ))
+                elif isinstance(value_expression, ast.Name):
+                    # Reduction can remove the load syntax for a direct alias
+                    # while retaining the bound producer under its exact
+                    # source name. Resolve only one resident identity; equal
+                    # candidates are deliberately left to the incumbent.
+                    resident = tuple(dict.fromkeys(
+                        int(value_id)
+                        for value_id in (
+                            (graph.G.graph.get("identity_table") or {}).get(
+                                str(value_expression.id), ()
+                            )
+                        )
+                        if int(value_id) in node_by_value
+                    ))
+                    if len(resident) != 1:
+                        continue
+                    rhs_value_id = int(resident[0])
+                else:
+                    continue
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        assignments[str(target.id)] = rhs_value_id
+            return assignments
+
+        direct_body_assignments = direct_name_assignments(body_statements)
+        direct_else_assignments = direct_name_assignments(else_statements)
+        for binding_name in dict.fromkeys((
+            *direct_body_assignments,
+            *direct_else_assignments,
+        )):
+            if (
+                binding_name in represented_binding_names
+                or binding_name in positional_output_names
+            ):
+                continue
+            body_value = direct_body_assignments.get(binding_name)
+            else_value = direct_else_assignments.get(binding_name)
+            authored_values = tuple(dict.fromkeys(
+                int(value)
+                for value in (body_value, else_value)
+                if value is not None
+            ))
+            history = tuple(dict.fromkeys(
+                int(value_id)
+                for value_id in (
+                    (graph.G.graph.get("identity_table") or {}).get(
+                        binding_name, ()
+                    )
+                )
+                if int(value_id) in node_by_value
+                and int(value_id) not in authored_values
+            ))
+            if not history or not authored_values:
+                continue
+            rhs_nodes = tuple(
+                int(node_by_value[value_id])
+                for value_id in authored_values
+                if value_id in node_by_value
+            )
+            if len(rhs_nodes) != len(authored_values):
+                continue
+            ranked_incumbents = []
+            for candidate_value_id in history:
+                candidate_node_id = int(node_by_value[candidate_value_id])
+                if not all(
+                    nx.has_path(graph.G, candidate_node_id, rhs_node_id)
+                    for rhs_node_id in rhs_nodes
+                ):
+                    continue
+                distances = tuple(
+                    int(nx.shortest_path_length(
+                        graph.G, candidate_node_id, rhs_node_id,
+                    ))
+                    for rhs_node_id in rhs_nodes
+                )
+                ranked_incumbents.append((
+                    max(distances), sum(distances),
+                    int(candidate_value_id),
+                ))
+            if not ranked_incumbents:
+                continue
+            ranked_incumbents.sort()
+            best_rank = ranked_incumbents[0][:2]
+            best = tuple(
+                candidate
+                for maximum, total, candidate in ranked_incumbents
+                if (maximum, total) == best_rank
+            )
+            if len(best) != 1:
+                unresolved = {
+                    "source_conditional_id": int(control_id),
+                    "binding_name": str(binding_name),
+                    "candidate_value_ids": best,
+                    "reason": "equal_priority_incumbents",
+                    "tie_policy": "incumbent",
+                }
+                unresolved_receipts = list(graph.G.graph.get(
+                    "unresolved_conditional_alias_assignments", ()
+                ))
+                if unresolved not in unresolved_receipts:
+                    unresolved_receipts.append(unresolved)
+                    graph.G.graph[
+                        "unresolved_conditional_alias_assignments"
+                    ] = tuple(unresolved_receipts)
+                continue
+            initial = int(best[0])
+            true_value = int(
+                body_value if body_value is not None else initial
+            )
+            false_value = int(
+                else_value if else_value is not None else initial
+            )
+            merge_spelling = int(
+                body_value if body_value is not None else else_value
+            )
+            carried.append((
+                true_value, false_value, initial, merge_spelling,
+            ))
+            represented_binding_names.add(str(binding_name))
+            receipt = {
+                "source_conditional_id": int(control_id),
+                "binding_name": str(binding_name),
+                "body_value_id": true_value,
+                "orelse_value_id": false_value,
+                "initial_value_id": initial,
+                "merge_spelling_value_id": merge_spelling,
+                "dataflow_rank": best_rank,
+                "priority": "exact_nearest_dataflow_ancestor",
+                "tie_policy": "incumbent",
+            }
+            receipts = list(graph.G.graph.get(
+                "synthesized_conditional_merge_receipts", ()
+            ))
+            if receipt not in receipts:
+                receipts.append(receipt)
+                graph.G.graph[
+                    "synthesized_conditional_merge_receipts"
+                ] = tuple(receipts)
         body = SequenceBlock((
             *(
                 StatementBlock((f"__scheduled_region_{index}__",))
@@ -19646,6 +19901,7 @@ class ProcessGraphGLSLDeployment:
                     reduction.control_program,
                     runtime_regions,
                     retained_value_ids=retained_value_ids,
+                    preserve_source_loop_carries=True,
                 )
                 for reduction in considered_reductions
             )
@@ -21500,6 +21756,7 @@ class ProcessGraphGLSLDeployment:
                     reduction.control_program,
                     runtime_regions,
                     retained_value_ids=retained_value_ids,
+                    preserve_source_loop_carries=True,
                 )
                 for reduction in considered_reductions
             )

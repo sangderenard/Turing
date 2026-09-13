@@ -2716,6 +2716,44 @@ def test_while_result_port_versions_an_already_defined_body_identity():
     assert check_definition_dominance(IRModule({function.name: function})) == []
 
 
+def test_while_break_bound_result_keeps_prebody_zero_trip_incumbent():
+    control = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=StatementBlock(("__scheduled_region_0__",)),
+            body=SequenceBlock((
+                StatementBlock(("__scheduled_region_1__",)),
+                ConditionalBlock(
+                    predicate_value_id=11,
+                    body=StatementBlock(("__scheduled_region_2__",)),
+                    carried_aliases=((3, 2, 2, 3),),
+                ),
+            )),
+            result_ports=((4, 2, 2),),
+        ),
+        region_indices=(0, 1, 2),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={
+            0: ((1,), (10,)),
+            1: ((1,), (11,)),
+            2: ((2,), (3,)),
+        },
+    )
+
+    assert shortfalls == ()
+    result_phi = next(
+        instruction
+        for instruction in function.blocks["while_exit"].instrs
+        if instruction.attributes.get("result_kind") == "break_bound"
+    )
+    assert [value.id for value in result_phi.args] == [2]
+    assert result_phi.attributes["incoming_blocks"] == ("while_header",)
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
 def test_while_result_port_selects_the_value_visible_on_a_break_edge():
     control = ControlProgram(
         WhileBlock(
@@ -3306,6 +3344,163 @@ def test_conditional_versions_join_when_graph_reuses_arm_identity():
         "source_value_id": 40,
         "ssa_conditional_write_version": True,
     }
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
+def test_shared_loop_incumbent_keeps_distinct_updates_and_rhs_identity():
+    """Two logical bindings may begin as the same source value then diverge."""
+
+    control = ControlProgram(WhileBlock(
+        predicate_value_id=10,
+        condition=SequenceBlock(()),
+        body=SequenceBlock((
+            ScalarFieldWriteBlock(
+                field_value_id=None,
+                value_expression=ControlExpression(
+                    "const", value_id=20, literal=7.0,
+                ),
+                dtype="float64",
+                effect_node_id=20,
+            ),
+            ConditionalBlock(
+                predicate_value_id=11,
+                body=SequenceBlock(()),
+                orelse=SequenceBlock(()),
+                predicate_expression=ControlExpression(
+                    "value", value_id=11,
+                ),
+                carried_aliases=((20, 1, 1, 30),),
+                source_node_id=12,
+            ),
+        )),
+        carried_aliases=((30, 1), (20, 1)),
+        result_ports=((40, 1, 30), (41, 1, 20)),
+        predicate_expression=ControlExpression(
+            "const", value_id=10, literal=True,
+        ),
+        source_loop_node_id=50,
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_value_meta={
+            1: Meta((), "float64"),
+            10: Meta((), "bool"),
+            11: Meta((), "bool"),
+        },
+    )
+
+    assert shortfalls == ()
+    loop_phis = [
+        instruction
+        for instruction in function.blocks["while_header"].instrs
+        if instruction.attributes.get("binding") == "loop_carried"
+    ]
+    assert [phi.attributes["updated_value_id"] for phi in loop_phis] == [
+        30, 20,
+    ]
+    conditional_phi = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "conditional_carried"
+    )
+    assert conditional_phi.args[0] is loop_phis[1].args[1]
+    assert conditional_phi.args[1] is loop_phis[0].res
+    assert loop_phis[0].args[1] is conditional_phi.res
+    assert loop_phis[1].args[1] is not conditional_phi.res
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
+def test_snapshot_update_reused_as_conditional_initial_stays_raw():
+    """A continuation merge must not overwrite its raw result snapshot."""
+
+    control = ControlProgram(WhileBlock(
+        predicate_value_id=10,
+        condition=SequenceBlock(()),
+        body=SequenceBlock((
+            ScalarFieldWriteBlock(
+                field_value_id=None,
+                value_expression=ControlExpression(
+                    "const", value_id=20, literal=2.0,
+                ),
+                dtype="float64",
+                effect_node_id=20,
+            ),
+            ConditionalBlock(
+                predicate_value_id=11,
+                body=SequenceBlock(()),
+                orelse=SequenceBlock(()),
+                predicate_expression=ControlExpression(
+                    "value", value_id=11,
+                ),
+                carried_aliases=((20, 20, 20, 30),),
+                source_node_id=12,
+            ),
+            ConditionalBlock(
+                predicate_value_id=13,
+                body=ScalarFieldWriteBlock(
+                    field_value_id=None,
+                    value_expression=ControlExpression(
+                        "const", value_id=40, literal=4.0,
+                    ),
+                    dtype="float64",
+                    effect_node_id=40,
+                ),
+                orelse=SequenceBlock(()),
+                predicate_expression=ControlExpression(
+                    "value", value_id=13,
+                ),
+                carried_aliases=((40, 30, 30, 40),),
+                source_node_id=14,
+            ),
+        )),
+        carried_aliases=((40, 1), (20, 1)),
+        result_ports=((50, 1, 20),),
+        predicate_expression=ControlExpression(
+            "const", value_id=10, literal=True,
+        ),
+        source_loop_node_id=60,
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_value_meta={
+            1: Meta((), "float64"),
+            10: Meta((), "bool"),
+            11: Meta((), "bool"),
+            13: Meta((), "bool"),
+        },
+    )
+
+    assert shortfalls == ()
+    loop_phis = [
+        instruction
+        for instruction in function.blocks["while_header"].instrs
+        if instruction.attributes.get("binding") == "loop_carried"
+    ]
+    assert [phi.attributes["updated_value_id"] for phi in loop_phis] == [
+        40, 20,
+    ]
+    conditional_phis = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "conditional_carried"
+    ]
+    assert loop_phis[0].args[1] is conditional_phis[-1].res
+    assert loop_phis[1].args[1] is not conditional_phis[0].res
+    raw_backedge = loop_phis[1].args[1]
+    raw_definition = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is raw_backedge
+    )
+    assert raw_definition.op == "Const"
+    assert raw_definition.attributes["value"] == 2.0
     assert check_definition_dominance(IRModule({function.name: function})) == []
 
 

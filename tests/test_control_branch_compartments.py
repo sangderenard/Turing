@@ -9,10 +9,16 @@ from types import SimpleNamespace
 import networkx as nx
 
 from src.compiler.glsl_deployment_strategy import (
+    _ordinary_conditional_control_programs,
     _optional_presence_control_expression,
     _repair_missing_phi_initial_identities,
     _branch_compartments,
     _record_field_state_keys,
+)
+from src.compiler.control_source import (
+    ConditionalBlock, ControlExpression, ControlProgram, SequenceBlock,
+    LoopControlBlock, StatementBlock, WhileBlock,
+    enrich_represented_conditionals,
 )
 from src.compiler.glsl_deployment_strategy import _retain_source_sequence_mutation_records
 from src.compiler.fortran_c_shell import (
@@ -167,6 +173,186 @@ def test_phi_initial_repair_updates_already_planned_control_identity():
     assert repaired.root.carried_aliases == ((261, 298, 256, 262),)
 
 
+def test_alias_assignment_missing_from_history_synthesizes_conditional_merge():
+    conditional = ast.parse(
+        "if ready:\n"
+        "    dt_cap = lattice_value\n"
+    ).body[0]
+    graph = nx.DiGraph()
+    graph.graph["source_control_records"] = {
+        10: {"expression": conditional, "predicate_id": 1},
+    }
+    # The reducer retained the incumbent name history but the branch performs
+    # a pure alias assignment, so the RHS has no entry under ``dt_cap``.
+    graph.graph["identity_table"] = {
+        "dt_cap": (2,),
+        "lattice_value": (3,),
+    }
+    graph.add_node(
+        1, value_id=1, type="Input", expr_obj=conditional.test,
+        parents=[],
+    )
+    graph.add_node(2, value_id=2, type="Input", parents=[])
+    graph.add_node(
+        3, value_id=3, type="floor",
+        parents=[(2, "value")],
+    )
+    graph.add_edge(2, 3)
+    graph.add_node(10, value_id=10, type="If", expr_obj=conditional,
+                   parents=[(1, "test")])
+    region = nx.DiGraph()
+    region.graph["deployment_nodes"] = (1,)
+
+    programs = _ordinary_conditional_control_programs(
+        SimpleNamespace(G=graph), (0,), (SimpleNamespace(G=region),),
+    )
+
+    assert len(programs) == 1
+    assert isinstance(programs[0].root, SequenceBlock)
+    carried = next(
+        block.carried_aliases
+        for block in programs[0].root.blocks
+        if isinstance(block, ConditionalBlock)
+    )
+    assert carried == ((3, 2, 2, 3),)
+    assert graph.graph["synthesized_conditional_merge_receipts"] == ({
+        "source_conditional_id": 10,
+        "binding_name": "dt_cap",
+        "body_value_id": 3,
+        "orelse_value_id": 2,
+        "initial_value_id": 2,
+        "merge_spelling_value_id": 3,
+        "dataflow_rank": (1, 1),
+        "priority": "exact_nearest_dataflow_ancestor",
+        "tie_policy": "incumbent",
+    },)
+
+
+def test_represented_loop_conditional_gains_missing_alias_and_keeps_incumbent():
+    resident = ConditionalBlock(
+        10,
+        StatementBlock(("resident-body",)),
+        source_node_id=90,
+        carried_aliases=((7, 6, 6, 8),),
+    )
+    program = ControlProgram(WhileBlock(
+        predicate_value_id=20,
+        condition=StatementBlock(("condition",)),
+        body=SequenceBlock((resident,)),
+    ))
+    candidate = ControlProgram(SequenceBlock((ConditionalBlock(
+        10,
+        StatementBlock(("candidate-body",)),
+        predicate_expression=ControlExpression("value", value_id=10),
+        source_node_id=90,
+        carried_aliases=(
+            (70, 60, 60, 8),
+            (3, 2, 2, 3),
+        ),
+    ),)))
+
+    enriched, receipts = enrich_represented_conditionals(
+        program, (candidate,),
+    )
+
+    conditional = enriched.root.body.blocks[0]
+    assert conditional.body.lines == ("resident-body",)
+    assert conditional.predicate_expression.value_id == 10
+    assert conditional.carried_aliases == (
+        (7, 6, 6, 8),
+        (3, 2, 2, 3),
+    )
+    assert [receipt["outcome"] for receipt in receipts] == [
+        "conflicting_incumbent_retained",
+        "candidate_added",
+    ]
+    assert all(receipt["tie_policy"] == "incumbent" for receipt in receipts)
+
+
+def test_represented_conditional_does_not_merge_terminal_only_assignment():
+    resident = ConditionalBlock(
+        10,
+        SequenceBlock((
+            StatementBlock(("assigned-before-break",)),
+            LoopControlBlock("break", site_node_id=91),
+        )),
+        source_node_id=90,
+    )
+    program = ControlProgram(WhileBlock(
+        predicate_value_id=20,
+        condition=StatementBlock(("condition",)),
+        body=SequenceBlock((resident,)),
+    ))
+    candidate = ControlProgram(SequenceBlock((ConditionalBlock(
+        10,
+        StatementBlock(("candidate-body",)),
+        source_node_id=90,
+        carried_aliases=((3, 2, 2, 3),),
+    ),)))
+
+    enriched, receipts = enrich_represented_conditionals(
+        program, (candidate,),
+    )
+
+    conditional = enriched.root.body.blocks[0]
+    assert conditional.carried_aliases == ()
+    assert receipts == ({
+        "source_conditional_id": 90,
+        "field": "carried_aliases",
+        "key": 3,
+        "incumbent": None,
+        "candidate": (3, 2, 2, 3),
+        "outcome": "terminal_only_update_not_merged",
+        "terminal_arms": ("body",),
+        "priority": "exact_lexical_fallthrough",
+        "tie_policy": "incumbent",
+    },)
+
+
+def test_loop_snapshot_and_unique_conditional_continuation_get_distinct_carries():
+    loop = WhileBlock(
+        predicate_value_id=10,
+        condition=StatementBlock(("condition",)),
+        body=SequenceBlock((
+            ConditionalBlock(
+                11, StatementBlock(("first",)),
+                carried_aliases=((21, 20, 20, 22),),
+                source_node_id=90,
+            ),
+            ConditionalBlock(
+                12, StatementBlock(("second",)),
+                carried_aliases=((23, 22, 22, 24),),
+                source_node_id=91,
+            ),
+        )),
+        carried_aliases=((20, 1),),
+        result_ports=((30, 1, 20),),
+        source_loop_node_id=80,
+    )
+
+    deferred, deferred_receipts = enrich_represented_conditionals(
+        ControlProgram(loop), (), enrich_loop_continuations=False,
+    )
+    assert deferred.root.carried_aliases == ((20, 1),)
+    assert deferred_receipts == ()
+
+    enriched, receipts = enrich_represented_conditionals(
+        ControlProgram(loop), (),
+    )
+
+    assert enriched.root.carried_aliases == ((24, 1), (20, 1))
+    assert receipts == ({
+        "source_loop_node_id": 80,
+        "snapshot_updated_value_id": 20,
+        "continued_updated_value_id": 24,
+        "initial_value_id": 1,
+        "continuation_chain": (20, 22, 24),
+        "outcome": "unique_continuation_added",
+        "priority": "unique_conditional_continuation",
+        "tie_policy": "incumbent",
+    },)
+
+
 def test_locationless_ast_helpers_do_not_claim_unrelated_branch_work():
     conditional = ast.parse("if ready:\n    value = source\n").body[0]
     guarded_name = conditional.body[0].value
@@ -250,3 +436,74 @@ def test_record_field_state_key_correlates_phi_and_setattr_history():
     assert _record_field_state_keys(graph, node_by_value, (41,)) == {
         (7, "flag")
     }
+
+
+def test_exact_field_state_phi_suppresses_later_flat_setattr_history():
+    conditional = ast.parse(
+        "if ready:\n"
+        "    ctrl.flag += 1\n"
+    ).body[0]
+    assignment = conditional.body[0]
+    graph = nx.DiGraph()
+    graph.graph["source_control_records"] = {
+        10: {"expression": conditional, "predicate_id": 1},
+    }
+    graph.graph["identity_table"] = {"ctrl.flag": (40, 42)}
+    graph.add_node(
+        1, value_id=1, type="Input", expr_obj=conditional.test,
+        parents=[],
+    )
+    graph.add_node(7, value_id=7, type="Input", parents=[])
+    graph.add_node(12, value_id=12, type="Constant", parents=[])
+    graph.add_node(
+        40, value_id=40, type="SetAttr",
+        attributes={"attribute": "flag"},
+        parents=[(7, "object"), (12, "value")],
+    )
+    graph.add_node(
+        41, value_id=41, type="Phi",
+        attributes={
+            "binding_name": "field:7.flag",
+            "source_conditional_id": 9,
+            "initial_value_id": 12,
+            "record_field_state": (7, "flag"),
+        },
+        parents=[(12, "body"), (12, "orelse")],
+    )
+    graph.add_node(
+        13, value_id=13, type="Add", expr_obj=assignment,
+        parents=[(41, "lhs"), (12, "rhs")],
+    )
+    graph.add_node(
+        42, value_id=42, type="SetAttr", expr_obj=assignment.target,
+        attributes={"attribute": "flag"},
+        parents=[(7, "object"), (13, "value")],
+    )
+    graph.add_node(
+        10, value_id=10, type="If", expr_obj=conditional,
+        parents=[(1, "test"), (13, "body")],
+    )
+    region = nx.DiGraph()
+    region.graph["deployment_nodes"] = (1,)
+
+    programs = _ordinary_conditional_control_programs(
+        SimpleNamespace(G=graph), (0,), (SimpleNamespace(G=region),),
+    )
+
+    carried = next(
+        block.carried_aliases
+        for block in programs[0].root.blocks
+        if isinstance(block, ConditionalBlock)
+    )
+    assert carried == ()
+    assert graph.graph[
+        "suppressed_flat_record_field_alias_receipts"
+    ] == ({
+        "source_conditional_id": 10,
+        "binding_name": "ctrl.flag",
+        "candidate_value_ids": (40, 42),
+        "record_field_keys": ((7, "flag"),),
+        "outcome": "exact_field_state_phi_retained",
+        "priority": "exact_reducer_record_field_state",
+        "tie_policy": "incumbent",
+    },)

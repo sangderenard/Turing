@@ -274,7 +274,8 @@
     "rear_differential_mass_kg": 20.0,
     "engine_rotating_inertia_kg_m2": 0.68,
     "engine_position": [-0.18, 0.08, 0.0],
-    "engine_orientation_degrees": [0.0, 0.0, 0.0]
+    "engine_orientation_degrees": [0.0, 0.0, 0.0],
+    "starting_system": "electric-starter"
   },
   "fuel_system": {
     "capacity_kg": 42.0,

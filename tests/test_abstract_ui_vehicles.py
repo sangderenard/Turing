@@ -1731,6 +1731,70 @@ def test_alternator_cvt_and_ev_regen_are_live_drivetrain_energy_paths():
         symbols["optional_fluid_coupling_engagement"], 0)) == 0
 
 
+def test_starting_systems_catalogue_declares_real_physics_and_dynamic_status():
+    dynamic_kinds = {"electric-starter", "external-starter"}
+    for kind, entry in vehicle_module.STARTING_SYSTEMS.items():
+        assert {"engages", "drive", "energy", "is_dynamic", "dynamic_model"} <= set(entry)
+        if kind in dynamic_kinds:
+            assert entry["is_dynamic"] is True
+            assert entry["dynamic_model"] == "series-dc-motor-torque-speed-curve"
+        else:
+            assert entry["is_dynamic"] is False
+            assert entry["dynamic_model"] == "declared-hook-not-yet-authoritative"
+
+
+def test_electric_starter_delivers_real_cold_crank_torque_that_overruns_at_catch_speed():
+    equations, symbols = symbolic_vehicle_equations()
+    outputs = {str(equation.lhs): equation.rhs for equation in equations}
+    config = load_default_car_configuration()
+    assert config.source["powertrain"]["starting_system"] == "electric-starter"
+    values = {name: 0.0 for name in symbols}
+    values.update(config.parameter_defaults())
+
+    def assist_torque(engine_omega: float, engaged: float) -> float:
+        substitutions = {symbols[name]: value for name, value in values.items() if name in symbols}
+        substitutions[symbols["engine_angular_speed"]] = engine_omega
+        substitutions[symbols["starter_engaged"]] = engaged
+        return float(outputs["starter_assist_torque_nm"].evalf(subs=substitutions))
+
+    idle = values["engine_idle_angular_speed"]
+    catch_speed = vehicle_module.STARTER_CATCH_RPM_FRACTION_OF_IDLE * idle
+    stalled = assist_torque(0.0, 1.0)
+    cranking = assist_torque(0.5 * catch_speed, 1.0)
+    overrun = assist_torque(2.0 * catch_speed, 1.0)
+    disengaged = assist_torque(0.0, 0.0)
+
+    assert math.isfinite(stalled) and stalled > 0
+    assert disengaged == 0.0
+    # A real series-DC motor's torque falls off as it spins up (current
+    # drops as back-EMF grows), and the overrunning Bendix pinion drops the
+    # assist out well before the engine reaches its own idle speed.
+    assert 0 < cranking < stalled
+    assert overrun < 0.01 * cranking
+
+    # Same real automotive order of magnitude as engine_toy's own cold-crank
+    # torque reference for this displacement (COLD_CRANK_MEP_PA * Vd /
+    # (4*pi)) at a real cranking speed -- not required to match exactly,
+    # since production's starter_torque_nm design point is its own
+    # independent config field, and a series motor's stall torque (0 rad/s)
+    # is always far above any steady mean-effective-pressure reference by
+    # real design, so the comparison is made at the cranking point instead.
+    displacement_m3 = values["engine_displacement_m3"]
+    cold_crank_reference_nm = vehicle_module.COLD_CRANK_MEP_PA * displacement_m3 / (4 * math.pi)
+    assert 0.1 * cold_crank_reference_nm < cranking < 10.0 * cold_crank_reference_nm
+
+
+def test_starter_contributes_zero_engine_torque_when_disengaged_or_non_electric():
+    equations, symbols = symbolic_vehicle_equations()
+    outputs = {str(equation.lhs): equation.rhs for equation in equations}
+    assert outputs["engine_torque"].has(symbols["starter_engaged"])
+    assert sympy.simplify(sympy.diff(
+        outputs["engine_torque"].subs(symbols["starter_is_electric_motor"], 0),
+        symbols["starter_engaged"])) == 0
+    assert sympy.simplify(outputs["starter_assist_torque_nm"].subs(
+        symbols["starter_engaged"], 0)) == 0
+
+
 def test_differential_brake_rotor_inertia_lives_once_on_its_shaft_coordinate():
     equations, symbols = symbolic_vehicle_equations()
     outputs = {str(equation.lhs): equation.rhs for equation in equations}

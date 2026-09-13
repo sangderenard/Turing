@@ -132,6 +132,7 @@ VEHICLE_STATE_OUTPUTS = (
     "direct_drive_bypass_torque_nm",
     "optional_fluid_coupling_torque_nm",
     "engine_torque", "clutch_torque", "transmission_output_torque",
+    "starter_assist_torque_nm", "starter_bus_current_a",
     "driveline_torque", "front_differential_torque", "rear_differential_torque",
     "front_differential_wrench_torque", "rear_differential_wrench_torque",
     "engine_acceleration_torque", "engine_angular_acceleration",
@@ -561,6 +562,29 @@ class VehicleConfiguration:
                 drag, "coefficient", positive=True)
             drag_defaults[f"drag_{identity}_reference_area"] = _number(
                 drag, "reference_area_m2", positive=True)
+        # Real series-DC-motor starter design point (engine_toy/starter.py
+        # ElectricStarter.for_engine): solve the motor's own resistance and
+        # back-EMF constant from its declared crank-side rated torque/speed/
+        # power/voltage design point -- V = I*R + K*I*w (series-wound
+        # back-EMF), T = K*I^2 -- so a bigger engine's declared starter is a
+        # bigger, hungrier motor by construction, not a separate curve.
+        starter_nominal_voltage = _number(electrical, "nominal_voltage", positive=True)
+        starter_design_torque_nm = _number(electrical, "starter_torque_nm", positive=True)
+        starter_design_power_w = _number(electrical, "starter_power_w", positive=True)
+        starter_design_speed_rad_s = _number(
+            electrical, "starter_cranking_speed_rad_s", positive=True)
+        starter_design_current_a = starter_design_power_w / starter_nominal_voltage
+        starter_k_series = starter_design_torque_nm / max(starter_design_current_a ** 2, 1e-9)
+        starter_back_emf_v = (starter_k_series * starter_design_current_a
+                              * starter_design_speed_rad_s)
+        starter_resistance_ohm = max(
+            (starter_nominal_voltage - starter_back_emf_v) / starter_design_current_a, 1e-6)
+        # Only these two kinds are today's live series-DC-motor torque-speed
+        # curve; every other STARTING_SYSTEMS kind stays a declared,
+        # zero-contribution hook (see STARTING_SYSTEMS["*"]["is_dynamic"])
+        # until its own real dynamic model lands.
+        starter_is_electric_motor = 1.0 if powertrain["starting_system"] in (
+            "electric-starter", "external-starter") else 0.0
         return {
             # The chassis integrator owns only the sprung graph. Each corner's
             # wheel/upright/brake/lower-coilover assembly is integrated through
@@ -661,6 +685,11 @@ class VehicleConfiguration:
             "alternator_electrical_demand_w": (
                 _number(electrical, "base_load_w", positive=True)
                 + _number(electrical, "ecu_load_w", positive=True)),
+            "starter_engaged": 0.0,
+            "nominal_voltage": starter_nominal_voltage,
+            "starter_resistance_ohm": starter_resistance_ohm,
+            "starter_k_series_nm_per_a2": starter_k_series,
+            "starter_is_electric_motor": starter_is_electric_motor,
             "accessory_motor_command": _number(electrical, "accessory_motor_command"),
             "accessory_motor_peak_power_w": _number(
                 electrical, "accessory_motor_peak_power_w", positive=True),
@@ -938,7 +967,7 @@ def vehicle_configuration_from_mapping(value: Mapping[str, Any]) -> VehicleConfi
                        "engine_mass_kg", "transmission_mass_kg", "front_differential_mass_kg",
                        "rear_differential_mass_kg", "transfer_case_mass_kg",
                        "engine_rotating_inertia_kg_m2", "engine_position",
-                       "engine_orientation_degrees"},
+                       "engine_orientation_degrees", "starting_system"},
         "fuel_system": {"capacity_kg", "initial_fuel_mass_kg", "tank_shell_mass_kg",
                         "fuel_energy_density_j_per_kg", "tank_position_x", "tank_position_y",
                         "tank_position_z"},
@@ -1185,8 +1214,12 @@ def vehicle_configuration_from_mapping(value: Mapping[str, Any]) -> VehicleConfi
         if not math.isclose(sum(component * component for component in components),
                             1.0, rel_tol=0.0, abs_tol=1e-9):
             raise ValueError(f"vehicle drag vector {identity!r} must be unit length")
-    for name in expected["powertrain"] - {"engine_position", "engine_orientation_degrees"}:
+    for name in expected["powertrain"] - {"engine_position", "engine_orientation_degrees",
+                                          "starting_system"}:
         _number(value["powertrain"], name, positive=True)
+    if value["powertrain"]["starting_system"] not in STARTING_SYSTEMS:
+        raise ValueError(
+            f"vehicle powertrain.starting_system must be one of {sorted(STARTING_SYSTEMS)}")
     for name in ("capacity_kg", "initial_fuel_mass_kg", "tank_shell_mass_kg",
                  "fuel_energy_density_j_per_kg"):
         _number(value["fuel_system"], name, positive=True)
@@ -1789,6 +1822,8 @@ def _symbols() -> dict[str, sympy.Symbol]:
         "alternator_efficiency", "alternator_cvt_ratio", "alternator_cvt_ratio_state",
         "alternator_cvt_efficiency", "alternator_cvt_ratio_response_hz",
         "alternator_electrical_demand_w",
+        "starter_engaged", "starter_is_electric_motor", "nominal_voltage",
+        "starter_resistance_ohm", "starter_k_series_nm_per_a2",
         "accessory_motor_command", "accessory_motor_peak_power_w",
         "accessory_motor_peak_torque_nm", "accessory_motor_drive_efficiency",
         "accessory_motor_regeneration_efficiency",
@@ -2310,10 +2345,32 @@ def _symbolic_vehicle_equations_authored() -> tuple[tuple[sympy.Equality, ...], 
     air_mix_reserve_pressure_pa = (
         air_mix_reserve_gas_mass_kg_next * gas_r * air_mix_reserve_temperature_k_next
         / s["air_mix_reserve_volume_m3"])
+    # Real series-DC-motor starter (engine_toy/starter.py ElectricStarter):
+    # V = I*R + K*I*w (series field back-EMF grows with speed AND current),
+    # T = K*I^2 -- a genuine torque-speed curve, not a flat assist number.
+    # An overrunning Bendix pinion drops the assist out smoothly once the
+    # crank outruns the starter (STARTER_CATCH_RPM_FRACTION_OF_IDLE of idle
+    # speed, matching engine_toy's real catch behavior), and
+    # starter_is_electric_motor is zero for every STARTING_SYSTEMS kind that
+    # does not yet have a live dynamic model (see that catalogue's
+    # "is_dynamic" flags), so an unimplemented kind contributes nothing
+    # rather than silently wrong torque.
+    starter_current = (s["nominal_voltage"]
+                       / (s["starter_resistance_ohm"]
+                          + s["starter_k_series_nm_per_a2"] * s["engine_angular_speed"]))
+    starter_catch_speed = (sympy.Float(str(STARTER_CATCH_RPM_FRACTION_OF_IDLE))
+                           * s["engine_idle_angular_speed"])
+    starter_overrun_gate = (1 - sympy.tanh(sympy.Float("8.0") * (
+        s["engine_angular_speed"] / starter_catch_speed - 1))) / 2
+    starter_assist_torque = (s["starter_is_electric_motor"] * s["starter_engaged"]
+                             * starter_overrun_gate
+                             * s["starter_k_series_nm_per_a2"] * starter_current ** 2)
+    starter_bus_current = s["starter_is_electric_motor"] * s["starter_engaged"] * starter_overrun_gate * starter_current
     engine_torque = s["assembly_alpha_drivetrain"] * (
         combustion_torque + idle_governor_torque - engine_braking_torque
         - s["accessory_load_torque"] - alternator_reaction_torque
-        - compressor_engine_reaction_torque + accessory_motor_engine_reaction_torque)
+        - compressor_engine_reaction_torque + accessory_motor_engine_reaction_torque
+        + starter_assist_torque)
     clutch_friction_state = (s["clutch_health"] * (1 - s["clutch_wear"])
                              * (1 - sympy.Float("0.45") * s["clutch_glaze"]))
     relative_drive_speed = s["engine_angular_speed"] - coupled_crank_speed
@@ -2848,6 +2905,8 @@ def _symbolic_vehicle_equations_authored() -> tuple[tuple[sympy.Equality, ...], 
         "direct_drive_bypass_torque_nm": direct_drive_bypass_torque,
         "optional_fluid_coupling_torque_nm": optional_fluid_coupling_torque,
         "engine_torque": engine_torque,
+        "starter_assist_torque_nm": starter_assist_torque,
+        "starter_bus_current_a": starter_bus_current,
         "clutch_torque": clutch_torque,
         "transmission_output_torque": transmission_output_torque,
         "driveline_torque": driveline_torque,
@@ -6529,6 +6588,7 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
         node, edge, nodes, engine_position=engine_position,
         axle_offset=axle_offset, wheelbase=wheelbase, half_width=half_width,
         component_masses=component_masses, drivetrain=drivetrain, electrical=electrical,
+        starting_system=powertrain["starting_system"],
     )
 
     # A reusable routed tension actuator. The cable does not pretend to be a
@@ -6908,6 +6968,30 @@ FLUID_MEDIA: dict[str, dict[str, float]] = {
     "coolant-water-glycol": {"density_kg_m3": 1070.0, "specific_heat_j_kg_k": 3500.0},   # 50/50 ethylene glycol
     "engine-oil":           {"density_kg_m3": 870.0,  "specific_heat_j_kg_k": 2000.0},
     "seawater":             {"density_kg_m3": 1025.0, "specific_heat_j_kg_k": 3990.0},
+    "water":                {"density_kg_m3": 1000.0, "specific_heat_j_kg_k": 4180.0},
+    # ---- GASES, which this table did not have at all ----
+    # Every gas circuit in the project -- intake, pneumatics, exhaust --
+    # was falling through to a liquid default, so its thermal capacity
+    # was computed at around nine hundred times the density of what is
+    # actually in it. A gas IS a thermal fluid; it simply carries its
+    # heat in very little mass, and that is the fact the table has to
+    # be able to state rather than round away.
+    #
+    # Densities are at the temperature each one is actually at when it
+    # matters, because a gas's density is not a property you can quote
+    # without saying that.
+    "air":                  {"density_kg_m3": 1.204, "specific_heat_j_kg_k": 1005.0},
+    "compressed-air":       {"density_kg_m3": 8.4,   "specific_heat_j_kg_k": 1005.0},
+    # engine exhaust, around 700 K at the manifold
+    "exhaust-gas":          {"density_kg_m3": 0.50,  "specific_heat_j_kg_k": 1150.0},
+    # PROPELLANT GAS is the extreme case: a gun's combustion products
+    # leave the muzzle near 1850 K, so at atmospheric pressure they are
+    # a seventh the density of air -- and they carry more energy per
+    # shot than anything else on the machine. Specific heat from the
+    # propellant's own gamma and gas constant (cp = gamma R / (gamma-1)),
+    # not a handbook guess.
+    "propellant-gas":       {"density_kg_m3": 0.149, "specific_heat_j_kg_k": 1835.0},
+    "crankcase-gas":        {"density_kg_m3": 1.15,  "specific_heat_j_kg_k": 1040.0},
 }
 # Heat-exchanger sizing, the real design rule: UA = rated heat rejection /
 # design temperature difference. Jacket water runs ~85-90 degC; a road
@@ -6968,20 +7052,74 @@ PNEUMATIC_COMPONENTS = {
     },
     "regulator": {"kind": "pressure-switch-unloader", "cut_in_frac": 0.84, "cut_out_frac": 1.0},
 }
+# Real starter sizing constants (engine_toy/starter.py, engine_toy/
+# electrical_network.py): a starter is a real box with real thermal/
+# mechanical limits, not an instant teleport to idle.  COLD_CRANK_MEP_PA
+# is the disclosed real cold-crank effective mean effective pressure
+# (compression pumping + cold oil drag, ~2 bar); CRANKING_RPM is a real
+# starter cranking speed.  Every "*_is_dynamic" flag below is honest about
+# which kinds this compiler actually turns into a live crank-torque
+# contribution (see starter_assist_torque in the symbolic equations) versus
+# which remain a real, disclosed hook awaiting the same treatment --
+# "declared-hook-not-yet-authoritative", matching this file's existing
+# mixture_control/ignition_system convention.
+COLD_CRANK_MEP_PA = 200_000.0
+STARTER_CRANKING_RPM = 200.0
+STARTER_DRIVE_EFFICIENCY = 0.60
+STARTER_DESIGN_EFFICIENCY = 0.60
+EXTERNAL_STARTER_SUPPLY_V = 24.0
+AIR_START_ADMISSION_WINDOW_FRAC = 0.30
+AIR_START_MEAN_CRANK_FACTOR = 0.80
+AIR_START_MIN_PRESSURE_PA = 400_000.0
+HUMAN_HAND_CRANK_POWER_W = 75.0
+HUMAN_HAND_CRANK_BURST_POWER_W = 300.0
+HUMAN_HAND_CRANK_TORQUE_MAX_NM = 60.0
+FLYWHEEL_BAR_SUSTAINED_FORCE_N = 350.0
+FLYWHEEL_BAR_BUMP_FORCE_N = 700.0
+FLYWHEEL_BAR_LEVER_M = 0.7
+RECOIL_PULL_ENERGY_J = 40.0
+RECOIL_PULL_DURATION_S = 0.6
+INERTIA_STARTER_MAX_ENERGY_J = 8_000.0
+INERTIA_STARTER_WIND_S = 20.0
+STARTER_CATCH_RPM_FRACTION_OF_IDLE = 0.6
 STARTING_SYSTEMS = {
     "electric-starter": {"engages": "flywheel-ring-gear", "drive": "series-dc-motor-bendix-pinion",
-                         "energy": "vehicle-12v-bus"},
+                         "energy": "vehicle-12v-bus", "is_dynamic": True,
+                         "dynamic_model": "series-dc-motor-torque-speed-curve",
+                         "duty_limit_s": 15.0},
     "external-starter": {"engages": "crank-nose-hex", "drive": "geared-dc-motor-on-cart",
-                         "energy": "external-supply"},
+                         "energy": "external-supply", "is_dynamic": True,
+                         "dynamic_model": "series-dc-motor-torque-speed-curve",
+                         "supply_v": EXTERNAL_STARTER_SUPPLY_V, "duty_limit_s": 15.0},
     "air-start":        {"engages": "cylinder-heads-air-distributor", "drive": "starting-air-admission",
-                         "energy": "starting-air-receiver"},
+                         "energy": "starting-air-receiver", "is_dynamic": False,
+                         "dynamic_model": "declared-hook-not-yet-authoritative",
+                         "admission_window_fraction": AIR_START_ADMISSION_WINDOW_FRAC,
+                         "mean_crank_factor": AIR_START_MEAN_CRANK_FACTOR,
+                         "minimum_receiver_pressure_pa": AIR_START_MIN_PRESSURE_PA},
     "air-motor-starter": {"engages": "flywheel-ring-gear", "drive": "pneumatic-vane-motor-bendix-pinion",
-                          "energy": "starting-air-receiver"},
+                          "energy": "starting-air-receiver", "is_dynamic": False,
+                          "dynamic_model": "declared-hook-not-yet-authoritative",
+                          "volumetric_efficiency": 0.85, "mechanical_efficiency": 0.80},
     "inertia-starter":  {"engages": "crank-nose-clutch-face", "drive": "hand-wound-flywheel-through-reduction",
-                         "energy": "operator"},
-    "recoil-pull":      {"engages": "crank-nose-ratchet-drum", "drive": "rope-pull", "energy": "operator"},
-    "hand-crank":       {"engages": "crank-nose-dog", "drive": "crank-handle", "energy": "operator"},
-    "flywheel-bar":     {"engages": "flywheel-rim-spoke-socket", "drive": "pry-bar", "energy": "operator"},
+                         "energy": "operator", "is_dynamic": False,
+                         "dynamic_model": "declared-hook-not-yet-authoritative",
+                         "wind_time_s": INERTIA_STARTER_WIND_S,
+                         "maximum_energy_j": INERTIA_STARTER_MAX_ENERGY_J,
+                         "hand_wind_power_w": HUMAN_HAND_CRANK_POWER_W},
+    "recoil-pull":      {"engages": "crank-nose-ratchet-drum", "drive": "rope-pull", "energy": "operator",
+                         "is_dynamic": False, "dynamic_model": "declared-hook-not-yet-authoritative",
+                         "pull_energy_j": RECOIL_PULL_ENERGY_J, "pull_duration_s": RECOIL_PULL_DURATION_S},
+    "hand-crank":       {"engages": "crank-nose-dog", "drive": "crank-handle", "energy": "operator",
+                         "is_dynamic": False, "dynamic_model": "declared-hook-not-yet-authoritative",
+                         "sustained_power_w": HUMAN_HAND_CRANK_POWER_W,
+                         "burst_power_w": HUMAN_HAND_CRANK_BURST_POWER_W,
+                         "maximum_torque_nm": HUMAN_HAND_CRANK_TORQUE_MAX_NM},
+    "flywheel-bar":     {"engages": "flywheel-rim-spoke-socket", "drive": "pry-bar", "energy": "operator",
+                         "is_dynamic": False, "dynamic_model": "declared-hook-not-yet-authoritative",
+                         "lever_m": FLYWHEEL_BAR_LEVER_M,
+                         "sustained_force_n": FLYWHEEL_BAR_SUSTAINED_FORCE_N,
+                         "bump_force_n": FLYWHEEL_BAR_BUMP_FORCE_N},
 }
 
 
@@ -6999,6 +7137,15 @@ def _vehicle_powertrain_graph(
     has_mechanical_fan: bool = True,
     include_cooling_stack: bool = False,
     has_nitrous: bool = False,
+    # A second, real accessory that can claim the same generic boss --
+    # a water-methanol injection kit: a pump-fed tank, one solenoid, one
+    # nozzle (no second fuel solenoid the way a wet nitrous kit needs --
+    # water-meth doesn't add oxidizer, it cools the charge instead, see
+    # the toy-side physics this feeds). Mutually exclusive with
+    # has_nitrous in practice (the boss only fits one real fitting at a
+    # time) but not enforced here -- that's a build-time choice, not a
+    # topology one.
+    has_auxiliary_injection: bool = False,
     has_turbo: bool = False,
     displacement_l: float = 1.5,
     redline_rpm: float = 6000.0,
@@ -7007,6 +7154,17 @@ def _vehicle_powertrain_graph(
     combustion_efficiency: float = 0.0,
     cooling_medium: str = "air",
     starting_system: str = "electric-starter",
+    # A real, minimal engine-bay/cabin electrical bulkhead crossing --
+    # OFF by default because _vehicle_mechanical_graph (the whole-
+    # vehicle builder) already builds its own full firewall/dash
+    # directly and would collide with a second one of the same real
+    # identity if this subunit built one unconditionally too. A caller
+    # with no chassis/body of its own at all (this toy: engine-only,
+    # no VehicleConfiguration) opts in here instead, getting the SAME
+    # real identities (electrical.firewall_pass_through, dash.
+    # instrument_cluster) production's own full vehicle graph uses --
+    # not a toy-invented substitute.
+    include_firewall: bool = False,
 ) -> None:
     """One engine's own powertrain subunit: crank -> clutch -> transmission
     -> transfer case -> (front/rear differential -> halfshaft), plus its
@@ -7224,18 +7382,45 @@ def _vehicle_powertrain_graph(
         # the starting-torque attachment, real for every starting system
         # (STARTING_SYSTEMS above): the electric starter's pinion at the
         # ring gear on the flywheel end, every other kind's drive on the
-        # crank nose. Physics-inert to a torque solver -- the starting
-        # torque itself is applied by the starter box that owns it
-        # (engine_toy/starter.py).
+        # crank nose. This graph node is placement/visualization only; the
+        # actual torque is a live series-DC-motor torque-speed curve in the
+        # compiled crank equation (starter_assist_torque in
+        # _symbolic_vehicle_equations_authored, ported from engine_toy/
+        # starter.py's ElectricStarter) for "electric-starter"/"external-
+        # starter" (STARTING_SYSTEMS[...]["is_dynamic"]); every other kind
+        # here still contributes zero torque until its own dynamic model
+        # lands (a disclosed hook, not a silent omission).
         starting = STARTING_SYSTEMS.get(starting_system, STARTING_SYSTEMS["electric-starter"])
         on_ring_gear = starting["engages"] == "flywheel-ring-gear"
         node("powertrain.starter_drive",
              [engine_position[0] + (.12 if on_ring_gear else -.14),
               engine_position[1] - (.06 if on_ring_gear else 0.0), (-.16 if on_ring_gear else 0.0)],
              "starter-drive-attachment", starting_system=starting_system,
-             engages=starting["engages"], drive=starting["drive"], energy=starting["energy"])
+             engages=starting["engages"], drive=starting["drive"], energy=starting["energy"],
+             is_dynamic=starting["is_dynamic"],
+             torque_channel="starter_assist_torque_nm" if starting["is_dynamic"] else None)
         edge("powertrain.starter_drive_to_crank", "powertrain.starter_drive", "powertrain.engine",
              "starter-drive-engagement", radius=.004, engagement="overrunning-when-caught")
+
+        if include_firewall:
+            # The real electrical bulkhead connector and instrument
+            # cluster -- the SAME real identities/kinds _vehicle_
+            # mechanical_graph's own full firewall uses (see that
+            # function's own "electrical.firewall_pass_through" /
+            # "dash.instrument_cluster" nodes), built here instead only
+            # because this caller has no chassis/body of its own to hang
+            # the real one on. Every accessory control switch below
+            # (nitrous arm, WMI arm, whatever else gets added) is dash-
+            # mounted and crosses here to reach its engine-bay
+            # controller -- a real two-sided manifold mounting surface,
+            # not a toy-invented substitute for one.
+            firewall_x = engine_position[0] + .30
+            node("electrical.firewall_pass_through",
+                 [firewall_x, engine_position[1] + .21, engine_position[2] - .10],
+                 "electrical-bulkhead-connector", fixed_to="chassis", circuit_role="firewall_pass_through")
+            node("dash.instrument_cluster",
+                 [firewall_x + .18, engine_position[1] + .32, engine_position[2]],
+                 "instrument-cluster-module", fixed_to="chassis", mass_kg=1.6, mass_in_total=False)
 
         if has_water_pump:
             # Real coolant ports on the block, same block-port convention
@@ -7415,6 +7600,21 @@ def _vehicle_powertrain_graph(
              [engine_position[0] - .10, engine_position[1] + .10, 0.0],
              "engine-block-component", mass_kg=0.6,
              heat_soak_w_per_k=0.9)
+        # A real generic accessory injection boss: a threaded NPT bung
+        # on the intake manifold, UNCONDITIONALLY present on every
+        # engine this graph builds -- the same real fitting a nitrous
+        # kit, an auxiliary fuel injector, a water-methanol injector, or
+        # anything else that can be manifolded into an injector threads
+        # into. What's actually plumbed to it (if anything) is a
+        # separate, optional real accessory below, not baked into the
+        # block itself; an unused boss is a real pipe plug, not a
+        # dangling line, so no delivery edge exists here unless
+        # something below actually claims it. Real reference size: 1/8
+        # NPT, the common nitrous-jet/aux-injector fitting.
+        node("powertrain.engine_block_port.accessory_injection_boss",
+             [engine_position[0] - .09, engine_position[1] + .09, .01],
+             "engine-block-port", port_kind="accessory-injection-boss",
+             thread_spec="1/8-NPT")
         # A real physical ceiling: the valve curtain/port cross-section
         # can only pass so much air regardless of how much pressure is
         # stacked upstream of it (a supercharger, nitrous) -- this is the
@@ -7530,7 +7730,15 @@ def _vehicle_powertrain_graph(
                  "powertrain.nitrous_nozzle", "routed-energy-line", radius=.003,
                  circuit_identity="nitrous-fuel",
                  medium_rate_state="fuel-pressure-flow-or-voltage-current")
-            edge("powertrain.nitrous_nozzle_to_intake", "powertrain.nitrous_nozzle",
+            # threads into the same real generic accessory boss every
+            # engine carries, then a short fixed run from the boss into
+            # the plenum -- purely a topology change from feeding the
+            # plenum directly (same circuit_identity, same real physics,
+            # the boss is just now the actual real mounting point)
+            edge("powertrain.nitrous_nozzle_to_boss", "powertrain.nitrous_nozzle",
+                 "powertrain.engine_block_port.accessory_injection_boss", "nitrous-delivery-line", radius=.005,
+                 circuit_identity="nitrous", medium_rate_state="nitrous-flow-and-pressure")
+            edge("powertrain.accessory_boss_to_intake", "powertrain.engine_block_port.accessory_injection_boss",
                  "powertrain.intake_plenum", "nitrous-delivery-line", radius=.005,
                  circuit_identity="nitrous", medium_rate_state="nitrous-flow-and-pressure")
             edge("electrical.wire.nitrous_solenoid_command", "electrical.nitrous_controller",
@@ -7542,6 +7750,130 @@ def _vehicle_powertrain_graph(
                  "powertrain.nitrous_fuel_solenoid", "insulated-copper-wire", radius=.0015,
                  command_coordinate="nitrous_solenoid_command",
                  reaction="electrical-command-only-mechanical-wrench-remains-in-solenoid-edge")
+            if include_firewall:
+                # A real guarded toggle switch on the dash -- the real,
+                # common hardware on a genuine nitrous install (a safety
+                # cover over the arm switch, not just a bare rocker) --
+                # crossing the firewall to reach the controller it arms,
+                # same two-segment real convention every other crossing
+                # here uses.
+                node("dash.nitrous_arm_switch",
+                     [firewall_x + .16, engine_position[1] + .30, engine_position[2] - .04],
+                     "guarded-toggle-switch", fixed_to="chassis", switch_state_coordinate="nitrous_armed")
+                for index, (seg_a, seg_b) in enumerate((
+                    ("dash.nitrous_arm_switch", "electrical.firewall_pass_through"),
+                    ("electrical.firewall_pass_through", "electrical.nitrous_controller"),
+                )):
+                    edge(f"electrical.wire.nitrous_arm_{index}", seg_a, seg_b, "insulated-copper-wire",
+                         radius=.0015, circuit="nitrous-arm", command_coordinate="nitrous_armed",
+                         electrical_authority="vehicle-computer-fusebox-relay-dispatch")
+
+        if has_auxiliary_injection:
+            # A real water-methanol injection kit -- the concrete proof
+            # the accessory boss is genuinely generic, not a nitrous-
+            # only fitting dressed up: a pump-fed tank (not a
+            # pressurized bottle -- WMI runs off its own small electric
+            # diaphragm/piston pump, real working pressure two orders
+            # of magnitude gentler than nitrous's saturated vapor
+            # pressure), one solenoid, one nozzle threaded into the
+            # SAME real boss nitrous would otherwise claim. No second
+            # "fuel" solenoid the way a wet nitrous kit needs one --
+            # water-meth adds no oxidizer, it suppresses knock by
+            # evaporatively cooling the charge (the real physics this
+            # feeds on the toy side), so there's nothing else to enrich.
+            node("powertrain.auxiliary_injection_tank",
+                 [engine_position[0] - .30, engine_position[1] - .02, -.10],
+                 "high-pressure-canister", mass_kg=2.0, capacity_kg=3.8,
+                 fill_level_frac=1.0, bottle_pressure_pa=1_700_000.0)
+            node("powertrain.auxiliary_injection_pump",
+                 [engine_position[0] - .22, engine_position[1] - .01, -.08],
+                 "electro-mechanical-pump")
+            node("electrical.auxiliary_injection_controller",
+                 [engine_position[0] - .05, engine_position[1] + .15, -.14],
+                 "control-module", armed=False)
+            node("powertrain.auxiliary_injection_solenoid",
+                 [engine_position[0] - .15, engine_position[1] + .02, -.04],
+                 "electro-mechanical-valve", solenoid_open_coordinate="auxiliary_injection_solenoid_command")
+            # A real progressive flow regulator -- the actual difference
+            # between a WMI kit and a nitrous kit's simple on/off
+            # solenoid. Real aftermarket WMI controllers meter delivery
+            # off boost/MAP through a ramp (0% duty at/below onset_
+            # map_frac, 100% at/above full_map_frac, linear between) --
+            # not tank-capacity-derived, a real declared nozzle flow
+            # rating at full duty. Missing this was the actual bug: an
+            # always-on binary valve dumped full flow through a near-
+            # zero intake-airflow denominator during the rpm ramp,
+            # clamping the resulting charge-cooling delta at its 120 K
+            # ceiling -- a real, un-metered kit could genuinely do that
+            # (over-rich WMI systems are a known real failure mode,
+            # "water-locking" a cylinder), but a correctly regulated one
+            # doesn't dose at all until there's real boost to protect.
+            node("powertrain.auxiliary_injection_regulator",
+                 [engine_position[0] - .19, engine_position[1] + .00, -.06],
+                 "flow-regulator", rated_flow_kg_s=0.0072,
+                 onset_map_frac=1.15, full_map_frac=1.55)
+            node("powertrain.auxiliary_injection_nozzle",
+                 [engine_position[0] - .09, engine_position[1] + .09, .01],
+                 "injection-nozzle")
+            edge("powertrain.auxiliary_injection_tank_to_pump", "powertrain.auxiliary_injection_tank",
+                 "powertrain.auxiliary_injection_pump", "nitrous-delivery-line", radius=.005,
+                 circuit_identity="auxiliary-injection", medium_rate_state="nitrous-flow-and-pressure")
+            edge("powertrain.auxiliary_injection_pump_to_regulator", "powertrain.auxiliary_injection_pump",
+                 "powertrain.auxiliary_injection_regulator", "nitrous-delivery-line", radius=.005,
+                 circuit_identity="auxiliary-injection", medium_rate_state="nitrous-flow-and-pressure")
+            edge("powertrain.auxiliary_injection_regulator_to_solenoid", "powertrain.auxiliary_injection_regulator",
+                 "powertrain.auxiliary_injection_solenoid", "nitrous-delivery-line", radius=.005,
+                 circuit_identity="auxiliary-injection", medium_rate_state="nitrous-flow-and-pressure")
+            edge("powertrain.auxiliary_injection_solenoid_to_nozzle", "powertrain.auxiliary_injection_solenoid",
+                 "powertrain.auxiliary_injection_nozzle", "nitrous-delivery-line", radius=.004,
+                 circuit_identity="auxiliary-injection", medium_rate_state="nitrous-flow-and-pressure")
+            # the same generic boss, the same short fixed run into the
+            # plenum -- real, physical proof of concept: whatever's
+            # actually plugged in there this build is what determines
+            # the circuit_identity chain that reaches it
+            edge("powertrain.auxiliary_injection_nozzle_to_boss", "powertrain.auxiliary_injection_nozzle",
+                 "powertrain.engine_block_port.accessory_injection_boss", "nitrous-delivery-line", radius=.004,
+                 circuit_identity="auxiliary-injection", medium_rate_state="nitrous-flow-and-pressure")
+            edge("powertrain.accessory_boss_to_intake_aux", "powertrain.engine_block_port.accessory_injection_boss",
+                 "powertrain.intake_plenum", "nitrous-delivery-line", radius=.005,
+                 circuit_identity="auxiliary-injection", medium_rate_state="nitrous-flow-and-pressure")
+            edge("electrical.wire.auxiliary_injection_solenoid_command", "electrical.auxiliary_injection_controller",
+                 "powertrain.auxiliary_injection_solenoid", "insulated-copper-wire", radius=.0015,
+                 command_coordinate="auxiliary_injection_solenoid_command",
+                 interlock_feedback=["engine_angular_speed", "wide_open_throttle"],
+                 reaction="electrical-command-only-mechanical-wrench-remains-in-solenoid-edge")
+            if include_firewall:
+                # Real, period-correct hardware, not a generic switch:
+                # WWII combat-power boost systems (this accessory's own
+                # real historical use -- see has_auxiliary_injection's
+                # docstring) were commonly wire-sealed rather than a
+                # plain toggle -- a breakable seal wire the pilot had to
+                # physically snap to access emergency power, logged for
+                # post-flight maintenance review. A car-mounted WMI kit
+                # gets the ordinary guarded toggle instead; which real
+                # hardware this is depends on what's actually plugged in
+                # here, same as the boss/regulator/controller above.
+                # this subunit has no direct "is this an aircraft
+                # engine" signal to key on -- disclosed simplification:
+                # water-methanol/emergency-power boost is real and
+                # historically distinctive enough on its own (every
+                # catalogue engine that actually carries it today is a
+                # WWII piston aero engine) that the real period hardware
+                # is used unconditionally here rather than guessed at
+                # from an indirect proxy; a future genuinely different
+                # water-meth build (a modern turbo car, say) would want
+                # its own real signal threaded in instead of this.
+                switch_kind = "wire-sealed-emergency-power-switch"
+                node("dash.auxiliary_injection_arm_switch",
+                     [firewall_x + .16, engine_position[1] + .28, engine_position[2] + .04],
+                     switch_kind, fixed_to="chassis", switch_state_coordinate="auxiliary_injection_armed")
+                for index, (seg_a, seg_b) in enumerate((
+                    ("dash.auxiliary_injection_arm_switch", "electrical.firewall_pass_through"),
+                    ("electrical.firewall_pass_through", "electrical.auxiliary_injection_controller"),
+                )):
+                    edge(f"electrical.wire.auxiliary_injection_arm_{index}", seg_a, seg_b, "insulated-copper-wire",
+                         radius=.0015, circuit="auxiliary-injection-arm", command_coordinate="auxiliary_injection_armed",
+                         electrical_authority="vehicle-computer-fusebox-relay-dispatch")
 
         if has_oil_pan:
             # A real thermal mass, not a fabricated one -- an oil pan

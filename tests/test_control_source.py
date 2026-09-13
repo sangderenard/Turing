@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import networkx as nx
 
 from src.compiler.control_source import (
+    ConditionalBlock,
     ControlProgram,
     ControlTarget,
     LoopBlock,
@@ -223,6 +224,53 @@ def test_project_control_regions_keeps_structural_binding_for_live_loop():
     )
 
     assert projected.iterable_bindings == ((40, 41, "iteration_9"),)
+
+
+def test_projection_keeps_control_defined_loop_update_without_numeric_region():
+    logical = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=StatementBlock(("__scheduled_region_3__",)),
+            body=ConditionalBlock(
+                predicate_value_id=11,
+                body=StatementBlock(("__scheduled_region_3__",)),
+                carried_aliases=((3, 2, 2, 4),),
+                source_node_id=12,
+            ),
+            carried_aliases=((4, 1), (5, 1)),
+            result_ports=((40, 1, 4), (41, 1, 5)),
+            source_loop_node_id=20,
+        ),
+        region_indices=(3,),
+    )
+
+    projected = project_control_regions(
+        logical,
+        (3,),
+        retained_value_ids=(1, 2, 3, 5, 10, 11),
+    )
+
+    assert projected.root.carried_aliases == ((4, 1), (5, 1))
+    assert projected.root.body.carried_aliases == ((3, 2, 2, 4),)
+
+
+def test_initial_source_loop_projection_defers_carried_update_pruning():
+    logical = ControlProgram(WhileBlock(
+        predicate_value_id=10,
+        condition=StatementBlock(("__scheduled_region_3__",)),
+        body=StatementBlock(("__scheduled_region_3__",)),
+        carried_aliases=((4, 1),),
+        source_loop_node_id=20,
+    ), region_indices=(3,))
+
+    projected = project_control_regions(
+        logical,
+        (3,),
+        retained_value_ids=(1, 10),
+        preserve_source_loop_carries=True,
+    )
+
+    assert projected.root.carried_aliases == ((4, 1),)
 
 
 def test_overlay_uses_known_nesting_for_equal_region_sets():

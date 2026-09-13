@@ -1472,3 +1472,228 @@ therefore amplified by the adaptive trajectory before native completes in 158
 steps and eager in 157; the trace contains no earlier discrete wrong-value
 edge. Trace:
 `build/patch_sequence_replay_v145-trace-o0/native-trace.log`.
+
+## Two-day continuity ledger and current frontier (2026-09-09 update)
+
+This section is the continuation point after roughly two days of integrated
+work.  A checked item below signs off only the named invariant and its cited
+evidence.  It does not turn a focused test into a claim of full-window native
+correctness.  The original nineteen-item structural audit is at zero findings,
+but the complete patch sequence remains open until the runtime and required
+coverage gates below pass.
+
+### Signed-off invariants
+
+- [x] **The original structural frontier remains closed at the repository-SSA
+  gate.** Accepted replays through v166 each converge after six frame rounds
+  and three result-type rounds with zero incompatible result contracts and
+  zero structural findings.  The repository contains 4,538 formals.  Latest
+  completed diagnostic artifact:
+  `build/patch_sequence_replay_v166/repository-ssa.pkl`.
+- [x] **One-step native execution has reached a completely matching public
+  surface at an earlier stable checkpoint.** Replays v145 and v146 both build
+  at explicit `-O0`, finish naturally, expose 48 buffers, and match 48/48.
+  This establishes that the full compiler/runtime route can be correct for one
+  step; later stricter identity repairs intentionally reopened two truthful
+  values rather than preserving an accidental match.
+- [x] **Terminal-only branch assignments do not reach a conditional merge.**
+  `enrich_represented_conditionals` now asks whether each arm can fall through
+  to its enclosing join.  An update whose only authored path ends in an
+  unconditional break/continue/return is suppressed with outcome
+  `terminal_only_update_not_merged`, priority `exact_lexical_fallthrough`, and
+  tie policy `incumbent`.  A conditional loop control retains its untaken path;
+  controls inside a nested loop stay local to that loop.
+- [x] **Exact reducer field-state Phis outrank flat dotted `SetAttr`
+  histories.** A flat identity history for `(receiver, field)` is now
+  suppressed whenever the reducer already owns that exact field state, even
+  when the authoritative Phi belongs to an earlier conditional.  The receipt
+  is `exact_field_state_phi_retained` with priority
+  `exact_reducer_record_field_state`; equal priority retains the incumbent.
+  Replay v158 removes producerless `%328` completely: zero definitions and
+  zero uses, while the exact lattice Phi `(286, 282) -> 564` remains.
+- [x] **Control-defined values survive the projection that carries them.**
+  Conditional merge/result identities are collected before numerical-region
+  projection.  A loop carry defined by Control IR is retained even if no
+  numerical region owns it.  Initial source-loop projection may defer carry
+  pruning until the ordinary conditional overlay has supplied its metadata;
+  the final projection still performs ordinary liveness pruning.
+- [x] **Shared loop incumbents split into distinct logical bindings during
+  local SSA lowering.** When several carries share one initial source
+  identity, loop header, latch, and post-loop maps select the first incumbent.
+  Conditional publication protects branch updates participating in those
+  distinct bindings, so the local raw snapshot is not overwritten by a later
+  conditional merge.  The focused SSA regression proves distinct backedges
+  and definition dominance.  A later repository pass still collapses the
+  production snapshot operand; that separate frontier is recorded below.
+- [x] **The continuation search itself is finite, directional, and
+  provenance-recorded.** For a snapshot carry, the Control IR enrichment pass
+  follows only a unique chain of conditional `initial -> merged` edges.  It
+  stops on a missing successor, records and rejects multiple successors, and
+  records and rejects a repeated identity.  Unique continuations precede the
+  lower-priority snapshot carry; ambiguous, cyclic, and equal-priority cases
+  retain the incumbent.  The focused chain regression passes.
+- [x] **The current focused batch is green.** `py_compile` passes for
+  `control_source.py`, `glsl_deployment_strategy.py`,
+  `precompile_to_ssa.py`, and `fortran_c_shell.py`.  The combined conditional,
+  loop-result, break-boundary, field-state, projection, shared-incumbent, and
+  continuation selection is 19 passed / 111 deselected.  It includes the
+  regression proving that a raw update reused as a conditional initial remains
+  the raw loop backedge while the recurrence uses the final conditional Phi.
+  `git diff --check` reports no whitespace errors (only the repository's
+  existing LF-to-CRLF notices).
+
+### Runtime evidence after the stricter identity repairs
+
+Replay v158 builds a 48-buffer one-step executable at explicit `-O0`.  Native
+and eager match 46/48.  The only public mismatches are `material.telemetry` and
+`dt_next`.  The exact `dt_next` values are:
+
+- native: `2.4413922801613808e-05`
+- eager: `2.44140625e-05`
+- lattice quantum: `2.3283064365386963e-10`
+
+The native value is exactly 104857 lattice quanta; the eager value is 104857.6
+quanta.  Source semantics retain both values: the lattice-constrained value is
+`dt_cap`, used as the next iteration's limit, while `last_dt_next` snapshots
+the raw proposal and is returned.  This reduced the broad numerical symptom to
+one exact compiler identity boundary.  Artifact:
+`build/patch_sequence_replay_v158-one-step-o0/managed-dt-parity.json`.
+
+Replays v159 and v160 tested projection retention and shared-incumbent lowering
+but still produced one logical carry.  They were useful negative evidence:
+retaining an existing source carry cannot create the second recurrence binding
+when the source conditional reuses one numeric identity for its arm result and
+its merge spelling.
+
+### v161-v166: corrected evidence and exact resumption point
+
+The first inspection after v161 looked at `step_with_dt_control_used`.  Its
+source IDs 238 and 24 belong to the integer retry state, not to the floating
+`dt` recurrence.  The resulting same-spelling hypothesis was tested in v162;
+it split retry identity 238 into a synthetic identity and therefore changed the
+wrong state.  That implementation and both supporting tests were removed.
+v162 remains only as rejected diagnostic evidence and must not be used as an
+accepted checkpoint.
+
+The correct production function is `run_superstep`.  Its v161 repository SSA
+contains two loop carries, but continuation enrichment ran before the late
+ordinary conditional overlay.  The recurrence stopped at update 282 instead of
+the lattice computation 286; both header Phis used final conditional Phi 565
+as their backedge.  Thus v161 was a structurally valid partial improvement, not
+a no-op and not the final identity separation.
+
+Continuation solving is now deferred until after
+`overlay_scheduled_control` and `_nest_lexical_conditionals_in_loops`.  Replay
+v163 then gives the recurrence carry update 286 and preserves the authored
+chain `274 -> 280 -> 282 -> 286 -> Phi 565`; `%328` remains absent.  The raw
+snapshot carry still receives backedge 565 in the final repository artifact.
+
+Conditional publication now publishes a merge under its initial identity only
+when that initial is not a protected source for another loop binding.  The
+focused regression proves the rule locally.  Replays v164 and v165 then show
+that `run_superstep` local lowering has distinct carried updates:
+
+```text
+recurrence: source update 286 -> SSA Phi 565
+raw snapshot: source update 274 -> SSA value 274
+```
+
+Opt-in provenance output under `TURING_DEBUG_LOOP_ALIAS_PUBLICATION=1` records
+the protected identities and publication decisions without changing normal
+compilation.  The v166 run adds latch-choice provenance.  Its live evidence
+shows the recurrence latch choosing 565 and the snapshot latch choosing 274.
+Therefore conditional enrichment, local publication, and latch completion are
+all behaving correctly.  The remaining collapse from snapshot operand 274 to
+565 occurs later, during repository/frame reconciliation.  v166 then finishes
+after six frame rounds and three result-type rounds, with 4,538 formals, zero
+incompatible result contracts, and zero structural findings.  Artifact:
+`build/patch_sequence_replay_v166/repository-ssa.pkl`.
+
+No C build has been run since v158.  This is deliberate: the exact SSA shape
+gate is still wrong, and another native compile would only measure the already
+known downstream symptom.
+
+### Checkpoint journey and disposition
+
+| Checkpoint | Disposition | What it established |
+|---|---|---|
+| v145-v146 | accepted runtime evidence | Explicit `-O0` one-step native and eager execution completed with 48/48 public buffers; v145 also located long-window divergence at substep 32. |
+| source v147 | trusted replay input | `pre-frame-link.pkl` is the stable source-side checkpoint used to avoid repeating ingestion and planning work. |
+| v158 | accepted diagnostic runtime evidence | Exact field-Phi authority removes `%328`; explicit `-O0` one-step parity is 46/48 and isolates telemetry plus raw `dt_next`. |
+| v159-v160 | accepted negative evidence | Projection retention and shared-incumbent lowering alone cannot produce the two required logical carry histories. |
+| v161 | accepted partial structural evidence | Early continuation solving reaches update 282, before the late lattice conditional is available. |
+| v162 | rejected | A same-spelling synthetic-ID hypothesis changes integer retry state 238.  The implementation and tests were removed. |
+| v163 | accepted partial structural evidence | Deferred continuation solving reaches recurrence update 286 and keeps the lattice chain, but both loop backedges still become 565. |
+| v164 | accepted partial structural evidence | Protected conditional publication passes focused tests; the final repository artifact still collapses the raw snapshot. |
+| v165 | accepted diagnostic evidence | Local conditional publication reports recurrence `286 -> 565` and raw snapshot `274 -> 274`; final repository SSA still has `274 -> 565`. |
+| v166 | accepted diagnostic evidence | Latch completion independently reports recurrence 565 and raw snapshot 274; replay finishes with 4,538 formals, zero incompatible contracts, and zero structural findings. |
+| v167 | in progress | Five stage probes bracket the first post-latch rewrite that changes the raw snapshot operand. |
+
+This table is a disposition ledger, not a list of releases.  Rejected evidence
+is retained so the same false path is not retried; accepted partial evidence
+signs off only the boundary named in its final column.
+
+### Generous remaining frontier
+
+The next implementation chunk begins after local loop lowering, where the
+snapshot operand is demonstrably still correct.  Work through this frontier in
+order, signing off each boundary only with direct evidence:
+
+1. [x] Let v166 finish naturally and retain its completed repository artifact
+   and full diagnostic log.  It has zero structural findings and zero
+   incompatible result contracts.
+2. [ ] Locate the first post-latch pass that changes the `run_superstep` snapshot
+   header-Phi backedge from object/value 274 to Phi 565.  Inspect the repository
+   rewrite stages around operand refresh, frame linking, storage-alias rebinding,
+   and result reconciliation.  If static inspection is insufficient, place
+   several opt-in probes in one replay so a single expensive run brackets the
+   mutation.
+3. State the violated identity rule in terms of source identity, SSA object
+   identity, owning loop carry, and provenance.  Do not special-case function
+   names or numeric IDs.
+4. Repair only the pass that performs the invalid canonicalization.  A loop
+   carried feed with explicit ownership must retain its selected SSA object;
+   equivalent numeric/source spellings must not redirect it to a conditional
+   Phi owned by a different logical carry.  Existing higher-priority evidence
+   may replace an incumbent; equal priority retains the incumbent.
+5. Preserve finite behavior.  Operand reconciliation must be an ordered,
+   monotone choice over existing candidates.  Re-visiting the same evidence
+   must be idempotent, and ambiguous/cyclic provenance must dead-end without
+   generating identities or oscillating between objects.
+6. Add a focused regression at the late repository/frame boundary that failed
+   in production.  Keep the local lowerer regression, but do not treat it as a
+   substitute for exercising the rewriting pass that caused the collapse.
+7. Run the combined focused batch and syntax checks once after the known edits
+   are assembled.  Record counts and any expected deselections.
+8. Replay the trusted checkpoint once more.  Before compiling, require two
+   `run_superstep` header Phis: recurrence update 286 must use backedge 565;
+   raw snapshot update 274 must use its raw SSA definition.  Require the chain
+   `274 -> 280 -> 282 -> 286 -> 565`, zero `%328` uses/definitions, zero
+   incompatible contracts, and zero structural findings.
+9. Only after that SSA shape passes, build the one-step artifact at explicit
+   `-O0` and run parity.  The immediate target is 48/48, including raw
+   `dt_next` and telemetry.
+10. Build and run the complete managed window at explicit `-O0`.  Compare all
+   48 public buffers, completion counts, full state arrays, telemetry, and the
+   controller trajectory.  If the prior substep-32 divergence remains, locate
+   the earliest causal trace value and open it as the next bounded chunk.
+11. Run the required coverage matrix in Patch01 through Patch10.  The current
+    focused control tests and production fixture do not by themselves prove
+    every listed empty/multirow collection, snapshot/clear, mapping alias,
+    first-arm field write, method capability, short-circuit side effect, keyed
+    read, diagnostic string, report slice, retry, terminal return, and repeated
+    full-window case.
+12. Re-run the full managed window enough times to establish that completion
+    and buffer parity are stable rather than a single-run accident.  Keep all
+    builds at `-O0` until every correctness gate is signed off.
+13. Audit every generated artifact and every checklist item before declaring
+    completion.  Update this ledger with the final commands and measured
+    outputs.  Optimization remains deferred until correctness and full native
+    parity are proved.
+
+The trusted source checkpoint is
+`build/patch_sequence_source_v147/pre-frame-link.pkl`.  The latest completed
+accepted diagnostic repository-SSA artifact is
+`build/patch_sequence_replay_v166/repository-ssa.pkl`; v167 is the current
+natural-running stage-probe replay at the time of this update.  No process in
+this sequence was killed for elapsed time, and no optimized build was used.
