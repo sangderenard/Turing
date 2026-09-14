@@ -56,8 +56,32 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                     if callee is None or not ids:
                         continue
                     outputs = tuple(emit_outputs(callee.name, callee))
+                    positions = tuple(map(
+                        int,
+                        instruction.attributes.get("output_positions", ()),
+                    ))
                     selected = tuple(map(int, instruction.attributes.get('callee_output_ids', ())))
-                    if selected:
+                    if positions:
+                        # The linker correlates caller aggregate members with
+                        # the callee's physical Ret ABI by position.  That is
+                        # stronger than numeric identity: caller/callee SSA
+                        # ids are function-local, and a callee output may be
+                        # collision-freshened after its source-level result
+                        # binding was recorded.  Looking up the old semantic
+                        # ids then skips type settlement entirely (a matmul
+                        # weight gradient whose id matched a helper-local
+                        # integer constant was exposed as a scalar).  Preserve
+                        # the exact positional contract the linker proved.
+                        if (
+                            len(positions) != len(ids)
+                            or any(
+                                position < 0 or position >= len(outputs)
+                                for position in positions
+                            )
+                        ):
+                            continue
+                        outputs = tuple(outputs[position] for position in positions)
+                    elif selected:
                         by_id = {int(value.id): value for value in outputs}
                         if len(selected) != len(ids) or any(value_id not in by_id for value_id in selected):
                             continue

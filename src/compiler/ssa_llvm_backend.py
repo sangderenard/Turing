@@ -3516,8 +3516,22 @@ def _emit_repository_call_module(
         slot = len(buffer_order)
         buffer_order.append(value_id)
         requirement = storage_requirements.get(value_id)
+        # A statically shaped public value's authored ROOT-function shape is
+        # its ABI, for outputs as well as arguments. Storage requirements also
+        # scan linked helper functions, whose SSA ids live in independent
+        # namespaces; using their union here can let a helper's coincident id
+        # widen a singleton-batch base-bias gradient (1,99) to an unrelated
+        # dendrite-weight buffer (381,198). Result-type settlement has already
+        # correlated aggregate returns by physical position, so a nonempty
+        # root output shape is authoritative. Retain inferred storage only for
+        # genuinely shapeless/dynamic root outputs.
+        root_shape = tuple(value.shape or ())
         buffer_shapes.append(tuple(
-            requirement.shape if requirement is not None else value.shape or ()
+            root_shape
+            if root_shape
+            else requirement.shape
+            if requirement is not None
+            else ()
         ))
         buffer_dtypes.append(_value_llvm_type(value))
         address = f"%public.addr.{slot}"

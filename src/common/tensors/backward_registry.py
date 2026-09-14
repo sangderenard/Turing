@@ -367,6 +367,28 @@ def matmul_vjp(g, A, B):
     gB = unbroadcast(AbstractTensor.matmul(T(A2), g2), B2.shape)
     return gA.reshape(A.shape), gB.reshape(B.shape)
 
+
+# Keep the ProcessGraph-authored rule self-contained. Returning the result of
+# a second tuple-returning helper made nested/multiple matmul adjoints depend on
+# forwarding an aggregate through two call frames; direct eager autograd was
+# correct, but source-call linking could lose the outer projections. This is
+# the same analytical rule as ``matmul_vjp`` above, authored directly in the
+# backward function that owns the two returned gradients.
+_MATMUL_VJP_SOURCE_BODY = (
+    "a_vector = getattr(A, 'ndim', len(getattr(A, 'shape', ()))) == 1; "
+    "b_vector = getattr(B, 'ndim', len(getattr(B, 'shape', ()))) == 1; "
+    "A2 = A.reshape((1, A.shape[0])) if a_vector else A; "
+    "B2 = B.reshape((B.shape[0], 1)) if b_vector else B; "
+    "g2 = (g.reshape((1, 1)) if (a_vector and b_vector) else "
+    "g.reshape((*g.shape[:-1], 1, g.shape[-1])) if a_vector else "
+    "g.reshape((*g.shape, 1)) if b_vector else g); "
+    "gA = unbroadcast(AbstractTensor.matmul("
+    "g2, B2.transpose(-2, -1)), A2.shape); "
+    "gB = unbroadcast(AbstractTensor.matmul("
+    "A2.transpose(-2, -1), g2), B2.shape); "
+    "return gA.reshape(A.shape), gB.reshape(B.shape)"
+)
+
 def pad_vjp(g, source, pad, mode="constant"):
     """Adjoint of a constant pad: crop the gradient back to the original region.
 
@@ -574,11 +596,16 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = tanh(x)",
         "latex": r"y = \tanh x, \quad \frac{\partial y}{\partial x} = 1 - \tanh^2 x = 1 - y^2",
         "backward": {
-            "x": "gx = unbroadcast(g * (1 - (x.detach().tanh()*x.detach().tanh())), x.shape)"
+            "x": "gx = g * (1 - (x.detach().tanh()*x.detach().tanh()))"
         },
         "python": {
             "parameters": ["g", "x"],
-            "body": "y = x.detach().tanh(); return unbroadcast(g * (1 - y*y), x.shape)"
+            # Unary elementwise tanh preserves shape exactly.  Routing its VJP
+            # through the general broadcast reducer added dynamic shape-frame
+            # inputs to an otherwise isolated fused kernel; those inputs are
+            # unnecessary and prevent the native backward from being a pure
+            # elementwise region.
+            "body": "y = x.detach().tanh(); return g * (1 - y*y)"
         },
         "domain": "x: any real",
         "notes": "",
@@ -1235,7 +1262,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         },
         "python": {
             "parameters": ["g", "A", "B"],
-            "body": "return matmul_vjp(g, A, B)"
+            "body": _MATMUL_VJP_SOURCE_BODY
         },
         "domain": "Inner dims match; batch dims broadcastable.",
         "notes": "Use T() as last-two-dims transpose. Apply unbroadcast to fold batch broadcasting.",
@@ -1606,7 +1633,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         },
         "python": {
             "parameters": ["g", "A", "B"],
-            "body": "return matmul_vjp(g, A, B)"
+            "body": _MATMUL_VJP_SOURCE_BODY
         },
         "domain": "Inner dims match; batch dims broadcastable.",
         "notes": "Use T() as last-two-dims transpose. Apply unbroadcast to fold batch broadcasting.",

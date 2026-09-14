@@ -1,5 +1,21 @@
 # Test baseline and hazards — read before running any test
 
+2026-09-14 perforated startup cache: the real-dataset NPZ round-trip regression
+passed in 28.25s, and the native cold-then-cached forward/VJP regression passed
+in 22.68s. A direct 50-transition LDT preparation measured 9.537s cold and
+0.037s cached. These checks do not cover a full-catalogue capture or long
+training run.
+
+2026-09-14 engine capture neutral/cooling/friction: the full
+`tests/test_perforated_multifuel_engine.py` passes 11 tests in 250.73 s.
+The exact Camry allocation (256 named samples per fuel, 104 random rows,
+seed 3747) makes this file take about four minutes; it is not a quick gate.
+Before the neutral fix that regression failed with load speed
+78,539,816,339.74483 rad/s. The engine_toy friction/stand/oxidation group
+passes 16 tests in 11.15 s; the station cooling/stand group passed 8 in
+9.97 s. Validation covers real teacher capture and energy accounting, not
+an all-profile 30-epoch training run or complete per-bearing calibration.
+
 2026-09-08 sequence-arena/dominance settlement: compiler-owned sequence arenas
 now claim storage provenance when created, before result reconciliation can
 replace them with a loop-local scalar. Unique operand-free constants whose

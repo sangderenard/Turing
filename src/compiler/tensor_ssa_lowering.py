@@ -944,6 +944,10 @@ def propagate_repository_ssa_call_metadata(
                     declared = tuple(map(
                         int, instruction.attributes.get("output_ids", ())
                     ))
+                    declared_positions = tuple(map(
+                        int,
+                        instruction.attributes.get("output_positions", ()),
+                    ))
                     if declared and instruction.res is not None:
                         caller_outputs = projections(function, int(instruction.res.id))
                         callee_values = {
@@ -952,11 +956,29 @@ def propagate_repository_ssa_call_metadata(
                         }
                         for position, output_id in enumerate(declared):
                             caller_value = caller_outputs.get(position)
+                            callee_position = (
+                                declared_positions[position]
+                                if position < len(declared_positions)
+                                else None
+                            )
+                            positional_callee_value = (
+                                callee_returns[callee_position]
+                                if (
+                                    callee_position is not None
+                                    and 0 <= callee_position < len(callee_returns)
+                                )
+                                else None
+                            )
+                            callee_value_id = (
+                                int(positional_callee_value.id)
+                                if positional_callee_value is not None
+                                else int(output_id)
+                            )
                             tensor_table = getattr(
                                 module, "tensor_tables", {}
                             ).get(callee_name)
                             descriptor = (
-                                tensor_table.by_id(output_id)
+                                tensor_table.by_id(callee_value_id)
                                 if tensor_table is not None else None
                             )
                             material_descriptor = (
@@ -976,10 +998,18 @@ def propagate_repository_ssa_call_metadata(
                                 # stamped those view extents onto a fully
                                 # materialized output at the next call edge.
                                 callee_value = SSAValue(
-                                    int(output_id),
+                                    callee_value_id,
                                     dtype=str(material_descriptor.dtype),
                                     shape=tuple(material_descriptor.shape),
                                 )
+                            elif positional_callee_value is not None:
+                                # Source-linked aggregate ids belong to the
+                                # caller's SSA namespace.  The linker records
+                                # the exact callee Ret position separately;
+                                # use that physical ABI instead of looking up
+                                # the caller id in the callee, where the same
+                                # integer may name an unrelated local constant.
+                                callee_value = positional_callee_value
                             else:
                                 callee_value = callee_values.get(output_id)
                                 if callee_value is None and descriptor is not None:
