@@ -92,6 +92,21 @@ class CompiledPerforatedNetwork:
     manifest_path: Path
 
 
+@dataclass(frozen=True)
+class CompiledPerforatedAdamChunk:
+    """One LLVM entry containing loss, generated VJP, and an Adam cycle."""
+
+    artifact: LLVMFunctionArtifact
+    input_value_ids: dict[str, int]
+    parameter_value_ids: dict[str, int]
+    gradient_value_ids: dict[str, int]
+    output_value_ids: dict[str, int]
+    optimizer_state_value_ids: dict[str, Any]
+    cycle_length: int
+    manifest_path: Path
+    cache_hit: bool = False
+
+
 def _compiler_fingerprint() -> str:
     """Invalidate native artifacts when their tensor/compiler sources change."""
     src_root = Path(__file__).resolve().parents[1]
@@ -228,6 +243,275 @@ def _build_graph(batch: int, in_dim: int, out_dim: int, branches: int):
     return prediction, bindings, shapes
 
 
+def _build_training_graph(batch: int, in_dim: int, out_dim: int, branches: int):
+    prediction, bindings, shapes = _build_graph(
+        batch, in_dim, out_dim, branches)
+    program = prediction.data.program
+    shapes.update({
+        "target": (batch, out_dim),
+        "sample_weight": (batch, 1),
+        # A full-shaped scale avoids scalar-shape ambiguity at linked helper
+        # boundaries while retaining exact valid-row normalization.
+        "loss_scale": (batch, out_dim),
+    })
+    for name in ("target", "sample_weight", "loss_scale"):
+        bindings[name] = SSATensorOperations.input(program, shapes[name])
+    error = prediction - bindings["target"]
+    loss = (
+        error * error * bindings["sample_weight"] * bindings["loss_scale"]
+    ).sum()
+    return loss, prediction, bindings, shapes
+
+
+def _load_cached_adam_chunk(
+    directory: Path,
+    *,
+    batch: int,
+    in_dim: int,
+    out_dim: int,
+    cycle_length: int,
+    branches: int,
+    gradient_accumulation_steps: int,
+    max_global_gradient_norm: float | None,
+) -> CompiledPerforatedAdamChunk | None:
+    manifest_path = directory / "contract.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        shape = payload["shape"]
+        if (
+            payload.get("schema") != "turing.perforated-adam-chunk-llvm"
+            or payload.get("version") != 2
+            or payload.get("build_fingerprint") != _compiler_fingerprint()
+            or shape != {
+                "batch": batch,
+                "cycle_length": cycle_length,
+                "dendrites_per_neuron": branches,
+                "input": in_dim,
+                "output": out_dim,
+            }
+            or payload.get("optimizer_options") != {
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "max_global_gradient_norm": max_global_gradient_norm,
+            }
+        ):
+            return None
+        record = payload["artifact"]
+        library = Path(record["library"])
+        if not library.is_file():
+            return None
+        state = dict(payload["optimizer_state"])
+        state["first_moment"] = {
+            int(key): int(value) for key, value in state["first_moment"].items()
+        }
+        state["second_moment"] = {
+            int(key): int(value) for key, value in state["second_moment"].items()
+        }
+        state["gradient_accumulator"] = {
+            int(key): int(value)
+            for key, value in state["gradient_accumulator"].items()
+        }
+        state["cycled_value_ids"] = tuple(map(int, state["cycled_value_ids"]))
+        for key in (
+            "steps", "learning_rate", "beta1", "beta2", "epsilon",
+            "beta1_power", "beta2_power", "iteration", "cycle_length",
+            "gradient_norm", "clipped_gradient_norm",
+        ):
+            state[key] = int(state[key])
+        state["gradient_accumulation_steps"] = int(
+            state["gradient_accumulation_steps"])
+        artifact = LLVMFunctionArtifact(
+            name=str(record["entry"]),
+            llvm_ir="",
+            buffer_order=tuple(map(int, record["buffer_order"])),
+            buffer_shapes=tuple(tuple(shape) for shape in record["buffer_shapes"]),
+            extent_order=tuple(tuple(item) for item in record.get("extent_order", ())),
+            shortfalls=(),
+            buffer_dtypes=tuple(map(str, record["buffer_dtypes"])),
+            library_path=library.resolve(),
+            training_steps_value_id=int(state["steps"]),
+            learning_rate_value_id=int(state["learning_rate"]),
+            optimizer_state_value_ids=state,
+        )
+        return CompiledPerforatedAdamChunk(
+            artifact=artifact,
+            input_value_ids={
+                str(key): int(value) for key, value in payload["inputs"].items()
+            },
+            parameter_value_ids={
+                str(key): int(value) for key, value in payload["parameters"].items()
+            },
+            gradient_value_ids={
+                str(key): int(value) for key, value in payload["gradients"].items()
+            },
+            output_value_ids={
+                str(key): int(value) for key, value in payload["outputs"].items()
+            },
+            optimizer_state_value_ids=state,
+            cycle_length=cycle_length,
+            manifest_path=manifest_path.resolve(),
+            cache_hit=True,
+        )
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+
+
+def compile_perforated_adam_chunk(
+    directory: str | Path,
+    *,
+    batch: int,
+    in_dim: int,
+    out_dim: int,
+    cycle_length: int = 4,
+    dendrites_per_neuron: int = 2,
+    gradient_accumulation_steps: int = 1,
+    max_global_gradient_norm: float | None = None,
+    name: str = "perforated_adam_chunk",
+    use_cache: bool = True,
+) -> CompiledPerforatedAdamChunk:
+    """Compile changing minibatches through one native loss/VJP/Adam cycle."""
+    if min(batch, in_dim, out_dim, cycle_length, dendrites_per_neuron,
+           gradient_accumulation_steps) < 1:
+        raise ValueError("all perforated Adam chunk dimensions must be positive")
+    from .process_graph_autograd import (
+        lower_training_motion_to_repository_ssa,
+        obtain_graph_reverse,
+    )
+    from .ssa_llvm_backend import (
+        compile_artifact,
+        emit_ssa_function_to_llvm,
+        with_native_adam_loop,
+    )
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    if use_cache:
+        cached = _load_cached_adam_chunk(
+            directory,
+            batch=batch,
+            in_dim=in_dim,
+            out_dim=out_dim,
+            cycle_length=cycle_length,
+            branches=dendrites_per_neuron,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            max_global_gradient_norm=max_global_gradient_norm,
+        )
+        if cached is not None:
+            return cached
+    loss, prediction, bindings, _shapes = _build_training_graph(
+        batch, in_dim, out_dim, dendrites_per_neuron)
+    ids = {
+        binding_name: int(value.data.value.id)
+        for binding_name, value in bindings.items()
+    }
+    parameter_names = (
+        "base_weight", "base_bias", "dendrite_weight",
+        "dendrite_bias", "dendrite_gain",
+    )
+    parameter_ids = tuple(ids[item] for item in parameter_names)
+    product = obtain_graph_reverse(
+        loss,
+        bindings=bindings,
+        wrt=parameter_ids,
+        packaging="combined",
+        unit_output_seed=True,
+    )
+    if product.motion is None:
+        raise RuntimeError("perforated Adam chunk produced no training motion")
+    lowering = lower_training_motion_to_repository_ssa(
+        product.motion,
+        function_name=f"{name}__motion",
+        observed_outputs={"prediction": int(prediction.data.value.id)},
+    )
+    if lowering.shortfalls:
+        raise RuntimeError(
+            f"{name} repository-SSA shortfalls: {lowering.shortfalls!r}")
+    emitted = emit_ssa_function_to_llvm(
+        lowering.module,
+        lowering.function_name,
+        entry_name=lowering.function_name,
+    )
+    if emitted.shortfalls:
+        raise RuntimeError(f"{name} LLVM shortfalls: {emitted.shortfalls!r}")
+    gradient_ids = {
+        parameter_name: int(product.motion.gradient_value_ids[ids[parameter_name]])
+        for parameter_name in parameter_names
+    }
+    outputs = dict(lowering.outputs)
+    wrapped = with_native_adam_loop(
+        emitted,
+        parameter_gradient_pairs=tuple(
+            (ids[parameter_name], gradient_ids[parameter_name])
+            for parameter_name in parameter_names
+        ),
+        cycled_value_ids=tuple(
+            ids[item] for item in (
+                "x", "target", "sample_weight", "loss_scale",
+                "dendrite_mask",
+            )
+        ) + (int(outputs["loss_0"]),),
+        cycle_length=cycle_length,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        max_global_gradient_norm=max_global_gradient_norm,
+        entry_name=name,
+    )
+    artifact = compile_artifact(wrapped, directory=directory / "native")
+    optimizer_state = dict(artifact.optimizer_state_value_ids or {})
+    manifest = {
+        "schema": "turing.perforated-adam-chunk-llvm",
+        "version": 2,
+        "build_fingerprint": _compiler_fingerprint(),
+        "execution": {
+            "motion": "combined-forward-loss-process-graph-vjp",
+            "optimizer": "adam",
+            "cycle_owner": "native-llvm-entry",
+            "tape_autograd": False,
+            "changing_minibatches": True,
+        },
+        "shape": {
+            "cycle_length": cycle_length,
+            "batch": batch,
+            "input": in_dim,
+            "output": out_dim,
+            "dendrites_per_neuron": dendrites_per_neuron,
+        },
+        "optimizer_options": {
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "max_global_gradient_norm": max_global_gradient_norm,
+        },
+        "inputs": ids,
+        "parameters": {name: ids[name] for name in parameter_names},
+        "gradients": gradient_ids,
+        "outputs": outputs,
+        "optimizer_state": optimizer_state,
+        "artifact": {
+            "entry": artifact.name,
+            "library": str(Path(artifact.library_path).resolve()),
+            "buffer_order": list(artifact.buffer_order),
+            "buffer_shapes": [list(shape) for shape in artifact.buffer_shapes],
+            "buffer_dtypes": list(artifact.buffer_dtypes),
+            "extent_order": [list(item) for item in artifact.extent_order],
+        },
+    }
+    manifest_path = directory / "contract.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return CompiledPerforatedAdamChunk(
+        artifact=artifact,
+        input_value_ids=ids,
+        parameter_value_ids={name: ids[name] for name in parameter_names},
+        gradient_value_ids=gradient_ids,
+        output_value_ids=outputs,
+        optimizer_state_value_ids=optimizer_state,
+        cycle_length=cycle_length,
+        manifest_path=manifest_path.resolve(),
+        cache_hit=False,
+    )
+
+
 def compile_perforated_network(
     directory: str | Path,
     *,
@@ -337,8 +621,10 @@ def compile_perforated_network(
 
 
 __all__ = [
+    "CompiledPerforatedAdamChunk",
     "CompiledPerforatedNetwork",
     "PerforatedLLVMContract",
     "TensorPort",
+    "compile_perforated_adam_chunk",
     "compile_perforated_network",
 ]

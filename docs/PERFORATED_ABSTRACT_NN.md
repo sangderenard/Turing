@@ -84,6 +84,46 @@ rows contain one `1` each, assigning every contiguous dendrite group to its
 output neuron; it participates in reverse computation but is deliberately not
 published as an Adam parameter or gradient.
 
+### Native changing-minibatch Adam cycle
+
+`compile_perforated_adam_chunk` emits one native entry containing the
+perforated forward, weighted loss, ProcessGraph-generated VJP, and a stateful
+Adam cycle. Its `x`, `target`, `sample_weight`, and `loss_scale` inputs carry a
+leading fixed chunk axis; each loop iteration repoints the motion ABI at the
+next slice before recomputing gradients. Parameters, first and second moments,
+bias-correction powers, and the iteration counter are caller-owned in/out
+buffers. There is no Python callback inside the cycle and no tape backward.
+
+The same entry performs ordinary averaged gradient accumulation followed by
+global L2 norm clipping before Adam. Both are compile options
+(`gradient_accumulation_steps` and `max_global_gradient_norm`) recorded in
+contract version 2. Gradient accumulators are caller-owned heap buffers rather
+than native stack allocations, so union-sized engine models do not consume the
+small Windows thread stack. The contract also publishes the final pre-clip and
+post-clip norms.
+
+The live and headless engine demo now uses this entry for actual training. It
+banks one complete shuffled dataset pass, including sample weights,
+information-dropout values, and per-motion dendrite masks. A runtime `steps`
+scalar may exceed that fixed bank length; LLVM cycles the bank internally, so
+epochs and passes add compute without multiplying host memory. The live shadow
+replay reuses the same native entry with `steps=1`.
+
+The explicit full-shaped `loss_scale` lets each minibatch retain exact
+valid-row normalization without differentiating a dynamic divisor, which the
+current repository LLVM call lowering cannot yet emit. The Adam arithmetic is
+the LLVM backend realization of the same law as functional AbstractTensor
+`adam_step`; joining that optimizer graph itself to the motion before LLVM is
+still a later composition step, not something this smoke claims.
+
+The focused three-minibatch regression uses accumulation 2 and clipping 0.15,
+then matches an independent NumPy reference for final loss, every parameter,
+every first/second moment, both beta powers, iteration count, and both gradient
+norms. An actual headless LDT engine run (`423 -> 212`, batch 2) compiled an
+18-batch bank and executed 72 motions in one native call in 0.999 seconds; its
+training loss moved from 1.11127 to 0.02979. Its contract and DLL are cached
+under the selected output directory.
+
 Contract version 2 adds three runtime graph-control ports without changing the
 compiled topology:
 

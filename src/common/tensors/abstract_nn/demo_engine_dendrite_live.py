@@ -534,7 +534,9 @@ def _attach_engine_transition_contract(learner: CompiledPerforatedAdam,
                                        preprocessing: dict,
                                        episodes_per_fuel: int,
                                        random_coverage_samples: int) -> None:
-    path = learner.compiled.manifest_path
+    path = (learner.training_cycle.manifest_path
+            if learner.training_cycle is not None
+            else learner.compiled.manifest_path)
     manifest = json.loads(path.read_text(encoding="utf-8"))
     manifest["engine_transition"] = {
         "schema": "turing.multifuel-engine-transition",
@@ -615,6 +617,51 @@ def _training_schedule(rng: np.random.Generator, episode_ids: np.ndarray,
             schedule.append((epoch, pass_index, indices, weights,
                              position + 1 == len(epoch_batches)))
     return schedule
+
+
+def _training_cycle_banks(
+    x: np.ndarray,
+    y: np.ndarray,
+    schedule,
+    rng: np.random.Generator,
+    feature_names,
+    *,
+    batch_size: int,
+    branches: int,
+    information_dropout: float,
+    branch_dropout: float,
+):
+    """Materialize the changing inputs consumed by one native LLVM cycle."""
+    if not 0.0 <= information_dropout < 1.0:
+        raise ValueError("information_dropout must be in [0, 1)")
+    if not 0.0 <= branch_dropout < 1.0:
+        raise ValueError("branch_dropout must be in [0, 1)")
+    protected = np.asarray([
+        name.startswith(("control.", "fuel.", "engine_profile."))
+        for name in feature_names
+    ])
+    x_bank, y_bank, weight_bank, mask_bank = [], [], [], []
+    width = y.shape[1] * branches
+    for _epoch, _pass_index, indices, weights, _epoch_end in schedule:
+        batch_x = _pad_batch(x, indices, batch_size).copy()
+        if information_dropout > 0.0:
+            missing = rng.random(batch_x.shape) < information_dropout
+            missing[:, protected] = False
+            batch_x[missing] = 0.0
+        mask = np.ones((1, width), dtype=np.float64)
+        if branch_dropout > 0.0:
+            mask = (rng.random(mask.shape) >= branch_dropout).astype(np.float64)
+            per_output = mask.reshape(y.shape[1], branches)
+            empty = np.flatnonzero(per_output.sum(axis=1) == 0.0)
+            if empty.size:
+                per_output[empty, rng.integers(
+                    0, branches, size=len(empty))] = 1.0
+        x_bank.append(batch_x)
+        y_bank.append(_pad_batch(y, indices, batch_size))
+        weight_bank.append(np.asarray(weights, dtype=np.float64).reshape(batch_size, 1))
+        mask_bank.append(mask)
+    return tuple(np.ascontiguousarray(np.stack(bank)) for bank in (
+        x_bank, y_bank, weight_bank, mask_bank))
 
 
 def _network_geometry(learner: CompiledPerforatedAdam, width: int, height: int):
@@ -793,6 +840,8 @@ def run_headless(*, output_dir: str | Path, epochs: int = 4,
                  batch_size: int = 16,
                  branches: int = 2, seed: int = 1729,
                  learning_rate: float = 0.006, audio: bool = True,
+                 gradient_accumulation_steps: int = 4,
+                 max_global_gradient_norm: float = 1.0,
                  information_dropout: float = 0.02,
                  branch_dropout: float = 0.02,
                  use_cache: bool = True,
@@ -805,13 +854,22 @@ def run_headless(*, output_dir: str | Path, epochs: int = 4,
         samples_per_fuel, seed, engine_toy_path, episodes_per_fuel,
         random_coverage_samples, engine_identities,
         output_dir / "dataset-cache" if use_cache else None)
+    rng = np.random.default_rng(seed + 7)
+    bank_schedule = _training_schedule(
+        rng, train_episode_ids, batch_size, 1, 1)
+    cycle_length = len(bank_schedule)
+    steps = cycle_length * epochs * passes_per_epoch
     print("[LLVM] preparing training artifact...", flush=True)
     learner = CompiledPerforatedAdam.compile(
         output_dir / "compiled", batch=batch_size, in_dim=x_train.shape[1],
         out_dim=y_train.shape[1], dendrites_per_neuron=branches,
-        seed=seed, learning_rate=learning_rate, use_cache=use_cache)
-    print(f"[LLVM {'cache hit' if learner.compiled.forward.key == 'cached' else 'compiled'}] "
-          "training artifact ready", flush=True)
+        seed=seed, learning_rate=learning_rate, cycle_length=cycle_length,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        max_global_gradient_norm=max_global_gradient_norm,
+        use_cache=use_cache)
+    print(f"[LLVM {'cache hit' if learner.training_cycle.cache_hit else 'compiled'}] "
+          f"{cycle_length}-batch bank / {steps}-motion training cycle ready",
+          flush=True)
     _attach_engine_transition_contract(
         learner, preprocessing, episodes_per_fuel, random_coverage_samples)
     print("[LLVM] preparing batch-1 rollout artifact...", flush=True)
@@ -836,10 +894,6 @@ def run_headless(*, output_dir: str | Path, epochs: int = 4,
     audio_state = LiveAudioState(rollout.engine)
     synth = EngineSoundSynth(SAMPLE_RATE)
     left_blocks, right_blocks = [], []
-    rng = np.random.default_rng(seed + 7)
-    schedule = _training_schedule(
-        rng, train_episode_ids, batch_size, epochs, passes_per_epoch)
-    steps = len(schedule)
     history: list[float] = []
     validation_history = []
     initial_validation = _validation_loss(
@@ -850,21 +904,33 @@ def run_headless(*, output_dir: str | Path, epochs: int = 4,
                        for name, value in learner.parameters.items()}
     audio_stride = max(1, int(math.ceil(
         steps / max(max_audio_seconds * 20.0, 1.0))))
-    metrics = {}
-    for step, (epoch, pass_index, indices, weights, epoch_end) in enumerate(schedule):
-        # Warm up, then cosine-decay without ever freezing completely.
-        progress = step / max(steps - 1, 1)
-        warmup = min(1.0, (step + 1) / max(5.0, steps * 0.03))
-        learner.learning_rate = learning_rate * warmup * (
-            0.08 + 0.92 * 0.5 * (1.0 + math.cos(math.pi * progress)))
-        result = _train_with_dropout(
-            learner, _pad_batch(x_train, indices, batch_size),
-            _pad_batch(y_train, indices, batch_size), rng,
-            preprocessing["feature_names"], sample_weight=weights,
-            information_dropout=information_dropout,
-            branch_dropout=branch_dropout)
-        _copy_network_parameters(learner, rollout_learner)
-        history.append(result.loss)
+    banks = _training_cycle_banks(
+        x_train, y_train, bank_schedule, rng, preprocessing["feature_names"],
+        batch_size=batch_size, branches=branches,
+        information_dropout=information_dropout,
+        branch_dropout=branch_dropout)
+    initial_prediction = learner.forward(banks[0][0])
+    initial_error = initial_prediction - banks[1][0]
+    initial_training_loss = float(np.sum(
+        initial_error * initial_error * banks[2][0]
+    ) / (banks[2][0].sum() * y_train.shape[1]))
+    print(f"[LLVM] executing {steps} motions as one native call...", flush=True)
+    training_started = time.perf_counter()
+    result, native_history = learner.run_cycle(*banks, steps=steps)
+    training_seconds = time.perf_counter() - training_started
+    # The native loss bank is cyclic and therefore contains the last complete
+    # sweep. Preserve a separately measured pre-training point for the plot.
+    history = [initial_training_loss, *native_history.tolist()]
+    print(f"[LLVM] native training cycle completed in {training_seconds:.3f}s", flush=True)
+    final_validation = _validation_loss(learner, x_test, y_test, batch_size)
+    validation_history.append((steps, final_validation))
+    if final_validation < best_validation:
+        best_validation = final_validation
+        best_step = steps
+        best_parameters = {name: value.copy()
+                           for name, value in learner.parameters.items()}
+    _copy_network_parameters(learner, rollout_learner)
+    for step in range(steps):
         throttle = float(np.clip(
             0.5 + 0.46 * math.sin(2.0 * math.pi * step / max(steps, 1)),
             0.0, 1.0))
@@ -879,33 +945,27 @@ def run_headless(*, output_dir: str | Path, epochs: int = 4,
             left, right = _render_audio_frame(audio_state, synth, audio_frames)
             left_blocks.append(left)
             right_blocks.append(right)
-        if epoch_end:
-            validation = _validation_loss(
-                learner, x_test, y_test, batch_size)
-            validation_history.append((step + 1, validation))
-            if validation < best_validation:
-                best_validation = validation
-                best_step = step + 1
-                best_parameters = {name: value.copy()
-                                   for name, value in learner.parameters.items()}
-        metrics = {
-            "step": step + 1, "steps": steps, "loss": result.loss,
-            "epoch": epoch + 1, "epochs": epochs,
-            "pass_in_epoch": pass_index + 1,
-            "passes_per_epoch": passes_per_epoch,
-            "gradient_norm": result.gradient_norm,
-            "parameter_norm": result.parameter_norm,
-            "fuel": FUEL_PROFILES[0], "load": 0.0, "rpm": rollout.rpm,
-            "throttle": throttle,
-            "network_rollout_diverged": rollout.diverged,
-            "validation_loss": validation_history[-1][1]
-            if validation_history else initial_validation,
-            "best_validation_loss": best_validation,
-            "best_step": best_step,
-            "learning_rate": learner.learning_rate,
-        }
-        if epoch_end and step + 1 < steps:
+        if ((step + 1) % (cycle_length * passes_per_epoch) == 0
+                and step + 1 < steps):
             rollout.reset()
+    metrics = {
+        "step": steps, "steps": steps, "loss": result.loss,
+        "epoch": epochs, "epochs": epochs,
+        "pass_in_epoch": passes_per_epoch,
+        "passes_per_epoch": passes_per_epoch,
+        "gradient_norm": result.gradient_norm,
+        "parameter_norm": result.parameter_norm,
+        "fuel": FUEL_PROFILES[0], "load": 0.0, "rpm": rollout.rpm,
+        "throttle": throttle,
+        "network_rollout_diverged": rollout.diverged,
+        "validation_loss": final_validation,
+        "best_validation_loss": best_validation,
+        "best_step": best_step,
+        "learning_rate": learner.learning_rate,
+        "native_training_seconds": training_seconds,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "max_global_gradient_norm": max_global_gradient_norm,
+    }
     for name, value in best_parameters.items():
         learner.parameters[name][...] = value
     _copy_network_parameters(learner, rollout_learner)
@@ -942,13 +1002,13 @@ def run_headless(*, output_dir: str | Path, epochs: int = 4,
         "episode_count": int(np.unique(dataset.episode_ids).size),
         "train_episode_count": int(np.unique(train_episode_ids).size),
         "moving_output_count": int(active.sum()),
-        "compiled_contract": str(learner.compiled.manifest_path.resolve()),
+        "compiled_contract": str(learner.training_cycle.manifest_path.resolve()),
         "audio": str(audio_path) if audio_path else None,
         "image": str(image_path),
         "weights": str(weights_path),
     }, indent=2) + "\n", encoding="utf-8")
     return LiveRunArtifacts(
-        image_path, audio_path, learner.compiled.manifest_path.resolve(),
+        image_path, audio_path, learner.training_cycle.manifest_path.resolve(),
         metrics_path, history[0], history[-1], best_validation)
 
 
@@ -960,6 +1020,8 @@ def run_interactive(*, output_dir: str | Path, epochs: int = 4,
                     batch_size: int = 16,
                     branches: int = 2, seed: int = 1729,
                     learning_rate: float = 0.006, audio: bool = True,
+                    gradient_accumulation_steps: int = 4,
+                    max_global_gradient_norm: float = 1.0,
                     information_dropout: float = 0.02,
                     branch_dropout: float = 0.02,
                     use_cache: bool = True,
@@ -982,13 +1044,22 @@ def run_interactive(*, output_dir: str | Path, epochs: int = 4,
         samples_per_fuel, seed, engine_toy_path, episodes_per_fuel,
         random_coverage_samples, engine_identities,
         output_dir / "dataset-cache" if use_cache else None)
+    rng = np.random.default_rng(seed + 7)
+    bank_schedule = _training_schedule(
+        rng, train_episode_ids, batch_size, 1, 1)
+    cycle_length = len(bank_schedule)
+    steps = cycle_length * epochs * passes_per_epoch
     print("[LLVM] preparing training artifact...", flush=True)
     learner = CompiledPerforatedAdam.compile(
         output_dir / "compiled", batch=batch_size, in_dim=x_train.shape[1],
         out_dim=y_train.shape[1], dendrites_per_neuron=branches,
-        seed=seed, learning_rate=learning_rate, use_cache=use_cache)
-    print(f"[LLVM {'cache hit' if learner.compiled.forward.key == 'cached' else 'compiled'}] "
-          "training artifact ready", flush=True)
+        seed=seed, learning_rate=learning_rate, cycle_length=cycle_length,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        max_global_gradient_norm=max_global_gradient_norm,
+        use_cache=use_cache)
+    print(f"[LLVM {'cache hit' if learner.training_cycle.cache_hit else 'compiled'}] "
+          f"{cycle_length}-batch bank / {steps}-motion training cycle ready",
+          flush=True)
     _attach_engine_transition_contract(
         learner, preprocessing, episodes_per_fuel, random_coverage_samples)
     print("[LLVM] preparing batch-1 rollout artifact...", flush=True)
@@ -1029,10 +1100,11 @@ def run_interactive(*, output_dir: str | Path, epochs: int = 4,
     pygame.display.set_mode((width, height), pygame.OPENGL | pygame.DOUBLEBUF)
     font = pygame.font.SysFont("consolas", 16)
     clock = pygame.time.Clock()
-    rng = np.random.default_rng(seed + 7)
-    schedule = _training_schedule(
-        rng, train_episode_ids, batch_size, epochs, passes_per_epoch)
-    steps = len(schedule)
+    training_banks = _training_cycle_banks(
+        x_train, y_train, bank_schedule, rng, preprocessing["feature_names"],
+        batch_size=batch_size, branches=branches,
+        information_dropout=information_dropout,
+        branch_dropout=branch_dropout)
     history = []
     step = 0
     running = True
@@ -1046,7 +1118,7 @@ def run_interactive(*, output_dir: str | Path, epochs: int = 4,
     correction_count = 0
     live_drift = shadow.drift_from(rollout)
     latest_shadow_values = physical_state_mapping(shadow.sim.state)
-    schedule_iterator = iter(schedule)
+    training_submitted = False
     training_complete = False
     epoch = pass_index = 0
     scheduler_drops = 0
@@ -1057,35 +1129,30 @@ def run_interactive(*, output_dir: str | Path, epochs: int = 4,
     future = None
     pending_engine_identity = None
 
-    def background_update(item, command_snapshot: LiveEngineControls):
+    def background_update(run_offline: bool, command_snapshot: LiveEngineControls):
         offline_result = None
+        offline_history = None
         metadata = None
-        if item is not None:
-            item_epoch, item_pass, indices, weights, epoch_end = item
-            offline_result = _train_with_dropout(
-                learner, _pad_batch(x_train, indices, batch_size),
-                _pad_batch(y_train, indices, batch_size), rng,
-                preprocessing["feature_names"], sample_weight=weights,
-                information_dropout=information_dropout,
-                branch_dropout=branch_dropout)
-            metadata = (item_epoch, item_pass, epoch_end)
+        if run_offline:
+            offline_result, offline_history = learner.run_cycle(
+                *training_banks, steps=steps)
+            metadata = (epochs - 1, passes_per_epoch - 1, True)
         live_x, live_y = shadow.step(command_snapshot)
         replay_x.append(live_x)
         replay_y.append(live_y)
         replay_result = None
         if len(replay_x) >= batch_size:
             chosen = rng.choice(len(replay_x), size=batch_size, replace=False)
-            replay_result = _train_with_dropout(
-                learner,
-                np.ascontiguousarray(np.stack([replay_x[i] for i in chosen])),
-                np.ascontiguousarray(np.stack([replay_y[i] for i in chosen])),
-                rng, preprocessing["feature_names"],
-                information_dropout=information_dropout,
-                branch_dropout=branch_dropout)
+            training_banks[0][0] = np.stack([replay_x[i] for i in chosen])
+            training_banks[1][0] = np.stack([replay_y[i] for i in chosen])
+            training_banks[2][0].fill(1.0)
+            replay_result, _replay_history = learner.run_cycle(
+                *training_banks, steps=1)
         parameters = {name: value.copy()
                       for name, value in learner.parameters.items()}
         return {
             "offline_result": offline_result,
+            "offline_history": offline_history,
             "replay_result": replay_result,
             "metadata": metadata,
             "parameters": parameters,
@@ -1130,8 +1197,9 @@ def run_interactive(*, output_dir: str | Path, epochs: int = 4,
                 latest_shadow_values = update["shadow_values"]
                 if update["offline_result"] is not None:
                     result = update["offline_result"]
-                    history.append(result.loss)
-                    step += 1
+                    history.extend(update["offline_history"].tolist())
+                    step = steps
+                    training_complete = True
                 if update["replay_result"] is not None:
                     live_result = update["replay_result"]
                 if update["metadata"] is not None:
@@ -1147,14 +1215,10 @@ def run_interactive(*, output_dir: str | Path, epochs: int = 4,
                 last_correction_time = time.monotonic()
                 pending_engine_identity = None
             if future is None:
-                item = None
-                if not training_complete:
-                    try:
-                        item = next(schedule_iterator)
-                    except StopIteration:
-                        training_complete = True
+                run_offline = not training_submitted
+                training_submitted = True
                 future = executor.submit(
-                    background_update, item, replace(command))
+                    background_update, run_offline, replace(command))
             keys = pygame.key.get_pressed()
             if keys[pygame.K_UP] or keys[pygame.K_w]:
                 command.throttle += 0.035
@@ -1279,6 +1343,8 @@ def main() -> None:
     parser.add_argument("--branches", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument("--learning-rate", type=float, default=0.006)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    parser.add_argument("--max-global-gradient-norm", type=float, default=1.0)
     parser.add_argument("--information-dropout", type=float, default=0.02)
     parser.add_argument("--branch-dropout", type=float, default=0.02)
     parser.add_argument("--no-audio", action="store_true")
@@ -1298,6 +1364,8 @@ def main() -> None:
         engine_identities=engine_identities,
         branches=args.branches, seed=args.seed,
         learning_rate=args.learning_rate, audio=not args.no_audio,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_global_gradient_norm=args.max_global_gradient_norm,
         information_dropout=args.information_dropout,
         branch_dropout=args.branch_dropout,
         use_cache=not args.no_cache,

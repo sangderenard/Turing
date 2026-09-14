@@ -790,6 +790,7 @@ def tensor_likeness(operation: str) -> str | None:
 # toolchain this repository already builds C with. No JIT.
 
 import ctypes as _ctypes
+import math as _math
 import re as _re
 import struct as _struct
 import subprocess as _subprocess
@@ -3660,6 +3661,10 @@ class LLVMFunctionArtifact:
     library_path: _Path | None = None
     training_steps_value_id: int | None = None
     learning_rate_value_id: int | None = None
+    #: Optional state ABI added by a native optimizer-cycle wrapper.  The
+    #: mapping is deliberately backend-neutral data so cached contracts can
+    #: reconstruct it without importing an optimizer runtime.
+    optimizer_state_value_ids: _Mapping[str, _Any] | None = None
     #: Value ids additionally exposed because a caller asked to watch them.
     #: Diagnostics only: a watch appends an output slot and one copy of a
     #: value that was already computed, so it cannot change what the program
@@ -3974,6 +3979,438 @@ def with_native_sgd_loop(
         output_surfaces=artifact.output_surfaces,
         training_steps_value_id=steps_id,
         learning_rate_value_id=learning_rate_id,
+    )
+
+
+def with_native_adam_loop(
+    artifact: LLVMFunctionArtifact,
+    *,
+    parameter_gradient_pairs: _Any,
+    entry_name: str | None = None,
+    cycled_value_ids: _Sequence[int] = (),
+    cycle_length: int = 1,
+    gradient_accumulation_steps: int = 1,
+    max_global_gradient_norm: float | None = None,
+) -> LLVMFunctionArtifact:
+    """Wrap a compiled forward/loss/VJP motion in a stateful Adam cycle.
+
+    ``cycled_value_ids`` name ordinary motion inputs whose public buffers gain
+    a leading ``cycle_length`` axis.  Before each motion call the wrapper
+    points those slots at the matching slice, so one native invocation can
+    consume genuinely different minibatches without a Python callback.
+    Parameters, first/second moments, bias-correction powers, and iteration
+    count remain caller-owned in/out buffers. Gradients are averaged over
+    ``gradient_accumulation_steps`` motions (including a trailing partial
+    group), then optionally clipped to ``max_global_gradient_norm`` before
+    each Adam update.
+    """
+    if artifact.shortfalls:
+        raise ValueError("cannot wrap an incomplete LLVM artifact")
+    if artifact.library_path is not None:
+        raise ValueError("wrap the LLVM artifact before native compilation")
+    pairs = tuple((int(parameter), int(gradient)) for parameter, gradient in (
+        parameter_gradient_pairs or ()
+    ))
+    if not pairs:
+        raise ValueError("native Adam loop requires parameter/gradient pairs")
+    cycle_length = int(cycle_length)
+    if cycle_length < 1:
+        raise ValueError("native Adam loop cycle_length must be positive")
+    gradient_accumulation_steps = int(gradient_accumulation_steps)
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    if max_global_gradient_norm is not None:
+        max_global_gradient_norm = float(max_global_gradient_norm)
+        if not _math.isfinite(max_global_gradient_norm) or max_global_gradient_norm <= 0.0:
+            raise ValueError("max_global_gradient_norm must be finite and positive")
+
+    positions = {
+        int(value_id): index for index, value_id in enumerate(artifact.buffer_order)
+    }
+    shapes = {
+        int(value_id): tuple(shape or ())
+        for value_id, shape in zip(artifact.buffer_order, artifact.buffer_shapes)
+    }
+    dtypes = {
+        int(value_id): dtype
+        for value_id, dtype in zip(
+            artifact.buffer_order,
+            artifact.buffer_dtypes or tuple("double" for _ in artifact.buffer_order),
+        )
+    }
+
+    def static_count(value_id: int) -> int:
+        count = 1
+        try:
+            for extent in shapes[value_id]:
+                count *= int(extent)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"native Adam loop requires static shape for value {value_id}"
+            ) from error
+        return max(1, count)
+
+    parameter_counts: dict[int, int] = {}
+    for parameter, gradient in pairs:
+        if parameter not in positions or gradient not in positions:
+            raise ValueError(
+                f"parameter/gradient pair ({parameter}, {gradient}) is not public"
+            )
+        if shapes[parameter] != shapes[gradient]:
+            raise ValueError(
+                f"parameter {parameter} shape {shapes[parameter]!r} does not "
+                f"match gradient {gradient} shape {shapes[gradient]!r}"
+            )
+        if dtypes[parameter] != "double" or dtypes[gradient] != "double":
+            raise ValueError("native Adam loop currently requires float64 parameters")
+        parameter_counts[parameter] = static_count(parameter)
+
+    cycled = tuple(dict.fromkeys(map(int, cycled_value_ids)))
+    for value_id in cycled:
+        if value_id not in positions:
+            raise ValueError(f"cycled value {value_id} is not public")
+        if dtypes[value_id] != "double":
+            raise ValueError("native Adam loop currently cycles float64 buffers")
+        static_count(value_id)
+
+    occupied = set(positions)
+
+    def fresh_id() -> int:
+        candidate = min((*occupied, 0)) - 1
+        while candidate in occupied:
+            candidate -= 1
+        occupied.add(candidate)
+        return candidate
+
+    first_moment_ids = {parameter: fresh_id() for parameter, _ in pairs}
+    second_moment_ids = {parameter: fresh_id() for parameter, _ in pairs}
+    gradient_accumulator_ids = {parameter: fresh_id() for parameter, _ in pairs}
+    steps_id = fresh_id()
+    learning_rate_id = fresh_id()
+    beta1_id = fresh_id()
+    beta2_id = fresh_id()
+    epsilon_id = fresh_id()
+    beta1_power_id = fresh_id()
+    beta2_power_id = fresh_id()
+    iteration_id = fresh_id()
+
+    buffer_order = list(artifact.buffer_order)
+    buffer_shapes = list(artifact.buffer_shapes)
+    buffer_dtypes = list(
+        artifact.buffer_dtypes or tuple("double" for _ in artifact.buffer_order)
+    )
+    for value_id in cycled:
+        slot = positions[value_id]
+        buffer_shapes[slot] = (cycle_length, *shapes[value_id])
+    for parameter, _gradient in pairs:
+        buffer_order.extend((first_moment_ids[parameter], second_moment_ids[parameter],
+                             gradient_accumulator_ids[parameter]))
+        buffer_shapes.extend((shapes[parameter], shapes[parameter], shapes[parameter]))
+        buffer_dtypes.extend(("double", "double", "double"))
+    scalar_records = (
+        (steps_id, "i32"),
+        (learning_rate_id, "double"),
+        (beta1_id, "double"),
+        (beta2_id, "double"),
+        (epsilon_id, "double"),
+        (beta1_power_id, "double"),
+        (beta2_power_id, "double"),
+        (iteration_id, "i32"),
+    )
+    for value_id, dtype in scalar_records:
+        buffer_order.append(value_id)
+        buffer_shapes.append(())
+        buffer_dtypes.append(dtype)
+    wrapped_positions = {
+        int(value_id): index for index, value_id in enumerate(buffer_order)
+    }
+
+    original_name = str(artifact.name)
+    selected_name = str(entry_name or f"{original_name}__adam")
+    once_name = "__" + _re.sub(
+        r"[^A-Za-z0-9_$.-]", "_", selected_name
+    ) + "_motion_once"
+    definition = _re.compile(
+        r"define\s+void\s+@" + _re.escape(original_name)
+        + r"\(ptr %buffers, ptr %extents\)\s*\{"
+    )
+    renamed, count = definition.subn(
+        f"define internal void @{once_name}(ptr %buffers, ptr %extents) {{",
+        artifact.llvm_ir,
+        count=1,
+    )
+    if count != 1:
+        raise ValueError(f"LLVM artifact has no unique public entry @{original_name}")
+
+    def load_scalar(lines, value_id: int, llvm_type: str, label: str) -> None:
+        slot = wrapped_positions[value_id]
+        lines.extend((
+            f"  %{label}.addr = getelementptr ptr, ptr %buffers, i64 {slot}",
+            f"  %{label}.ptr = load ptr, ptr %{label}.addr, align 8",
+            f"  %{label} = load {llvm_type}, ptr %{label}.ptr, align "
+            f"{4 if llvm_type == 'i32' else 8}",
+        ))
+
+    gradient_norm_id = fresh_id()
+    clipped_gradient_norm_id = fresh_id()
+    for value_id in (gradient_norm_id, clipped_gradient_norm_id):
+        buffer_order.append(value_id)
+        buffer_shapes.append(())
+        buffer_dtypes.append("double")
+    wrapped_positions = {
+        int(value_id): index for index, value_id in enumerate(buffer_order)
+    }
+
+    lines = [
+        f"define void @{selected_name}(ptr %buffers, ptr %extents) {{",
+        "entry:",
+        "  %gradient.norm.square.ptr = alloca double, align 8",
+        "  store double 0.0, ptr %gradient.norm.square.ptr, align 8",
+    ]
+    load_scalar(lines, steps_id, "i32", "steps")
+    load_scalar(lines, learning_rate_id, "double", "lr")
+    load_scalar(lines, beta1_id, "double", "beta1")
+    load_scalar(lines, beta2_id, "double", "beta2")
+    load_scalar(lines, epsilon_id, "double", "epsilon")
+    beta1_power_slot = wrapped_positions[beta1_power_id]
+    beta2_power_slot = wrapped_positions[beta2_power_id]
+    iteration_slot = wrapped_positions[iteration_id]
+    lines.extend((
+        f"  %beta1.power.addr = getelementptr ptr, ptr %buffers, i64 {beta1_power_slot}",
+        "  %beta1.power.ptr = load ptr, ptr %beta1.power.addr, align 8",
+        f"  %beta2.power.addr = getelementptr ptr, ptr %buffers, i64 {beta2_power_slot}",
+        "  %beta2.power.ptr = load ptr, ptr %beta2.power.addr, align 8",
+        f"  %iteration.addr = getelementptr ptr, ptr %buffers, i64 {iteration_slot}",
+        "  %iteration.ptr = load ptr, ptr %iteration.addr, align 8",
+        f"  %gradient.norm.addr = getelementptr ptr, ptr %buffers, i64 {wrapped_positions[gradient_norm_id]}",
+        "  %gradient.norm.ptr = load ptr, ptr %gradient.norm.addr, align 8",
+        f"  %clipped.gradient.norm.addr = getelementptr ptr, ptr %buffers, i64 {wrapped_positions[clipped_gradient_norm_id]}",
+        "  %clipped.gradient.norm.ptr = load ptr, ptr %clipped.gradient.norm.addr, align 8",
+    ))
+    for pair_index, (parameter, gradient) in enumerate(pairs):
+        lines.extend((
+            f"  %parameter.addr.{pair_index} = getelementptr ptr, ptr %buffers, i64 {positions[parameter]}",
+            f"  %parameter.ptr.{pair_index} = load ptr, ptr %parameter.addr.{pair_index}, align 8",
+            f"  %gradient.addr.{pair_index} = getelementptr ptr, ptr %buffers, i64 {positions[gradient]}",
+            f"  %gradient.ptr.{pair_index} = load ptr, ptr %gradient.addr.{pair_index}, align 8",
+            f"  %moment1.addr.{pair_index} = getelementptr ptr, ptr %buffers, i64 {wrapped_positions[first_moment_ids[parameter]]}",
+            f"  %moment1.ptr.{pair_index} = load ptr, ptr %moment1.addr.{pair_index}, align 8",
+            f"  %moment2.addr.{pair_index} = getelementptr ptr, ptr %buffers, i64 {wrapped_positions[second_moment_ids[parameter]]}",
+            f"  %moment2.ptr.{pair_index} = load ptr, ptr %moment2.addr.{pair_index}, align 8",
+            f"  %gradient.accumulator.addr.{pair_index} = getelementptr ptr, ptr %buffers, i64 {wrapped_positions[gradient_accumulator_ids[parameter]]}",
+            f"  %gradient.accumulator.{pair_index} = load ptr, ptr %gradient.accumulator.addr.{pair_index}, align 8",
+        ))
+    for cycle_index, value_id in enumerate(cycled):
+        lines.extend((
+            f"  %cycle.addr.{cycle_index} = getelementptr ptr, ptr %buffers, i64 {positions[value_id]}",
+            f"  %cycle.bank.{cycle_index} = load ptr, ptr %cycle.addr.{cycle_index}, align 8",
+        ))
+    lines.extend((
+        "  br label %training.header",
+        "training.header:",
+        "  %training.iteration = phi i32 [ 0, %entry ], [ %training.next, %training.continue ]",
+        "  %training.active = icmp slt i32 %training.iteration, %steps",
+        "  br i1 %training.active, label %training.motion, label %training.exit",
+        "training.motion:",
+        f"  %cycle.index = urem i32 %training.iteration, {cycle_length}",
+        "  %cycle.index64 = zext i32 %cycle.index to i64",
+    ))
+    for cycle_index, value_id in enumerate(cycled):
+        lines.extend((
+            f"  %cycle.offset.{cycle_index} = mul i64 %cycle.index64, {static_count(value_id)}",
+            f"  %cycle.slice.{cycle_index} = getelementptr double, ptr %cycle.bank.{cycle_index}, i64 %cycle.offset.{cycle_index}",
+            f"  store ptr %cycle.slice.{cycle_index}, ptr %cycle.addr.{cycle_index}, align 8",
+        ))
+    lines.extend((
+        f"  call void @{once_name}(ptr %buffers, ptr %extents)",
+        "  br label %accumulate.0.header",
+    ))
+    for pair_index, (parameter, _gradient) in enumerate(pairs):
+        count_value = parameter_counts[parameter]
+        predecessor = ("%training.motion" if pair_index == 0
+                       else f"%accumulate.{pair_index - 1}.exit")
+        next_block = (f"accumulate.{pair_index + 1}.header"
+                      if pair_index + 1 < len(pairs) else "accumulate.decide")
+        lines.extend((
+            f"accumulate.{pair_index}.header:",
+            f"  %accumulate.index.{pair_index} = phi i64 [ 0, {predecessor} ], [ %accumulate.next.{pair_index}, %accumulate.{pair_index}.body ]",
+            f"  %accumulate.active.{pair_index} = icmp ult i64 %accumulate.index.{pair_index}, {count_value}",
+            f"  br i1 %accumulate.active.{pair_index}, label %accumulate.{pair_index}.body, label %accumulate.{pair_index}.exit",
+            f"accumulate.{pair_index}.body:",
+            f"  %accumulate.gradient.element.{pair_index} = getelementptr double, ptr %gradient.ptr.{pair_index}, i64 %accumulate.index.{pair_index}",
+            f"  %accumulate.gradient.value.{pair_index} = load double, ptr %accumulate.gradient.element.{pair_index}, align 8",
+            f"  %accumulate.element.{pair_index} = getelementptr double, ptr %gradient.accumulator.{pair_index}, i64 %accumulate.index.{pair_index}",
+            f"  %accumulate.value.{pair_index} = load double, ptr %accumulate.element.{pair_index}, align 8",
+            f"  %accumulate.sum.{pair_index} = fadd double %accumulate.value.{pair_index}, %accumulate.gradient.value.{pair_index}",
+            f"  store double %accumulate.sum.{pair_index}, ptr %accumulate.element.{pair_index}, align 8",
+            f"  %accumulate.next.{pair_index} = add i64 %accumulate.index.{pair_index}, 1",
+            f"  br label %accumulate.{pair_index}.header",
+            f"accumulate.{pair_index}.exit:",
+            f"  br label %{next_block}",
+        ))
+    lines.extend((
+        "accumulate.decide:",
+        f"  %group.position = urem i32 %training.iteration, {gradient_accumulation_steps}",
+        "  %group.count = add i32 %group.position, 1",
+        f"  %group.full = icmp eq i32 %group.count, {gradient_accumulation_steps}",
+        "  %training.next.preview = add i32 %training.iteration, 1",
+        "  %training.final = icmp eq i32 %training.next.preview, %steps",
+        "  %optimizer.ready = or i1 %group.full, %training.final",
+        "  br i1 %optimizer.ready, label %norm.0.header, label %training.continue",
+    ))
+    for pair_index, (parameter, _gradient) in enumerate(pairs):
+        count_value = parameter_counts[parameter]
+        predecessor = ("%accumulate.decide" if pair_index == 0
+                       else f"%norm.{pair_index - 1}.exit")
+        next_block = (f"norm.{pair_index + 1}.header"
+                      if pair_index + 1 < len(pairs) else "optimizer.prepare")
+        lines.extend((
+            f"norm.{pair_index}.header:",
+            f"  %norm.index.{pair_index} = phi i64 [ 0, {predecessor} ], [ %norm.next.{pair_index}, %norm.{pair_index}.body ]",
+            f"  %norm.active.{pair_index} = icmp ult i64 %norm.index.{pair_index}, {count_value}",
+            f"  br i1 %norm.active.{pair_index}, label %norm.{pair_index}.body, label %norm.{pair_index}.exit",
+            f"norm.{pair_index}.body:",
+            f"  %norm.accumulator.element.{pair_index} = getelementptr double, ptr %gradient.accumulator.{pair_index}, i64 %norm.index.{pair_index}",
+            f"  %norm.accumulator.value.{pair_index} = load double, ptr %norm.accumulator.element.{pair_index}, align 8",
+            f"  %norm.group.count.{pair_index} = sitofp i32 %group.count to double",
+            f"  %norm.gradient.average.{pair_index} = fdiv double %norm.accumulator.value.{pair_index}, %norm.group.count.{pair_index}",
+            f"  %norm.gradient.square.{pair_index} = fmul double %norm.gradient.average.{pair_index}, %norm.gradient.average.{pair_index}",
+            f"  %norm.square.current.{pair_index} = load double, ptr %gradient.norm.square.ptr, align 8",
+            f"  %norm.square.next.{pair_index} = fadd double %norm.square.current.{pair_index}, %norm.gradient.square.{pair_index}",
+            f"  store double %norm.square.next.{pair_index}, ptr %gradient.norm.square.ptr, align 8",
+            f"  %norm.next.{pair_index} = add i64 %norm.index.{pair_index}, 1",
+            f"  br label %norm.{pair_index}.header",
+            f"norm.{pair_index}.exit:",
+            f"  br label %{next_block}",
+        ))
+    clip_literal = ("0.0" if max_global_gradient_norm is None
+                    else repr(max_global_gradient_norm))
+    lines.extend((
+        "optimizer.prepare:",
+        "  %gradient.norm.square = load double, ptr %gradient.norm.square.ptr, align 8",
+        "  %gradient.norm = call double @llvm.sqrt.f64(double %gradient.norm.square)",
+        f"  %clip.enabled = fcmp ogt double {clip_literal}, 0.0",
+        f"  %clip.required = fcmp ogt double %gradient.norm, {clip_literal}",
+        "  %clip.active = and i1 %clip.enabled, %clip.required",
+        "  %clip.denominator = fadd double %gradient.norm, 1.0e-9",
+        f"  %clip.candidate = fdiv double {clip_literal}, %clip.denominator",
+        "  %clip.scale = select i1 %clip.active, double %clip.candidate, double 1.0",
+        "  %clipped.gradient.norm = fmul double %gradient.norm, %clip.scale",
+        "  store double %gradient.norm, ptr %gradient.norm.ptr, align 8",
+        "  store double %clipped.gradient.norm, ptr %clipped.gradient.norm.ptr, align 8",
+        "  %beta1.power.current = load double, ptr %beta1.power.ptr, align 8",
+        "  %beta2.power.current = load double, ptr %beta2.power.ptr, align 8",
+        "  %beta1.power.next = fmul double %beta1.power.current, %beta1",
+        "  %beta2.power.next = fmul double %beta2.power.current, %beta2",
+        "  %one.minus.beta1 = fsub double 1.0, %beta1",
+        "  %one.minus.beta2 = fsub double 1.0, %beta2",
+        "  %one.minus.beta1.power = fsub double 1.0, %beta1.power.next",
+        "  %one.minus.beta2.power = fsub double 1.0, %beta2.power.next",
+        "  br label %update.0.header",
+    ))
+    for pair_index, (parameter, _gradient) in enumerate(pairs):
+        count_value = parameter_counts[parameter]
+        next_block = (f"update.{pair_index + 1}.header"
+                      if pair_index + 1 < len(pairs) else "optimizer.latch")
+        predecessor = ("%optimizer.prepare" if pair_index == 0
+                       else f"%update.{pair_index - 1}.exit")
+        lines.extend((
+            f"update.{pair_index}.header:",
+            f"  %update.index.{pair_index} = phi i64 [ 0, {predecessor} ], [ %update.next.{pair_index}, %update.{pair_index}.body ]",
+            f"  %update.active.{pair_index} = icmp ult i64 %update.index.{pair_index}, {count_value}",
+            f"  br i1 %update.active.{pair_index}, label %update.{pair_index}.body, label %update.{pair_index}.exit",
+            f"update.{pair_index}.body:",
+            f"  %parameter.element.{pair_index} = getelementptr double, ptr %parameter.ptr.{pair_index}, i64 %update.index.{pair_index}",
+            f"  %gradient.element.{pair_index} = getelementptr double, ptr %gradient.accumulator.{pair_index}, i64 %update.index.{pair_index}",
+            f"  %moment1.element.{pair_index} = getelementptr double, ptr %moment1.ptr.{pair_index}, i64 %update.index.{pair_index}",
+            f"  %moment2.element.{pair_index} = getelementptr double, ptr %moment2.ptr.{pair_index}, i64 %update.index.{pair_index}",
+            f"  %parameter.value.{pair_index} = load double, ptr %parameter.element.{pair_index}, align 8",
+            f"  %gradient.sum.{pair_index} = load double, ptr %gradient.element.{pair_index}, align 8",
+            f"  %gradient.group.count.{pair_index} = sitofp i32 %group.count to double",
+            f"  %gradient.average.{pair_index} = fdiv double %gradient.sum.{pair_index}, %gradient.group.count.{pair_index}",
+            f"  %gradient.value.{pair_index} = fmul double %gradient.average.{pair_index}, %clip.scale",
+            f"  %moment1.value.{pair_index} = load double, ptr %moment1.element.{pair_index}, align 8",
+            f"  %moment2.value.{pair_index} = load double, ptr %moment2.element.{pair_index}, align 8",
+            f"  %moment1.old.{pair_index} = fmul double %beta1, %moment1.value.{pair_index}",
+            f"  %moment1.grad.{pair_index} = fmul double %one.minus.beta1, %gradient.value.{pair_index}",
+            f"  %moment1.new.{pair_index} = fadd double %moment1.old.{pair_index}, %moment1.grad.{pair_index}",
+            f"  %gradient.square.{pair_index} = fmul double %gradient.value.{pair_index}, %gradient.value.{pair_index}",
+            f"  %moment2.old.{pair_index} = fmul double %beta2, %moment2.value.{pair_index}",
+            f"  %moment2.grad.{pair_index} = fmul double %one.minus.beta2, %gradient.square.{pair_index}",
+            f"  %moment2.new.{pair_index} = fadd double %moment2.old.{pair_index}, %moment2.grad.{pair_index}",
+            f"  %moment1.hat.{pair_index} = fdiv double %moment1.new.{pair_index}, %one.minus.beta1.power",
+            f"  %moment2.hat.{pair_index} = fdiv double %moment2.new.{pair_index}, %one.minus.beta2.power",
+            f"  %moment2.sqrt.{pair_index} = call double @llvm.sqrt.f64(double %moment2.hat.{pair_index})",
+            f"  %adam.denom.{pair_index} = fadd double %moment2.sqrt.{pair_index}, %epsilon",
+            f"  %adam.ratio.{pair_index} = fdiv double %moment1.hat.{pair_index}, %adam.denom.{pair_index}",
+            f"  %adam.scaled.{pair_index} = fmul double %lr, %adam.ratio.{pair_index}",
+            f"  %parameter.new.{pair_index} = fsub double %parameter.value.{pair_index}, %adam.scaled.{pair_index}",
+            f"  store double %parameter.new.{pair_index}, ptr %parameter.element.{pair_index}, align 8",
+            f"  store double %moment1.new.{pair_index}, ptr %moment1.element.{pair_index}, align 8",
+            f"  store double %moment2.new.{pair_index}, ptr %moment2.element.{pair_index}, align 8",
+            f"  store double 0.0, ptr %gradient.element.{pair_index}, align 8",
+            f"  %update.next.{pair_index} = add i64 %update.index.{pair_index}, 1",
+            f"  br label %update.{pair_index}.header",
+            f"update.{pair_index}.exit:",
+            f"  br label %{next_block}",
+        ))
+    lines.extend((
+        "optimizer.latch:",
+        "  store double %beta1.power.next, ptr %beta1.power.ptr, align 8",
+        "  store double %beta2.power.next, ptr %beta2.power.ptr, align 8",
+        "  %iteration.current = load i32, ptr %iteration.ptr, align 4",
+        "  %iteration.next = add i32 %iteration.current, 1",
+        "  store i32 %iteration.next, ptr %iteration.ptr, align 4",
+        "  store double 0.0, ptr %gradient.norm.square.ptr, align 8",
+        "  br label %training.continue",
+        "training.continue:",
+        "  %training.next = add i32 %training.iteration, 1",
+        "  br label %training.header",
+        "training.exit:",
+    ))
+    for cycle_index, _value_id in enumerate(cycled):
+        lines.append(
+            f"  store ptr %cycle.bank.{cycle_index}, ptr %cycle.addr.{cycle_index}, align 8"
+        )
+    lines.extend(("  ret void", "}"))
+    sqrt_declaration = (
+        "" if "@llvm.sqrt.f64" in renamed
+        else "\ndeclare double @llvm.sqrt.f64(double)\n"
+    )
+    state = {
+        "kind": "adam",
+        "first_moment": first_moment_ids,
+        "second_moment": second_moment_ids,
+        "gradient_accumulator": gradient_accumulator_ids,
+        "steps": steps_id,
+        "learning_rate": learning_rate_id,
+        "beta1": beta1_id,
+        "beta2": beta2_id,
+        "epsilon": epsilon_id,
+        "beta1_power": beta1_power_id,
+        "beta2_power": beta2_power_id,
+        "iteration": iteration_id,
+        "gradient_norm": gradient_norm_id,
+        "clipped_gradient_norm": clipped_gradient_norm_id,
+        "cycled_value_ids": cycled,
+        "cycle_length": cycle_length,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "max_global_gradient_norm": max_global_gradient_norm,
+    }
+    return LLVMFunctionArtifact(
+        name=selected_name,
+        llvm_ir=renamed.rstrip() + sqrt_declaration + "\n" + "\n".join(lines) + "\n",
+        buffer_order=tuple(buffer_order),
+        buffer_shapes=tuple(buffer_shapes),
+        extent_order=artifact.extent_order,
+        shortfalls=(),
+        buffer_dtypes=tuple(buffer_dtypes),
+        needs_text_sink=artifact.needs_text_sink,
+        output_publications=artifact.output_publications,
+        output_surfaces=artifact.output_surfaces,
+        training_steps_value_id=steps_id,
+        learning_rate_value_id=learning_rate_id,
+        optimizer_state_value_ids=state,
     )
 
 

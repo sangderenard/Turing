@@ -1,5 +1,16 @@
 # Test baseline and hazards — read before running any test
 
+2026-09-14 full-cycle perforated engine training: the complete focused LLVM
+file passes 4 tests in 63.38s. Its three-minibatch regression exercises
+gradient accumulation 2, a 0.15 global-norm clip, and a trailing partial group,
+matching an independent reference for loss, five parameters, ten moment
+tensors, beta powers, iteration, and pre/post-clip norms. The actual headless
+LDT path (`423 -> 212`, batch 2) compiled an 18-batch cyclic bank and executed
+72 forward/loss/generated-VJP/Adam motions in one native call in 0.999s;
+training loss moved 1.11127 -> 0.02979. Adam is presently a backend-native
+cycle around the pre-LLVM-composed forward/loss/VJP motion; it is not yet a
+linked functional-Adam ProcessGraph.
+
 2026-09-14 perforated startup cache: the real-dataset NPZ round-trip regression
 passed in 28.25s, and the native cold-then-cached forward/VJP regression passed
 in 22.68s. A direct 50-transition LDT preparation measured 9.537s cold and
