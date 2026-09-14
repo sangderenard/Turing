@@ -109,6 +109,14 @@ scalar may exceed that fixed bank length; LLVM cycles the bank internally, so
 epochs and passes add compute without multiplying host memory. The live shadow
 replay reuses the same native entry with `steps=1`.
 
+The demo defaults are intentionally solve-oriented: all catalogued engine
+profiles, 256 named samples and 256 episodes per fuel/profile, 3,000 additional
+random simulator transitions, 32 epochs with one complete dataset pass each,
+batch 64, accumulation 4 (effective batch 256), global clip 1.0, and Adam
+learning rate 0.002. Every setting remains a CLI option for smaller development
+runs. `passes_per_epoch=1` keeps the ordinary meaning of an epoch: one full
+visit to the captured dataset.
+
 The explicit full-shaped `loss_scale` lets each minibatch retain exact
 valid-row normalization without differentiating a dynamic divisor, which the
 current repository LLVM call lowering cannot yet emit. The Adam arithmetic is

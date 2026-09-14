@@ -34,6 +34,20 @@ from .demo_perforated_multifuel_engine import (
 from ....compiler.compiled_perforated_adam import CompiledPerforatedAdam
 
 
+# Production-oriented defaults. Development/smoke runs can still override
+# every value on the command line without changing the compiled ABI.
+DEFAULT_EPOCHS = 32
+DEFAULT_PASSES_PER_EPOCH = 1
+DEFAULT_SAMPLES_PER_FUEL = 256
+DEFAULT_EPISODES_PER_FUEL = 256
+DEFAULT_RANDOM_COVERAGE_SAMPLES = 3_000
+DEFAULT_BATCH_SIZE = 64
+DEFAULT_BRANCHES = 2
+DEFAULT_LEARNING_RATE = 0.002
+DEFAULT_GRADIENT_ACCUMULATION_STEPS = 4
+DEFAULT_MAX_GLOBAL_GRADIENT_NORM = 1.0
+
+
 @dataclass(frozen=True)
 class LiveRunArtifacts:
     image_path: Path
@@ -832,16 +846,18 @@ def _validation_loss(learner: CompiledPerforatedAdam, x: np.ndarray,
     return squared_error / max(count, 1)
 
 
-def run_headless(*, output_dir: str | Path, epochs: int = 4,
-                 passes_per_epoch: int = 4,
-                 samples_per_fuel: int = 16, episodes_per_fuel: int = 8,
-                 random_coverage_samples: int = 3_000,
+def run_headless(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
+                 passes_per_epoch: int = DEFAULT_PASSES_PER_EPOCH,
+                 samples_per_fuel: int = DEFAULT_SAMPLES_PER_FUEL,
+                 episodes_per_fuel: int = DEFAULT_EPISODES_PER_FUEL,
+                 random_coverage_samples: int = DEFAULT_RANDOM_COVERAGE_SAMPLES,
                  engine_identities: tuple[str, ...] | None = None,
-                 batch_size: int = 16,
-                 branches: int = 2, seed: int = 1729,
-                 learning_rate: float = 0.006, audio: bool = True,
-                 gradient_accumulation_steps: int = 4,
-                 max_global_gradient_norm: float = 1.0,
+                 batch_size: int = DEFAULT_BATCH_SIZE,
+                 branches: int = DEFAULT_BRANCHES, seed: int = 1729,
+                 learning_rate: float = DEFAULT_LEARNING_RATE,
+                 audio: bool = True,
+                 gradient_accumulation_steps: int = DEFAULT_GRADIENT_ACCUMULATION_STEPS,
+                 max_global_gradient_norm: float = DEFAULT_MAX_GLOBAL_GRADIENT_NORM,
                  information_dropout: float = 0.02,
                  branch_dropout: float = 0.02,
                  use_cache: bool = True,
@@ -1012,16 +1028,18 @@ def run_headless(*, output_dir: str | Path, epochs: int = 4,
         metrics_path, history[0], history[-1], best_validation)
 
 
-def run_interactive(*, output_dir: str | Path, epochs: int = 4,
-                    passes_per_epoch: int = 4,
-                    samples_per_fuel: int = 16, episodes_per_fuel: int = 8,
-                    random_coverage_samples: int = 3_000,
+def run_interactive(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
+                    passes_per_epoch: int = DEFAULT_PASSES_PER_EPOCH,
+                    samples_per_fuel: int = DEFAULT_SAMPLES_PER_FUEL,
+                    episodes_per_fuel: int = DEFAULT_EPISODES_PER_FUEL,
+                    random_coverage_samples: int = DEFAULT_RANDOM_COVERAGE_SAMPLES,
                     engine_identities: tuple[str, ...] | None = None,
-                    batch_size: int = 16,
-                    branches: int = 2, seed: int = 1729,
-                    learning_rate: float = 0.006, audio: bool = True,
-                    gradient_accumulation_steps: int = 4,
-                    max_global_gradient_norm: float = 1.0,
+                    batch_size: int = DEFAULT_BATCH_SIZE,
+                    branches: int = DEFAULT_BRANCHES, seed: int = 1729,
+                    learning_rate: float = DEFAULT_LEARNING_RATE,
+                    audio: bool = True,
+                    gradient_accumulation_steps: int = DEFAULT_GRADIENT_ACCUMULATION_STEPS,
+                    max_global_gradient_norm: float = DEFAULT_MAX_GLOBAL_GRADIENT_NORM,
                     information_dropout: float = 0.02,
                     branch_dropout: float = 0.02,
                     use_cache: bool = True,
@@ -1331,20 +1349,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--output-dir", default=".turing-cache/engine-dendrite-live")
-    parser.add_argument("--epochs", type=int, default=4)
-    parser.add_argument("--passes-per-epoch", type=int, default=4)
-    parser.add_argument("--samples-per-fuel", type=int, default=16)
-    parser.add_argument("--episodes-per-fuel", type=int, default=8)
-    parser.add_argument("--random-coverage-samples", type=int, default=3_000)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--passes-per-epoch", type=int, default=DEFAULT_PASSES_PER_EPOCH)
+    parser.add_argument("--samples-per-fuel", type=int, default=DEFAULT_SAMPLES_PER_FUEL)
+    parser.add_argument("--episodes-per-fuel", type=int, default=DEFAULT_EPISODES_PER_FUEL)
+    parser.add_argument("--random-coverage-samples", type=int,
+                        default=DEFAULT_RANDOM_COVERAGE_SAMPLES)
     parser.add_argument(
         "--engine-profiles", nargs="+", default=["all"],
         help="catalogue engine identities, or 'all' for the union ABI")
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--branches", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--branches", type=int, default=DEFAULT_BRANCHES)
     parser.add_argument("--seed", type=int, default=1729)
-    parser.add_argument("--learning-rate", type=float, default=0.006)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
-    parser.add_argument("--max-global-gradient-norm", type=float, default=1.0)
+    parser.add_argument("--learning-rate", type=float,
+                        default=DEFAULT_LEARNING_RATE)
+    parser.add_argument("--gradient-accumulation-steps", type=int,
+                        default=DEFAULT_GRADIENT_ACCUMULATION_STEPS)
+    parser.add_argument("--max-global-gradient-norm", type=float,
+                        default=DEFAULT_MAX_GLOBAL_GRADIENT_NORM)
     parser.add_argument("--information-dropout", type=float, default=0.02)
     parser.add_argument("--branch-dropout", type=float, default=0.02)
     parser.add_argument("--no-audio", action="store_true")
