@@ -46,6 +46,11 @@ DEFAULT_BRANCHES = 2
 DEFAULT_LEARNING_RATE = 0.002
 DEFAULT_GRADIENT_ACCUMULATION_STEPS = 4
 DEFAULT_MAX_GLOBAL_GRADIENT_NORM = 1.0
+DEFAULT_ADAPTIVE_SAMPLE_REFRESH = True
+DEFAULT_REFRESH_GAP_GROWTH = 0.02
+DEFAULT_REFRESH_NAMED_SAMPLES_PER_FUEL = 64
+DEFAULT_REFRESH_RANDOM_COVERAGE_SAMPLES = 750
+DEFAULT_MAX_SAMPLE_REFRESHES = 4
 
 
 @dataclass(frozen=True)
@@ -678,6 +683,42 @@ def _training_cycle_banks(
         x_bank, y_bank, weight_bank, mask_bank))
 
 
+def _capture_refresh_training_pool(
+    preprocessing: dict,
+    active: np.ndarray,
+    *,
+    seed: int,
+    named_samples_per_fuel: int,
+    episodes_per_fuel: int,
+    random_coverage_samples: int,
+    engine_toy_path=None,
+):
+    """Capture fresh real-simulator programs and normalize to the fixed ABI."""
+    fresh = make_engine_union_data(
+        named_samples_per_fuel=named_samples_per_fuel,
+        seed=seed,
+        episodes_per_fuel=episodes_per_fuel,
+        random_coverage_samples=random_coverage_samples,
+        engine_identities=tuple(preprocessing["engine_names"]),
+        engine_toy_path=engine_toy_path,
+    )
+    if list(fresh.feature_names) != preprocessing["feature_names"]:
+        raise RuntimeError("refreshed simulator features changed the union ABI")
+    selected_targets = [
+        name for name, enabled in zip(fresh.target_names, active) if enabled
+    ]
+    if selected_targets != preprocessing["target_names"]:
+        raise RuntimeError("refreshed simulator targets changed the union ABI")
+    feature_mean = np.asarray(preprocessing["feature_mean"])
+    feature_scale = np.asarray(preprocessing["feature_scale"])
+    target_mean = np.asarray(preprocessing["target_mean"])
+    target_scale = np.asarray(preprocessing["target_scale"])
+    x = (np.asarray(fresh.features) - feature_mean) / feature_scale
+    y = (np.asarray(fresh.targets)[:, active] - target_mean) / target_scale
+    return (np.ascontiguousarray(x), np.ascontiguousarray(y),
+            np.asarray(fresh.episode_ids, dtype=np.int64))
+
+
 def _network_geometry(learner: CompiledPerforatedAdam, width: int, height: int):
     activity = learner.dendrite_activity()
     normalized = activity / max(float(np.percentile(activity, 95)), 1e-12)
@@ -858,6 +899,11 @@ def run_headless(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
                  audio: bool = True,
                  gradient_accumulation_steps: int = DEFAULT_GRADIENT_ACCUMULATION_STEPS,
                  max_global_gradient_norm: float = DEFAULT_MAX_GLOBAL_GRADIENT_NORM,
+                 adaptive_sample_refresh: bool = DEFAULT_ADAPTIVE_SAMPLE_REFRESH,
+                 refresh_gap_growth: float = DEFAULT_REFRESH_GAP_GROWTH,
+                 refresh_named_samples_per_fuel: int = DEFAULT_REFRESH_NAMED_SAMPLES_PER_FUEL,
+                 refresh_random_coverage_samples: int = DEFAULT_REFRESH_RANDOM_COVERAGE_SAMPLES,
+                 max_sample_refreshes: int = DEFAULT_MAX_SAMPLE_REFRESHES,
                  information_dropout: float = 0.02,
                  branch_dropout: float = 0.02,
                  use_cache: bool = True,
@@ -914,6 +960,13 @@ def run_headless(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
     validation_history = []
     initial_validation = _validation_loss(
         learner, x_test, y_test, batch_size)
+    pool_x = x_train
+    pool_y = y_train
+    pool_episode_ids = np.asarray(train_episode_ids, dtype=np.int64)
+    initial_training_loss = _validation_loss(
+        learner, pool_x, pool_y, batch_size)
+    previous_training_loss = initial_training_loss
+    previous_gap = initial_validation - initial_training_loss
     best_validation = initial_validation
     best_step = 0
     best_parameters = {name: value.copy()
@@ -925,26 +978,78 @@ def run_headless(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
         batch_size=batch_size, branches=branches,
         information_dropout=information_dropout,
         branch_dropout=branch_dropout)
-    initial_prediction = learner.forward(banks[0][0])
-    initial_error = initial_prediction - banks[1][0]
-    initial_training_loss = float(np.sum(
-        initial_error * initial_error * banks[2][0]
-    ) / (banks[2][0].sum() * y_train.shape[1]))
-    print(f"[LLVM] executing {steps} motions as one native call...", flush=True)
-    training_started = time.perf_counter()
-    result, native_history = learner.run_cycle(*banks, steps=steps)
-    training_seconds = time.perf_counter() - training_started
-    # The native loss bank is cyclic and therefore contains the last complete
-    # sweep. Preserve a separately measured pre-training point for the plot.
-    history = [initial_training_loss, *native_history.tolist()]
-    print(f"[LLVM] native training cycle completed in {training_seconds:.3f}s", flush=True)
-    final_validation = _validation_loss(learner, x_test, y_test, batch_size)
-    validation_history.append((steps, final_validation))
-    if final_validation < best_validation:
-        best_validation = final_validation
-        best_step = steps
-        best_parameters = {name: value.copy()
-                           for name, value in learner.parameters.items()}
+    history = [initial_training_loss]
+    training_seconds = 0.0
+    sample_refreshes = []
+    result = None
+    final_validation = initial_validation
+    for epoch_index in range(epochs):
+        epoch_steps = cycle_length * passes_per_epoch
+        print(f"[LLVM] epoch {epoch_index + 1}/{epochs}: executing "
+              f"{epoch_steps} motions...", flush=True)
+        training_started = time.perf_counter()
+        result, native_history = learner.run_cycle(*banks, steps=epoch_steps)
+        training_seconds += time.perf_counter() - training_started
+        history.extend(native_history.tolist())
+        training_loss = _validation_loss(
+            learner, pool_x, pool_y, batch_size)
+        final_validation = _validation_loss(
+            learner, x_test, y_test, batch_size)
+        completed_steps = (epoch_index + 1) * epoch_steps
+        validation_history.append((completed_steps, final_validation))
+        if final_validation < best_validation:
+            best_validation = final_validation
+            best_step = completed_steps
+            best_parameters = {name: value.copy()
+                               for name, value in learner.parameters.items()}
+        gap = final_validation - training_loss
+        gap_growth = gap - previous_gap
+        should_refresh = (
+            adaptive_sample_refresh
+            and len(sample_refreshes) < max_sample_refreshes
+            and training_loss < previous_training_loss
+            and training_loss < final_validation
+            and gap_growth >= refresh_gap_growth
+        )
+        if should_refresh:
+            refresh_index = len(sample_refreshes) + 1
+            scale = refresh_index
+            print(f"[sample refresh {refresh_index}] validation gap grew by "
+                  f"{gap_growth:.5g}; capturing new simulator programs...",
+                  flush=True)
+            fresh_x, fresh_y, fresh_episodes = _capture_refresh_training_pool(
+                preprocessing, active,
+                seed=seed + 10_000 * refresh_index,
+                named_samples_per_fuel=(
+                    refresh_named_samples_per_fuel * scale),
+                episodes_per_fuel=episodes_per_fuel,
+                random_coverage_samples=(
+                    refresh_random_coverage_samples * scale),
+                engine_toy_path=engine_toy_path,
+            )
+            episode_offset = int(pool_episode_ids.max(initial=-1)) + 1
+            pool_x = np.concatenate((pool_x, fresh_x), axis=0)
+            pool_y = np.concatenate((pool_y, fresh_y), axis=0)
+            pool_episode_ids = np.concatenate((
+                pool_episode_ids, fresh_episodes + episode_offset))
+            refreshed_schedule = _training_schedule(
+                rng, pool_episode_ids, batch_size, 1, 1)[:cycle_length]
+            banks = _training_cycle_banks(
+                pool_x, pool_y, refreshed_schedule, rng,
+                preprocessing["feature_names"], batch_size=batch_size,
+                branches=branches, information_dropout=information_dropout,
+                branch_dropout=branch_dropout)
+            sample_refreshes.append({
+                "epoch": epoch_index + 1,
+                "gap_growth": gap_growth,
+                "new_samples": len(fresh_x),
+                "pool_samples": len(pool_x),
+            })
+        previous_training_loss = training_loss
+        previous_gap = gap
+    print(f"[LLVM] {epochs} native epochs completed in "
+          f"{training_seconds:.3f}s", flush=True)
+    assert result is not None
     _copy_network_parameters(learner, rollout_learner)
     for step in range(steps):
         throttle = float(np.clip(
@@ -981,6 +1086,9 @@ def run_headless(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
         "native_training_seconds": training_seconds,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "max_global_gradient_norm": max_global_gradient_norm,
+        "adaptive_sample_refresh": adaptive_sample_refresh,
+        "sample_refreshes": sample_refreshes,
+        "final_sample_pool_size": len(pool_x),
     }
     for name, value in best_parameters.items():
         learner.parameters[name][...] = value
@@ -1040,6 +1148,11 @@ def run_interactive(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
                     audio: bool = True,
                     gradient_accumulation_steps: int = DEFAULT_GRADIENT_ACCUMULATION_STEPS,
                     max_global_gradient_norm: float = DEFAULT_MAX_GLOBAL_GRADIENT_NORM,
+                    adaptive_sample_refresh: bool = DEFAULT_ADAPTIVE_SAMPLE_REFRESH,
+                    refresh_gap_growth: float = DEFAULT_REFRESH_GAP_GROWTH,
+                    refresh_named_samples_per_fuel: int = DEFAULT_REFRESH_NAMED_SAMPLES_PER_FUEL,
+                    refresh_random_coverage_samples: int = DEFAULT_REFRESH_RANDOM_COVERAGE_SAMPLES,
+                    max_sample_refreshes: int = DEFAULT_MAX_SAMPLE_REFRESHES,
                     information_dropout: float = 0.02,
                     branch_dropout: float = 0.02,
                     use_cache: bool = True,
@@ -1057,7 +1170,7 @@ def run_interactive(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
     )
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    (x_train, y_train, _x_test, _y_test, dataset, _active,
+    (x_train, y_train, x_test, y_test, dataset, active,
      train_episode_ids, preprocessing) = _prepare(
         samples_per_fuel, seed, engine_toy_path, episodes_per_fuel,
         random_coverage_samples, engine_identities,
@@ -1123,6 +1236,19 @@ def run_interactive(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
         batch_size=batch_size, branches=branches,
         information_dropout=information_dropout,
         branch_dropout=branch_dropout)
+    initial_training_loss = _validation_loss(
+        learner, x_train, y_train, batch_size)
+    initial_validation = _validation_loss(
+        learner, x_test, y_test, batch_size)
+    adaptive_state = {
+        "pool_x": x_train,
+        "pool_y": y_train,
+        "pool_episode_ids": np.asarray(train_episode_ids, dtype=np.int64),
+        "banks": training_banks,
+        "previous_training_loss": initial_training_loss,
+        "previous_gap": initial_validation - initial_training_loss,
+        "sample_refreshes": [],
+    }
     history = []
     step = 0
     running = True
@@ -1136,7 +1262,8 @@ def run_interactive(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
     correction_count = 0
     live_drift = shadow.drift_from(rollout)
     latest_shadow_values = physical_state_mapping(shadow.sim.state)
-    training_submitted = False
+    epochs_submitted = 0
+    epochs_completed = 0
     training_complete = False
     epoch = pass_index = 0
     scheduler_drops = 0
@@ -1147,25 +1274,82 @@ def run_interactive(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
     future = None
     pending_engine_identity = None
 
-    def background_update(run_offline: bool, command_snapshot: LiveEngineControls):
+    def background_update(epoch_index: int | None,
+                          command_snapshot: LiveEngineControls):
         offline_result = None
         offline_history = None
         metadata = None
-        if run_offline:
+        if epoch_index is not None:
             offline_result, offline_history = learner.run_cycle(
-                *training_banks, steps=steps)
-            metadata = (epochs - 1, passes_per_epoch - 1, True)
+                *adaptive_state["banks"],
+                steps=cycle_length * passes_per_epoch)
+            training_loss = _validation_loss(
+                learner, adaptive_state["pool_x"],
+                adaptive_state["pool_y"], batch_size)
+            validation_loss = _validation_loss(
+                learner, x_test, y_test, batch_size)
+            gap = validation_loss - training_loss
+            gap_growth = gap - adaptive_state["previous_gap"]
+            should_refresh = (
+                adaptive_sample_refresh
+                and len(adaptive_state["sample_refreshes"])
+                    < max_sample_refreshes
+                and training_loss < adaptive_state["previous_training_loss"]
+                and training_loss < validation_loss
+                and gap_growth >= refresh_gap_growth
+            )
+            if should_refresh:
+                refresh_index = len(adaptive_state["sample_refreshes"]) + 1
+                fresh_x, fresh_y, fresh_episodes = _capture_refresh_training_pool(
+                    preprocessing, active,
+                    seed=seed + 10_000 * refresh_index,
+                    named_samples_per_fuel=(
+                        refresh_named_samples_per_fuel * refresh_index),
+                    episodes_per_fuel=episodes_per_fuel,
+                    random_coverage_samples=(
+                        refresh_random_coverage_samples * refresh_index),
+                    engine_toy_path=engine_toy_path,
+                )
+                offset = int(adaptive_state["pool_episode_ids"].max(
+                    initial=-1)) + 1
+                adaptive_state["pool_x"] = np.concatenate((
+                    adaptive_state["pool_x"], fresh_x), axis=0)
+                adaptive_state["pool_y"] = np.concatenate((
+                    adaptive_state["pool_y"], fresh_y), axis=0)
+                adaptive_state["pool_episode_ids"] = np.concatenate((
+                    adaptive_state["pool_episode_ids"],
+                    fresh_episodes + offset))
+                refreshed_schedule = _training_schedule(
+                    rng, adaptive_state["pool_episode_ids"],
+                    batch_size, 1, 1)[:cycle_length]
+                adaptive_state["banks"] = _training_cycle_banks(
+                    adaptive_state["pool_x"], adaptive_state["pool_y"],
+                    refreshed_schedule, rng, preprocessing["feature_names"],
+                    batch_size=batch_size, branches=branches,
+                    information_dropout=information_dropout,
+                    branch_dropout=branch_dropout)
+                adaptive_state["sample_refreshes"].append({
+                    "epoch": epoch_index + 1,
+                    "gap_growth": gap_growth,
+                    "new_samples": len(fresh_x),
+                    "pool_samples": len(adaptive_state["pool_x"]),
+                })
+            adaptive_state["previous_training_loss"] = training_loss
+            adaptive_state["previous_gap"] = gap
+            metadata = (epoch_index, passes_per_epoch - 1, True)
         live_x, live_y = shadow.step(command_snapshot)
         replay_x.append(live_x)
         replay_y.append(live_y)
         replay_result = None
         if len(replay_x) >= batch_size:
             chosen = rng.choice(len(replay_x), size=batch_size, replace=False)
-            training_banks[0][0] = np.stack([replay_x[i] for i in chosen])
-            training_banks[1][0] = np.stack([replay_y[i] for i in chosen])
-            training_banks[2][0].fill(1.0)
+            adaptive_state["banks"][0][0] = np.stack(
+                [replay_x[i] for i in chosen])
+            adaptive_state["banks"][1][0] = np.stack(
+                [replay_y[i] for i in chosen])
+            adaptive_state["banks"][2][0].fill(1.0)
             replay_result, _replay_history = learner.run_cycle(
-                *training_banks, steps=1)
+                *adaptive_state["banks"], steps=1)
         parameters = {name: value.copy()
                       for name, value in learner.parameters.items()}
         return {
@@ -1216,8 +1400,9 @@ def run_interactive(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
                 if update["offline_result"] is not None:
                     result = update["offline_result"]
                     history.extend(update["offline_history"].tolist())
-                    step = steps
-                    training_complete = True
+                    step += cycle_length * passes_per_epoch
+                    epochs_completed += 1
+                    training_complete = epochs_completed >= epochs
                 if update["replay_result"] is not None:
                     live_result = update["replay_result"]
                 if update["metadata"] is not None:
@@ -1233,10 +1418,12 @@ def run_interactive(*, output_dir: str | Path, epochs: int = DEFAULT_EPOCHS,
                 last_correction_time = time.monotonic()
                 pending_engine_identity = None
             if future is None:
-                run_offline = not training_submitted
-                training_submitted = True
+                epoch_to_run = None
+                if epochs_submitted < epochs:
+                    epoch_to_run = epochs_submitted
+                    epochs_submitted += 1
                 future = executor.submit(
-                    background_update, run_offline, replace(command))
+                    background_update, epoch_to_run, replace(command))
             keys = pygame.key.get_pressed()
             if keys[pygame.K_UP] or keys[pygame.K_w]:
                 command.throttle += 0.035
@@ -1367,6 +1554,15 @@ def main() -> None:
                         default=DEFAULT_GRADIENT_ACCUMULATION_STEPS)
     parser.add_argument("--max-global-gradient-norm", type=float,
                         default=DEFAULT_MAX_GLOBAL_GRADIENT_NORM)
+    parser.add_argument("--no-adaptive-sample-refresh", action="store_true")
+    parser.add_argument("--refresh-gap-growth", type=float,
+                        default=DEFAULT_REFRESH_GAP_GROWTH)
+    parser.add_argument("--refresh-named-samples-per-fuel", type=int,
+                        default=DEFAULT_REFRESH_NAMED_SAMPLES_PER_FUEL)
+    parser.add_argument("--refresh-random-coverage-samples", type=int,
+                        default=DEFAULT_REFRESH_RANDOM_COVERAGE_SAMPLES)
+    parser.add_argument("--max-sample-refreshes", type=int,
+                        default=DEFAULT_MAX_SAMPLE_REFRESHES)
     parser.add_argument("--information-dropout", type=float, default=0.02)
     parser.add_argument("--branch-dropout", type=float, default=0.02)
     parser.add_argument("--no-audio", action="store_true")
@@ -1388,6 +1584,11 @@ def main() -> None:
         learning_rate=args.learning_rate, audio=not args.no_audio,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_global_gradient_norm=args.max_global_gradient_norm,
+        adaptive_sample_refresh=not args.no_adaptive_sample_refresh,
+        refresh_gap_growth=args.refresh_gap_growth,
+        refresh_named_samples_per_fuel=args.refresh_named_samples_per_fuel,
+        refresh_random_coverage_samples=args.refresh_random_coverage_samples,
+        max_sample_refreshes=args.max_sample_refreshes,
         information_dropout=args.information_dropout,
         branch_dropout=args.branch_dropout,
         use_cache=not args.no_cache,

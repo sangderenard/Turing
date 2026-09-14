@@ -11,6 +11,13 @@ training loss moved 1.11127 -> 0.02979. Adam is presently a backend-native
 cycle around the pre-LLVM-composed forward/loss/VJP motion; it is not yet a
 linked functional-Adam ProcessGraph.
 
+2026-09-14 adaptive engine sample refresh: a forced-trigger real LDT headless
+run completed 2 native epochs / 36 motions with accumulation 2 and clipping
+1.0. After epoch 1, a widening 0.26246 validation gap captured 54 new
+real-simulator transitions, grew the training pool 33 -> 87 rows, refilled the
+same 18-batch LLVM bank without recompilation, and completed epoch 2. Training
+loss moved 0.89212 -> 0.13489 and validation improved 0.73089 -> 0.64798.
+
 2026-09-14 perforated startup cache: the real-dataset NPZ round-trip regression
 passed in 28.25s, and the native cold-then-cached forward/VJP regression passed
 in 22.68s. A direct 50-transition LDT preparation measured 9.537s cold and

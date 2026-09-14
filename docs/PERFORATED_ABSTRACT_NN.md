@@ -117,6 +117,16 @@ learning rate 0.002. Every setting remains a CLI option for smaller development
 runs. `passes_per_epoch=1` keeps the ordinary meaning of an epoch: one full
 visit to the captured dataset.
 
+Adaptive sample refresh is also on by default. After each native epoch, the
+host measures full training-pool and held-out error with compiled inference.
+When training error is falling below validation while the validation gap grows
+by at least 0.02, it captures new real-simulator programs across every selected
+engine profile. Each refresh adds named regime/control sequences plus an
+increasing random control/environment set, grows the source pool, and refills
+the existing fixed-size LLVM bank from that pool. The network is not recompiled.
+Defaults allow four refreshes, beginning with 64 named samples per fuel/profile
+and 750 random transitions; `--no-adaptive-sample-refresh` disables the policy.
+
 The explicit full-shaped `loss_scale` lets each minibatch retain exact
 valid-row normalization without differentiating a dynamic divisor, which the
 current repository LLVM call lowering cannot yet emit. The Adam arithmetic is
