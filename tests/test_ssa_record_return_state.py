@@ -58,6 +58,73 @@ def test_conditional_phi_replaces_only_dominated_continuation_uses():
     assert receipt["tie_policy"] == "incumbent"
 
 
+@pytest.mark.parametrize("owned_update", [True, False])
+def test_conditional_continuation_preserves_owned_loop_snapshot(owned_update):
+    initial = SSAValue(0, "float64")
+    increment = SSAValue(1, "float64")
+    predicate = SSAValue(2, "bool")
+    recurrence = SSAValue(10, "float64")
+    snapshot = SSAValue(11, "float64")
+    raw = SSAValue(20, "float64")
+    constrained = SSAValue(21, "float64")
+    merged = SSAValue(30, "float64")
+    continuation = SSAValue(31, "float64")
+    recurrence_phi = Instr("Phi", [initial, merged], recurrence, attributes={
+        "binding": "loop_carried", "initial_value_id": 0,
+        "updated_value_id": 21, "incoming_blocks": ("entry", "merge"),
+    })
+    snapshot_phi = Instr("Phi", [initial, raw], snapshot, attributes={
+        "binding": "loop_carried", "initial_value_id": 0,
+        "updated_value_id": 20 if owned_update else 21,
+        "incoming_blocks": ("entry", "merge"),
+    })
+    function = Function("root", [initial, increment, predicate], {
+        "entry": BasicBlock("entry", [
+            Instr("Br", [], None, attributes={"target": "header"}),
+        ], ["header"]),
+        "header": BasicBlock("header", [
+            recurrence_phi, snapshot_phi,
+            Instr("CondBr", [predicate], None, attributes={
+                "true_target": "body", "false_target": "exit",
+            }),
+        ], ["body", "exit"]),
+        "body": BasicBlock("body", [
+            Instr("Add", [recurrence, increment], raw),
+            Instr("CondBr", [predicate], None, attributes={
+                "true_target": "changed", "false_target": "unchanged",
+            }),
+        ], ["changed", "unchanged"]),
+        "changed": BasicBlock("changed", [
+            Instr("Mul", [raw, increment], constrained),
+            Instr("Br", [], None, attributes={"target": "merge"}),
+        ], ["merge"]),
+        "unchanged": BasicBlock("unchanged", [
+            Instr("Br", [], None, attributes={"target": "merge"}),
+        ], ["merge"]),
+        "merge": BasicBlock("merge", [
+            Instr("Phi", [constrained, raw], merged, attributes={
+                "binding": "conditional_carried",
+                "incoming_blocks": ("changed", "unchanged"),
+            }),
+            Instr("Copy", [raw], continuation),
+            Instr("Br", [], None, attributes={"target": "header"}),
+        ], ["header"]),
+        "exit": BasicBlock("exit", [Instr("Ret", [snapshot, recurrence], None)]),
+    })
+    module = IRModule({"root": function})
+    assert check_definition_dominance(module) == []
+    reconcile_conditional_phi_continuations(module)
+    assert snapshot_phi.args[1] is (raw if owned_update else merged)
+    assert recurrence_phi.args[1] is merged
+    assert function.blocks["merge"].instrs[1].args[0] is merged
+    assert reconcile_conditional_phi_continuations(module) == 0
+    assert check_definition_dominance(module) == []
+    if owned_update:
+        [receipt] = function.metadata["retained_loop_update_receipts"]
+        assert receipt["priority"] == "exact_loop_carried_update"
+        assert receipt["tie_policy"] == "incumbent"
+
+
 def test_redefined_value_object_is_freshened_per_dominating_edge():
     initial = SSAValue(0, "float64")
     predicate = SSAValue(1, "bool")

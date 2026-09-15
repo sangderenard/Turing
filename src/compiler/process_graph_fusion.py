@@ -528,6 +528,11 @@ def reduce_scheduled_shader_regions(
         for left, right in semantic_edges
         if left in executable and right in executable
     }
+    # Keep the path's boundary provenance separately from its endpoints.
+    # A -> B and A -> coordinator -> B can coexist. The direct edge does
+    # not license swallowing the second path into a region: the coordinator
+    # still needs A's publication before B can execute.
+    coordinator_execution_edges = projected_execution_edges - direct_execution_edges
     for source in executable:
         pending = [
             child
@@ -543,6 +548,7 @@ def reduce_scheduled_shader_regions(
             for child in semantic_successors[current]:
                 if child in executable:
                     projected_execution_edges.add((source, child))
+                    coordinator_execution_edges.add((source, child))
                 else:
                     pending.append(child)
 
@@ -638,8 +644,7 @@ def reduce_scheduled_shader_regions(
         if any(
             left in members
             and right in members
-            and (left, right) not in direct_execution_edges
-            for left, right in projected_execution_edges
+            for left, right in coordinator_execution_edges
         ):
             # The dependency between these numerical endpoints crosses at
             # least one structural/coordinator node.  Internalizing both ends

@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import Any, Mapping
 
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from ..transmogrifier.ssa import Instr, SSAValue
 
 
@@ -357,33 +358,14 @@ def plan_region_to_ssa_instrs(
         return made
 
     values: dict[int, SSAValue] = {}
-    # Temporaries minted here live in the CALLER's numbering: a planner
-    # region is carved out of the caller and shares its value space, so the
-    # caller reads a region's published values by id. Seeding the allocator
-    # from only this region's own line ids let temporaries collide with
-    # caller ids the region never mentions -- region-internal GEP addresses
-    # landed on the ids of the caller's scalar parameters, and the fluid
-    # advance read a height cell where tracer_diffusivity should have been
-    # (same-number-different-space, the class this tree keeps paying for).
-    # ``first_free_value_id`` is the caller's watermark; the region's own
-    # max stays in the seed so a caller that cannot supply one keeps the
-    # old behaviour.
-    next_value_id = max(int(first_free_value_id) - 1, max((
-        int(value_id)
-        for item in region.items
-        if isinstance(item, PlanLine)
-        for value_id in (*item.inputs, *item.outputs)
-    ), default=-1)) + 1
-
     def fresh_like(result: SSAValue) -> SSAValue:
-        nonlocal next_value_id
+        value_id = GLOBAL_MONOTONIC_IDS.mint()
         made = SSAValue(
-            next_value_id,
+            value_id,
             dtype=result.dtype,
             shape=tuple(result.shape),
         )
-        values[next_value_id] = made
-        next_value_id += 1
+        values[value_id] = made
         return made
 
     instructions = []

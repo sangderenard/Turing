@@ -26,6 +26,7 @@ from ..transmogrifier.ssa import (
     SSASequenceTable,
     SSAValue,
 )
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 
 
 class SSASequenceShortfallCode(str, Enum):
@@ -149,7 +150,6 @@ def schedule_joined_sequence_mutations(function: Function) -> int:
 
 class _Builder:
     def __init__(self, first_value_id: int) -> None:
-        self.next_value_id = int(first_value_id)
         self.blocks: dict[str, BasicBlock] = {}
 
     def block(self, name: str) -> BasicBlock:
@@ -158,9 +158,7 @@ class _Builder:
         return block
 
     def fresh(self, dtype: str | None = None) -> SSAValue:
-        value = SSAValue(self.next_value_id, dtype=dtype)
-        self.next_value_id += 1
-        return value
+        return SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=dtype)
 
     def emit(
         self,

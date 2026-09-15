@@ -12,6 +12,7 @@ from ..common.tensors.fused_ir import (
     OpStep,
     canonical_elementwise_op,
 )
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from ..transmogrifier.ssa import Instr
 
 
@@ -76,16 +77,8 @@ def lower_ssa_to_fused_program(
     steps: list[OpStep] = []
     issues: list[LoweringIssue] = []
     outputs: dict[str, int] = {}
-    next_value_id = max(
-        (instr.res.id for instr in instrs),
-        default=-1,
-    ) + 1
-
     def fresh_id() -> int:
-        nonlocal next_value_id
-        result = next_value_id
-        next_value_id += 1
-        return result
+        return GLOBAL_MONOTONIC_IDS.mint()
 
     def operand(value_id: int):
         if value_id in available:

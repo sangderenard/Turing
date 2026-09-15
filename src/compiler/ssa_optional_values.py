@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from ..transmogrifier.ssa import Instr, SSAValue
 
 
@@ -17,26 +18,6 @@ _NE_OPS = {"Ne", "ne", "NotEqual", "not_equal"}
 def _functions(module: Any) -> dict[str, Any]:
     functions = getattr(module, "functions", module)
     return dict(functions or {})
-
-
-def _next_value_id(functions: dict[str, Any]) -> int:
-    ids = {
-        int(value.id)
-        for function in functions.values()
-        for value in function.args
-    }
-    ids.update(
-        int(value.id)
-        for function in functions.values()
-        for block in function.blocks.values()
-        for instruction in block.instrs
-        for value in (
-            *instruction.args,
-            *((instruction.res,) if instruction.res is not None else ()),
-        )
-    )
-    return max(ids, default=-1) + 1
-
 
 def _insert_before_terminator(block: Any, instructions: list[Instr]) -> None:
     index = len(block.instrs)
@@ -58,7 +39,6 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
     """
 
     functions = _functions(module)
-    next_id = _next_value_id(functions)
     contracts: dict[str, dict[str, Any]] = {}
     receipts: list[dict[str, Any]] = []
 
@@ -127,10 +107,12 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                         edge_instructions: list[Instr] = []
                         if is_absent:
                             payload = SSAValue(
-                                next_id, dtype=dtype, shape=shape, device=device,
+                                GLOBAL_MONOTONIC_IDS.mint(),
+                                dtype=dtype,
+                                shape=shape,
+                                device=device,
                                 accounting={"optional_inactive_payload": True},
                             )
-                            next_id += 1
                             edge_instructions.append(Instr(
                                 "Const", [], payload,
                                 attributes={
@@ -145,10 +127,10 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                         present = presence_by_payload.get(int(value.id))
                         if present is None:
                             present = SSAValue(
-                                next_id, dtype="bool",
+                                GLOBAL_MONOTONIC_IDS.mint(),
+                                dtype="bool",
                                 accounting={"ssa_optional_presence_edge": True},
                             )
-                            next_id += 1
                             edge_instructions.append(Instr(
                                 "Const", [], present,
                                 attributes={
@@ -166,13 +148,13 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                             "binding"
                         ) or "") == "return_merge"
                         presence = SSAValue(
-                            next_id, dtype="bool",
+                            GLOBAL_MONOTONIC_IDS.mint(),
+                            dtype="bool",
                             accounting={
                                 "ssa_optional_presence": True,
                                 "ssa_optional_payload_id": int(instruction.res.id),
                             },
                         )
-                        next_id += 1
                         instruction.args = payload_args
                         instruction.res.dtype = dtype
                         instruction.res.shape = shape
@@ -302,27 +284,32 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                     "ssa_optional_payload": True,
                 }
                 presence = SSAValue(
-                    next_id, dtype="bool",
+                    GLOBAL_MONOTONIC_IDS.mint(),
+                    dtype="bool",
                     accounting={
                         "ssa_optional_presence": True,
                         "ssa_optional_payload_id": int(payload.id),
                     },
                 )
-                next_id += 1
                 aggregate = SSAValue(
-                    next_id, dtype="ssa.aggregate", shape=(2,),
+                    GLOBAL_MONOTONIC_IDS.mint(),
+                    dtype="ssa.aggregate",
+                    shape=(2,),
                     accounting={
                         "ssa_aggregate_outputs": (payload, presence),
                         "ssa_optional_result": True,
                     },
                 )
-                next_id += 1
                 projection: list[Instr] = []
                 for position, output in enumerate((payload, presence)):
-                    position_value = SSAValue(next_id, dtype="int")
-                    next_id += 1
-                    address = SSAValue(next_id, dtype="ptr")
-                    next_id += 1
+                    position_value = SSAValue(
+                        GLOBAL_MONOTONIC_IDS.mint(),
+                        dtype="int",
+                    )
+                    address = SSAValue(
+                        GLOBAL_MONOTONIC_IDS.mint(),
+                        dtype="ptr",
+                    )
                     projection.extend((
                         Instr("Const", [], position_value,
                               attributes={"value": position}),

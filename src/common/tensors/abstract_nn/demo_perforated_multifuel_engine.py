@@ -38,9 +38,11 @@ LOAD_BANDS = ("idle", "light", "medium", "heavy", "overload")
 TRANSITION_REGIMES = (
     "starting", "idling", "idle-recovery", "idle-load-compensation",
     "load-recovery", "high-end", "upshift", "downshift",
-    "random-coverage",
+    "wot-pull", "random-coverage",
 )
-NAMED_TRANSITION_REGIMES = TRANSITION_REGIMES[:-1]
+NAMED_TRANSITION_REGIMES = TRANSITION_REGIMES[:8]
+MIN_NAMED_EPISODE_TRANSITIONS = 32
+WOT_PULL_CAPTURE_DT_SECONDS = 0.05
 MACHINE_OUTPUT_NAMES = (
     "state.current_torque_nm", "state.torque_rms_nm", "state.power_kw",
     "state.power_rms_kw", "state.accessory_drag_nm",
@@ -59,7 +61,7 @@ _TRANSITION_STATE_NAMES = (
     "state.coupling_slipping", "state.stalled",
 )
 _CONTROL_NAMES = (
-    "control.throttle", "control.brake_load_nm",
+    "control.dt_seconds", "control.throttle", "control.brake_load_nm",
     "control.electrical_load_frac",
     "control.known_accessory_shaft_load_w",
     "control.idle_load_feedforward_frac", "control.clutch_frac",
@@ -321,7 +323,8 @@ def _regime_command(regime: str, progress: float, player_noise: float,
         throttle = 0.48 if progress < 0.52 else 0.14
         return load, float(np.clip(throttle + player_noise, 0.09, 0.72)), electrical, None, 1.0
     if regime == "high-end":
-        return 0.78, float(np.clip(0.88 + player_noise, 0.70, 1.0)), electrical, None, 1.0
+        throttle = 0.72 + 0.32 * min(1.0, progress / 0.65)
+        return 0.78, float(np.clip(throttle + player_noise, 0.65, 1.0)), electrical, None, 1.0
     if regime == "upshift":
         # Disengage, select the next ratio, and re-engage around midpoint.
         if progress < 0.42:
@@ -387,6 +390,7 @@ def make_multifuel_engine_data(samples_per_fuel: int = 256, seed: int = 1729,
                           external_brake_nm: float = 0.0,
                           starter_signal: float = 0.0,
                           ignition_enabled: float = 1.0,
+                          dt_seconds: float = 0.005,
                           previous_state=None, previous_controls=None):
         nonlocal feedforward_rows
         sim.throttle = throttle
@@ -405,6 +409,7 @@ def make_multifuel_engine_data(samples_per_fuel: int = 256, seed: int = 1729,
         if throttle < 0.08 and feedforward > 0.0:
             feedforward_rows += 1
         controls = {
+            "control.dt_seconds": dt_seconds,
             "control.throttle": throttle,
             "control.brake_load_nm": sim.brake_load_nm,
             "control.electrical_load_frac": sim.electrical_load_frac,
@@ -421,7 +426,7 @@ def make_multifuel_engine_data(samples_per_fuel: int = 256, seed: int = 1729,
             before, previous_state, controls, previous_controls)
         feature_rows.append({**engine_parameters, **before, **controls,
                              **context})
-        sim.step(0.005)
+        sim.step(dt_seconds)
         after = physical_state_mapping(sim.state)
         target_rows.append({name: after.get(name, 0.0) - value
                             for name, value in before.items()})
@@ -434,7 +439,15 @@ def make_multifuel_engine_data(samples_per_fuel: int = 256, seed: int = 1729,
         return before, controls
 
     for fuel_id, fuel in enumerate(fuel_profiles):
-        episode_count = min(episodes_per_fuel, samples_per_fuel // 2)
+        # An episode count is a ceiling, not a request to fragment every named
+        # regime into two-tick scraps. Transition history and sustained control
+        # response need useful contiguous windows.
+        if samples_per_fuel < len(NAMED_TRANSITION_REGIMES) * MIN_NAMED_EPISODE_TRANSITIONS:
+            episode_count = min(episodes_per_fuel, samples_per_fuel // 2)
+        else:
+            episode_count = min(
+                episodes_per_fuel, len(NAMED_TRANSITION_REGIMES),
+                samples_per_fuel // MIN_NAMED_EPISODE_TRANSITIONS)
         lengths = np.full(episode_count, samples_per_fuel // episode_count,
                           dtype=np.int64)
         lengths[:samples_per_fuel % episode_count] += 1
@@ -446,10 +459,10 @@ def make_multifuel_engine_data(samples_per_fuel: int = 256, seed: int = 1729,
                 capture.fuel_choice = fuel
             capture.gear_index = 0
             capture.clutch_frac = 0.0
-            capture.throttle = 0.88
+            capture.throttle = 1.0
             shift_rpm = max(1_200.0, capture.engine.idle_rpm * 1.8)
-            high_rpm = capture.engine.power_peak_rpm * 0.92
-            for _ in range(100):
+            high_rpm = capture.engine.redline_rpm * 0.94
+            for _ in range(400):
                 capture.step(0.05)
                 if ("shift" not in captured_operating_states
                         and capture.state.rpm >= shift_rpm):

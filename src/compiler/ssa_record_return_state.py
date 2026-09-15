@@ -2,6 +2,8 @@
 
 import networkx as nx
 
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
+
 
 def normalize_declared_scalar_record_shapes(module):
     """Enforce the physical shape promised by scalar record descriptors.
@@ -423,7 +425,9 @@ def reconcile_conditional_phi_continuations(module):
     Value ids are not sufficient here: independently lowered projections may
     deliberately retain the same source id.  Match the exact SSAValue object,
     select the unique latest dominating conditional Phi, and leave an
-    incumbent untouched when candidates are incomparable.
+    incumbent untouched when candidates are incomparable. An explicitly owned
+    loop update is a snapshot of its selected producer, not a stale capture of
+    a later conditional version.
     """
     receipts = []
     for symbol, function in module.functions.items():
@@ -459,8 +463,13 @@ def reconcile_conditional_phi_continuations(module):
 
         # An arm is keyed by Python identity, not by source-derived value id.
         candidates = {}
+        definitions = {}
         for block_name, block in function.blocks.items():
             for instruction_index, operation in enumerate(block.instrs):
+                if operation.res is not None:
+                    definitions.setdefault(int(operation.res.id), []).append((
+                        str(block_name), int(instruction_index), operation.res,
+                    ))
                 attributes = operation.attributes or {}
                 if (
                     operation.op != "Phi"
@@ -505,6 +514,43 @@ def reconcile_conditional_phi_continuations(module):
                         else str(block_name)
                     )
                     phi_edge = position < len(incoming)
+                    owned_definitions = definitions.get(int(incumbent.id), ())
+                    if (
+                        phi_edge
+                        and (operation.attributes or {}).get("binding")
+                        == "loop_carried"
+                        and (operation.attributes or {}).get("updated_value_id")
+                        == int(incumbent.id)
+                        and dominates(str(block_name), target_block)
+                        and len(owned_definitions) == 1
+                        and owned_definitions[0][2] is incumbent
+                        and candidate_available(
+                            owned_definitions[0], target_block,
+                            int(instruction_index), True,
+                        )
+                    ):
+                        # Dominance proves availability, not assignment to
+                        # this logical loop binding. The raw update may also
+                        # feed a conditional that controls another recurrence.
+                        # Retain the exact producer chosen by local lowering.
+                        receipt = {
+                            "function": str(symbol),
+                            "consumer_block": str(block_name),
+                            "consumer_value_id": int(operation.res.id),
+                            "consumer_position": int(position),
+                            "updated_value_id": int(incumbent.id),
+                            "producer_block": owned_definitions[0][0],
+                            "priority": "exact_loop_carried_update",
+                            "tie_policy": "incumbent",
+                        }
+                        prior = tuple(function.metadata.get(
+                            "retained_loop_update_receipts", (),
+                        ))
+                        if receipt not in prior:
+                            function.metadata["retained_loop_update_receipts"] = (
+                                *prior, receipt,
+                            )
+                        continue
                     current = incumbent
                     chain = []
                     seen = {id(current)}
@@ -570,22 +616,6 @@ def freshen_redefined_ssa_objects(module):
     from dataclasses import replace
 
     receipts = []
-    next_value_id = 1 + max((
-        int(value.id)
-        for function in module.functions.values()
-        for value in (
-            list(function.args)
-            + [
-                item
-                for block in function.blocks.values()
-                for instruction in block.instrs
-                for item in (
-                    list(instruction.args)
-                    + ([] if instruction.res is None else [instruction.res])
-                )
-            ]
-        )
-    ), default=0)
     for symbol, function in module.functions.items():
         block_names = tuple(function.blocks)
         if not block_names:
@@ -637,9 +667,10 @@ def freshen_redefined_ssa_objects(module):
                 "source_value_id": int(original.id),
             })
             fresh = replace(
-                original, id=int(next_value_id), accounting=accounting
+                original,
+                id=GLOBAL_MONOTONIC_IDS.mint(),
+                accounting=accounting,
             )
-            next_value_id += 1
             definition.res = fresh
 
             for use_block, block in function.blocks.items():
@@ -934,24 +965,13 @@ def repair_non_dominating_return_phi_inputs(function):
                 changed = True
 
     definitions = {}
-    max_value_id = max(
-        (
-            int(value.id)
-            for value in function.args
-        ),
-        default=-1,
-    )
     for block_name, block in function.blocks.items():
         for index, instruction in enumerate(block.instrs):
-            for argument in instruction.args:
-                max_value_id = max(max_value_id, int(argument.id))
             if instruction.res is not None:
                 value_id = int(instruction.res.id)
-                max_value_id = max(max_value_id, value_id)
                 definitions.setdefault(value_id, []).append(
                     (block_name, index, instruction)
                 )
-    next_value_id = max_value_id + 1
     formal_ids = {int(value.id) for value in function.args}
 
     def definition_dominates(value_id, edge_name, insertion_index):
@@ -1044,7 +1064,7 @@ def repair_non_dominating_return_phi_inputs(function):
                 failed = False
 
                 def materialize(value):
-                    nonlocal next_value_id, failed
+                    nonlocal failed
                     value_id = int(value.id)
                     if definition_dominates(
                         value_id, str(edge_name), insertion_index
@@ -1067,7 +1087,7 @@ def repair_non_dominating_return_phi_inputs(function):
                         failed = True
                         return value
                     cloned_result = SSAValue(
-                        next_value_id,
+                        GLOBAL_MONOTONIC_IDS.mint(),
                         dtype=producer.res.dtype,
                         shape=producer.res.shape,
                         device=producer.res.device,
@@ -1079,7 +1099,6 @@ def repair_non_dominating_return_phi_inputs(function):
                             "return_edge_recomputation": True,
                         },
                     )
-                    next_value_id += 1
                     cloned_attributes = dict(producer.attributes or {})
                     cloned_attributes.update({
                         "return_edge_recomputation": True,
@@ -1151,7 +1170,6 @@ def publish_scalar_record_return_fields(module):
                 values.update((int(value.id), value) for value in operation.args)
                 if operation.res is not None:
                     values[int(operation.res.id)] = operation.res
-        next_id = max(values, default=0) + 1
         conversions = {
             (name, int(op.args[0].id), op.res.dtype): op.res
             for name, block in function.blocks.items() for op in block.instrs
@@ -1194,8 +1212,10 @@ def publish_scalar_record_return_fields(module):
                         key = (predecessor, int(selected.id), fallback.dtype)
                         converted = conversions.get(key)
                         if converted is None:
-                            converted = SSAValue(next_id, dtype=fallback.dtype)
-                            next_id += 1
+                            converted = SSAValue(
+                                GLOBAL_MONOTONIC_IDS.mint(),
+                                dtype=fallback.dtype,
+                            )
                             edge.instrs.insert(-1, Instr('Cast', [selected], converted, attributes={
                                 'record_return_field_conversion': field.name,
                                 'source_field_value_id': int(selected.id),

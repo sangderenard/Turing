@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from ..transmogrifier.ssa import Instr, SSAValue
 
 _GATHER = ("Indexed", "gather")
@@ -31,33 +32,8 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
     ``functions`` is a mapping of name -> repository SSA ``Function``.
     """
 
-    # Address temporaries are minted above every id in the MODULE, not above
-    # each function's own maximum. A planner region is carved out of its caller
-    # and shares the caller's value space, so a per-function allocator hands a
-    # region-internal address the very integer the caller uses for one of its
-    # own scalars -- and the whole-program structural-output recovery, which
-    # matches a caller's desired id against any id a callee produces, then
-    # binds the caller's scalar to that address. That is how the fluid advance
-    # read a height cell where ``tracer_diffusivity`` belonged: region_2's
-    # address landed on 80, region_1's on 89 (same number, different space).
-    # One module-wide watermark makes the collision unrepresentable.
-    next_id = -1
-    for function in functions.values():
-        for value in function.args:
-            next_id = max(next_id, int(value.id))
-        for block in function.blocks.values():
-            for instruction in block.instrs:
-                if instruction.res is not None:
-                    next_id = max(next_id, int(instruction.res.id))
-                for argument in instruction.args:
-                    next_id = max(next_id, int(argument.id))
-    next_id += 1
-
     def fresh() -> SSAValue:
-        nonlocal next_id
-        value = SSAValue(next_id)
-        next_id += 1
-        return value
+        return SSAValue(GLOBAL_MONOTONIC_IDS.mint())
 
     for function in functions.values():
 

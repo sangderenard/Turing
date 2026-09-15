@@ -6311,20 +6311,22 @@ def _inert_routing_nodes(graph: Any) -> frozenset[int]:
     return result
 
 
-def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
-    """Whether a node routes syntax but performs no computation (cached).
+# Serialized ProcessGraphs retain this derived cache. Bump its schema when
+# classification semantics change, so a compiler replay recomputes old facts.
+_DISPATCH_METADATA_CACHE_SCHEMA = 2
 
-    This ~200-line classifier dominated ``compile_process_graph`` because it is
-    a pure function of the (planning-stable) graph yet is evaluated for every
-    node more than once -- once building each shell's executable-node set, again
-    validating dispatch coverage. Memoize it per graph, keyed by the same cheap
-    (node count, edge count) fingerprint ``_dependency_order`` uses, so a graph
-    that gains or loses structure is reclassified while a mere re-query is a
-    dict hit.
+
+def _dispatch_metadata_node_classifier(graph: Any):
+    """Return a cached classifier for one pass over a stable planning graph.
+
+    NetworkX counts edges by walking node degrees. Validate the cache once
+    per pass, rather than doing that graph-wide walk for every queried node.
+    Obtain a new classifier after changing the graph's structure.
     """
 
     G = graph.G
-    fingerprint = (G.number_of_nodes(), G.number_of_edges())
+    fingerprint = (_DISPATCH_METADATA_CACHE_SCHEMA,
+                   G.number_of_nodes(), G.number_of_edges())
     cache = G.graph.get("_dispatch_metadata_cache")
     if cache is None or cache.get("__fingerprint__") != fingerprint:
         cache = {"__fingerprint__": fingerprint,
@@ -6336,17 +6338,31 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
                      ).values()
                  )}
         G.graph["_dispatch_metadata_cache"] = cache
-    key = int(node_id)
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-    result = _is_dispatch_metadata_node_impl(graph, node_id)
-    cache[key] = result
-    return result
+    def classify(node_id: int) -> bool:
+        key = int(node_id)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        result = _is_dispatch_metadata_node_impl(graph, node_id)
+        cache[key] = result
+        return result
+
+    return classify
+
+
+def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
+    """Classify a single node, validating the graph cache before the query."""
+    return _dispatch_metadata_node_classifier(graph)(node_id)
 
 
 def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
     data = graph.G.nodes[node_id]
+    if (data.get("attributes") or {}).get("authored_call_result_projection"):
+        # Specialization publishes typed leaves of a callee's tuple return.
+        # Their tensor descriptors describe the payload, not a tensor gather
+        # to dispatch. Keep the projection at its owning call/branch; a free
+        # numerical region here escapes the loop that produces the return.
+        return True
     if (data.get("attributes") or {}).get("bound_method_ref") is not None:
         return True
     if (data.get("attributes") or {}).get("conditional_result_of") is not None:
@@ -15089,11 +15105,12 @@ def _compile_whole_process_graph(
         for subgraph in shell.dispatch_subgraphs
         for node_id in subgraph.G.graph.get("deployment_nodes", ())
     }
+    is_dispatch_metadata = _dispatch_metadata_node_classifier(shell.process_graph)
     uncovered = [
         node_id
         for node_id in shell.process_graph.G
         if node_id not in covered
-        and not _is_dispatch_metadata_node(shell.process_graph, node_id)
+        and not is_dispatch_metadata(node_id)
     ]
     if uncovered:
         details = ", ".join(
@@ -22741,10 +22758,11 @@ def strategize_shell_deployment(
     _resolve_grounded_tensor_operations(graph)
     reference_tables = build_shell_reference_tables(graph)
     ordered_executable_nodes = _dependency_order(graph)
+    is_dispatch_metadata = _dispatch_metadata_node_classifier(graph)
     executable_nodes = tuple(
         node_id
         for node_id in ordered_executable_nodes
-        if not _is_dispatch_metadata_node(graph, node_id)
+        if not is_dispatch_metadata(node_id)
     )
     # Control membership is a semantic partition: numerical work may be
     # reduced freely inside one planner-owned loop body or conditional branch,

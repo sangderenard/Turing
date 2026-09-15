@@ -28,6 +28,7 @@ from .ssa_aggregate_abi import (
     legalize_aggregate_adapters,
     legalize_aggregate_output_views,
 )
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 
 
 @dataclass(frozen=True, order=True)
@@ -1119,15 +1120,15 @@ def lower_tensor_calls_to_repository_ssa(
     if settle_canonical_value_metadata(module):
         propagate_repository_ssa_call_metadata(module)
 
-    next_id = max(_used_value_ids(module), default=-1) + 1
     linked_roots: set[str] = set()
     shortfalls: list[TensorSSALoweringShortfall] = []
 
     def fresh(*, shape=(), dtype: str | None = "float64") -> SSAValue:
-        nonlocal next_id
-        result = SSAValue(next_id, dtype=dtype, shape=tuple(shape))
-        next_id += 1
-        return result
+        return SSAValue(
+            GLOBAL_MONOTONIC_IDS.mint(),
+            dtype=dtype,
+            shape=tuple(shape),
+        )
 
     def constant(value: Any, dtype: str) -> tuple[SSAValue, Instr]:
         result = fresh(dtype=dtype)

@@ -1,5 +1,23 @@
 # Test baseline and hazards — read before running any test
 
+2026-09-14 native managed DT snapshot: the late conditional-continuation pass
+now preserves an explicitly owned raw loop update. The return-state/control
+batch passes 42 tests (72 deselected). Current replay of source checkpoint
+v147 converges in six frame and three result rounds, with zero structural
+findings and incompatible contracts; its explicit `-O0` one-step executable
+matches 48/48 native/eager buffers for both one and two short outer calls.
+The full `1/120` window completes in both executions (169 native / 167 eager
+successful substeps, no critical/nonfinite attempts), but strict pointwise
+parity remains 38/48. Full-window status and exact commands:
+`docs/CONTINUATION_2026-09-14_NATIVE_DT.md`.
+
+Adjacent shell checks found two existing failures:
+`test_whole_object_if_assignment_lowers_to_conditional_phi_merge` expects an
+obsolete function name; `test_nested_if_threads_inner_phi_into_outer_phi`
+supplies no extraction contract. Both reproduce with HEAD versions of
+`fortran_c_shell` and `ssa_record_return_state` loaded into an isolated
+process, without replacing working-tree files. Their assertions remain intact.
+
 2026-09-14 full-cycle perforated engine training: the complete focused LLVM
 file passes 4 tests in 63.38s. Its three-minibatch regression exercises
 gradient accumulation 2, a 0.15 global-norm clip, and a trailing partial group,

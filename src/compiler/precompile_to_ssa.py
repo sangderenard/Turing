@@ -13,6 +13,7 @@ from typing import Any, Iterable, Mapping
 
 import networkx as nx
 
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from .control_source import (
     CallBlock,
     ConditionalBlock,
@@ -947,7 +948,6 @@ class _ControlSSABuilder:
         }
         self.parameter_names = tuple(map(str, parameter_names))
         self.function_name = function_name
-        self.next_value_id = int(first_value_id)
         self.blocks: dict[str, BasicBlock] = {}
         self.block_counts: dict[str, int] = {}
         self.shortfalls: list[SSALoweringShortfall] = []
@@ -1243,21 +1243,11 @@ class _ControlSSABuilder:
             self.external_values[value_id] = value
             self.arguments.append(value)
             self.declared_parameter_only_ids.add(value_id)
-        if self.external_values:
-            self.next_value_id = max(
-                self.next_value_id,
-                max(self.external_values) + 1,
-            )
         signature_ids = {
             value_id
             for feeds, outputs in self.region_signatures.values()
             for value_id in (*feeds, *outputs)
         }
-        if signature_ids:
-            self.next_value_id = max(
-                self.next_value_id,
-                max(signature_ids) + 1,
-            )
         # Descriptor cells and other compiler-minted storage must live above
         # the complete authored/control identity domain.  Reserving only the
         # numerical region signatures allowed a fresh sequence-length cell to
@@ -1278,16 +1268,6 @@ class _ControlSSABuilder:
                 sequence_length_values or {}
             ).items()
         }
-        if reserved_control_ids:
-            self.next_value_id = max(
-                self.next_value_id, max(reserved_control_ids) + 1
-            )
-        if os.environ.get("TURING_DEBUG_REGION_OUTPUTS"):
-            print(f"DEBUG-BUILDER-WATERMARK {self.function_name}: next={self.next_value_id} "
-                  f"externals_max={max(self.external_values, default=-1)} "
-                  f"signature_max={max(signature_ids, default=-1)} "
-                  f"reserved_max={max(reserved_control_ids, default=-1)}",
-                  file=sys.stderr, flush=True)
         # A specialized callee may receive a heterogeneous payload directly,
         # after its owning loop has already been split into the caller.  Such
         # a value still has two ABI columns: its authored scalar identity and
@@ -1421,15 +1401,10 @@ class _ControlSSABuilder:
                     "sequence_id": int(sequence_id),
                 },
             )
-        # Allocate deterministic flattened companions only after all authored
-        # sequence descriptors exist. Their IDs come from the ordinary SSA
-        # allocator in sorted authored-sequence order and therefore remain a
-        # reproducible compile-complementary artifact.
         for sequence_id in sorted(self.joined_sequence_ids):
             if int(sequence_id) not in self.sequence_descriptors:
                 continue
-            flat_sequence_id = int(self.next_value_id)
-            self.next_value_id += 1
+            flat_sequence_id = GLOBAL_MONOTONIC_IDS.mint()
             flat = self._sequence_descriptor(
                 flat_sequence_id,
                 policy="duplicates",
@@ -1602,7 +1577,7 @@ class _ControlSSABuilder:
             lowering = lower_sequence_contains(
                 descriptor,
                 function_name=helper_name,
-                first_value_id=self.next_value_id,
+                first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
             )
             self._register_sequence_lowering(lowering)
             query = self.external_value(int(query_id))
@@ -1611,7 +1586,6 @@ class _ControlSSABuilder:
                 if negate else SSAValue(int(result_id), dtype="bool")
             )
             if not negate:
-                self.next_value_id = max(self.next_value_id, int(result_id) + 1)
                 self.external_values[int(result_id)] = call_result
             self.emit(
                 Handler.Call,
@@ -1626,7 +1600,6 @@ class _ControlSSABuilder:
             )
             if negate:
                 result = SSAValue(int(result_id), dtype="bool")
-                self.next_value_id = max(self.next_value_id, int(result_id) + 1)
                 self.external_values[int(result_id)] = result
                 self.emit(Handler.LNot, [call_result], result)
         scheduled_table_operations = {
@@ -1718,7 +1691,7 @@ class _ControlSSABuilder:
             descriptor,
             function_name=helper_name,
             default_parameter=default_literal is not None,
-            first_value_id=self.next_value_id,
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
         )
         self._register_sequence_lowering(lowering)
         result = SSAValue(
@@ -1732,7 +1705,6 @@ class _ControlSSABuilder:
                        )
                    ]),
         )
-        self.next_value_id = max(self.next_value_id, int(result_id) + 1)
         self.external_values[int(result_id)] = result
         default_operands: tuple[SSAValue, ...] = ()
         if default_literal is not None:
@@ -1790,7 +1762,7 @@ class _ControlSSABuilder:
         lowering = lower_table_store(
             descriptor,
             function_name=helper_name,
-            first_value_id=self.next_value_id,
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
         )
         self._register_sequence_lowering(lowering)
         self.emit(
@@ -1932,7 +1904,7 @@ class _ControlSSABuilder:
                 lowering = lower_child_table_delete(
                     pool,
                     function_name=helper_name,
-                    first_value_id=self.next_value_id,
+                    first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
                 )
                 self._register_sequence_lowering(lowering)
                 pool_arguments = [
@@ -1982,14 +1954,14 @@ class _ControlSSABuilder:
             lowering = lower_table_delete_first(
                 descriptor,
                 function_name=helper_name,
-                first_value_id=self.next_value_id,
+                first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
             )
         else:
             helper_name = f"ssa_sequence_{int(sequence_id)}_delete"
             lowering = lower_table_delete(
                 descriptor,
                 function_name=helper_name,
-                first_value_id=self.next_value_id,
+                first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
             )
         self._register_sequence_lowering(lowering)
         self.emit(
@@ -2026,7 +1998,7 @@ class _ControlSSABuilder:
         lowering = lower_sequence_fill(
             descriptor,
             function_name=helper_name,
-            first_value_id=self.next_value_id,
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
         )
         self._register_sequence_lowering(lowering)
         value = self.fresh_value(dtype=str(descriptor.column_dtypes[0]))
@@ -2072,7 +2044,7 @@ class _ControlSSABuilder:
         lowering = lower_sequence_append_fill(
             descriptor,
             function_name=helper_name,
-            first_value_id=self.next_value_id,
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
         )
         self._register_sequence_lowering(lowering)
         value = self.fresh_value(dtype=str(descriptor.column_dtypes[0]))
@@ -2127,7 +2099,7 @@ class _ControlSSABuilder:
             destination,
             source,
             function_name=helper_name,
-            first_value_id=self.next_value_id,
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
         )
         if not lowering.complete:
             self.shortfalls.extend(
@@ -2235,7 +2207,7 @@ class _ControlSSABuilder:
             destination,
             source,
             function_name=helper_name,
-            first_value_id=self.next_value_id,
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
         )
         if not lowering.complete:
             self.shortfalls.extend(
@@ -2301,7 +2273,7 @@ class _ControlSSABuilder:
         lowering = lower_sequence_prepend(
             descriptor,
             function_name=helper_name,
-            first_value_id=self.next_value_id,
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
         )
         self._register_sequence_lowering(lowering)
         status = self.fresh_value(dtype="int")
@@ -2353,7 +2325,7 @@ class _ControlSSABuilder:
             destination,
             source,
             function_name=helper_name,
-            first_value_id=self.next_value_id,
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
         )
         self._register_sequence_lowering(lowering)
         storage = tuple({
@@ -2472,10 +2444,6 @@ class _ControlSSABuilder:
                 for instruction in block.instrs
                 if instruction.res is not None
             )
-            self.next_value_id = max(
-                self.next_value_id,
-                max(helper_ids, default=-1) + 1,
-            )
 
     def fresh_value(
         self,
@@ -2483,8 +2451,11 @@ class _ControlSSABuilder:
         dtype: str | None = None,
         shape: tuple[int, ...] = (),
     ) -> SSAValue:
-        value = SSAValue(self.next_value_id, dtype=dtype, shape=shape)
-        self.next_value_id += 1
+        value = SSAValue(
+            GLOBAL_MONOTONIC_IDS.mint(),
+            dtype=dtype,
+            shape=shape,
+        )
         return value
 
     def external_value(
@@ -5148,7 +5119,7 @@ class _ControlSSABuilder:
                 lookup = lower_table_lookup(
                     destination,
                     function_name=lookup_name,
-                    first_value_id=self.next_value_id,
+                    first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
                 )
                 self._register_sequence_lowering(lookup)
                 lookup_handle = self.fresh_value(dtype="int")
@@ -5373,7 +5344,7 @@ class _ControlSSABuilder:
                 count_lowering = lower_sequence_append(
                     destination,
                     function_name=count_name,
-                    first_value_id=self.next_value_id,
+                    first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
                 )
                 if not count_lowering.complete:
                     self.shortfalls.extend(
@@ -5396,14 +5367,14 @@ class _ControlSSABuilder:
                     lower_sequence_append(
                         flat,
                         function_name=flat_name,
-                        first_value_id=self.next_value_id,
+                        first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
                     )
                     if singleton_value_id is not None
                     else lower_sequence_extend(
                         flat,
                         source,
                         function_name=flat_name,
-                        first_value_id=self.next_value_id,
+                        first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
                     )
                 )
                 if not flat_lowering.complete:
@@ -5494,13 +5465,13 @@ class _ControlSSABuilder:
                 lower_sequence_append(
                     destination,
                     function_name=function_name,
-                    first_value_id=self.next_value_id,
+                    first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
                 )
                 if operation == "append"
                 else lower_sequence_add(
                     destination,
                     function_name=function_name,
-                    first_value_id=self.next_value_id,
+                    first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
                 )
             )
             mutation_values = tuple(
@@ -5594,7 +5565,7 @@ class _ControlSSABuilder:
                 destination,
                 source,
                 function_name=function_name,
-                first_value_id=self.next_value_id,
+                first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
             )
             call_arguments = tuple({
                 value.id: value
@@ -8016,13 +7987,14 @@ def lower_class_navigation_to_ssa(
     class Builder:
         def __init__(self, name: str, dtypes: tuple[str, ...]):
             self.name = name
-            self.args = [SSAValue(i, dtype=dtype) for i, dtype in enumerate(dtypes)]
-            self.next_id = len(self.args)
+            self.args = [
+                SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=dtype)
+                for dtype in dtypes
+            ]
             self.instructions: list[Instr] = []
 
         def emit(self, operation: Handler, args=(), *, dtype="i32", **attributes):
-            result = SSAValue(self.next_id, dtype=dtype)
-            self.next_id += 1
+            result = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=dtype)
             self.instructions.append(Instr(
                 operation.value, list(args), result, attributes=attributes,
             ))
@@ -8299,13 +8271,8 @@ def _inject_field_slot_access(
     # dodge those too or it collides with a load result.
     existing_ids.update(int(value_id) for _kind, value_id, _slot in field_ops)
     existing_ids.update(int(value_id) for value_id in output_value_ids)
-    next_id = max(existing_ids, default=-1) + 1
-
     def fresh() -> int:
-        nonlocal next_id
-        value_id = next_id
-        next_id += 1
-        return value_id
+        return GLOBAL_MONOTONIC_IDS.mint()
 
     # A receiver is physically a set of typed columns.  The traditional one
     # arena form is the degenerate (and fastest) one-column case.  Slots keep a

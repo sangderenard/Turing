@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib as _contextlib
 import dataclasses
 
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from ..transmogrifier.ssa import Instr, SSAValue
 
 _POW = ("Pow", "pow")
@@ -90,13 +91,8 @@ def reduce_constant_exponent_pow(functions, inexact: bool | None = None) -> dict
         inexact = active_contract().inexact_identities
     allowed = _EXACT_EXPONENTS + (_INEXACT_EXPONENTS if inexact else ())
 
-    next_id = _module_watermark(functions)
-
     def fresh() -> SSAValue:
-        nonlocal next_id
-        value = SSAValue(next_id, dtype="float64")
-        next_id += 1
-        return value
+        return SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype="float64")
 
     counts = {"pow_to_mul": 0, "pow_to_reciprocal": 0, "pow_to_sqrt": 0}
 
@@ -1056,15 +1052,13 @@ def reduce_precision_operations(functions) -> dict:
         "scaling_by_power_of_two": 0,
         "single_renormalisation_per_chain": 0,
     }
-    next_id = _module_watermark(functions)
-
     def fresh(like) -> SSAValue:
-        nonlocal next_id
         value = SSAValue(
-            next_id, dtype=like.dtype, shape=tuple(like.shape or ()),
+            GLOBAL_MONOTONIC_IDS.mint(),
+            dtype=like.dtype,
+            shape=tuple(like.shape or ()),
             device=like.device, accounting=dict(like.accounting or {}),
         )
-        next_id += 1
         return value
 
     def is_power_of_two(value: float) -> bool:
@@ -1275,8 +1269,6 @@ def contract_multiply_add_to_fma(functions, licensed: bool | None = None) -> dic
     if not licensed:
         return counts
 
-    next_id = _module_watermark(functions)
-
     for function in functions.values():
         protected: set[int] = set()
         for key in ("source_output_value_ids", "required_source_value_ids"):
@@ -1342,12 +1334,12 @@ def contract_multiply_add_to_fma(functions, licensed: bool | None = None) -> dic
                 factors = list(product.args)
                 if operation == "Sub":
                     negated = SSAValue(
-                        next_id, dtype=addend.dtype,
+                        GLOBAL_MONOTONIC_IDS.mint(),
+                        dtype=addend.dtype,
                         shape=tuple(addend.shape or ()),
                         device=addend.device,
                         accounting=dict(addend.accounting or {}),
                     )
-                    next_id += 1
                     rewritten.append(Instr(
                         "Neg", [addend], negated,
                         attributes={"lowered_from": "Sub"},
@@ -1857,7 +1849,6 @@ def lower_precision_operations(
     expandable = {add_name, sub_name, mul_name, div_name, neg_name}
 
     counts = {name: 0 for name in expandable}
-    next_id = _module_watermark(functions)
     original_formals = {
         str(name): tuple(function.args) for name, function in functions.items()
     }
@@ -2014,10 +2005,11 @@ def lower_precision_operations(
             row = [formal]
             for _index in range(1, width):
                 extra = SSAValue(
-                    next_id, dtype=formal.dtype, shape=(),
+                    GLOBAL_MONOTONIC_IDS.mint(),
+                    dtype=formal.dtype,
+                    shape=(),
                     device=formal.device,
                 )
-                next_id += 1
                 function.args.append(extra)
                 row.append(extra)
             rows.append(row)
@@ -2051,16 +2043,17 @@ def lower_precision_operations(
             section_element: list = [None]
 
             def fresh(like):
-                nonlocal next_id
                 declared = section_element[0]
                 dtype = (
                     declared if declared in _NARROW_LIMB_ELEMENTS
                     else like.dtype
                 )
                 value = SSAValue(
-                    next_id, dtype=dtype, shape=(), device=like.device,
+                    GLOBAL_MONOTONIC_IDS.mint(),
+                    dtype=dtype,
+                    shape=(),
+                    device=like.device,
                 )
-                next_id += 1
                 return value
 
             def put(op, args, like):
@@ -2259,9 +2252,11 @@ def lower_precision_operations(
             addressed: dict[int, tuple] = {}
 
             def constant(number: int):
-                nonlocal next_id
-                value = SSAValue(next_id, dtype="int", shape=())
-                next_id += 1
+                value = SSAValue(
+                    GLOBAL_MONOTONIC_IDS.mint(),
+                    dtype="int",
+                    shape=(),
+                )
                 emitted.append(Instr("Const", [], value, attributes={
                     "constant": int(number),
                     PRECISION_SECTION_ATTRIBUTE: True,

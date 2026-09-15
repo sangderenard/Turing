@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from itertools import chain
 
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from ..transmogrifier.ssa import Instr, SSAValue
 
 
@@ -166,10 +167,6 @@ def adapt_physical_call_inputs(functions) -> int:
     count = 0
     for caller in functions.values():
         caller_formals = {int(value.id): value for value in caller.args}
-        instruction_values = (value for block in caller.blocks.values()
-            for instruction in block.instrs
-            for value in chain(instruction.args, () if instruction.res is None else (instruction.res,)))
-        next_id = 1 + max((int(value.id) for value in chain(caller.args, instruction_values)), default=-1)
         for block in caller.blocks.values():
             rewritten = []
             for instruction in block.instrs:
@@ -200,10 +197,9 @@ def adapt_physical_call_inputs(functions) -> int:
                         if source_dtype not in numeric or target_dtype not in numeric:
                             continue
                         # Shape is retained; a span conversion is elementwise.
-                        converted = SSAValue(next_id, dtype=target_dtype, shape=actual.shape, device=actual.device,
+                        converted = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=target_dtype, shape=actual.shape, device=actual.device,
                             accounting={'physical_dtype': target_dtype,
                                 'call_input_conversion': (caller.name, int(actual.id), callee.name, int(formal.id))})
-                        next_id += 1
                         rewritten.append(Instr('Cast', [actual], converted,
                             attributes={'target_dtype': target_dtype, 'source_dtype': source_dtype,
                                 'physical_region_input_conversion': True}))
@@ -227,10 +223,9 @@ def adapt_physical_call_inputs(functions) -> int:
                             and int(instruction.res.id) == int(original.id)
                             and not (not original.shape and (original.accounting or {}).get('program_abi_storage') == 'span')
                             and int(original.id) not in {int(value.id) for value in caller.args}):
-                        temporary = SSAValue(next_id, dtype=backend_dtype, shape=original.shape, device=original.device,
+                        temporary = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=backend_dtype, shape=original.shape, device=original.device,
                             accounting={'physical_dtype': backend_dtype,
                                 'call_output_conversion': (callee.name, int(formal.id), caller.name, int(original.id))})
-                        next_id += 1
                         instruction.args[position] = temporary
                         instruction.res = temporary
                         if 'output_ids' in instruction.attributes:

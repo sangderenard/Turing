@@ -645,6 +645,7 @@ class KernelBank:
                         contract: str | None,
                         specialized: Mapping[str, int],
                         directory: Path, backend: str = "llvm"):
+        from src.compiler.extraction_contract import ExtractionContract
         from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
         from src.compiler.work_contract import set_active_contract
 
@@ -668,6 +669,11 @@ class KernelBank:
                     warnings.simplefilter("ignore", DeprecationWarning)
                     module, outputs, _exports = lower_ast_source_to_ssa(
                         source, spec.function_name, name=tag,
+                        extraction_contract=ExtractionContract(
+                            Path(__file__).resolve().parents[2]
+                            / "extraction_contracts"
+                            / "program_extraction.yaml"
+                        ),
                     )
                 try:
                     with module_pickle.open("wb") as stream:

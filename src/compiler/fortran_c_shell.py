@@ -45,6 +45,7 @@ from .fortran_toolchain import (
 )
 from .ssa_fortran_backend import FortranEmissionError, fortran_compiler
 from .transformation_priority import frame_transformation_ledger
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 
 
 _UNCOPYABLE_LITERAL_TYPES: set[str] = set()
@@ -2079,23 +2080,6 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
 
     from ..transmogrifier.ssa import SSAValue
 
-    next_fresh_id = max(
-        (
-            int(value.id)
-            for function in functions.values()
-            for value in (
-                *function.args,
-                *(
-                    instruction.res
-                    for block in function.blocks.values()
-                    for instruction in block.instrs
-                    if instruction.res is not None
-                ),
-            )
-        ),
-        default=-1,
-    ) + 1
-
     def calls_into(callee_name: str) -> list[tuple[Any, Any]]:
         return [
             (caller, instruction)
@@ -2140,7 +2124,7 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                     continue
                 for formal in tail:
                     slot = SSAValue(
-                        next_fresh_id,
+                        GLOBAL_MONOTONIC_IDS.mint(),
                         dtype=formal.dtype,
                         shape=tuple(formal.shape or ()),
                         device=formal.device,
@@ -2152,7 +2136,6 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                             "propagated_formal_id": int(formal.id),
                         },
                     )
-                    next_fresh_id += 1
                     owner.args.append(slot)
                     call.args.append(slot)
                     if declared is not None:
@@ -2184,22 +2167,6 @@ def _prune_unused_callee_formals(
 
     records = call_records or {}
     removed_total = 0
-    next_fresh_id = max(
-        (
-            int(value.id)
-            for function in functions.values()
-            for value in (
-                *function.args,
-                *(
-                    instruction.res
-                    for block in function.blocks.values()
-                    for instruction in block.instrs
-                    if instruction.res is not None
-                ),
-            )
-        ),
-        default=-1,
-    ) + 1
     def calls_into(callee_name: str) -> list[tuple[Any, Any]]:
         return [
             (caller, instruction)
@@ -3152,7 +3119,7 @@ def _authored_sequence_record_views(
 
     The sequence is caller-owned columnar storage; its loop target is a row
     correlation, never a Python object crossing the native ABI. Only complete
-    authored record schemas are admitted, so every projected field has a
+    declared record schemas are admitted, so every projected field has a
     declared physical representation before lowering begins.
     """
 
@@ -3375,7 +3342,7 @@ def _sequence_row_record_slots(
 def _record_row_physical_columns(
     record: Mapping[str, Any],
 ) -> tuple[tuple[str, str], ...]:
-    """Return the exact flat ABI columns for one authored record row."""
+    """Return the exact flat ABI columns for one declared record row."""
 
     columns: list[tuple[str, str]] = []
     for field_name, receipt_value in dict(record.get("fields") or {}).items():
@@ -12278,7 +12245,7 @@ def _sequence_record_identity_contracts(
     graph_obj: Any,
     sequence_declarations: Iterable[tuple[int, str, int, bool]],
 ) -> dict[int, str]:
-    """Correlate resident sequence IDs with authored record-row identities."""
+    """Correlate resident sequence IDs with declared record-row identities."""
 
     declared = {int(item[0]) for item in sequence_declarations}
     identities = graph_obj.graph.get("identity_table") or {}
@@ -12606,22 +12573,6 @@ def _propagate_record_field_demand(all_functions: Mapping[str, Any]) -> None:
 
     from ..transmogrifier.ssa import SSAValue
 
-    next_fresh_id = 1 + max(
-        (
-            int(value.id)
-            for function in all_functions.values()
-            for value in (
-                *function.args,
-                *(
-                    instruction.res
-                    for block in function.blocks.values()
-                    for instruction in block.instrs
-                    if instruction.res is not None
-                ),
-            )
-        ),
-        default=0,
-    )
     grew = True
     while grew:
         grew = False
@@ -12672,7 +12623,7 @@ def _propagate_record_field_demand(all_functions: Mapping[str, Any]) -> None:
                             instruction.args.append(existing)
                         else:
                             propagated = SSAValue(
-                                next_fresh_id,
+                                GLOBAL_MONOTONIC_IDS.mint(),
                                 dtype=formal.dtype,
                                 shape=tuple(formal.shape or ()),
                                 device=formal.device,
@@ -12681,7 +12632,6 @@ def _propagate_record_field_demand(all_functions: Mapping[str, Any]) -> None:
                                     "program_abi_field_written": False,
                                 },
                             )
-                            next_fresh_id += 1
                             caller.args.append(propagated)
                             caller_fields[key] = propagated
                             instruction.args.append(propagated)
@@ -16281,7 +16231,6 @@ def _class_surface_ssa_program(
             for instruction in block.instrs
             for argument in instruction.args
         }
-        next_projection_id = 1 + max(available, default=0)
         for desired_id in desired_ids:
             if desired_id in available:
                 continue
@@ -16360,10 +16309,8 @@ def _class_surface_ssa_program(
             output_index = len(declared)
             declared.append(desired_id)
             call.attributes["output_ids"] = tuple(declared)
-            index_value = SSAValue(next_projection_id, dtype="int")
-            next_projection_id += 1
-            address = SSAValue(next_projection_id, dtype="ptr")
-            next_projection_id += 1
+            index_value = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype="int")
+            address = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype="ptr")
             result = SSAValue(
                 desired_id,
                 dtype=produced_value.dtype,
@@ -16452,15 +16399,6 @@ def _class_surface_ssa_program(
         # only exists for the authored expression itself. These stay inside the
         # function's own SSA numbering -- graph node keys are Python object
         # identities and are not part of that space.
-        next_structural_id = 1 + max((
-            *values,
-            *(
-                int(data["value_id"])
-                for _node_id, data in graph.nodes(data=True)
-                if isinstance(data.get("value_id"), int)
-            ),
-        ), default=0)
-
         def structural_boolop_value(value_id: int, data, canonical: str):
             """Lower ``and``/``or`` as the operand selection Python defines.
 
@@ -16542,15 +16480,13 @@ def _class_surface_ssa_program(
                     values[int(value_id)] = operands[0]
                     return operands[0]
 
-            nonlocal next_structural_id
             current = operands[0]
             for position, operand in enumerate(operands[1:], start=1):
                 last = position == len(operands) - 1
                 if last:
                     result_id = value_id
                 else:
-                    result_id = next_structural_id
-                    next_structural_id += 1
+                    result_id = GLOBAL_MONOTONIC_IDS.mint()
                 dtype = current.dtype or operand.dtype
                 result = SSAValue(int(result_id), dtype=dtype)
                 # Select(mask, when_true, when_false). `or` keeps the left
@@ -16828,7 +16764,6 @@ def _class_surface_ssa_program(
                     ))
                     return None
                 storage_args.append(storage_value)
-            nonlocal next_structural_id
             from .ir_sequence_tables import lower_sequence_contains
 
             helper_name = (
@@ -16837,25 +16772,11 @@ def _class_surface_ssa_program(
             )
             lowering = lower_sequence_contains(
                 descriptor, function_name=helper_name,
-                first_value_id=next_structural_id,
+                first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
             )
             for helper_function in lowering.functions:
                 all_functions[helper_function.name] = helper_function
-                helper_ids = [
-                    int(argument.id) for argument in helper_function.args
-                ] + [
-                    int(instruction.res.id)
-                    for block in helper_function.blocks.values()
-                    for instruction in block.instrs
-                    if instruction.res is not None
-                ]
-                if helper_ids:
-                    next_structural_id = max(
-                        next_structural_id, 1 + max(helper_ids)
-                    )
-            call_result_id = next_structural_id if negate else value_id
-            if negate:
-                next_structural_id += 1
+            call_result_id = GLOBAL_MONOTONIC_IDS.mint() if negate else value_id
             call_result = SSAValue(int(call_result_id), dtype="bool")
             insertions.append(Instr(
                 "Call", [*storage_args, query_value], call_result,
@@ -17106,11 +17027,8 @@ def _class_surface_ssa_program(
                             *prior_receipts, receipt,
                         )
                     return operand
-                nonlocal next_structural_id
-                index = SSAValue(next_structural_id, dtype="int")
-                next_structural_id += 1
-                address = SSAValue(next_structural_id, dtype="ptr")
-                next_structural_id += 1
+                index = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype="int")
+                address = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype="ptr")
                 result = SSAValue(value_id, dtype=operand.dtype)
                 insertions.extend((
                     Instr("Const", [], index, attributes={"value": 0}),
@@ -17922,6 +17840,7 @@ def _class_surface_ssa_program(
                     recovered_by_id = {
                         int(item.res.id): item for item in insertions if item.res is not None
                     }
+                    insertion_objects = {id(item) for item in insertions}
                     for recovered in reversed(insertions):
                         if recovered.res is None:
                             continue
@@ -17929,7 +17848,7 @@ def _class_surface_ssa_program(
                             (candidate_block, offset, candidate)
                             for candidate_block in function.blocks.values()
                             for offset, candidate in enumerate(candidate_block.instrs)
-                            if candidate not in insertions
+                            if id(candidate) not in insertion_objects
                             and any(
                                 int(argument.id) == int(recovered.res.id)
                                 for argument in candidate.args
@@ -18449,19 +18368,6 @@ def _class_surface_ssa_program(
             aliases.update(record_storage_aliases)
             function.metadata["value_aliases"] = aliases
             values = function_values(function)
-        # ProcessGraph node keys are AST/Python object identities.  Only an
-        # explicitly published ``value_id`` belongs to repository SSA and may
-        # seed its allocator.  Falling back to ``node_id`` here makes otherwise
-        # identical programs acquire process-address-scale physical ABI ids.
-        graph_value_ids = (
-            int(data["value_id"])
-            for _node_id, data in graph.nodes(data=True)
-            if "value_id" in data
-        )
-        next_physical_id = 1 + max((
-            *values,
-            *graph_value_ids,
-        ), default=0)
         table = all_record_tables.setdefault(symbol, SSARecordTable())
         pooled_scalar_columns: dict[tuple[str, str], SSAValue] = {}
 
@@ -18575,8 +18481,6 @@ def _class_surface_ssa_program(
             span, or reference leaves do.
             """
 
-            nonlocal next_physical_id
-
             if schema_name in active:
                 raise ValueError(
                     "cyclic nested program ABI record "
@@ -18646,8 +18550,7 @@ def _class_surface_ssa_program(
                     for part_name, (
                         part_storage, part_dtype, part_rank,
                     ) in parts.items():
-                        part_id = next_physical_id
-                        next_physical_id += 1
+                        part_id = GLOBAL_MONOTONIC_IDS.mint()
                         part_ids[part_name] = part_id
                         part_value = SSAValue(
                             part_id,
@@ -18792,7 +18695,7 @@ def _class_surface_ssa_program(
                         column_arenas = []
                         for column in columns:
                             arena = SSAValue(
-                                next_physical_id,
+                                GLOBAL_MONOTONIC_IDS.mint(),
                                 dtype=str(column["dtype"]),
                                 accounting={
                                     "program_abi_record": schema_identity,
@@ -18817,12 +18720,11 @@ def _class_surface_ssa_program(
                                     ),
                                 },
                             )
-                            next_physical_id += 1
                             function.args.append(arena)
                             values[int(arena.id)] = arena
                             column_arenas.append(arena)
                         lengths = SSAValue(
-                            next_physical_id, dtype="int64",
+                            GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
                             accounting={
                                 "program_abi_record": schema_identity,
                                 "program_abi_parameter": str(parameter_name),
@@ -18836,9 +18738,8 @@ def _class_surface_ssa_program(
                                 ),
                             },
                         )
-                        next_physical_id += 1
                         stride = SSAValue(
-                            next_physical_id, dtype="int64",
+                            GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
                             accounting={
                                 "program_abi_record": schema_identity,
                                 "program_abi_parameter": str(parameter_name),
@@ -18851,13 +18752,13 @@ def _class_surface_ssa_program(
                                 "program_abi_field_written": False,
                             },
                         )
-                        next_physical_id += 1
                         function.args.extend((lengths, stride))
                         values[int(lengths.id)] = lengths
                         values[int(stride.id)] = stride
                         row_handle = values[int(row_handle_id)]
-                        row_offset = SSAValue(next_physical_id, dtype="int64")
-                        next_physical_id += 1
+                        row_offset = SSAValue(
+                            GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+                        )
                         setup = [Instr(
                             "Mul", [row_handle, stride], row_offset,
                             attributes={
@@ -18868,9 +18769,9 @@ def _class_surface_ssa_program(
                         pointers = []
                         for column, arena in zip(columns, column_arenas):
                             pointer = SSAValue(
-                                next_physical_id, dtype=str(column["dtype"])
+                                GLOBAL_MONOTONIC_IDS.mint(),
+                                dtype=str(column["dtype"]),
                             )
-                            next_physical_id += 1
                             setup.append(Instr(
                                 "GetElementPtr", [arena, row_offset], pointer,
                                 attributes={
@@ -18883,11 +18784,11 @@ def _class_surface_ssa_program(
                             ))
                             pointers.append(pointer)
                         length_pointer = SSAValue(
-                            next_physical_id, dtype="int64"
+                            GLOBAL_MONOTONIC_IDS.mint(), dtype="int64"
                         )
-                        next_physical_id += 1
-                        length = SSAValue(next_physical_id, dtype="int64")
-                        next_physical_id += 1
+                        length = SSAValue(
+                            GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+                        )
                         setup.extend((
                             Instr(
                                 "GetElementPtr", [lengths, row_handle],
@@ -19041,7 +18942,7 @@ def _class_surface_ssa_program(
                         column = pooled_scalar_columns.get(column_key)
                         if column is None:
                             column = SSAValue(
-                                next_physical_id,
+                                GLOBAL_MONOTONIC_IDS.mint(),
                                 dtype=(
                                     None if nested_dtype is None
                                     else str(nested_dtype)
@@ -19066,7 +18967,6 @@ def _class_surface_ssa_program(
                                     ),
                                 },
                             )
-                            next_physical_id += 1
                             pooled_scalar_columns[column_key] = column
                             function.args.append(column)
                             values[int(column.id)] = column
@@ -19074,7 +18974,7 @@ def _class_surface_ssa_program(
                         if row_handle is not None:
                             result_id = candidate_ids[0]
                             pointer = SSAValue(
-                                next_physical_id,
+                                GLOBAL_MONOTONIC_IDS.mint(),
                                 dtype=(
                                     None if nested_dtype is None
                                     else str(nested_dtype)
@@ -19083,7 +18983,6 @@ def _class_surface_ssa_program(
                                     "program_abi_record_column_pointer": True,
                                 },
                             )
-                            next_physical_id += 1
                             result = SSAValue(
                                 result_id,
                                 dtype=(
@@ -19166,13 +19065,13 @@ def _class_surface_ssa_program(
                                             token_vocabulary.index(token) + 1
                                         )
                                         constant = SSAValue(
-                                            next_physical_id, dtype="int64"
+                                            GLOBAL_MONOTONIC_IDS.mint(),
+                                            dtype="int64",
                                         )
-                                        next_physical_id += 1
                                         compared = SSAValue(
-                                            next_physical_id, dtype="bool"
+                                            GLOBAL_MONOTONIC_IDS.mint(),
+                                            dtype="bool",
                                         )
-                                        next_physical_id += 1
                                         setup.extend((
                                             Instr(
                                                 "Const", [], constant,
@@ -19198,11 +19097,9 @@ def _class_surface_ssa_program(
                                         merged = SSAValue(
                                             predicate_id
                                             if position == len(comparisons) - 1
-                                            else next_physical_id,
+                                            else GLOBAL_MONOTONIC_IDS.mint(),
                                             dtype="bool",
                                         )
-                                        if int(merged.id) == next_physical_id:
-                                            next_physical_id += 1
                                         setup.append(Instr(
                                             "Or", [combined, compared], merged,
                                             attributes={
@@ -19414,8 +19311,7 @@ def _class_surface_ssa_program(
                 if not candidate_ids:
                     if str(field_name) not in demanded_fields:
                         continue
-                    candidate_ids = (next_physical_id,)
-                    next_physical_id += 1
+                    candidate_ids = (GLOBAL_MONOTONIC_IDS.mint(),)
                 if storage == "keyed":
                     key_encoding = str(
                         field.get("key_encoding") or "string_token"
@@ -19505,8 +19401,7 @@ def _class_surface_ssa_program(
                     for part_name, (
                         part_storage, part_dtype, part_rank
                     ) in parts.items():
-                        part_id = next_physical_id
-                        next_physical_id += 1
+                        part_id = GLOBAL_MONOTONIC_IDS.mint()
                         part_ids[part_name] = part_id
                         part_value = SSAValue(
                             part_id,
@@ -19602,11 +19497,10 @@ def _class_surface_ssa_program(
                                 "dtype": str(field.get("dtype") or "unknown"),
                             },)
                         column_ids = [sequence_id]
-                        column_ids.extend(range(
-                            next_physical_id,
-                            next_physical_id + len(columns) - 1,
-                        ))
-                        next_physical_id += len(columns) - 1
+                        column_ids.extend(
+                            GLOBAL_MONOTONIC_IDS.mint()
+                            for _column in columns[1:]
+                        )
                         member_specs = [
                             (
                                 int(column_id),
@@ -19618,17 +19512,15 @@ def _class_surface_ssa_program(
                                 column_ids, columns, strict=True,
                             ))
                         ]
-                        length_id = next_physical_id
-                        capacity_id = next_physical_id + 1
-                        next_physical_id += 2
+                        length_id = GLOBAL_MONOTONIC_IDS.mint()
+                        capacity_id = GLOBAL_MONOTONIC_IDS.mint()
                         member_specs.extend((
                             (length_id, "int64", "length", 0),
                             (capacity_id, "int64", "capacity", 0),
                         ))
                         status_id = None
                         if mutable:
-                            status_id = next_physical_id
-                            next_physical_id += 1
+                            status_id = GLOBAL_MONOTONIC_IDS.mint()
                             member_specs.append((status_id, "int", "status", 0))
                         for member_id, member_dtype, member_name, member_rank in (
                             member_specs
@@ -19781,8 +19673,7 @@ def _class_surface_ssa_program(
                         )
                     ))
                     if not presence_ids:
-                        presence_ids = (next_physical_id,)
-                        next_physical_id += 1
+                        presence_ids = (GLOBAL_MONOTONIC_IDS.mint(),)
                     requested_presence_ids = tuple(map(int, presence_ids))
                     presence_values = []
                     for presence_id in requested_presence_ids:
@@ -19804,9 +19695,8 @@ def _class_surface_ssa_program(
                             )
                         ):
                             presence = SSAValue(
-                                next_physical_id, dtype="bool"
+                                GLOBAL_MONOTONIC_IDS.mint(), dtype="bool"
                             )
-                            next_physical_id += 1
                         if presence is None:
                             presence = SSAValue(int(presence_id), dtype="bool")
                         if not any(
@@ -19911,9 +19801,8 @@ def _class_surface_ssa_program(
                                 ):
                                     continue
                                 became_present = SSAValue(
-                                    next_physical_id, dtype="bool"
+                                    GLOBAL_MONOTONIC_IDS.mint(), dtype="bool"
                                 )
-                                next_physical_id += 1
                                 rewritten.extend((
                                     Instr(
                                         "Const", [], became_present,
@@ -19996,9 +19885,9 @@ def _class_surface_ssa_program(
                                         ):
                                             continue
                                         became_present = SSAValue(
-                                            next_physical_id, dtype="bool"
+                                            GLOBAL_MONOTONIC_IDS.mint(),
+                                            dtype="bool",
                                         )
-                                        next_physical_id += 1
                                         block.instrs[index + 1:index + 1] = (
                                             Instr(
                                                 "Const", [], became_present,
@@ -20063,17 +19952,13 @@ def _class_surface_ssa_program(
                     writable=bool(mutable and field_written),
                 ))
             if fields:
-                # The frontend identity table can publish several exact
-                # occurrences for one authored record parameter (the formal,
-                # a method-receiver occurrence, and forwarded call edges).
-                # They are not merely equal spellings: they all belong to the
-                # same parameter entry above.  Register the one physical field
-                # surface under every such proven identity so later method
-                # linking can correlate ``ctrl`` in the caller with ``self``
-                # in the callee.  Choosing only the first identity strands the
-                # other exact occurrence, causing private scratch fields to be
-                # allocated for a receiver which already has caller-owned
-                # storage.
+                # The frontend identity table can publish several source sites
+                # for one record parameter: the formal, a method receiver, and
+                # forwarded call edges.  Those sites are correlation evidence,
+                # not an ID source.  Register the one physical field surface
+                # under every proven site so method linking can correlate
+                # ``ctrl`` in the caller with ``self`` in the callee without
+                # allocating a second receiver arena.
                 for parameter_id in sorted(parameter_ids):
                     if int(parameter_id) in table.records:
                         continue
@@ -20130,15 +20015,6 @@ def _class_surface_ssa_program(
         if function is None or not abi_records:
             return
         values = function_values(function)
-        graph_value_ids = (
-            int(data["value_id"])
-            for _node_id, data in graph.nodes(data=True)
-            if "value_id" in data
-        )
-        next_value_id = 1 + max((
-            *values,
-            *graph_value_ids,
-        ), default=0)
         constants = []
         table = all_record_tables.setdefault(symbol, SSARecordTable())
         layouts = []
@@ -20175,8 +20051,7 @@ def _class_surface_ssa_program(
                     value_id = positional_values[index]
                 if value_id is None and "default" in field:
                     default = field.get("default")
-                    value_id = next_value_id
-                    next_value_id += 1
+                    value_id = GLOBAL_MONOTONIC_IDS.mint()
                     # A ``None`` default keeps its semantic dtype (``is None``
                     # folds on it) but occupies the field's declared storage:
                     # the emitter consults ``physical_dtype`` first, and
@@ -20459,7 +20334,6 @@ def _class_surface_ssa_program(
         if function is None or table is None:
             return
         values = function_values(function)
-        next_value_id = 1 + max(values, default=0)
         layouts = dict(function.metadata.get("record_return_layouts", ()))
         from .ssa_record_return_state import scalar_return_field_versions
         source_graph = source_graphs_by_symbol.get(symbol)
@@ -20475,7 +20349,6 @@ def _class_surface_ssa_program(
         }
 
         def select_return_arguments(receivers, field_name, predecessors, arguments, source_slot_index):
-            nonlocal next_value_id
             if return_field_version is None or not (
                 len(receivers) == len(predecessors) == len(arguments)
             ):
@@ -20505,8 +20378,10 @@ def _class_surface_ssa_program(
                     key = (predecessor, int(selected.id), argument.dtype)
                     converted = conversions.get(key)
                     if converted is None:
-                        converted = SSAValue(next_value_id, dtype=argument.dtype)
-                        next_value_id += 1
+                        converted = SSAValue(
+                            GLOBAL_MONOTONIC_IDS.mint(),
+                            dtype=argument.dtype,
+                        )
                         function.blocks[predecessor].instrs.insert(-1, Instr(
                             "Cast", [selected], converted,
                             attributes={
@@ -20668,7 +20543,7 @@ def _class_surface_ssa_program(
                                     (instruction.attributes or {}).get("return_slot_index"),
                                 )
                             result = SSAValue(
-                                next_value_id,
+                                GLOBAL_MONOTONIC_IDS.mint(),
                                 dtype=source_field.dtype or arguments[0].dtype,
                                 shape=arguments[0].shape,
                                 accounting={
@@ -20677,7 +20552,6 @@ def _class_surface_ssa_program(
                                     "record_field_slot": slot_index,
                                 },
                             )
-                            next_value_id += 1
                             attributes = dict(instruction.attributes or {})
                             attributes.update({
                                 "record_phi": result_id,
@@ -20808,7 +20682,6 @@ def _class_surface_ssa_program(
             return False
 
         values = function_values(function)
-        next_value_id = 1 + max(values, default=0)
         receipts = list(function.metadata.get(
             "loop_record_phi_materializations", ()
         ))
@@ -20901,8 +20774,7 @@ def _class_surface_ssa_program(
                         for field in updated.fields
                         if field not in projected_fields
                     )
-                    projected_updated_id = next_value_id
-                    next_value_id += 1
+                    projected_updated_id = GLOBAL_MONOTONIC_IDS.mint()
                     table.register(SSARecordDescriptor(
                         projected_updated_id,
                         str(initial.identity),
@@ -20977,8 +20849,7 @@ def _class_surface_ssa_program(
                     for field in (() if incumbent is None else incumbent.fields)
                     for value_id in field.value_ids
                 )
-                header_record_id = next_value_id
-                next_value_id += 1
+                header_record_id = GLOBAL_MONOTONIC_IDS.mint()
                 header_value = SSAValue(
                     header_record_id,
                     accounting={
@@ -21687,12 +21558,6 @@ def _class_surface_ssa_program(
             if caller is None:
                 continue
             available = function_values(caller)
-            graph_ids = {
-                int(data["value_id"])
-                for _node_id, data in caller_graph.nodes(data=True)
-                if "value_id" in data
-            }
-            next_value_id = 1 + max((*available, *graph_ids), default=0)
             caller_records = all_record_tables.setdefault(
                 caller_symbol, SSARecordTable()
             )
@@ -21787,7 +21652,7 @@ def _class_surface_ssa_program(
                 }
 
                 def nested_record_closure(root: Any) -> tuple[Any, ...]:
-                    """Return the authored record/storage tree rooted at ``root``.
+                    """Return the declared record/storage tree rooted at ``root``.
 
                     Nested records are still ordinary repository-SSA record
                     descriptors.  Following their ids here makes construction
@@ -21923,8 +21788,7 @@ def _class_surface_ssa_program(
                 for old_id in referenced_ids:
                     if old_id in remap:
                         continue
-                    remap[old_id] = next_value_id
-                    next_value_id += 1
+                    remap[old_id] = GLOBAL_MONOTONIC_IDS.mint()
                 # A constructor's repository-SSA signature is its complete
                 # physical frame, not merely its authored parameters and
                 # record fields. Region scratch and descriptor slots are also
@@ -21934,12 +21798,11 @@ def _class_surface_ssa_program(
                     old_id = int(value.id)
                     if old_id in remap:
                         continue
-                    remap[old_id] = next_value_id
-                    next_value_id += 1
+                    remap[old_id] = GLOBAL_MONOTONIC_IDS.mint()
 
                 # Constructor field writes and subsequent reads can carry
                 # separate local sequence descriptors for one record slot.
-                # Correlate all such authored field-op views to the canonical
+                # Correlate all such field-operation views to the canonical
                 # record field before building the call frame.
                 constructor_field_sequence_ids = set()
                 constructor_field_sequence_ids_by_name = {}
@@ -22047,21 +21910,21 @@ def _class_surface_ssa_program(
                                 )
                             for old_id in map(int, pool_ids):
                                 if old_id not in remap:
-                                    remap[old_id] = next_value_id
+                                    new_id = GLOBAL_MONOTONIC_IDS.mint()
+                                    remap[old_id] = new_id
                                     source = constructor_values.get(
                                         old_id, SSAValue(old_id)
                                     )
                                     value = clone_value(
                                         source,
-                                        next_value_id,
+                                        new_id,
                                         accounting={
                                             "record_instance": str(class_identity),
                                             "constructor_callsite_id": int(node_id),
                                         },
                                     )
                                     caller.args.append(value)
-                                    available[next_value_id] = value
-                                    next_value_id += 1
+                                    available[new_id] = value
                             mapped_sequence_id = remap[
                                 int(source_sequence.sequence_id)
                             ]
@@ -22217,8 +22080,7 @@ def _class_surface_ssa_program(
                             if field_sequence is None or callee_sequence is None:
                                 pool_specs = []
                                 break
-                            row_stride_id = next_value_id
-                            next_value_id += 1
+                            row_stride_id = GLOBAL_MONOTONIC_IDS.mint()
                             row_stride = SSAValue(
                                 row_stride_id,
                                 dtype="int",
@@ -22283,8 +22145,7 @@ def _class_surface_ssa_program(
                             pool_specs = []
                         elif scalar_fields:
                             scalar_source_id = scalar_source_ids[0]
-                            scalar_stride_id = next_value_id
-                            next_value_id += 1
+                            scalar_stride_id = GLOBAL_MONOTONIC_IDS.mint()
                             scalar_stride = SSAValue(
                                 scalar_stride_id,
                                 dtype="int",
@@ -22661,27 +22522,16 @@ def _class_surface_ssa_program(
             # same defect on the signature, where it displaces the positional
             # correlation and hands the emitted function a parameter no caller
             # could name or fill.
-            caller_graph_ids = {
-                int(data["value_id"])
-                for _node_id, data in caller_graph.nodes(data=True)
-                if "value_id" in data
-            }
-            next_result_storage_id = 1 + max(
-                (*caller_values, *caller_graph_ids), default=0
-            )
-
             def allocate_result_storage(
                 old_id: int,
                 *,
                 distinct_slot: bool = False,
                 field: Any = None,
             ) -> int:
-                nonlocal next_result_storage_id
                 old_id = int(old_id)
                 if not distinct_slot and old_id in result_storage_bindings:
                     return result_storage_bindings[old_id]
-                new_id = next_result_storage_id
-                next_result_storage_id += 1
+                new_id = GLOBAL_MONOTONIC_IDS.mint()
                 source = function_values(callee_function).get(
                     old_id, SSAValue(old_id)
                 )
@@ -22956,9 +22806,8 @@ def _class_surface_ssa_program(
                     if int(record.record_id) == int(root.record_id):
                         continue
                     result_record_bindings[int(record.record_id)] = (
-                        next_result_storage_id
+                        GLOBAL_MONOTONIC_IDS.mint()
                     )
-                    next_result_storage_id += 1
                 for record in reversed(record_order):
                     mapped_fields = []
                     for field in record.fields:
@@ -23235,7 +23084,7 @@ def _class_surface_ssa_program(
             # sequence ids even though the record table correctly identifies
             # one physical field.  Bind every descriptor proven to be another
             # view of that field.  The proof is structural: its sequence id is
-            # one of the authored field-op value ids for the same slot and its
+            # one of the field-operation value ids for the same slot and its
             # row contract matches the canonical descriptor.  This preserves
             # every occurrence while giving them one caller-owned arena.
             callee_sequence_table = all_sequence_tables.get(callee_symbol)
@@ -23981,6 +23830,10 @@ def _class_surface_ssa_program(
         ]
     frame_ledgers = {}
     frame_round = 0
+
+    def mint_compiler_value_id() -> int:
+        return GLOBAL_MONOTONIC_IDS.mint()
+
     def frame_fixed_point_digest() -> str:
         """Fingerprint every mutable ledger governed by the frame pass."""
 
@@ -24001,7 +23854,7 @@ def _class_surface_ssa_program(
         changed = False
         frame_round += 1
         if progress is not None:
-            progress(f"ssa-frame: round {frame_round}, {sum(len(function.args) for function in all_functions.values())} formals, next value {next_value_id}")
+            progress(f"ssa-frame: round {frame_round}, {sum(len(function.args) for function in all_functions.values())} formals, next value {GLOBAL_MONOTONIC_IDS.peek()}")
         # A record-valued native result becomes physical during this fixed
         # point.  Source GetAttr nodes which read that exact result can have
         # been lowered earlier as provisional frame inputs because no field
@@ -24297,7 +24150,6 @@ def _class_surface_ssa_program(
                 reserved_value_ids.update(
                     _frame_binding_value_ids(pending_record.frame_bindings)
                 )
-            next_value_id = 1 + max(reserved_value_ids, default=0)
             rebuilt_records = []
 
             def resolve_call_feed(
@@ -24305,7 +24157,6 @@ def _class_surface_ssa_program(
             ) -> SSAValue | None:
                 """Resolve structural call feeds at their invocation site."""
 
-                nonlocal next_value_id
                 source_id = int(source_id)
                 aliases = {
                     int(alias): int(resident)
@@ -24485,9 +24336,9 @@ def _class_surface_ssa_program(
                     current = operands[0]
                     for index, operand in enumerate(operands[1:], start=1):
                         is_last = index == len(operands) - 1
-                        result_id = source_id if is_last else next_value_id
-                        if not is_last:
-                            next_value_id += 1
+                        result_id = (
+                            source_id if is_last else mint_compiler_value_id()
+                        )
                         result = SSAValue(
                             result_id,
                             dtype="bool",
@@ -25246,14 +25097,13 @@ def _class_surface_ssa_program(
                                 # The receiver handle is not its scalar member.
                                 # Materialize the exact declared member when a
                                 # read-only method is the caller's first use.
-                                member = clone_value(formal, next_value_id, accounting={
+                                member = clone_value(formal, mint_compiler_value_id(), accounting={
                                     "program_abi_parameter": str(parameter),
                                     "linked_parameter_provenance": "exact_receiver_field",
                                     "linked_call_frame_storage": None,
                                     "split_from_unproven_alias": None,
                                     "split_from_result_storage": None,
                                 })
-                                next_value_id += 1
                                 member.shape = _linked_frame_physical_shape(formal)
                                 caller.args.append(member)
                                 values[int(member.id)] = member
@@ -25364,7 +25214,7 @@ def _class_surface_ssa_program(
                             else:
                                 caller_storage = clone_value(
                                     argument,
-                                    next_value_id,
+                                    mint_compiler_value_id(),
                                     accounting={
                                         **({
                                             "program_abi_parameter": str(
@@ -25377,7 +25227,6 @@ def _class_surface_ssa_program(
                                         "callsite_id": int(record.callsite_id),
                                     },
                                 )
-                                next_value_id += 1
                                 caller.args.append(caller_storage)
                                 values[int(caller_storage.id)] = caller_storage
                             refreshed_frame_bindings.append((
@@ -25634,8 +25483,9 @@ def _class_surface_ssa_program(
                             source_record_id = int(source_record.record_id)
                             if source_record_id in record_id_map:
                                 continue
-                            record_id_map[source_record_id] = next_value_id
-                            next_value_id += 1
+                            record_id_map[source_record_id] = (
+                                mint_compiler_value_id()
+                            )
 
                         def allocate_late_result_storage(
                             source_id: int,
@@ -25643,15 +25493,13 @@ def _class_surface_ssa_program(
                             field: Any = None,
                             distinct_slot: bool = False,
                         ) -> int:
-                            nonlocal next_value_id
                             source_id = int(source_id)
                             if (
                                 not distinct_slot
                                 and source_id in result_storage_bindings
                             ):
                                 return int(result_storage_bindings[source_id])
-                            caller_value_id = next_value_id
-                            next_value_id += 1
+                            caller_value_id = mint_compiler_value_id()
                             source = callee_values.get(
                                 source_id,
                                 SSAValue(
@@ -25889,8 +25737,7 @@ def _class_surface_ssa_program(
                                 for callee_value_id in map(
                                     int, callee_field.value_ids
                                 ):
-                                    caller_value_id = next_value_id
-                                    next_value_id += 1
+                                    caller_value_id = mint_compiler_value_id()
                                     source = callee_values.get(
                                         callee_value_id,
                                         SSAValue(
@@ -26018,10 +25865,11 @@ def _class_surface_ssa_program(
                             and live_record_result_map.get(int(callee_id))
                             != source_id
                         ):
+                            replacement_id = mint_compiler_value_id()
                             if not frame_ledger.propose(
                                 (str(caller_symbol), int(record.callsite_id), str(record.callee_symbol), int(callee_id)),
                                 "distinct_result", (str(record.callee_symbol), int(callee_id)),
-                                before=source_id, after=next_value_id,
+                                before=source_id, after=replacement_id,
                             ):
                                 incumbent = frame_ledger.incumbent_target(
                                     (str(caller_symbol), int(record.callsite_id), str(record.callee_symbol), int(callee_id))
@@ -26033,7 +25881,7 @@ def _class_surface_ssa_program(
                             )
                             replacement = clone_value(
                                 argument,
-                                next_value_id,
+                                replacement_id,
                                 accounting={
                                     "linked_call_frame_storage": str(
                                         record.callee_symbol
@@ -26042,7 +25890,6 @@ def _class_surface_ssa_program(
                                     "split_from_result_storage": source_id,
                                 },
                             )
-                            next_value_id += 1
                             caller.args.append(replacement)
                             values[int(replacement.id)] = replacement
                             refreshed_bindings.append((
@@ -26087,11 +25934,15 @@ def _class_surface_ssa_program(
                             distinct_bindings.append((callee_id, kind, source))
                             continue
                         replacement_id = slot_by_owner.get((source_id, owner))
+                        proposed_replacement_id = (
+                            mint_compiler_value_id()
+                            if replacement_id is None else replacement_id
+                        )
                         if not frame_ledger.propose(
                             (str(caller_symbol), int(record.callsite_id), str(record.callee_symbol), int(callee_id)),
                             "distinct_owner", owner,
                             before=source_id,
-                            after=next_value_id if replacement_id is None else replacement_id,
+                            after=proposed_replacement_id,
                         ):
                             # A losing challenger retains the incumbent's
                             # physical slot, not the conflicting proposal.
@@ -26106,7 +25957,7 @@ def _class_surface_ssa_program(
                             )
                             replacement = clone_value(
                                 argument,
-                                next_value_id,
+                                proposed_replacement_id,
                                 accounting={
                                     "linked_call_frame_storage": str(
                                         record.callee_symbol
@@ -26115,7 +25966,6 @@ def _class_surface_ssa_program(
                                     "split_from_unproven_alias": source_id,
                                 },
                             )
-                            next_value_id += 1
                             caller.args.append(replacement)
                             values[int(replacement.id)] = replacement
                             replacement_id = int(replacement.id)
@@ -26596,8 +26446,7 @@ def _class_surface_ssa_program(
                             for index in range(len(callee_aggregate_outputs)):
                                 node_id = projected_by_index.get(index)
                                 if node_id is None:
-                                    node_id = next_value_id
-                                    next_value_id += 1
+                                    node_id = mint_compiler_value_id()
                                 completed.append(int(node_id))
                             bound_aggregate_outputs = tuple(completed)
                             break
@@ -26825,9 +26674,8 @@ def _class_surface_ssa_program(
                                 pool = field_spec["pool"]
                                 callee_sequence = field_spec["callee_sequence"]
                                 row_offset = SSAValue(
-                                    next_value_id, dtype="int"
+                                    mint_compiler_value_id(), dtype="int"
                                 )
-                                next_value_id += 1
                                 pooled_setup.append(Instr(
                                     "Mul",
                                     [
@@ -26886,13 +26734,12 @@ def _class_surface_ssa_program(
                                     pointer_sources.items()
                                 ):
                                     pointer = SSAValue(
-                                        next_value_id,
+                                        mint_compiler_value_id(),
                                         dtype=values[int(source_id)].dtype,
                                         accounting={
                                             "record_instance_pool_pointer": True
                                         },
                                     )
-                                    next_value_id += 1
                                     pooled_setup.append(Instr(
                                         "GetElementPtr",
                                         [values[int(source_id)], offset],
@@ -26906,9 +26753,8 @@ def _class_surface_ssa_program(
                                 "scalar_fields", ()
                             ):
                                 scalar_base = SSAValue(
-                                    next_value_id, dtype="int"
+                                    mint_compiler_value_id(), dtype="int"
                                 )
-                                next_value_id += 1
                                 pooled_setup.append(Instr(
                                     "Mul",
                                     [
@@ -26927,9 +26773,8 @@ def _class_surface_ssa_program(
                                 scalar_index = scalar_base
                                 if int(scalar_spec["offset"]):
                                     offset_value = SSAValue(
-                                        next_value_id, dtype="int"
+                                        mint_compiler_value_id(), dtype="int"
                                     )
-                                    next_value_id += 1
                                     pooled_setup.append(Instr(
                                         "Const", [], offset_value,
                                         attributes={
@@ -26939,9 +26784,8 @@ def _class_surface_ssa_program(
                                         },
                                     ))
                                     scalar_index = SSAValue(
-                                        next_value_id, dtype="int"
+                                        mint_compiler_value_id(), dtype="int"
                                     )
-                                    next_value_id += 1
                                     pooled_setup.append(Instr(
                                         "Add",
                                         [scalar_base, offset_value],
@@ -26953,7 +26797,7 @@ def _class_surface_ssa_program(
                                         },
                                     ))
                                 pointer = SSAValue(
-                                    next_value_id,
+                                    mint_compiler_value_id(),
                                     dtype=values[int(
                                         scalar_spec["arena_value_id"]
                                     )].dtype,
@@ -26961,7 +26805,6 @@ def _class_surface_ssa_program(
                                         "record_instance_pool_pointer": True
                                     },
                                 )
-                                next_value_id += 1
                                 pooled_setup.append(Instr(
                                     "GetElementPtr",
                                     [
@@ -27043,7 +26886,7 @@ def _class_surface_ssa_program(
                                 and length_position < len(call_arguments)
                             ):
                                 derived_length = SSAValue(
-                                    next_value_id,
+                                    mint_compiler_value_id(),
                                     dtype=str(argument.dtype or "int64"),
                                     accounting={
                                         "linked_scalar_source_transform": (
@@ -27052,7 +26895,6 @@ def _class_surface_ssa_program(
                                         "source_name": source_name,
                                     },
                                 )
-                                next_value_id += 1
                                 constants.append(Instr(
                                     "Load",
                                     [call_arguments[int(length_position)]],
@@ -27166,11 +27008,10 @@ def _class_surface_ssa_program(
                             call_arguments.append(value)
                         elif kind in {"default_literal", "caller_literal"}:
                             value = SSAValue(
-                                next_value_id,
+                                mint_compiler_value_id(),
                                 dtype=argument.dtype,
                                 shape=argument.shape,
                             )
-                            next_value_id += 1
                             constants.append(Instr(
                                 "Const", [], value,
                                 attributes={"value": source},
@@ -27248,7 +27089,8 @@ def _class_surface_ssa_program(
                                     and caller_length_address is not None
                                 ):
                                     returned_length = SSAValue(
-                                        next_value_id, dtype="int64",
+                                        mint_compiler_value_id(),
+                                        dtype="int64",
                                         accounting={
                                             "linked_sequence_result_length": True,
                                             "callsite_id": int(
@@ -27256,7 +27098,6 @@ def _class_surface_ssa_program(
                                             ),
                                         },
                                     )
-                                    next_value_id += 1
                                     result_frame_sync.extend((
                                         Instr(
                                             "Load",
@@ -27345,8 +27186,7 @@ def _class_surface_ssa_program(
                             # instructions that already reference the old
                             # id by number). Allocate a genuinely fresh id
                             # for this call's own aggregate result instead.
-                            caller_result_id = next_value_id
-                            next_value_id += 1
+                            caller_result_id = mint_compiler_value_id()
                         result = values.get(
                             caller_result_id,
                             SSAValue(
@@ -27445,10 +27285,12 @@ def _class_surface_ssa_program(
                             selected_positions,
                             selected_outputs,
                         )):
-                            index_value = SSAValue(next_value_id, dtype="int")
-                            next_value_id += 1
-                            address = SSAValue(next_value_id, dtype="ptr")
-                            next_value_id += 1
+                            index_value = SSAValue(
+                                mint_compiler_value_id(), dtype="int",
+                            )
+                            address = SSAValue(
+                                mint_compiler_value_id(), dtype="ptr",
+                            )
                             caller_node = caller_graph.nodes.get(
                                 int(caller_id), {}
                             )
@@ -28765,7 +28607,8 @@ def _class_surface_ssa_program(
                         or ("unknown",) * len(source_sequence.column_value_ids)
                     ):
                         value = SSAValue(
-                            next_value_id, dtype=str(dtype or "unknown"),
+                            mint_compiler_value_id(),
+                            dtype=str(dtype or "unknown"),
                             accounting={
                                 "compiler_frame_storage": str(function_name),
                                 "record_child_pool_sequence_id": int(
@@ -28777,12 +28620,11 @@ def _class_surface_ssa_program(
                                 "record_child_pool_member": int(column_index),
                             },
                         )
-                        next_value_id += 1
                         function.args.append(value)
                         current_values[int(value.id)] = value
                         child_columns.append(int(value.id))
                     child_lengths = SSAValue(
-                        next_value_id, dtype="int64",
+                        mint_compiler_value_id(), dtype="int64",
                         accounting={
                             "compiler_frame_storage": str(function_name),
                             "record_child_pool_sequence_id": int(
@@ -28794,11 +28636,11 @@ def _class_surface_ssa_program(
                             "record_child_pool_lengths": True,
                         },
                     )
-                    next_value_id += 1
                     function.args.append(child_lengths)
                     current_values[int(child_lengths.id)] = child_lengths
-                    child_capacity = SSAValue(next_value_id, dtype="int64")
-                    next_value_id += 1
+                    child_capacity = SSAValue(
+                        mint_compiler_value_id(), dtype="int64",
+                    )
                     capacity_product = Instr(
                         "Mul",
                         [
@@ -28860,7 +28702,7 @@ def _class_surface_ssa_program(
                                 f"{destination_sequence.sequence_id}_"
                                 f"append_child_{source_sequence.sequence_id}"
                             ),
-                            first_value_id=next_value_id,
+                            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
                         )
                     )
                     if not child_lowering.complete:
@@ -29205,7 +29047,8 @@ def _class_surface_ssa_program(
                         source_sequence.column_dtypes
                     ):
                         value = SSAValue(
-                            next_value_id, dtype=str(dtype or "unknown"),
+                            mint_compiler_value_id(),
+                            dtype=str(dtype or "unknown"),
                             accounting={
                                 "compiler_frame_storage": str(function_name),
                                 "record_child_pool_sequence_id": int(
@@ -29217,12 +29060,11 @@ def _class_surface_ssa_program(
                                 "record_child_pool_member": int(column_index),
                             },
                         )
-                        next_value_id += 1
                         function.args.append(value)
                         current_values[int(value.id)] = value
                         child_columns.append(int(value.id))
                     child_lengths = SSAValue(
-                        next_value_id, dtype="int64",
+                        mint_compiler_value_id(), dtype="int64",
                         accounting={
                             "compiler_frame_storage": str(function_name),
                             "record_child_pool_sequence_id": int(
@@ -29234,11 +29076,11 @@ def _class_surface_ssa_program(
                             "record_child_pool_lengths": True,
                         },
                     )
-                    next_value_id += 1
                     function.args.append(child_lengths)
                     current_values[int(child_lengths.id)] = child_lengths
-                    child_capacity = SSAValue(next_value_id, dtype="int64")
-                    next_value_id += 1
+                    child_capacity = SSAValue(
+                        mint_compiler_value_id(), dtype="int64",
+                    )
                     capacity_product = Instr(
                         "Mul",
                         [
@@ -29300,7 +29142,7 @@ def _class_surface_ssa_program(
                                 f"{destination_sequence.sequence_id}_"
                                 f"append_child_{source_sequence.sequence_id}"
                             ),
-                            first_value_id=next_value_id,
+                            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
                         )
                     )
                     if not child_lowering.complete:
@@ -29566,7 +29408,6 @@ def _class_surface_ssa_program(
         for instruction in instructions:
             canonical.setdefault(int(instruction.res.id), instruction.res)
 
-        next_value_id = 1 + max(occupied, default=0)
         freshened: dict[int, int] = {}
         seen_objects: set[int] = set()
         for instruction in instructions:
@@ -29578,12 +29419,9 @@ def _class_surface_ssa_program(
             old_id = int(result.id)
             if canonical[old_id] is result:
                 continue
-            while next_value_id in occupied:
-                next_value_id += 1
-            result.id = next_value_id
-            occupied.add(next_value_id)
-            freshened[old_id] = next_value_id
-            next_value_id += 1
+            result.id = mint_compiler_value_id()
+            occupied.add(int(result.id))
+            freshened[old_id] = int(result.id)
         if freshened:
             function.metadata["freshened_synthetic_value_ids"] = tuple(
                 sorted(freshened.items())
@@ -30031,7 +29869,6 @@ def _class_surface_ssa_program(
                 return None
             return caller_values.get(int(field.value_ids[0]))
 
-        next_value_id = 1 + max(caller_values, default=0)
         for record in records:
             if record.resolution != "native_call":
                 continue
@@ -30111,11 +29948,10 @@ def _class_surface_ssa_program(
                         complete = False
                         break
                     value = SSAValue(
-                        next_value_id,
+                        mint_compiler_value_id(),
                         dtype=argument.dtype,
                         shape=argument.shape,
                     )
-                    next_value_id += 1
                     constants.append(Instr(
                         "Const", [], value, attributes={"value": source},
                     ))
@@ -30457,8 +30293,6 @@ def _class_surface_ssa_program(
         caller_values = function_values(caller)
         caller_graph = source_graphs_by_symbol.get(caller_symbol)
         caller_record_table = all_record_tables.get(caller_symbol)
-        next_value_id = 1 + max(caller_values, default=0)
-
         def cleaned_frame_value(source_id: int) -> SSAValue | None:
             source_id = int(source_id)
             value = caller_values.get(source_id)
@@ -30541,11 +30375,10 @@ def _class_surface_ssa_program(
                         refreshed = []
                         break
                     value = SSAValue(
-                        next_value_id,
+                        mint_compiler_value_id(),
                         dtype=argument.dtype,
                         shape=argument.shape,
                     )
-                    next_value_id += 1
                     constants.append(Instr(
                         "Const", [], value, attributes={"value": source},
                     ))

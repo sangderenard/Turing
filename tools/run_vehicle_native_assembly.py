@@ -444,6 +444,12 @@ class _PythonVehicleMaterial:
                  f"tire_fidelity_mode AFTER entrypoint call (result[4], what "
                  f"becomes tire_input next tick): {after}", flush=True)
             self._fidelity_diagnostic_ticks = getattr(self, "_fidelity_diagnostic_ticks", 0) + 1
+        self.accept_tick_result(result, contact_in, fixture_in, vehicle_out,
+                                publish_visual=publish_visual)
+
+    def accept_tick_result(self, result, contact_in, fixture_in, vehicle_out,
+                           publish_visual=True):
+        """Publish a completed eager or native graph result to the same viewer."""
         self.last = result
         self._copy_flat(vehicle_out, self._data(result[0]))
         graph_contact_result = self._data(result[1])[0]
@@ -778,6 +784,10 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
         energy_exchange_fraction=(
             None if args.dt_energy_fraction <= 0.0 else float(args.dt_energy_fraction)),
     )
+    native_simulation = None
+    if getattr(args, "native_simulation", None) is not None:
+        from src.compiler.vehicle_validator_simulation import NativeValidatorSimulation
+        native_simulation = NativeValidatorSimulation(args.native_simulation, material)
     stop = threading.Event()
     status_lock = threading.Condition()
     live = {
@@ -1125,13 +1135,45 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
                     with status_lock:
                         live.update(stage=stage, progress=progress,
                                     status="stepping")
-                    advanced, dt_next, metrics = run_superstep(
-                        state, window, dt_next, 0.03, targets, controller,
-                        advance, allow_increase_mid_round=True,
-                        max_retries=None,
-                        rollback_threshold_multiplier=(
-                            rollback_threshold_multiplier),
-                        rollback=rollback_enabled)
+                    if native_simulation is None:
+                        advanced, dt_next, metrics = run_superstep(
+                            state, window, dt_next, 0.03, targets, controller,
+                            advance, allow_increase_mid_round=True,
+                            max_retries=None,
+                            rollback_threshold_multiplier=(
+                                rollback_threshold_multiplier),
+                            rollback=rollback_enabled)
+                    else:
+                        completed = native_simulation.step(
+                            window, dt_next, controller, targets, vehicle_in,
+                            contact_in, fixture_in, vehicle_out,
+                            tire_dt_fraction=tire_dt_fraction, rollback=rollback_enabled,
+                            rollback_threshold_multiplier=rollback_threshold_multiplier)
+                        advanced, dt_next = completed.advanced, completed.dt_next
+                        observed = completed.telemetry
+                        error_matrix = completed.displacement
+                        offender = np.unravel_index(int(np.argmax(error_matrix)), error_matrix.shape)
+                        accepted_clock[0] += advanced
+                        metrics = Metrics(max_vel=float(observed[5]), max_flux=float(observed[5]),
+                                          div_inf=0.0, mass_err=0.0, error_channels={
+                            "maximum_substep_displacement_m": float(observed[4])})
+                        with status_lock:
+                            live.update(
+                                sim_time=accepted_clock[0], accepted_time=accepted_clock[0],
+                                substep_dt=float(observed[3]),
+                                substep_index=int(live["substep_index"]) + int(observed[0]),
+                                accepted_substeps=int(live["accepted_substeps"]) + int(observed[1]),
+                                rejected_substeps=int(live["rejected_substeps"]) + int(observed[2]),
+                                error_max=float(observed[4]),
+                                error_rms=float(np.sqrt(np.mean(error_matrix * error_matrix))),
+                                error_p95=float(np.percentile(error_matrix, 95.0)),
+                                error_per_wheel=tuple(float(value) for value in error_matrix.max(axis=1)),
+                                error_location=f"{profile.wheel_names[offender[0]]}:vertex-{offender[1]}",
+                                rule_violation="none" if observed[4] <= 0.006 else "last substep displacement > 0.006 m",
+                                status="native-window-complete")
+                            status_lock.notify_all()
+                            while displayed_attempt[0] < live["substep_index"] and not stop.is_set():
+                                status_lock.wait(timeout=0.1)
                     advanced = float(advanced)
                     if advanced <= 0.0 or metrics.hard_failure:
                         raise RuntimeError(
@@ -1204,6 +1246,8 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
         raise RuntimeError(live["error"])
     print(json.dumps({
         "profile": profile.identity, "python_material": True,
+        "simulation_execution": "python" if native_simulation is None else "native",
+        "native_simulation": (None if native_simulation is None else str(args.native_simulation.resolve())),
         "stages": list(profile.stages), "sim_time_s": live["sim_time"],
         "wheel_count": len(profile.wheel_names),
         "pillar_count": len(profile.fixture_plan.pillars),
@@ -1280,7 +1324,7 @@ def main() -> int:
     parser.add_argument("--stop-after-stage", default=None,
                         help="write the exact post-stage checkpoint and stop")
     parser.add_argument("--python-material", action="store_true",
-                        help="execute the authored Python graph instead of loading C material")
+                        help="use the authored Python graph setup (execution is native when --native-simulation is supplied)")
     parser.add_argument("--python-viewer", action="store_true",
                         help="show live solver tensors in the Python validator viewer")
     parser.add_argument("--headless-frame", type=Path, default=None,
@@ -1328,7 +1372,13 @@ def main() -> int:
               "bead ring. No ramp-in yet on first contact -- pair with a "
               "small --tire-dt-fraction (e.g. 0.01) to avoid an impulsive "
               "first-contact step."))
+    parser.add_argument("--native-simulation", type=Path, default=None,
+                        help="compiled coupled DT/physics artifact for the Python dually viewer")
     args = parser.parse_args()
+    if args.native_simulation is not None and (
+        args.assembly_profile != "dually-axle" or not args.python_material
+    ):
+        parser.error("--native-simulation requires --assembly-profile dually-axle --python-material")
     resume_requested = any((args.resume_report, args.resume_telemetry, args.start_stage))
     if resume_requested and not all((args.resume_report, args.resume_telemetry,
                                      args.start_stage)):

@@ -43,6 +43,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from ..transmogrifier.ssa import Function, Instr, SSAValue
 
 DEPLOY_OP = "Deploy"
@@ -209,19 +210,6 @@ def analyze_deployment_dataflow(
         ))
     return tuple(regions)
 
-
-def _next_value_id(function: Function) -> int:
-    highest = -1
-    for value in function.args:
-        highest = max(highest, int(value.id))
-    for _block, _index, instruction in _instruction_stream(function):
-        if instruction.res is not None:
-            highest = max(highest, int(instruction.res.id))
-        for argument in instruction.args:
-            highest = max(highest, int(argument.id))
-    return highest + 1
-
-
 def bind_deployment_dataflow(function: Function) -> DeploymentBindingReport:
     """Upgrade marker pairs to operand-bearing form, in place.
 
@@ -234,7 +222,6 @@ def bind_deployment_dataflow(function: Function) -> DeploymentBindingReport:
     regions = analyze_deployment_dataflow(function)
     bound: list[int] = []
     skipped: list[tuple[int, str]] = []
-    next_id = _next_value_id(function)
 
     for region in regions:
         if not region.has_markers:
@@ -261,8 +248,10 @@ def bind_deployment_dataflow(function: Function) -> DeploymentBindingReport:
             continue
 
         if deploy.res is None:
-            deploy.res = SSAValue(next_id, dtype=DEPLOY_TOKEN_DTYPE)
-            next_id += 1
+            deploy.res = SSAValue(
+                GLOBAL_MONOTONIC_IDS.mint(),
+                dtype=DEPLOY_TOKEN_DTYPE,
+            )
 
         live_out_values: list[SSAValue] = []
         roles: list[str] = ["frame"]

@@ -1,5 +1,11 @@
 # One patch sequence for all19 baseline findings
 
+**2026-09-14 continuation:** see
+[Native managed tire and dt controller](CONTINUATION_2026-09-14_NATIVE_DT.md).
+The v167 raw-snapshot rewrite is repaired, the current replay passes its SSA
+shape gate, and the rebuilt `-O0` one-step artifact matches all 48 buffers.
+The continuation records the full-window verification separately.
+
 ## 2026-09-08 in/out scalar return snapshots
 
 A scalar field may be updated through caller-owned storage and also returned
