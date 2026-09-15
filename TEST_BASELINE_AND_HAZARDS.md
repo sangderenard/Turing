@@ -66,6 +66,16 @@ issuer no longer produces.
    `all`/`any`/`sum`/`prod`/`mean`/`min`/`max`; an explicit axis is left
    unrecovered rather than guessed.
 
+2026-09-15 validator build v13: the fresh balloon-validator build with every
+repair above reports `undefined_operands=0` (was 1), with unmaterialized
+boundaries, unresolved calls, optional merges, structural outputs and
+non-native boundaries all empty. `unaccounted_formals` fell 47 -> 27 and is the
+only remaining gate family: 13 in `validator_simulation_advance`, 6 in each of
+the two `_wrench_force` specializations, and one each in
+`step_with_dt_control_used` and `vehicle_tire_recurrence`. Command:
+`python -u tools/build_vehicle_validator_simulation.py --output build/validator_frontier_20260915_v13 --lanes 8`;
+it reached the gate in about 45 minutes. No native artifact exists yet.
+
 Captured bindings of a nested function are now recorded as a `closure_formals`
 ABI receipt and accounted by `check_formal_parity`. The receipt is keyed on the
 source graph's `closure`/`external` binding kind, never on a name: a name-keyed

@@ -166,7 +166,52 @@ An isolated lowering of `vehicle_material_nodes_vector` pursues
 shell successfully, so this is probably a fidelity gap in the isolated harness
 rather than a build defect; it was not chased.
 
-## Validator build in flight
+## Validator build result
+
+The fresh build with every repair (`build/validator_frontier_20260915_v13`)
+closed the blocker it was aimed at. The full-native execution contract now
+reports:
+
+| gate family | v12 (repairs 1-4) | v13 (all repairs) |
+|---|---|---|
+| unmaterialized boundaries | 0 | 0 |
+| unresolved calls | 0 | 0 |
+| **undefined operands** | **1** | **0** |
+| unaccounted formals | 47 | 27 |
+| optional merges / structural outputs / non-native | 0 | 0 |
+
+Unaccounted formals is the only remaining family, and it is fully enumerated:
+
+| function | unnamed | what they are |
+|---|---|---|
+| `validator_simulation_advance` | 13 | shaped `(341,)` and `(1, 1, 1)` values used only as region-call feeds |
+| `_wrench_force` (two specializations) | 6 each | two subscripts and two `.shape` reads over captures, plus one variant-row column |
+| `step_with_dt_control_used` | 1 | value 473 |
+| `vehicle_tire_recurrence` | 1 | value 6 |
+
+`balloon_tire_reduced_vector_step`'s four `r0`/`z0` tuple-unpack temporaries
+are absent from the v13 list only because that build carried the earlier
+name-keyed capture receipt. Under the graph-backed receipt they return, as they
+should: they are escaped locals, not captures, and closing them needs a real
+repair rather than an accounting entry.
+
+Giving closure captures their caller-side tensor descriptors was tried and
+reverted. It reached the specialization (the digest changed) but did not let
+`wrench_k.shape[:2]` fold, so it bought nothing and was not worth the extra
+specialization variants. A minimal repro is
+`def root(a, gain): def blend(query): return query * gain.reshape(gain.shape[:1] + (1,))`,
+where the capture's graph node still shows no tensor descriptor.
+
+## Reaching execution
+
+`build_simulation` writes `manifest.json`, the compiled library, the repository
+SSA and the artifact into its output directory; the viewer then runs natively
+through `tools/run_vehicle_native_assembly.py --native-simulation DIRECTORY`,
+which drives `NativeValidatorSimulation`. Both gates before that point are
+strict: the lowering contract above, then `run_all` findings must be empty and
+C emission complete.
+
+## Validator build command
 
 The balloon-tire validator simulation is the target: its program includes
 `balloon_tire_vector_step`, `balloon_tire_reduced_vector_step`,
