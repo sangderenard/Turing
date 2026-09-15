@@ -232,7 +232,42 @@ it cannot justify.
 **Invariant.** Recovery may choose where a definition goes, never whether a use
 can see it.
 
-## 9. Publication must honour the declared dtype
+## 9. Still confused: a nested static loop is preserved, and its list index then has no producer
+
+**Rule as written.** A multi-carried loop is a coordinated recurrence whose
+whole `(initial, updated)` vector must advance on one backedge, so it is
+preserved rather than unrolled. The protection closes over lexical owners,
+because evaporating an owner would erase its retained child control.
+
+**Where that goes wrong.** The protection also covers a loop with a *single*
+carried binding purely because it is nested, and the closure then protects its
+owner. Two ordinary static loops therefore both become `NATIVE_SOURCE` even
+though each one alone is `UNROLL`:
+
+```python
+for segment in range(3):                      # alone: UNROLL
+    r0, r1 = station_r[segment], station_r[segment + 1]
+    for node in nodes:                        # alone: UNROLL
+        segment_area = segment_area + chord   # one carried binding
+```
+
+Once the outer loop is retained, `station_r[segment]` indexes a Python list of
+tensors by a runtime value, which has no lowering. The destructuring
+temporaries the compiler itself created for `r0, r1` are then formals with no
+producer. In the balloon tire this is exactly `r0`/`r1`/`z0`/`z1` in
+`balloon_tire_reduced_vector_step`, four unnamed formals.
+
+Either interpretation would resolve it: unroll the outer loop so the index is
+literal, or lower the Python list to a sequence the retained loop can index.
+Unrolling innermost-first would make both loops eligible, but the evaporator
+clones value producers and cannot yet clone a retained child loop, which is
+what the closure protects against. Pinned as
+`test_nested_static_loops_unroll_their_list_index`.
+
+`TURING_DEBUG_LOOP_EVAPORATION` prints each candidate's strategy, trip count
+and guard components, which is how the demotion was located.
+
+## 10. Publication must honour the declared dtype
 
 **Rule.** The interior may compute in the double working representation. What
 crosses the ABI is what the source declared.

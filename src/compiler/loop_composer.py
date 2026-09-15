@@ -834,14 +834,27 @@ def evaporate_unrolled_loops(
         # Cloning value producers does not clone authored calls or terminal
         # edges. Keep their iterative owner until an unroller can publish
         # both the call occurrences and the guarded break/continue edges.
-        if any(
-            member.loop.control_sites or any(
-                any((graph.G.nodes[node_id].get("attributes") or {}).get(key)
-                    is not None for key in ("callee_ref", "method_ref", "constructor_ref"))
-                for node_id in member.loop.body_nodes if node_id in graph.G
-            )
+        blocked_by_control = any(
+            member.loop.control_sites for member in selected_plans
+        )
+        blocked_by_call = any(
+            any((graph.G.nodes[node_id].get("attributes") or {}).get(key)
+                is not None for key in ("callee_ref", "method_ref", "constructor_ref"))
             for member in selected_plans
-        ):
+            for node_id in member.loop.body_nodes if node_id in graph.G
+        )
+        if os.environ.get("TURING_DEBUG_LOOP_EVAPORATION"):
+            print(
+                f"DEBUG-LOOP-EVAPORATION loop={loop_id} "
+                f"body_nodes={len(loop.body_nodes)} "
+                f"control_sites={blocked_by_control} calls={blocked_by_call} "
+                f"strategy={getattr(plan.strategy, 'name', plan.strategy)!r} "
+                f"iterator_kind={loop.iterator_kind!r} "
+                f"start={loop.start!r} stop={loop.stop!r} step={loop.step!r} "
+                f"iterable_constant={type(loop.iterable_constant).__name__}",
+                file=sys.stderr, flush=True,
+            )
+        if blocked_by_control or blocked_by_call:
             continue
         # Collection mutations are resident memory effects, not values that can
         # be replaced by cloning the loop body's numerical producer cone. The
