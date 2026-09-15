@@ -355,6 +355,29 @@ than discovering its absence at emission.
 
 Pinned as `tests/test_dispatch_argument_ports.py`.
 
+## Where these rules meet the time field
+
+Three of the sections above are one defect seen three times: a binding the
+compiler has already resolved, which the graph vocabulary has no port to
+carry, discovered at the far end. Section 6a is a closure capture, which
+acquires its caller-side binding only during call linking. Section 12 is a
+dispatched job's arguments. The prescription is the same in both: mint the
+port where the binding is minted, while the thing being named is still in
+hand, rather than discovering its absence at emission.
+
+Section 10 has a deadline attached to it. Retention is decided by carried
+state, and `engine_toy/TIME_FIELD_DESIGN.md` makes the time field dynamical:
+`log_tau` *and* `dlog_tau_dt`, position and velocity, per zone. A second
+carried value is already enough on its own to retain a loop, with no nesting,
+and a retained loop cannot index a Python list of tensors by its loop
+variable. So that defect moves from the balloon tire into the dt machinery as
+soon as the field gains its velocity. Widening the unroll rule would be a fix
+that expires; lowering the index in the retained case is the one that
+survives.
+
+`engine_toy/NEGATIVE_DRIFT_AND_DIFFUSION_REPORT.md` carries the measurements
+behind both statements.
+
 ## Diagnostics that find this class of defect
 
 These are env-gated and print to stderr. They exist because each one located a
