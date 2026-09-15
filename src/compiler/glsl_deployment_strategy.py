@@ -2464,10 +2464,15 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             continue
         emitted_regions.add(region_index)
         subgraph = shell.dispatch_subgraphs[region_index]
+        # The dispatch subgraph was carved before loop evaporation could
+        # replace the nodes it named.  The live graph is the authority for
+        # what this region still contains, so drop members it no longer
+        # holds instead of indexing them and raising a bare KeyError.
         region_nodes = tuple(
             int(value)
             for value in subgraph.G.graph.get("deployment_nodes", ())
             if int(value) not in call_result_projection_ids
+            and int(value) in graph.G
         )
         original_region_node_set = set(region_nodes)
         carried_initial_boundaries = {
@@ -2500,7 +2505,13 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             replace those producers at a numerical region cut.
             """
 
-            node_data = graph.G.nodes[int(node_id)]
+            node_data = graph.G.nodes.get(int(node_id))
+            if node_data is None:
+                # Loop evaporation removes the nodes it replaced, and a region
+                # view carved before that still names them.  The graph is the
+                # authority this recomputation exists to consult, so a node it
+                # no longer holds contributes no parents rather than raising.
+                return ()
             operation = str(
                 node_data.get("op") or node_data.get("type") or ""
             )
