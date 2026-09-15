@@ -317,6 +317,44 @@ settles to `double` for the kernel while the root wrapper still declares
 `int64_t`. The call edge has physical input adapters but no output adapter.
 Pinned as `test_consumed_integer_output_is_published_in_its_declared_dtype`.
 
+## 12. Still confused: a dispatched job carries no argument ports
+
+**Rule.** A dispatcher operation is a call. Its arguments need ports, and an
+argument whose resolved identity is a callable definition needs a port that
+names code rather than a value.
+
+**What is confused.** `threading.Thread(target=work, args=(values,))` lowers to
+`thread_create` and fails at emission with `dispatcher arguments lack SSA
+identities`. Measured at the failure, the check compares
+
+| side | positional | keywords |
+|---|---|---|
+| resolved from the graph | 0 | `('target',)` |
+| authored in the source | 0 | `['target', 'args']` |
+
+So `target` does resolve: it is a `StaticReference` node with
+`reference_kind='function_subgraph'` carried as `kw:target`. It is **`args`**
+that has no edge at all, and the tuple's contents never enter the graph — the
+`values` parameter has no `Input` node, because nothing consumes it.
+
+**Why the order matters.** Giving `target` a function-reference port and
+excluding it from the arity check leaves zero resolved keywords against two
+authored ones. Relaxing the check further would emit a job submission with no
+data ports: a worker that silently receives nothing, which is worse than the
+current refusal. The data ports come first; the function port is a real and
+separate improvement, because a `StaticReference` value id is not a runtime
+value and every higher-order call meets the same wall.
+
+**The shared shape.** This is the third instance in this document of one
+defect: *a binding the compiler has already resolved, which the graph
+vocabulary has no port to carry, discovered at the far end.* Section 6a is the
+same thing for a closure capture, which acquires its caller-side binding only
+during call linking. The prescription is the same in both: mint the port where
+the binding is minted, while the thing being named is still in hand, rather
+than discovering its absence at emission.
+
+Pinned as `tests/test_dispatch_argument_ports.py`.
+
 ## Diagnostics that find this class of defect
 
 These are env-gated and print to stderr. They exist because each one located a
