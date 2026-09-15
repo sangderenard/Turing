@@ -18103,17 +18103,31 @@ def _class_surface_ssa_program(
                             if candidate.res is not None
                             and candidate not in moving
                         } | formal_ids
-                        if consumer is None and not external <= available:
+                        missing = external - available
+                        blocking = {
+                            int(candidate.res.id)
+                            for candidate in use_block.instrs[consumer_index:]
+                            if candidate not in moving
+                            and candidate.res is not None
+                            and int(candidate.res.id) in external
+                        }
+                        if os.environ.get("TURING_DEBUG_RECOVERY_PLACEMENT"):
+                            print(
+                                f"DEBUG-RECOVERY-PLACEMENT {symbol} "
+                                f"id={int(recovered.res.id)} "
+                                f"use_blocks={len(use_blocks)} "
+                                f"target={'entry-hoist' if consumer is None else 'consumer'} "
+                                f"index={consumer_index} moving={len(moving)} "
+                                f"missing={sorted(missing)[:6]} "
+                                f"blocking={sorted(blocking)[:6]}",
+                                file=sys.stderr, flush=True,
+                            )
+                        if consumer is None and missing:
                             # An operand this block does not have cannot be
                             # hoisted here; leave the value where it is and
                             # let the definition-dominance check report it.
                             continue
-                        if any(
-                            candidate.res is not None
-                            and int(candidate.res.id) in external
-                            for candidate in use_block.instrs[consumer_index:]
-                            if candidate not in moving
-                        ):
+                        if blocking:
                             continue
                         for candidate_block in function.blocks.values():
                             candidate_block.instrs = [

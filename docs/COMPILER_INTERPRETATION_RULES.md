@@ -178,7 +178,24 @@ real defect. They still announce themselves.
 **Invariant.** A capture is accounted because the caller can name it and knows
 its contract. A value that merely lacks a name is never accounted.
 
-## 6a. Still confused: an enclosing parameter read only by a closure
+## 6a. Still confused: a capture whose producer was folded away
+
+The contract lookup finds the enclosing value through the caller's identity
+table. A binding whose producer was folded — `wrench_k = inputs[:, 33].reshape(...)`
+— keeps no entry there, and captures have no caller-side binding edge in the
+source graph at all: they acquire one during call linking, later. Such a
+capture therefore reaches its callee undescribed, and every shape expression
+over it (`wrench_k.shape[:2]`) stays unresolved and escapes as an anonymous
+formal. This is the six remaining unnamed formals in each of the two
+`_wrench_force` specializations. Pinned as
+`test_capture_of_a_folded_binding_still_has_a_contract`.
+
+A tempting shortcut is unsound and was tried and reverted: using the capture
+node's own value id as the caller's id. Callee-local ids are per-function, so
+`plane_point_q` took the shape of whatever value happened to share id 0 in the
+caller. Supplying these contracts belongs where captures are actually bound.
+
+## 6b. Still confused: an enclosing parameter read only by a closure
 
 An authored parameter consumed only inside a nested function is dropped from the
 enclosing signature and replaced by one anonymous formal per callsite, so no
