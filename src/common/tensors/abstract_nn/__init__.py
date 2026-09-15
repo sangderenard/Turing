@@ -3,6 +3,7 @@ from .activations import ReLU, Sigmoid, Tanh, Identity
 from .losses import MSELoss, CrossEntropyLoss, BCEWithLogitsLoss
 from .optimizer import Adam
 from .perforated import PerforatedLinear
+from .perforated_recurrent import PerforatedRecurrentTransition
 from .train import train_step, train_loop
 from .utils import set_seed
 
@@ -74,6 +75,6 @@ __all__ = [
     "Linear", "Sequential", "Model", "RectConv2d", "RectConv3d",
     "MaxPool2d", "Flatten", "wrap_module", "ReLU", "Sigmoid", "Tanh",
     "Identity", "MSELoss", "CrossEntropyLoss", "BCEWithLogitsLoss", "Adam",
-    "PerforatedLinear",
+    "PerforatedLinear", "PerforatedRecurrentTransition",
     "train_step", "train_loop", "set_seed", *_LAZY_EXPORTS,
 ]
