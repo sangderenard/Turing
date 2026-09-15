@@ -18045,15 +18045,26 @@ def _class_surface_ssa_program(
                                 for argument in candidate.args
                             )
                         ]
-                        # A private structural value belongs immediately before
-                        # its exact consumer.  If it feeds multiple control
-                        # blocks, this local placement cannot prove a common
-                        # dominator and the ordinary backend/self-check remains
-                        # the honest gate.
+                        # A private structural value belongs immediately
+                        # before its exact consumer.  When it feeds several
+                        # control blocks there is no single consumer to sit
+                        # in front of, but the definition still has to
+                        # dominate every use: the entry block does, by
+                        # construction, so recover that case below instead of
+                        # leaving the value defined inside one arm.
                         use_blocks = {id(item[0]) for item in uses}
-                        if not uses or len(use_blocks) != 1:
+                        if not uses:
                             continue
-                        use_block, _use, consumer = uses[0]
+                        entry_block = (
+                            function.blocks.get("entry")
+                            or next(iter(function.blocks.values()), None)
+                        )
+                        if len(use_blocks) == 1:
+                            use_block, _use, consumer = uses[0]
+                        elif entry_block is None:
+                            continue
+                        else:
+                            use_block, consumer = entry_block, None
                         closure = {int(recovered.res.id)}
                         pending = list(closure)
                         while pending:
@@ -18070,7 +18081,33 @@ def _class_surface_ssa_program(
                             and int(item.res.id) in closure
                         ]
                         external = {int(argument.id) for item in moving for argument in item.args} - closure
-                        consumer_index = use_block.instrs.index(consumer)
+                        if consumer is not None:
+                            consumer_index = use_block.instrs.index(consumer)
+                        else:
+                            # No consumer in the dominating block: sit in
+                            # front of the earliest use there if the value is
+                            # read in it, otherwise before its terminator, so
+                            # every later block sees the definition.
+                            entry_uses = [
+                                offset for candidate_block, offset, _candidate
+                                in uses if candidate_block is use_block
+                            ]
+                            consumer_index = (
+                                min(entry_uses) if entry_uses
+                                else max(len(use_block.instrs) - 1, 0)
+                            )
+                        formal_ids = {int(value.id) for value in function.args}
+                        available = {
+                            int(candidate.res.id)
+                            for candidate in use_block.instrs[:consumer_index]
+                            if candidate.res is not None
+                            and candidate not in moving
+                        } | formal_ids
+                        if consumer is None and not external <= available:
+                            # An operand this block does not have cannot be
+                            # hoisted here; leave the value where it is and
+                            # let the definition-dominance check report it.
+                            continue
                         if any(
                             candidate.res is not None
                             and int(candidate.res.id) in external
@@ -18083,7 +18120,12 @@ def _class_surface_ssa_program(
                                 item for item in candidate_block.instrs
                                 if item not in moving
                             ]
-                        consumer_index = use_block.instrs.index(consumer)
+                        if consumer is not None:
+                            consumer_index = use_block.instrs.index(consumer)
+                        else:
+                            consumer_index = min(
+                                consumer_index, len(use_block.instrs)
+                            )
                         use_block.instrs[consumer_index:consumer_index] = moving
                     break
             function.metadata["recovered_structural_outputs"] = tuple(

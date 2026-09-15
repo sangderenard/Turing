@@ -165,6 +165,39 @@ def test_dtype_spelling_does_not_evict_a_cast_from_its_region(tmp_path):
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
 
 
+@pytest.mark.parametrize('extents', [
+    '(gain.shape[0], 1)',
+    'gain.shape + (1,)',
+    'gain.shape[:1] + (1,)',
+])
+def test_shape_tuple_arithmetic_folds_before_the_reshape(tmp_path, extents):
+    """A shape tuple is a structural value, slices included.
+
+    Indexing a shape and concatenating one both folded, but slicing one did
+    not: the slice index itself was never resolved, so ``x.shape[:1] + (1,)``
+    left its reshape unresolved. The reshape then kept the source extents and
+    the consuming multiply saw incompatible operands -- the same spelling the
+    balloon tire uses as ``wrench_k.shape[:2] + (1,)``.
+    """
+
+    module, root = _lower(
+        'def root(a, gain):\n'
+        f'    return a * gain.reshape({extents})\n',
+        'shape_tuple', {'a': (4, 3), 'gain': (4,)},
+    )
+    assert not run_all(module)
+
+    generator = np.random.default_rng(13)
+    a = generator.standard_normal((4, 3))
+    gain = generator.standard_normal((4,))
+    expected = a * gain.reshape((4, 1))
+    actual, = _execute(
+        module, root, tmp_path / 'shape_tuple', {'a': a, 'gain': gain},
+        [expected],
+    )
+    np.testing.assert_array_equal(actual, expected)
+
+
 def test_short_circuit_reduction_operand_is_recovered_for_its_region(tmp_path):
     """A reduction reached only through ``and`` still has to be produced.
 

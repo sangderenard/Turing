@@ -17013,6 +17013,29 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                     dtype,
                 )
             return unresolved
+        if node_type in {"Slice", "slice"} or isinstance(
+            expression, ast.Slice,
+        ):
+            # A slice is an ordinary structural value, the same currency the
+            # basic-index reader already builds.  Without it a shape tuple
+            # could be indexed (``x.shape[0]``) and concatenated
+            # (``x.shape + (1,)``) but never sliced, so ``x.shape[:2] + (1,)``
+            # left its reshape unresolved: the reshape kept the source extents
+            # and the consuming operation saw incompatible operands.
+            bounds: dict[str, Any] = {}
+            for parent, role in (data.get("parents") or ()):
+                role = str(role)
+                if role not in {"lower", "upper", "step"}:
+                    continue
+                bound = known.get(int(parent), unresolved)
+                if bound is unresolved or isinstance(
+                    bound, _ProgramABIValueFact
+                ):
+                    return unresolved
+                bounds[role] = bound
+            return slice(
+                bounds.get("lower"), bounds.get("upper"), bounds.get("step"),
+            )
         if node_type in {"Tuple", "List", "Set"} or isinstance(
             expression, (ast.Tuple, ast.List, ast.Set),
         ):

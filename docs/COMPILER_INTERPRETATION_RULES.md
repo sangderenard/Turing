@@ -167,7 +167,52 @@ caller can supply it. This is pinned as
 identically at `3af7d206`. The capture rule above covers the contract; the
 parameter's own signature slot is a separate, open defect.
 
-## 7. Publication must honour the declared dtype
+## 7. A shape tuple is a structural value, slices included
+
+**Rule.** `x.shape` is a tuple the compiler can read, index, concatenate and
+slice, exactly as Python does, because every element is a static extent.
+
+**What confused it.** Indexing folded (`x.shape[0]`) and concatenation folded
+(`x.shape + (1,)`), but slicing did not: the structural evaluator had no case
+for a `Slice` node, so the index of `x.shape[:2]` never resolved and the
+subscript stayed unknown. The reshape consuming it then had no target extents,
+kept its source shape, and the next operation saw operands that cannot combine.
+
+The balloon tire writes exactly this spelling:
+`wrench_k.reshape(wrench_k.shape[:2] + (1,))`.
+
+**How it works now.** A `Slice` node evaluates to a Python `slice` built from
+its resolved bounds, which is the same currency the basic-index reader already
+produces. An unresolved bound keeps the whole slice unresolved rather than
+guessing `None`.
+
+**Invariant.** Anything the source can do to a tuple of static extents, the
+fold can do, or it must say it cannot.
+
+## 8. A recovered definition must dominate every use
+
+**Rule.** Structural recovery inserts real instructions. Like any definition,
+they have to be reachable from every use.
+
+**What confused it.** Recovered instructions are inserted before the function's
+terminator, then moved in front of their consumer. The move required a single
+consuming block: with uses in more than one block the placement could not prove
+a common dominator, so it left the definition where it landed. In
+`validator_simulation_advance` the recovered boolean is read by a planned
+region in `entry` and returned from `if_merge`, so it stayed in `if_merge` and
+did not dominate its region call.
+
+**How it works now.** A value used from several blocks is hoisted into the entry
+block, which dominates every block by construction, in front of its earliest use
+there. Hoisting is allowed only when every external operand of the moved closure
+is already available at that point; otherwise the value stays put and the
+definition-dominance check reports it rather than the compiler moving something
+it cannot justify.
+
+**Invariant.** Recovery may choose where a definition goes, never whether a use
+can see it.
+
+## 9. Publication must honour the declared dtype
 
 **Rule.** The interior may compute in the double working representation. What
 crosses the ABI is what the source declared.
