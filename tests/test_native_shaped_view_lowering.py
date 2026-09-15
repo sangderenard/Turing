@@ -198,6 +198,42 @@ def test_shape_tuple_arithmetic_folds_before_the_reshape(tmp_path, extents):
     np.testing.assert_array_equal(actual, expected)
 
 
+def test_element_read_of_a_tuple_result_is_computed_not_projected(tmp_path):
+    """Descend a projection path only while it is still an aggregate.
+
+    ``result[1]`` selects one of a call's outputs. ``result[1][0]`` reads an
+    element of that output, which is ordinary numerical work, yet the
+    projection walk kept descending through it. The read then belonged to no
+    region, nothing computed it, and the caller kept a formal for it -- the
+    thirteen unnamed formals in ``validator_simulation_advance``, which reads
+    ``result[1][0, 0, 6]`` from its tick-vector call.
+    """
+
+    from src.compiler.fortran_c_shell import _undefined_repository_ssa_operands
+
+    module, root = _lower(
+        'def inner(left, right):\n'
+        '    return left * 2.0, right * 3.0\n'
+        '\n'
+        '\n'
+        'def root(a, b):\n'
+        '    result = inner(a, b)\n'
+        '    return result[0].sum(dim=1) + result[1][0]\n',
+        'tuple_element', {'a': (8, 4, 9), 'b': (9,)},
+    )
+    assert not run_all(module)
+    assert _undefined_repository_ssa_operands(module) == ()
+
+    generator = np.random.default_rng(23)
+    a = generator.standard_normal((8, 4, 9))
+    b = generator.standard_normal((9,))
+    expected = (a * 2.0).sum(axis=1) + (b * 3.0)[0]
+    actual, = _execute(
+        module, root, tmp_path / 'tuple_element', {'a': a, 'b': b}, [expected],
+    )
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+
 def test_short_circuit_reduction_operand_is_recovered_for_its_region(tmp_path):
     """A reduction reached only through ``and`` still has to be produced.
 

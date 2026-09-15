@@ -1998,7 +1998,14 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                 if int(successor) in found:
                     continue
                 found.add(int(successor))
-                pending.append(int(successor))
+                # Keep descending only while the projection is itself an
+                # intermediate aggregate.  ``r[1][0]`` is a structural path
+                # when ``r[1]`` is another tuple, and an ordinary element read
+                # when ``r[1]`` is a tensor.  Walking through a tensor removed
+                # that read from every region, so nothing computed it and the
+                # caller kept a formal for it.
+                if _tensor_descriptor(graph, int(successor)) is None:
+                    pending.append(int(successor))
         return found
 
     call_result_projection_ids = {

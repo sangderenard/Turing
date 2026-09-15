@@ -97,6 +97,26 @@ literal integer. Everything else stays a numerical view its region computes.
 **Invariant.** Ownership follows computation. If evaluating it requires
 arithmetic, some region owns it.
 
+## 4a. A projection path ends at the first tensor
+
+**Rule.** The walk from a callsite through its projections continues only
+while each step is still an intermediate aggregate. `r[1][0]` is a structural
+path when `r[1]` is another tuple, and an ordinary element read when `r[1]` is
+a tensor.
+
+**What confused it.** The walk descended through every `Indexed` successor
+regardless. A tensor output's element read was therefore classified as a
+call-boundary projection, belonged to no region, and nothing computed it, so
+the caller kept a formal for it. This is the thirteen unnamed formals in
+`validator_simulation_advance`, which reads `result[1][0, 0, 6]` from its
+tick-vector call.
+
+**How it works now.** A projection is recorded, but the walk only descends
+past it when the projected value has no tensor descriptor.
+
+**Invariant.** Selecting an output is structure. Reading inside an output is
+computation.
+
 ## 5. A coordinator-only operand still has to be produced
 
 **Rule.** A short-circuited `and`/`or` operand may be skipped at runtime, so it
