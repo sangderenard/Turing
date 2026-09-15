@@ -555,14 +555,37 @@ def lower_python_threading(tree: ast.AST) -> ast.AST:
                       "line": getattr(source, "lineno", None),
                       "column": getattr(source, "col_offset", None),
                       "requires_concurrent_progress": True}
+            # A ``Thread`` in authored source is a request for CONCURRENT
+            # PROGRESS, not a request for an operating-system thread. Taken
+            # literally it would mean spawn-and-destroy per unit of work,
+            # which is the one disposition the deployment runtime never
+            # wants: ``turing_pool`` exists precisely because workers should
+            # start once and park between frames ("already up and waiting
+            # for jobs"), and ``HostDeploymentPool`` says the same on the
+            # host side. So the authored spawn lowers to a JOB SUBMISSION
+            # against an already-running pool, and the authored join lowers
+            # to that frame's completion wait.
+            #
+            # Stating it here rather than leaving it to each backend keeps
+            # one answer: a backend that reads ``dispatch_disposition``
+            # cannot decide to spawn, and the serial disposition (zero
+            # workers, caller drains) remains the identical claim loop
+            # rather than a second implementation.
+            if kind == "thread":
+                record["dispatch_disposition"] = "pooled_job"
+                record["pool_residency"] = "persistent"
             call._turing_dispatch_operation = record
+            parameters = {"lowering_namespace": "dispatcher",
+                          "operation": operation,
+                          "required_capability": "communicating_tasks"}
+            if kind == "thread":
+                parameters["dispatch_disposition"] = "pooled_job"
+                parameters["pool_residency"] = "persistent"
             call._extraction_contract = {
                 "action": "intrinsic", "identity": f"turing.dispatch.{operation}",
                 "rule_id": "python-threading-to-dispatcher",
                 "classification": "dispatcher-operation",
-                "parameters": {"lowering_namespace": "dispatcher",
-                               "operation": operation,
-                               "required_capability": "communicating_tasks"},
+                "parameters": parameters,
             }
             self.records.append(record)
             return call
