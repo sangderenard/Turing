@@ -9,6 +9,36 @@ from __future__ import annotations
 from collections import Counter
 
 
+def prune_unused_phis(function, protected_value_ids=()) -> tuple[int, ...]:
+    """Remove unused joins without dropping their producers or effects.
+
+    Source control can join a branch-local name that is overwritten before
+    any continuation reads it. Such a join needs no value on the other edge.
+    Only uniquely defined, unreferenced Phi results are eligible; callers can
+    protect identities still referenced by descriptor tables.
+    """
+    protected = set(map(int, protected_value_ids))
+    protected.update(map(int, function.metadata.get("semantic_output_ids", ())))
+    removed = []
+    while True:
+        instructions = [item for block in function.blocks.values() for item in block.instrs]
+        used = {int(value.id) for item in instructions for value in item.args}
+        counts = Counter(int(item.res.id) for item in instructions if item.res is not None)
+        dead = {
+            int(item.res.id) for item in instructions
+            if item.op == "Phi" and item.res is not None
+            and counts[int(item.res.id)] == 1
+            and int(item.res.id) not in used | protected
+        }
+        if not dead:
+            return tuple(removed)
+        for block in function.blocks.values():
+            block.instrs[:] = [item for item in block.instrs if not (
+                item.op == "Phi" and item.res is not None and int(item.res.id) in dead
+            )]
+        removed.extend(sorted(dead))
+
+
 def hoist_nondominating_constants(function) -> tuple[dict[str, object], ...]:
     """Place unique operand-free constants before every reachable use.
 

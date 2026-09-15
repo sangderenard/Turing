@@ -108,3 +108,48 @@ def test_inferred_projection_inherits_proven_buffer_representation():
     assert result.dtype == 'bool'
     assert result.accounting['physical_dtype'] == 'float64'
     assert not conflicts
+
+
+def test_repeated_region_projection_receives_its_own_physical_contract():
+    source = SSAValue(4, 'bool', (1,), accounting={'physical_dtype': 'float64'})
+    first, repeated = SSAValue(4, 'bool', (1,)), SSAValue(8, 'bool', (1,))
+    aggregate, pointer = SSAValue(9, 'ssa.aggregate'), SSAValue(10, 'ptr')
+    index = SSAValue(11, 'int64')
+    root = Function('root', [first], {'entry': BasicBlock('entry', [
+        Instr('Call', [], aggregate, attributes={
+            'callee': 'producer', 'result_convention': 'ssa.aggregate', 'output_ids': (4,),
+        }),
+        Instr('Const', [], index, attributes={'value': 0}),
+        Instr('GetElementPtr', [aggregate, index], pointer, attributes={'source_output_id': 4}),
+        Instr('Load', [pointer], repeated), Instr('Ret', [repeated], None),
+    ])})
+    fs = {'root': root, 'producer': function('producer', source)}
+    _, _, conflicts, _ = settle_call_result_types(fs, outputs, values)
+    assert not conflicts
+    assert repeated.accounting['physical_dtype'] == 'float64'
+    assert repeated.accounting['ssa_call_result_from'] == ('producer', 4)
+
+
+def test_projection_uses_caller_output_identity_after_dead_output_removal():
+    left, right = SSAValue(21, 'float64', (3,)), SSAValue(22, 'float64', (7,))
+    first, second = SSAValue(4, 'unknown'), SSAValue(5, 'unknown')
+    repeated = SSAValue(8, 'unknown')
+    aggregate, pointer, index = SSAValue(9, 'ssa.aggregate'), SSAValue(10, 'ptr'), SSAValue(11, 'int64')
+    root = Function('root', [first, second], {'entry': BasicBlock('entry', [
+        Instr('Call', [], aggregate, attributes={
+            'callee': 'producer', 'result_convention': 'ssa.aggregate',
+            'output_ids': (4, 5), 'callee_output_ids': (21, 22),
+        }),
+        Instr('Const', [], index, attributes={'value': 1}),
+        # Slot zero was removed. Original slot one still names caller output 4.
+        Instr('GetElementPtr', [aggregate, index], pointer,
+              attributes={'source_output_id': 4, 'aggregate_index': 1}),
+        Instr('Load', [pointer], repeated), Instr('Ret', [repeated], None),
+    ])})
+    producer = Function('producer', [left, right], {'entry': BasicBlock('entry', [
+        Instr('Ret', [left, right], None),
+    ])})
+    _, _, conflicts, _ = settle_call_result_types({'root': root, 'producer': producer}, outputs, values)
+    assert not conflicts
+    assert repeated.shape == (3,)
+    assert repeated.accounting['ssa_call_result_from'] == ('producer', 21)

@@ -1968,7 +1968,7 @@ def emit_ssa_module_to_c(
             for formal in function.args
         }
         address_buffer_types: dict[int, str] = {
-            int(formal.id): _value_buffer_c_type(formal)
+            int(formal.id): buffer_type(formal)
             for formal in function.args
         }
         # Element type belongs to the addressed storage, not to the value a
@@ -2227,7 +2227,7 @@ def emit_ssa_module_to_c(
                         continue
                     expressions[projection_id] = projected_expression
                     addresses[projection_id] = projected_address
-                    address_buffer_types[projection_id] = buffer_type(output)
+                    address_buffer_types[projection_id] = solved_buffer_type(record.callee, output)
         integer_ids = {
             int(formal.id) for formal in function.args
             if _is_integer_dtype(formal.dtype)
@@ -2321,6 +2321,8 @@ def emit_ssa_module_to_c(
                 return f"*(({buffer_type(value)} *)({home}))"
             return held
 
+        phi_scalar_cells: set[tuple[int, int]] = set()
+
         def phi_edge_assignments(source_block: str, target_block: str) -> list[str]:
             """The out-of-SSA copies owed on one CFG edge."""
 
@@ -2342,6 +2344,33 @@ def emit_ssa_module_to_c(
                             source = instruction.args[position]
                             address = (operand(source) if _pointer_value_depth(source) > 0
                                        else address_operand(source))
+                            if (not tuple(source.shape or ())
+                                    and _pointer_value_depth(source) == 0
+                                    and _declared_span_rank(source) == 0):
+                                target_type = buffer_type(instruction.res)
+                                source_type = address_buffer_types.get(int(source.id))
+                                if source_type is None or source_type != target_type:
+                                    # A one-element array recurrence can start
+                                    # from a scalar literal. Its numeric value
+                                    # is not an address (zero would become NULL).
+                                    # Give that incoming edge a typed cell with
+                                    # function lifetime, just like a scalar call
+                                    # conversion, then join the actual address.
+                                    if math.prod(instruction.res.shape or (1,)) != 1:
+                                        shortfalls.append(CEmissionShortfall(
+                                            "Phi", "scalar incoming value needs an explicit broadcast",
+                                        ))
+                                        continue
+                                    key = (int(instruction.res.id), position)
+                                    cell = f"phiin{key[0]}_{key[1]}"
+                                    if key not in phi_scalar_cells:
+                                        local_tensor_declarations.append(f"    {target_type} {cell};")
+                                        phi_scalar_cells.add(key)
+                                    scalar = scalar_operand(source)
+                                    if scalar is None:
+                                        continue
+                                    assignments.append(f"        {cell} = ({target_type})({scalar});")
+                                    address = f"&{cell}"
                             value = None if address is None else (
                                 f"({phi_declarations[int(instruction.res.id)]})({address})"
                             )
@@ -2702,7 +2731,30 @@ def emit_ssa_module_to_c(
                             else numeric.hex()
                         )
                     result_id = int(instruction.res.id)
-                    if not tuple(instruction.res.shape or ()):
+                    constant_shape = tuple(instruction.res.shape or ())
+                    if constant_shape:
+                        if any(not isinstance(extent, int) or extent < 0 for extent in constant_shape):
+                            shortfalls.append(CEmissionShortfall(
+                                op, f"scalar constant has unresolved tensor shape in {fn}",
+                            ))
+                            continue
+                        # Shape settlement can turn a scalar constant into a
+                        # one-element tensor carried by a loop. Its literal is
+                        # still a value, never a native storage address. A
+                        # scalar Const payload with shape is a tensor splat.
+                        count = math.prod(constant_shape)
+                        element_type = buffer_type(instruction.res)
+                        storage = activation_array(element_type, max(1, count))
+                        literal = expressions[result_id]
+                        body.append(
+                            f"        for (size_t const_i_{result_id} = 0; "
+                            f"const_i_{result_id} < {count}; ++const_i_{result_id}) "
+                            f"{storage}[const_i_{result_id}] = ({element_type})({literal});"
+                        )
+                        expressions[result_id] = storage
+                        addresses[result_id] = storage
+                        address_buffer_types[result_id] = element_type
+                    else:
                         # Pointer propagation means a downstream native helper
                         # consumes this scalar by address.  A tensor-table
                         # scratch declaration for the same semantic id is not
@@ -2716,6 +2768,7 @@ def emit_ssa_module_to_c(
                         )
                         expressions[result_id] = f"t{result_id}"
                         addresses[result_id] = f"&t{result_id}"
+                        address_buffer_types[result_id] = buffer_type(instruction.res)
                     continue
                 if op in {"Br", "br"}:
                     target = str(instruction.attributes.get("target"))
@@ -3277,15 +3330,20 @@ def emit_ssa_module_to_c(
                         ):
                             # No storage is shared at a scalar call boundary:
                             # the callee receives a fresh one-cell temporary.
-                            # Use each value's own authored storage dtype here,
-                            # not the array-alias union solver.  A repository
-                            # helper formal may also serve shaped callers, and
-                            # that legitimate array component must not make a
-                            # bool scalar caller masquerade as double.
+                            # Read the actual cell's emitted storage type. A
+                            # repository helper may also serve shaped callers;
+                            # its storage contract does not change the scalar
+                            # cell that this caller has already produced.
                             actual_type = address_buffer_types.get(
                                 int(actual.id), _value_buffer_c_type(actual)
                             )
-                            formal_type = _value_buffer_c_type(formal)
+                            # The callee implementation has one settled input
+                            # representation, including constraints from its
+                            # native kernels. Convert from the actual scalar's
+                            # own storage into that representation; a logical
+                            # integer formal may be implemented in double
+                            # storage and cannot receive an int32 address.
+                            formal_type = solved_buffer_type(callee, formal)
                             if actual_type != formal_type:
                                 scalar = scalar_operand(actual)
                                 if scalar is None:
@@ -3313,7 +3371,7 @@ def emit_ssa_module_to_c(
                                 break
                             local_name = f"callarg{call_token}_{argument_index}"
                             body.append(
-                                f"        {buffer_type(formal)} "
+                                f"        {solved_buffer_type(callee, formal)} "
                                 f"{local_name} = {scalar};"
                             )
                             value = f"&{local_name}"
@@ -3812,6 +3870,7 @@ def emit_ssa_module_to_c(
                     continue
                 result_id = int(instruction.res.id)
                 declared = None
+                declared_storage_type = _scalar_c_type(instruction.res.dtype)
                 if op in {"GetElementPtr", "getelementptr"} and len(args) >= 2:
                     base = instruction.args[0]
                     pointer_depth = _pointer_value_depth(base)
@@ -4007,6 +4066,7 @@ def emit_ssa_module_to_c(
                         )
                     if op == "FpToUi":
                         result_type = _unsigned_c_type(instruction.res.dtype)
+                    declared_storage_type = result_type
                     declared = (
                         f"const {result_type} t{result_id} = "
                         f"({result_type})({source});"
@@ -4095,6 +4155,7 @@ def emit_ssa_module_to_c(
                         f"? ({args[0]}) : ({args[1]}));"
                     )
                 elif op == "Pow" and len(args) == 2:
+                    declared_storage_type = "double"
                     # Constant exponents approved by the active work contract
                     # have already been rewritten by
                     # reduce_constant_exponent_pow. A Pow that survives that
@@ -4105,6 +4166,7 @@ def emit_ssa_module_to_c(
                         f"pow({args[0]}, {args[1]});"
                     )
                 elif op.casefold() in _TERNARY and len(args) == 3:
+                    declared_storage_type = "double"
                     declared = (
                         f"const double t{result_id} = "
                         f"fma({args[0]}, {args[1]}, {args[2]});"
@@ -4218,6 +4280,7 @@ def emit_ssa_module_to_c(
                         f"{_UNARY_PREDICATES[op.casefold()]}({args[0]});"
                     )
                 elif op.casefold() in _UNARY_FOLDED and len(args) == 1:
+                    declared_storage_type = "double"
                     declared = (
                         f"const double t{result_id} = "
                         f"{_UNARY_FOLDED[op.casefold()]}({args[0]});"
@@ -4247,6 +4310,13 @@ def emit_ssa_module_to_c(
                     if declared.startswith("const "):
                         declared = declared[len("const "):]
                     addresses[result_id] = f"&t{result_id}"
+                    # This address belongs to the C local just emitted. A
+                    # logical predicate can carry a double-valued repository
+                    # buffer contract while its scalar instruction creates a
+                    # uint8_t cell. Call conversions must use the actual cell.
+                    address_buffer_types[result_id] = (
+                        loaded_type if op == "Load" else declared_storage_type
+                    )
                 if (
                     result_id in emitted_scalar_locals
                     and not tuple(instruction.res.shape or ())

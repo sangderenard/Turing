@@ -1970,6 +1970,31 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     for parent, role in successor_data.get("parents") or ()
                 ):
                     continue
+                # Only a literal integer index is a structural path onto a
+                # call's outputs.  A slice or a tuple of slices over a tensor
+                # call result (``moment[:, :, 1]``, ``m[:, :, 0:2]``) is a
+                # numerical view an owning region must compute; treating it
+                # as a projection left it with no producer at all.
+                index_parents = tuple(
+                    int(parent)
+                    for parent, role in successor_data.get("parents") or ()
+                    if str(role) == "index"
+                )
+                if len(index_parents) != 1 or index_parents[0] not in graph.G:
+                    continue
+                index_data = graph.G.nodes[index_parents[0]]
+                if str(index_data.get("type")) not in {
+                    "Const", "const", "Constant",
+                }:
+                    continue
+                try:
+                    index_value = _constant_value(index_data)
+                except KeyError:
+                    continue
+                if not isinstance(index_value, int) or isinstance(
+                    index_value, bool
+                ):
+                    continue
                 if int(successor) in found:
                     continue
                 found.add(int(successor))
@@ -6313,7 +6338,7 @@ def _inert_routing_nodes(graph: Any) -> frozenset[int]:
 
 # Serialized ProcessGraphs retain this derived cache. Bump its schema when
 # classification semantics change, so a compiler replay recomputes old facts.
-_DISPATCH_METADATA_CACHE_SCHEMA = 2
+_DISPATCH_METADATA_CACHE_SCHEMA = 3
 
 
 def _dispatch_metadata_node_classifier(graph: Any):
@@ -6433,6 +6458,16 @@ def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
             node_type in {"Indexed", "IndexedStore"}
             and str(role) == "index"
             and basic_index_literal(_constant_value(parent_data))
+        ):
+            continue
+        # A dtype spelling (``x.to_dtype("int64")``) is operation metadata
+        # for a numerical cast, not a non-numeric data operand.  Treating it
+        # as one severed every cast from its region: ``cell_index`` and
+        # ``upper`` in the periodic terrain became unproduced region feeds.
+        if (
+            str(data.get("op") or node_type).casefold()
+            in _DTYPE_CAST_OPERATIONS
+            and isinstance(_constant_value(parent_data), str)
         ):
             continue
         try:
@@ -7572,11 +7607,8 @@ def _ordinary_conditional_control_programs(
             ))
         )
         # A ``return`` ending an arm is a control effect of that arm: it
-        # leaves the function carrying the arm's values. Handled here only
-        # for conditionals outside every loop; inside a loop body the loop
-        # planner already places the return control at its lexical position
-        # (`LoopDescriptor.return_controls`), and placing it twice would
-        # emit two return edges for one source return.
+        # leaves the function carrying the arm's values. The overlay removes
+        # the loop schedule's copy when the exact anchor and slots agree.
         return_slot_values = dict(graph.G.graph.get("return_slot_values") or {})
         enclosing_loop_spans = tuple(
             (int(loop_expression.lineno), int(getattr(
@@ -7694,7 +7726,7 @@ def _ordinary_conditional_control_programs(
             )
 
         def arm_return_control(statements):
-            if inside_loop or not statements:
+            if not statements:
                 return None
             terminal = statements[-1]
             if not isinstance(terminal, ast.Return) or terminal.value is None:
@@ -7708,9 +7740,28 @@ def _ordinary_conditional_control_programs(
             ))
             if slots is None:
                 return None
+            # LoopDescriptor.return_controls anchors a return at its value,
+            # not an ast.Return statement node. Tuple containers can be
+            # reduced away, in which case its last surviving exact slot is
+            # the anchor, as in LoopComposer.describe.
+            signature = lambda expr: (
+                *(getattr(expr, key, None) for key in (
+                    "lineno", "col_offset", "end_lineno", "end_col_offset")),
+                ast.dump(expr, include_attributes=False),
+            )
+            sites = [int(node_id) for node_id, node_data in graph.G.nodes(data=True)
+                     if isinstance(node_data.get("expr_obj"), ast.AST)
+                     and signature(node_data["expr_obj"]) == signature(returned)]
+            site_id = min(sites) if sites else next((
+                int(value_id) for value_id in reversed(slots)
+                if value_id is not None and int(value_id) in graph.G
+            ), None)
+            if inside_loop and site_id is None:
+                return None
             return LoopControlBlock(
                 "return", None, True, None,
                 source_action="return",
+                site_node_id=site_id,
                 return_value_ids=tuple(slots),
             )
 
@@ -8568,6 +8619,58 @@ def _overlay_control_or_require_subdivision(
     *, region_dependencies: Iterable[tuple[int, int]] = (),
 ) -> ControlProgram:
     """Turn a named cross-scope overlay refusal into loop-owned frontier data."""
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, LoopBlock, LoopControlBlock, SequenceBlock, WhileBlock,
+    )
+
+    def children(block):
+        if isinstance(block, SequenceBlock):
+            return block.blocks
+        if isinstance(block, ConditionalBlock):
+            return (block.body,) + (() if block.orelse is None else (block.orelse,))
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            return (block.body, *block.terminal_controls)
+        if isinstance(block, CallBlock):
+            return (block.callee,)
+        return ()
+
+    owned_returns = {}
+    def collect(block):
+        if (isinstance(block, LoopControlBlock) and block.action == "return"
+                and block.site_node_id is not None and block.predicate_value_id is None
+                and block.predicate_expression is None):
+            owned_returns.setdefault(int(block.site_node_id), set()).add(tuple(block.return_value_ids))
+        for child in children(block):
+            collect(child)
+
+    for conditional in conditional_controls:
+        collect(conditional.root)
+
+    def remove_duplicate_return(block):
+        if (isinstance(block, LoopControlBlock) and block.action == "return"
+                and block.site_node_id is not None
+                and owned_returns.get(int(block.site_node_id)) == {tuple(block.return_value_ids)}):
+            return SequenceBlock(())
+        if isinstance(block, SequenceBlock):
+            return replace(block, blocks=tuple(remove_duplicate_return(child) for child in block.blocks))
+        if isinstance(block, ConditionalBlock):
+            return replace(block, body=remove_duplicate_return(block.body),
+                           orelse=None if block.orelse is None else remove_duplicate_return(block.orelse))
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            return replace(block, body=remove_duplicate_return(block.body),
+                           terminal_controls=tuple(remove_duplicate_return(child) for child in block.terminal_controls))
+        if isinstance(block, CallBlock):
+            return replace(block, callee=remove_duplicate_return(block.callee))
+        return block
+
+    # A terminal return belongs inside its authored conditional arm. The
+    # loop's flat guarded copy is the same source site, not another return.
+    # Keeping both postponed the real edge until after the branch merge and
+    # left its return value without a dominating definition.
+    if owned_returns:
+        loop_controls = tuple(replace(control, root=remove_duplicate_return(control.root))
+                              for control in loop_controls)
 
     try:
         from .control_source import order_control_region_dependencies
@@ -16627,6 +16730,27 @@ def _fold_callsite_structural_values(graph: Any) -> None:
         if descriptor is None:
             descriptor = _record_field_descriptor(parent)
         if attribute in {"shape", "ndim", "ndims"}:
+            pending_inputs = [int(parent)]
+            seen_inputs = set()
+            while pending_inputs:
+                current = pending_inputs.pop()
+                if current in seen_inputs or current not in graph.G:
+                    continue
+                seen_inputs.add(current)
+                source = graph.G.nodes[current]
+                operation = str(source.get("op") or source.get("type") or "").casefold()
+                if operation == "input":
+                    if _tensor_descriptor(graph, current) is None:
+                        return unresolved
+                    continue
+                # A declared record span supplies its own shape boundary;
+                # the opaque receiver is not an untyped tensor parameter.
+                if operation == "getattr" and _record_field_descriptor(current) is not None:
+                    continue
+                pending_inputs.extend(
+                    int(value) for value, role in source.get("parents") or ()
+                    if str(role) not in {"callee", "func", "definition"}
+                )
             planner_descriptors = (
                 graph.G.graph.get("planner_tensor_descriptors") or {}
             )
@@ -18355,6 +18479,7 @@ def _apply_callsite_tensor_descriptors(
     })
     graph.G.graph["planner_tensor_descriptors"] = authoritative
     identities = graph.G.graph.get("identity_table") or {}
+    changed_inputs = set()
     for name, descriptor in descriptors.items():
         candidates = tuple(dict.fromkeys((
             *tuple(identities.get(str(name), ())),
@@ -18371,7 +18496,25 @@ def _apply_callsite_tensor_descriptors(
             data = graph.G.nodes[int(node_id)]
             if data.get("type") != "Input":
                 continue
+            if data.get("tensor") != dict(descriptor):
+                changed_inputs.add(int(node_id))
             data["tensor"] = copy.deepcopy(dict(descriptor))
+
+    # Cached intermediate shapes were derived before these exact argument
+    # descriptors arrived. Invalidate their dependency closure so structural
+    # folding recomputes them; stale padded scalar shapes are not evidence.
+    affected = set(changed_inputs)
+    changed = True
+    while changed:
+        changed = False
+        for node_id, data in graph.G.nodes(data=True):
+            if int(node_id) in affected:
+                continue
+            if any(int(parent) in affected for parent, role in data.get("parents") or ()
+                   if str(role) not in {"callee", "func", "definition"}):
+                affected.add(int(node_id))
+                data.pop("tensor", None)
+                changed = True
 
 
 def _follow_declared_value_source(

@@ -4882,6 +4882,7 @@ def analyze_shader_loop_reductions(
                     True,
                     guarded_expression(chain),
                     source_action="return",
+                    site_node_id=int(node_id),
                     return_value_ids=tuple(slot_values),
                 ),
             )

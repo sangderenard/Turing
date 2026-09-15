@@ -1480,7 +1480,7 @@ def test_linked_record_result_expands_as_typed_sequence_row():
     assert append.attributes["ssa_sequence_operation"] == "append_child_copy"
     destination = module.sequence_tables[root.name].by_id(1)
     assert destination.child_table_pool is not None
-    assert destination.child_table_pool.handle_column == 14
+    assert destination.child_table_pool.handle_column == 16
     assert "ssa_deferred_record_row" not in append.attributes
     assert append.attributes["ssa_record_row_identity"] == "Metrics"
 

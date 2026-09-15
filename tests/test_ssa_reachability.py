@@ -2,6 +2,33 @@ from src.compiler.ssa_reachability import prune_constant_control_flow
 from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
 
 
+def test_unused_join_is_removed_without_removing_effectful_producer():
+    from src.compiler.ssa_reachability import prune_unused_phis
+
+    produced, joined, chained, retained = [SSAValue(i, "float64") for i in range(4)]
+    call = Instr("Call", [], produced, attributes={"callee": "effect"})
+    function = Function("root", [], {"entry": BasicBlock("entry", [
+        call, Instr("Phi", [produced], joined), Instr("Phi", [joined], chained),
+        Instr("Phi", [produced], retained), Instr("Ret", [], None),
+    ])})
+    assert set(prune_unused_phis(function, (retained.id,))) == {joined.id, chained.id}
+    assert [item.op for item in function.blocks["entry"].instrs] == ["Call", "Phi", "Ret"]
+    assert function.blocks["entry"].instrs[0] is call
+    assert function.blocks["entry"].instrs[1].res is retained
+    assert prune_unused_phis(function, (retained.id,)) == ()
+
+
+def test_live_and_ambiguous_joins_remain_visible_to_validation():
+    from src.compiler.ssa_reachability import prune_unused_phis
+
+    source, live, ambiguous = [SSAValue(i, "float64") for i in range(3)]
+    function = Function("root", [source], {"entry": BasicBlock("entry", [
+        Instr("Phi", [source], live), Instr("Phi", [source], ambiguous),
+        Instr("Const", [], ambiguous, attributes={"value": 0}), Instr("Ret", [live], None),
+    ])})
+    assert prune_unused_phis(function) == ()
+
+
 def test_dead_edge_removed_even_when_both_predecessor_blocks_remain_live():
     flag, literal, left, right, merged = [SSAValue(i, 'bool') for i in range(5)]
     function = Function('root', [flag, left, right], {

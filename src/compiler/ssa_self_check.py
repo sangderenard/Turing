@@ -31,11 +31,12 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 
-# Real value ids are monotonic counters. An id at this scale is a memory
-# address that leaked in -- ``fortran_c_shell`` already calls id()-carrying
-# arguments "dead code by definition" -- and one in a SIGNATURE additionally
-# displaces the positional correlation every ABI consumer relies on.
-ID_SCALE_THRESHOLD = 10**9
+# A diagnostic heuristic, never an authority for allocating SSA identities.
+# The central issuer starts at 10**9, so that value cannot distinguish an
+# issued identity from an escaped object address. Keep this guard at the
+# scale of the observed 64-bit object-address failures (trillions), while
+# definition/ABI checks independently validate the identities themselves.
+ID_SCALE_THRESHOLD = 2**40
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,13 @@ def check_formal_parity(module: Any) -> list[Finding]:
         accounted.update(
             int(entry["value_id"])
             for entry in metadata.get("storage_formals") or ()
+        )
+        # A nested function's captured bindings are formals with exact source
+        # names.  They are not authored parameters, but a caller can name
+        # them, which is precisely what this check asks of a signature.
+        accounted.update(
+            int(entry["value_id"])
+            for entry in metadata.get("closure_formals") or ()
         )
         # Tuple/list parameters expand to physical member inputs just as
         # records expand to fields. Admit only the graph's exact member
@@ -213,8 +221,8 @@ def check_id_scale(module: Any) -> list[Finding]:
     """No value id is a memory address.
 
     Catches the poisoned-allocator class at the product boundary: a formal,
-    result or operand with an id()-scale id means some allocator's base was
-    seeded from an object identity rather than the monotonic counter.
+    result or operand with an id()-scale id suggests some allocator's base
+    was seeded from an object identity rather than the monotonic counter.
 
     Does not prove ids are dense or gap-free, only that none is absurd.
     """
@@ -235,8 +243,8 @@ def check_id_scale(module: Any) -> list[Finding]:
             findings.append(Finding(
                 "id_scale", str(name),
                 f"value ids at memory-address scale: {sorted(suspicious)[:4]} "
-                "-- an allocator base was seeded from id() rather than the "
-                "monotonic counter",
+                "-- possible object identity used instead of an issued "
+                "monotonic identity",
             ))
     return findings
 

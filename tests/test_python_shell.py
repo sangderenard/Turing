@@ -221,6 +221,17 @@ def test_id_scale_findings_name_the_poisoned_allocator():
     assert findings and "memory-address scale" in findings[0].detail
 
 
+def test_central_issuer_id_is_not_reported_as_a_memory_address():
+    from src.compiler.monotonic_ids import GLOBAL_MONOTONIC_IDS
+    from src.transmogrifier.ssa import BasicBlock, Function, IRModule, SSAValue
+
+    value = SSAValue(GLOBAL_MONOTONIC_IDS.mint())
+    module = IRModule({"f": Function("f", [value], {
+        "entry": BasicBlock("entry", []),
+    })})
+    assert check_id_scale(module) == []
+
+
 def test_disagreeing_output_contracts_are_a_finding():
     from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
 

@@ -8,10 +8,12 @@ No tensor executor, backend object, or late runtime dispatch survives this pass.
 from __future__ import annotations
 
 import dataclasses
+import os
+import sys
 from dataclasses import dataclass
 from hashlib import sha256
 from math import prod
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import c_tensor_opcode
 from ..transmogrifier.ssa import (
@@ -272,6 +274,13 @@ _SHAPED_SSA_OPERATIONS = {
     "Sub": "sub", "sub": "sub",
     "Mul": "mul", "Mult": "mul", "mul": "mul",
     "Div": "truediv", "truediv": "truediv",
+    # Tensor ``%`` and ``//`` are catalogued binary kernels (CT_OP_MOD and
+    # CT_OP_FLOORDIV).  Without these spellings they fell through to the
+    # scalar instruction emitter, which computed element zero only and
+    # never filled the result buffer (the periodic terrain's ``uv`` and
+    # ``cell_index`` were silently zero).
+    "Mod": "mod", "mod": "mod",
+    "FloorDiv": "floordiv", "floordiv": "floordiv",
     "Pow": "pow", "pow": "pow",
     "sum": "sum", "mean": "mean", "prod": "prod",
     "min": "min", "max": "max", "any": "any", "all": "all",
@@ -612,9 +621,23 @@ def propagate_repository_ssa_call_metadata(
         )
         fixed_constant = int(value_id) in constant_result_ids(function)
         for value in values_by_id(function).get(int(value_id), ()):
+            # An occurrence that declares itself an exact view of this same
+            # storage owns its shape.  Restamping it with the allocation
+            # owner's shape silently rewrote ``b.reshape((-1, 1, 2))`` back
+            # to ``b``'s own extents, so the broadcast kernel conformed the
+            # wrong axes and every consumer read misaligned elements.
+            declared_view = (value.accounting or {}).get("ssa_storage_view")
+            retained_view = (
+                isinstance(declared_view, Mapping)
+                and tuple(value.shape or ())
+                == tuple(declared_view.get("view_shape") or ())
+                and bool(source_shape)
+                and prod(tuple(value.shape or ())) == prod(source_shape)
+            )
             if (
                 not fixed_constant
                 and authoritative
+                and not retained_view
                 and tuple(value.shape or ()) != source_shape
             ):
                 value.shape = source_shape
@@ -1925,12 +1948,36 @@ def lower_tensor_calls_to_repository_ssa(
                         alias_of=source_descriptor.tensor_id,
                         data_value_id=source_descriptor.data_value_id,
                     )
+                    if os.environ.get("TURING_DEBUG_VIEW_ALIAS"):
+                        print(
+                            f"DEBUG-VIEW-ALIAS {function_name} {operation} "
+                            f"result=%{result.id} shape={tuple(result.shape or ())!r} "
+                            f"source=%{source.id} shape={tuple(source.shape or ())!r} "
+                            f"args={[int(a.id) for a in args]!r}",
+                            file=sys.stderr, flush=True,
+                        )
+                    # One storage identity may carry several shaped views.
+                    # Mark this occurrence as a view of that storage so
+                    # whole-module ABI propagation keeps the authored view
+                    # instead of restamping it with the allocation owner's
+                    # shape; the element count proves they describe the same
+                    # bytes.
+                    view_shape = tuple(result.shape) or tuple(source.shape)
+                    view_accounting = dict(source.accounting or {})
+                    if view_shape and tuple(source.shape or ()) and (
+                        tuple(view_shape) != tuple(source.shape or ())
+                    ):
+                        view_accounting["ssa_storage_view"] = {
+                            "storage_value_id": int(source.id),
+                            "view_shape": tuple(int(e) for e in view_shape),
+                            "operation": str(operation),
+                        }
                     aliases[int(result.id)] = SSAValue(
                         source.id,
                         dtype=result.dtype or source.dtype,
-                        shape=tuple(result.shape) or tuple(source.shape),
+                        shape=view_shape,
                         device=result.device or source.device,
-                        accounting=dict(source.accounting),
+                        accounting=view_accounting,
                     )
                     continue
 
@@ -1957,6 +2004,26 @@ def lower_tensor_calls_to_repository_ssa(
                     and int(argument.id) in constants
                 ]
                 source = data_args[0] if data_args else (args[0] if args else None)
+                # The broadcast instruction owns its destination extents.
+                # Resolve them before registering the allocation descriptor;
+                # otherwise a provisional singleton shape becomes the ABI
+                # even though the kernel later writes the full broadcast.
+                broadcast_shape = None
+                if operation in {"broadcast_to", "expand"}:
+                    requested_shape = _attribute(
+                        instruction.attributes, "shape", "size", "sizes"
+                    )
+                    if requested_shape is None:
+                        requested_shape = next((
+                            item for item in metadata
+                            if _as_sequence(item) is not None
+                        ), None)
+                    broadcast_shape = _as_sequence(requested_shape)
+                    if broadcast_shape is None and result.shape:
+                        broadcast_shape = tuple(result.shape)
+                    if broadcast_shape is not None:
+                        broadcast_shape = tuple(map(int, broadcast_shape))
+                        result.shape = broadcast_shape
                 # An earlier instruction in this same rewrite can establish
                 # the physical descriptor for a value whose later occurrence
                 # was captured before shape settlement.  Use that resident
@@ -2688,20 +2755,7 @@ def lower_tensor_calls_to_repository_ssa(
                     ))
 
                 elif operation in {"broadcast_to", "expand"} and source is not None:
-                    requested_shape = _attribute(
-                        instruction.attributes, "shape", "size", "sizes"
-                    )
-                    if requested_shape is None:
-                        requested_shape = next(
-                            (
-                                item for item in metadata
-                                if _as_sequence(item) is not None
-                            ),
-                            None,
-                        )
-                    output_shape = _as_sequence(requested_shape)
-                    if output_shape is None and result.shape:
-                        output_shape = tuple(result.shape)
+                    output_shape = broadcast_shape
                     if output_shape is not None and (
                         source.shape or source.dtype is not None
                     ):

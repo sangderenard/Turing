@@ -1,5 +1,90 @@
 # Test baseline and hazards — read before running any test
 
+2026-09-15 shaped-view and integer-operator repairs: four compiler defects were
+found by comparing compiled output against eager `AbstractTensor` execution,
+and each is now covered by `tests/test_native_shaped_view_lowering.py`
+(5 passed, 1 xfailed, ~22 s). None of them raised: every one produced a
+complete, compiling program that read the wrong elements.
+
+1. A reshape view occurrence lost its extents. `b.reshape((-1, 1, 2))` and `b`
+   share one storage identity, so whole-module ABI propagation and formal-use
+   interning both restamped the view with the allocation owner's shape. The
+   broadcast kernel then conformed the wrong axes. View occurrences now carry
+   an `ssa_storage_view` receipt that both passes retain when the element
+   count proves they describe the same bytes.
+2. Tensor `%` and `//` had no opcode spelling, so they fell through to the
+   scalar emitter, which computed element zero and left the result buffer
+   untouched. Both are catalogued binary kernels and now lower as such;
+   native output matches eager for all four operand-sign combinations.
+3. A dtype spelling (`to_dtype("int64")`) counted as a non-numeric constant
+   operand, which made the whole cast coordinator metadata and left its result
+   an unproduced region feed reading as zero.
+4. A slice over a tensor call result was treated as a call-boundary
+   projection. Only a literal integer index is such a projection; a slice is a
+   numerical view an owning region must compute.
+
+The dispatch classifier cache schema moved 2 -> 3 so saved graph replays
+recompute these classifications. `reduce_scheduled_shader_regions` also lost
+two superlinear scans (per-candidate iteration over every coordinator edge,
+and per-quotient-edge iteration over every direct edge and region member);
+the fusion identities and legality rules are unchanged.
+
+Adjacent focused batch on the repaired tree: `test_ssa_fusion_regions`,
+`test_region_kernel_dedup`, `test_deployment_outlining`,
+`test_repository_ssa_dispatch`, `test_scheduled_process_graph_dispatches`,
+`test_native_call_input_receipts` and `test_tensor_ssa_call_metadata` pass
+71 tests in 12.54 s, with no failures.
+
+`tests/test_process_graph_function_linking.py` reports **14 failed, 57 passed**
+on the repaired tree against **16 failed, 55 passed** in a clean worktree at
+`3af7d206`. The repaired tree's failures are a strict subset of HEAD's:
+`test_callsite_shape_discards_padded_scalar_result_descriptors` and
+`test_shape_constant_waits_for_authoritative_callsite_descriptor` now pass and
+nothing new fails.
+`test_structural_boolean_call_feed_is_materialized_before_linking` fails in
+both, so it is pre-existing despite sitting in the same recovery area.
+
+`tests/test_precompile_to_ssa.py` plus `tests/test_ir_sequence_tables.py`
+report **9 failed, 125 passed** in the working tree. The identical nine
+failures reproduce in a clean `git worktree` at `3af7d206` (9 failed, 123
+passed), so they are pre-existing and none belong to these repairs. They
+supersede the older per-file rows below for these two files. Two of the nine
+are the previously documented `test_native_fortran_ops_keep_mean_and_span_fill_in_ssa`
+and `test_index_dtype_propagation_is_scoped_per_function_identity`; two more
+(`test_sequence_helper_fresh_ids_reserve_non_argument_descriptor_identities`
+and `test_nested_iterable_row_is_handle_stride_and_child_address`) assert
+locally derived "next id" values that the central `GLOBAL_MONOTONIC_IDS`
+issuer no longer produces.
+
+5. A short-circuit reduction operand was never produced. Structural recovery
+   rebuilds coordinator-only `and` operands from their exact graph edges but
+   had no reduction case, so `pressure.isfinite().all()` failed, its enclosing
+   boolean chain failed with it, and the owner called its own region with a
+   value nothing defines. This is the single undefined operand that stopped
+   the validator build at `validator_simulation_advance` planned region 44.
+   Recovery now emits the same instruction a region body carries for one-operand
+   `all`/`any`/`sum`/`prod`/`mean`/`min`/`max`; an explicit axis is left
+   unrecovered rather than guessed.
+
+Captured bindings of a nested function are now recorded as a `closure_formals`
+ABI receipt and accounted by `check_formal_parity`. The receipt is keyed on the
+source graph's `closure`/`external` binding kind, never on a name: a name-keyed
+first attempt claimed `balloon_tire_reduced_vector_step`'s own `r0`/`z0`
+tuple-unpack temporaries, which are escaped locals and must keep announcing
+themselves. `_wrench_force` drops from 14 unnamed formals to 6. Execution of nested calls
+that capture enclosing values is still wrong and is pinned as two xfail
+regressions: the result reaches the caller as a scalar occurrence, and an
+enclosing parameter consumed only through the closure is dropped from the
+enclosing signature. Both reproduce identically at `3af7d206`.
+
+Open and pinned, not fixed: a declared `int64` output published as the double
+working representation whenever a tensor kernel also consumes it. Returned
+alone it is correct; consumed as well, the root wrapper still declares
+`int64_t` while the publication copies raw doubles. The call edge has
+physical input adapters but no output adapter. It is marked xfail in the file
+above so it announces itself when repaired.
+
+
 2026-09-14 native managed DT snapshot: the late conditional-continuation pass
 now preserves an explicitly owned raw loop update. The return-state/control
 batch passes 42 tests (72 deselected). Current replay of source checkpoint
@@ -1148,3 +1233,13 @@ loop completion boundary: native performs 158 successful substeps and leaves
 completion false, while eager performs 157 and completes. Report:
 `build/patch_sequence_replay_v130-standalone-o0/managed-dt-parity.json`. No
 optimization or process deadline was used.
+# 2026-09-14 native frontier continuation
+
+See `docs/NATIVE_FRONTIER_REPAIRS_2026-09-14.md` for commands and artifacts.
+Targeted native adjoint/recurrent/optional/managed-output coverage passes
+17 tests in 117.35 seconds; the optional record/scalar group passes seven in
+19.07 seconds. The validator v7 replay produces repository SSA but still fails
+the executable gate: 13 formal-parity groups, three dominance findings, one
+optional result contract. The fresh v8 source build and real-engine 64-transition
+training run must be checked for their concrete results; neither is declared
+successful here. No full-suite run or baseline suppression was performed.

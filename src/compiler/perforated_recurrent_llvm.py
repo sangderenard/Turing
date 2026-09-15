@@ -242,7 +242,7 @@ def compile_recurrent_adam_trajectory(
     cell = PerforatedRecurrentTransition()
     state = bindings["initial_state"]
     hidden = bindings["initial_hidden"]
-    squared_error_sum = None
+    loss = None
     prediction = None
     for step in range(trajectory_steps):
         x = bindings[f"exogenous_{step}"] + state @ bindings["state_route"]
@@ -253,13 +253,8 @@ def compile_recurrent_adam_trajectory(
         state = (state + prediction * bindings["delta_to_state_scale"]
                  + bindings["delta_to_state_bias"])
         error = state - bindings[f"target_state_{step}"]
-        squared_error = error * error
-        squared_error_sum = (squared_error if squared_error_sum is None
-                             else squared_error_sum + squared_error)
-    # Reduce once. A chain of scalar loss additions lets constant
-    # specialization erase the unit upstream-gradient argument from bw_add;
-    # tensor accumulation retains a concrete adjoint at every transition.
-    loss = (squared_error_sum * bindings["loss_scale"]).sum()
+        step_loss = (error * error * bindings["loss_scale"]).sum()
+        loss = step_loss if loss is None else loss + step_loss
     ids = {key: int(value.data.value.id) for key, value in bindings.items()}
     parameter_ids = tuple(ids[key] for key in PARAMETER_NAMES)
     product = obtain_graph_reverse(

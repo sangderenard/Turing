@@ -46,6 +46,27 @@ def settle_call_result_types(functions, emit_outputs, function_values):
     def bindings():
         for caller in functions.values():
             values = function_values(caller)
+            instructions = [item for block in caller.blocks.values() for item in block.instrs]
+            # Repeated region calls can retain semantic output_ids while the
+            # loop's next-iteration Load owns a fresh physical result identity.
+            # Follow the actual aggregate/pointer objects to settle every
+            # projection instead of typing only the first semantic slot.
+            projections = {}
+            pointer_origins = {}
+            for item in instructions:
+                if item.op == 'GetElementPtr' and item.res is not None and item.args:
+                    position = (item.attributes or {}).get('source_output_id')
+                    if position is not None:
+                        position = ('source', int(position))
+                    if position is None:
+                        position = (item.attributes or {}).get('aggregate_index')
+                    if position is not None:
+                        pointer_origins[id(item.res)] = (id(item.args[0]), position)
+            for item in instructions:
+                if item.op == 'Load' and item.res is not None and item.args:
+                    origin = pointer_origins.get(id(item.args[0]))
+                    if origin is not None:
+                        projections.setdefault(origin[0], []).append((origin[1], item.res))
             for block in caller.blocks.values():
                 for instruction in block.instrs:
                     if (instruction.op not in {'Call', 'call'}
@@ -91,6 +112,22 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                     for value_id, source in zip(ids, outputs):
                         if value_id in values:
                             yield caller, values[value_id], callee, source
+                    for position, target in projections.get(id(instruction.res), ()):
+                        if isinstance(position, tuple):
+                            # source_output_id names the caller's semantic
+                            # output. Original aggregate indices may have gaps
+                            # after dead output removal; the call's explicit
+                            # caller/callee correspondence is authoritative.
+                            candidates = [source for value_id, source in zip(ids, outputs)
+                                          if value_id == position[1]]
+                            if len(candidates) != 1:
+                                continue
+                            source = candidates[0]
+                        elif isinstance(position, int) and 0 <= position < len(outputs):
+                            source = outputs[position]
+                        else:
+                            continue
+                        yield caller, target, callee, source
 
     exact_values = set()
     changed = True

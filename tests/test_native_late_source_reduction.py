@@ -1,12 +1,59 @@
 import ast
 
 import networkx as nx
+import pytest
 
 from src.compiler.fortran_c_shell import (
     _recover_late_source_pure_expressions,
     _recover_late_source_unary_operations,
 )
 from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+
+@pytest.mark.parametrize("operation", ["item", "mul"])
+def test_multiple_recoveries_follow_live_producer_positions(operation):
+    graph = nx.DiGraph()
+    sources = [SSAValue(10, "float64"), SSAValue(20, "float64")]
+    results = [SSAValue(11, "float64"), SSAValue(21, "float64")]
+    for source, result in zip(sources, results):
+        graph.add_node(source.id, type="tensor", op="tensor", parents=[])
+        graph.add_node(result.id, type=operation, op=operation, parents=(
+            [(source.id, "operand")] if operation == "item"
+            else [(source.id, "lhs"), (source.id, "rhs")]
+        ))
+    block = BasicBlock("entry", [
+        Instr("Const", [], sources[0], attributes={"value": 2.0}),
+        Instr("Const", [], sources[1], attributes={"value": 3.0}),
+        Instr("Ret", results, None),
+    ])
+    function = Function("root", list(results), {"entry": block})
+    recover = (_recover_late_source_unary_operations if operation == "item"
+               else _recover_late_source_pure_expressions)
+    assert len(recover(function, graph)) == 2
+    available = set()
+    for instruction in block.instrs:
+        assert all(value.id in available for value in instruction.args)
+        if instruction.res is not None:
+            available.add(instruction.res.id)
+
+
+def test_scalar_storage_handle_does_not_make_list_replication_numeric():
+    graph = nx.DiGraph()
+    graph.add_node(1, type="Constant", op="const", parents=[],
+                   attributes={"aggregate_kind": "list", "value": [2.0]})
+    graph.add_node(2, type="Constant", op="const", parents=[],
+                   attributes={"value": 3})
+    graph.add_node(3, type="Mul", op="mul", parents=[(1, "lhs"), (2, "rhs")])
+    arena, count, result = (SSAValue(i, "float64") for i in (1, 2, 3))
+    block = BasicBlock("entry", [
+        Instr("Load", [SSAValue(4, "ptr")], arena),
+        Instr("Const", [], count, attributes={"value": 3}),
+        Instr("Ret", [result], None),
+    ])
+    function = Function("root", [result], {"entry": block})
+    assert _recover_late_source_pure_expressions(function, graph) == ()
+    assert function.args == [result]
+    assert all(instruction.op != "Mul" for instruction in block.instrs)
 
 
 def _source_graph():

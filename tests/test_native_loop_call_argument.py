@@ -33,6 +33,7 @@ def root(dt):
     root = module.functions[exports[0]]
     parameter = dict(root.metadata['parameter_names'])['dt']
     output = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
+    (tmp_path / 'repository-ssa.pkl').write_bytes(pickle.dumps((module, {}, exports)))
     artifact = emit_ssa_to_c(module, exports[0], watch=(output,))
     assert artifact.complete, artifact.shortfalls
     artifact.compile(tmp_path / 'native')

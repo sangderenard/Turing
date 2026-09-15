@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from itertools import chain
+from math import prod
 
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from ..transmogrifier.ssa import Instr, SSAValue
@@ -37,6 +38,36 @@ def _intern_unshadowed_formal_uses(functions):
                         or argument is formal
                     ):
                         rebound.append(argument)
+                        continue
+                    # One storage identity may carry several shaped views.
+                    # An occurrence that declares itself an exact view of
+                    # this same storage (``b.reshape((-1, 1, 2))``) owns its
+                    # extents: interning it to the formal silently restored
+                    # ``b``'s own shape, so the broadcast conformed the wrong
+                    # axes.  Adopt the formal's storage contract and keep the
+                    # authored view shape.
+                    declared_view = (argument.accounting or {}).get(
+                        'ssa_storage_view'
+                    )
+                    view_shape = tuple(
+                        (declared_view or {}).get('view_shape') or ()
+                    )
+                    if (
+                        view_shape
+                        and view_shape == tuple(argument.shape or ())
+                        and tuple(formal.shape or ())
+                        and prod(view_shape) == prod(tuple(formal.shape))
+                    ):
+                        rebound.append(SSAValue(
+                            int(formal.id),
+                            dtype=formal.dtype,
+                            shape=view_shape,
+                            device=formal.device,
+                            accounting={
+                                **dict(formal.accounting or {}),
+                                'ssa_storage_view': dict(declared_view),
+                            },
+                        ))
                         continue
                     # Identity is already proven by the integer ID and lack
                     # of a shadowing producer.  The declared formal is the

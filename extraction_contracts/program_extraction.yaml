@@ -92,10 +92,10 @@ program_abi:
         stiff_flag: {storage: scalar, dtype: bool, mutable: true, default: false}
         sim_frame: {storage: scalar, dtype: int64, mutable: true, default: 0}
         proc_ms: {storage: scalar, dtype: float64, mutable: true, default: 0.0}
-        dt_limit: {storage: scalar, dtype: float64, mutable: true, default: null}
+        dt_limit: {storage: scalar, dtype: float64, mutable: true, optional: true, default: null}
         error_channels: {storage: keyed, dtype: float64, mutable: true}
         hard_failure: {storage: scalar, dtype: bool, mutable: true, default: false}
-        advanced_dt: {storage: scalar, dtype: float64, mutable: true, default: null}
+        advanced_dt: {storage: scalar, dtype: float64, mutable: true, optional: true, default: null}
         unresolved_report:
           storage: table
           rank: 1

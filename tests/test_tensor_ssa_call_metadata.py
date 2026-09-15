@@ -25,6 +25,26 @@ from src.transmogrifier.ssa import (
 )
 
 
+@pytest.mark.parametrize("operation", ["broadcast_to", "expand"])
+def test_explicit_broadcast_shape_owns_allocation_before_call_settlement(operation):
+    source = SSAValue(0, "float64", (1, 1))
+    output = SSAValue(1, "float64", (1, 1))
+    function = Function("broadcast_shape", [source], {
+        "entry": BasicBlock("entry", [
+            Instr(operation, [source], output, attributes={"shape": (2, 3)}),
+            Instr("Ret", [output], None),
+        ]),
+    })
+    module = IRModule({function.name: function})
+    assert not lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference())
+    descriptor = module.tensor_tables[function.name].by_id(output.id)
+    assert output.shape == descriptor.shape == (2, 3)
+    assert descriptor.byte_size == 48
+    assert descriptor.strides == (3, 1)
+    assert descriptor.owns_allocation
+
+
 def test_materialized_call_operand_shape_wins_over_an_aliased_feed_view():
     """A semantic feed id may name several reshape views of one storage id."""
 

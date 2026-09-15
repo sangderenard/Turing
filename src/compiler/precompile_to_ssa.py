@@ -7335,6 +7335,11 @@ class _ControlSSABuilder:
             for instruction in block.instrs
             for value in instruction.args
         }
+        # The function's ``Ret`` is emitted after this naming pass, so a
+        # parameter whose only use is being returned (``return vehicle_input,
+        # ...``) is not yet visible in any block.  Returning an argument is a
+        # real ABI use: the caller must supply it, so it must keep its name.
+        used_value_ids.update(int(value.id) for value in returned)
         named_parameters = {name for name, _ in parameter_value_names}
         parameter_value_names += tuple(
             (name, value_id)
@@ -11589,6 +11594,16 @@ def lower_control_sections_to_ssa(
             if all(instruction.op in _PURE_REGION_OPS for instruction in instructions)
         ),
     )
+    # Uniform types describe a control use (for example an integer loop
+    # bound), not authority to reinterpret an explicitly typed ABI buffer.
+    # The same value can also feed tensor arithmetic. Preserve the declared
+    # storage type at the coordinator just as region lowering does above.
+    control = replace(control, uniforms=tuple(
+        replace(uniform, dtype=str((value_dtypes or {}).get(
+            int(uniform.value_id), uniform.dtype
+        )))
+        for uniform in control.uniforms
+    ))
     control_function, control_shortfalls = lower_control_program_to_ssa(
         control,
         function_name=control_name,

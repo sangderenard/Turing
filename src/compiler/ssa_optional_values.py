@@ -50,6 +50,29 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
             if instruction.res is not None
         }
         presence_by_payload: dict[int, SSAValue] = {}
+        # Linked record fields have an explicit physical presence member.
+        # Read the function-local descriptor, not copied accounting IDs from
+        # the callee's namespace, when lowering tests of a returned field.
+        record_table = (getattr(module, "record_tables", {}) or {}).get(function_name)
+        if record_table is not None:
+            values = {int(value.id): value for value in function.args}
+            values.update({value_id: instruction.res for value_id, instruction in producers.items()})
+            candidates: dict[int, set[int]] = {}
+            for record in record_table.records.values():
+                fields = {field.name: field for field in record.fields}
+                for name, field in fields.items():
+                    presence_field = fields.get(f"{name}.__present")
+                    if (len(field.value_ids) == 1 and presence_field is not None
+                            and len(presence_field.value_ids) == 1):
+                        candidates.setdefault(int(field.value_ids[0]), set()).add(
+                            int(presence_field.value_ids[0])
+                        )
+            for payload_id, presence_ids in candidates.items():
+                if len(presence_ids) != 1:
+                    continue
+                presence_id = next(iter(presence_ids))
+                if presence_id in values and values[presence_id].dtype == "bool":
+                    presence_by_payload[payload_id] = values[presence_id]
         lowered_one = True
         while lowered_one:
             lowered_one = False

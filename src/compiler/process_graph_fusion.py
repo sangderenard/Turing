@@ -552,6 +552,13 @@ def reduce_scheduled_shader_regions(
                 else:
                     pending.append(child)
 
+    # Index the coordinator-crossing edges by source so a merge candidate
+    # is checked in time proportional to its members' degrees, not to the
+    # size of the whole projected edge set.
+    coordinator_successors: dict[int, set[int]] = {}
+    for left, right in coordinator_execution_edges:
+        coordinator_successors.setdefault(left, set()).add(right)
+
     level_nodes: dict[int, list[int]] = {}
     for node_id in topological:
         level_nodes.setdefault(int(levels[node_id]), []).append(node_id)
@@ -642,9 +649,9 @@ def reduce_scheduled_shader_regions(
             # lowerer can accept, which is worse than not fusing at all.
             return False
         if any(
-            left in members
-            and right in members
-            for left, right in coordinator_execution_edges
+            right in members
+            for left in members
+            for right in coordinator_successors.get(left, ())
         ):
             # The dependency between these numerical endpoints crosses at
             # least one structural/coordinator node.  Internalizing both ends
@@ -751,19 +758,31 @@ def reduce_scheduled_shader_regions(
         while True:
             quotient_graph = quotient()
             merged_vertical = False
+            # One owner map per quotient: the direct-edge test and the
+            # ordering key are then constant-time per quotient edge.  The
+            # previous per-edge scans of every direct edge and every member
+            # made this pass superlinear enough to stall a 64-step unrolled
+            # recurrent training graph indefinitely.
+            owner = {
+                node_id: region_id
+                for region_id, members in regions.items()
+                for node_id in members
+            }
+            direct_region_pairs = {
+                (owner[source], owner[target])
+                for source, target in direct_execution_edges
+                if owner[source] != owner[target]
+            }
+            region_start = {
+                region_id: min(order_index[node] for node in members)
+                for region_id, members in regions.items()
+            }
             for left, right in sorted(
                 quotient_graph.edges,
-                key=lambda edge: (
-                    min(order_index[node] for node in regions[edge[0]]),
-                    min(order_index[node] for node in regions[edge[1]]),
-                ),
+                key=lambda edge: (region_start[edge[0]], region_start[edge[1]]),
             ):
                 if (
-                    any(
-                        source in regions[left]
-                        and target in regions[right]
-                        for source, target in direct_execution_edges
-                    )
+                    (left, right) in direct_region_pairs
                     and can_merge((left, right), quotient_graph)
                 ):
                     merge((left, right), "vertical-fusion")
