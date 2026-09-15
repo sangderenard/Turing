@@ -15941,6 +15941,53 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                         candidates.setdefault(
                             (int(reference), str(parameter)), []
                         ).append(copy.deepcopy(dict(descriptor)))
+                # A nested function reads bindings its caller owns, and those
+                # captures are ordinary values of this exact caller.  The
+                # callee had no contract for them, so every shape expression
+                # over a capture -- ``wrench_k.shape[:2]`` inside
+                # ``_wrench_force`` -- stayed unresolved and escaped as an
+                # anonymous formal.  Offer the enclosing value's descriptor
+                # under the capture's own name; the agreement check below
+                # applies to it exactly as it does to a bound argument, so a
+                # shared catalogue graph is only specialized when every
+                # callsite names the same contract.
+                caller_identities = caller.G.graph.get("identity_table") or {}
+                for _capture_id, capture in callee.G.nodes(data=True):
+                    capture_attributes = capture.get("attributes") or {}
+                    if str(capture.get("type") or "") != "Input":
+                        continue
+                    if str(
+                        capture_attributes.get("binding_kind") or ""
+                    ) not in {"closure", "external"}:
+                        continue
+                    capture_name = str(
+                        capture_attributes.get("binding_name") or ""
+                    )
+                    if not capture_name:
+                        continue
+                    capture_values = tuple(dict.fromkeys(
+                        int(value_id)
+                        for value_id in caller_identities.get(capture_name, ())
+                        if int(value_id) in caller.G
+                    ))
+                    capture_descriptor = (
+                        None if len(capture_values) != 1
+                        else _tensor_descriptor(caller, capture_values[0])
+                    )
+                    if os.environ.get("TURING_DEBUG_CAPTURE_DESCRIPTOR"):
+                        print(
+                            "DEBUG-CAPTURE-DESCRIPTOR "
+                            f"caller={caller.G.graph.get('function_name')!r} "
+                            f"callee_ref={int(reference)} name={capture_name!r} "
+                            f"values={capture_values!r} "
+                            f"descriptor={capture_descriptor!r}",
+                            file=sys.stderr, flush=True,
+                        )
+                    if capture_descriptor is None:
+                        continue
+                    candidates.setdefault(
+                        (int(reference), capture_name), []
+                    ).append(copy.deepcopy(dict(capture_descriptor)))
         by_reference: dict[int, dict[str, dict[str, Any]]] = {}
         for (reference, parameter), descriptors in candidates.items():
             if not descriptors or any(

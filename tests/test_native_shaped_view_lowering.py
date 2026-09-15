@@ -201,18 +201,15 @@ def test_short_circuit_reduction_operand_is_recovered_for_its_region(tmp_path):
     assert artifact.complete, artifact.shortfalls
 
 
-@pytest.mark.xfail(
-    reason='a nested call that captures an enclosing value returns its result '
-           'to the caller as a scalar occurrence, so only one element is '
-           'written; reproduces identically at 3af7d206',
-    strict=False,
-)
 def test_captured_local_binds_to_its_enclosing_producer(tmp_path):
-    """A nested function's captures are formals with exact source names.
+    """A capture is the enclosing value, contract included.
 
     ``blend`` reads ``scaled`` from its enclosing scope, so the caller must
-    supply it.  It is not an authored parameter, so the signature used to
-    look as though it had grown a value no caller could name.
+    supply it. It is not an authored parameter, so the signature used to look
+    as though it had grown a value no caller could name, and the callee had no
+    contract for it at all -- which left its own result shapeless, so the whole
+    tensor returned to the caller as a scalar occurrence and only one element
+    was ever written.
     """
 
     module, root = _lower(
