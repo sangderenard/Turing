@@ -15736,7 +15736,13 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                 member_id, type="Indexed", op="Indexed", value_id=member_id,
                 parents=[(node_id, "base"), (index_id, "index")], children=[],
                 attributes={"authored_call_result_projection": True},
-                tensor={} if descriptor is None else copy.deepcopy(dict(descriptor)),
+                # A member that is itself an aggregate has no tensor fact of
+                # its own; its structure stays in the ordered output
+                # descriptors, where the nested projection path reads it.
+                tensor=(
+                    {} if descriptor is None or isinstance(descriptor, tuple)
+                    else copy.deepcopy(dict(descriptor))
+                ),
             )
             caller.G.add_edge(node_id, member_id, role="base")
             caller.G.add_edge(index_id, member_id, role="index")
@@ -15906,7 +15912,14 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                         len(return_kinds) == 1
                         and return_kinds <= {"tuple", "list"}
                         and result_descriptors
-                        and all(item is None or isinstance(item, Mapping)
+                        # An authored return may mix tensors with nested
+                        # aggregates -- the vehicle tick returns fifteen
+                        # tensors and one four-member history tuple.  Refusing
+                        # the whole publication because one member is nested
+                        # left every sibling projection unresolved, so each
+                        # ``result[k]`` became a formal no caller could fill.
+                        and all(item is None
+                                or isinstance(item, (Mapping, tuple))
                                 for item in result_descriptors)
                     ):
                         changed |= publish_return_members(

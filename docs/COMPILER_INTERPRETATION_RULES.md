@@ -232,7 +232,28 @@ it cannot justify.
 **Invariant.** Recovery may choose where a definition goes, never whether a use
 can see it.
 
-## 9. Still confused: a nested static loop is preserved, and its list index then has no producer
+## 9. A return may mix tensors and nested aggregates
+
+**Rule.** An authored `return` tuple publishes one member per element, so the
+caller's `result[k]` resolves to that member. Members may be tensors, absent,
+or nested aggregates.
+
+**What confused it.** Publication required *every* member descriptor to be a
+tensor mapping or `None`. The vehicle tick returns fifteen tensors and one
+four-member history tuple, and that single nested member failed the test, so
+the whole publication was refused. Nothing was published, every sibling
+`result[k]` had no member to resolve to, and each became a formal no caller
+could fill — the thirteen unnamed formals in `validator_simulation_advance`.
+
+**How it works now.** A nested member is admitted. It is published as a member
+with no tensor fact of its own, because an aggregate is not a tensor, and its
+structure stays in the ordered output descriptors where the nested projection
+path reads it.
+
+**Invariant.** One member the compiler cannot describe as a tensor is a fact
+about that member, not grounds to refuse the ones it can.
+
+## 10. Still confused: a nested static loop is preserved, and its list index then has no producer
 
 **Rule as written.** A multi-carried loop is a coordinated recurrence whose
 whole `(initial, updated)` vector must advance on one backedge, so it is
@@ -267,7 +288,7 @@ what the closure protects against. Pinned as
 `TURING_DEBUG_LOOP_EVAPORATION` prints each candidate's strategy, trip count
 and guard components, which is how the demotion was located.
 
-## 10. Publication must honour the declared dtype
+## 11. Publication must honour the declared dtype
 
 **Rule.** The interior may compute in the double working representation. What
 crosses the ABI is what the source declared.
