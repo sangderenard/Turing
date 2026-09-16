@@ -20122,7 +20122,47 @@ class ProcessGraphGLSLDeployment:
                         )
                         operator = str(effect.operator)
                         modelled = operator in _MODELLED_STATE_OPERATORS
-                        if not modelled and receiver_class is None:
+                        # THE CALL MAY HAVE RESOLVED AND BEEN REFUSED.  Source
+                        # pursuit follows ``self.<field>.<method>`` to the
+                        # real method; the extraction contract then decides
+                        # whether that method's origin may be ingested.  A
+                        # file under no declared root is ``unknown`` and
+                        # rejected as ``provenance_not_declared`` -- the call
+                        # node carries that exact decision.  Reporting only
+                        # "class unresolved" sent readers into the resolver
+                        # when the missing fact was a root in the contract.
+                        boundary = attributes.get("extraction_contract")
+                        boundary = (
+                            dict(boundary)
+                            if isinstance(boundary, Mapping)
+                            and str(boundary.get("action") or "")
+                            not in {"ingest_python", ""}
+                            else None
+                        )
+                        if boundary is not None:
+                            parameters = dict(
+                                boundary.get("parameters") or {}
+                            )
+                            why = (
+                                "the receiver resolved: this call is "
+                                f"{boundary.get('identity')!r} defined in "
+                                f"{boundary.get('origin')!r}, but the "
+                                "extraction contract classified that "
+                                f"origin {boundary.get('classification')!r} "
+                                f"and chose {boundary.get('action')!r} "
+                                f"(rule {boundary.get('rule_id')!r}"
+                                + (
+                                    f", reason {parameters['reason']!r}"
+                                    if parameters.get("reason") else ""
+                                )
+                                + "), so its source was not pursued and no "
+                                "transition can be modelled. Declare that "
+                                "origin under the contract's roots "
+                                "(`ExtractionContract.with_roots(authored="
+                                "[...])`, or the sheet's `roots:`) or add "
+                                "an ingest rule matching it"
+                            )
+                        elif not modelled and receiver_class is None:
                             why = (
                                 "the receiver's class is unresolved AND "
                                 f"{operator!r} is outside the modelled "
@@ -20162,6 +20202,10 @@ class ProcessGraphGLSLDeployment:
                             "why_opaque": why,
                             "has_state_output": (
                                 effect.state_output_id is not None
+                            ),
+                            **(
+                                {"extraction_contract": boundary}
+                                if boundary is not None else {}
                             ),
                         })
                     return tuple(details)

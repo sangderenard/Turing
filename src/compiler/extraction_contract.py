@@ -803,8 +803,7 @@ class ExtractionContract:
         empty; mutating ``program_abi`` in place would make both claims false.
         """
 
-        derived = ExtractionContract(self.path)
-        derived.execution = self.execution
+        derived = self._derive()
         derived.program_abi = (
             program_abi
             if isinstance(program_abi, ProgramABIContract)
@@ -820,13 +819,89 @@ class ExtractionContract:
         ).hexdigest()
         return derived
 
+    def with_roots(
+        self,
+        *,
+        authored: Iterable[str | os.PathLike[str]] = (),
+        repository: Iterable[str | os.PathLike[str]] = (),
+    ) -> "ExtractionContract":
+        """Return the same policy with more source roots declared.
+
+        Classification is by origin path: a definition under an authored or
+        repository root is ``authored_python`` / ``repository_python`` and
+        is ingested by the sheet's defaults; a source file under neither is
+        ``unknown`` and rejected as ``provenance_not_declared``.  A program
+        that lives beside the repository -- engine_toy beside turing -- has
+        every class it imports from its own directory rejected that way,
+        and the first symptom is far downstream: a loop-body call on a
+        field holding such an object resolves its method (the ``.`` step
+        works) and then cannot be pursued, so the effect stays opaque and
+        the loop refuses.  Until this builder existed the sheet was the only
+        place a root could be stated, and an overlay contract had no way to
+        say where its own program is.
+
+        Paths are resolved absolutely.  The derived contract keeps the
+        program ABI and execution model, starts an empty decision ledger,
+        and carries a fingerprint that includes the added roots.
+        """
+
+        derived = self._derive()
+        derived.authored_roots = (
+            *self.authored_roots,
+            *(Path(str(item)).resolve() for item in authored),
+        )
+        derived.repository_roots = (
+            *self.repository_roots,
+            *(Path(str(item)).resolve() for item in repository),
+        )
+        receipt = json.dumps(
+            {
+                "authored": [str(path) for path in derived.authored_roots],
+                "repository": [
+                    str(path) for path in derived.repository_roots
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        derived.fingerprint = hashlib.sha256(
+            f"{self.fingerprint}:roots:{receipt}".encode("utf-8")
+        ).hexdigest()
+        return derived
+
+    def roots_receipt(self) -> dict[str, list[str]]:
+        """The roots this contract classifies source under, resolved."""
+
+        return {
+            "authored": [str(path) for path in self.authored_roots],
+            "repository": [str(path) for path in self.repository_roots],
+        }
+
+    def _derive(self) -> "ExtractionContract":
+        """A fresh copy of this policy: same sheet, ABI, execution, roots.
+
+        Every ``with_*`` builder starts here so that builders compose in
+        any order.  Re-reading the sheet alone dropped whatever an earlier
+        builder had declared -- roots stated by ``with_roots`` vanished the
+        moment ``with_program_abi`` ran after it.
+        """
+
+        derived = ExtractionContract(self.path)
+        derived.execution = self.execution
+        derived.program_abi = self.program_abi
+        derived.authored_roots = tuple(self.authored_roots)
+        derived.repository_roots = tuple(self.repository_roots)
+        overlay = getattr(self, "execution_overlay_path", None)
+        if overlay is not None:
+            derived.execution_overlay_path = overlay
+        return derived
+
     def with_execution(
         self, execution: ExecutionContract | Mapping[str, Any],
     ) -> "ExtractionContract":
         """Return the same extraction rules with a stricter execution model."""
 
-        derived = ExtractionContract(self.path)
-        derived.program_abi = self.program_abi
+        derived = self._derive()
         derived.execution = (
             execution
             if isinstance(execution, ExecutionContract)

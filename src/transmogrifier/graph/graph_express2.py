@@ -245,6 +245,89 @@ def _ast_aggregate_kind(value):
     return value_type.__name__ if value_type in aggregate_types else None
 
 
+def _class_body_field_values(definition, attribute):
+    """Every expression a class body gives to instance field ``attribute``.
+
+    Yields ``(expression, is_annotation)``.  Three spellings state a field:
+    ``self.x = value`` / ``self.x: T = value`` anywhere in a method,
+    ``setattr(self, "x", value)`` with a literal name, and a class-level
+    ``x: T`` annotation, whose ``T`` is yielded as an annotation.  ``self``
+    and ``cls`` are both receivers.  A ``setattr`` with a computed name is
+    not a statement about any particular field and is not yielded.
+    """
+
+    receivers = {"self", "cls"}
+    for statement in ast.walk(definition):
+        if isinstance(statement, ast.Assign):
+            if statement.value is not None and any(
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id in receivers
+                and target.attr == attribute
+                for target in statement.targets
+            ):
+                yield statement.value, False
+        elif isinstance(statement, ast.AnnAssign):
+            target = statement.target
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id in receivers
+                and target.attr == attribute
+            ):
+                if statement.value is not None:
+                    yield statement.value, False
+            elif (
+                isinstance(target, ast.Name)
+                and target.id == attribute
+                and statement in definition.body
+            ):
+                yield statement.annotation, True
+        elif (
+            isinstance(statement, ast.Call)
+            and isinstance(statement.func, ast.Name)
+            and statement.func.id == "setattr"
+            and len(statement.args) == 3
+            and isinstance(statement.args[0], ast.Name)
+            and statement.args[0].id in receivers
+            and isinstance(statement.args[1], ast.Constant)
+            and statement.args[1].value == attribute
+        ):
+            yield statement.args[2], False
+
+
+def _resolve_class_body_field(definition, attribute, field_bindings, seen):
+    """Resolve one field of a class body to the class it holds, or ``None``.
+
+    Conservative exactly as before: every stated value must resolve, and the
+    alternatives are merged; one unresolvable statement makes the whole
+    field unresolved rather than guessed from the others.
+    """
+
+    values = []
+    unresolved = False
+    for expression, is_annotation in _class_body_field_values(
+        definition, attribute
+    ):
+        resolved = (
+            _resolve_ast_parent_reference(expression, field_bindings, seen)
+            if is_annotation
+            else _resolve_ast_value_reference(expression, field_bindings, seen)
+        )
+        if is_annotation and not inspect.isclass(resolved):
+            resolved = None
+        if resolved is None:
+            unresolved = True
+        else:
+            values.append(resolved)
+    if unresolved or not values:
+        return None
+    result = values[0]
+    for value in values[1:]:
+        result = _merge_ast_reference(result, value)
+    return result
+
+
 def _class_field_reference(owner, attribute, seen):
     """Infer a field's constructor provenance without constructing an object."""
 
@@ -261,43 +344,45 @@ def _class_field_reference(owner, attribute, seen):
     )
     field_bindings.setdefault("self", owner)
     field_bindings.setdefault("cls", owner)
-    values = []
-    unresolved = False
-    next_seen = {*seen, key}
-    for statement in ast.walk(definition):
-        if isinstance(statement, ast.Assign):
-            value = statement.value
-            matched = any(
-                isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Name)
-                and target.value.id in {"self", "cls"}
-                and target.attr == attribute
-                for target in statement.targets
-            )
-        elif isinstance(statement, ast.AnnAssign):
-            value = statement.value
-            target = statement.target
-            matched = (
-                isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Name)
-                and target.value.id in {"self", "cls"}
-                and target.attr == attribute
-            )
-        else:
-            continue
-        if value is None or not matched:
-            continue
-        resolved = _resolve_ast_value_reference(value, field_bindings, next_seen)
-        if resolved is None:
-            unresolved = True
-        else:
-            values.append(resolved)
-    if unresolved or not values:
+    return _resolve_class_body_field(
+        definition, attribute, field_bindings, {*seen, key}
+    )
+
+
+def _source_class_field_reference(definition, attribute, bindings, seen):
+    """The same inference for a class that exists only as submitted source.
+
+    A class defined in the text being compiled has no Python object, so
+    ``getattr`` cannot navigate it.  Its methods bind ``self``/``cls`` to the
+    ``ast.ClassDef`` itself (see the root-definition seeding in
+    ``_expand_unresolved_ast_parents``), and this is the ``.`` step on that
+    identity: ``self.field`` resolves to the class the body assigns to
+    ``field`` -- an imported class, resolved through the class's own import
+    bindings -- so that ``self.field.step`` reaches a real method and its
+    source is pursued.  Without this step the receiver of every
+    ``self.<field>.<method>()`` in a source-defined class was ``None``, the
+    call was reported ``dynamic_or_primitive``, and the field's class never
+    entered the class table.  A method name resolves to nothing here: the
+    reducer links methods of source classes through the class table.
+    """
+
+    key = (definition, attribute)
+    if key in seen:
         return None
-    result = values[0]
-    for value in values[1:]:
-        result = _merge_ast_reference(result, value)
-    return result
+    if any(
+        isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and member.name == attribute
+        for member in definition.body
+    ):
+        return None
+    field_bindings = dict(
+        getattr(definition, "_python_bindings", None) or bindings or {}
+    )
+    field_bindings["self"] = definition
+    field_bindings["cls"] = definition
+    return _resolve_class_body_field(
+        definition, attribute, field_bindings, {*seen, key}
+    )
 
 
 def _resolve_ast_value_reference(expression, bindings, seen=frozenset()):
@@ -402,6 +487,10 @@ def _resolve_ast_parent_reference(expression, bindings, seen=frozenset()):
     owner = _resolve_ast_parent_reference(expression.value, bindings, seen)
     if owner is None:
         return None
+    if isinstance(owner, ast.ClassDef):
+        return _source_class_field_reference(
+            owner, expression.attr, bindings, seen
+        )
     if isinstance(owner, _ASTReferenceAlternatives):
         resolved = tuple(
             value
@@ -1106,6 +1195,24 @@ def _ast_local_constructor_bindings(definition, bindings):
     return resolved
 
 
+def _reducer_facing_bindings(bindings):
+    """The static environment the reducer may read: Python values only.
+
+    ``self`` bound to an ``ast.ClassDef`` is how this resolver navigates a
+    source-defined class.  The reducer reads ``_python_bindings`` as static
+    Python bindings for name resolution and canonicalises every surviving
+    one, and an AST node is neither a static value nor serialisable data.
+    """
+
+    if not any(isinstance(value, ast.AST) for value in bindings.values()):
+        return bindings
+    return {
+        name: value
+        for name, value in bindings.items()
+        if not isinstance(value, ast.AST)
+    }
+
+
 _UNRESOLVED_LITERAL = object()
 
 
@@ -1429,6 +1536,7 @@ def _expand_unresolved_ast_parents(
                 occurrence is not None
                 and not callable(occurrence)
                 and not inspect.ismodule(occurrence)
+                and not isinstance(occurrence, ast.AST)
             ):
                 occurrence_decision = include.decide(occurrence)
                 occurrence_mode = occurrence_decision.parameters.get(
@@ -1470,13 +1578,34 @@ def _expand_unresolved_ast_parents(
             (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
         )
     ]
+    # A method of a class defined in the submitted text resolves ``self``
+    # and ``cls`` against that ``ast.ClassDef`` -- the source-class identity
+    # that ``_source_class_field_reference`` navigates.  A discovered Python
+    # class binds them to the class object (below, when it is admitted);
+    # this is the same rule for a class that has no object.  Source
+    # identity only: nothing is instantiated.
+    source_class_of_method = {
+        id(member): definition
+        for definition in definitions
+        if isinstance(definition, ast.ClassDef)
+        for member in definition.body
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
     definitions_by_name = {}
     for definition in definitions:
+        seed = root_bindings
+        owner_class = source_class_of_method.get(id(definition))
+        if owner_class is not None:
+            seed = dict(root_bindings)
+            seed.setdefault("self", owner_class)
+            seed.setdefault("cls", owner_class)
         definition_bindings = _ast_local_constructor_bindings(
             definition,
-            root_bindings,
+            seed,
         )
-        definition._python_bindings = definition_bindings
+        definition._python_bindings = _reducer_facing_bindings(
+            definition_bindings
+        )
         for member in ast.walk(definition):
             node_bindings[id(member)] = definition_bindings
         definitions_by_name.setdefault(definition.name, []).append(definition)
@@ -1650,7 +1779,9 @@ def _expand_unresolved_ast_parents(
         return lexical_calls(definition)
 
     def install_definition_bindings(definition, definition_bindings):
-        definition._python_bindings = definition_bindings
+        definition._python_bindings = _reducer_facing_bindings(
+            definition_bindings
+        )
         aggregate_kinds = dict(
             getattr(definition, "_python_aggregate_binding_kinds", {}) or {}
         )

@@ -597,3 +597,47 @@ def test_autograd_instance_occurrences_pursue_the_real_tape_source():
     }
     assert "src.common.tensors.autograd.Autograd" in occurrences
     assert "src.common.tensors.autograd.GradTape" in occurrences
+
+
+def test_with_roots_declares_where_a_program_beside_the_repository_lives(
+    tmp_path, monkeypatch,
+):
+    """A source file under no declared root is ``unknown`` and rejected.
+
+    The sheet's roots are relative to the sheet, so a program that sits
+    BESIDE the repository (engine_toy beside turing) has every class it
+    imports from its own directory rejected as ``provenance_not_declared``
+    -- and an overlay contract had no way to say where its program is.
+    ``with_roots`` is that way, and it must survive the other builders.
+    """
+    import importlib
+
+    (tmp_path / "beside_module.py").write_text(
+        "class Beside:\n    def step(self, dt):\n        return dt\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    beside = importlib.import_module("beside_module")
+
+    base = ExtractionContract(CONTRACT)
+    undeclared = base.decide(beside.Beside.step)
+    assert undeclared.subject.classification == "unknown"
+    assert undeclared.action is ExtractionAction.REJECT
+    assert undeclared.parameters["reason"] == "provenance_not_declared"
+
+    rooted = base.with_roots(authored=[tmp_path])
+    declared = rooted.decide(beside.Beside.step)
+    assert declared.subject.classification == "authored_python"
+    assert declared.action is ExtractionAction.INGEST_PYTHON
+    assert declared.ingest_parent
+    assert str(tmp_path.resolve()) in rooted.roots_receipt()["authored"]
+    assert rooted.fingerprint != base.fingerprint
+
+    # builders compose in either order without losing the root
+    chained = rooted.with_program_abi(rooted.program_abi.receipt())
+    assert chained.decide(beside.Beside.step).ingest_parent
+    reversed_order = base.with_program_abi(
+        base.program_abi.receipt()
+    ).with_roots(authored=[tmp_path])
+    assert reversed_order.decide(beside.Beside.step).ingest_parent
+    assert chained.execution.host_runtime == base.execution.host_runtime
