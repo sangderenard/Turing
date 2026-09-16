@@ -393,3 +393,113 @@ defect that no exception reported.
 The reliable method is the same every time: compile the authored source,
 execute it, and compare against eager `AbstractTensor` execution on the same
 inputs. A structural audit that reports nothing proves nothing on its own.
+
+
+---
+
+## A bound record resolves and the object parameter is dropped anyway
+
+**This is a defect with a clean reproduction, and the first two
+explanations for it were wrong. Both are recorded because they are the
+explanations anyone else will reach for.**
+
+### The symptom
+
+Lower a function whose work happens through an object:
+
+```python
+def frame(batch, out):
+    batch.sync_state_span()
+    out[0] = 1.0
+    return out
+```
+
+with `EngineBatch` declared in `program_abi.records` and bound in
+`program_abi.bindings`. It lowers without complaint, emits with **zero
+shortfalls**, and produces a function whose body is gone. With two object
+parameters and no scalar work, the whole emission is:
+
+```llvm
+define void @engine_toy_game__frame(ptr %buffers, ptr %extents) {
+entry:
+  ret void
+}
+```
+
+### What it is not
+
+*Not "methods cannot lower".* A free function call lowers correctly: the
+same probe with `def bump(x): return x * 2.0 + 1.0` called from `frame`
+emits 73 lines of real IR with the call resolved.
+
+*Not "the binding did not match".* It is worth checking, because it is easy
+to get wrong -- `records_for_function` matches with `fnmatchcase`, so a
+binding written `{"function": "frame", ...}` never matches the qualified
+name `engine_toy_game__frame` and silently does nothing. Write `"*frame"`.
+But with the glob correct and the binding confirmed resolving:
+
+```
+records_for_function('engine_toy_game__frame')
+  -> {'batch': 'craft_graph.EngineBatch', 'graph': 'craft_graph.VehicleGraph', ...}
+```
+
+the emitted function is still empty.
+
+### What it is
+
+The contract resolves the record. The lowering drops the parameter:
+
+```
+parameter_names: {'out': 1}        # `batch` is absent
+```
+
+An object-typed parameter does not reach the ABI even when the contract has
+said exactly what it is, and everything reached through that parameter goes
+with it. The body is then genuinely dead, and an empty body is the correct
+lowering of a function with nothing observable in it -- which is why no
+shortfall fires. The defect is upstream of the emission, in whatever builds
+`parameter_names`.
+
+### Why this is worse than the refusal it replaces
+
+Undeclared, the same program refuses, and refuses well:
+
+```
+CompilationSubdivisionRequired: a loop's body regions are scheduled but the
+loop itself could not compile, which would otherwise silently run the body
+once with no iteration and no effect from its blockers:
+  loop_node=252 blockers=('opaque-state-effect',)  batch.step(dt)
+```
+
+Declaring the record clears that guard without making the parameter
+materialise, so a loud, actionable refusal becomes a silent no-op reported
+as success. The message was written to prevent exactly this and now
+describes what happens one level up.
+
+### The guard, until it is fixed
+
+**Zero shortfalls on an empty function is not a pass.**
+
+```python
+artifact = emit_ssa_function_to_llvm(module, qualified)
+assert artifact.shortfalls == ()
+assert dict(module.functions[qualified].metadata["parameter_names"])   # NOT empty
+assert len(module.functions[qualified].instructions) > 0
+```
+
+then execute against eager, which is the only check an empty body cannot
+pass.
+
+### The improvement
+
+Either make a bound record materialise its parameter -- the contract
+already knows the identity, the fields, the storage and the mutability, so
+the information is present and unused -- or emit a shortfall when a
+parameter named in `records_for_function` does not appear in
+`parameter_names`, so the gap between what was declared and what was
+compiled can never be silent.
+
+Reproduction: `engine_toy/time_trials/demo_game.py`, entry `frame`, with
+`EngineBatch` and `VehicleGraph` declared and bound `"*frame"`. Lowers in
+3.4 s, emits in 0.0 s, zero shortfalls, eight lines of LLVM of which one is
+`ret void`.

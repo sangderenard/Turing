@@ -3768,6 +3768,72 @@ def _symbolic_wheel_contact_equations_loaded() -> tuple[tuple[sympy.Equality, ..
     return symbolic_equations_cached(_symbolic_wheel_contact_equations_authored)
 
 
+#: DEFAULTS FOR EVERYTHING A CONFIGURATION DOES NOT SUPPLY.
+#:
+#: A caller builds the input vector by name and fills what it can from
+#: `VehicleConfiguration.parameter_defaults()`. Anything the configuration
+#: does not carry is then a zero, silently, and a zero is a plausible
+#: number for almost all of these -- which is how a craft ends up with a
+#: tire of no radius, no inflation pressure and no friction, reports zero
+#: contact force at every wheel, and looks like a physics bug.
+#:
+#: Measured consequences of leaving them at zero, each one found the hard
+#: way: no normal force at any compression (the patch law needs a real
+#: major radius and pressure); no traction at any wheel speed (the body
+#: law has NO radius input of any kind and takes `slip_longitudinal` as
+#: an input, so slip must be formed outside it); and a contact response
+#: that returns exactly 0.0 N rather than complaining when it is stepped
+#: faster than its own radial mode.
+#:
+#: These are a plain, small craft: a passenger-car tire at 2.4 bar on dry
+#: tarmac. They are defaults, not a configuration -- anything a real
+#: configuration states overrides them.
+BASIC_CRAFT_CONTACT_DEFAULTS: Mapping[str, float] = {
+    # the ground frame: level, with the craft the right way up
+    "support": 1.0, "normal_x": 0.0, "normal_y": 1.0, "normal_z": 0.0,
+    "forward_x": 1.0, "forward_y": 0.0, "forward_z": 0.0,
+    "right_x": 0.0, "right_y": 0.0, "right_z": 1.0,
+    # the tire itself
+    "tire_major_radius": 0.28,
+    "tire_section_radius": 0.10,
+    "tire_effective_tread_width": 0.195,
+    "tire_pressure": 240_000.0,
+    "tire_reference_volume": 0.030,
+    "tire_gas_polytropic_exponent": 1.3,
+    "tire_radial_effective_mass": 6.0,
+    "radial_carcass_loss": 0.04,
+    "minimum_contact_area": 0.008,
+    "maximum_contact_area": 0.060,
+    # the sidewall, as a shear element
+    "sidewall_shear_stiffness_longitudinal": 180_000.0,
+    "sidewall_shear_stiffness_lateral": 140_000.0,
+    "sidewall_shear_damping": 900.0,
+    # dry tarmac
+    "mu_static": 1.05, "mu_kinetic": 0.90,
+    "load_sensitivity": 0.075, "slip_transition_speed": 0.42,
+    "corner_weight": 3_000.0,
+}
+
+#: The size of the wheel, which the body law does not have an input for
+#: and therefore cannot know. Anything converting wheel speed to ground
+#: speed -- which is to say anything computing slip -- needs it.
+BASIC_CRAFT_ROLLING_RADIUS_M: float = 0.31
+
+
+def basic_craft_defaults(configuration=None) -> dict[str, float]:
+    """Every contact input with a real value, configuration first.
+
+    Merge order is deliberate: the fallbacks above are the floor, and
+    whatever the configuration actually states wins. A caller that wants
+    to know what it is relying on can diff the two.
+    """
+    values = dict(BASIC_CRAFT_CONTACT_DEFAULTS)
+    if configuration is not None:
+        stated = configuration.parameter_defaults()
+        values.update({k: float(v) for k, v in stated.items() if k in values})
+    return values
+
+
 def symbolic_wheel_contact_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, sympy.Symbol]]:
     """The authored contact law, built once per revision of this file."""
 

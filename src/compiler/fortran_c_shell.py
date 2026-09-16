@@ -34245,6 +34245,73 @@ def lower_resolved_process_graph_unit_to_ssa(
     return module, outputs, exports
 
 
+def _report_unmaterialised_record_parameters(module, extraction_contract) -> None:
+    """Complain when a bound record never became a parameter.
+
+    A LOUD COMPLAINT THAT NAMES THE INSTRUCTION IS WORTH MORE THAN A
+    SILENT ADAPTATION. This one exists because the silent version cost a
+    day: with a record declared in `program_abi.records` and bound in
+    `program_abi.bindings`, the contract resolves the parameter's identity
+    and the lowering drops the parameter anyway. Everything reached
+    through it is then genuinely dead, the body empties, and the emission
+    reports ZERO SHORTFALLS on a function whose whole content was
+
+        define void @f(ptr %buffers, ptr %extents) { entry: ret void }
+
+    Undeclared, the same program refused loudly and correctly --
+    `opaque-state-effect`, naming the call. Declaring the record removed
+    that guard without materialising anything, so a useful refusal became
+    a no-op reported as success. This restores a complaint to that gap.
+
+    It reports rather than raises: the gap is a compiler defect, not a
+    fault in the program being compiled, and a build that is already
+    working around it should not start failing. The receipt is on the
+    function, and it is the thing to grep for when an emission looks
+    suspiciously empty.
+    """
+
+    import warnings
+
+    program_abi = getattr(extraction_contract, "program_abi", None)
+    if program_abi is None or not getattr(program_abi, "records", None):
+        return
+    for qualified, function in module.functions.items():
+        metadata = getattr(function, "metadata", None)
+        if metadata is None:
+            continue
+        # ONLY BINDINGS AIMED AT THIS FUNCTION. The repository sheet binds
+        # `state`, `targets`, `metrics`, `ctrl` and `controller` with a bare
+        # `"*"`, so they match every function compiled and their absence
+        # from any particular one means nothing. A binding written for a
+        # named function -- `"*frame"`, `"_dependency_order"` -- is a claim
+        # about THAT function, and its absence is the thing worth saying.
+        targeted = {
+            binding.parameter: program_abi.records[binding.record]
+            for binding in program_abi.bindings
+            if binding.function != "*"
+            and fnmatchcase(str(qualified), binding.function)
+            and binding.record in program_abi.records
+        }
+        if not targeted:
+            continue
+        bound = targeted
+        present = set(dict(metadata.get("parameter_names", {}) or {}))
+        missing = tuple(sorted(set(bound) - present))
+        if not missing:
+            continue
+        metadata["unmaterialised_record_parameters"] = missing
+        warnings.warn(
+            f"{qualified}: {len(missing)} parameter(s) have a declared "
+            f"program_abi record that never reached the ABI: "
+            f"{', '.join(missing)}. Everything reached through them is dead, "
+            f"so the emitted body may be empty with no shortfall. Declared "
+            f"records: "
+            + ", ".join(f"{name}={bound[name].identity}" for name in missing),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
 def lower_ast_source_to_ssa(
     source: str,
     entrypoint: str | None = None,
@@ -35277,6 +35344,7 @@ def lower_ast_source_to_ssa(
             function.metadata["loop_interchange_decisions"] = (
                 *function.metadata["loop_interchange_decisions"], decision,
             )
+    _report_unmaterialised_record_parameters(module, extraction_contract)
     return module, outputs, exports
 
 

@@ -389,7 +389,15 @@ class MetaLoopRunner:
                     clamped=False,
                     metrics=None,
                 )
-            for adv, alloc in zip(self._schedule, self._realtime_allocations):
+            # `compile_allocations` returns a MAPPING keyed by id(adv), not a
+            # sequence. Zipping the schedule against the mapping itself walks
+            # its KEYS, so every engine was handed a pointer address as its
+            # millisecond allocation -- measured: 2429530572816 ms, a step_dt
+            # of 2.4e9 seconds, which is how a car came to travel 1.8e21 m in
+            # 120 frames. Look each one up by the identity it was keyed under.
+            allocations = self._realtime_allocations or {}
+            for adv in self._schedule:
+                alloc = allocations.get(id(adv))
                 step_dt_ms = alloc if alloc is not None else dt*1000.0 if dt is not None else 1.0
                 step_dt = step_dt_ms / 1000.0  # convert ms to seconds
                 t0 = time.perf_counter()
