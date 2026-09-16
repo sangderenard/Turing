@@ -1995,7 +1995,6 @@ def _hard_clamp(value: sympy.Basic, lower: sympy.Basic | float,
 
 
 @lru_cache(maxsize=1)
-@lru_cache(maxsize=1)
 def _symbolic_vehicle_equations_loaded() -> tuple[tuple[sympy.Equality, ...], dict[str, sympy.Symbol]]:
     return symbolic_equations_cached(_symbolic_vehicle_equations_authored)
 
