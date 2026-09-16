@@ -1087,6 +1087,7 @@ def _normalize_lexical_values(
     class_field_sequence_dtypes: Mapping[
         tuple[str, str], tuple[str, ...]
     ] | None = None,
+    class_field_classes: Mapping[tuple[str, str], str] | None = None,
 ) -> None:
     """Resolve unique lexical occurrences into a monotonic value DAG.
 
@@ -2160,6 +2161,22 @@ def _normalize_lexical_values(
                     ))
                     if receiver_class is not None else None
                 )
+                # A field that holds a source-local object: this read
+                # yields an instance of that class (``result_class_ref``,
+                # the same fact a call returning a class instance carries),
+                # so a method call on it resolves through the class table.
+                # Not ``class_ref``: that marks a construction, and the
+                # deployment side reads its presence as one.
+                field_class = (
+                    (class_field_classes or {}).get((
+                        str(receiver_class), str(expression.attr)
+                    ))
+                    if receiver_class is not None else None
+                )
+                if field_class is not None:
+                    graph.G.nodes[attribute_id].setdefault(
+                        "attributes", {}
+                    )["result_class_ref"] = field_class
                 if field_kind is not None:
                     mapping_contract = dict(
                         (class_field_mapping_contracts or {}).get((
@@ -5116,6 +5133,58 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             graph.G.graph.get("external_class_field_aggregate_kinds") or {}
         ).items()
     }
+    # (owner, field) -> the source-local class an instance field HOLDS.
+    # ``self.ordnance = OrdnanceField()`` in a method of the owner, or
+    # ``ordnance: OrdnanceField`` declared on the class, states it. A field
+    # read ``self.ordnance`` then yields an object of that class, and the
+    # method call ``self.ordnance.step(...)`` resolves its ``method_ref``
+    # through the class table exactly as ``self.step(...)`` already does --
+    # which is what makes it a source-linked call the callee owns instead
+    # of an opaque state effect no model can be formed for. Recorded only
+    # when every assignment names ONE class; two classes for one field is
+    # not a fact this table may state.
+    class_field_classes: dict[tuple[str, str], str] = {}
+    contested_field_classes: set[tuple[str, str]] = set()
+
+    def note_field_class(owner: str, field: str, class_name: str) -> None:
+        key = (str(owner), str(field))
+        if key in contested_field_classes:
+            return
+        known = class_field_classes.get(key)
+        if known is None:
+            class_field_classes[key] = str(class_name)
+        elif known != str(class_name):
+            del class_field_classes[key]
+            contested_field_classes.add(key)
+
+    for owner_name, class_definition in class_definitions.items():
+        for member in class_definition.body:
+            if (
+                isinstance(member, ast.AnnAssign)
+                and isinstance(member.target, ast.Name)
+                and isinstance(member.annotation, ast.Name)
+                and member.annotation.id in class_definitions
+            ):
+                note_field_class(
+                    owner_name, member.target.id, member.annotation.id
+                )
+                continue
+            if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in source_walk(member):
+                if (
+                    isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Attribute)
+                    and isinstance(node.targets[0].value, ast.Name)
+                    and node.targets[0].value.id in {"self", "cls"}
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in class_definitions
+                ):
+                    note_field_class(
+                        owner_name, node.targets[0].attr, node.value.func.id
+                    )
     class_field_mapping_contracts: dict[
         tuple[str, str], dict[str, Any]
     ] = {}
@@ -5981,6 +6050,12 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             # arbitrary Python objects and executable default factories remain
             # unresolved and must be represented by ordinary graph structure.
             "field_defaults": class_field_defaults(definition),
+            "field_classes": {
+                field_name: held_class
+                for (owner, field_name), held_class
+                in class_field_classes.items()
+                if owner == class_name
+            },
         }
         for class_name, definition in class_definitions.items()
     }
@@ -7473,6 +7548,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             class_field_aggregate_kinds=class_field_aggregate_kinds,
             class_field_mapping_contracts=local_mapping_contracts,
             class_field_sequence_dtypes=class_field_sequence_dtypes,
+            class_field_classes=class_field_classes,
         )
         generator_yields = tuple(
             node_id

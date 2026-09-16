@@ -19268,7 +19268,13 @@ def _resolve_grounded_method_references(graph: Any) -> None:
             visited.add(current)
             node = graph.G.nodes[current]
             attributes = node.get("attributes") or {}
+            # ``class_ref`` marks a construction; ``result_class_ref`` a
+            # value that IS an instance of the class -- a call returning
+            # one, or a field read of a field that holds one. The reducer
+            # resolves receivers through both; so does this.
             class_ref = attributes.get("class_ref")
+            if class_ref is None:
+                class_ref = attributes.get("result_class_ref")
             if class_ref is not None:
                 candidates.add(str(class_ref))
                 continue
