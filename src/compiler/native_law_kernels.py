@@ -34,7 +34,7 @@ import pickle
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -103,6 +103,11 @@ class LawKernel:
     argument_names: tuple[str, ...]
     argument_ids: tuple[int, ...]
     output_ids: dict[str, int]
+    #: Outputs the law reduces to a constant. They have no value id -- a
+    #: literal is never a region output -- so they are carried here and
+    #: served as a column of that value. Absent them, one constant zero
+    #: refuses a law of 146 outputs.
+    constant_outputs: dict = field(default_factory=dict)
     calls: int = 0
     seconds: float = 0.0
 
@@ -119,6 +124,8 @@ class LawKernel:
             name: execution.buffers[value_id]
             for name, value_id in self.output_ids.items()
         }
+        for name, value in self.constant_outputs.items():
+            results[name] = np.full(self.batch, value, dtype=np.float64)
         self.calls += 1
         self.seconds += time.perf_counter() - started
         return results
@@ -163,6 +170,24 @@ def _lower_law(compilation: Any, law: str, batch: int, backend: str) -> LawKerne
         else [return_value])
     returned_names = [
         node.id if isinstance(node, _ast.Name) else None for node in returned]
+    # A TEMPORARY BOUND TO A LITERAL IS NOT AN UNLOWERED OUTPUT.
+    # Literals never become region outputs, so a stage line like `t109 = 0`
+    # leaves `t109` out of `named_outputs` entirely and the check below
+    # reads that absence as a failure to lower. Measured on the vehicle
+    # body: exactly one output of 146 --
+    # `wheel_gyroscopic_reaction_torque_z`, whose temporary is the literal
+    # 0 -- and that single constant refused the whole law. It is why this
+    # law sits in TURING_LAW_NATIVE_SKIP; the reason recorded there, that
+    # its lowering "takes minutes", is true but is not what stopped it.
+    literal_of_temporary = {
+        node.targets[0].id: float(node.value.value)
+        for node in stage_function.body
+        if isinstance(node, _ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], _ast.Name)
+        and isinstance(node.value, _ast.Constant)
+        and isinstance(node.value.value, (int, float))
+        and not isinstance(node.value.value, bool)}
     if len(returned_names) != len(output_names):
         raise RuntimeError(
             f"{law}: stage returns {len(returned_names)} values, the law "
@@ -171,15 +196,25 @@ def _lower_law(compilation: Any, law: str, batch: int, backend: str) -> LawKerne
         str(temporary): int(value_id)
         for temporary, value_id in tuple(function.metadata.get("named_outputs") or ())
     }
+    constant_outputs = {
+        output: literal_of_temporary[temporary]
+        for output, temporary in zip(output_names, returned_names)
+        if temporary is not None and temporary not in id_of_temporary
+        and temporary in literal_of_temporary}
     unresolved = [
         output for output, temporary in zip(output_names, returned_names)
-        if temporary is None or temporary not in id_of_temporary]
+        if output not in constant_outputs
+        and (temporary is None or temporary not in id_of_temporary)]
     if unresolved:
         raise RuntimeError(
             f"{law}: outputs without a lowered value: {unresolved[:5]}")
+    if constant_outputs:
+        _log(f"{law}: {len(constant_outputs)} output(s) are constants, served "
+             f"as such: {sorted(constant_outputs)[:4]}")
     output_ids = {
         output: id_of_temporary[temporary]
         for output, temporary in zip(output_names, returned_names)
+        if output not in constant_outputs
     }
     argument_ids = tuple(int(value.id) for value in function.args)
     if len(argument_ids) != len(argument_names):
@@ -202,7 +237,7 @@ def _lower_law(compilation: Any, law: str, batch: int, backend: str) -> LawKerne
     return LawKernel(
         law=law, batch=batch, backend=backend, artifact=artifact,
         argument_names=argument_names, argument_ids=argument_ids,
-        output_ids=output_ids,
+        output_ids=output_ids, constant_outputs=constant_outputs,
     )
 
 
