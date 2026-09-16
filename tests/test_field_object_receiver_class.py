@@ -218,11 +218,13 @@ def test_self_of_a_source_text_class_resolves_its_field_to_the_imported_class(
     )
 
 
-def test_a_declared_root_lets_the_imported_field_class_be_pursued(
+def test_a_declared_source_lets_the_imported_field_class_be_pursued(
     tmp_path, monkeypatch,
 ):
     source = _imported_module(tmp_path, monkeypatch, "held_module_b")
-    policy = ExtractionContract(SHEET).with_roots(authored=[tmp_path])
+    policy = ExtractionContract(SHEET).with_sources([
+        ("held_module_b", tmp_path / "held_module_b.py"),
+    ])
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         module, _outputs, _exports = lower_ast_source_to_ssa(
@@ -241,7 +243,7 @@ def test_a_declared_root_lets_the_imported_field_class_be_pursued(
     assert "loop_body" in entry.blocks, list(entry.blocks)
 
 
-def test_an_undeclared_root_is_named_by_the_refusal(tmp_path, monkeypatch):
+def test_an_undeclared_source_is_named_by_the_refusal(tmp_path, monkeypatch):
     source = _imported_module(tmp_path, monkeypatch, "held_module_c")
     with pytest.raises(CompilationSubdivisionRequired) as refusal:
         _lower(source, "undeclared")
@@ -250,4 +252,4 @@ def test_an_undeclared_root_is_named_by_the_refusal(tmp_path, monkeypatch):
     assert "provenance_not_declared" in message
     assert "held_module_c.ImportedField.step" in message
     assert "held_module_c.py" in message
-    assert "with_roots" in message
+    assert "with_sources" in message

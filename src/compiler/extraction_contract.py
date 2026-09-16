@@ -782,6 +782,9 @@ class ExtractionContract:
         roots = raw.get("roots", {})
         self.authored_roots = self._roots(roots.get("authored", ()))
         self.repository_roots = self._roots(roots.get("repository", ()))
+        #: resolved file path -> module name, from ``with_sources``: the
+        #: selective admission of source that lives outside every root.
+        self.declared_sources: dict[Path, str] = {}
         self.stdlib_root = Path(sysconfig.get_paths()["stdlib"]).resolve()
         self.limits = dict(raw.get("limits") or {})
         self.fingerprint = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
@@ -819,78 +822,94 @@ class ExtractionContract:
         ).hexdigest()
         return derived
 
-    def with_roots(
+    def with_sources(
         self,
-        *,
-        authored: Iterable[str | os.PathLike[str]] = (),
-        repository: Iterable[str | os.PathLike[str]] = (),
+        sources: Iterable[
+            tuple[str, str | os.PathLike[str]] | Mapping[str, Any]
+        ],
     ) -> "ExtractionContract":
-        """Return the same policy with more source roots declared.
+        """Return the same policy admitting named source files from elsewhere.
 
         Classification is by origin path: a definition under an authored or
-        repository root is ``authored_python`` / ``repository_python`` and
-        is ingested by the sheet's defaults; a source file under neither is
-        ``unknown`` and rejected as ``provenance_not_declared``.  A program
-        that lives beside the repository -- engine_toy beside turing -- has
-        every class it imports from its own directory rejected that way,
-        and the first symptom is far downstream: a loop-body call on a
-        field holding such an object resolves its method (the ``.`` step
-        works) and then cannot be pursued, so the effect stays opaque and
-        the loop refuses.  Until this builder existed the sheet was the only
-        place a root could be stated, and an overlay contract had no way to
-        say where its own program is.
+        repository root is ingested by the sheet's defaults; one under no
+        root is ``unknown`` and rejected ``provenance_not_declared``.  A
+        program beside the repository (engine_toy beside turing) imports
+        classes from its own directory, and the first symptom is far
+        downstream: a loop-body call on a field holding such an object
+        resolves its method and then cannot be pursued, so the effect stays
+        opaque and the loop refuses.
+
+        This is the selective form of the declaration, and deliberately not
+        a directory root: each entry names ONE module by name and by file
+        path, ``("ordnance", ".../engine_toy/ordnance.py")`` or
+        ``{"name": ..., "path": ...}``, and a definition is admitted as
+        ``authored_python`` only when its origin is that exact file AND its
+        module name is that exact name.  A sibling file in the same
+        directory stays ``unknown``; a file that is on the list under a
+        different module name stays ``unknown``.  What a declared module
+        itself imports is not admitted by this entry: pursuit reaching it
+        is reported with its origin, and the author declares it or not.
 
         Paths are resolved absolutely.  The derived contract keeps the
         program ABI and execution model, starts an empty decision ledger,
-        and carries a fingerprint that includes the added roots.
+        and carries a fingerprint that includes the declared sources.
         """
 
         derived = self._derive()
-        derived.authored_roots = (
-            *self.authored_roots,
-            *(Path(str(item)).resolve() for item in authored),
-        )
-        derived.repository_roots = (
-            *self.repository_roots,
-            *(Path(str(item)).resolve() for item in repository),
-        )
+        declared = dict(self.declared_sources)
+        for entry in sources:
+            if isinstance(entry, Mapping):
+                name, path = entry.get("name"), entry.get("path")
+            else:
+                name, path = entry
+            if not name or path is None:
+                raise ExtractionContractError(
+                    "each declared source needs a module name and a path"
+                )
+            resolved = Path(str(path)).resolve()
+            if resolved.suffix.casefold() != ".py":
+                raise ExtractionContractError(
+                    f"declared source {resolved} is not a Python source file"
+                )
+            previous = declared.get(resolved)
+            if previous is not None and previous != str(name):
+                raise ExtractionContractError(
+                    f"declared source {resolved} is named both "
+                    f"{previous!r} and {str(name)!r}"
+                )
+            declared[resolved] = str(name)
+        derived.declared_sources = declared
         receipt = json.dumps(
-            {
-                "authored": [str(path) for path in derived.authored_roots],
-                "repository": [
-                    str(path) for path in derived.repository_roots
-                ],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
+            derived.sources_receipt(), sort_keys=True, separators=(",", ":"),
         )
         derived.fingerprint = hashlib.sha256(
-            f"{self.fingerprint}:roots:{receipt}".encode("utf-8")
+            f"{self.fingerprint}:sources:{receipt}".encode("utf-8")
         ).hexdigest()
         return derived
 
-    def roots_receipt(self) -> dict[str, list[str]]:
-        """The roots this contract classifies source under, resolved."""
+    def sources_receipt(self) -> list[dict[str, str]]:
+        """The foreign source files this contract admits, by name and path."""
 
-        return {
-            "authored": [str(path) for path in self.authored_roots],
-            "repository": [str(path) for path in self.repository_roots],
-        }
+        return [
+            {"name": name, "path": str(path)}
+            for path, name in sorted(
+                self.declared_sources.items(), key=lambda item: str(item[0])
+            )
+        ]
 
     def _derive(self) -> "ExtractionContract":
-        """A fresh copy of this policy: same sheet, ABI, execution, roots.
+        """A fresh copy of this policy: same sheet, ABI, execution, sources.
 
         Every ``with_*`` builder starts here so that builders compose in
         any order.  Re-reading the sheet alone dropped whatever an earlier
-        builder had declared -- roots stated by ``with_roots`` vanished the
-        moment ``with_program_abi`` ran after it.
+        builder had declared -- sources stated by ``with_sources`` vanished
+        the moment ``with_program_abi`` ran after it.
         """
 
         derived = ExtractionContract(self.path)
         derived.execution = self.execution
         derived.program_abi = self.program_abi
-        derived.authored_roots = tuple(self.authored_roots)
-        derived.repository_roots = tuple(self.repository_roots)
+        derived.declared_sources = dict(self.declared_sources)
         overlay = getattr(self, "execution_overlay_path", None)
         if overlay is not None:
             derived.execution_overlay_path = overlay
@@ -1054,6 +1073,14 @@ class ExtractionContract:
             classification = "native_extension"
         elif inspect.isbuiltin(target):
             classification = "native_extension"
+        elif (
+            resolved is not None
+            and self.declared_sources.get(resolved) is not None
+            and self.declared_sources[resolved] == module
+        ):
+            # Declared by name AND path (``with_sources``); either alone
+            # is not the declaration.
+            classification = "authored_python"
         elif resolved is not None and self._within(resolved, self.authored_roots):
             classification = "authored_python"
         elif resolved is not None and self._within(resolved, self.repository_roots):

@@ -20157,10 +20157,11 @@ class ProcessGraphGLSLDeployment:
                                 )
                                 + "), so its source was not pursued and no "
                                 "transition can be modelled. Declare that "
-                                "origin under the contract's roots "
-                                "(`ExtractionContract.with_roots(authored="
-                                "[...])`, or the sheet's `roots:`) or add "
-                                "an ingest rule matching it"
+                                "one file by module name and path "
+                                "(`ExtractionContract.with_sources([(name, "
+                                "path)])`) if the program is meant to use "
+                                "it; if it is not, the program is using "
+                                "something it should not"
                             )
                         elif not modelled and receiver_class is None:
                             why = (
