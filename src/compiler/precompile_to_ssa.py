@@ -7278,6 +7278,25 @@ class _ControlSSABuilder:
                     continue
                 return None
 
+        def owned_literal(value_id: int) -> SSAValue | None:
+            """Resolve an output whose identity is a canonical literal.
+
+            ``z = 0; t = x + z; return t, z``: no region publishes ``z``.
+            The planner keeps every region's rematerialised copy private
+            (``control_owned_literals``) and the control function owns the
+            literal, so resolve it as the provisional formal that
+            ``_materialize_control_constants`` turns into this function's
+            own ``Const`` -- exactly how a folded ``flag = True; break`` is
+            resolved on its break edge.  Silently dropping it here left the
+            output to the call-frame pass, which found the callee's private
+            copy and appended it to the region call's declared outputs after
+            the callee's Ret was already fixed: on the vehicle body, 144
+            declared against 143 produced, the literal's id last.
+            """
+            if int(value_id) not in self.constant_value_ids:
+                return None
+            return self.external_value(int(value_id))
+
         for name, history in self.named_output_histories.items():
             value = next((
                 resolved
@@ -7285,6 +7304,13 @@ class _ControlSSABuilder:
                 for resolved in (existing_value(value_id),)
                 if resolved is not None
             ), None)
+            if value is None:
+                value = next((
+                    resolved
+                    for value_id in reversed(history)
+                    for resolved in (owned_literal(value_id),)
+                    if resolved is not None
+                ), None)
             if value is None:
                 continue
             # A returned name whose final identity is a LoopResult port means
@@ -7298,6 +7324,8 @@ class _ControlSSABuilder:
                 returned_ids.add(value.id)
         for value_id in self.output_value_ids:
             value = self.external_values.get(value_id)
+            if value is None:
+                value = owned_literal(value_id)
             if value is not None:
                 value = carried_port_values.get(int(value.id), value)
             if value is None or value.id in returned_ids:

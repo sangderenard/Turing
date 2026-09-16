@@ -196,11 +196,16 @@ def _lower_law(compilation: Any, law: str, batch: int, backend: str) -> LawKerne
         str(temporary): int(value_id)
         for temporary, value_id in tuple(function.metadata.get("named_outputs") or ())
     }
+    # A constant output is served as a constant whether or not the lowering
+    # also lists it: once the control function materialises its own literal
+    # for a returned temporary, ``named_outputs`` names it and the kernel
+    # exposes it as a rank-0 buffer -- one cell, not a column, so a
+    # per-row reader would index past it.  The literal's value is the
+    # output; the buffer is an ABI fact about the kernel.
     constant_outputs = {
         output: literal_of_temporary[temporary]
         for output, temporary in zip(output_names, returned_names)
-        if temporary is not None and temporary not in id_of_temporary
-        and temporary in literal_of_temporary}
+        if temporary is not None and temporary in literal_of_temporary}
     unresolved = [
         output for output, temporary in zip(output_names, returned_names)
         if output not in constant_outputs
