@@ -2906,13 +2906,44 @@ def _emit_repository_call_module(
                                 result_ptrs.append(temporary)
                     elif declared_ids:
                         if len(selected) != len(callee_outputs):
+                            # SAY WHICH ONES, AND SAY WHY THIS BRANCH RAN.
+                            # The branch above resolves exactly this case by
+                            # mapping declared positions onto real callee
+                            # output indices, but it is only reachable when
+                            # the call carries `output_slots`. Without that
+                            # attribute control arrives here, where the only
+                            # rule is exact equality -- so the actionable
+                            # facts are that the correlation is ABSENT, and
+                            # which declared entries have no callee output.
+                            # Printing two id lists and leaving the reader to
+                            # diff them costs an afternoon; caller and callee
+                            # ids are independent numbering domains, so the
+                            # diff is not even meaningful by value.
+                            had_slots = "output_slots" in instruction.attributes
+                            surplus = tuple(
+                                declared_ids[position]
+                                for position in selected
+                                if position >= len(callee_outputs)
+                                and position < len(declared_ids)
+                            )
                             shortfalls.append(LLVMEmissionShortfall(
                                 name,
                                 symbol,
-                                "aggregate positions "
-                                f"{selected!r} do not match "
-                                f"{len(callee_outputs)} callee outputs; "
-                                f"declared={declared_ids!r}",
+                                f"the call selects {len(selected)} aggregate "
+                                f"position(s) but the callee produces "
+                                f"{len(callee_outputs)} output(s), and the "
+                                f"call carries no output_slots correlation "
+                                f"({'present' if had_slots else 'ABSENT'}) "
+                                f"to say which position is which output. "
+                                f"Positions beyond the callee's outputs: "
+                                f"{surplus!r}. Emit `output_slots` at the "
+                                f"call (see fortran_c_shell's physical "
+                                f"result bindings) so declared positions map "
+                                f"onto callee output indices; caller and "
+                                f"callee ids are independent numbering "
+                                f"domains and must not be matched by value. "
+                                f"declared={declared_ids!r} selected="
+                                f"{selected!r}",
                             ))
                             continue
                         result_ptrs = []

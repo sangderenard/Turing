@@ -94,6 +94,7 @@ from .loop_composer import (
     evaporate_unrolled_loops,
     materialize_retained_loop_ports,
 )
+from .loop_ir import MODELLED_STATE_OPERATORS as _MODELLED_STATE_OPERATORS
 from .loop_ir import LoopStateEffectMode
 from .process_graph_callable import EphemeralProcessGraphCallable
 from .process_graph_fusion import (
@@ -20098,17 +20099,64 @@ class ProcessGraphGLSLDeployment:
                             int(effect.effect_node_id), {}
                         )
                         expression = data.get("expr_obj")
+                        # SAY WHY THIS ONE IS OPAQUE.
+                        # `opaque` is the DEFAULT mode, not a detection:
+                        # the classifier recognises a loop-body mutation
+                        # only when the state's aggregate_kind is a known
+                        # container AND the operator is one of a short
+                        # fixed vocabulary. Everything else -- every
+                        # `.step()` ever written -- falls through to it.
+                        # Reporting the bare word sends a reader looking
+                        # for what was detected, when the fact is that
+                        # nothing was.
+                        attributes = data.get("attributes") or {}
+                        receiver_class = (
+                            attributes.get("result_class_ref")
+                            or attributes.get("class_ref")
+                        )
+                        operator = str(effect.operator)
+                        modelled = operator in _MODELLED_STATE_OPERATORS
+                        if not modelled and receiver_class is None:
+                            why = (
+                                "the receiver's class is unresolved AND "
+                                f"{operator!r} is outside the modelled "
+                                "operator vocabulary, so no state "
+                                "transition could be formed"
+                            )
+                        elif not modelled:
+                            why = (
+                                f"{operator!r} is outside the modelled "
+                                "operator vocabulary "
+                                f"({sorted(_MODELLED_STATE_OPERATORS)})"
+                            )
+                        elif receiver_class is None:
+                            why = (
+                                f"{operator!r} is modellable, but the "
+                                "receiver's class is unresolved so its "
+                                "aggregate_kind is unknown"
+                            )
+                        else:
+                            why = (
+                                "operator and receiver are both known; the "
+                                "mode was not upgraded from the default"
+                            )
                         details.append({
                             "effect_node_id": int(effect.effect_node_id),
                             "state_name": str(effect.state_name),
-                            "operator": str(effect.operator),
+                            "operator": operator,
                             "source": (
                                 ast.unparse(expression)
                                 if isinstance(expression, ast.AST) else None
                             ),
-                            "method_ref": (
-                                data.get("attributes") or {}
-                            ).get("method_ref"),
+                            "method_ref": attributes.get("method_ref"),
+                            "receiver_class": (
+                                None if receiver_class is None
+                                else str(receiver_class)
+                            ),
+                            "why_opaque": why,
+                            "has_state_output": (
+                                effect.state_output_id is not None
+                            ),
                         })
                     return tuple(details)
 
@@ -20147,7 +20195,12 @@ class ProcessGraphGLSLDeployment:
                     "a loop's body regions are scheduled but the loop "
                     "itself could not compile, which would otherwise "
                     "silently run the body once with no iteration and no "
-                    "effect from its blockers: "
+                    "effect from its blockers. Note that 'opaque-state-"
+                    "effect' is the DEFAULT classification, not a "
+                    "detection, and that an opaque effect normally still "
+                    "HAS a state output -- what is missing is a model of "
+                    "the transition, not a value. Each effect below says "
+                    "why it stayed at the default: "
                     + "; ".join(
                         f"loop_node={reduction.loop_node_id} "
                         f"regions={tuple(sorted(reduction.region_indices))} "

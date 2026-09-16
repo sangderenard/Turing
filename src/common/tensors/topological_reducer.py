@@ -25,6 +25,10 @@ from .abstract_nn.token_encoder import encode_identity_tokens
 from .abstract_nn.token_lexicon import structural_context_tokens
 
 from ...compiler.shell_reference_tables import build_class_navigation_table
+from ...compiler.loop_ir import (
+    MAPPING_MUTATION_OPERATORS as _MAPPING_MUTATION_OPERATORS,
+    SEQUENCE_MUTATION_OPERATORS as _SEQUENCE_MUTATION_OPERATORS,
+)
 from ...transmogrifier.function_table import (
     ExternalFunctionTable,
     FunctionTable,
@@ -4316,9 +4320,7 @@ def _normalize_lexical_values(
                     )
                     sequence_mutation = (
                         sequence_policy is not None
-                        and call.func.attr in {
-                            "add", "append", "clear", "extend", "pop"
-                        }
+                        and call.func.attr in _SEQUENCE_MUTATION_OPERATORS
                         and not (
                             aggregate_kind == "dict"
                             and call.func.attr == "pop"
@@ -4332,7 +4334,7 @@ def _normalize_lexical_values(
                     )
                     mapping_mutation = (
                         aggregate_kind == "dict"
-                        and call.func.attr in {"update", "pop", "setdefault"}
+                        and call.func.attr in _MAPPING_MUTATION_OPERATORS
                         and state_attributes.get("sequence_writable", True)
                     )
                     state_effects.append({
