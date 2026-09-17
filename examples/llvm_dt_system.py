@@ -129,6 +129,20 @@ def dt_system_contract(entry, column_names, batch):
     base = policy.program_abi.receipt()
     records = {name: base["records"][name] for name in ("Targets", "STController", "Metrics")}
     bindings = [b for b in base["bindings"] if b["record"] in records]
+    # ``state`` (run_superstep's rollback receiver) is a PieceState: never
+    # declared before now, so its class never resolved and ``.restore()``
+    # was an opaque call to an unresolved receiver.  Its one attribute is
+    # a mapping of named spans -- keyed storage, string keys.
+    records["PieceState"] = {
+        "identity": "llvm_dt_system.PieceState",
+        "fields": {
+            "columns": {
+                "storage": "keyed", "key_encoding": "string_token",
+                "dtype": "float64", "rank": 1, "mutable": True,
+            },
+        },
+    }
+    bindings.append({"function": "*", "parameter": "state", "record": "PieceState"})
     values = [{
         "function": entry, "parameter": name, "storage": "span",
         "dtype": "float64", "rank": 1, "shape": [int(batch)],
