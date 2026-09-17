@@ -34453,6 +34453,64 @@ def lower_ast_source_to_ssa(
             f"{len(interchange.decisions)} reduction nest(s)"
         )
     tree = ast.parse(source)
+    # A binding that is an LLVM-compiled piece is a callee the program may
+    # call but never ingests: it is linked by its own repository SSA (so the
+    # call site knows the exact signature) and the native lanes call the
+    # artifact's symbol.  The authored program needs no stub for it -- the
+    # def is synthesized here, in the piece's own argument order -- and the
+    # piece's root function carries the artifact so a backend can link the
+    # LLVM module in rather than re-lower the body.
+    from .extraction_contract import llvm_piece_of
+
+    linked_pieces = {
+        str(name): piece
+        for name, value in dict(python_bindings or {}).items()
+        for piece in (llvm_piece_of(value),)
+        if piece is not None and getattr(piece, "module", None) is not None
+    }
+    if linked_pieces:
+        linked_repository_ssa = dict(linked_repository_ssa or {})
+        for name, piece in linked_pieces.items():
+            if name in linked_repository_ssa:
+                continue
+            piece_root = piece.module.functions[str(piece.entry)]
+            piece_root.metadata["llvm_piece"] = {
+                "symbol": str(piece.artifact.name),
+                "llvm_ir": str(piece.artifact.llvm_ir),
+                "buffer_order": tuple(int(v) for v in piece.artifact.buffer_order),
+                "extent_order": tuple(
+                    (int(v), str(kind), None if axis is None else int(axis))
+                    for v, kind, axis in piece.artifact.extent_order),
+            }
+            linked_repository_ssa[name] = (
+                piece.module, str(piece.entry), dict(piece.outputs or {}),
+            )
+            if not any(
+                isinstance(statement, ast.FunctionDef) and statement.name == name
+                for statement in tree.body
+            ):
+                piece_source = getattr(piece, "source", None)
+                stub = None
+                if piece_source:
+                    # The piece's own authored def: exact arity, names and
+                    # result shape for the call site.  The link keeps its
+                    # body from being lowered again.
+                    for statement in ast.parse(str(piece_source)).body:
+                        if isinstance(statement, ast.FunctionDef):
+                            stub = statement
+                            stub.name = name
+                            break
+                if stub is None:
+                    stub = ast.FunctionDef(
+                        name=name,
+                        args=ast.arguments(
+                            posonlyargs=[], vararg=None, kwonlyargs=[], kw_defaults=[],
+                            kwarg=None, defaults=[],
+                            args=[ast.arg(arg=str(a)) for a in piece.argument_names]),
+                        body=[ast.Pass()], decorator_list=[], returns=None,
+                    )
+                tree.body.append(stub)
+        tree = ast.fix_missing_locations(tree)
     # No selected root is the canonical whole-source mode.  It deliberately
     # disables runtime-closure pruning so module statements, every authored
     # definition, and their configured dependency domains remain eligible.

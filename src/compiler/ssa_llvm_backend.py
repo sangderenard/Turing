@@ -1079,6 +1079,11 @@ def _internal_call_closure(
         if callee is None:
             return None
         symbol = str(callee)
+        target = module.functions.get(symbol)
+        if target is not None and target.metadata.get("llvm_piece"):
+            # An LLVM piece is called by its exported entry and its module
+            # is linked in whole; its SSA body is a signature, not an edge.
+            return None
         try:
             _kernel_signature(symbol)
         except (KeyError, ValueError):
@@ -1087,6 +1092,54 @@ def _internal_call_closure(
         return None
 
     return module.reachable_functions(str(root), follow_call=follow), kernels
+
+
+def _piece_symbols(module: _IRModule) -> dict[str, dict]:
+    """Function name -> llvm_piece record for every linked LLVM piece."""
+
+    return {
+        name: dict(function.metadata["llvm_piece"])
+        for name, function in module.functions.items()
+        if function.metadata.get("llvm_piece")
+    }
+
+
+_PIECE_SYMBOL = _re.compile(r"@([A-Za-z_$.-][\w$.-]*)\s*\(")
+
+
+def _piece_module_parts(llvm_ir: str) -> tuple[dict[str, str], dict[str, str]]:
+    """A piece module's ``declare`` lines and ``define`` blocks, by symbol.
+
+    The module header (source_filename, datalayout, triple) is the host's to
+    write once; only the functions travel.
+    """
+
+    declarations: dict[str, str] = {}
+    definitions: dict[str, str] = {}
+    lines = llvm_ir.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("declare "):
+            match = _PIECE_SYMBOL.search(line)
+            if match:
+                declarations[match.group(1)] = line
+            index += 1
+            continue
+        if line.startswith("define "):
+            match = _PIECE_SYMBOL.search(line)
+            block = [line]
+            index += 1
+            while index < len(lines) and lines[index] != "}":
+                block.append(lines[index])
+                index += 1
+            block.append("}")
+            index += 1
+            if match:
+                definitions[match.group(1)] = chr(10).join(block)
+            continue
+        index += 1
+    return declarations, definitions
 
 
 from .hierarchical_plan import PREDICATE_OPERATIONS  # noqa: E402
@@ -1115,6 +1168,8 @@ def _emit_repository_call_module(
     )
 
     reachable, kernels_used = _internal_call_closure(module, function_name)
+    piece_records = _piece_symbols(module)
+    linked_pieces: dict[str, str] = {}
     shortfalls: list[LLVMEmissionShortfall] = []
     from .ir_identities import precision_backend_shortfalls
     shortfalls.extend(
@@ -1373,6 +1428,15 @@ def _emit_repository_call_module(
             callee_aggregate_parameter_positions[callee_name] = positions
 
     function_outputs: dict[str, tuple[_Any, ...]] = {}
+    # A linked LLVM piece is not emitted, but its call sites need its
+    # outputs: the piece root's Ret names them, in the artifact's order.
+    for name in piece_records:
+        function_outputs[name] = next((
+            tuple(instruction.args)
+            for block in module.functions[name].blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"Ret", "ret", "Return", "return"}
+        ), ())
     for name in reachable:
         function = module.functions[name]
         returned = next((
@@ -2821,7 +2885,7 @@ def _emit_repository_call_module(
                         )
                     continue
 
-                if symbol in reachable:
+                if symbol in reachable or symbol in piece_records:
                     callee_outputs = function_outputs[symbol]
                     declared_ids = tuple(map(
                         int, instruction.attributes.get("output_ids", ())
@@ -3070,19 +3134,83 @@ def _emit_repository_call_module(
                             f"selected={selected!r}, declared={declared_ids!r}",
                         ))
                         continue
-                    internal_call_records.append((
-                        internal_symbols.get(name),
-                        internal_symbols[symbol],
-                        (*call_args, *result_ptrs),
-                    ))
-                    body.append(
-                        f"  call void @{internal_symbols[symbol]}("
-                        + ", ".join(f"ptr {value}" for value in (
-                            *call_args, *result_ptrs,
-                            *(("%extents",) if symbol in extent_users else ()),
+                    piece = piece_records.get(symbol)
+                    if piece is not None:
+                        # The piece's exported entry takes one pointer table
+                        # in its own buffer order (inputs then outputs, by
+                        # the piece's value ids) and one int32 extent table.
+                        callee_function = module.functions[symbol]
+                        callee_arg_ids = [int(v.id) for v in callee_function.args]
+                        callee_out_ids = [int(v.id) for v in callee_outputs]
+                        piece_values = {int(v.id): v for v in callee_function.args}
+                        piece_values.update({int(v.id): v for v in callee_outputs})
+                        slots: list[str] = []
+                        for value_id in piece["buffer_order"]:
+                            value_id = int(value_id)
+                            if value_id in callee_arg_ids:
+                                slots.append(call_args[callee_arg_ids.index(value_id)])
+                            elif value_id in callee_out_ids:
+                                slots.append(result_ptrs[callee_out_ids.index(value_id)])
+                            else:
+                                shortfalls.append(LLVMEmissionShortfall(
+                                    name, symbol,
+                                    f"LLVM piece buffer {value_id} is neither a "
+                                    "formal nor an output of the piece",
+                                ))
+                                slots.append("null")
+                        extent_values: list[int] = []
+                        for value_id, kind, axis in piece["extent_order"]:
+                            value = piece_values.get(int(value_id))
+                            shape = tuple(int(n) for n in (getattr(value, "shape", None) or ()))
+                            if kind in {"numel", "element_count"}:
+                                count = 1
+                                for n in shape:
+                                    count *= n
+                                extent_values.append(count)
+                            elif kind == "rank":
+                                extent_values.append(len(shape))
+                            elif kind in {"dim", "shape"} and axis is not None and axis < len(shape):
+                                extent_values.append(shape[axis])
+                            else:
+                                shortfalls.append(LLVMEmissionShortfall(
+                                    name, symbol,
+                                    f"LLVM piece extent {(value_id, kind, axis)!r} is not static",
+                                ))
+                                extent_values.append(0)
+                        table = f"%piece.buffers.{tag}"
+                        extents_table = f"%piece.extents.{tag}"
+                        body.append(f"  {table} = alloca ptr, i64 {max(len(slots), 1)}, align 8")
+                        for slot_index, slot in enumerate(slots):
+                            body.append(
+                                f"  %piece.slot.{tag}.{slot_index} = getelementptr ptr, "
+                                f"ptr {table}, i64 {slot_index}")
+                            body.append(
+                                f"  store ptr {slot}, ptr %piece.slot.{tag}.{slot_index}, align 8")
+                        body.append(
+                            f"  {extents_table} = alloca i32, i64 {max(len(extent_values), 1)}, align 4")
+                        for extent_index, extent in enumerate(extent_values):
+                            body.append(
+                                f"  %piece.extent.{tag}.{extent_index} = getelementptr i32, "
+                                f"ptr {extents_table}, i64 {extent_index}")
+                            body.append(
+                                f"  store i32 {extent}, ptr %piece.extent.{tag}.{extent_index}, align 4")
+                        body.append(
+                            f"  call void @{piece['symbol']}(ptr {table}, ptr {extents_table})")
+                        linked_pieces[str(piece["symbol"])] = str(piece["llvm_ir"])
+                    else:
+                        internal_call_records.append((
+                            internal_symbols.get(name),
+                            internal_symbols[symbol],
+                            (*call_args, *result_ptrs),
                         ))
-                        + ")"
-                    )
+                        body.append(
+                            f"  call void @{internal_symbols[symbol]}("
+                            + ", ".join(f"ptr {value}" for value in (
+                                *call_args, *result_ptrs,
+                                *(("%extents",) if symbol in extent_users else ()),
+                            ))
+                            + ")"
+                        )
                     if result is not None:
                         if forwarded is not None and int(forwarded[0]) == result_id:
                             # The call already wrote the wrapper's public
@@ -3608,6 +3736,10 @@ def _emit_repository_call_module(
     definitions: dict[str, str] = {}
     declarations: dict[str, str] = {}
     unresolved: set[str] = set()
+    for piece_symbol, piece_ir in linked_pieces.items():
+        piece_declarations, piece_definitions = _piece_module_parts(piece_ir)
+        declarations.update(piece_declarations)
+        definitions.update(piece_definitions)
     # The scalar tables reach target intrinsics from the emitted bodies and the
     # wrapper, not only from authored kernels, so the closure starts at every
     # symbol this module actually references.

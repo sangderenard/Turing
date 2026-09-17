@@ -837,6 +837,10 @@ class CModuleArtifact:
     #: pool is still correct -- just undeployed.
     pool_required: bool = False
     pooled_regions: tuple[tuple[str, int], ...] = ()
+    #: LLVM pieces this module calls as externs: (symbol, llvm_ir).  Each is
+    #: written beside the C source and handed to the same compiler
+    #: invocation, so the piece is linked exactly as it was emitted.
+    linked_llvm: tuple[tuple[str, str], ...] = ()
     library_path: Path | None = None
     _entry: Any = field(default=None, repr=False)
 
@@ -890,6 +894,10 @@ class CModuleArtifact:
                     encoding="utf-8",
                 )
             pool_sources.append(str(destination / "turing_pool.c"))
+        for symbol, llvm_ir in self.linked_llvm:
+            piece_path = destination / f"{symbol}.ll"
+            piece_path.write_text(llvm_ir, encoding="utf-8")
+            pool_sources.append(str(piece_path))
         command = [
             sys.executable, "-m", "ziglang", "cc", "-shared",
             f"-{optimization}",
@@ -1186,12 +1194,17 @@ class CModuleArtifact:
             raise ValueError(
                 f"unsupported C optimization level {optimization!r}"
             )
+        linked_sources: list[str] = []
+        for symbol, llvm_ir in self.linked_llvm:
+            piece_path = destination / f"{symbol}.ll"
+            piece_path.write_text(llvm_ir, encoding="utf-8")
+            linked_sources.append(str(piece_path))
         command = [
             sys.executable, "-m", "ziglang", "cc", f"-{optimization}",
             "-std=c11",
             *flags,
             "-o", str(executable_path),
-            str(module_source_path), str(host_source_path),
+            str(module_source_path), str(host_source_path), *linked_sources,
         ]
         completed = subprocess.run(
             command, capture_output=True, text=True, check=False,
@@ -1221,6 +1234,10 @@ def _module_call_closure(module: IRModule, root: str) -> tuple[str, ...]:
         if name in seen or name not in module.functions:
             continue
         seen.append(name)
+        if module.functions[name].metadata.get("llvm_piece"):
+            # An LLVM piece is called, never emitted: its callees are
+            # inside the linked module and must not be re-lowered here.
+            continue
         for block in module.functions[name].blocks.values():
             for instruction in block.instrs:
                 if instruction.op in ("Call", "call"):
@@ -1856,6 +1873,7 @@ def emit_ssa_module_to_c(
     deployment_support: list[str] = []
     deployment_trampolines: list[str] = []
     pooled_regions: list[tuple[str, int]] = []
+    linked_llvm: list[tuple[str, str]] = []
     effect_guard_used = [False]
     deployment_outlines = {
         key: record
@@ -1946,6 +1964,64 @@ def emit_ssa_module_to_c(
             parameters.append(f"void *{destination}")
         if fn in extent_users:
             parameters.append("long long *extents")
+        piece = function.metadata.get("llvm_piece")
+        if piece:
+            symbol = str(piece["symbol"])
+            output_values_by_id = {
+                int(output.id): output for output in native_outputs[fn]
+            }
+            slots: list[str] = []
+            for value_id in piece["buffer_order"]:
+                value_id = int(value_id)
+                if value_id in formal_ids:
+                    slots.append(f"v{value_id}")
+                elif value_id in output_destinations:
+                    slots.append(output_destinations[value_id])
+                else:
+                    shortfalls.append(CEmissionShortfall(
+                        "Call", f"LLVM piece {symbol!r} buffer {value_id} is "
+                        f"neither a formal nor an output of {fn}"))
+                    slots.append("NULL")
+            extent_values: list[str] = []
+            for value_id, kind, axis in piece["extent_order"]:
+                value = formal_values_by_id.get(int(value_id)) or output_values_by_id.get(int(value_id))
+                shape = tuple(int(n) for n in (getattr(value, "shape", None) or ()))
+                if kind in {"numel", "element_count"}:
+                    count = 1
+                    for n in shape:
+                        count *= n
+                    extent_values.append(str(count))
+                elif kind == "rank":
+                    extent_values.append(str(len(shape)))
+                elif kind in {"dim", "shape"} and axis is not None and axis < len(shape):
+                    extent_values.append(str(shape[axis]))
+                else:
+                    shortfalls.append(CEmissionShortfall(
+                        "Call", f"LLVM piece {symbol!r} extent {(value_id, kind, axis)!r} "
+                        f"is not static in {fn}"))
+                    extent_values.append("0")
+            extern_line = f"extern void {symbol}(void **buffers, int32_t *extents);"
+            if extern_line not in prototypes:
+                prototypes.append(extern_line)
+            linked_llvm.append((symbol, str(piece["llvm_ir"])))
+            shim = [
+                f"    void *piece_buffers[{max(len(slots), 1)}] = {{"
+                + ", ".join(slots or ["NULL"]) + "};",
+                f"    int32_t piece_extents[{max(len(extent_values), 1)}] = {{"
+                + ", ".join(extent_values or ["0"]) + "};",
+                f"    {symbol}(piece_buffers, piece_extents);",
+            ]
+            prototypes.append(
+                f"static {function_return_type} {_c_symbol(fn)}("
+                + ", ".join(parameters) + ");"
+            )
+            definitions.append("\n".join((
+                f"static {function_return_type} {_c_symbol(fn)}("
+                + ", ".join(parameters) + ") {",
+                *shim,
+                "}",
+            )))
+            continue
         body: list[str] = []
         expressions: dict[int, str] = {
             int(formal.id): storage_expression(formal, f"v{formal.id}")
@@ -4699,6 +4775,7 @@ def emit_ssa_module_to_c(
         "",
     ))
     return CModuleArtifact(
+        linked_llvm=tuple(linked_llvm),
         name=name,
         source=source,
         buffer_order=tuple(buffer_order),

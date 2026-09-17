@@ -334,6 +334,12 @@ def _v3_valuewise(
 def maximum(self, other):
     """Elementwise maximum with automatic promotion."""
     from ..abstraction import AbstractTensor
+    from ..extended_precision import Precision
+    if isinstance(other, Precision):
+        # A wide operand owns the comparison: the reflected form keeps every
+        # limb of whichever value is chosen, where wrapping it as a tensor
+        # would hand its limb channels to a backend that cannot see them.
+        return getattr(Precision.of(self, other.limbs), "maximum")(other)
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
     if not isinstance(other, AbstractTensor):
@@ -348,6 +354,12 @@ def maximum(self, other):
 def minimum(self, other):
     """Elementwise minimum with automatic promotion."""
     from ..abstraction import AbstractTensor
+    from ..extended_precision import Precision
+    if isinstance(other, Precision):
+        # A wide operand owns the comparison: the reflected form keeps every
+        # limb of whichever value is chosen, where wrapping it as a tensor
+        # would hand its limb channels to a backend that cannot see them.
+        return getattr(Precision.of(self, other.limbs), "minimum")(other)
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
     if not isinstance(other, AbstractTensor):

@@ -131,6 +131,81 @@ class LawKernel:
         return results
 
 
+@dataclass
+class LLVMPiece:
+    """A compiled law as a plain positional Python callable.
+
+    This is the object authored Python calls when it wants a law: columns in
+    ``argument_names`` order in, a tuple in ``output_names`` order out.  It
+    runs the LLVM artifact eagerly, and it DECLARES itself to the source
+    compiler -- an ``artifact`` that is an ``LLVMFunctionArtifact`` plus the
+    ``argument_ids`` / ``output_ids`` that map the call to the artifact's
+    buffers -- so a lowering that meets it at a call site lowers the call as
+    an in-C call to the same symbol instead of ingesting Python.
+    """
+
+    artifact: Any
+    argument_names: tuple[str, ...]
+    argument_ids: tuple[int, ...]
+    output_names: tuple[str, ...]
+    output_ids: dict[str, int]
+    constant_outputs: dict = field(default_factory=dict)
+    batch: int = 1
+    #: The repository SSA the artifact was emitted from -- module, entry
+    #: symbol and outputs -- which is what a lowering links at a call site
+    #: to know the piece's exact signature without re-lowering its body.
+    module: Any = None
+    entry: str | None = None
+    outputs: Any = None
+    #: The authored Python the piece was lowered from.  A lowering that
+    #: links the piece ingests this def for the call's signature and arity
+    #: only; its body is never lowered again -- the link supplies the SSA.
+    source: str | None = None
+
+    @classmethod
+    def from_kernel(cls, kernel: LawKernel) -> "LLVMPiece":
+        return cls(
+            kernel.artifact, kernel.argument_names, kernel.argument_ids,
+            tuple(kernel.output_ids) + tuple(kernel.constant_outputs),
+            dict(kernel.output_ids), dict(kernel.constant_outputs), kernel.batch,
+        )
+
+    def save(self, path) -> None:
+        """Persist the piece as one file: artifact, ids, names, SSA and source."""
+        import pickle
+
+        with open(path, "wb") as stream:
+            pickle.dump(self, stream)
+
+    @classmethod
+    def load(cls, path) -> "LLVMPiece":
+        import pickle
+
+        with open(path, "rb") as stream:
+            piece = pickle.load(stream)
+        if not isinstance(piece, cls):
+            raise TypeError(f"{path}: not an LLVMPiece")
+        return piece
+
+    def __call__(self, *columns):
+        from .ssa_llvm_backend import prepare_artifact_execution
+
+        if len(columns) != len(self.argument_names):
+            raise TypeError(
+                f"{self.artifact.name}: takes {len(self.argument_names)} "
+                f"columns, got {len(columns)}")
+        execution = prepare_artifact_execution(self.artifact, {
+            value_id: np.asarray(column, dtype=np.float64)
+            for value_id, column in zip(self.argument_ids, columns)
+        })
+        execution.run()
+        return tuple(
+            execution.buffers[self.output_ids[name]] if name in self.output_ids
+            else np.full(self.batch, self.constant_outputs[name], dtype=np.float64)
+            for name in self.output_names
+        )
+
+
 def _lower_law(compilation: Any, law: str, batch: int, backend: str) -> LawKernel:
     from src.common.tensors import AbstractTensor
     from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (

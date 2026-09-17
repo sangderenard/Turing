@@ -915,6 +915,41 @@ class Precision:
         sign = self.sign()
         return self._map_limbs(lambda term: term * sign)
 
+    def _select(self, other: Any, take_self: Any) -> "Precision":
+        """Elementwise choice between two values, each kept WHOLE.
+
+        ``take_self`` is a 0/1 mask.  A limb times 0 or 1 is exact, and the
+        sum of two limbs of which exactly one is zero is exact, so the chosen
+        expansion arrives untouched -- no limb is ever rounded on its own.
+        """
+
+        width = max(self.limbs, Precision.width_of(other))
+        mine = self.terms(width)
+        if isinstance(other, Precision):
+            theirs = other.terms(width)
+        else:
+            head = self.term(0) * 0.0 + other
+            theirs = [head] + [head * 0.0 for _index in range(width - 1)]
+        keep = take_self * 1.0
+        drop = 1.0 - keep
+        return Precision(
+            [a * keep + b * drop for a, b in zip(mine, theirs)], width,
+        )
+
+    def maximum(self, other: Any) -> "Precision":
+        """Elementwise larger value, selecting the WHOLE expansion.
+
+        The comparison is made on the difference's leading limb, which for
+        a distilled expansion carries the sign of the whole difference.
+        """
+
+        return self._select(other, (self - other).term(0) >= 0.0)
+
+    def minimum(self, other: Any) -> "Precision":
+        """Elementwise smaller value, selecting the WHOLE expansion."""
+
+        return self._select(other, (self - other).term(0) <= 0.0)
+
     def floor(self):
         """The integer part, as an ordinary tensor.
 

@@ -127,6 +127,29 @@ class ExecutionContract:
         }
 
 
+def llvm_piece_of(value: Any) -> Any | None:
+    """The LLVM piece a callable declares itself to be, or None.
+
+    A piece is recognised by what it DECLARES: an ``artifact`` that is an
+    ``LLVMFunctionArtifact`` together with the ``argument_ids`` and
+    ``output_ids`` that bind a positional call to that artifact's buffers.
+    Nothing is inferred from names.
+    """
+
+    artifact = getattr(value, "artifact", None)
+    if artifact is None:
+        return None
+    from .ssa_llvm_backend import LLVMFunctionArtifact
+
+    if not isinstance(artifact, LLVMFunctionArtifact):
+        return None
+    if not hasattr(value, "argument_ids") or not hasattr(value, "output_ids"):
+        return None
+    if not hasattr(value, "output_names") or not hasattr(value, "argument_names"):
+        return None
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ExtractionSubject:
     module: str
@@ -1127,6 +1150,9 @@ class ExtractionContract:
         return True
 
     def decide(self, value: Any) -> ExtractionDecision:
+        piece = llvm_piece_of(value)
+        if piece is not None:
+            return self._decide_llvm_piece(piece)
         subject = self.subject(value)
         key = (
             subject.module,
@@ -1194,6 +1220,66 @@ class ExtractionContract:
                         )
                     self._source_origins.add(source_path)
                     self._source_bytes += source_bytes
+            self._decisions[key] = decision
+        return decision
+
+    def _decide_llvm_piece(self, piece: Any) -> ExtractionDecision:
+        """An LLVM-compiled callable met at a call site: call its symbol.
+
+        No rule table is consulted.  The piece declares its own ABI -- the
+        artifact's buffer and extent order plus the value ids that map the
+        call's arguments and results onto those buffers -- and that is the
+        whole decision: the call lowers as an in-C call to the artifact's
+        entry, and the C lane links the artifact's LLVM module in.
+        """
+
+        artifact = piece.artifact
+        subject = ExtractionSubject(
+            module="llvm", qualname=str(artifact.name), kind="llvm_piece",
+            occurrence="", origin=str(getattr(artifact, "library_path", "") or ""),
+            classification="dynamic_library", source_available=False,
+        )
+        key = (subject.module, subject.qualname, subject.occurrence, subject.origin)
+        with self._lock:
+            cached = self._decisions.get(key)
+        if cached is not None:
+            return cached
+        buffer_order = tuple(int(v) for v in artifact.buffer_order)
+        parameters = {
+            "loader": "static-link",
+            "symbol_resolution": {
+                "symbol": str(artifact.name),
+                "llvm_ir": str(artifact.llvm_ir),
+            },
+            "callbacks": (),
+            "execution": "native",
+            "shell_capability": None,
+            "shell_abi": None,
+            "external_domain": "llvm-piece",
+            "native_abi": "llvm-buffer",
+            "piece_abi": {
+                "buffer_order": buffer_order,
+                "buffer_dtypes": tuple(str(d) for d in (artifact.buffer_dtypes or ())),
+                "buffer_shapes": tuple(tuple(int(n) for n in s) for s in (artifact.buffer_shapes or ())),
+                "extent_order": tuple(
+                    (int(v), str(kind), None if axis is None else int(axis))
+                    for v, kind, axis in artifact.extent_order),
+                "argument_slots": tuple(
+                    buffer_order.index(int(v)) for v in piece.argument_ids),
+                "output_slots": tuple(
+                    None if name not in piece.output_ids
+                    else buffer_order.index(int(piece.output_ids[name]))
+                    for name in piece.output_names),
+                "constant_outputs": {
+                    str(name): float(value)
+                    for name, value in dict(piece.constant_outputs or {}).items()},
+                "output_names": tuple(piece.output_names),
+                "argument_names": tuple(piece.argument_names),
+            },
+        }
+        decision = ExtractionDecision(subject, ExtractionAction.USE_NATIVE,
+                                      "llvm_piece", parameters)
+        with self._lock:
             self._decisions[key] = decision
         return decision
 

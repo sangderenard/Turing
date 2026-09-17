@@ -1,0 +1,252 @@
+"""SUPERSEDED 2026-09-16 -- kept only as a note, not used.
+
+This version built the dt system through GraphBuilder.round() +
+MetaLoopRunner.set_process_graph(), i.e. the multi-engine composition layer
+(DtCompatibleEngine + StateTable + registered identities + the
+DtToProcessAdapter/ILPScheduler process graph).  That layer:
+
+  - is NOT required to use the dt system -- it is an optional layer on top
+  - has never been lowered by the compiler (only run_superstep /
+    step_with_dt_control_used has, in vehicle_python_compilation.py,
+    native_voxel_fluid.py, symbolic_fluid_dt.py, symbolic_fluid_native_runtime.py)
+  - was reached for only because LLVMStep had already been written as a
+    registered DtCompatibleEngine, not because anything about the task
+    required it
+
+The dt system's real cross-frame statefulness is simpler than that: it lives
+in the caller-owned ``state`` object (copy_shallow/restore) and in the
+STController instance, both reused across repeated run_superstep calls. A
+plain Python loop holding those two objects and calling
+``run_superstep(state, round_max, dt_init, dx, targets, ctrl, advance)``
+each frame, with ``advance`` calling the LLVM piece(s) directly, has
+everything persistence requires -- see llvm_dt_system.py for that version.
+"""
+
+"""The dt system with LLVM pieces as its steps.  One function.
+
+    engines, results = dt_system(piece_files, columns, rounds=..., round_dt=..., dx=...)
+
+``piece_files`` are LLVM pieces saved by ``LLVMPiece.save``.  ``columns`` is
+one dict of named columns shared by every step through the state table.
+Everything else is the dt system as it exists: ``Targets``, ``STController``,
+``Metrics``, ``StateTable``, ``EngineRegistration``, ``GraphBuilder``,
+``MetaLoopRunner``.  The state table saves and restores the columns.
+"""
+
+import sys
+
+import numpy as np
+
+from src.common.dt_system.dt_controller import STController, Targets
+from src.common.dt_system.dt_graph import GraphBuilder, MetaLoopRunner
+from src.common.dt_system.dt_scaler import Metrics
+from src.common.dt_system.engine_api import DtCompatibleEngine, EngineRegistration
+from src.common.dt_system.state_table import StateTable
+from src.compiler.native_law_kernels import LLVMPiece
+
+C_BACKEND = "c"
+LLVM_BACKEND = "llvm"
+FORTRAN_BACKEND = "fortran"
+
+SCOPE = "engine"
+SHARED = "columns"
+
+
+class LLVMStep(DtCompatibleEngine):
+    """One LLVM piece as an engine: columns in, columns out, by name."""
+
+    def __init__(self, name, piece, feedback):
+        self.name = name
+        self.piece = piece
+        self.feedback = dict(feedback)     # output name -> input column it becomes next step
+        self.columns = {}
+        self._dt_limit = None
+
+    # The dt system's own refusal: step_with_state compares the requested dt
+    # to this ceiling and answers ok=False with dt_limit=ceiling when it is
+    # exceeded.  The ceiling is the piece's last published dt_limit.
+    def causal_ceiling_dt(self):
+        return float("inf") if self._dt_limit is None else float(self._dt_limit)
+
+    def preferred_dt(self):
+        return self._dt_limit
+
+    def sync_from_state(self, table):
+        for name in self.piece.argument_names:
+            value = table.get(SCOPE, SHARED, name)
+            if value is not None:
+                self.columns[name] = value
+
+    def publish_to_state(self, table):
+        for name, value in self.columns.items():
+            table.set(SCOPE, SHARED, name, value)
+
+    def step(self, dt, state, state_table):
+        dt_column = np.full(self.piece.batch, float(dt))
+        arguments = [dt_column if name == "dt" else self.columns[name]
+                     for name in self.piece.argument_names]
+        outputs = dict(zip(self.piece.output_names, self.piece(*arguments)))
+        for name, value in outputs.items():
+            self.columns[self.feedback.get(name, name)] = value
+        metrics = Metrics(
+            max_vel=float(outputs["max_vel"].max()) if "max_vel" in outputs else 0.0,
+            max_flux=float(outputs["max_flux"].max()) if "max_flux" in outputs else 0.0,
+            div_inf=float(outputs["div_inf"].max()) if "div_inf" in outputs else 0.0,
+            mass_err=float(outputs["mass_err"].max()) if "mass_err" in outputs else 0.0,
+            dt_limit=float(outputs["dt_limit"].min()) if "dt_limit" in outputs else None,
+            error_channels={name: float(outputs[name].max())
+                            for name in ("energy_j", "power_w") if name in outputs},
+        )
+        self._dt_limit = metrics.dt_limit
+        return True, metrics, self.columns
+
+    def get_state(self, state=None):
+        return self.columns
+
+
+def dt_system_over(steps, columns, rounds, round_dt, dx, targets=None, controller=None):
+    """The dt system over already-loaded pieces.  This is the function that lowers."""
+    targets = targets or Targets(cfl=0.5, div_max=1e9, mass_max=1e-3, energy_exchange_fraction=0.2)
+    controller = controller or STController()
+    state_table = StateTable()
+    for name, value in columns.items():
+        state_table.set(SCOPE, SHARED, name, value)
+
+    engines = []
+    for index, piece in enumerate(steps):
+        feedback = {name: name[:-5] for name in piece.output_names
+                    if name.endswith("_next") and name[:-5] in piece.argument_names}
+        engine = LLVMStep(f"step{index}", piece, feedback)
+        engine.register(
+            state_table,
+            lambda row: {"pos": (float(row), 0.0), "mass": 0.0},
+            range(piece.batch),
+            group_label=engine.name, dedup=False)
+        engines.append(engine)
+    registrations = [
+        EngineRegistration(name=engine.name, engine=engine, targets=targets, dx=dx, localize=False)
+        for engine in engines]
+
+    round_node = GraphBuilder(ctrl=controller, targets=targets, dx=dx).round(
+        round_dt, registrations, state_table=state_table)
+    runner = MetaLoopRunner(state_table=state_table)
+    runner.set_process_graph(round_node)          # the once-work, done once, here
+    results = [frame(runner) for _round in range(rounds)]
+    for name in columns:
+        columns[name] = state_table.get(SCOPE, SHARED, name)
+    return engines, results
+
+
+def frame(runner):
+    """One frame of the dt system over the ALREADY-BUILT round.
+
+    ``run_round()`` with no argument reuses ``runner``'s stored schedule --
+    no DtToProcessAdapter, no networkx walk -- so this is exactly the
+    run-many-times unit: the planning (set_process_graph, done once) never
+    appears in its closure."""
+    return runner.run_round()
+
+
+def dt_system(piece_files, columns, *, rounds, round_dt, dx,
+              targets=None, controller=None):
+    """Load the pieces from their files and run the dt system over them in Python."""
+    steps = [LLVMPiece.load(path) for path in piece_files]
+    return dt_system_over(steps, columns, rounds, round_dt, dx, targets, controller)
+
+
+def dt_system_contract(entry, column_names, batch):
+    """The columns as spans plus the dt system's own records.
+
+    ``Targets``, ``STController`` and ``Metrics`` are retained exactly as
+    ``extraction_contracts/program_extraction.yaml`` declares them, the same
+    way the managed vehicle contract retains them; the columns are the
+    program's span parameters.
+    """
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.native_law_kernels import _CONTRACTS
+
+    policy = ExtractionContract(_CONTRACTS / "program_extraction.yaml")
+    base = policy.program_abi.receipt()
+    records = {name: base["records"][name] for name in ("Targets", "STController", "Metrics")}
+    bindings = [b for b in base["bindings"] if b["record"] in records]
+    values = [{
+        "function": entry, "parameter": name, "storage": "span",
+        "dtype": "float64", "rank": 1, "shape": [int(batch)],
+        "python_type": "src.common.tensors.abstraction.AbstractTensor",
+    } for name in column_names]
+    return policy.with_program_abi(
+        {"records": records, "bindings": bindings, "values": values}
+    ).with_execution_file(_CONTRACTS / "vehicle_full_native_execution.yaml")
+
+
+def lowered_system(piece_files, columns, *, rounds, round_dt, dx,
+                   targets=None, controller=None,
+                   backend=C_BACKEND, parameterized=None,
+                   directory=None, optimization="O2"):
+    """Lower ``dt_system_over`` -- this file's dt system with the pieces as its
+    steps -- to ``backend`` and return a native runner over the columns.
+
+    ``parameterized`` names the columns that are the program's parameters
+    (spans); by default every column is.  The pieces are bound by name, so
+    the lowering notices each ``steps[i](...)`` as an LLVM call and the
+    backend calls the piece's entry and links its module.
+    """
+    import inspect
+    from pathlib import Path
+
+    from src.common.tensors import AbstractTensor
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    steps = [LLVMPiece.load(path) for path in piece_files]
+    batch = steps[0].batch
+    names = tuple(parameterized) if parameterized is not None else tuple(columns)
+    # Python does the planning: the round tree, the process graph and the
+    # schedule are built once here.  Only ``frame`` is lowered.
+    targets = targets or Targets(cfl=0.5, div_max=1e9, mass_max=1e-3, energy_exchange_fraction=0.2)
+    controller = controller or STController()
+    state_table = StateTable()
+    for name, value in columns.items():
+        state_table.set(SCOPE, SHARED, name, value)
+    engines = []
+    for index, piece in enumerate(steps):
+        feedback = {name: name[:-5] for name in piece.output_names
+                    if name.endswith("_next") and name[:-5] in piece.argument_names}
+        engine = LLVMStep(f"step{index}", piece, feedback)
+        engine.register(state_table, lambda row: {"pos": (float(row), 0.0), "mass": 0.0},
+                        range(piece.batch), group_label=engine.name, dedup=False)
+        engines.append(engine)
+    registrations = [EngineRegistration(name=e.name, engine=e, targets=targets, dx=dx, localize=False)
+                     for e in engines]
+    round_node = GraphBuilder(ctrl=controller, targets=targets, dx=dx).round(
+        round_dt, registrations, state_table=state_table)
+    runner = MetaLoopRunner(state_table=state_table)
+    runner.set_process_graph(round_node)
+    entry = "frame"
+    source = inspect.getsource(sys.modules[__name__])
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, entry,
+        python_bindings={"AbstractTensor": AbstractTensor, "steps": steps, "runner": runner},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        runtime_closure_only=True, name="llvm_dt_system",
+        extraction_contract=dt_system_contract(entry, names, batch),
+    )
+    build = Path(directory) if directory is not None else Path.cwd() / "build" / "llvm_dt_system"
+    if backend == C_BACKEND:
+        from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+
+        artifact = emit_ssa_module_to_c(module, exports[0])
+        if not artifact.complete:
+            raise RuntimeError("C emission shortfalls: " + "; ".join(
+                f"{s.operation}: {s.reason}" for s in artifact.shortfalls[:6]))
+        return artifact.compile(build, optimization=optimization)
+    if backend == LLVM_BACKEND:
+        from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
+
+        return compile_artifact(emit_ssa_function_to_llvm(module, exports[0]),
+                                directory=build, optimization=optimization)
+    if backend == FORTRAN_BACKEND:
+        raise NotImplementedError("the Fortran deployment route is not built for this program yet")
+    raise ValueError(f"unknown backend {backend!r}")

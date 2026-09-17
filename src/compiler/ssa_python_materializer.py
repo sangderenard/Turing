@@ -458,6 +458,25 @@ class _BodyMaterializer:
                     f"{callee!r} publishes no result value; only "
                     "value-producing calls are spelled here"
                 )
+            # A SymPy function the scalar table has no opcode for (sinh,
+            # asin, ...) arrives as a direct call by name. In the tensor
+            # vocabulary that name is the catalogued method of its first
+            # operand -- the same redirect the unary table applies -- and
+            # the class's own switchboard (signal math, precision cores)
+            # takes it from there. Spelled as a bare name it would resolve
+            # to nothing at all.
+            if (
+                self.tensor_vocabulary
+                and callee in TENSOR_CALL_FORMS
+                and not TENSOR_CALL_FORMS[callee]
+                and instruction.args
+            ):
+                first, *rest = [
+                    self.operand(argument) for argument in instruction.args
+                ]
+                self.assign(result, f"{first}.{callee}({', '.join(rest)})")
+                self._mark_constant(result, constant=False)
+                return
             # A region call publishes its outputs as one aggregate, which the
             # caller then projects with GetElementPtr/Load. Python's tuple is
             # that aggregate exactly, so the convention needs no encoding --
