@@ -1677,6 +1677,77 @@ def _method_parameter_layout(graph: Any) -> tuple[
     return receiver, call_positional, all_parameters
 
 
+def _record_aggregate_ledger_lookup(
+    graph: Any, value_id: int, data: Any, attributes: Any, leaves: Any,
+) -> None:
+    """Put every ledger lookup on the book, found or not.
+
+    This is the chokepoint every aggregate-member decision passes through,
+    and a miss here is silent: no ledger means no callsite aggregate
+    descriptors, so no indexed member leaves, so no ``parameter_member_
+    formals`` receipt, so the members read as formals no caller can name --
+    and the first thing that says so is the full-native contract at the far
+    end of the build, naming value ids with nothing to tie them back to.
+
+    ``restore(self, snapshot)`` is the live case.  Its snapshot comes from
+    ``saved = state.copy_shallow() if rollback else None`` -- a CONDITIONAL
+    producer.  The ledger belongs to ``copy_shallow()``'s own result node,
+    and what the conditional node in between carries instead is what this
+    record exists to show, without guessing at it.
+    """
+    try:
+        from .identity_concordance import current_identity_book
+
+        owner = (
+            graph.G.graph.get("function_name")
+            or graph.G.graph.get("qualified_name")
+            or graph.G.graph.get("function_ref")
+        )
+        interesting = {
+            "aggregate_leaf_value_ids", "optional_presence",
+            "conditional_member_bindings", "producer_kind", "aggregate_kind",
+            "aggregate_index", "aggregate_parent_binding",
+        }
+        # An EMPTIED ledger -- the key present, the tuple empty -- is the
+        # case worth the extra detail.  It is indistinguishable from "never
+        # had one" to every reader, because the lookup below tests the
+        # tuple's truth and not the key's presence.  The full attribute key
+        # set fingerprints which writer produced the node, which is the one
+        # thing the shorter record could not say.
+        emptied = "aggregate_leaf_value_ids" in attributes and not leaves
+        # Holding a ledger is not enough.  The consumer additionally
+        # requires every leaf to still be RESIDENT in the graph
+        # (``all(int(leaf) in caller.G ...)`` where callsite aggregate
+        # descriptors are collected), and a ledger whose leaves were folded
+        # away fails that test as silently as a missing ledger does.
+        # ``_repair_missing_aggregate_leaf_projections`` is supposed to
+        # rebuild those, but it declines whenever the stored descriptor
+        # count does not match the leaf count, which leaves the dangling
+        # ledger in place and nobody the wiser.
+        resident = sum(1 for leaf in leaves if int(leaf) in graph.G)
+        current_identity_book().page("aggregate_ledger").set(
+            (str(owner), int(value_id), "ledger_lookup"),
+            0,
+            (
+                "emptied" if emptied
+                else "absent" if not leaves
+                else "resident" if resident == len(leaves)
+                else "dangling",
+                len(leaves),
+                resident,
+                str(data.get("type") or data.get("op") or ""),
+                type(data.get("expr_obj")).__name__,
+                tuple(sorted(interesting.intersection(attributes))),
+                *((
+                    tuple(sorted(map(str, attributes))),
+                    len(tuple(attributes.get("tensor_output_descriptors") or ())),
+                ) if emptied else ()),
+            ),
+        )
+    except Exception:  # noqa: BLE001 -- diagnostics never fail a build
+        pass
+
+
 def _authored_aggregate_leaves(graph: Any, value_id: int) -> tuple[int, ...]:
     """Return the exact leaf ledger for an authored aggregate value.
 
@@ -1692,6 +1763,7 @@ def _authored_aggregate_leaves(graph: Any, value_id: int) -> tuple[int, ...]:
     data = graph.G.nodes[value_id]
     attributes = data.get("attributes") or {}
     leaves = tuple(map(int, attributes.get("aggregate_leaf_value_ids", ())))
+    _record_aggregate_ledger_lookup(graph, value_id, data, attributes, leaves)
     if leaves:
         return leaves
     if not isinstance(data.get("expr_obj"), ast.Starred):
@@ -15377,6 +15449,27 @@ def _source_static_value(graph: Any, node_id: int, visiting=None) -> bool:
     visiting.add(node_id)
     data = graph.G.nodes[node_id]
     if data.get("type") in {"Constant", "Const", "const", "StaticReference"}:
+        # A structurally specialized aggregate is not source data.
+        #
+        # Deciding WHICH arm of ``x if flag else y`` survives is a decision
+        # about structure; it says nothing about the contents.  The fold
+        # rewrites the node's type to Constant and records that distinction
+        # as ``structural_specialization``, and the aggregate ledger it
+        # carries still names runtime values.
+        #
+        # Read as static, such a node takes the literal-specialization path
+        # and never the aggregate-member path, so its members are never
+        # given per-index leaves and never earn a ``parameter_member_
+        # formals`` receipt -- they reach emission as formals no caller can
+        # name.  ``saved = state.copy_shallow() if rollback else None`` in
+        # dt_controller is the case: ``rollback=True`` arrives as a literal,
+        # the ternary folds, and 52 live tensor copies start reading as a
+        # compile-time constant.
+        attributes = data.get("attributes") or {}
+        if attributes.get("structural_specialization") and tuple(
+            attributes.get("aggregate_leaf_value_ids") or ()
+        ):
+            return False
         return True
     if data.get("type") == "Input":
         name = (data.get("attributes") or {}).get("binding_name")
@@ -17538,6 +17631,27 @@ def _fold_callsite_structural_values(graph: Any) -> None:
         # aggregate ledger so later sequence lowering can still distinguish
         # a singleton ``[opcode]`` from an arbitrary scalar-valued constant
         # and recover its original leaf identity.
+        # ``tensor_output_descriptors`` travels WITH the ledger or the
+        # ledger is unrecoverable.  This fold clears the node's parents and
+        # drops every parent edge just above, so the leaf nodes the ledger
+        # names are stranded and later pruned; the retained leaf ids then
+        # refer to nodes that are no longer resident.
+        #
+        # ``_repair_missing_aggregate_leaf_projections`` exists for exactly
+        # this ("a selected producer can survive while a projection from
+        # the rejected arm is removed, leaving ... a dangling leaf ID"),
+        # and it rebuilds each missing position from the stored output
+        # descriptors -- but it declines when the descriptor count does not
+        # match the leaf count, and dropping them here makes that count 0.
+        # So the repair silently skipped, the consumer silently rejected a
+        # ledger it could not verify as resident, and the members arrived
+        # at the far end of the build as formals with no ABI accounting.
+        #
+        # Measured on the two-piece llvm_dt_system product: the
+        # ``copy_shallow()`` result held 52 leaves with 52 resident, and
+        # the folded ``saved = ... if rollback else None`` node held the
+        # same 52 leaves with 0 resident.  Every writer of this ledger
+        # publishes both keys together; only this fold split them.
         attributes = {
             key: copy.deepcopy(source_attributes[key])
             for key in (
@@ -17547,6 +17661,7 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 "sequence_column_count",
                 "sequence_writable",
                 "aggregate_leaf_value_ids",
+                "tensor_output_descriptors",
             )
             if key in source_attributes
         }
