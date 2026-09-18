@@ -156,6 +156,40 @@ def euler_bound(rate, state):
     return 1 / (smooth_abs(slope) + EPS)
 
 
+def stability_score(rate, state, dt):
+    """Amplification of ONE explicit Euler step on d(state)/dt = rate:
+    ``|1 + dt * d(rate)/d(state)|``.
+
+    ``euler_bound`` returns the dt at which this crosses 1 -- the ceiling.
+    This is where the step actually being taken sits against that ceiling,
+    so a caller can see its margin instead of only being told it has not
+    been exceeded: below 1 the step contracts an error, above 1 it grows
+    one, and the distance from 1 is how fast.  Same symbolic derivative as
+    ``euler_bound``, and the same Heaviside respelling, because Max/Min
+    kinks have no native lowering.
+    """
+    slope = sp.diff(rate, state).replace(
+        sp.Heaviside, lambda *args: smooth_step(args[0], sp.Float(1e-9)))
+    return smooth_abs(1 + dt * slope)
+
+
+def error_scale(value, source):
+    """Relative condition number of ``value`` with respect to ``source``:
+    ``|source * d(value)/d(source)| / |value|``.
+
+    The standard forward error bound of numerical analysis -- a relative
+    error in ``source`` arrives in ``value`` multiplied by this.  One means
+    error is passed through unchanged; large means the step is amplifying
+    the uncertainty it was handed, which is a fact about the law and not
+    about the arithmetic that evaluated it.  Derived here, symbolically,
+    for the same reason every other diagnostic is: it is a closed-form
+    function of the law's own parameters and costs nothing to state.
+    """
+    slope = sp.diff(value, source).replace(
+        sp.Heaviside, lambda *args: smooth_step(args[0], sp.Float(1e-9)))
+    return smooth_abs(source * slope) / (smooth_abs(value) + EPS)
+
+
 def relax(dt, tau):
     """Fraction of a gap closed in ``dt`` by first-order relaxation.
 
@@ -244,7 +278,8 @@ VOXEL_AIR_STEP = [
     named("max_vel", sp.Max(*[smooth_abs(F_face[f]) for f in FACES]) / (rho_a * A_face * dt + TINY)),
     named("max_flux", sum(smooth_abs(F_face[f]) for f in FACES) / dt),
     named("div_inf", smooth_abs(dm_a_flow) / ((m_a + TINY) * dt)),
-    named("mass_err", smooth_abs(m_a_n - (m_a + dm_a_flow)) / (m_a + TINY)),
+    named("mass_err", smooth_abs(m_a_n - (m_a + dm_a_flow))
+          / (smooth_abs(m_a_n) + smooth_abs(m_a) + smooth_abs(dm_a_flow) + TINY)),
     named("energy_j", C_cell * T),
     named("power_w", smooth_abs(dQ_flow + dQ_cond + Q_ext) / dt),
 ]
@@ -349,12 +384,27 @@ VOXEL_SPECIES_STEP = [
         euler_bound(-m_a * (auto + accr), m_l),
         euler_bound(-m_a * revap, m_r),
     )),
+    # The same two rates dt_limit takes its euler_bound from, read as the
+    # margin actually being used rather than as a ceiling.
+    named("stability", sp.Max(
+        stability_score(-m_a * (auto + accr), m_l, dt),
+        stability_score(-m_a * revap, m_r, dt),
+    )),
+    # How much relative error each condensate carries out of the step
+    # compared with what it carried in; the worst of the four.
+    named("error_scale", sp.Max(
+        error_scale(m_v_n, m_v),
+        error_scale(m_l_n, m_l),
+        error_scale(m_i_n, m_i),
+        error_scale(m_r_n, m_r),
+    )),
     named("max_vel", sp.Max(w_l, w_i, w_r)),
     named("max_flux", (smooth_abs(dm_v_flow) + smooth_abs(dm_cond) + dm_auto + dm_revap
                        + rain_out + drizzle_out + snow_out) / dt),
     named("div_inf", smooth_abs(dm_v_flow + dm_v_diff) / ((m_v + TINY) * dt)),
     named("mass_err", smooth_abs((m_v_n + m_l_n + m_i_n + m_r_n) - total_water - expected_change)
-          / (total_water + TINY)),
+          / (smooth_abs(m_v_n) + smooth_abs(m_l_n) + smooth_abs(m_i_n) + smooth_abs(m_r_n)
+             + smooth_abs(total_water) + smooth_abs(expected_change) + TINY)),
     named("energy_j", C_species * T + L_v * m_v),
     named("power_w", smooth_abs(Q_lat) / dt),
 ]
@@ -442,7 +492,8 @@ AEROSOL_STEP = [
     named("max_flux", E_M + (dep_in_M + smooth_abs(dM_flow) * V / dt)
           + M_pre * (loss_settle + loss_wall + loss_wash + loss_rainout) * V / dt),
     named("div_inf", smooth_abs(dM_flow) / ((M_a + TINY) * dt)),
-    named("mass_err", smooth_abs(M_a_n - M_pre * survive) / (M_a + TINY)),
+    named("mass_err", smooth_abs(M_a_n - M_pre * survive)
+          / (smooth_abs(M_a_n) + smooth_abs(M_pre * survive) + TINY)),
 ]
 
 
@@ -453,7 +504,8 @@ r, n_s, T_p, e_amb, z, w, c_s = sp.symbols("r n_s T_p e_amb z w c_s")
 
 r_d = cbrt(3 * n_s * M_s / (4 * pi * rho_s))          # dry crystal radius
 r3, rd3 = r**3, r_d**3
-a_w_drop = (r3 - rd3) / (r3 - rd3 * (1 - kappa) + TINY)  # kappa-Koehler water activity
+koehler_den = r3 - rd3 * (1 - kappa) + TINY
+a_w_drop = (r3 - rd3) / koehler_den                  # kappa-Koehler water activity
 A_kelvin = 2 * M_w * sigma_w / (R_u * T_p * rho_w)
 S_eq = a_w_drop * sp.exp(A_kelvin / r)
 e_s_amb = saturation_pressure(T, P_tp, T_tp, L_v, R_v)
@@ -496,7 +548,14 @@ w_next = v_t + (w - v_t) * sp.exp(-dt / (tau_v + TINY))
 # equilibrium radius, above it there is none and the drop runs away into a
 # cloud drop.  This bound keeps the stable branch stable and leaves the
 # runaway alone; the Mason bound keeps one step from overshooting S_eq.
-dS_eq_dr = sp.diff(S_eq, r)
+# dS_eq/dr = S_eq (d ln a_w/dr - A/r^2).  sp.diff spells d ln a_w/dr by the
+# product rule as 3r^2 e^(A/r) [1/den - (r^3 - r_d^3)/den^2], two terms of
+# ~10^5 whose difference is 1 - a_w ~ 10^-5: four digits gone.  The
+# difference is kappa r_d^3 / den exactly, and multiplying by a_w cancels
+# the (r^3 - r_d^3) factor, so the solute term is 3 r^2 kappa r_d^3 / den^2
+# (finite at the dry radius too); the Kelvin term stays -A a_w / r^2.
+dS_eq_dr = sp.exp(A_kelvin / r) * (
+    3 * r**2 * (kappa * rd3 + TINY) / koehler_den**2 - A_kelvin * a_w_drop / r**2)
 F_sum = F_k + F_d
 
 DROPLET_STEP = [
@@ -517,7 +576,8 @@ DROPLET_STEP = [
     )),
     named("max_vel", smooth_abs(w_next)),
     named("max_flux", smooth_abs(dm_w) / dt),
-    named("mass_err", smooth_abs(r_next**2 - r2_next) / (r**2 + TINY)),
+    named("mass_err", smooth_abs(r_next**2 - r2_next)
+          / (smooth_abs(r_next**2) + smooth_abs(r2_next) + TINY)),
     named("energy_j", C_p * T_p),
     named("power_w", smooth_abs(L_v * dm_w) / dt + h_c * 4 * pi * r**2 * smooth_abs(T - T_p)),
 ]
@@ -581,7 +641,8 @@ SALT_SOLUTION_STEP = [
         euler_bound(growth + nucleation - dissolution, n_c),
     )),
     named("max_flux", smooth_abs(dn_c) * M_s / dt),
-    named("mass_err", smooth_abs(n_c_n - (n_c + dn_c)) / (n_s + EPS)),
+    named("mass_err", smooth_abs(n_c_n - (n_c + dn_c))
+          / (smooth_abs(n_c_n) + smooth_abs(n_c) + smooth_abs(dn_c) + TINY)),
     named("energy_j", C_sol * T_sol),
     named("power_w", smooth_abs(Q_reaction) / dt),
 ]
@@ -671,7 +732,10 @@ SURFACE_STEP = [
     named("max_vel", u_film),
     named("max_flux", smooth_abs(J) * A_s + phi_drop + phi_sed),
     named("mass_err", (smooth_abs(m_film_1 - (m_film + dm_liq + phi_drop * dt - runoff))
-                       + smooth_abs(m_frost_n - (m_frost + dm_ice))) / (m_film + m_frost + TINY)),
+                       + smooth_abs(m_frost_n - (m_frost + dm_ice)))
+          / (smooth_abs(m_film_1) + smooth_abs(m_film) + smooth_abs(dm_liq)
+             + smooth_abs(phi_drop * dt) + smooth_abs(runoff)
+             + smooth_abs(m_frost_n) + smooth_abs(m_frost) + smooth_abs(dm_ice) + TINY)),
     named("energy_j", C_tot * T_s),
     named("power_w", smooth_abs(Q_lat + Q_conv_s + Q_plate) / dt),
 ]
@@ -727,7 +791,9 @@ POOL_STEP = [
     )),
     named("max_vel", C_w * sp.sqrt(2 * g * H_sill)),
     named("max_flux", phi_in + smooth_abs(J_pool) * A_wet + overflow / dt),
-    named("mass_err", smooth_abs(m_p_n - (m_p + phi_in * dt - dm_evap - overflow)) / (m_p + TINY)),
+    named("mass_err", smooth_abs(m_p_n - (m_p + phi_in * dt - dm_evap - overflow))
+          / (smooth_abs(m_p_n) + smooth_abs(m_p) + smooth_abs(phi_in * dt)
+             + smooth_abs(dm_evap) + smooth_abs(overflow) + TINY)),
     named("energy_j", C_l * T_l),
     named("power_w", smooth_abs(Q_lat_pool + Q_conv_pool + Q_floor + Q_in) / dt),
 ]
@@ -756,6 +822,8 @@ LAW_PUBLICATIONS = {
         SymbolicPublication(output="LWC", semantic="cloud_water_content", unit="kg/m^3"),
         SymbolicPublication(output="IWC", semantic="ice_water_content", unit="kg/m^3"),
         SymbolicPublication(output="RWC", semantic="rain_water_content", unit="kg/m^3"),
+        SymbolicPublication(output="stability", semantic="step_amplification", unit="1"),
+        SymbolicPublication(output="error_scale", semantic="relative_condition_number", unit="1"),
     ),
     "aerosol_step": (
         SymbolicPublication(output="beta_ext", semantic="extinction_coefficient", unit="1/m"),

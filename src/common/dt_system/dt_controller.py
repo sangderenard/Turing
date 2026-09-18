@@ -211,13 +211,13 @@ def step_with_dt_control_used(state,
                              ctrl: STController,
                              advance,
                              retries: int = 0,
-                             max_retries: int | None = 3,
+                             max_retries: int | None = 256,
                              failures: list[tuple[float, Metrics, tuple[str, ...]]] | None = None,
                              ref=None,
                               attempt_log: list[dict] | None = None,
-                              allow_unresolved: bool = False,
+                              allow_unresolved: bool = True,
                               rollback_threshold_multiplier: float = 1.0,
-                              rollback: bool = True,
+                              rollback: bool = False,
                               distribution=None):
     if rollback_threshold_multiplier < 1.0:
         raise ValueError("rollback_threshold_multiplier must be >= 1.0")
@@ -501,7 +501,7 @@ def step_with_dt_control_used(state,
 def step_with_dt_control(state, dt, dx, targets: Targets, ctrl: STController,
                          advance, retries: int = 0,
                          rollback_threshold_multiplier: float = 1.0,
-                         rollback: bool = True,
+                         rollback: bool = False,
                          distribution=None):
     metrics, dt_next, _dt_used = step_with_dt_control_used(
         state, dt, dx, targets, ctrl, advance, retries, ref=dt,
@@ -524,10 +524,10 @@ def run_superstep(state,
                   eps: float = 1e-15,
                   event_boundaries: tuple[float, ...] = (),
                   attempt_log: list[dict] | None = None,
-                  allow_unresolved: bool = False,
-                  max_retries: int | None = 3,
+                  allow_unresolved: bool = True,
+                  max_retries: int | None = 256,
                   rollback_threshold_multiplier: float = 1.0,
-                  rollback: bool = True,
+                  rollback: bool = False,
                   distribution=None,
                   schedule_lattice_steps: int = 0,
                   max_iters: int = 100_000):
@@ -559,9 +559,23 @@ def run_superstep(state,
     # step before it, but the FIRST attempt of a round has nothing behind
     # it; a core that knows its own safe step (an authored integration step,
     # a stiffness bound) states it here and the opener never exceeds it.
+    #
+    # ``dt_limit_hint`` is accepted as EITHER a plain value or a callable.
+    # PREFER THE PLAIN VALUE.  A core that has already advanced knows its
+    # own limit as a number it just computed, and publishing that number is
+    # a field assignment the compiled lane can see; wrapping it in a method
+    # buys nothing and costs a call whose body the caller cannot inspect.
+    # Reserve the callable form for a core that genuinely cannot know the
+    # limit until it is asked -- one that has to poll a sub-engine, or that
+    # derives the bound lazily because computing it is not free.  A method
+    # that only does ``return self._x`` should be the attribute instead.
+    #
+    # Accepting both is not politeness: a float attribute silently fails
+    # ``callable()`` and the pin is then skipped without a word, so the
+    # core's own stability limit is computed every step and discarded.
     hint = getattr(state, "dt_limit_hint", None)
-    if substep != "pinned" and callable(hint):
-        declared = hint()
+    if substep != "pinned" and hint is not None:
+        declared = hint() if callable(hint) else hint
         if declared is not None and math.isfinite(float(declared)) and float(declared) > 0.0:
             dt_cap = AbstractTensor.minimum(dt_cap, AbstractTensor.tensor(float(declared)))
     last_dt_next = dt_cap

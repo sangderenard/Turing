@@ -78,6 +78,100 @@ def _reduce(value, how: str) -> float:
     return float(value)
 
 
+#: Bump when the payload shape below changes.
+_LAW_MODULE_CACHE_SCHEMA = 1
+
+
+def load_law_module_cached(path, *, name: str | None = None, cache_dir=None, force: bool = False):
+    """Import a law module, or restore its constructed ``LAWS`` from disk.
+
+    Executing ``symbolic_chamber_solvers.py`` builds every law's SymPy
+    expression trees at import, and that construction -- not compilation,
+    which the dual-IR cache already covers, and not stepping -- is the
+    ~7 minutes every run of the raincloud demo was paying (measured: 435 s
+    for ``module constructed`` before a single step).  The trees are a
+    pure function of the source text, so they are cached as a pickle keyed
+    on the source digest (plus the SymPy and Python versions, since a
+    pickle from another interpreter is not one to trust).  A hit is
+    seconds.  Any edit to the law file misses once and re-caches.
+
+    What comes back is either the real module (miss) or a namespace
+    carrying exactly what a caller needs to compile and run the laws --
+    ``LAWS``, ``LAW_PUBLICATIONS``, ``DTYPE``, ``SCHEDULE``, ``BATCH`` --
+    which is all ``CompiledLaw.from_module`` reads.  The helper FUNCTIONS
+    of the law module (``negotiate``, ``relax``, ...) are not in the cache;
+    a caller that wants those must import the module itself.
+
+    Flags: ``TURING_DISABLE_LAW_MODULE_CACHE=1`` always executes the
+    module; ``TURING_LAW_MODULE_CACHE_DIR`` relocates the cache (default:
+    ``__lawcache__`` beside the law file).  ``force=True`` re-constructs
+    and overwrites.
+    """
+    import hashlib
+    import importlib.util
+    import os
+    import pickle
+    import sys
+    import time
+    import types
+    from pathlib import Path
+
+    import sympy
+
+    path = Path(path).resolve()
+    name = name or path.stem
+    source = path.read_bytes()
+    key = hashlib.sha256(b"\0".join([
+        str(_LAW_MODULE_CACHE_SCHEMA).encode(), source,
+        sympy.__version__.encode(), sys.version.encode(),
+    ])).hexdigest()
+    disabled = os.environ.get("TURING_DISABLE_LAW_MODULE_CACHE", "").casefold() in {"1", "true", "yes", "on"}
+    root = Path(cache_dir or os.environ.get("TURING_LAW_MODULE_CACHE_DIR") or (path.parent / "__lawcache__"))
+    cache_file = root / f"{name}-{key[:16]}.pkl"
+
+    if not force and not disabled and cache_file.exists():
+        t0 = time.time()
+        # Unpickling a SymPy tree rebuilds it through the constructors, and
+        # Min/Max/Add canonicalise on construction -- which IS the expensive
+        # part of building the laws, so a plain load re-paid most of the
+        # 435 s (measured: >141 CPU-s and still going).  Inside evaluate(False)
+        # the constructors skip canonicalisation and the same load is 8.8 s.
+        # The tree is the same tree; the lowering walks args and never relied
+        # on canonical order.
+        with open(cache_file, "rb") as fh, sympy.evaluate(False):
+            payload = pickle.load(fh)
+        ns = types.SimpleNamespace(**payload)
+        ns.__law_cache__ = str(cache_file)
+        ns.__construct_seconds__ = time.time() - t0
+        print(f"laws: cache hit ({ns.__construct_seconds__:.1f} s) {cache_file.name}", flush=True)
+        return ns
+
+    t0 = time.time()
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    mod.__construct_seconds__ = time.time() - t0
+    mod.__law_cache__ = None
+    print(f"laws: constructed ({mod.__construct_seconds__:.1f} s)"
+          + ("" if disabled else f", caching to {cache_file.name}"), flush=True)
+    if not disabled:
+        payload = {
+            "LAWS": mod.LAWS,
+            "LAW_PUBLICATIONS": getattr(mod, "LAW_PUBLICATIONS", {}),
+            "DTYPE": getattr(mod, "DTYPE", "float64"),
+            "SCHEDULE": getattr(mod, "SCHEDULE", "asap"),
+            "BATCH": getattr(mod, "BATCH", 1),
+        }
+        root.mkdir(parents=True, exist_ok=True)
+        tmp = cache_file.with_suffix(f".{os.getpid()}.tmp")
+        with open(tmp, "wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, cache_file)          # atomic: a concurrent reader never sees a half file
+        mod.__law_cache__ = str(cache_file)
+    return mod
+
+
 class LawState:
     """The columns one law advances; ``run_superstep`` reads ``dt_limit_hint``."""
 

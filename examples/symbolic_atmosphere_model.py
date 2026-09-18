@@ -20,8 +20,20 @@ pi = sp.pi
 T, P_tp, L_v, R_v, T_tp = sp.symbols('T P_tp L_v R_v T_tp')
 A, B, C, P = sp.symbols('A B C P')
 
-# Clausius-Clapeyron Relation
-e_s_expr = P_tp * sp.exp((L_v / R_v) * (1 / T_tp - 1 / T))
+# Clausius-Clapeyron Relation.
+#
+# The exponent is (T - T_tp) / (T T_tp), NOT 1/T_tp - 1/T.  They are the
+# same number in exact arithmetic and they are not the same number in
+# float64: near ambient the two reciprocals agree to several digits and
+# their difference cancels those digits away, after which L_v / R_v ~ 5400
+# amplifies what is left.  Measured at 295 K, the cancelling spelling is
+# 9 ULP off in e_s, and a relaxation to saturation integrates that error
+# into real condensate -- it was observed producing cloud water in a cell
+# that was exactly saturated and should have produced none.
+# symbolic_chamber_solvers.saturation_pressure is spelled this way for the
+# same reason; the two files must agree bit for bit, because state seeded
+# from one and stepped by the other differs by exactly this.
+e_s_expr = P_tp * sp.exp((L_v / R_v) * (T - T_tp) / (T * T_tp))
 
 # Antoine Equation (represented as an equality)
 antoine_eq = sp.Eq(sp.log(P, 10), A - B / (C + T))

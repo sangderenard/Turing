@@ -841,16 +841,48 @@ class CModuleArtifact:
     #: written beside the C source and handed to the same compiler
     #: invocation, so the piece is linked exactly as it was emitted.
     linked_llvm: tuple[tuple[str, str], ...] = ()
+    #: The same pieces' already-built DLLs: (symbol, library_path).  Empty
+    #: string when a piece was never compiled to a library.  Used only by
+    #: ``link="dynamic"``, which links against these instead of recompiling
+    #: ``linked_llvm``.
+    linked_libraries: tuple[tuple[str, str], ...] = ()
     library_path: Path | None = None
     _entry: Any = field(default=None, repr=False)
+    #: Directories the OS loader must search for dynamically linked pieces,
+    #: registered by ``entry()`` via ``os.add_dll_directory``.
+    _dll_directories: tuple[str, ...] = field(default=(), repr=False)
+    _dll_handles: Any = field(default=None, repr=False)
 
     @property
     def complete(self) -> bool:
         return not self.shortfalls
 
+    def _dynamic_link_inputs(self) -> tuple[list[str], list[Path]]:
+        """What the linker is handed under ``link="dynamic"``: the import
+        library beside each piece's DLL when it exists (``.lib``), else the
+        DLL itself (mingw links against a DLL directly).  Also returns the
+        DLLs, whose directories the loader must be told about at run time."""
+        inputs: list[str] = []
+        libraries: list[Path] = []
+        for symbol, library in self.linked_libraries:
+            if not library:
+                raise RuntimeError(
+                    f"link='dynamic': LLVM piece {symbol!r} has no compiled "
+                    "library to link against (it was never compiled to a DLL)")
+            dll = Path(library)
+            if not dll.is_file():
+                raise RuntimeError(f"link='dynamic': piece library missing: {dll}")
+            import_library = dll.with_suffix(".lib")
+            inputs.append(str(import_library if import_library.is_file() else dll))
+            libraries.append(dll)
+        return inputs, libraries
+
     def compile(
         self, directory: str | Path, *, optimization: str = "O2",
+        link: str = "static",
     ) -> "CModuleArtifact":
+        if link not in {"static", "dynamic"}:
+            raise ValueError(f"unsupported link mode {link!r}: 'static' or 'dynamic'")
         if not self.complete:
             raise ValueError(
                 "C module artifact has emission shortfalls: "
@@ -894,10 +926,16 @@ class CModuleArtifact:
                     encoding="utf-8",
                 )
             pool_sources.append(str(destination / "turing_pool.c"))
-        for symbol, llvm_ir in self.linked_llvm:
-            piece_path = destination / f"{symbol}.ll"
-            piece_path.write_text(llvm_ir, encoding="utf-8")
-            pool_sources.append(str(piece_path))
+        if link == "dynamic":
+            # link against the pieces' own DLLs; their IR is not recompiled
+            link_inputs, piece_dlls = self._dynamic_link_inputs()
+            pool_sources.extend(link_inputs)
+            self._dll_directories = tuple(sorted({str(dll.parent.resolve()) for dll in piece_dlls}))
+        else:
+            for symbol, llvm_ir in self.linked_llvm:
+                piece_path = destination / f"{symbol}.ll"
+                piece_path.write_text(llvm_ir, encoding="utf-8")
+                pool_sources.append(str(piece_path))
         command = [
             sys.executable, "-m", "ziglang", "cc", "-shared",
             f"-{optimization}",
@@ -927,6 +965,14 @@ class CModuleArtifact:
         if self.library_path is None:
             raise RuntimeError("C module artifact was not compiled")
         if self._entry is None:
+            if self._dll_directories and self._dll_handles is None:
+                # dynamically linked pieces: the loader searches the process
+                # directory, system directories and PATH -- not the module's
+                # own directory -- so each piece's directory is registered
+                # explicitly; the handles are kept alive with the artifact
+                import os
+
+                self._dll_handles = [os.add_dll_directory(d) for d in self._dll_directories]
             function = getattr(ctypes.CDLL(str(self.library_path)), self.name)
             function.restype = None
             function.argtypes = [
@@ -1013,7 +1059,10 @@ class CModuleArtifact:
         feeds: Mapping[int, Any],
         *,
         optimization: str = "O2",
+        link: str = "static",
     ) -> CStandaloneExecutable:
+        if link not in {"static", "dynamic"}:
+            raise ValueError(f"unsupported link mode {link!r}: 'static' or 'dynamic'")
         """Compile this complete C channel into a Python-free executable.
 
         The generated host owns one material-buffer table.  Its heap is the
@@ -1195,10 +1244,20 @@ class CModuleArtifact:
                 f"unsupported C optimization level {optimization!r}"
             )
         linked_sources: list[str] = []
-        for symbol, llvm_ir in self.linked_llvm:
-            piece_path = destination / f"{symbol}.ll"
-            piece_path.write_text(llvm_ir, encoding="utf-8")
-            linked_sources.append(str(piece_path))
+        if link == "dynamic":
+            # link against the pieces' DLLs and put a copy of each beside the
+            # executable, which is where a standalone program's loader looks
+            import shutil
+
+            link_inputs, piece_dlls = self._dynamic_link_inputs()
+            linked_sources.extend(link_inputs)
+            for dll in piece_dlls:
+                shutil.copy2(dll, destination / dll.name)
+        else:
+            for symbol, llvm_ir in self.linked_llvm:
+                piece_path = destination / f"{symbol}.ll"
+                piece_path.write_text(llvm_ir, encoding="utf-8")
+                linked_sources.append(str(piece_path))
         command = [
             sys.executable, "-m", "ziglang", "cc", f"-{optimization}",
             "-std=c11",
@@ -1874,6 +1933,7 @@ def emit_ssa_module_to_c(
     deployment_trampolines: list[str] = []
     pooled_regions: list[tuple[str, int]] = []
     linked_llvm: list[tuple[str, str]] = []
+    linked_libraries: list[tuple[str, str]] = []
     effect_guard_used = [False]
     deployment_outlines = {
         key: record
@@ -2004,6 +2064,7 @@ def emit_ssa_module_to_c(
             if extern_line not in prototypes:
                 prototypes.append(extern_line)
             linked_llvm.append((symbol, str(piece["llvm_ir"])))
+            linked_libraries.append((symbol, str(piece.get("library_path") or "")))
             shim = [
                 f"    void *piece_buffers[{max(len(slots), 1)}] = {{"
                 + ", ".join(slots or ["NULL"]) + "};",
@@ -4776,6 +4837,7 @@ def emit_ssa_module_to_c(
     ))
     return CModuleArtifact(
         linked_llvm=tuple(linked_llvm),
+        linked_libraries=tuple(linked_libraries),
         name=name,
         source=source,
         buffer_order=tuple(buffer_order),

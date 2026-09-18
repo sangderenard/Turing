@@ -7,6 +7,83 @@ from typing import Tuple, Optional
 import math
 
 
+# ── Error channels as spans, not as a dict ────────────────────────────────
+#
+# ``Metrics.error_channels`` is a ``dict[str, float]``, and a dict does not
+# lower: it becomes a keyed store addressed by string tokens, and every
+# consultation of it on the step path is a string hash.  Today that is four
+# hashes per declared channel per attempt (the proposal's penalty, the soft
+# band, the rollback band, plus the rebuild in ``coerce_metrics``).
+#
+# The same information crosses as three ALIGNED SPANS instead:
+#
+#     ids     monotonic channel id, one per channel
+#     values  the measure itself
+#     names   every name packed into one byte array, with start offsets
+#
+# The id is stated rather than left implicit in the position because a
+# stage publishes SEVERAL channels -- there is no reason a sim has only one
+# error metric -- so a consumer holding column 7 has to know WHICH criterion
+# that is, not merely where it sat in someone's list.  Ids are handed out
+# once, at declaration time, and the id IS the index into the registry.
+#
+# ``names`` exists for one purpose: printing a console line or a refusal.
+# Nothing on the step path may read it.  Resolving a name to an id is a
+# build-time act; the loop that judges a step indexes and never hashes.
+
+_CHANNEL_NAMES: list[str] = []
+_CHANNEL_BY_NAME: dict[str, int] = {}
+
+
+def declare_channel(name: str) -> int:
+    """The monotonic id for ``name``, assigning one on first sight.
+
+    BUILD TIME ONLY.  This is the one function that looks a channel up by
+    string; it exists so that nothing else ever has to.
+    """
+    key = str(name)
+    existing = _CHANNEL_BY_NAME.get(key)
+    if existing is not None:
+        return existing
+    ident = len(_CHANNEL_NAMES)
+    _CHANNEL_NAMES.append(key)
+    _CHANNEL_BY_NAME[key] = ident
+    return ident
+
+
+def channel_name(channel_id: int) -> str:
+    """The declared name of a channel.  Reporting only -- never on the path."""
+    return _CHANNEL_NAMES[int(channel_id)]
+
+
+def declared_channels() -> tuple[str, ...]:
+    """Every channel declared so far, in id order."""
+    return tuple(_CHANNEL_NAMES)
+
+
+def packed_channel_names(ids) -> tuple[bytes, tuple[int, ...]]:
+    """``(blob, offsets)`` for these channel ids: the names as one minimal
+    byte array plus one start offset per id, the last offset being the end.
+
+    This is the whole textual surface of the channel system, and it is what
+    a log line or a refusal reads.  It is built once and carried alongside;
+    a step never touches it.
+    """
+    chunks: list[bytes] = []
+    offsets: list[int] = [0]
+    for channel_id in ids:
+        chunks.append(_CHANNEL_NAMES[int(channel_id)].encode("utf-8"))
+        offsets.append(offsets[-1] + len(chunks[-1]))
+    return b"".join(chunks), tuple(offsets)
+
+
+def unpack_channel_name(blob: bytes, offsets, index: int) -> str:
+    """One name back out of ``packed_channel_names``.  Reporting only."""
+    start = int(offsets[int(index)])
+    stop = int(offsets[int(index) + 1])
+    return blob[start:stop].decode("utf-8")
+
+
 @dataclass
 class Metrics:
     """Simulation diagnostics collected during a micro-step.

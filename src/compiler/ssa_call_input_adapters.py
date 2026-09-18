@@ -130,6 +130,14 @@ def physical_call_input_conflicts(functions):
                         or len(instruction.args) != len(callee.args)):
                     continue
                 for actual, formal in zip(instruction.args, callee.args):
+                    # A keyed mapping's own occurrence is a descriptor that
+                    # names its length/keys/values slots, not physical storage
+                    # (the backends treat it as structural); its dtype is the
+                    # sequence convention's column-0 placeholder, never a
+                    # buffer representation to reconcile at a call.
+                    if any((value.accounting or {}).get('program_abi_storage') == 'keyed'
+                           for value in (actual, formal)):
+                        continue
                     # A typed pointer constrains its element representation;
                     # "ptr" itself is not a competing numerical dtype.
                     actual_type = (actual.accounting or {}).get('physical_dtype') or actual.dtype

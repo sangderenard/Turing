@@ -119,6 +119,13 @@ class ChamberSim:
         members.update({f"surface:{i}": engine.state for i, (_s, engine) in enumerate(self.surfaces)})
         members.update({f"pool:{i}": engine.state for i, (_s, engine) in enumerate(self.pools)})
         self.state = PackageState(members)
+        # the order _advance_all visits the engines, so per-law metrics can
+        # be keyed by name after the merge (the merge keeps only the max)
+        self._law_names = ([f"surface:{i}" for i in range(len(self.surfaces))]
+                           + [f"pool:{i}" for i in range(len(self.pools))]
+                           + ["air"] + [f"species:{n}" for n in self.species]
+                           + (["aerosol"] if self.aerosol is not None else []))
+        self.metrics_by_law: dict[str, Metrics] = {}
         self.frame = 0
         self.monitor = monitor if monitor is not None else CascadeMonitor()
 
@@ -241,6 +248,7 @@ class ChamberSim:
             ok_all &= ok; metrics_all.append(m)
 
         self.frame += 1
+        self.metrics_by_law = dict(zip(self._law_names, metrics_all))
         merged = merge_metrics(metrics_all, self.frame)
         state.dt_limit_hint = merged.dt_limit
         return ok_all, merged

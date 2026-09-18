@@ -99,7 +99,7 @@ def piece_from_law(compilation: Any, law: str, batch: int, *,
 def compose_native_package(source: str, entry: str, pieces: Mapping[str, LLVMPiece],
                            argument_names: Sequence[str], batch: int, *,
                            directory: str | Path, name: str | None = None,
-                           optimization: str = "O2"):
+                           optimization: str = "O2", link: str = "static"):
     """Lower authored Python that calls LLVM pieces into one compiled C module.
 
     ``source`` is the program as you would run it in Python; ``pieces`` binds
@@ -126,7 +126,7 @@ def compose_native_package(source: str, entry: str, pieces: Mapping[str, LLVMPie
         raise RuntimeError(
             f"{entry}: C emission shortfalls: "
             + "; ".join(f"{s.operation}: {s.reason}" for s in artifact.shortfalls[:6]))
-    artifact = artifact.compile(directory, optimization=optimization)
+    artifact = artifact.compile(directory, optimization=optimization, link=link)
     root = module.functions[exports[0]]
     return NativePackage(
         artifact=artifact,
