@@ -47,9 +47,12 @@ Findings (each is one concrete disagreement, with the two claims):
 
 from __future__ import annotations
 
+import contextvars
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
+
+from .id_space import group_by_prefix, label as id_label
 
 
 @dataclass(frozen=True)
@@ -248,6 +251,106 @@ class CorrelationTable:
         found: list[Finding] = []
         for name, function in module.functions.items():
             found.extend(self._function_findings(module, str(name), function))
+        found.extend(self._sequence_descriptor_findings(module))
+        found.extend(self._binding_kind_findings(module))
+        return found
+
+    @staticmethod
+    def _binding_kind_findings(module: Any) -> list[Finding]:
+        """One caller slot bound under two different kinds across callsites.
+
+        A frame binding's kind is not a label on the slot; it selects which
+        machinery may materialize it.  ``caller_storage`` can restore a slot
+        a structural cleanup removed, ``caller_alias`` and ``caller_value``
+        cannot.  So when two callsites name the SAME caller id for the same
+        callee formal but disagree on the kind, they do not merely describe
+        it differently -- one of them can supply the argument and the other
+        reports ``missing_<kind>`` and refuses the call.
+
+        Neither callsite can see this on its own: each consults its own
+        private maps in its own elif order and records a locally consistent
+        answer.  The disagreement only exists across the pair, which is the
+        whole reason the decisions are written to a shared page.
+        """
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        page = (getattr(book, "pages", {}) or {}).get("argument_binding")
+        if page is None:
+            return []
+        found: list[Finding] = []
+        for row in page.rows():
+            kinds_by_source: dict[Any, dict[str, list[int]]] = {}
+            for column, fact in page.history(row):
+                if not (isinstance(fact, tuple) and len(fact) == 2):
+                    continue
+                kind, source = fact
+                if not isinstance(source, int):
+                    continue
+                kinds_by_source.setdefault(int(source), {}).setdefault(
+                    str(kind), []
+                ).append(int(column))
+            for source, by_kind in sorted(kinds_by_source.items()):
+                if len(by_kind) < 2:
+                    continue
+                function_name, value_id = (
+                    (row[0], row[1]) if isinstance(row, tuple) and len(row) >= 2
+                    else (str(row), -1)
+                )
+                found.append(Finding(
+                    "binding-kind-disagreement",
+                    str(function_name),
+                    int(value_id),
+                    f"caller id {id_label(int(source))} is bound as "
+                    + "; ".join(
+                        f"{kind!r} at callsite(s) {sorted(columns)}"
+                        for kind, columns in sorted(by_kind.items())
+                    )
+                    + " -- one slot, and only some of those kinds can "
+                      "materialize it",
+                ))
+        return found
+
+    @staticmethod
+    def _sequence_descriptor_findings(module: Any) -> list[Finding]:
+        """Descriptors whose own two records contradict each other.
+
+        A descriptor states which of its columns are keys AND what each
+        column holds.  When it says column 0 is a key and also says that
+        column is float64, those are two of its own claims disagreeing --
+        exactly what this table exists to catch, and catchable without
+        knowing which pass wrote it.
+
+        It matters because a key is not merely imprecise as a float: a
+        string key lowers to an fnv1a-**64** token and float64 carries only
+        53 bits exactly, so a token above 2**53 is silently rounded and then
+        never matches its own lookup.  The entry goes missing rather than
+        failing loudly, which is the worst available outcome.
+        """
+        integral = {
+            "int", "int8", "int16", "int32", "int64",
+            "uint8", "uint16", "uint32", "uint64", "bool",
+        }
+        found: list[Finding] = []
+        for function_name, table in (
+            getattr(module, "sequence_tables", {}) or {}
+        ).items():
+            for sequence_id, descriptor in sorted(
+                getattr(table, "sequences", {}).items()
+            ):
+                dtypes = tuple(getattr(descriptor, "column_dtypes", ()) or ())
+                for column in getattr(descriptor, "key_columns", ()) or ():
+                    if int(column) >= len(dtypes):
+                        continue
+                    dtype = str(dtypes[int(column)])
+                    if dtype in integral:
+                        continue
+                    found.append(Finding(
+                        "key-column-not-integral",
+                        str(function_name),
+                        int(sequence_id),
+                        f"column {int(column)} is declared a key but holds "
+                        f"{dtype!r}; a key column is an index and cannot be "
+                        f"a float (dtypes={dtypes})",
+                    ))
         return found
 
     def _identity_claims(self, row: ValueRow) -> list[Claim]:
@@ -539,18 +642,302 @@ def concordance_report(module: Any, *, limit: int = 12) -> str:
     by_kind: dict[str, list[Finding]] = defaultdict(list)
     for finding in findings:
         by_kind[finding.kind].append(finding)
+    census = group_by_prefix(value_id for _function, value_id in table.rows)
     lines = [
         f"identity concordance: {len(table.rows)} rows across "
         f"{len(module.functions)} functions, {len(findings)} finding(s)"
     ]
+    # Every row gathered under its own id group, before any finding: a
+    # count per prefix says at a glance which spaces this module actually
+    # uses, and a group that should be empty (``history`` ids among a
+    # function's own values, say) shows up as a number rather than having
+    # to be hunted for.
+    if len(census) > 1 or (census and census[0].label != "legacy"):
+        lines.append(
+            "  id groups: "
+            + ", ".join(
+                f"{group.label}={len(group.value_ids)}" for group in census
+            )
+        )
     for kind in sorted(by_kind):
         entries = by_kind[kind]
         lines.append(f"  [{kind}] x{len(entries)}")
         for finding in entries[:limit]:
+            named = (
+                "?" if finding.value_id is None
+                else id_label(finding.value_id)
+            )
             lines.append(
-                f"     {finding.function} value {finding.value_id}: "
+                f"     {finding.function} value {named}: "
                 f"{finding.detail}"
             )
         if len(entries) > limit:
             lines.append(f"     ... {len(entries) - limit} more")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Identity pages: row x column x page, for facts a finished-module table
+# cannot see.
+#
+# ``CorrelationTable`` above audits one finished module -- it has no notion
+# of time, so it can only ever compare a value against itself, never against
+# what it USED to be.  Two 2026-09-17/18 defects were exactly that: a
+# correct fact computed once but never carried to the one consumer that
+# needed it (an alias map read in two places, not the third that mattered),
+# and a value's shape flipping A -> B -> A within a single fixed-point round
+# while every step honestly reported "changed" -- a round-boundary snapshot
+# necessarily reads that as no change at all, because it is none, net.
+#
+# A page is one pipeline stage's table.  A row is one identity -- whatever a
+# page decides makes two facts "about the same thing" (a value id, an
+# (function, value id) pair, ...).  A column is one round -- whatever
+# "round" means on that page (a fixed-point iteration, a phase index).  A
+# cell is the fact that identity held at that round.  Reading one row across
+# its own columns finds an in-stage oscillation.  Reading one row's key
+# across two different pages finds a cross-stage disagreement -- the shape
+# of every fault above and, going forward, the general instrument for both.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class IdentityPage:
+    """One pipeline stage's row (identity) x column (round) table of facts."""
+
+    name: str
+    cells: dict[tuple[Any, int], Any] = field(default_factory=dict)
+    columns: list[int] = field(default_factory=list)
+
+    def set(self, row: Any, column: int, fact: Any) -> None:
+        if column not in self.columns:
+            self.columns.append(column)
+        self.cells[(row, column)] = fact
+
+    def rows(self) -> tuple[Any, ...]:
+        return tuple(dict.fromkeys(row for row, _ in self.cells))
+
+    def history(self, row: Any) -> tuple[tuple[int, Any], ...]:
+        """This row's fact at every column it was recorded on, in order."""
+        return tuple(
+            (column, self.cells[(row, column)])
+            for column in self.columns
+            if (row, column) in self.cells
+        )
+
+    def spans(self, row: Any) -> tuple[tuple[int, int, Any], ...]:
+        """This row's history collapsed to contiguous (start, end, fact) runs."""
+        entries = self.history(row)
+        if not entries:
+            return ()
+        runs: list[tuple[int, int, Any]] = []
+        start_column, current_fact = entries[0]
+        end_column = start_column
+        for column, fact in entries[1:]:
+            if fact != current_fact:
+                runs.append((start_column, end_column, current_fact))
+                start_column, current_fact = column, fact
+            end_column = column
+        runs.append((start_column, end_column, current_fact))
+        return tuple(runs)
+
+    def oscillating_rows(
+        self, key: Any = None, *, old_key: Any = None,
+    ) -> dict[Any, tuple[tuple[int, int, Any], ...]]:
+        """Rows that left a value and later came back to it -- a round-trip,
+        never a settle, and the exact shape a round-boundary-only snapshot
+        cannot see (the net effect across the trip is zero).
+
+        ``key`` extracts the comparable "resulting" value from a fact
+        (default: the fact itself).  For a fact that bundles its own
+        transition -- ``(old, new, ...)``, as a mutation-log style page does
+        -- pass ``key=lambda fact: fact[1]``.
+
+        That alone still misses the most common real case: fact A moves a
+        value from its UNRECORDED starting point to X, fact B moves it from
+        X back to that same starting point.  The visited-value sequence is
+        genuinely [start, X, start] -- a real round-trip -- but only X and
+        start-as-B's-new ever get compared unless the implicit start is
+        counted too.  Pass ``old_key`` (extracting the "before" side of the
+        SAME fact shape, e.g. ``lambda fact: fact[0]``) to prepend that
+        first recorded starting value to the sequence before checking.
+        """
+        project = key or (lambda fact: fact)
+        found = {}
+        for row in self.rows():
+            runs = self.spans(row)
+            facts = [project(fact) for _, _, fact in runs]
+            if old_key is not None and runs:
+                facts = [old_key(runs[0][2]), *facts]
+            if len(set(facts)) < len(facts):
+                found[row] = runs
+        return found
+
+
+class IdentityBook:
+    """Every stage's page, so one identity's claim can be read across all
+    of them -- the comparison none of them makes on its own."""
+
+    def __init__(self) -> None:
+        self.pages: dict[str, IdentityPage] = {}
+
+    def page(self, name: str) -> IdentityPage:
+        return self.pages.setdefault(name, IdentityPage(name))
+
+    def latest_by_page(self, row: Any) -> dict[str, Any]:
+        """The final fact recorded for `row` on each page that ever saw it."""
+        result = {}
+        for name, page in self.pages.items():
+            runs = page.spans(row)
+            if runs:
+                result[name] = runs[-1][2]
+        return result
+
+    def disagreements(self, row: Any) -> dict[str, Any] | None:
+        """The per-page facts for `row`, if more than one distinct fact
+        exists among them -- else None (the pages agree, or only one saw it)."""
+        latest = self.latest_by_page(row)
+        if len({repr(fact) for fact in latest.values()}) > 1:
+            return latest
+        return None
+
+
+# One book per top-level compile, reachable from anywhere in the call stack
+# without a `module` argument -- a contextvar rather than module.metadata,
+# because the module a mid-pipeline pass is building is not always the same
+# object the top-level entry point will eventually return, and a crash deep
+# inside one stage (exactly tonight's fault) must not lose everything
+# recorded before it.  `lower_ast_source_to_ssa` opens one with
+# `begin_identity_book()` and dumps it in a `finally` with
+# `end_identity_book()`, success or failure, at the one small, honest cost
+# of the book itself: it is only ever appended to as a side effect of work
+# the pass was already doing.
+_ACTIVE_IDENTITY_BOOK: contextvars.ContextVar[IdentityBook | None] = (
+    contextvars.ContextVar("identity_concordance_active_book", default=None)
+)
+
+
+def begin_identity_book() -> tuple[IdentityBook, contextvars.Token]:
+    """Start a fresh book for one compile and make it current.
+
+    Returns the book and a reset token.  A nested compile (one
+    ``lower_ast_source_to_ssa`` invoked while another is already on the
+    stack) must not clobber the outer compile's book to ``None`` when it
+    finishes -- that would silently orphan everything the outer compile
+    recorded before the nested one started.  The token lets ``end_identity_
+    book`` restore exactly the PREVIOUS value instead of blanking it.
+    """
+    book = IdentityBook()
+    token = _ACTIVE_IDENTITY_BOOK.set(book)
+    return book, token
+
+
+def current_identity_book() -> IdentityBook:
+    """The active compile's book, creating a detached one if none is open
+    (so a page write is never a hard error just because nothing called
+    ``begin_identity_book`` -- it simply has nowhere to be dumped later)."""
+    book = _ACTIVE_IDENTITY_BOOK.get()
+    if book is None:
+        book = IdentityBook()
+        _ACTIVE_IDENTITY_BOOK.set(book)
+    return book
+
+
+def end_identity_book(
+    token: contextvars.Token | None = None,
+) -> IdentityBook | None:
+    """Detach and return the book that was active (or None if none was
+    open), restoring whatever was active before it via `token` when given
+    (see `begin_identity_book`) instead of unconditionally clearing to None.
+    """
+    book = _ACTIVE_IDENTITY_BOOK.get()
+    if token is not None:
+        _ACTIVE_IDENTITY_BOOK.reset(token)
+    else:
+        _ACTIVE_IDENTITY_BOOK.set(None)
+    return book
+
+
+def identity_book(module: Any) -> IdentityBook:
+    """The current compile's book, also cached on ``module.metadata`` when
+    available -- so code with a module in hand (an already-finished
+    ``IRModule``, inspected after the fact) and code with only the ambient
+    compile context (a pass mid-construction, or an exception handler with
+    no module at all) read the exact same instance."""
+    book = current_identity_book()
+    metadata = getattr(module, "metadata", None)
+    if metadata is not None and metadata.get("identity_book") is None:
+        metadata["identity_book"] = book
+    return book
+
+
+def row_value_id(row: Any) -> int | None:
+    """The SSA value id a page row is about, when it names one.
+
+    Pages key rows differently -- ``(function, value id, field)`` for a
+    mutation page, a bare id for a reference count -- so presentation takes
+    the first integer it finds and says nothing when there is none, rather
+    than guessing a position that happens to work for one page's shape.
+    """
+    if isinstance(row, int):
+        return int(row)
+    if isinstance(row, tuple):
+        for item in row:
+            if isinstance(item, int):
+                return int(item)
+    return None
+
+
+def render_identity_book(book: IdentityBook) -> str:
+    """Every page, every row, its full span history -- the dense log."""
+    lines = [f"identity book: {len(book.pages)} page(s)"]
+    for page_name in sorted(book.pages):
+        page = book.pages[page_name]
+        rows = page.rows()
+        lines.append(f"[{page_name}] {len(rows)} row(s), {len(page.cells)} cell(s)")
+        # Rows gathered under the id group they belong to, so one page's
+        # entries read as the few spaces they actually span rather than as
+        # one undifferentiated list.  A row whose key names no id keeps its
+        # place under "unkeyed" instead of being dropped or invented into
+        # a group.
+        by_group: dict[str, list[Any]] = {}
+        for row in rows:
+            value_id = row_value_id(row)
+            group = (
+                "unkeyed" if value_id is None
+                else (group_by_prefix([value_id])[0].label)
+            )
+            by_group.setdefault(group, []).append(row)
+        for group in sorted(by_group):
+            group_rows = by_group[group]
+            if len(by_group) > 1:
+                lines.append(f"  ({group}) {len(group_rows)} row(s)")
+            for row in group_rows:
+                spans = page.spans(row)
+                trail = " -> ".join(
+                    f"{start}..{end}={fact}" for start, end, fact in spans
+                )
+                lines.append(f"  {render_row(row)}: {trail}")
+    return "\n".join(lines)
+
+
+def render_row(row: Any) -> str:
+    """A page row with its ids named rather than spelled out in full.
+
+    A flagged id is a nineteen-digit number; printing it raw makes the log
+    unsearchable by the serial a reader actually has in hand (from a
+    traceback, say) and unreadable at a glance.  Each integer in the row is
+    rendered through :func:`id_space.label`, which leaves an unflagged id
+    exactly as it was -- so nothing about legacy output changes -- and
+    turns a flagged one into ``minted#1000013548``.
+    """
+    if isinstance(row, int):
+        return id_label(row)
+    if isinstance(row, tuple):
+        return (
+            "(" + ", ".join(
+                id_label(item) if isinstance(item, int) and not isinstance(item, bool)
+                else repr(item)
+                for item in row
+            ) + ")"
+        )
+    return repr(row)

@@ -803,19 +803,28 @@ from typing import (
 
 from ..transmogrifier.ssa import IRModule as _IRModule, SSAValue as _SSAValue
 
-# Synthetic buffer ids for history watches. They are deliberately far above
-# any real SSA numbering so a history slot can never be mistaken for, or
-# collide with, a value the program actually owns -- the id-collision class
-# of bug this tree has already paid for more than once.
-_HISTORY_RING_BASE = 1_000_000_000
-_HISTORY_COUNT_BASE = 2_000_000_000
+# Synthetic buffer ids for history watches.  These used to be numeric bases
+# (1e9 and 2e9) chosen to sit "deliberately far above any real SSA
+# numbering" -- but ``GLOBAL_MONOTONIC_IDS`` issues compiler-minted values
+# starting at exactly 1_000_000_000 and counting up, so the ring buffer for
+# authored value 263 and the minted value 1_000_000_263 were the same
+# number.  The ranges were never disjoint; nothing enforced the gap the
+# comment claimed.  A flag bit cannot overlap another group's numbering by
+# construction, so the property is now structural instead of hoped for.
+from .id_space import (
+    HISTORY as _HISTORY_FLAG,
+    HISTORY_COUNT as _HISTORY_COUNT_FLAG,
+    compose as _compose_id,
+    serial_of as _serial_of_id,
+)
 
 
 def history_ids(value_id: int) -> tuple[int, int]:
     """Buffer ids carrying ``value_id``'s history ring and its sample count."""
+    serial = _serial_of_id(value_id)
     return (
-        _HISTORY_RING_BASE + int(value_id),
-        _HISTORY_COUNT_BASE + int(value_id),
+        _compose_id(serial, _HISTORY_FLAG),
+        _compose_id(serial, _HISTORY_FLAG | _HISTORY_COUNT_FLAG),
     )
 from .output_publication import (
     function_output_publications,
@@ -1618,8 +1627,7 @@ def _emit_repository_call_module(
             value = root_values.get(raw_id)
             if value is None:
                 continue
-            ring_id = _HISTORY_RING_BASE + raw_id
-            count_id = _HISTORY_COUNT_BASE + raw_id
+            ring_id, count_id = history_ids(raw_id)
             appended_history.append(_SSAValue(
                 ring_id,
                 dtype=getattr(value, "dtype", None) or "float64",

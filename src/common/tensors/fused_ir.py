@@ -21,6 +21,8 @@ from dataclasses import dataclass, field, replace
 from numbers import Real
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
+from ...compiler.id_space import serial_of as _id_serial_of
+
 
 @dataclass
 class Meta:
@@ -130,7 +132,13 @@ def unroll_feed_axis_reductions(program: "FusedProgram") -> "FusedProgram":
     meta: dict[int, Meta] = dict(program.meta or {})
     producers = {step.result_id for step in program.steps}
     used_ids = {step.result_id for step in program.steps} | set(program.feeds)
-    next_id = (max(used_ids) + 1) if used_ids else 0
+    # Watermark from serials, not raw ids: an id carrying group/flag bits
+    # (see src/compiler/id_space.py) would otherwise drag this counter into
+    # that group and every fresh id would inherit its bits unminted.  A
+    # legacy, unflagged id is its own serial, so this is a no-op today.
+    next_id = (
+        max(_id_serial_of(value_id) for value_id in used_ids) + 1
+    ) if used_ids else 0
 
     def fresh_id() -> int:
         nonlocal next_id

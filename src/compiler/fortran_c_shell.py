@@ -12022,6 +12022,60 @@ def _sequence_row_operations(
     return tuple(operations)
 
 
+_UNTYPED = {"", "unknown", "none", "None"}
+_INTEGRAL_DTYPES = {
+    "int", "int8", "int16", "int32", "int64",
+    "uint8", "uint16", "uint32", "uint64", "bool",
+}
+
+
+def _key_columns_integral(descriptor: Any) -> bool:
+    """Whether every column this descriptor calls a key is integral.
+
+    A key column is an index; a float cannot be one, and a string key is
+    an fnv1a-64 token that float64's 53-bit mantissa silently rounds.  A
+    descriptor failing this is invalid on its own terms, independently of
+    which pass built it -- which is what lets a consumer refuse it without
+    having to know the right answer.
+    """
+    dtypes = tuple(getattr(descriptor, "column_dtypes", ()) or ())
+    for column in getattr(descriptor, "key_columns", ()) or ():
+        if int(column) >= len(dtypes):
+            return False
+        if str(dtypes[int(column)]) not in _INTEGRAL_DTYPES:
+            return False
+    return True
+
+
+def _declared_column_dtype(value: Any, default: str) -> str:
+    """The dtype a sequence column actually holds, declaration first.
+
+    Two failures this replaces, both seen on the real dt-system build:
+
+    ``str(value.dtype or default)`` only falls back when dtype is None.
+    The compiler's "I could not work it out" sentinel is the STRING
+    ``"unknown"``, which is truthy, so it sailed through and a column
+    declared int64 was published as ``unknown``.
+
+    Worse, a key column that had been inferred from its neighbours came
+    out ``float64``.  A string-token key is an fnv1a-**64** value and
+    float64 carries only 53 bits exactly, so every token above 2**53 is
+    silently rounded -- the key then never matches its own lookup and the
+    channel goes missing rather than failing loudly.  Inference must not
+    be able to decide this: ``physical_dtype`` is the declared contract
+    the ABI already recorded beside the value, so it is consulted first
+    and the categorical default (int64 for a key column) stands behind it.
+    """
+    accounting = dict(getattr(value, "accounting", None) or {})
+    declared = accounting.get("physical_dtype")
+    if declared is not None and str(declared) not in _UNTYPED:
+        return str(declared)
+    inferred = getattr(value, "dtype", None)
+    if inferred is not None and str(inferred) not in _UNTYPED:
+        return str(inferred)
+    return str(default)
+
+
 def _sequence_column_dtype_contracts(
     graph_obj: Any,
     sequence_declarations: Iterable[tuple[int, str, int, bool]],
@@ -13430,6 +13484,7 @@ def _class_surface_ssa_program(
         lower_control_sections_to_ssa,
         resolve_sequence_schemas,
     )
+    from .identity_concordance import current_identity_book
     from .string_table import StringTable
 
     # One table for the whole object: every method's string constants tokenize
@@ -13442,6 +13497,18 @@ def _class_surface_ssa_program(
     all_record_tables: dict[str, Any] = {}
     all_reference_tables: dict[str, Any] = {}
     module_metadata: dict[str, Any] = {}
+    # The active compile's shared book (``current_identity_book()`` -- the
+    # SAME instance every other pass reaches, including tensor_ssa_lowering.py
+    # via ``identity_book(module)``, and the top-level entry point's crash
+    # log, none of which need this specific ``module`` object to find it):
+    # one row per (function, value id, kind of fact), one column per call
+    # site processed, so an argument-binding decision made here and a shape
+    # fact settled later, both about the same numbered value, land on pages
+    # that can be read against each other.
+    module_metadata["identity_book"] = current_identity_book()
+    argument_binding_page = module_metadata["identity_book"].page(
+        "argument_binding"
+    )
     module_metadata["specialized_dependency_extensions"] = tuple(
         getattr(compilation.deployment, "specialized_dependency_extensions", ())
     )
@@ -16017,6 +16084,45 @@ def _class_surface_ssa_program(
                 and attributes.get("aggregate_parent_binding") in authored_parameters
                 and attributes.get("aggregate_index") is not None
             )
+            # A tuple parameter's members are ABI-accounted ONLY through the
+            # receipt above, and it is granted only when the member's root
+            # name is an authored parameter.  A member whose root does not
+            # match is silently not recorded, and the first thing that says
+            # so is the full-native contract at the far end of the build,
+            # naming value ids with no way back to the name that failed.
+            #
+            # So both outcomes go on the book: the receipts granted, and the
+            # candidates refused together with the root name that missed.
+            # ``restore(self, snapshot)`` is the live case -- 104 formals,
+            # 52 accounted, and the question the log could not answer was
+            # which root name its 52 tuple members claimed.
+            try:
+                member_page = current_identity_book().page("member_formals")
+                for value_id, data in graph_obj.nodes(data=True):
+                    attributes = data.get("attributes") or {}
+                    if (
+                        data.get("type") != "Input"
+                        or attributes.get("aggregate_index") is None
+                    ):
+                        continue
+                    root_name = attributes.get("aggregate_parent_binding")
+                    member_page.set(
+                        (str(function_name), int(value_id), "member_formal"),
+                        int(attributes["aggregate_index"]),
+                        (
+                            "granted"
+                            if (
+                                attributes.get("binding_kind") == "parameter"
+                                and root_name in authored_parameters
+                            )
+                            else "refused",
+                            root_name,
+                            attributes.get("binding_kind"),
+                            authored_parameters,
+                        ),
+                    )
+            except Exception:  # noqa: BLE001 -- diagnostics never fail a build
+                pass
             lowered_control.metadata["source_function_reference"] = (
                 None if function_reference is None
                 else int(function_reference)
@@ -17083,8 +17189,8 @@ def _class_surface_ssa_program(
                         capacity_value_id=int(length_value.id),
                         status_address_id=None,
                         column_dtypes=(
-                            str(keys_value.dtype or "int64"),
-                            str(values_value.dtype or "float64"),
+                            _declared_column_dtype(keys_value, "int64"),
+                            _declared_column_dtype(values_value, "float64"),
                         ),
                         key_columns=(0,),
                         writable=False,
@@ -23086,6 +23192,113 @@ def _class_surface_ssa_program(
                 caller_result_records,
                 callee_result_records,
             )
+            # A callee's own per-field formal for a declared record (for
+            # example ``_propose_dt_pen``'s formal for ``metrics.max_vel``)
+            # is a distinct id from anything exact_bindings/storage_bindings
+            # above know about whenever the actual argument is itself the
+            # forwarded result of an earlier call in this same caller
+            # (``coerced = coerce_metrics(metrics)``, then
+            # ``_propose_dt_pen(coerced, ...)``) -- the field formal fell
+            # through to allocate_result_storage and leased a second,
+            # duplicate physical slot for a field the caller already owns.
+            # An ABI-declared (record, field) pair names one physical slot
+            # per caller regardless of which call produced the reference to
+            # it, exactly as _propagate_record_field_demand's caller_fields
+            # lookup already assumes elsewhere in this module; reuse that
+            # same identity here instead of minting a duplicate.
+            # A slot some OTHER callsite already took as its own frame
+            # storage is that callsite's frame, not a shared identity -- and
+            # the book is what knows the difference.  ``caller.args`` alone
+            # cannot answer it: ``allocate_result_storage`` appends its
+            # per-callsite lease to that same list carrying the callee's
+            # ``(record, field)`` accounting, so a later callsite scanning
+            # for that name finds the earlier lease and adopts it.
+            #
+            # ``pi_update`` is called twice from
+            # ``step_with_dt_control_used``, and the binding page shows the
+            # cost exactly: its formals 88/7/8 each leased a fresh slot per
+            # callsite (415 -> minted#1000005224/5225/5226, 460 ->
+            # minted#1000005235/5236/5237) while formal 94 alone had
+            # callsite 460 reusing callsite 415's private lease
+            # minted#1000005223.  The column IS the callsite, so "who else
+            # already claimed this slot" is a question the page answers and
+            # no single callsite can.
+            current_callsite = int(planned_call.callsite_id)
+            leased_by_another_callsite = {
+                int(source)
+                for (_row, column), fact in argument_binding_page.cells.items()
+                if isinstance(fact, tuple) and len(fact) == 2
+                and str(fact[0]) == "caller_storage"
+                and isinstance(fact[1], int)
+                and int(column) != current_callsite
+                for source in (fact[1],)
+            }
+            caller_field_formals: dict[tuple[Any, Any], Any] = {}
+            for formal in all_functions[caller_symbol].args:
+                formal_accounting = formal.accounting or {}
+                field_name = formal_accounting.get("program_abi_field")
+                if field_name is None:
+                    continue
+                if int(formal.id) in leased_by_another_callsite:
+                    continue
+                key = (formal_accounting.get("program_abi_record"), field_name)
+                # A caller can carry more than one formal claiming the same
+                # (record, field): the genuinely declared one, and a
+                # compiler-minted duplicate an earlier call's greedy result-
+                # storage allocation already leased for it (the exact
+                # ``error_channels`` phantom this fix exists to stop
+                # aliasing to).  Whichever happens to iterate last must not
+                # arbitrarily decide the identity; a compiler-minted formal
+                # never displaces an already-found genuinely declared one.
+                if key in caller_field_formals and (
+                    formal_accounting.get("linked_call_frame_storage")
+                    or formal_accounting.get("compiler_frame_storage")
+                ):
+                    continue
+                caller_field_formals[key] = formal
+            for formal in callee_function.args:
+                formal_id = int(formal.id)
+                if formal_id in identity_aliases:
+                    continue
+                accounting = formal.accounting or {}
+                field = accounting.get("program_abi_field")
+                if field is None:
+                    continue
+                existing_formal = caller_field_formals.get(
+                    (accounting.get("program_abi_record"), field)
+                )
+                if existing_formal is None:
+                    continue
+                existing = int(existing_formal.id)
+                if existing == formal_id:
+                    continue
+                # A shared (record, field) NAME is only one physical slot
+                # when both sides also agree on physical representation --
+                # the tire's ``pi_update`` build proved that name alone is
+                # not enough: a bool formal and a float64 formal were
+                # matched by name and aliased, and the compiler's own
+                # immutable-storage-type check correctly refused the
+                # resulting call ("2 incompatible physical call inputs").
+                # The storage KIND (scalar/keyed/span/...) must always
+                # agree -- a keyed handle's own ``dtype`` is routinely None
+                # (its identity is the handle, not a scalar type), so
+                # requiring dtype equality unconditionally would refuse
+                # the "error_channels" keyed-field alias this fix exists to
+                # make.  Only when both sides are plain scalars does dtype
+                # become the compatibility signal that actually caught the
+                # tire's bool/float64 collision.
+                existing_accounting = existing_formal.accounting or {}
+                if accounting.get("program_abi_storage") != existing_accounting.get(
+                    "program_abi_storage"
+                ):
+                    continue
+                if accounting.get("program_abi_storage") == "scalar" and (
+                    formal.dtype is None
+                    or existing_formal.dtype is None
+                    or formal.dtype != existing_formal.dtype
+                ):
+                    continue
+                identity_aliases[formal_id] = existing
             caller_values = function_values(all_functions[caller_symbol])
             # Only ids a node EXPLICITLY declares. The old fallback to
             # ``node_id`` reached ProcessGraph's node keys, which are ``id()``
@@ -23894,8 +24107,25 @@ def _class_surface_ssa_program(
                     value_id, "caller_storage", storage_bindings[value_id]
                 ))
             elif value_id in identity_aliases:
+                # ``caller_storage``, not ``caller_alias``: every target in
+                # ``identity_aliases`` is a formal of the caller, and a
+                # function's formals ARE its physical frame.  Naming a
+                # physical slot is what ``caller_storage`` means; the
+                # ``caller_alias`` kind is for a binding reached through the
+                # callee identity ledger, which is not what happened here.
+                #
+                # The distinction is not cosmetic.  Only ``caller_storage``
+                # can restore a slot a structural cleanup removed (the
+                # ``clone_value`` fallback where the call is wired); the
+                # ``caller_alias`` kind has no such path, so the same slot
+                # bound under the two labels resolves at one callsite and
+                # fails at the other.  ``pi_update``'s formal 94 proved it:
+                # the concordance recorded callsite 415 binding
+                # ``('caller_storage', X)`` and callsite 460 binding
+                # ``('caller_alias', X)`` for one identical X, and only 460
+                # reported ``missing_caller_alias``.
                 frame_bindings.append((
-                    value_id, "caller_alias", identity_aliases[value_id]
+                    value_id, "caller_storage", identity_aliases[value_id]
                 ))
             elif value_id in default_literals:
                 frame_bindings.append((
@@ -23926,6 +24156,20 @@ def _class_surface_ssa_program(
                     "caller_storage",
                     allocate_result_storage(value_id),
                 ))
+        # Record this call's binding decisions onto the shared book, keyed
+        # the same way tensor_ssa_lowering.py keys its own rows -- (owning
+        # function, value id, kind-of-fact) -- so a value threaded through as
+        # frame storage (the exact "restore" shape: one numbered slot shared
+        # by shape across several call frames) can be read on this page
+        # (who decided its caller binding, and from which callsite) against
+        # the shape-enrichment page (what shape each occurrence of it later
+        # settled to), instead of each staying invisible to the other.
+        for recorded_value_id, recorded_kind, recorded_source in frame_bindings:
+            argument_binding_page.set(
+                (str(callee_symbol), int(recorded_value_id), "binding"),
+                int(planned_call.callsite_id),
+                (recorded_kind, recorded_source),
+            )
         decompositions = tuple(
             instruction
             for block in all_functions[caller_symbol].blocks.values()
@@ -32229,6 +32473,62 @@ def _class_surface_ssa_program(
                         # The incumbent stays; registering the view would
                         # only raise a false descriptor conflict.
                         continue
+                    if (
+                        incumbent is not None
+                        and tuple(map(int, incumbent.column_value_ids))
+                        == tuple(map(int, mapped_columns))
+                        and int(incumbent.length_address_id)
+                        == frame_map[int(descriptor.length_address_id)]
+                        and tuple(incumbent.key_columns)
+                        == tuple(descriptor.key_columns)
+                        and all(
+                            str(dtype) in {"unknown", "", "None"}
+                            for dtype in descriptor.column_dtypes
+                        )
+                        and any(
+                            str(dtype) not in {"unknown", "", "None"}
+                            for dtype in incumbent.column_dtypes
+                        )
+                    ):
+                        # Same columns and same length cell -- the storage
+                        # identity both sides agree on -- but this view
+                        # knows NOTHING about what the columns hold, while
+                        # the incumbent carries the declared contract (the
+                        # ``Metrics.error_channels`` case: incumbent
+                        # ('int64','float64') from the record ABI, this view
+                        # ('unknown','unknown')).  That is partial knowledge
+                        # meeting complete knowledge, not a contradiction: a
+                        # descriptor that cannot say what its columns hold is
+                        # a structural passthrough of the same storage and is
+                        # not authoritative about the sequence, so it must not
+                        # displace the typed incumbent -- nor does its own
+                        # capacity/status cell, which is this frame's copy of
+                        # a cell the typed owner already names.  Two
+                        # DIFFERENT concrete dtypes still conflict below,
+                        # because that is a real disagreement.
+                        continue
+                    if (
+                        incumbent is not None
+                        and tuple(map(int, incumbent.column_value_ids))
+                        == tuple(map(int, mapped_columns))
+                        and int(incumbent.length_address_id)
+                        == frame_map[int(descriptor.length_address_id)]
+                        and tuple(incumbent.key_columns)
+                        == tuple(descriptor.key_columns)
+                        and _key_columns_integral(incumbent)
+                        and not _key_columns_integral(descriptor)
+                    ):
+                        # Same storage, and the incoming view is INVALID on
+                        # its face: it declares a key column that is not
+                        # integral, which a key -- an index -- cannot be.
+                        # The lowering already reports that as a shortfall
+                        # where it is created; here the only question is
+                        # whether it may overwrite a descriptor that IS
+                        # valid, and it may not.  An invalid record never
+                        # displaces a valid one, which is a weaker and safer
+                        # claim than deciding what the right dtype would
+                        # have been.
+                        continue
                     caller_sequences.register(SSASequenceDescriptor(
                         sequence_id=mapped_sequence_id,
                         column_value_ids=mapped_columns,
@@ -34711,7 +35011,7 @@ def _report_unmaterialised_record_parameters(module, extraction_contract) -> Non
         )
 
 
-def lower_ast_source_to_ssa(
+def _lower_ast_source_to_ssa_impl(
     source: str,
     entrypoint: str | None = None,
     *,
@@ -35806,6 +36106,59 @@ def lower_ast_source_to_ssa(
             )
     _report_unmaterialised_record_parameters(module, extraction_contract)
     return module, outputs, exports
+
+
+def _dump_identity_book_log(
+    book: Any, *, name: str | None, entrypoint: str | None, ok: bool,
+) -> None:
+    """Write this compile's dense identity-book log next to other build
+    artifacts.  Best-effort and silent on failure: logging must never mask
+    or replace the real compile result, only add to it -- the entire point
+    is a near-free receipt every compile leaves behind, not a gate on any
+    of them."""
+    if book is None or not book.pages:
+        return
+    try:
+        import os
+        import time
+
+        from .identity_concordance import render_identity_book
+
+        directory = os.path.join("artifacts", "identity_logs")
+        os.makedirs(directory, exist_ok=True)
+        label = str(name or entrypoint or "compile")
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        status = "ok" if ok else "failed"
+        path = os.path.join(directory, f"{label}.{stamp}.{status}.log")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(render_identity_book(book))
+    except Exception:
+        pass
+
+
+def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
+    """Thin wrapper over ``_lower_ast_source_to_ssa_impl``: opens one
+    IdentityBook for this compile and always writes its dense log, success
+    or exception, before the call returns or the exception propagates.  The
+    book itself costs nothing beyond what the passes were already doing --
+    they were minting these facts anyway; this only keeps them.
+    """
+    from .identity_concordance import begin_identity_book, end_identity_book
+
+    _, _token = begin_identity_book()
+    ok = False
+    try:
+        result = _lower_ast_source_to_ssa_impl(*args, **kwargs)
+        ok = True
+        return result
+    finally:
+        book = end_identity_book(_token)
+        entrypoint = kwargs.get("entrypoint")
+        if entrypoint is None and len(args) > 1:
+            entrypoint = args[1]
+        _dump_identity_book_log(
+            book, name=kwargs.get("name"), entrypoint=entrypoint, ok=ok,
+        )
 
 
 lower_ast_source_to_ssa.__canonical_source_compiler__ = True

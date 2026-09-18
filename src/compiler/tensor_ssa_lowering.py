@@ -25,6 +25,7 @@ from ..transmogrifier.ssa import (
 )
 from ..transmogrifier.ssa_registry import Handler
 from ..transmogrifier.tensor_ssa_reference import SSATensorCodeReference
+from .identity_concordance import identity_book
 from .ssa_aggregate_abi import (
     _constant_integer,
     legalize_aggregate_adapters,
@@ -555,6 +556,32 @@ def propagate_repository_ssa_call_metadata(
     constant_indices_cache: dict[int, dict[int, int]] = {}
     returned_cache: dict[int, tuple[SSAValue, ...]] = {}
     projection_cache: dict[tuple[int, int], dict[int, SSAValue]] = {}
+    function_names_by_id: dict[int, str] = {
+        id(fn): name for name, fn in module.functions.items()
+    }
+    # A round-boundary snapshot (fixed_point_state) can only ever show a
+    # difference when the whole round's net effect differs from the last one
+    # seen.  Two authoritative writers disagreeing about one value WITHIN a
+    # single round -- write A, then write B that reverts it -- nets to zero
+    # by the time the round-end snapshot is taken, even though `changed` was
+    # honestly set twice.  An IdentityPage sees it anyway: row = the exact
+    # (function, value id, field) written, column = the round it was written
+    # in, so a row that revisits an earlier fact is a genuine round-trip,
+    # found by reading straight across a row instead of diffing round
+    # boundaries.  Taken from the module's shared IdentityBook, not a
+    # standalone page, so a value's argument-binding history (written by
+    # fortran_c_shell.py) and its shape-enrichment history (written here)
+    # sit on the same book and can be read against each other by anything
+    # that shares the same row-key convention.
+    mutation_page = identity_book(module).page("tensor_shape_enrichment")
+    # Two writes can land in the SAME round (the fill, then the revert that
+    # produced tonight's paradox both did) -- round alone is not a unique
+    # column, so pair it with a monotonic step to keep every individual
+    # write its own cell instead of the second silently overwriting the
+    # first.  The round is still the primary label; it rides along in the
+    # column tuple and in the fact itself.
+    import itertools
+    mutation_step = itertools.count()
 
     def values(function) -> tuple[SSAValue, ...]:
         key = id(function)
@@ -620,7 +647,7 @@ def propagate_repository_ssa_call_metadata(
             "physical_dtype"
         )
         fixed_constant = int(value_id) in constant_result_ids(function)
-        for value in values_by_id(function).get(int(value_id), ()):
+        for value in occurrences_of(int(value_id), function):
             # An occurrence that declares itself an exact view of this same
             # storage owns its shape.  Restamping it with the allocation
             # owner's shape silently rewrote ``b.reshape((-1, 1, 2))`` back
@@ -634,12 +661,23 @@ def propagate_repository_ssa_call_metadata(
                 and bool(source_shape)
                 and prod(tuple(value.shape or ())) == prod(source_shape)
             )
+            def _log(field: str, old: Any, new: Any) -> None:
+                mutation_page.set(
+                    (
+                        function_names_by_id.get(id(function), "?"),
+                        int(value.id), field,
+                    ),
+                    (fixed_point_round, next(mutation_step)),
+                    (old, new, authoritative, int(source.id)),
+                )
+
             if (
                 not fixed_constant
                 and authoritative
                 and not retained_view
                 and tuple(value.shape or ()) != source_shape
             ):
+                _log("shape", tuple(value.shape or ()), source_shape)
                 value.shape = source_shape
                 changed = True
             elif (
@@ -647,6 +685,7 @@ def propagate_repository_ssa_call_metadata(
                 and source_shape
                 and not tuple(value.shape or ())
             ):
+                _log("shape", tuple(value.shape or ()), source_shape)
                 value.shape = source_shape
                 changed = True
             if (
@@ -654,12 +693,14 @@ def propagate_repository_ssa_call_metadata(
                 and (value.dtype is None or authoritative)
                 and value.dtype != source_dtype
             ):
+                _log("dtype", value.dtype, source_dtype)
                 value.dtype = source_dtype
                 changed = True
             if (
                 source_physical_dtype is not None
                 and (value.accounting or {}).get("physical_dtype") is None
             ):
+                _log("physical_dtype", None, str(source_physical_dtype))
                 value.accounting = {
                     **dict(value.accounting or {}),
                     "physical_dtype": str(source_physical_dtype),
@@ -673,6 +714,7 @@ def propagate_repository_ssa_call_metadata(
                     )
                 )
             ):
+                _log("ssa_aggregate_outputs", (), source_aggregate)
                 value.accounting = {
                     **dict(value.accounting or {}),
                     "ssa_aggregate_outputs": source_aggregate,
@@ -709,6 +751,11 @@ def propagate_repository_ssa_call_metadata(
             "float32": 4, "float": 4, "int32": 4, "i32": 4,
             "float64": 8, "double": 8, "int64": 8, "i64": 8,
         }.get(str(source.dtype or descriptor.dtype).lower(), 8)
+        mutation_page.set(
+            (callee_name, int(formal.id), "descriptor.shape"),
+            (fixed_point_round, next(mutation_step)),
+            (tuple(descriptor.shape), shape, True, int(source.id)),
+        )
         table.tensors[int(formal.id)] = dataclasses.replace(
             descriptor,
             dtype=str(source.dtype or descriptor.dtype),
@@ -825,6 +872,54 @@ def propagate_repository_ssa_call_metadata(
         )
         return value_state, descriptor_state
 
+    # Which functions genuinely hold each numbered value.  A per-function
+    # cache (``values_by_id`` above) only ever answers "who shares this id
+    # WITHIN one function" -- it cannot see that the SAME numbered frame-
+    # storage slot is ALSO held by a caller several levels up the chain, so
+    # filling it here can leave a stale copy up there to later revert the
+    # fix (the ``restore`` paradox this diagnostic exists to name).  Trying
+    # to recognize this by accounting tag (``linked_call_frame_storage`` and
+    # its kin) is not reliable -- a plain, genuinely shared formal can carry
+    # empty accounting.  One reference count over the whole module, run
+    # once, answers the real structural question directly instead: does
+    # more than one function actually hold this id.  Funneled onto the
+    # shared book (not kept private) so it is inspectable and cross-
+    # checkable the same way every other page is, including in the always-
+    # on log.
+    reference_counts: dict[int, set[str]] = {}
+    for owner_name, owner_function in module.functions.items():
+        for value in values(owner_function):
+            reference_counts.setdefault(int(value.id), set()).add(owner_name)
+    shared_value_ids = {
+        value_id for value_id, owners in reference_counts.items()
+        if len(owners) > 1
+    }
+    reference_count_page = identity_book(module).page(
+        "cross_function_references"
+    )
+    for value_id in shared_value_ids:
+        reference_count_page.set(
+            value_id, 0, tuple(sorted(reference_counts[value_id]))
+        )
+
+    def occurrences_of(value_id: int, function: Any) -> tuple[SSAValue, ...]:
+        """Every live occurrence of ``value_id`` this enrichment must keep
+        synchronized: just this function's own cache for an ordinary,
+        function-local id, but every occurrence across every function that
+        holds it once the reference count says it is genuinely shared."""
+        if int(value_id) not in shared_value_ids:
+            return values_by_id(function).get(int(value_id), ())
+        seen: list[SSAValue] = []
+        seen_ids: set[int] = set()
+        for other_function in module.functions.values():
+            for candidate in values_by_id(other_function).get(
+                int(value_id), ()
+            ):
+                if id(candidate) not in seen_ids:
+                    seen_ids.add(id(candidate))
+                    seen.append(candidate)
+        return tuple(seen)
+
     changed = True
     settle_exact_formals = True
     # Authoritative return metadata is a settling phase, not a permanent
@@ -836,6 +931,7 @@ def propagate_repository_ssa_call_metadata(
     settle_exact_returns = bool(authoritative_returns)
     initial_state = fixed_point_state()
     seen_states = {initial_state: 0}
+    history = [initial_state]
     state_receipts = [{
         "round": 0,
         "digest": sha256(repr(initial_state).encode("utf-8")).hexdigest(),
@@ -939,12 +1035,29 @@ def propagate_repository_ssa_call_metadata(
                                 tuple(semantic_actual.shape or ())
                                 and not tuple(actual.shape or ())
                             ):
+                                mutation_page.set(
+                                    (function_name, int(actual.id), "shape"),
+                                    (fixed_point_round, next(mutation_step)),
+                                    (
+                                        tuple(actual.shape or ()),
+                                        tuple(semantic_actual.shape),
+                                        False, int(semantic_actual.id),
+                                    ),
+                                )
                                 actual.shape = tuple(semantic_actual.shape)
                                 changed = True
                             if (
                                 semantic_actual.dtype is not None
                                 and actual.dtype is None
                             ):
+                                mutation_page.set(
+                                    (function_name, int(actual.id), "dtype"),
+                                    (fixed_point_round, next(mutation_step)),
+                                    (
+                                        actual.dtype, semantic_actual.dtype,
+                                        False, int(semantic_actual.id),
+                                    ),
+                                )
                                 actual.dtype = semantic_actual.dtype
                                 changed = True
                         # The caller's actual value is the concrete contract
@@ -1090,6 +1203,7 @@ def propagate_repository_ssa_call_metadata(
         settle_exact_formals = False
         settle_exact_returns = False
         state = fixed_point_state()
+        history.append(state)
         state_receipts.append({
             "round": fixed_point_round,
             "digest": sha256(repr(state).encode("utf-8")).hexdigest(),
@@ -1099,10 +1213,99 @@ def propagate_repository_ssa_call_metadata(
             module.metadata["call_metadata_fixed_point_receipts"] = tuple(
                 state_receipts
             )
+            # The digest alone says THAT the module is cycling, not WHICH
+            # value is disputed or by whom.  Diff every consecutive pair of
+            # recorded rounds between the first and repeated occurrence to
+            # name the exact (function, value id) whose fact flips back and
+            # forth -- a receipt the next run can read directly instead of
+            # re-deriving this by re-running the whole lowering.
+            def _keyed(round_state: Any) -> dict[Any, Any]:
+                # Key by (function, occurrence) -- the Python-object identity
+                # fixed_point_state() actually iterates -- never by value id
+                # alone.  Two distinct SSA aliases can share one canonical id
+                # and legitimately disagree; collapsing them onto one id-keyed
+                # entry silently keeps only whichever occurrence iterated
+                # last, hiding exactly the disagreement this diagnostic
+                # exists to show.  The value id is still visible inside each
+                # entry's own tuple for grouping/reporting.
+                value_state, descriptor_state = round_state
+                keyed: dict[Any, Any] = {
+                    (entry[0], "value", entry[1]): entry for entry in value_state
+                }
+                keyed.update({
+                    (entry[0], "descriptor", entry[1]): entry
+                    for entry in descriptor_state
+                })
+                return keyed
+
+            oscillating: dict[Any, list[tuple[int, Any]]] = {}
+            for round_index in range(first_round, fixed_point_round):
+                before = _keyed(history[round_index])
+                after = _keyed(history[round_index + 1])
+                for key in before.keys() | after.keys():
+                    before_fact, after_fact = before.get(key), after.get(key)
+                    if before_fact != after_fact:
+                        oscillating.setdefault(
+                            key, [(round_index, before_fact)]
+                        ).append((round_index + 1, after_fact))
+            module.metadata["call_metadata_fixed_point_oscillation"] = {
+                str(key): tuple(trail) for key, trail in oscillating.items()
+            }
+            trail_report = "; ".join(
+                f"{key}: " + " -> ".join(f"r{r}={fact}" for r, fact in trail)
+                for key, trail in list(oscillating.items())[:5]
+            )
+            # A round-boundary snapshot can only differ when a round's NET
+            # effect differs from one already seen -- it is structurally
+            # blind to two writers disagreeing about one value WITHIN the
+            # same round (write A, then a later write reverts it to what
+            # round 0 already had).  The oscillation trail above is real but
+            # can legitimately be empty for exactly that reason.  The
+            # mutation page records every individual write as its own cell,
+            # so it can still show that in-round round-trip: a row (the
+            # exact (function, value id, field) written) whose fact history
+            # revisits an earlier value is exactly this shape of defect,
+            # confirmed against the actual product build 2026-09-17/18
+            # (`step_1__restore__specialized_*`: filled from a shared
+            # template formal, then authoritatively reverted using a stale
+            # copy of itself as the "source of truth").
+            repeated_writes = mutation_page.oscillating_rows(
+                key=lambda fact: fact[1], old_key=lambda fact: fact[0],
+            )
+            module.metadata["call_metadata_fixed_point_repeated_writes"] = {
+                str(target): entries for target, entries in repeated_writes.items()
+            }
+            repeated_report = "; ".join(
+                f"{target}: " + " -> ".join(
+                    f"round{column[0]}.{column[1]} {fact[0]}->{fact[1]} "
+                    f"(authoritative={fact[2]}, source={fact[3]})"
+                    for column, fact in mutation_page.history(target)
+                )
+                for target in list(repeated_writes)[:5]
+            )
+            # The other half of why this book is shared: fortran_c_shell.py
+            # already recorded, on the SAME book, who decided each of these
+            # values' caller bindings and from which callsite -- before this
+            # pass ever touched their shape.  Pull it onto the same row key
+            # (function, value id) so the report shows not just THAT a value
+            # round-tripped but WHOSE two binding decisions disagreed about it.
+            binding_page = identity_book(module).pages.get("argument_binding")
+            binding_report = "; ".join(
+                f"{target[:2]}: " + " -> ".join(
+                    f"callsite{column} {fact[0]}={fact[1]}"
+                    for column, fact in binding_page.history(
+                        (target[0], target[1], "binding")
+                    )
+                )
+                for target in list(repeated_writes)[:5]
+            ) if binding_page is not None else ""
             raise RuntimeError(
                 "repository SSA call metadata fixed point repeated state "
                 f"from round {first_round} at round {fixed_point_round} "
-                "while a pass still reported change"
+                "while a pass still reported change. "
+                f"Disputed fact(s) (round-boundary diff): {trail_report}. "
+                f"Repeated writes within the disputed round(s): {repeated_report}. "
+                f"Argument-binding history for the same values: {binding_report}"
             )
         seen_states.setdefault(state, fixed_point_round)
         changed_any |= changed

@@ -729,12 +729,62 @@ class SSASequenceTable:
     """Function-scoped sequence/table storage descriptions."""
 
     sequences: Dict[int, SSASequenceDescriptor] = field(default_factory=dict)
+    #: Every column-dtype tuple ever offered for a sequence id, in order.
+    #: Diagnostic only; never consulted for a decision.
+    attempts: Dict[int, list] = field(default_factory=dict)
 
     def register(self, descriptor: SSASequenceDescriptor) -> SSASequenceDescriptor:
         sequence_id = int(descriptor.sequence_id)
         existing = self.sequences.get(sequence_id)
+        # Every attempt, not just the winner: a conflict report that shows
+        # only incumbent-vs-newcomer cannot distinguish two sites that
+        # stably disagree from a sequence of sites that flip a value back
+        # and forth, and those need opposite fixes.
+        self.attempts.setdefault(sequence_id, []).append(
+            tuple(descriptor.column_dtypes)
+        )
+        # The same claim onto the compile's shared book, so a sequence's
+        # column typing is carried from the moment it is first claimed
+        # through every later propagation and reconciliation, rather than
+        # each pass keeping its own private view and comparing only
+        # incumbent-against-newcomer.  Recording only; nothing here decides.
+        try:
+            from ..compiler.identity_concordance import current_identity_book
+
+            current_identity_book().page("sequence_column_claims").set(
+                (int(sequence_id), "column_dtypes"),
+                len(self.attempts[sequence_id]) - 1,
+                (
+                    tuple(descriptor.column_dtypes),
+                    tuple(descriptor.key_columns),
+                ),
+            )
+        except Exception:
+            # Diagnostics must never be able to fail a lowering.
+            pass
         if existing is not None and existing != descriptor:
-            raise ValueError(f"conflicting SSA sequence descriptor {sequence_id}")
+            # Name the id the way a reader can act on -- ``minted#1000013548``
+            # rather than 2305843010213707500 -- and say WHICH fields the two
+            # registrations disagree about, since "conflicting" alone sends
+            # the reader back to re-derive that by hand from a build log.
+            from ..compiler.id_space import label as _id_label
+
+            differing = tuple(sorted(
+                name for name in vars(descriptor)
+                if getattr(existing, name, None) != getattr(descriptor, name)
+            ))
+            detail = "; ".join(
+                f"{name}: incumbent={getattr(existing, name, None)!r} "
+                f"vs new={getattr(descriptor, name)!r}"
+                for name in differing
+            )
+            offered = self.attempts.get(sequence_id, [])
+            raise ValueError(
+                f"conflicting SSA sequence descriptor {_id_label(sequence_id)}"
+                f" (differs in: {', '.join(differing) or 'identity only'})"
+                + (f" [{detail}]" if detail else "")
+                + f" dtypes offered in order: {offered}"
+            )
         self.sequences[sequence_id] = descriptor
         return descriptor
 

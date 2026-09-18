@@ -14,6 +14,7 @@ from typing import Any, Iterable, Mapping
 import networkx as nx
 
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
+from .id_space import serial_of as _id_serial_of
 from .control_source import (
     CallBlock,
     ConditionalBlock,
@@ -583,7 +584,17 @@ def lower_fused_integral_to_repository_ssa(
             *(int(step.result_id) for step in program.steps),
             *(int(value_id) for value_id in program.outputs.values()),
         }
-        first_value_id = max(authored_ids, default=-1) + 1
+        # Watermark from the SERIALS, never the raw numbers.  A raw max over
+        # ids that carry group/flag bits (see id_space) lands the watermark
+        # in whatever group the largest id belonged to, and every value
+        # allocated from it then inherits that group's bits without ever
+        # passing through ``compose`` -- a value silently claiming a space
+        # it was never minted into.  While ids are unflagged this is exactly
+        # the previous behaviour, since a legacy id IS its own serial.
+        first_value_id = max(
+            (_id_serial_of(value_id) for value_id in authored_ids),
+            default=-1,
+        ) + 1
         control = ControlProgram(SequenceBlock(()))
         function, shortfalls = lower_control_program_to_ssa(
             control,
@@ -4564,6 +4575,16 @@ class _ControlSSABuilder:
             writable=bool(writable),
             child_table_pool=child_table_pool,
         )
+        # NOTE: a key column here is routinely left with the provisional
+        # dtype a structural constant carries (float64, or "unknown"), and
+        # no column contract reaches this point to correct it -- see
+        # ``identity_concordance``'s ``key-column-not-integral`` finding,
+        # which reports it for the whole module.  It is NOT raised as an
+        # ``SSALoweringShortfall`` here on purpose: a shortfall is fatal at
+        # emission, the defect is present for every keyed store in the
+        # tree, and making it fatal halts every build before the root cause
+        # (the missing contract) can be threaded down to this point.  The
+        # audit carries it until then.
         self.sequence_descriptors[value_id] = descriptor
         self.sequence_storage_values[value_id] = (
             data, *extra_columns, length_address, capacity,
