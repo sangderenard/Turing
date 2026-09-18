@@ -13434,14 +13434,69 @@ def _prune_dead_local_sequences(
                   if descriptor.live_flags_value_id is not None else ()),
             }
             members = _strip_dead_cell_bookkeeping(function, members)
-            del table.sequences[sequence_id]
-            removed += 1
             still_consumed = {
                 int(argument.id)
                 for block in function.blocks.values()
                 for instruction in block.instrs
                 for argument in instruction.args
             }
+            # Stamp every RETAINED member before the descriptor goes.
+            #
+            # Below, a member formal that nothing consumes is dropped -- but
+            # one that is still consumed is kept, and once the descriptor is
+            # unregistered nothing can say what that formal was.  The pass
+            # that builds ``storage_formals`` learns a cell's identity by
+            # walking the surviving descriptors, so an orphaned member is
+            # never stamped, never enters the ledger, and arrives at the
+            # full-native contract as a formal with no accounting at all --
+            # "no caller can know what to pass" -- even though its caller
+            # does lease it a slot.
+            #
+            # This is the last moment the identity exists, so record it
+            # here, with the same keys the descriptor walk would have
+            # written. Measured on the two-piece llvm_dt_system product:
+            # exactly two such formals, both sequence length-address cells.
+            ordered_members = (
+                *map(int, descriptor.column_value_ids),
+                int(descriptor.length_address_id),
+                int(descriptor.capacity_value_id),
+                *((int(descriptor.status_address_id),)
+                  if descriptor.status_address_id is not None else ()),
+                *((int(descriptor.live_flags_value_id),)
+                  if descriptor.live_flags_value_id is not None else ()),
+            )
+            member_positions = {
+                value_id: index
+                for index, value_id in enumerate(ordered_members)
+            }
+            for argument in function.args:
+                value_id = int(argument.id)
+                if (
+                    value_id not in members
+                    or value_id not in still_consumed
+                ):
+                    continue
+                accounting = dict(argument.accounting or {})
+                if any(accounting.get(key) not in {None, ""} for key in (
+                    "program_abi_parameter",
+                    "linked_call_frame_storage",
+                    "returned_record_storage",
+                    "compiler_frame_storage",
+                )):
+                    continue
+                argument.accounting = {
+                    **accounting,
+                    "compiler_frame_storage": str(function.name),
+                    "compiler_frame_sequence_id": int(sequence_id),
+                    # -1 marks the descriptor handle itself, which the
+                    # descriptor walk never indexes as a member.
+                    "compiler_frame_member": int(
+                        member_positions.get(value_id, -1)
+                    ),
+                    "compiler_frame_orphaned_descriptor": True,
+                }
+            del table.sequences[sequence_id]
+            removed += 1
             _drop_formals_and_call_operands(
                 all_functions, function, [
                     position

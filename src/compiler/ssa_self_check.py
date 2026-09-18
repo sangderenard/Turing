@@ -126,6 +126,45 @@ def check_formal_parity(module: Any) -> list[Finding]:
         # empty or when every parameter has expanded into member formals.
         # Retain the name-based check for older serialized products.
         if (named or "authored_parameters" in metadata) and unnamed:
+            # Say WHICH ledger should have listed it, not only that none
+            # did.  "No caller can know what to pass" is the symptom; the
+            # useful facts are what the formal itself carries and how full
+            # each accounting channel is, because the repair belongs to
+            # whichever pass owns the channel it is missing from.  A formal
+            # with NO accounting keys at all, in a function whose storage
+            # ledger holds hundreds of others, was appended by something
+            # that never registered it -- a different defect from one that
+            # is registered under the wrong name.
+            try:
+                from .identity_concordance import current_identity_book
+
+                page = current_identity_book().page("formal_parity")
+                by_id = {
+                    int(argument.id): argument
+                    for argument in getattr(function, "args", ())
+                }
+                channels = tuple(sorted(
+                    (channel, len(metadata.get(channel) or ()))
+                    for channel in (
+                        "parameter_names", "storage_formals",
+                        "closure_formals", "parameter_member_formals",
+                        "authored_parameters",
+                    )
+                ))
+                for value_id in unnamed:
+                    argument = by_id.get(int(value_id))
+                    page.set(
+                        (str(name), int(value_id), "unaccounted_formal"),
+                        0,
+                        (
+                            tuple(sorted(
+                                getattr(argument, "accounting", None) or {}
+                            )),
+                            channels,
+                        ),
+                    )
+            except Exception:  # noqa: BLE001 -- diagnostics never fail a build
+                pass
             findings.append(Finding(
                 "formal_parity", str(name),
                 f"{len(formals)} formals but only {len(set(formals) & accounted)} named or "
