@@ -407,7 +407,7 @@ def decode_huffman_octets(
         dead = (
             (dead > 0)
             | ambiguous
-            | ((candidate_length >= table.max_bits) & ~hit)
+            | ((candidate_length >= table.max_bits) & hit.logical_not())
         ).to_dtype("int64")
         numeric_hit = hit.to_dtype("int64")
         symbol = (

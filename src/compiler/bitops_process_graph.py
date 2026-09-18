@@ -65,6 +65,7 @@ def expand_bitops_process_graph(
     target.roots = list(source.roots)
     target.domain_shape = source.domain_shape
     target.node_map = dict(source.node_map)
+    target.G.graph["bit_width"] = int(bit_width)
     original_order = list(nx.topological_sort(source.G))
     next_id = _next_free_id(
         target.G,
@@ -127,6 +128,7 @@ def expand_bitops_process_graph(
             node_data["control"] = {
                 **dict(node_data.get("control") or {}),
                 "lowered_by": "bitops",
+                "source_node": old_id,
                 "source_operation": op,
             }
             target.G.add_node(next_id, **node_data)

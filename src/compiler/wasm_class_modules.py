@@ -47,6 +47,7 @@ chunk is a numbered prerequisite of it.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -56,6 +57,101 @@ from .process_graph_fusion import (
     fused_program_to_process_graph,
     reduce_scheduled_shader_regions,
 )
+
+
+# These operations change an invocation-wide tensor extent into shared state.
+# Element tiling may only cross them with an explicit partial-reduction Join;
+# silently evaluating them once per tile changes one world into many worlds.
+COLLECTIVE_FUSED_OPERATIONS = frozenset({
+    "sum", "mean", "prod", "min", "max", "any", "all", "argmin", "argmax",
+})
+
+
+def fused_program_extent_effect(program: FusedProgram) -> str:
+    """Classify whether a fused program is safe to split by element extent."""
+
+    program = getattr(program, "program", program)
+    for step in program.steps:
+        if (
+            str(step.op_name) in COLLECTIVE_FUSED_OPERATIONS
+            or "reduce_op" in dict(step.attrs or {})
+        ):
+            return "collective"
+    return "pointwise"
+
+
+def _diagnose_region(program, region, module_name) -> str:
+    """A self-explaining diagnosis appended to a region emission failure.
+
+    An 'operand was never produced' shortfall is opaque on its own. This walks
+    the region and classifies every DANGLING operand -- a value an op reads that
+    is neither a region feed nor produced by an earlier step -- reporting what
+    the IR still knows about it: a capture origin means an undeclared feed; being
+    in ``state_in`` means unwired state; surviving metadata means its producer
+    was pruned; nothing at all means the producer was eliminated during
+    capture/partitioning while a consumer kept the reference. Naming the
+    distinction in the error turns a blind rebuild-and-guess loop into a direct
+    fix -- for this program and every future one.
+    """
+
+    produced = set(program.feeds) | {s.result_id for s in program.steps}
+    meta = program.meta or {}
+    origins = (program.extras or {}).get("capture_feed_origins", {})
+    state_in = program.state_in or set()
+
+    # Non-numeric constants (str/bytes) a scalar kernel cannot represent, and
+    # what reads them -- so a "found str/bytes" shortfall says which literal it
+    # was and how it is used (a dict key vs a compared/stored value), which
+    # decides whether it interns to a hash or needs real byte handling.
+    consumers: dict[int, list] = {}
+    for step in program.steps:
+        for operand in step.input_ids:
+            consumers.setdefault(operand, []).append((step.step_id, step.op_name))
+    nonnumeric = []
+    for step in program.steps:
+        if step.op_name != "tensor_from_list":
+            continue
+        values = step.attrs.get("values")
+        if isinstance(values, (str, bytes, bytearray)):
+            readers = ", ".join(f"{op}#{sid}"
+                                for sid, op in consumers.get(step.result_id, ())) or "(output)"
+            nonnumeric.append(
+                f"  value {step.result_id}: {type(values).__name__} "
+                f"{values!r:.60}; read by {readers}"
+            )
+
+    dangling: dict[int, list] = {}
+    for step in program.steps:
+        for operand in step.input_ids:
+            if operand in produced:
+                continue
+            dangling.setdefault(operand, []).append((step.step_id, step.op_name))
+    if not dangling:
+        if nonnumeric:
+            return (f"\n\nregion {region} ({module_name}) non-numeric constants "
+                    f"(a scalar kernel cannot hold a string/bytes):\n"
+                    + "\n".join(nonnumeric)
+                    + f"\n  region outputs={dict(program.outputs)}")
+        return ""  # the shortfall is something else
+    lines = [f"\n\nregion {region} ({module_name}) dangling operands "
+             f"(read but never produced and not a feed):"]
+    for operand in sorted(dangling):
+        entry = meta.get(operand)
+        origin = origins.get(operand) or origins.get(str(operand))
+        readers = ", ".join(f"{op}#{sid}" for sid, op in dangling[operand])
+        if origin is not None:
+            what = f"UNDECLARED FEED (capture origin {origin})"
+        elif operand in state_in:
+            what = "STATE value not wired as a feed"
+        elif entry is not None and getattr(entry, "shape", None) is not None:
+            what = (f"lost producer (meta shape={tuple(entry.shape)} "
+                    f"dtype={getattr(entry, 'dtype', None)})")
+        else:
+            what = "producer eliminated during capture/partitioning (no metadata)"
+        lines.append(f"  value {operand}: {what}; read by {readers}")
+    lines.append(f"  region feeds={sorted(program.feeds)} "
+                 f"outputs={dict(program.outputs)}")
+    return "\n".join(lines)
 
 
 def partition_threaded_wasm_program(
@@ -229,6 +325,11 @@ def partition_threaded_wasm_program(
             "vertical-fusion" in dispatch.rewrite_history
             for dispatch in reduced.dispatches
         ),
+        "extent_effect": fused_program_extent_effect(pruned),
+        "collective_regions": [
+            index for index, member in region_programs.items()
+            if fused_program_extent_effect(member) == "collective"
+        ],
         "rewrite_history": [
             list(dispatch.rewrite_history) for dispatch in reduced.dispatches
         ],
@@ -272,6 +373,26 @@ class ClassModuleSpec:
         return f"{self.name}__{self.index}"
 
 
+def _region_reduction_digest(program, module_name, dtype, static_offset) -> str:
+    """Content key for one lowered region.
+
+    ``emit_wasm_module`` is a pure function of the region program plus these
+    emission parameters, so hashing exactly those makes the cached kernel valid
+    to reuse whenever they are unchanged. ``static_offset`` is included on
+    purpose: two builds that place a region's static data at different offsets
+    are genuinely different kernels and must not share a cache entry.
+    """
+
+    from joblib.externals import cloudpickle
+
+    digest = hashlib.sha256()
+    digest.update(cloudpickle.dumps(program))
+    digest.update(
+        f"|{module_name}|{dtype}|{int(static_offset)}".encode("utf-8")
+    )
+    return digest.hexdigest()
+
+
 def emit_control_region_modules(
     control,
     region_programs: Mapping[int, FusedProgram],
@@ -279,6 +400,9 @@ def emit_control_region_modules(
     owner_name: str,
     module_dir: str,
     dtype: str = "float64",
+    logical_input_names: Mapping[int, str] | None = None,
+    reduction_cache=None,
+    progress=None,
 ) -> tuple[dict[int, object], dict]:
     """Emit planner regions without flattening their controlling program.
 
@@ -286,13 +410,37 @@ def emit_control_region_modules(
     Values crossing region boundaries are assigned shared-memory identities;
     the companion control coordinator invokes these exact kernels according
     to the planner-owned loop/state-machine structure.
+
+    ``logical_input_names`` names external region values whose identity comes
+    from a caller-owned contract rather than capture provenance. State-carried
+    values are the motivating case: a region sees the previous ``next_phase``
+    value, while the public input through which it returns is named ``phase``.
+
+    ``reduction_cache`` (a ``ReductionArtifactStore``), when given, persists each
+    lowered region under its content key so an interrupted or repeated bake
+    reloads regions it already lowered instead of re-emitting them. ``progress``,
+    if given, is called ``progress(region, was_cached)`` as each region resolves.
     """
 
     from .fused_program_wasm_backend import (
         emit_wasm_module,
         program_feed_order,
+        required_steps,
+    )
+    # Container recognition is shared, backend-neutral IR analysis -- take it from
+    # the central module, not from another backend.
+    from .ir_container_ops import (
+        pure_container_store as _pure_container_store,
+        pure_container_read as _pure_container_read,
     )
     from .wasm_binary import WasmImport
+    from .wasm_container import (
+        HEAP_CURSOR_ADDR,
+        HEAP_RESERVED_BYTES,
+        DEFAULT_MAP_CAPACITY,
+        MAP_HEADER_BYTES,
+        map_block_bytes,
+    )
 
     ordered_regions = tuple(dict.fromkeys(map(int, control.region_indices)))
     missing = set(ordered_regions) - set(map(int, region_programs))
@@ -304,6 +452,10 @@ def emit_control_region_modules(
     programs = {
         region: getattr(region_programs[region], "program", region_programs[region])
         for region in ordered_regions
+    }
+    contract_input_names = {
+        int(value_id): str(name)
+        for value_id, name in dict(logical_input_names or {}).items()
     }
     producer: dict[int, tuple[str, str]] = {}
     module_names = {
@@ -317,39 +469,75 @@ def emit_control_region_modules(
 
     modules = {}
     entries = []
+    # Byte-identical kernels (same topology + constants + dtype) share one file:
+    # the module binary is independent of the region's value-ids and name, so a
+    # program that repeats an operation over different data collapses to a
+    # handful of distinct kernels. Per-region method-card wiring is unaffected --
+    # only the emitted ``.wasm`` file dedups. ``kernel_files`` maps a binary
+    # hash to its shared kernel name.
+    kernel_files: dict[str, str] = {}
     edges = []
     logical_inputs: dict[str, list[tuple[str, str]]] = {}
     value_bindings: dict[int, str] = {
         value_id: f"out::{module_name}::{output_name}"
         for value_id, (module_name, output_name) in producer.items()
     }
-    static_offset = 0
+    # Reserve the heap-control bytes at the start of linear memory so the fixed
+    # HEAP_CURSOR_ADDR the container kernels bake never collides with static
+    # data. Region static data (and everything else) starts past it.
+    static_offset = HEAP_RESERVED_BYTES
     for region in ordered_regions:
         program = programs[region]
         module_name = module_names[region]
-        module = emit_wasm_module(
-            program,
-            name=module_name,
-            dtype=dtype,
-            imports=(WasmImport(
-                module="env",
-                field="memory",
-                kind="memory",
-                memory_pages=1,
-            ),),
-            static_data_offset=static_offset,
-        )
-        if not module.complete:
-            raise RuntimeError(module.shortfall_report())
+
+        def _lower_region(program=program, module_name=module_name,
+                          static_offset=static_offset):
+            module = emit_wasm_module(
+                program,
+                name=module_name,
+                dtype=dtype,
+                imports=(WasmImport(
+                    module="env",
+                    field="memory",
+                    kind="memory",
+                    memory_pages=1,
+                ),),
+                static_data_offset=static_offset,
+            )
+            # Raise *inside* the compute closure so an incomplete lowering
+            # never reaches the cache: a shortfall must be retried on the next
+            # pass, not persisted as if it were a finished region.
+            if not module.complete:
+                raise RuntimeError(
+                    module.shortfall_report()
+                    + _diagnose_region(program, region, module_name)
+                )
+            return module
+
+        if reduction_cache is not None:
+            module, was_cached = reduction_cache.get_or_compute(
+                _region_reduction_digest(
+                    program, module_name, dtype, static_offset
+                ),
+                _lower_region,
+            )
+        else:
+            module, was_cached = _lower_region(), False
+        if progress is not None:
+            progress(int(region), was_cached)
         modules[region] = module
+        kernel_hash = hashlib.sha256(module.binary).hexdigest()
+        kernel_name = kernel_files.setdefault(
+            kernel_hash, f"{owner_name}_k{kernel_hash[:12]}"
+        )
         api_entry = module.api.entry_points[0]
         inputs = [
             parameter.name for parameter in api_entry.parameters
-            if parameter.role == "input"
+            if parameter.role in {"input", "inout"}
         ]
         outputs = [
             parameter.name for parameter in api_entry.parameters
-            if parameter.role == "output"
+            if parameter.role in {"output", "inout"}
         ]
         feed_ids = tuple(map(int, program_feed_order(program)))
         if len(feed_ids) != len(inputs):
@@ -371,7 +559,9 @@ def emit_control_region_modules(
                 continue
             origin = origins.get(value_id, origins.get(str(value_id), {}))
             logical_name = str(
-                origin.get("binding_name") or f"input_{value_id}"
+                origin.get("binding_name")
+                or contract_input_names.get(value_id)
+                or f"input_{value_id}"
             )
             logical_inputs.setdefault(logical_name, []).append(
                 (module_name, input_name)
@@ -379,7 +569,10 @@ def emit_control_region_modules(
             value_bindings.setdefault(value_id, f"in::{logical_name}")
         entries.append({
             "name": module_name,
-            "url": f"{module_dir}/{module_name}.wasm",
+            # The kernel file is shared by byte-identical regions; the method
+            # card keeps its own per-region ``name`` for field-slot wiring.
+            "kernel": kernel_name,
+            "url": f"{module_dir}/{kernel_name}.wasm",
             "entry": module.api.entry,
             "inputs": inputs,
             "outputs": outputs,
@@ -392,6 +585,7 @@ def emit_control_region_modules(
                 "shared_memory_import", {"module": "env", "field": "memory"}
             ),
             "operation_count": len(program.steps),
+            "extent_effect": fused_program_extent_effect(program),
             "node_ids": [int(step.result_id) for step in program.steps],
             "is_root": False,
             "region_index": region,
@@ -400,6 +594,40 @@ def emit_control_region_modules(
             static_offset,
             int(module.api.metadata.get("reserved_bytes", 0)),
         )
+    # A field write (``index_set``) mutates its object in place: the updated
+    # buffer IS the source buffer. Redirect the region's output storage onto the
+    # ``data`` input's storage so the coordinator hands both the same resident
+    # slot -- the scatter store then writes the live field, not a fresh copy.
+    # (``build_class_inventory`` merges redirected keys into one field slot.)
+    storage_redirects: dict[str, str] = {}
+    for region in ordered_regions:
+        for step in getattr(programs[region], "steps", ()):
+            # Both subscript-store conventions put the target buffer first.
+            if step.op_name not in ("index_set", "IndexedStore"):
+                continue
+            out_key = value_bindings.get(step.result_id)
+            data_key = value_bindings.get(step.input_ids[0])
+            if out_key and data_key and out_key != data_key:
+                storage_redirects[str(out_key)] = str(data_key)
+
+    # A container field (a dict/list keyed by RVAs or string names) needs a heap
+    # map seeded by the coordinator, not a plain count-sized array. Detect them
+    # with the same predicates the backend uses to lower container stores/reads,
+    # and record the resident field key so the coordinator allocates a map there.
+    container_field_keys: set[str] = set()
+    for region in ordered_regions:
+        program = programs[region]
+        live = required_steps(program)
+        descriptor = (
+            _pure_container_store(program, live)
+            or _pure_container_read(program, live)
+        )
+        if descriptor is None:
+            continue
+        key = value_bindings.get(descriptor[0])
+        if key:
+            container_field_keys.add(str(key))
+
     return modules, {
         "modules": entries,
         "edges": edges,
@@ -410,6 +638,17 @@ def emit_control_region_modules(
         "value_bindings": {
             str(value_id): key for value_id, key in value_bindings.items()
         },
+        "storage_redirects": storage_redirects,
+        "container_fields": sorted(container_field_keys),
+        "heap": {
+            "cursor_addr": HEAP_CURSOR_ADDR,
+            "reserved_bytes": HEAP_RESERVED_BYTES,
+            "map_capacity": DEFAULT_MAP_CAPACITY,
+            "map_block_bytes": map_block_bytes(DEFAULT_MAP_CAPACITY),
+            "map_header_bytes": MAP_HEADER_BYTES,
+        },
+        "region_count": len(ordered_regions),
+        "unique_kernels": len(kernel_files),
     }
 
 
@@ -754,8 +993,8 @@ def build_manifest(
     for spec in specs:
         module = modules[spec.index]
         entry_point = module.api.entry_points[0]
-        inputs = [p.name for p in entry_point.parameters if p.role == "input"]
-        outputs = [p.name for p in entry_point.parameters if p.role == "output"]
+        inputs = [p.name for p in entry_point.parameters if p.role in {"input", "inout"}]
+        outputs = [p.name for p in entry_point.parameters if p.role in {"output", "inout"}]
         module_entries.append({
             "name": spec.module_name,
             "url": f"{module_dir}/{spec.module_name}.wasm",
@@ -818,6 +1057,8 @@ def build_embedded_class_graph(
     embed_binaries: bool = True,
     module_dir: str = "modules",
     storage_redirects: Mapping[str, str] | None = None,
+    input_names: Sequence[str] = (),
+    allow_external_outputs: bool = False,
 ) -> dict:
     """Adapt ``build_manifest`` for a logical program's browser shell.
 
@@ -832,6 +1073,12 @@ def build_embedded_class_graph(
     ``describe_process_graph_api`` uses, so a shell's input row (one per
     logical parameter) knows every ``(module, input)`` pair its value has
     to be delivered to, even when more than one chunk needs it directly.
+
+    ``storage_redirects`` aliases logical input storage to logical outputs.
+    When a redirect names an external feed whose capture provenance is absent,
+    ``input_names`` supplies the source ABI order.  The fallback is applied
+    only when every unnamed external feed is accounted for by a redirect, so
+    an incomplete contract cannot silently attach state to the wrong value.
     """
 
     import base64
@@ -851,12 +1098,55 @@ def build_embedded_class_graph(
         else:
             module_entries.append(dict(entry))
 
+    external_value_ids = {
+        int(value_id)
+        for value_entries in manifest["graph_input_value_ids"].values()
+        for value_id, _input_name in value_entries
+    }
+    unnamed_value_ids = [
+        int(value_id)
+        for value_id in ordered_feed_ids(program)
+        if int(value_id) in external_value_ids
+        and not (origins.get(value_id) or origins.get(str(value_id)))
+    ]
+    unnamed_value_ids.extend(sorted(
+        external_value_ids - set(unnamed_value_ids) - {
+            int(value_id)
+            for value_id in external_value_ids
+            if origins.get(value_id) or origins.get(str(value_id))
+        }
+    ))
+    redirects = dict(storage_redirects or {})
+    known_names = {
+        str(origin.get("binding_name"))
+        for value_id in external_value_ids
+        for origin in (origins.get(value_id) or origins.get(str(value_id)) or {},)
+        if origin.get("binding_name")
+    }
+    missing_redirect_inputs = set(redirects) - known_names
+    ordered_redirect_inputs = [
+        str(name) for name in input_names if str(name) in missing_redirect_inputs
+    ]
+    ordered_redirect_inputs.extend(
+        name for name in redirects
+        if name in missing_redirect_inputs and name not in ordered_redirect_inputs
+    )
+    fallback_names = (
+        dict(zip(unnamed_value_ids, ordered_redirect_inputs))
+        if len(unnamed_value_ids) == len(ordered_redirect_inputs)
+        else {}
+    )
+
     logical_inputs: dict[str, list[tuple[str, str]]] = {}
     for module_name, value_entries in manifest["graph_input_value_ids"].items():
         for value_id, input_name in value_entries:
-            origin = origins.get(value_id)
+            origin = origins.get(value_id) or origins.get(str(value_id))
             binding_name = origin.get("binding_name") if origin else None
-            logical_name = binding_name or f"input_{value_id}"
+            logical_name = (
+                binding_name
+                or fallback_names.get(int(value_id))
+                or f"input_{value_id}"
+            )
             logical_inputs.setdefault(logical_name, []).append(
                 (module_name, input_name)
             )
@@ -874,6 +1164,8 @@ def build_embedded_class_graph(
     for output_name, value_id in program.outputs.items():
         producer = producer_of_value.get(value_id)
         if producer is None:
+            if allow_external_outputs and int(value_id) in external_value_ids:
+                continue
             raise ValueError(
                 f"segmented program output {output_name!r} value {value_id} "
                 "has no producing module"
@@ -881,11 +1173,13 @@ def build_embedded_class_graph(
         logical_outputs[output_name] = list(producer)
 
     resolved_redirects = {}
-    for input_name, output_name in dict(storage_redirects or {}).items():
+    for input_name, output_name in redirects.items():
         if input_name not in logical_inputs:
             raise ValueError(f"storage redirect names unknown input {input_name!r}")
         producer = logical_outputs.get(output_name)
         if producer is None:
+            if allow_external_outputs:
+                continue
             raise ValueError(f"storage redirect names unknown output {output_name!r}")
         resolved_redirects[f"in::{input_name}"] = (
             f"out::{producer[0]}::{producer[1]}"
@@ -1199,5 +1493,6 @@ __all__ = [
     "emit_class_modules",
     "emit_control_region_modules",
     "partition_reduced_program",
+    "fused_program_extent_effect",
     "schedule_module_levels",
 ]

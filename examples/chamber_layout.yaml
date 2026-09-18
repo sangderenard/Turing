@@ -1,0 +1,141 @@
+# The chamber's program layout.
+#
+# Two things, and deliberately nothing else:
+#
+#   sequence   the order the stages run in
+#   alias      which state objects are ONE storage under several names
+#
+# A stage is one instance of one law.  Every unique state object of a stage
+# is a node, named <stage>.<object>.  An alias group is one slot in the
+# state tensor carrying every label in the group -- including the case that
+# matters most: the name a value has when a stage writes it, and the name it
+# has when the next reader reads it.
+#
+# THERE IS NO CONVERSION SLOT, ON PURPOSE.  If a value has to be scaled,
+# summed or otherwise computed on its way from one stage to another, it is
+# not an alias and it does not belong here: it is work, and work is a stage.
+# The layout cannot express it, which is how the rule is enforced rather
+# than merely stated.  The `unbuilt` section at the bottom lists exactly
+# where the chamber currently does such work in Python, so each one is a
+# visible, named debt rather than hidden glue.
+
+stages:
+  - name: ceiling
+    law: surface_step
+  - name: floor
+    law: surface_step
+  - name: pool
+    law: pool_step
+  - name: air
+    law: voxel_air_step
+  - name: water
+    law: voxel_species_step
+
+# Surfaces and pools see the gas as it stands at the start of the tick; the
+# air step then runs on their heat, and the species ride the air's flows.
+sequence: [ceiling, floor, pool, air, water]
+
+alias:
+
+  # ---- recurrence: what a stage wrote is what it reads next tick --------
+  # One slot, two labels.  The write is in place; there is no copy.
+  - [air.m_a_next,      air.m_a]
+  - [air.T_next,        air.T]
+  - [water.m_v_next,    water.m_v]
+  - [water.m_l_next,    water.m_l]
+  - [water.m_i_next,    water.m_i]
+  - [water.m_r_next,    water.m_r]
+  - [ceiling.m_film_next,   ceiling.m_film]
+  - [ceiling.m_frost_next,  ceiling.m_frost]
+  - [ceiling.rho_frost_next, ceiling.rho_frost]
+  - [ceiling.m_crust_next,  ceiling.m_crust]
+  - [ceiling.n_s_next,      ceiling.n_s_film]
+  - [ceiling.m_sed_next,    ceiling.m_sed]
+  - [ceiling.T_s_next,      ceiling.T_s]
+  - [floor.m_film_next,     floor.m_film]
+  - [floor.m_frost_next,    floor.m_frost]
+  - [floor.rho_frost_next,  floor.rho_frost]
+  - [floor.m_crust_next,    floor.m_crust]
+  - [floor.n_s_next,        floor.n_s_film]
+  - [floor.m_sed_next,      floor.m_sed]
+  - [floor.T_s_next,        floor.T_s]
+  - [pool.m_p_next,     pool.m_p]
+  - [pool.n_s_next,     pool.n_s_pool]
+  - [pool.T_l_next,     pool.T_l]
+
+  # ---- handoffs that really are one storage ----------------------------
+  # The air step's face flows ARE the species step's face flows.
+  - [air.F_xm, water.F_xm]
+  - [air.F_xp, water.F_xp]
+  - [air.F_ym, water.F_ym]
+  - [air.F_yp, water.F_yp]
+  - [air.F_zm, water.F_zm]
+  - [air.F_zp, water.F_zp]
+
+  # The cell's temperature is one temperature, for everything in it.
+  - [air.T, water.T, ceiling.T, floor.T, pool.T]
+
+  # The vapour partial pressure the species publishes is the ambient the
+  # surfaces and the pool evaporate against.
+  - [water.e, ceiling.e_amb, floor.e_amb, pool.e_amb]
+
+  # The cell's dry-air mass is the species step's carrier.
+  - [air.m_a, water.m_a]
+
+  # ---- parameters: declared once, read by whoever needs them -----------
+  - [air.dt, water.dt, ceiling.dt, floor.dt, pool.dt]
+  - [air.dx, water.dx]
+  - [air.R_a, ceiling.R_a, pool.R_a]
+  - [air.cv_a, ceiling.cv_a, pool.cv_a]
+  - [water.R_v, ceiling.R_v, pool.R_v]
+  - [water.P_tp, ceiling.P_tp, pool.P_tp]
+  - [water.T_tp, ceiling.T_tp, pool.T_tp]
+  - [water.L_v, ceiling.L_v, pool.L_v]
+  - [water.L_f, ceiling.L_f]
+  - [water.c_w, ceiling.c_w, pool.c_w]
+  - [water.c_i, ceiling.c_i]
+  - [ceiling.M_w, floor.M_w, pool.M_w]
+  - [ceiling.M_s, floor.M_s]
+  - [ceiling.R_u, floor.R_u, pool.R_u]
+  - [ceiling.rho_w, floor.rho_w, pool.rho_w]
+  - [ceiling.rho_air, floor.rho_air, pool.rho_air]
+  - [ceiling.g, floor.g, pool.g]
+  - [ceiling.h_conv, floor.h_conv, pool.h_conv]
+  - [ceiling.alpha_evap, floor.alpha_evap, pool.alpha_evap]
+  - [ceiling.sigma_l, floor.sigma_l, pool.sigma_l]
+  - [ceiling.theta_c, floor.theta_c, pool.theta_c]
+  - [ceiling.mu_l, floor.mu_l]
+  - [ceiling.i_vh, floor.i_vh, pool.i_vh]
+  - [ceiling.b_sat0, floor.b_sat0]
+  - [ceiling.db_sat_dT, floor.db_sat_dT]
+  - [ceiling.T_ref, floor.T_ref]
+
+# ---------------------------------------------------------------------
+# UNBUILT: work the chamber does in Python today that this layout refuses
+# to hide.  Each is a stage that has not been written.  Named here so the
+# debt is visible; nothing below is wired.
+# ---------------------------------------------------------------------
+unbuilt:
+  - stage: precipitation_to_surface
+    does: (water.rain_out + water.drizzle_out + water.snow_out) / dt
+    feeds: floor.phi_drop
+  - stage: runoff_to_pool
+    does: floor.runoff / dt
+    feeds: pool.phi_in
+  - stage: gas_heat_sum
+    does: sum of every species' Q_lat and every surface's and pool's Q_gas
+    feeds: air.Q_ext
+  - stage: condensate_capacity
+    does: sum over species of m_v*cv_v + (m_l + m_r)*c_w + m_i*c_i
+    feeds: air.C_cond
+  - stage: vapour_pressure_sum
+    does: sum over species of m_v*R_v*T/V
+    feeds: air.P_vap
+  - stage: neighbour_gather
+    does: gather of P, T, q and the cell above's m_l/m_i/m_r over the
+          voxel topology (air.P_xm..P_zp, air.T_xm..T_zp, water.q_xm..q_zp,
+          water.m_l_up/m_i_up/m_r_up)
+    feeds: the face and upstream inputs of air and water
+
+# Laws compiled and available, not instantiated by this scenario:
+#   aerosol_step, droplet_step, salt_solution_step

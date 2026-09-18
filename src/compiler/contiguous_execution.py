@@ -258,8 +258,13 @@ def contiguate(programs: Sequence[FusedProgram]) -> ContiguousExecutionPlan:
     )
     for operation in operations:
         if operation.relation is IndexRelation.CROSS_INVOCATION:
-            flush(before=previous_boundary, after=operation.reason)
+            flush(before=previous_boundary)
             pending.append(operation)
+            # A cross-invocation kernel may read values from many lanes and
+            # publish values consumed by many different workgroups. It must be
+            # isolated on BOTH sides: a GLSL barrier inside one workgroup is
+            # not a device-wide phase boundary.
+            flush(before=previous_boundary, after=operation.reason)
             previous_boundary = operation.reason
             continue
         pending.append(operation)

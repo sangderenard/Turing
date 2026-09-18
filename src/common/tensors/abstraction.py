@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque, NamedTuple, Iterable, TYPE_CHECKING
 import math
 import inspect
+import itertools
 from functools import wraps
 import time
 from collections import deque
@@ -218,11 +219,69 @@ def _register_all_conversions():
     PyTorchTensorOperations = BACKEND_REGISTRY.get("torch")
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
+_IDENTITY_COUNTER = itertools.count()
+
+
+def tensor_identity(value: Any) -> int:
+    """Return a stable identity token for ``value``.
+
+    ``id(value)`` is a memory address: once an object is freed, CPython is
+    free to hand that same address to a later, unrelated object. Any code
+    that uses ``id()`` as a durable cross-reference key (tape node keys,
+    ProcessGraph primitive-capture correlation, ...) can then silently
+    conflate two different values that happened not to be alive at the same
+    time. For an :class:`AbstractTensor`, a monotonic counter value is
+    assigned once, lazily, and cached on the instance itself -- so the token
+    lives exactly as long as the object and is never reused. Non-tensor
+    values fall back to ``id()`` since there is nowhere to cache a token.
+    """
+    if isinstance(value, AbstractTensor):
+        # Ordinary attribute access, not ``__dict__`` indexing. Reaching into
+        # the instance dictionary bypasses nothing here -- ``AbstractTensor``
+        # overrides neither ``__getattr__`` nor ``__setattr__`` -- but it does
+        # ingest as a literal dictionary read and write, so a graph built from
+        # this function carried a Python mapping into the IR and left a
+        # ``GetAttr('__dict__')`` chain that the planner could not place. The
+        # class-level default below means the read always resolves, so this is
+        # the same two operations expressed on the path every other attribute
+        # already takes.
+        token = value._identity_token
+        if token is None:
+            token = next(_IDENTITY_COUNTER)
+            value._identity_token = token
+        return token
+    return id(value)
+
+
+def _defers_to_reflected(other: Any) -> bool:
+    """Whether a forward dunder should step aside for ``other``'s own.
+
+    ``Precision`` is not an ``AbstractTensor`` -- it composes several of
+    them -- and carries its own ``__radd__``/``__rsub__``/etc. Python only
+    tries those when the forward call answers ``NotImplemented``; left
+    unchecked, ``AbstractTensor``'s forward operator instead falls through
+    to the numpy-facing backend, which does not recognise a ``Precision``
+    operand and raises trying to use it as an array dtype. That failure
+    reads as "numpy doesn't understand precision", but numpy is never
+    supposed to see it -- the reflected method is, and this is what lets
+    it.
+    """
+
+    from .extended_precision import Precision
+
+    return isinstance(other, Precision)
+
+
 class AbstractTensor:
+    # Declared so ``tensor_identity`` reads a slot that always exists rather
+    # than a lookup that misses on first use. Instances overwrite it with
+    # their own token; the class value is only ever the "not yet assigned"
+    # sentinel.
+    _identity_token: int | None = None
     _preferred_backend: str | None = None
     _preferred_device: Any = None
     inf: float = float('inf')
-    ninf: float = float('-inf')  
+    ninf: float = float('-inf')
     nan: float = float('nan')
 
     @staticmethod
@@ -236,9 +295,13 @@ class AbstractTensor:
         if not isinstance(x, AbstractTensor):
             x = AbstractTensor.tensor(x)
 
-        x = AbstractTensor.where(AbstractTensor.isnan(x), nan, x)
-        x = AbstractTensor.where(x == AbstractTensor.inf, posinf, x)
-        x = AbstractTensor.where(x == AbstractTensor.ninf, neginf, x)
+        # Use the selected backend's structural ``where`` implementation.
+        # Calling ``AbstractTensor.where`` directly bypasses a source-producing
+        # backend override and falls into the Python valuewise/tolist path.
+        where = type(x).where
+        x = where(AbstractTensor.isnan(x), nan, x)
+        x = where(x == AbstractTensor.inf, posinf, x)
+        x = where(x == AbstractTensor.ninf, neginf, x)
         return x
 
     def __index__(self):
@@ -471,6 +534,17 @@ class AbstractTensor:
 
     # --- Unary math ---
     def sqrt(self) -> "AbstractTensor":
+        # The transcendental switchboard covers the WHOLE surface: when the
+        # caller selected the signal-math cores or the compiled kernel bank,
+        # sqrt, exp and log route there exactly as the trigonometric surface
+        # does, so no method quietly keeps reaching the backend's borrowed
+        # libm while the rest of the mathematics is our own. The surface
+        # composes taped primitive operations, so it is not wrapped in a
+        # second autograd node here.
+        from .abstraction_methods import trigonometry as _switchboard
+
+        if _switchboard.active_implementation()[0] != "operator":
+            return _switchboard._dispatch("sqrt", self)
         finalize = AbstractTensor._pre_autograd("sqrt", [self])
         if isinstance(self, AbstractTensor):
             result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
@@ -483,6 +557,10 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement sqrt_()")
 
     def exp(self) -> "AbstractTensor":
+        from .abstraction_methods import trigonometry as _switchboard
+
+        if _switchboard.active_implementation()[0] != "operator":
+            return _switchboard._dispatch("exp", self)
         finalize = AbstractTensor._pre_autograd("exp", [self])
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.exp_()
@@ -492,6 +570,10 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement exp_()")
 
     def log(self) -> "AbstractTensor":
+        from .abstraction_methods import trigonometry as _switchboard
+
+        if _switchboard.active_implementation()[0] != "operator":
+            return _switchboard._dispatch("log", self)
         finalize = AbstractTensor._pre_autograd("log", [self])
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.log_()
@@ -502,27 +584,54 @@ class AbstractTensor:
 
     @staticmethod
     def real(x) -> "AbstractTensor":
-        """Return the real part of a complex tensor."""
+        """Return the real part of a complex tensor.
+
+        Records an autograd node: without this, ``fft -> real -> sum`` silently
+        returned no gradient at all, because ``real`` was the only usable exit
+        from the spectral domain and it never joined the tape.
+        """
         if not isinstance(x, AbstractTensor):
             x = AbstractTensor.tensor(x)
+        finalize = AbstractTensor._pre_autograd("real", [x])
         result = type(x)(track_time=x.track_time, tape=getattr(x, "_tape", None))
         result.data = x.real_()
-        return result
+        return finalize(result)
 
     def real_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement real_()")
 
     @staticmethod
     def imag(x) -> "AbstractTensor":
-        """Return the imaginary part of a complex tensor."""
+        """Return the imaginary part of a complex tensor. Records an autograd node."""
         if not isinstance(x, AbstractTensor):
             x = AbstractTensor.tensor(x)
+        finalize = AbstractTensor._pre_autograd("imag", [x])
         result = type(x)(track_time=x.track_time, tape=getattr(x, "_tape", None))
         result.data = x.imag_()
-        return result
+        return finalize(result)
 
     def imag_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement imag_()")
+
+    @staticmethod
+    def complex(real, imag) -> "AbstractTensor":
+        """Assemble a complex tensor from real and imaginary parts.
+
+        The inverse of :meth:`real`/:meth:`imag`; exists mainly so their
+        backward rules have something to construct a complex-valued gradient
+        with (``d/dx real(x) = complex(g, 0)`` for complex ``x``).
+        """
+        if not isinstance(real, AbstractTensor):
+            real = AbstractTensor.tensor(real)
+        if not isinstance(imag, AbstractTensor):
+            imag = AbstractTensor.tensor(imag)
+        finalize = AbstractTensor._pre_autograd("complex", [real, imag])
+        result = type(real)(track_time=real.track_time, tape=getattr(real, "_tape", None))
+        result.data = real.complex_(imag.data)
+        return finalize(result)
+
+    def complex_(self, imag):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement complex_()")
 
     # --- Softmax utilities ---
     def softmax(self, dim: int = -1) -> "AbstractTensor":
@@ -542,25 +651,87 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement log_softmax_()")
 
     # --- Basic layout ---
-    def mean(self, dim=None, keepdim: bool = False):
+    def _normalize_reduction_call(
+        self,
+        operation: str,
+        dim,
+        keepdim: bool,
+        *,
+        axis=None,
+        dtype=None,
+        out=None,
+        keepdims=None,
+    ):
+        """Normalize NumPy and tensor-dialect reduction spellings.
+
+        NumPy reduction dispatch calls an object's method with ``axis``,
+        ``dtype``, ``out``, and ``keepdims`` keywords.  The tensor dialect
+        historically exposed the equivalent ``dim`` and ``keepdim`` names.
+        Keeping the normalization here lets captured programs accept either
+        surface without teaching every backend about both ABIs.
+        """
+        if axis is not None:
+            if dim is not None and dim != axis:
+                raise TypeError(
+                    f"{operation}() received conflicting dim={dim!r} and axis={axis!r}"
+                )
+            dim = axis
+        if keepdims is not None:
+            if keepdim is not False and bool(keepdim) != bool(keepdims):
+                raise TypeError(
+                    f"{operation}() received conflicting keepdim and keepdims values"
+                )
+            keepdim = bool(keepdims)
+        if out is not None:
+            raise TypeError(
+                f"{operation}() does not support an out arena; alias the returned tensor instead"
+            )
+        source = self if dtype is None else self.to_dtype(dtype)
+        return source, dim, keepdim
+
+    def mean(
+        self,
+        dim=None,
+        keepdim: bool = False,
+        *,
+        axis=None,
+        dtype=None,
+        out=None,
+        keepdims=None,
+    ):
         """Return the mean of the tensor along the specified dimension(s)."""
-        finalize = AbstractTensor._pre_autograd(
-            "mean", [self], params={"axis": dim, "keepdim": keepdim}
+        source, dim, keepdim = self._normalize_reduction_call(
+            "mean", dim, keepdim, axis=axis, dtype=dtype, out=out, keepdims=keepdims
         )
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.mean_(dim=dim, keepdim=keepdim)
+        finalize = AbstractTensor._pre_autograd(
+            "mean", [source], params={"axis": dim, "keepdim": keepdim}
+        )
+        result = type(source)(track_time=source.track_time, tape=getattr(source, "_tape", None))
+        result.data = source.mean_(dim=dim, keepdim=keepdim)
         result = finalize(result)
         if getattr(result.data, "shape", ()) == ():
             return AbstractScalar.__new__(AbstractScalar, result)
         return result
 
-    def sum(self, dim=None, keepdim: bool = False):
+    def sum(
+        self,
+        dim=None,
+        keepdim: bool = False,
+        *,
+        axis=None,
+        dtype=None,
+        out=None,
+        keepdims=None,
+    ):
         """Return the sum of the tensor along the specified dimension(s)."""
-        finalize = AbstractTensor._pre_autograd(
-            "sum", [self], params={"axis": dim, "keepdim": keepdim}
+        source, dim, keepdim = self._normalize_reduction_call(
+            "sum", dim, keepdim, axis=axis, dtype=dtype, out=out, keepdims=keepdims
         )
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.sum_(dim=dim, keepdim=keepdim)
+        finalize = AbstractTensor._pre_autograd(
+            "sum", [source], params={"axis": dim, "keepdim": keepdim}
+        )
+        result = type(source)(track_time=source.track_time, tape=getattr(source, "_tape", None))
+        result.data = source.sum_(dim=dim, keepdim=keepdim)
         result = finalize(result)
         if getattr(result.data, "shape", ()) == ():
             return AbstractScalar.__new__(AbstractScalar, result)
@@ -575,13 +746,25 @@ class AbstractTensor:
         result.data = self.cumsum_(dim)
         return finalize(result)
 
-    def min(self, dim=None, keepdim: bool = False):
+    def min(
+        self,
+        dim=None,
+        keepdim: bool = False,
+        *,
+        axis=None,
+        dtype=None,
+        out=None,
+        keepdims=None,
+    ):
         """Return the minimum of the tensor along the specified dimension(s)."""
-        finalize = AbstractTensor._pre_autograd(
-            "min", [self], params={"axis": dim, "keepdim": keepdim}
+        source, dim, keepdim = self._normalize_reduction_call(
+            "min", dim, keepdim, axis=axis, dtype=dtype, out=out, keepdims=keepdims
         )
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.min_(dim=dim, keepdim=keepdim)
+        finalize = AbstractTensor._pre_autograd(
+            "min", [source], params={"axis": dim, "keepdim": keepdim}
+        )
+        result = type(source)(track_time=source.track_time, tape=getattr(source, "_tape", None))
+        result.data = source.min_(dim=dim, keepdim=keepdim)
         result = finalize(result)
         if getattr(result.data, "shape", ()) == ():
             return AbstractScalar.__new__(AbstractScalar, result)
@@ -849,7 +1032,14 @@ class AbstractTensor:
         # elementwise ops through it instead of NumPy; when it is not,
         # NodusTensorOperations falls back to the inherited NumPy behaviour
         # per-op, so preferring it here costs nothing when nodus is absent.
-        for backend_name in ("nodus", "numpy", "torch", "pure_python"):
+        # ABSTRACT_TENSOR_BACKEND names the backend to try first, process
+        # wide, without touching code: e.g. "numpy" to keep an eager run on
+        # plain NumPy while the nodus arena is connected.
+        requested = os.environ.get("ABSTRACT_TENSOR_BACKEND", "").strip().lower()
+        order = ("nodus", "numpy", "torch", "pure_python")
+        if requested:
+            order = (requested,) + tuple(name for name in order if name != requested)
+        for backend_name in order:
             backend_cls = BACKEND_REGISTRY.get(backend_name)
             if backend_cls is not None:
                 cls = backend_cls
@@ -1128,10 +1318,20 @@ class AbstractTensor:
         result.data = self.log_softmax_(dim)
         return result
 
-    def pad(self, pad: Tuple[int, ...] = (0, 0), value: float = 0) -> "AbstractTensor":
+    def pad(
+        self,
+        pad: Tuple[int, ...] = (0, 0),
+        value: float = 0,
+        mode: str = "constant",
+    ) -> "AbstractTensor":
+        finalize = AbstractTensor._pre_autograd(
+            "pad",
+            [self],
+            params={"pad": pad, "value": value, "mode": mode},
+        )
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.pad_(pad, value)
-        return result
+        result.data = self.pad_(pad, value, mode=mode)
+        return finalize(result)
 
     # --- 2D spatial helpers -------------------------------------------------
     def pad2d(self, pad: Tuple[int, int, int, int], value: float = 0.0) -> "AbstractTensor":
@@ -1710,9 +1910,18 @@ class AbstractTensor:
         )
 
     def index_select(self, dim: int = 0, indices: Any = None) -> "AbstractTensor":
+        # Was missing entirely: this built its result directly with no
+        # _pre_autograd call, so any gradient reaching an index_select in
+        # the forward graph silently stopped here -- found while building
+        # AbstractTensor.interp, which genuinely needs to backprop through
+        # the gathers that pick each query point's bracketing samples.
+        indices_tensor = indices if isinstance(indices, AbstractTensor) else self.ensure_tensor(indices)
+        finalize = AbstractTensor._pre_autograd(
+            "index_select", [self, indices_tensor], params={"dim": dim}
+        )
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.index_select_(dim, indices)
-        return result
+        return finalize(result)
 
     def argmin(self, dim: Optional[int] = None) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
@@ -1763,17 +1972,11 @@ class AbstractTensor:
     def to_dtype(self, dtype: str = "float") -> "AbstractTensor":
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.to_dtype_(dtype)
-        source_kind = getattr(
-            getattr(getattr(self, "data", None), "dtype", None),
-            "kind",
-            None,
-        )
-        target_kind = getattr(
-            getattr(getattr(result, "data", None), "dtype", None),
-            "kind",
-            None,
-        )
-        if target_kind == source_kind:
+        source_dtype = getattr(getattr(self, "data", None), "dtype", None)
+        target_dtype = getattr(getattr(result, "data", None), "dtype", None)
+        source_kind = getattr(source_dtype, "kind", None)
+        target_kind = getattr(target_dtype, "kind", None)
+        if source_dtype == target_dtype:
             operation = "reshape"
             params = {"shape": tuple(result.shape)}
         elif target_kind == "b":
@@ -1834,6 +2037,61 @@ class AbstractTensor:
         finalize = AbstractTensor._pre_autograd("searchsorted", [seq, vals], params={"side": side})
         return finalize(counts)
     @staticmethod
+    def interp(x_new: Any, x: Any, y: Any) -> "AbstractTensor":
+        """1-D linear interpolation, base-operator only.
+
+        Built from ``searchsorted`` (itself compare+sum, no backend hook)
+        plus ``index_select`` and ordinary arithmetic -- no backend hook
+        here either, so every backend inherits it, and it stays on the
+        autograd tape (differentiable in both ``x_new`` and ``y``). This is
+        the same "define once in base operators" pattern as
+        ``unravel_index_``/``searchsorted`` themselves: written for a real
+        need (porting a CWT inverse-transform's upsampling step, which used
+        ``torch.nn.functional.interpolate``, an eager, non-lowerable escape
+        hatch unsuitable for compilation) rather than as a general
+        image-resize facility -- see ``AbstractTensor.F.interpolate`` for
+        that different, torch/PIL/scipy-backed job.
+
+        ``x`` are known sample points (ascending, 1-D), ``y`` their values,
+        ``x_new`` the query points. Outside ``[x[0], x[-1]]`` the boundary
+        value is held constant, matching ``numpy.interp``'s default.
+        """
+        x = AbstractTensor.get_tensor(x)
+        y = AbstractTensor.get_tensor(y)
+        x_new = AbstractTensor.get_tensor(x_new)
+
+        n = x.get_shape()[0]
+        # Right-side insertion index, clamped to [1, n-1]: lo = idx-1 and
+        # hi = idx are then always valid neighbours, including exactly at a
+        # sample point and outside either boundary (where the clamp holds
+        # the nearest edge segment, giving the constant-extrapolation
+        # boundary behaviour numpy.interp has by default).
+        idx = AbstractTensor.searchsorted(x, x_new, side="right")
+        idx = idx.clip(1, n - 1)
+        lo = idx - 1
+
+        x_lo = x.index_select(0, lo)
+        x_hi = x.index_select(0, idx)
+        y_lo = y.index_select(0, lo)
+        y_hi = y.index_select(0, idx)
+
+        span = x_hi - x_lo
+        # A repeated sample point makes span exactly 0; the weight is
+        # irrelevant there since y_lo == y_hi for that segment, so guard the
+        # division rather than let a NaN reach an otherwise-exact result.
+        safe_span = AbstractTensor.where(
+            span == 0, AbstractTensor.ones_like(span), span
+        )
+        t = (x_new - x_lo) / safe_span
+        # Outside [x[0], x[-1]] the segment picked by the index clamp above
+        # is the nearest edge one, but t itself still linearly extrapolates
+        # past it unless also clamped -- clamping t to [0, 1] is exactly
+        # "hold the boundary value constant" (numpy.interp's default) while
+        # leaving every interior t (already naturally in [0, 1]) untouched.
+        t = t.clip(0.0, 1.0)
+        return y_lo + t * (y_hi - y_lo)
+
+    @staticmethod
     def concat(*args, **kwargs):
         return AbstractTensor.cat(*args, **kwargs)
     # --- Order statistics --------------------------------------------------
@@ -1879,6 +2137,11 @@ class AbstractTensor:
         - Interpolation uses NumPy's traditional "linear" scheme with
           rank = p/100 * (N-1).
         """
+        # Several public call sites intentionally use the class-style form
+        # ``AbstractTensor.percentile(sequence, n)``.  Normalize that first
+        # operand just as the rest of the high-level tensor API does, while
+        # leaving ordinary instance calls unchanged.
+        self = AbstractTensor.get_tensor(self)
         # Parse percentile and behaviour flags
         try:
             p = float(n)
@@ -2234,10 +2497,14 @@ class AbstractTensor:
         return lambda result: result
 
     def matmul(self, other: AbstractTensor) -> AbstractTensor:
-        """Matrix multiplication."""
-        return self._apply_operator("matmul", self, other)
+        """Matrix multiplication through the compiler-owned BLAS semantic seam."""
+        from .abstraction_methods.blas import matmul
 
-    def _apply_operator(self, op: str, left: Any, right: Any):
+        return matmul(self, other)
+
+    def _apply_operator(self, op: str, left: Any, right: Any, *,
+                        limbs: int = 1, accumulator: Any = None,
+                        accumulate_output: bool = False):
         """
         Arithmetic with bool tensors:
         - if mixing with floats/complex -> cast bool to float
@@ -2253,6 +2520,43 @@ class AbstractTensor:
             right = left.ensure_tensor(right)      # instead of get_tensor(... Faculty.NUMPY)
         elif isinstance(right, AbstractTensor) and isinstance(left, (list, tuple)):
             left = right.ensure_tensor(left)       # instead of get_tensor(... Faculty.NUMPY)
+
+        # Extended precision is a SPECIAL CASE, caught here and handled by the
+        # operand that owns it -- not mixed into this path. A limbed value
+        # keeps its limbs in extra channels, and a general tensor operation
+        # cannot be taught to see past them: measured, ``mean`` on a two-limb
+        # value returned half of it, because it divided by the widened element
+        # count. ``sum``, ``max`` and the rest were right only by accident.
+        #
+        # So the width lives on its own type, which owns the operators that
+        # understand it, and everything else either collapses at the boundary
+        # or refuses. Being loudly unsupported beats being quietly halved.
+        from .extended_precision import Precision
+
+        # Width is a PARAMETER of the operation, so the existing operator
+        # deployment carries it: a caller that wants an exact step asks for it
+        # here and every backend, every dtype and the tape all keep working,
+        # because nothing else in this path changes.
+        #
+        # It reaches the operation two ways, and both are the same request. An
+        # operand may already be a ``Precision``, which is how width travels
+        # down a chain without being restated at every step; or the call names
+        # ``limbs`` directly, which is how the first step of a chain gets its
+        # width in the first place. A promotion at the boundary and a
+        # parameter at the call are the same thing said at different times.
+        #
+        # ``limbs=1`` is the default and costs one comparison, so ordinary
+        # arithmetic is untouched -- which matters, because a wider default
+        # buys nothing measurable for a single + - * /: IEEE already returns
+        # the correctly rounded result, and computing one wide and rounding
+        # back was bit-identical on every pair tested.
+        width = max(int(limbs or 1),
+                    Precision.width_of(left), Precision.width_of(right))
+        if width > 1 or accumulator is not None:
+            return Precision.dispatch(
+                op, left, right, limbs=width, accumulator=accumulator,
+                accumulate_output=accumulate_output,
+            )
 
         # Record first using the original operand wrappers so parameter identity
         # is preserved on the tape (ids match actual model params).
@@ -2380,15 +2684,23 @@ class AbstractTensor:
 
 
     def __add__(self, other):
+        if _defers_to_reflected(other):
+            return NotImplemented
         return self._apply_operator("add", self, other)
 
     def __sub__(self, other):
+        if _defers_to_reflected(other):
+            return NotImplemented
         return self._apply_operator("sub", self, other)
 
     def __mul__(self, other):
+        if _defers_to_reflected(other):
+            return NotImplemented
         return self._apply_operator("mul", self, other)
 
     def __truediv__(self, other):
+        if _defers_to_reflected(other):
+            return NotImplemented
         return self._apply_operator("truediv", self, other)
 
     def __floordiv__(self, other):
@@ -2401,7 +2713,9 @@ class AbstractTensor:
         return self._apply_operator("pow", self, other)
 
     def __matmul__(self, other):
-        return self._apply_operator("matmul", self, other)
+        from .abstraction_methods.blas import matmul
+
+        return matmul(self, other)
 
     def __eq__(self, other):
         return self.equal(other)
@@ -2444,7 +2758,9 @@ class AbstractTensor:
         return self._apply_operator("pow", other, self)
 
     def __rmatmul__(self, other):
-        return self._apply_operator("matmul", other, self)
+        from .abstraction_methods.blas import rmatmul
+
+        return rmatmul(self, other)
 
     # In-place operators
     def __iadd__(self, other):
@@ -2469,7 +2785,9 @@ class AbstractTensor:
         return self._apply_operator("ipow", self, other)
 
     def __imatmul__(self, other):
-        return self._apply_operator("imatmul", self, other)
+        from .abstraction_methods.blas import imatmul
+
+        return imatmul(self, other)
 
     # --- Indexing helpers ---
     def __getitem__(self, idx):
@@ -2505,8 +2823,19 @@ class AbstractTensor:
         # ---- prefer backend-specific get_item_ if available ----
         # Try to locate the ops/backend object (name may vary in your codebase)
 
+        index_tensors = (
+            tuple(item for item in idx if isinstance(item, AbstractTensor))
+            if isinstance(idx, tuple)
+            else (idx,) if isinstance(idx, AbstractTensor)
+            else ()
+        )
         finalize = AbstractTensor._pre_autograd(
-            "slice", [self], params={"slices": index}
+            "slice",
+            [self],
+            params={
+                "slices": index,
+                "index_tensors": index_tensors,
+            },
         )
 
         if hasattr(self, "get_item_"):
@@ -2519,6 +2848,23 @@ class AbstractTensor:
         if isinstance(result, self.tensor_type):
             wrapped = type(self)(track_time=getattr(self, "track_time", False), tape=getattr(self, "_tape", None))
             wrapped.data = result
+            return finalize(wrapped)
+        if getattr(AbstractTensor.autograd, "capture_all", False):
+            # Backends commonly return a native scalar for an integer index
+            # (NumPy's ``np.float64`` is the usual example).  Compiler forward
+            # observation preserves the backend and scalar rank in a fresh
+            # wrapper so the recorded occurrence and later no-grad loop
+            # occurrences agree on result type and shape.  Ordinary Python
+            # execution retains the backend's native scalar behavior.
+            wrapped = type(self)(
+                track_time=getattr(self, "track_time", False),
+                tape=getattr(self, "_tape", None),
+            )
+            wrapped.data = self.tensor_from_list_(
+                result,
+                dtype=getattr(result, "dtype", None),
+                device=self.get_device(),
+            )
             return finalize(wrapped)
         return result
 
@@ -2638,9 +2984,19 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement squeeze_()")
 
     def unravel_index_(self, shape):
-        raise NotImplementedError(
-            f"{self.__class__.__name__} must implement unravel_index_()"
-        )
+        """Row-major coordinate decomposition, built from base operators.
+
+        ``%`` and ``//`` are enough to unravel an index, so this needs no
+        backend support at all: every backend inherits a working version, and
+        it is correct for array indices as well as scalars.  Backends may still
+        override with a native call, but none has to.
+        """
+        remaining = self
+        coords = []
+        for extent in reversed(tuple(shape)):
+            coords.append(remaining % extent)
+            remaining = remaining // extent
+        return tuple(reversed(coords))
 
     def nbytes_(self) -> int:
         """Backend hook for nbytes query."""
@@ -3200,8 +3556,8 @@ def _wrap_with_autograd(name: str, func: Callable) -> Callable:
         # canonical node with normalized parameters. Do not overwrite that
         # node with the parameterless compatibility wrapper record.
         tape = getattr(result, "_tape", None)
-        existing = getattr(tape, "_nodes", {}).get(id(result))
-        previous = previous_nodes.get(id(tape), {}).get(id(result))
+        existing = getattr(tape, "_nodes", {}).get(tensor_identity(result))
+        previous = previous_nodes.get(id(tape), {}).get(tensor_identity(result))
         if (
             existing is not None
             and existing is not previous
@@ -3503,15 +3859,31 @@ from .abstraction_methods.elementwise import (
     __or__ as elementwise_or,
     __xor__ as elementwise_xor,
     __invert__ as elementwise_invert,
+    __lshift__ as elementwise_lshift,
+    __rshift__ as elementwise_rshift,
     where as elementwise_where,
     sign as elementwise_sign,
+    sigmoid as elementwise_sigmoid,
     maximum as elementwise_maximum,
     minimum as elementwise_minimum,
+    atan2 as elementwise_atan2,
+    round as elementwise_round,
+    floor as elementwise_floor,
     _as_scalar, _scalar_kernel,
     _v1_valuewise, _v2_valuewise, _v3_valuewise
 )
 
+# --- SSA structural mirrors (from abstraction_methods/ssa_structure.py) ---
+# One attribute deeper than the tensor methods on purpose: this is program
+# structure vocabulary (class/field/method/function definitions and the field
+# accessor pair), not a tensor operation, and it should not surface to someone
+# browsing tensor methods. See that module for why it exists at all.
+from .abstraction_methods.ssa_structure import SSA_STRUCTURE as _ssa_structure
+
+AbstractTensor.ssa = _ssa_structure
+
 # --- Elementwise operator assignments (from abstraction_methods/elementwise.py) ---
+AbstractTensor.sigmoid   = elementwise_sigmoid
 AbstractTensor.__eq__    = elementwise_eq
 AbstractTensor.__ne__    = elementwise_ne
 AbstractTensor.__lt__    = elementwise_lt
@@ -3522,13 +3894,25 @@ AbstractTensor.__and__   = elementwise_and
 AbstractTensor.__or__    = elementwise_or
 AbstractTensor.__xor__   = elementwise_xor
 AbstractTensor.__invert__= elementwise_invert
+AbstractTensor.__lshift__= elementwise_lshift
+AbstractTensor.__rshift__= elementwise_rshift
 AbstractTensor.where     = staticmethod(elementwise_where)
 AbstractTensor.sign      = elementwise_sign
 AbstractTensor.maximum   = elementwise_maximum
 AbstractTensor.minimum   = elementwise_minimum
+AbstractTensor.atan2     = elementwise_atan2
+AbstractTensor.round     = elementwise_round
+AbstractTensor.floor     = elementwise_floor
 
 AbstractTensor._as_scalar   = staticmethod(_as_scalar)
 AbstractTensor._scalar_kernel = staticmethod(_scalar_kernel)
 AbstractTensor._v1_valuewise  = _v1_valuewise
 AbstractTensor._v2_valuewise  = _v2_valuewise
 AbstractTensor._v3_valuewise  = _v3_valuewise
+
+# Install the semantic mathematical-library hierarchy only after the class and
+# its public operators are complete.  The namespace composes those operators;
+# it never materializes through the optional native Python product.
+from .mathematical_library import install_abstract_tensor_mathematical_library
+
+install_abstract_tensor_mathematical_library(AbstractTensor)

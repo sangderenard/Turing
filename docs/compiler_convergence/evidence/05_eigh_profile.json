@@ -1,0 +1,205 @@
+{
+  "schema": "turing.eigh-profile.v1",
+  "source_authority": "tests/test_compiled_linalg.py::JACOBI_EIGH",
+  "rows": [
+    {
+      "algorithm": "compiled-whole-jacobi-test-kernel",
+      "contract": "fast",
+      "size": 3,
+      "compile_seconds": 2.328380199993262,
+      "first_call_seconds": 0.0051263000059407204,
+      "relaunch_median_seconds": 9.059999138116837e-05,
+      "warm_median_seconds": 9.300012607127428e-06,
+      "errors": {
+        "eigenvalue_max_abs": 1.7763568394002505e-15,
+        "orthogonality_max_abs": 1.3322676295501878e-15,
+        "residual_max_abs": 1.2212453270876722e-15
+      },
+      "status": "timed",
+      "sweeps": 12,
+      "tolerance": 1e-15,
+      "spectrum": "orthogonal Q @ diag(linspace(1,2,n)) @ Q.T"
+    },
+    {
+      "algorithm": "abstract-tensor-jacobi",
+      "size": 3,
+      "compile_seconds": null,
+      "first_call_seconds": 0.08833030000096187,
+      "relaunch_median_seconds": null,
+      "warm_median_seconds": 0.08834859999478795,
+      "errors": {
+        "eigenvalue_max_abs": 3.1086244689504383e-15,
+        "orthogonality_max_abs": 1.1102230246251565e-15,
+        "residual_max_abs": 2.220446049250313e-15
+      },
+      "contract": "abstract-tensor-default",
+      "status": "timed",
+      "sweeps": 12,
+      "tolerance": 1e-15,
+      "spectrum": "orthogonal Q @ diag(linspace(1,2,n)) @ Q.T"
+    },
+    {
+      "algorithm": "abstract-tensor-blas",
+      "size": 3,
+      "compile_seconds": null,
+      "first_call_seconds": 0.634754900005646,
+      "relaunch_median_seconds": null,
+      "warm_median_seconds": 0.0020349999831523746,
+      "errors": {
+        "eigenvalue_max_abs": 3.1086244689504383e-15,
+        "orthogonality_max_abs": 1.1102230246251565e-15,
+        "residual_max_abs": 2.220446049250313e-15
+      },
+      "contract": "develop",
+      "native_rotation": {
+        "route": "specialized",
+        "module_key": "a38541da8c085f27",
+        "problem_n": 3,
+        "prebaked_n": 9,
+        "parameter_ids_by_name": {
+          "s": 2,
+          "y": 4,
+          "c": 0,
+          "x": 3
+        }
+      },
+      "status": "timed",
+      "sweeps": 12,
+      "tolerance": 1e-15,
+      "spectrum": "orthogonal Q @ diag(linspace(1,2,n)) @ Q.T"
+    },
+    {
+      "algorithm": "compiled-whole-jacobi-test-kernel",
+      "contract": "fast",
+      "size": 4,
+      "compile_seconds": 2.328380199993262,
+      "first_call_seconds": 0.00012320000678300858,
+      "relaunch_median_seconds": 9.280000813305378e-05,
+      "warm_median_seconds": 1.2399978004395962e-05,
+      "errors": {
+        "eigenvalue_max_abs": 1.3322676295501878e-15,
+        "orthogonality_max_abs": 5.551115123125783e-16,
+        "residual_max_abs": 4.440892098500626e-16
+      },
+      "status": "timed",
+      "sweeps": 12,
+      "tolerance": 1e-15,
+      "spectrum": "orthogonal Q @ diag(linspace(1,2,n)) @ Q.T"
+    },
+    {
+      "algorithm": "abstract-tensor-jacobi",
+      "size": 4,
+      "compile_seconds": null,
+      "first_call_seconds": 0.17485260000103153,
+      "relaunch_median_seconds": null,
+      "warm_median_seconds": 0.17564080000738613,
+      "errors": {
+        "eigenvalue_max_abs": 1.3322676295501878e-15,
+        "orthogonality_max_abs": 2.220446049250313e-16,
+        "residual_max_abs": 2.55351295663786e-15
+      },
+      "contract": "abstract-tensor-default",
+      "status": "timed",
+      "sweeps": 12,
+      "tolerance": 1e-15,
+      "spectrum": "orthogonal Q @ diag(linspace(1,2,n)) @ Q.T"
+    },
+    {
+      "algorithm": "abstract-tensor-blas",
+      "size": 4,
+      "compile_seconds": null,
+      "first_call_seconds": 0.003686499985633418,
+      "relaunch_median_seconds": null,
+      "warm_median_seconds": 0.003403799986699596,
+      "errors": {
+        "eigenvalue_max_abs": 1.3322676295501878e-15,
+        "orthogonality_max_abs": 2.220446049250313e-16,
+        "residual_max_abs": 2.55351295663786e-15
+      },
+      "contract": "develop",
+      "native_rotation": {
+        "route": "specialized",
+        "module_key": "a38541da8c085f27",
+        "problem_n": 4,
+        "prebaked_n": 9,
+        "parameter_ids_by_name": {
+          "s": 2,
+          "y": 4,
+          "c": 0,
+          "x": 3
+        }
+      },
+      "status": "timed",
+      "sweeps": 12,
+      "tolerance": 1e-15,
+      "spectrum": "orthogonal Q @ diag(linspace(1,2,n)) @ Q.T"
+    },
+    {
+      "algorithm": "compiled-whole-jacobi-test-kernel",
+      "contract": "fast",
+      "size": 6,
+      "compile_seconds": 2.328380199993262,
+      "first_call_seconds": 0.00013219998800195754,
+      "relaunch_median_seconds": 0.00010060000931844115,
+      "warm_median_seconds": 2.3800006601959467e-05,
+      "errors": {
+        "eigenvalue_max_abs": 2.220446049250313e-15,
+        "orthogonality_max_abs": 1.5543122344752192e-15,
+        "residual_max_abs": 1.9984014443252818e-15
+      },
+      "status": "timed",
+      "sweeps": 12,
+      "tolerance": 1e-15,
+      "spectrum": "orthogonal Q @ diag(linspace(1,2,n)) @ Q.T"
+    },
+    {
+      "algorithm": "abstract-tensor-jacobi",
+      "size": 6,
+      "compile_seconds": null,
+      "first_call_seconds": 0.4278078000061214,
+      "relaunch_median_seconds": null,
+      "warm_median_seconds": 0.4316804999834858,
+      "errors": {
+        "eigenvalue_max_abs": 3.774758283725532e-15,
+        "orthogonality_max_abs": 1.5543122344752192e-15,
+        "residual_max_abs": 3.9968028886505635e-15
+      },
+      "contract": "abstract-tensor-default",
+      "status": "timed",
+      "sweeps": 12,
+      "tolerance": 1e-15,
+      "spectrum": "orthogonal Q @ diag(linspace(1,2,n)) @ Q.T"
+    },
+    {
+      "algorithm": "abstract-tensor-blas",
+      "size": 6,
+      "compile_seconds": null,
+      "first_call_seconds": 0.010250999999698251,
+      "relaunch_median_seconds": null,
+      "warm_median_seconds": 0.009673199994722381,
+      "errors": {
+        "eigenvalue_max_abs": 3.774758283725532e-15,
+        "orthogonality_max_abs": 1.5543122344752192e-15,
+        "residual_max_abs": 3.9968028886505635e-15
+      },
+      "contract": "develop",
+      "native_rotation": {
+        "route": "specialized",
+        "module_key": "a38541da8c085f27",
+        "problem_n": 6,
+        "prebaked_n": 9,
+        "parameter_ids_by_name": {
+          "s": 2,
+          "y": 4,
+          "c": 0,
+          "x": 3
+        }
+      },
+      "status": "timed",
+      "sweeps": 12,
+      "tolerance": 1e-15,
+      "spectrum": "orthogonal Q @ diag(linspace(1,2,n)) @ Q.T"
+    }
+  ],
+  "backward_policy": "no opaque EIGH backward is installed; the BLAS route refuses autograd semantics and the Jacobi route retains primitive tape ops"
+}

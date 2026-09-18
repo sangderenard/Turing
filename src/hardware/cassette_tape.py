@@ -65,6 +65,7 @@ class CassetteTapeBackend:
     # -------------------------- Simulation & Audio ----------------------------- #
     sample_rate_hz: int = 44100
     time_scale_factor: float = 1.0
+    play_audio: bool = True
     
     attack_ms: float = 2.0
     decay_ms: float = 2.0
@@ -90,10 +91,22 @@ class CassetteTapeBackend:
     _audio_queue: Optional[queue.Queue] = None
     _audio_thread: threading.Thread | None = None
 
+    # Monotonic physical-work counters.  These deliberately count attempted
+    # transport activity independently of wall-clock acceleration so compiler
+    # witnesses can compare predicted and observed tape costs.
+    _seek_operations: int = 0
+    _seek_distance_inches: float = 0.0
+    _read_frames: int = 0
+    _write_frames: int = 0
+    _movement_inches: float = 0.0
+
     # Optional callback for visualizers (e.g., reel demos) to receive
     # updates on tape position and activity. The callable should accept
     # ``(tape_position_tuple, head_pos_inches, reading, writing)``.
     status_callback: Callable[[Tuple[int, int], float, bool, bool], None] | None = None
+    activity_callback: Callable[
+        [Tuple[int, int], float, bool, bool, str], None
+    ] | None = None
 
     def __post_init__(self):
         if np is None:
@@ -137,17 +150,29 @@ class CassetteTapeBackend:
 
     def _notify_status(self, op_name: str) -> None:
         """Send tape position and activity to the status callback if present."""
-        if self.status_callback is None:
-            return
         current_bit = int(round(self._head_pos_inches * self.bits_per_inch))
         left = max(self.total_bits - current_bit, 0)
         right = min(current_bit, self.total_bits)
         reading = op_name == "read"
         writing = op_name == "write"
-        try:
-            self.status_callback((left, right), self._head_pos_inches, reading, writing)
-        except Exception:
-            pass
+        if self.status_callback is not None:
+            try:
+                self.status_callback(
+                    (left, right), self._head_pos_inches, reading, writing,
+                )
+            except Exception:
+                pass
+        if self.activity_callback is not None:
+            try:
+                self.activity_callback(
+                    (left, right),
+                    self._head_pos_inches,
+                    reading,
+                    writing,
+                    op_name,
+                )
+            except Exception:
+                pass
 
     def _ensure_audio_capacity(self, required_samples: int):
         if self._buffer_cursor + required_samples > len(self._audio_buffer):
@@ -163,6 +188,9 @@ class CassetteTapeBackend:
         if abs(distance_inches) < 1e-6:
             self._notify_status("seek")
             return
+
+        self._seek_operations += 1
+        self._seek_distance_inches += abs(distance_inches)
         
         direction = 1 if distance_inches > 0 else -1
         self._simulate_movement(abs(distance_inches), self.seek_speed_ips, direction, 'seek')
@@ -179,6 +207,7 @@ class CassetteTapeBackend:
             if current_idx != bit_idx:
                 raise RuntimeError("head misaligned for read")
             bit_width_inches = 1.0 / self.bits_per_inch
+            self._read_frames += 1
             self._head.enqueue_read(track, lane, bit_idx)
             self._simulate_movement(bit_width_inches, self.read_write_speed_ips, 1, 'read')
             frame = self._head.activate(track, 'read', self.read_write_speed_ips)
@@ -196,6 +225,7 @@ class CassetteTapeBackend:
             if current_idx != bit_idx:
                 raise RuntimeError("head misaligned for write")
             bit_width_inches = 1.0 / self.bits_per_inch
+            self._write_frames += 1
             self._head.enqueue_write(track, lane, bit_idx, frame)
             self._simulate_movement(bit_width_inches, self.read_write_speed_ips, 1, 'write')
             self._head.activate(track, 'write', self.read_write_speed_ips)
@@ -216,6 +246,7 @@ class CassetteTapeBackend:
     # ------------------------------------------------------------------
     def _simulate_movement(self, distance_inches: float, target_speed_ips: float, direction: int, op_name: str):
         """Simulate movement using a trapezoidal motor envelope."""
+        self._movement_inches += abs(distance_inches)
         distance_frames = int(round(distance_inches * self.bits_per_inch))
         calib = MotorCalibration(
             fast_wind_ms=BIT_FRAME_MS * (self.read_write_speed_ips / self.seek_speed_ips),
@@ -273,6 +304,13 @@ class CassetteTapeBackend:
         while True:
             chunk = self._audio_queue.get()
             if chunk is None: break
-            if _sd is not None:
+            # A zero time scale is the non-realtime orchestration mode: retain
+            # and count the emergent audio, but do not race a host audio device
+            # with simulation/test workers.
+            if (
+                _sd is not None
+                and self.play_audio
+                and self.time_scale_factor > 0.0
+            ):
                 try: _sd.play(chunk * SIMULATION_VOLUME, self.sample_rate_hz, blocking=True)
                 except Exception as e: print(f"Audio playback error: {e}")

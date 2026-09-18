@@ -383,7 +383,13 @@ class JAXTensorOperations(AbstractTensor):
         from jax.nn import log_softmax
         return log_softmax(self._to_jnp(tensor), axis=dim)
 
-    def pad_(self, tensor: Any, pad: Tuple[int, ...], value: float = 0) -> Any:
+    def pad_(
+        self,
+        tensor: Any,
+        pad: Tuple[int, ...],
+        value: float = 0,
+        mode: str = "constant",
+    ) -> Any:
         if len(pad) % 2 != 0:
             raise ValueError("Padding length must be even.")
         num_dims_to_pad = len(pad) // 2
@@ -395,7 +401,18 @@ class JAXTensorOperations(AbstractTensor):
             left = pad[-2 * (i + 1)]
             right = pad[-2 * (i + 1) + 1]
             pad_width.append((left, right))
-        return jnp.pad(tensor, pad_width=tuple(pad_width), constant_values=value).tolist()
+        if mode == "constant":
+            return jnp.pad(
+                tensor,
+                pad_width=tuple(pad_width),
+                mode=mode,
+                constant_values=value,
+            ).tolist()
+        return jnp.pad(
+            tensor,
+            pad_width=tuple(pad_width),
+            mode=mode,
+        ).tolist()
 
     def cat_(self, tensors: List[Any], dim: int = 0) -> Any:
         tensors = [self._to_jnp(t) for t in tensors]

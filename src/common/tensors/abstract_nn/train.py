@@ -30,7 +30,10 @@ class GradControl:
 
 
 def _l2(g) -> float:
-    # scalar float L2 for any AbstractTensor
+    # scalar float L2 for any AbstractTensor. A gradient of None (the
+    # allow_unused contract: parameter not reached by this graph) has norm 0.
+    if g is None:
+        return 0.0
     s = (g * g).sum()
     # Some backends return a tensor with sqrt(), others a numeric value
     if hasattr(s, "sqrt"):
@@ -41,6 +44,8 @@ def _l2(g) -> float:
 def _global_l2(grads: List) -> float:
     s = 0.0
     for g in grads:
+        if g is None:
+            continue
         s += float((g * g).sum().item())
     return s ** 0.5
 
@@ -135,8 +140,17 @@ def train_step(
 
     L = (pred * grad_pred).sum() if getattr(pred, "ndim", 0) > 0 else pred * grad_pred
     params_all = [p for layer in model.layers for p in layer.parameters()]
-    grads_all = autograd.grad(L, params_all, retain_graph=False, allow_unused=True)
-    for p, g in zip(params_all, grads_all):
+    grads_all = list(
+        autograd.grad(L, params_all, retain_graph=False, allow_unused=True)
+    )
+    for index, (p, g) in enumerate(zip(params_all, grads_all)):
+        if g is None:
+            # Module-wrapped layers (conv/pool chains) deliver parameter
+            # gradients through module.backward, which stashes them on the
+            # parameter during the tape walk; the tape itself reports None.
+            # Harvest the stash -- assigning None here would destroy it.
+            grads_all[index] = getattr(p, "_grad", None)
+            continue
         try:
             p._grad = g
         except Exception:
@@ -147,13 +161,16 @@ def train_step(
 
         idx = 0
         for i, l in enumerate(model.layers):
-            gW = grads_all[idx] if idx < len(grads_all) else None
-            idx += 1
-            gB = grads_all[idx] if l.b is not None and idx < len(grads_all) else None
-            if l.b is not None:
-                idx += 1
-            b0 = float(l.b[0, 0].item()) if l.b is not None else None
-            hook_panel.run('debug', layer=l, i=i, W=l.W, gW=gW, b0=b0)
+            # Walk by each layer's ACTUAL parameters: pooling/flatten layers
+            # have none, conv layers store bias as (out,) not (1, out).
+            layer_params = list(l.parameters()) if hasattr(l, "parameters") else []
+            layer_grads = grads_all[idx : idx + len(layer_params)]
+            idx += len(layer_params)
+            bias = getattr(l, "b", None)
+            gW = layer_grads[0] if layer_grads else None
+            b0 = float(bias.reshape(-1)[0].item()) if bias is not None else None
+            hook_panel.run('debug', layer=l, i=i, W=getattr(l, "W", None),
+                           gW=gW, b0=b0)
 
     # Collect params/grads in a stable order
     params: List[AbstractTensor] = params_all
@@ -225,14 +242,12 @@ def train_step(
     per_layer_norms_after = []
     idx = 0
     for layer in model.layers:
-        gW = grads[idx]
-        idx += 1
-        gB = grads[idx] if layer.b is not None else None
-        if layer.b is not None:
-            idx += 1
+        layer_params = list(layer.parameters()) if hasattr(layer, "parameters") else []
+        g_list = grads[idx : idx + len(layer_params)]
+        idx += len(layer_params)
         per_layer_norms_after.append({
-            "W": _l2(gW),
-            "b": _l2(gB) if gB is not None else None,
+            "W": _l2(g_list[0]) if g_list else 0.0,
+            "b": _l2(g_list[1]) if len(g_list) > 1 else None,
         })
 
     hook_panel.run(
@@ -253,11 +268,14 @@ def train_step(
         new_params = optimizer.step(params, grads)
         i = 0
         for layer in model.layers:
-            layer.W = rebind(f"{layer.__class__.__name__}.W", new_params[i])
-            i += 1
-            if layer.b is not None:
-                layer.b = rebind(f"{layer.__class__.__name__}.b", new_params[i])
-                i += 1
+            layer_params = list(layer.parameters()) if hasattr(layer, "parameters") else []
+            if layer_params:
+                layer.W = rebind(f"{layer.__class__.__name__}.W", new_params[i])
+                if len(layer_params) > 1 and getattr(layer, "b", None) is not None:
+                    layer.b = rebind(f"{layer.__class__.__name__}.b", new_params[i + 1])
+            # Advance by the layer's ACTUAL parameter count, so parameterless
+            # layers (pooling, flatten) never desync the walk.
+            i += len(layer_params)
         if zero_grad:
             model.zero_grad()
         hook_panel.run('step_end', model=model, x=x, y=y, loss=loss)

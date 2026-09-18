@@ -19,6 +19,19 @@ def process_graph_to_ssa_instrs(pg: ProcessGraph, schedule: str = "alap") -> Lis
     Loop analysis is intentionally omitted – ProcessGraphs are expected to be
     acyclic once scheduled. Cyclic behaviour must be resolved prior to invoking
     this helper.
+
+    NOT the compiler entrypoint for a general Python function. This reads
+    whatever ``op``/``label`` a node already carries (falling back to the
+    raw ``expr_obj``'s Python type name, or worse, the object itself, if
+    neither is set) -- it does not resolve control flow, attribute access,
+    or free names itself. Feeding it a ProcessGraph built by
+    graph_express2.ProcessGraph.build_from_ast() without first running the
+    real pipeline's control/region/binding passes silently emits degenerate
+    instructions (``op`` holding a literal ``<ast.Name object at 0x...>``)
+    for anything past straight-line scalar expressions, without raising.
+    For real Python-function compilation use
+    src.common.tensors.accelerator_backends.aot_compile.compile_ast_aot,
+    which drives this same underlying machinery correctly.
     """
 
     # Run the embedded scheduler. ``compute_levels`` populates ``pg.levels`` and
@@ -29,6 +42,10 @@ def process_graph_to_ssa_instrs(pg: ProcessGraph, schedule: str = "alap") -> Lis
     ret = pg.compute_levels(method=schedule, order="dependency")
     levels = ret if ret is not None else pg.levels
     order = sorted(levels, key=lambda n: levels[n])
+    distinct_levels = tuple(sorted({int(level) for level in levels.values()}))
+    schedule_groups = {
+        level: ordinal for ordinal, level in enumerate(distinct_levels)
+    }
 
     values: Dict[int, SSAValue] = {}
     instrs: List[Instr] = []
@@ -70,6 +87,36 @@ def process_graph_to_ssa_instrs(pg: ProcessGraph, schedule: str = "alap") -> Lis
 
         args = [values.setdefault(p, SSAValue(p)) for p in parents]
         attributes = dict(data.get("attributes") or data.get("extra_args") or {})
+        attributes.update({
+            "schedule_level": int(levels[nid]),
+            "schedule_group": schedule_groups[int(levels[nid])],
+            "schedule_method": str(schedule),
+        })
+        from .semantic_translation import (
+            SemanticRepresentation, semantic_identity,
+        )
+        source_identity = semantic_identity(
+            str(op), SemanticRepresentation.PROCESS_GRAPH,
+            facets=dict(attributes.get("semantic_facets") or {}),
+        )
+        source_family = attributes.get("semantic_family")
+        if source_family is not None:
+            from .semantic_translation import SemanticOperationIdentity
+            source_identity = SemanticOperationIdentity(
+                str(source_family), SemanticRepresentation.PROCESS_GRAPH,
+                str(attributes.get("semantic_spelling") or op),
+                dict(attributes.get("semantic_facets") or {}),
+            )
+        from .semantic_translation import SemanticOperationIdentity
+        target_identity = SemanticOperationIdentity(
+            source_identity.family,
+            SemanticRepresentation.REPOSITORY_SSA,
+            str(op), dict(source_identity.facets),
+        )
+        attributes.update(target_identity.attributes())
+        attributes["semantic_source_representation"] = (
+            source_identity.representation.value
+        )
         if data.get("constant") is not None:
             attributes["value"] = data["constant"]
         source = data.get("source_span")

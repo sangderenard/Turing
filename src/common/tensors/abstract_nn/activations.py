@@ -7,15 +7,20 @@ import sys
 # -------- helpers (pure-tensor, numerically stable) --------
 
 def _sigmoid_stable(x: AbstractTensor) -> AbstractTensor:
-    # piecewise-stable sigmoid:
-    # if x >= 0: 1/(1+exp(-x)) ; else: exp(x)/(1+exp(x))
-    pos = x.greater_equal(0.0)
-    neg = x.less(0.0)
-    z_pos = (-x).exp()
-    y_pos = 1.0 / (1.0 + z_pos)
-    z_neg = x.exp()
-    y_neg = z_neg / (1.0 + z_neg)
-    return pos * y_pos + neg * y_neg
+    """The same piecewise-stable sigmoid, now as one primitive.
+
+    This used to be assembled here from two comparisons, two ``exp`` calls and
+    a blend -- correct, but it left the recorded ``sigmoid`` op describing a
+    composition no backend had. Compiling a model that used it failed with
+    "sigmoid has no captured basic-operator lowering", because the tape
+    carried an atom whose contents lived only in this function.
+
+    ``AbstractTensor.sigmoid`` takes the identical branch, so the numerics are
+    unchanged; the difference is that every backend now has it, and the graph
+    carries one node instead of seven.
+    """
+
+    return x.sigmoid()
 
 def _tanh_stable(x: AbstractTensor) -> AbstractTensor:
     return x.tanh()

@@ -1,0 +1,176 @@
+/*@turing.segment.v1
+id = python-torture
+language = python
+encoding = utf-8
+outputs = summary
+entry = main
+@end*/
+from functools import wraps
+
+
+def logged(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        return result
+    return wrapper
+
+
+class Shape:
+    def __init__(self, name):
+        self.name = name
+
+    def area(self):
+        raise NotImplementedError
+
+
+class Rectangle(Shape):
+    def __init__(self, width, height):
+        super().__init__("rectangle")
+        self.width = width
+        self.height = height
+
+    @logged
+    def area(self):
+        return self.width * self.height
+
+
+def make_multiplier(factor):
+    def multiply(value):
+        return value * factor
+    return multiply
+
+
+def area_report(shapes):
+    doubled = make_multiplier(2)
+    try:
+        areas = [doubled(shape.area()) for shape in shapes if shape.area() > 0]
+    except NotImplementedError:
+        areas = []
+    total = sum(areas)
+    if (count := len(areas)) > 0:
+        average = total / count
+    else:
+        average = 0
+    return {"total": total, "average": average, "count": count}
+
+
+def make_shapes():
+    yield Rectangle(3, 4)
+    yield Rectangle(5, 6)
+
+
+summary = area_report(list(make_shapes()))
+result = summary
+/*@turing.end*/
+
+/*@turing.segment.v1
+id = javascript-torture
+language = javascript
+encoding = utf-8
+outputs = summary
+entry = main
+@end*/
+class Vector {
+  constructor(x, y) {
+    this.x = x;
+    this.y = y;
+  }
+  length() {
+    return Math.sqrt(this.x ** 2 + this.y ** 2);
+  }
+}
+
+const scale = (factor) => (vector) => new Vector(vector.x * factor, vector.y * factor);
+
+async function computeLengths(vectors) {
+  const scaled = vectors.map(scale(2));
+  const { length: count } = scaled;
+  const lengths = scaled.map((v) => v.length());
+  return { lengths, count };
+}
+
+const vectors = [new Vector(3, 4), new Vector(1, 1)];
+const result = await computeLengths(vectors);
+/*@turing.end*/
+
+/*@turing.shader.v1
+id = glsl-torture
+language = glsl
+encoding = utf-8
+stage = compute
+inputs = values
+outputs = totals
+abi = turing.shader-component.v1
+local-size = 32
+@end*/
+#version 430
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer Values {
+    float values[];
+};
+layout(std430, binding = 1) writeonly buffer Totals {
+    float totals[];
+};
+
+float accumulate(uint start, uint count) {
+    float total = 0.0;
+    for (uint i = 0u; i < count; i++) {
+        float v = values[start + i];
+        if (v > 0.0) {
+            total += v;
+        } else {
+            total -= v;
+        }
+    }
+    return total;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint start = idx * 4u;
+    totals[idx] = accumulate(start, 4u);
+}
+/*@turing.end*/
+
+/*@turing.shader.v1
+id = wgsl-torture
+language = wgsl
+encoding = utf-8
+stage = compute
+inputs = weights
+outputs = weighted
+@end*/
+struct Params {
+    scale: f32,
+    offset: f32,
+};
+
+@group(0) @binding(0) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read_write> weighted: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn transform(value: f32) -> f32 {
+    var result: f32 = value * params.scale + params.offset;
+    if (result < 0.0) {
+        result = 0.0;
+    }
+    return result;
+}
+
+@compute @workgroup_size(32)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    weighted[i] = transform(weights[i]);
+}
+/*@turing.end*/
+
+/*@turing.segment.v1
+id = sympy-torture
+language = sympy
+encoding = utf-8
+outputs = expression
+@end*/
+Sum((x**2 + 2*x*y - sin(y)**2) / (1 + exp(-x)), (x, 0, n)) + Derivative(cos(y) * Integral(z**3, z), y)
+/*@turing.end*/

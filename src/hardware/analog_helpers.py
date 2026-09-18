@@ -29,10 +29,17 @@ def extract_lane(frame: np.ndarray, lane: int) -> np.ndarray:
     return wave.astype(frame.dtype)
  
 def lane_rms(wave: np.ndarray, lane: int, half_bw: int = 3) -> float:
-    """RMS energy of ``wave`` on ``lane``."""
+    """Return a length-independent spectral amplitude for ``lane``.
+
+    Raw FFT magnitudes scale with the number of samples.  Comparing those
+    magnitudes with physical amplitude thresholds made the write-bias floor
+    look like a logical one.  The band norm is therefore converted back to a
+    sinusoidal amplitude before it reaches either decoding or NAND logic.
+    """
     spec = np.fft.rfft(wave.astype("f4"))
     band = lane_band(lane, half_bw)
-    return float(np.sqrt(np.mean(np.abs(spec[band]) ** 2)))
+    band_energy = np.sqrt(np.sum(np.abs(spec[band]) ** 2))
+    return float(2.0 * band_energy / len(wave))
 
 def track_rms(wave: np.ndarray) -> float:
     """Whole-track RMS energy."""
@@ -45,7 +52,10 @@ def mix_fft_lane(orig: np.ndarray, new: np.ndarray, lane: int) -> np.ndarray:
     new_fft = np.fft.rfft(new)
     bin_idx = _lane_bin(lane)
     orig_fft[bin_idx] = new_fft[bin_idx]
-    mixed = np.fft.irfft(orig_fft)
+    # ``FRAME_SAMPLES`` is odd at the current sample rate.  Without an
+    # explicit length NumPy reconstructs 2*(bins-1), silently dropping one
+    # sample and making the next lane combination non-broadcastable.
+    mixed = np.fft.irfft(orig_fft, n=len(orig))
     return mixed.astype(orig.dtype)
  
 def replay_envelope(env_wave: np.ndarray, lane: int) -> np.ndarray:

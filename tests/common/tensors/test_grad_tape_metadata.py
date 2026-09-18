@@ -1,6 +1,7 @@
 import pytest
 
 from src.common.tensors.autograd import autograd, GradTape
+from src.common.tensors.abstraction import tensor_identity
 
 try:  # NumPy backend is optional
     from src.common.tensors.numpy_backend import NumPyTensorOperations as Tensor
@@ -39,7 +40,7 @@ def test_add_records_metadata():
     assert ctx["result_strides"] == c.data.strides
     assert ctx["params"] == {}
     for tensor in (a, b, c):
-        graph_node = autograd.tape.graph.nodes[id(tensor)]
+        graph_node = autograd.tape.graph.nodes[tensor_identity(tensor)]
         assert graph_node["shape"] == tensor.shape
         assert graph_node["dtype"] == tensor.dtype
         assert graph_node["device"] == tensor.device

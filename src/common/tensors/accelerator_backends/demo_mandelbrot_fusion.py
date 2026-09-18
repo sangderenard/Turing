@@ -214,7 +214,7 @@ def build_parametric_mandelbrot_glsl_deployment(
     """Plan and select an ingested Mandelbrot function's GLSL shell."""
 
     from ....compiler.glsl_deployment_strategy import (
-        strategize_glsl_deployment,
+        strategize_shell_deployment,
     )
     from .mandelbrot_encoder_program import (
         build_mandelbrot_recording_process_graph,
@@ -223,7 +223,7 @@ def build_parametric_mandelbrot_glsl_deployment(
     graph = build_mandelbrot_recording_process_graph(
         profile_verbose=verbose_profile,
     )
-    module_shell_type = strategize_glsl_deployment(graph)
+    module_shell_type = strategize_shell_deployment(graph)
     module_shell = module_shell_type(
         iterations=int(iterations),
         profiling=profiling,
@@ -478,6 +478,7 @@ def _aot_compile_mandelbrot_fortran(count: int, iterations: int, out_path: Path)
         aot.compiled_shell_program,
         aot.shell_control_program,
         region_programs=aot.region_programs,
+        hierarchy_plan=getattr(aot, "hierarchy_plan", None),
         numerical_name=numerical_name,
         control_name=control_name,
     )

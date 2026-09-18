@@ -1,0 +1,775 @@
+<!-- Template for build_kernel_showcase.py: {"elements":2000000,"machine":"Windows|AMD64|AMD64 Family 21 Model 2 Stepping 0, AuthenticAMD|cores=8","problems":{"cubic":{"title":"Cardano's cubic","physics":"The depressed cubic x\u00b3 + px + q = 0 -- the equation Cardano published a radical formula for in 1545. Six sympy-derived Newton steps solve it to machine precision.","equation_html":"x<sup>3</sup> + p\u2009x + q = 0","law_label":"x \u2190 (-q + 2*x**3)/(p + 3*x**2)","steps":6,"input_ranges":[[1.0,3.0],[-2.0,2.0]],"residual_kind":"polynomial","ir_lines":80,"wasm_bytes":618,"wasm_base64":"AGFzbQEAAAABCQFgBX9/f35+AAMCAQAFAwEAEAYJAX8BQYCAwAALBxcCBm1lbW9yeQIACnNvbHZlX3NwYW4AAArnAgHkAgIBfwR8AkAgBCADVw0AIAQgA30hBCAAIAOnQQN0IgVqIQAgASAFaiEBIAIgBWohAgNAIAJEAAAAAAAA8D8gACsDACIGRAAAAAAAAPA/IAZEAAAAAAAA8D8gBkQAAAAAAADwPyAGRAAAAAAAAPA/IAZEAAAAAAAA8D8gBkQAAAAAAAAAAKCjRAAAAAAAAAAAIAErAwAiB6GiIgggCKIiCUQAAAAAAAAIQKKgoyAIIAmiIgggCKAgB6GiIgggCKIiCUQAAAAAAAAIQKKgoyAIIAmiIgggCKAgB6GiIgggCKIiCUQAAAAAAAAIQKKgoyAIIAmiIgggCKAgB6GiIgggCKIiCUQAAAAAAAAIQKKgoyAIIAmiIgYgBqAgB6GiIgYgBqIiCEQAAAAAAAAIQKKgoyAGIAiiIgYgBqAgB6GiOQMAIABBCGohACABQQhqIQEgAkEIaiECIARCf3wiBEIAUg0ACwsLADUEbmFtZQALCmN1YmljLndhc20BDQEACnNvbHZlX3NwYW4HEgEAD19fc3RhY2tfcG9pbnRlcgCGAQ90YXJnZXRfZmVhdHVyZXMHKw9idWxrLW1lbW9yeS1vcHQrFmNhbGwtaW5kaXJlY3Qtb3ZlcmxvbmcrDmV4dGVuZGVkLWNvbnN0KwptdWx0aXZhbHVlKw9tdXRhYmxlLWdsb2JhbHMrE25vbnRyYXBwaW5nLWZwdG9pbnQrCHNpZ24tZXh0","native":{"elements":2000000,"numpy_ms":1027.1394000010332,"numpy_fast_ms":245.842200005427,"serial_ms":20.32699999108445,"pooled_ms":5.207999987760559,"workers":7,"probe_speedup":3.934257778890335,"agreement":4.440892098500626e-16,"residual":8.174598775667619e-10}},"quintic":{"title":"The unsolvable quintic","physics":"Abel and Ruffini proved the Bring quintic x\u2075 + px + q = 0 has no solution in radicals. Newton's method does not care: eight compiled steps find the real root anyway.","equation_html":"x<sup>5</sup> + p\u2009x + q = 0","law_label":"x \u2190 (-q + 4*x**5)/(p + 5*x**4)","steps":8,"input_ranges":[[1.0,3.0],[-2.0,2.0]],"residual_kind":"polynomial","ir_lines":132,"wasm_bytes":785,"wasm_base64":"AGFzbQEAAAABCQFgBX9/f35+AAMCAQAFAwEAEAYJAX8BQYCAwAALBxcCBm1lbW9yeQIACnNvbHZlX3NwYW4AAAqMBAGJBAIBfwR8AkAgBCADVw0AIAQgA30hBCAAIAOnQQN0IgVqIQAgASAFaiEBIAIgBWohAgNAIAJEAAAAAAAA8D8gACsDACIGRAAAAAAAAPA/IAZEAAAAAAAA8D8gBkQAAAAAAADwPyAGRAAAAAAAAPA/IAZEAAAAAAAA8D8gBkQAAAAAAADwPyAGRAAAAAAAAPA/IAZEAAAAAAAAAACgo0QAAAAAAAAAACABKwMAIgehoiIIIAggCCAIoqKiIglEAAAAAAAAFECioKMgCCAJokQAAAAAAAAQQKIgB6GiIgggCCAIIAiioqIiCUQAAAAAAAAUQKKgoyAIIAmiRAAAAAAAABBAoiAHoaIiCCAIIAggCKKioiIJRAAAAAAAABRAoqCjIAggCaJEAAAAAAAAEECiIAehoiIIIAggCCAIoqKiIglEAAAAAAAAFECioKMgCCAJokQAAAAAAAAQQKIgB6GiIgggCCAIIAiioqIiCUQAAAAAAAAUQKKgoyAIIAmiRAAAAAAAABBAoiAHoaIiCCAIIAggCKKioiIJRAAAAAAAABRAoqCjIAggCaJEAAAAAAAAEECiIAehoiIGIAYgBiAGoqKiIghEAAAAAAAAFECioKMgBiAIokQAAAAAAAAQQKIgB6GiOQMAIABBCGohACABQQhqIQEgAkEIaiECIARCf3wiBEIAUg0ACwsLADcEbmFtZQANDHF1aW50aWMud2FzbQENAQAKc29sdmVfc3BhbgcSAQAPX19zdGFja19wb2ludGVyAIYBD3RhcmdldF9mZWF0dXJlcwcrD2J1bGstbWVtb3J5LW9wdCsWY2FsbC1pbmRpcmVjdC1vdmVybG9uZysOZXh0ZW5kZWQtY29uc3QrCm11bHRpdmFsdWUrD211dGFibGUtZ2xvYmFscysTbm9udHJhcHBpbmctZnB0b2ludCsIc2lnbi1leHQ=","native":{"elements":2000000,"numpy_ms":2191.275399993174,"numpy_fast_ms":344.51400001125876,"serial_ms":41.39020000002347,"pooled_ms":7.7363999880617484,"workers":7,"probe_speedup":5.498437979078796,"agreement":5.551115123125783e-16,"residual":7.853717676198357e-13}},"pendulum":{"title":"Exact pendulum period","physics":"Beyond the small-angle lie: the true period needs the complete elliptic integral K(k), computed here by the arithmetic\u2013geometric mean -- Gauss's iteration, quadratically convergent, six steps. Output is T/T\u2080, how much slower a real pendulum swings at amplitude \u03b8\u2080 = 2\u2009arcsin(k).","equation_html":"T = T<sub>0</sub> / agm(1, \u221a(1 \u2212 k\u00b2))","law_label":"(a, b) \u2190 ((a+b)/2, \u221a(ab))","steps":6,"input_ranges":[[0.01,0.95],[0.0,1.0]],"residual_kind":"convergence","ir_lines":62,"wasm_bytes":547,"wasm_base64":"AGFzbQEAAAABCQFgBX9/f35+AAMCAQAFAwEAEAYJAX8BQYCAwAALBxcCBm1lbW9yeQIACnNvbHZlX3NwYW4AAAqdAgGaAgIBfwN8AkAgBCADVw0AIAQgA30hBCAAIAOnQQN0IgVqIQAgAiAFaiECA0AgAkQAAAAAAADwP0QAAAAAAADwPyAAKwMAIgYgBqKhnyIGnyIHRAAAAAAAAOA/oiAGRAAAAAAAAOA/okQAAAAAAADgP6AiBkQAAAAAAADgP6KgIghEAAAAAAAA4D+iIAefIAafoiIGRAAAAAAAAOA/oqAiB0QAAAAAAADgP6IgCJ8gBp+iIgZEAAAAAAAA4D+ioCIIRAAAAAAAAOA/oiAHnyAGn6IiBkQAAAAAAADgP6KgRAAAAAAAAOA/oiAInyAGn6JEAAAAAAAA4D+ioKM5AwAgAEEIaiEAIAJBCGohAiAEQn98IgRCAFINAAsLCwA4BG5hbWUADg1wZW5kdWx1bS53YXNtAQ0BAApzb2x2ZV9zcGFuBxIBAA9fX3N0YWNrX3BvaW50ZXIAhgEPdGFyZ2V0X2ZlYXR1cmVzBysPYnVsay1tZW1vcnktb3B0KxZjYWxsLWluZGlyZWN0LW92ZXJsb25nKw5leHRlbmRlZC1jb25zdCsKbXVsdGl2YWx1ZSsPbXV0YWJsZS1nbG9iYWxzKxNub250cmFwcGluZy1mcHRvaW50KwhzaWduLWV4dA==","native":{"elements":2000000,"numpy_ms":399.2182999936631,"numpy_fast_ms":148.08680000714958,"serial_ms":39.693799990345724,"pooled_ms":10.552599997026846,"workers":7,"probe_speedup":3.254717907382323,"agreement":0.0,"residual":null}},"chaos":{"title":"Logistic-map chaos orbit","physics":"Sixty-four iterations of x \u2190 r\u2009x(1\u2212x) in the chaotic regime. With no fast-math on any target, native, wasm, and numpy trajectories agree bit-for-bit -- a reassociating compiler would send each down a different orbit.","equation_html":"x \u2190 r\u2009x (1 \u2212 x)","law_label":"x \u2190 r\u2009x(1\u2212x), 64 iterations","steps":64,"input_ranges":[[3.6,3.99],[0.05,0.95]],"residual_kind":"reference","ir_lines":276,"wasm_bytes":1515,"wasm_base64":"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","native":{"elements":2000000,"numpy_ms":2141.412400000263,"numpy_fast_ms":1108.8118000043323,"serial_ms":77.99360000353772,"pooled_ms":13.121399999363348,"workers":7,"probe_speedup":6.822986876602486,"agreement":0.0,"residual":null}}}} and
+     {
+  cubic: { solve: (a, b) => { let s0 = 0.0; const t0_0 = ((1.0 / (a + (3.0 * (s0 * s0)))) * ((-1.0 * b) + (2.0 * ((s0 * s0) * s0)))); s0 = t0_0; const t1_0 = ((1.0 / (a + (3.0 * (s0 * s0)))) * ((-1.0 * b) + (2.0 * ((s0 * s0) * s0)))); s0 = t1_0; const t2_0 = ((1.0 / (a + (3.0 * (s0 * s0)))) * ((-1.0 * b) + (2.0 * ((s0 * s0) * s0)))); s0 = t2_0; const t3_0 = ((1.0 / (a + (3.0 * (s0 * s0)))) * ((-1.0 * b) + (2.0 * ((s0 * s0) * s0)))); s0 = t3_0; const t4_0 = ((1.0 / (a + (3.0 * (s0 * s0)))) * ((-1.0 * b) + (2.0 * ((s0 * s0) * s0)))); s0 = t4_0; const t5_0 = ((1.0 / (a + (3.0 * (s0 * s0)))) * ((-1.0 * b) + (2.0 * ((s0 * s0) * s0)))); s0 = t5_0; return s0; }, residual: (o, a, b) => Math.abs(((b + ((o * o) * o)) + (o * a))) },
+  quintic: { solve: (a, b) => { let s0 = 0.0; const t0_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t0_0; const t1_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t1_0; const t2_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t2_0; const t3_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t3_0; const t4_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t4_0; const t5_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t5_0; const t6_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t6_0; const t7_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t7_0; return s0; }, residual: (o, a, b) => Math.abs(((b + ((((o * o) * o) * o) * o)) + (o * a))) },
+  pendulum: { solve: (a, b) => { let s0 = 1.0; let s1 = Math.sqrt((1.0 + (-1.0 * (a * a)))); const t0_0 = ((0.5 * s0) + (0.5 * s1)); const t0_1 = (Math.sqrt(s0) * Math.sqrt(s1)); s0 = t0_0; s1 = t0_1; const t1_0 = ((0.5 * s0) + (0.5 * s1)); const t1_1 = (Math.sqrt(s0) * Math.sqrt(s1)); s0 = t1_0; s1 = t1_1; const t2_0 = ((0.5 * s0) + (0.5 * s1)); const t2_1 = (Math.sqrt(s0) * Math.sqrt(s1)); s0 = t2_0; s1 = t2_1; const t3_0 = ((0.5 * s0) + (0.5 * s1)); const t3_1 = (Math.sqrt(s0) * Math.sqrt(s1)); s0 = t3_0; s1 = t3_1; const t4_0 = ((0.5 * s0) + (0.5 * s1)); const t4_1 = (Math.sqrt(s0) * Math.sqrt(s1)); s0 = t4_0; s1 = t4_1; const t5_0 = ((0.5 * s0) + (0.5 * s1)); const t5_1 = (Math.sqrt(s0) * Math.sqrt(s1)); s0 = t5_0; s1 = t5_1; return (1.0 / s0); }, residual: null },
+  chaos: { solve: (a, b) => { let s0 = b; const t0_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t0_0; const t1_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t1_0; const t2_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t2_0; const t3_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t3_0; const t4_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t4_0; const t5_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t5_0; const t6_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t6_0; const t7_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t7_0; const t8_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t8_0; const t9_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t9_0; const t10_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t10_0; const t11_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t11_0; const t12_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t12_0; const t13_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t13_0; const t14_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t14_0; const t15_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t15_0; const t16_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t16_0; const t17_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t17_0; const t18_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t18_0; const t19_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t19_0; const t20_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t20_0; const t21_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t21_0; const t22_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t22_0; const t23_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t23_0; const t24_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t24_0; const t25_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t25_0; const t26_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t26_0; const t27_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t27_0; const t28_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t28_0; const t29_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t29_0; const t30_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t30_0; const t31_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t31_0; const t32_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t32_0; const t33_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t33_0; const t34_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t34_0; const t35_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t35_0; const t36_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t36_0; const t37_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t37_0; const t38_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t38_0; const t39_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t39_0; const t40_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t40_0; const t41_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t41_0; const t42_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t42_0; const t43_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t43_0; const t44_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t44_0; const t45_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t45_0; const t46_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t46_0; const t47_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t47_0; const t48_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t48_0; const t49_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t49_0; const t50_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t50_0; const t51_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t51_0; const t52_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t52_0; const t53_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t53_0; const t54_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t54_0; const t55_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t55_0; const t56_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t56_0; const t57_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t57_0; const t58_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t58_0; const t59_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t59_0; const t60_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t60_0; const t61_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t61_0; const t62_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t62_0; const t63_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t63_0; return s0; }, residual: null },
+} are replaced at build time. Committed single-theme
+     dark instrument design; every surface painted explicitly. -->
+<title>Kernel Proving Ground</title>
+<style>
+  :root {
+    --ground: #0E1114;
+    --panel: #161B20;
+    --panel-deep: #12161A;
+    --edge: #232B33;
+    --ink: #E8EDF2;
+    --dim: #8C99A6;
+    --faint: #5A6672;
+    --serial: #4C86C0;
+    --pooled: #BE7C22;
+    --ok: #58A470;
+    --bad: #C4635A;
+    --mono: "Cascadia Code", "JetBrains Mono", "SF Mono", "Fira Code",
+            Consolas, "Liberation Mono", monospace;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
+             serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { background: var(--ground); }
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 16px;
+    line-height: 1.55;
+    padding: 48px 20px 80px;
+  }
+  .wrap { max-width: 920px; margin: 0 auto; }
+
+  /* ---- header ---- */
+  header { margin-bottom: 40px; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--pooled);
+    margin-bottom: 14px;
+  }
+  h1 {
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: clamp(28px, 5vw, 42px);
+    letter-spacing: -0.02em;
+    line-height: 1.1;
+    text-wrap: balance;
+    margin-bottom: 18px;
+  }
+  .thesis {
+    max-width: 62ch;
+    color: var(--dim);
+    font-size: 17px;
+  }
+  .thesis strong { color: var(--ink); font-weight: 600; }
+
+  /* ---- pipeline strip ---- */
+  .pipeline {
+    display: flex;
+    align-items: stretch;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 30px 0 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .stage {
+    background: var(--panel);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    padding: 10px 14px;
+    color: var(--dim);
+  }
+  .stage b { color: var(--ink); font-weight: 600; display: block; }
+  .stage-arrow {
+    align-self: center;
+    color: var(--faint);
+    font-family: var(--mono);
+  }
+
+  /* ---- environment + controls ---- */
+  .bench-controls {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    background: var(--panel-deep);
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin: 26px 0 34px;
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .bench-controls label { color: var(--dim); }
+  select {
+    background: var(--panel);
+    color: var(--ink);
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 6px 8px;
+  }
+  button {
+    background: var(--pooled);
+    color: #14100A;
+    border: none;
+    border-radius: 5px;
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 8px 16px;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.12); }
+  button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.quiet {
+    background: var(--panel);
+    color: var(--ink);
+    border: 1px solid var(--edge);
+    font-weight: 400;
+  }
+  .env { color: var(--faint); font-size: 12px; margin-left: auto; }
+
+  /* ---- kernel cards ---- */
+  .kernel {
+    background: var(--panel);
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    padding: 26px 28px;
+    margin-bottom: 26px;
+  }
+  .kernel-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .kernel-head h2 {
+    font-family: var(--mono);
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .equation {
+    font-family: var(--serif);
+    font-style: italic;
+    font-size: 16px;
+    color: var(--dim);
+  }
+  .physics { max-width: 68ch; color: var(--dim); margin-bottom: 14px; }
+  .physics em { color: var(--ink); font-style: normal; }
+  .law {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--faint);
+    background: var(--panel-deep);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    padding: 8px 12px;
+    overflow-x: auto;
+    white-space: pre;
+    margin-bottom: 18px;
+  }
+
+  /* ---- instrument strip ---- */
+  .instrument {
+    border-top: 1px solid var(--edge);
+    padding-top: 16px;
+  }
+  .run-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+  .status { color: var(--dim); }
+  .status.ok { color: var(--ok); }
+  .status.bad { color: var(--bad); }
+
+  .legend {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--faint);
+    margin-bottom: 8px;
+  }
+  .legend .swatch {
+    display: inline-block;
+    width: 9px; height: 9px;
+    border-radius: 2px;
+    margin: 0 5px 0 12px;
+    vertical-align: baseline;
+  }
+  .legend .swatch:first-child { margin-left: 0; }
+
+  .bars { display: grid; gap: 8px; }
+  .bar-row {
+    display: grid;
+    grid-template-columns: 118px 1fr;
+    align-items: center;
+    gap: 12px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+  .bar-name { color: var(--dim); text-align: right; }
+  .bar-track {
+    position: relative;
+    height: 22px;
+    background: var(--panel-deep);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    position: absolute;
+    inset: 2px auto 2px 2px;
+    width: 0%;
+    border-radius: 3px;
+    transition: width 420ms ease;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .bar-fill { transition: none; }
+  }
+  .bar-fill.serial { background: var(--serial); }
+  .bar-fill.pooled { background: var(--pooled); }
+  .bar-label {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    left: 10px;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.55);
+  }
+  .speedup {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--pooled);
+    border: 1px solid var(--edge);
+    background: var(--panel-deep);
+    border-radius: 999px;
+    padding: 2px 10px;
+    margin-top: 10px;
+  }
+
+  /* ---- reference marks ---- */
+  .reference {
+    margin-top: 16px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--faint);
+  }
+  .reference table {
+    border-collapse: collapse;
+    margin-top: 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .reference td, .reference th {
+    text-align: right;
+    padding: 3px 14px 3px 0;
+    font-weight: 400;
+    color: var(--faint);
+  }
+  .reference th { color: var(--dim); }
+  .reference td:first-child, .reference th:first-child { text-align: left; }
+
+  /* ---- footer / architecture ---- */
+  .arch {
+    border-top: 1px solid var(--edge);
+    margin-top: 44px;
+    padding-top: 30px;
+  }
+  .arch h2 {
+    font-family: var(--mono);
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 12px;
+  }
+  .arch p { max-width: 68ch; color: var(--dim); margin-bottom: 12px; }
+  .arch code {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--ink);
+    background: var(--panel-deep);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">turing compiler &middot; deployment layer</div>
+  <h1>Kernel Proving Ground</h1>
+  <p class="thesis">
+    Four physics problems, each solved by an update law <strong>derived
+    symbolically with sympy</strong> and compiled <strong>ahead of
+    time</strong> from the same LLVM IR into two targets: a native library
+    that produced the reference marks below, and the WebAssembly modules
+    embedded in this page &mdash; which you can run <strong>right now, on
+    your machine</strong>, serial against a worker pool.
+  </p>
+  <div class="pipeline">
+    <div class="stage"><b>sympy</b>update law, symbolic</div>
+    <div class="stage-arrow">&rarr;</div>
+    <div class="stage"><b>LLVM IR</b>stepwise SSA, no fast-math</div>
+    <div class="stage-arrow">&rarr;</div>
+    <div class="stage"><b>native AOT</b>zig clang &minus;O2, reference marks</div>
+    <div class="stage-arrow">&#8600;</div>
+    <div class="stage"><b>wasm32 AOT</b>same .ll, embedded here</div>
+  </div>
+</header>
+
+<div class="bench-controls">
+  <label for="elements">elements</label>
+  <select id="elements">
+    <option value="500000">500 k</option>
+    <option value="1000000" selected>1 M</option>
+    <option value="2000000">2 M</option>
+    <option value="4000000">4 M</option>
+  </select>
+  <button id="run-all">run all kernels</button>
+  <span class="env" id="env"></span>
+</div>
+
+<div id="kernels"></div>
+
+<section class="arch">
+  <h2>what this measures</h2>
+  <p>
+    Every kernel here is one <code>.ll</code> file. The build machine
+    compiled it natively and measured four tiers &mdash; two numpy
+    baselines (what <code>sympy.lambdify</code> generates, where every
+    operation allocates a fresh full-size temporary, and a hand-tuned
+    in-place version with preallocated <code>out=</code> buffers: the
+    strongest fair CPU-Python baseline), serial LLVM, and the deployment
+    layer&rsquo;s worker pool, sized by a live calibration probe. Those
+    are the <em>reference marks</em> under each card, stamped with the
+    machine that earned them.
+  </p>
+  <p>
+    The same <code>.ll</code> compiled to wasm32 is what your browser
+    runs. Serial is one call on the main thread. Pooled mirrors the
+    repository&rsquo;s own browser shell (<code>ensureTileWorkers</code>):
+    the module is compiled once, cloned to copy-in/copy-out Web Workers,
+    and joined at a barrier &mdash; JavaScript coordination, because on a
+    static page that is what WebAssembly parallelism <em>is</em>. No
+    SharedArrayBuffer is assumed and no fast-math is enabled anywhere:
+    native, wasm, and the in-page reference agree bit for bit, which is
+    checked before any number is timed &mdash; the chaotic kernel would
+    expose a single reordered multiply.
+  </p>
+  <p>
+    Correctness gates, then measurement, then the claim &mdash; the same
+    order the compiler&rsquo;s deployment stage enforces when it decides,
+    per region and per backend, between serial, pooled, and GPU dispatch.
+  </p>
+</section>
+</div>
+
+<script>
+"use strict";
+const DATA = {"elements":2000000,"machine":"Windows|AMD64|AMD64 Family 21 Model 2 Stepping 0, AuthenticAMD|cores=8","problems":{"cubic":{"title":"Cardano's cubic","physics":"The depressed cubic x\u00b3 + px + q = 0 -- the equation Cardano published a radical formula for in 1545. Six sympy-derived Newton steps solve it to machine precision.","equation_html":"x<sup>3</sup> + p\u2009x + q = 0","law_label":"x \u2190 (-q + 2*x**3)/(p + 3*x**2)","steps":6,"input_ranges":[[1.0,3.0],[-2.0,2.0]],"residual_kind":"polynomial","ir_lines":80,"wasm_bytes":618,"wasm_base64":"AGFzbQEAAAABCQFgBX9/f35+AAMCAQAFAwEAEAYJAX8BQYCAwAALBxcCBm1lbW9yeQIACnNvbHZlX3NwYW4AAArnAgHkAgIBfwR8AkAgBCADVw0AIAQgA30hBCAAIAOnQQN0IgVqIQAgASAFaiEBIAIgBWohAgNAIAJEAAAAAAAA8D8gACsDACIGRAAAAAAAAPA/IAZEAAAAAAAA8D8gBkQAAAAAAADwPyAGRAAAAAAAAPA/IAZEAAAAAAAA8D8gBkQAAAAAAAAAAKCjRAAAAAAAAAAAIAErAwAiB6GiIgggCKIiCUQAAAAAAAAIQKKgoyAIIAmiIgggCKAgB6GiIgggCKIiCUQAAAAAAAAIQKKgoyAIIAmiIgggCKAgB6GiIgggCKIiCUQAAAAAAAAIQKKgoyAIIAmiIgggCKAgB6GiIgggCKIiCUQAAAAAAAAIQKKgoyAIIAmiIgYgBqAgB6GiIgYgBqIiCEQAAAAAAAAIQKKgoyAGIAiiIgYgBqAgB6GiOQMAIABBCGohACABQQhqIQEgAkEIaiECIARCf3wiBEIAUg0ACwsLADUEbmFtZQALCmN1YmljLndhc20BDQEACnNvbHZlX3NwYW4HEgEAD19fc3RhY2tfcG9pbnRlcgCGAQ90YXJnZXRfZmVhdHVyZXMHKw9idWxrLW1lbW9yeS1vcHQrFmNhbGwtaW5kaXJlY3Qtb3ZlcmxvbmcrDmV4dGVuZGVkLWNvbnN0KwptdWx0aXZhbHVlKw9tdXRhYmxlLWdsb2JhbHMrE25vbnRyYXBwaW5nLWZwdG9pbnQrCHNpZ24tZXh0","native":{"elements":2000000,"numpy_ms":1027.1394000010332,"numpy_fast_ms":245.842200005427,"serial_ms":20.32699999108445,"pooled_ms":5.207999987760559,"workers":7,"probe_speedup":3.934257778890335,"agreement":4.440892098500626e-16,"residual":8.174598775667619e-10}},"quintic":{"title":"The unsolvable quintic","physics":"Abel and Ruffini proved the Bring quintic x\u2075 + px + q = 0 has no solution in radicals. Newton's method does not care: eight compiled steps find the real root anyway.","equation_html":"x<sup>5</sup> + p\u2009x + q = 0","law_label":"x \u2190 (-q + 4*x**5)/(p + 5*x**4)","steps":8,"input_ranges":[[1.0,3.0],[-2.0,2.0]],"residual_kind":"polynomial","ir_lines":132,"wasm_bytes":785,"wasm_base64":"AGFzbQEAAAABCQFgBX9/f35+AAMCAQAFAwEAEAYJAX8BQYCAwAALBxcCBm1lbW9yeQIACnNvbHZlX3NwYW4AAAqMBAGJBAIBfwR8AkAgBCADVw0AIAQgA30hBCAAIAOnQQN0IgVqIQAgASAFaiEBIAIgBWohAgNAIAJEAAAAAAAA8D8gACsDACIGRAAAAAAAAPA/IAZEAAAAAAAA8D8gBkQAAAAAAADwPyAGRAAAAAAAAPA/IAZEAAAAAAAA8D8gBkQAAAAAAADwPyAGRAAAAAAAAPA/IAZEAAAAAAAAAACgo0QAAAAAAAAAACABKwMAIgehoiIIIAggCCAIoqKiIglEAAAAAAAAFECioKMgCCAJokQAAAAAAAAQQKIgB6GiIgggCCAIIAiioqIiCUQAAAAAAAAUQKKgoyAIIAmiRAAAAAAAABBAoiAHoaIiCCAIIAggCKKioiIJRAAAAAAAABRAoqCjIAggCaJEAAAAAAAAEECiIAehoiIIIAggCCAIoqKiIglEAAAAAAAAFECioKMgCCAJokQAAAAAAAAQQKIgB6GiIgggCCAIIAiioqIiCUQAAAAAAAAUQKKgoyAIIAmiRAAAAAAAABBAoiAHoaIiCCAIIAggCKKioiIJRAAAAAAAABRAoqCjIAggCaJEAAAAAAAAEECiIAehoiIGIAYgBiAGoqKiIghEAAAAAAAAFECioKMgBiAIokQAAAAAAAAQQKIgB6GiOQMAIABBCGohACABQQhqIQEgAkEIaiECIARCf3wiBEIAUg0ACwsLADcEbmFtZQANDHF1aW50aWMud2FzbQENAQAKc29sdmVfc3BhbgcSAQAPX19zdGFja19wb2ludGVyAIYBD3RhcmdldF9mZWF0dXJlcwcrD2J1bGstbWVtb3J5LW9wdCsWY2FsbC1pbmRpcmVjdC1vdmVybG9uZysOZXh0ZW5kZWQtY29uc3QrCm11bHRpdmFsdWUrD211dGFibGUtZ2xvYmFscysTbm9udHJhcHBpbmctZnB0b2ludCsIc2lnbi1leHQ=","native":{"elements":2000000,"numpy_ms":2191.275399993174,"numpy_fast_ms":344.51400001125876,"serial_ms":41.39020000002347,"pooled_ms":7.7363999880617484,"workers":7,"probe_speedup":5.498437979078796,"agreement":5.551115123125783e-16,"residual":7.853717676198357e-13}},"pendulum":{"title":"Exact pendulum period","physics":"Beyond the small-angle lie: the true period needs the complete elliptic integral K(k), computed here by the arithmetic\u2013geometric mean -- Gauss's iteration, quadratically convergent, six steps. Output is T/T\u2080, how much slower a real pendulum swings at amplitude \u03b8\u2080 = 2\u2009arcsin(k).","equation_html":"T = T<sub>0</sub> / agm(1, \u221a(1 \u2212 k\u00b2))","law_label":"(a, b) \u2190 ((a+b)/2, \u221a(ab))","steps":6,"input_ranges":[[0.01,0.95],[0.0,1.0]],"residual_kind":"convergence","ir_lines":62,"wasm_bytes":547,"wasm_base64":"AGFzbQEAAAABCQFgBX9/f35+AAMCAQAFAwEAEAYJAX8BQYCAwAALBxcCBm1lbW9yeQIACnNvbHZlX3NwYW4AAAqdAgGaAgIBfwN8AkAgBCADVw0AIAQgA30hBCAAIAOnQQN0IgVqIQAgAiAFaiECA0AgAkQAAAAAAADwP0QAAAAAAADwPyAAKwMAIgYgBqKhnyIGnyIHRAAAAAAAAOA/oiAGRAAAAAAAAOA/okQAAAAAAADgP6AiBkQAAAAAAADgP6KgIghEAAAAAAAA4D+iIAefIAafoiIGRAAAAAAAAOA/oqAiB0QAAAAAAADgP6IgCJ8gBp+iIgZEAAAAAAAA4D+ioCIIRAAAAAAAAOA/oiAHnyAGn6IiBkQAAAAAAADgP6KgRAAAAAAAAOA/oiAInyAGn6JEAAAAAAAA4D+ioKM5AwAgAEEIaiEAIAJBCGohAiAEQn98IgRCAFINAAsLCwA4BG5hbWUADg1wZW5kdWx1bS53YXNtAQ0BAApzb2x2ZV9zcGFuBxIBAA9fX3N0YWNrX3BvaW50ZXIAhgEPdGFyZ2V0X2ZlYXR1cmVzBysPYnVsay1tZW1vcnktb3B0KxZjYWxsLWluZGlyZWN0LW92ZXJsb25nKw5leHRlbmRlZC1jb25zdCsKbXVsdGl2YWx1ZSsPbXV0YWJsZS1nbG9iYWxzKxNub250cmFwcGluZy1mcHRvaW50KwhzaWduLWV4dA==","native":{"elements":2000000,"numpy_ms":399.2182999936631,"numpy_fast_ms":148.08680000714958,"serial_ms":39.693799990345724,"pooled_ms":10.552599997026846,"workers":7,"probe_speedup":3.254717907382323,"agreement":0.0,"residual":null}},"chaos":{"title":"Logistic-map chaos orbit","physics":"Sixty-four iterations of x \u2190 r\u2009x(1\u2212x) in the chaotic regime. With no fast-math on any target, native, wasm, and numpy trajectories agree bit-for-bit -- a reassociating compiler would send each down a different orbit.","equation_html":"x \u2190 r\u2009x (1 \u2212 x)","law_label":"x \u2190 r\u2009x(1\u2212x), 64 iterations","steps":64,"input_ranges":[[3.6,3.99],[0.05,0.95]],"residual_kind":"reference","ir_lines":276,"wasm_bytes":1515,"wasm_base64":"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","native":{"elements":2000000,"numpy_ms":2141.412400000263,"numpy_fast_ms":1108.8118000043323,"serial_ms":77.99360000353772,"pooled_ms":13.121399999363348,"workers":7,"probe_speedup":6.822986876602486,"agreement":0.0,"residual":null}}}};
+const JS_REFERENCE = {
+  cubic: { solve: (a, b) => { let s0 = 0.0; const t0_0 = ((1.0 / (a + (3.0 * (s0 * s0)))) * ((-1.0 * b) + (2.0 * ((s0 * s0) * s0)))); s0 = t0_0; const t1_0 = ((1.0 / (a + (3.0 * (s0 * s0)))) * ((-1.0 * b) + (2.0 * ((s0 * s0) * s0)))); s0 = t1_0; const t2_0 = ((1.0 / (a + (3.0 * (s0 * s0)))) * ((-1.0 * b) + (2.0 * ((s0 * s0) * s0)))); s0 = t2_0; const t3_0 = ((1.0 / (a + (3.0 * (s0 * s0)))) * ((-1.0 * b) + (2.0 * ((s0 * s0) * s0)))); s0 = t3_0; const t4_0 = ((1.0 / (a + (3.0 * (s0 * s0)))) * ((-1.0 * b) + (2.0 * ((s0 * s0) * s0)))); s0 = t4_0; const t5_0 = ((1.0 / (a + (3.0 * (s0 * s0)))) * ((-1.0 * b) + (2.0 * ((s0 * s0) * s0)))); s0 = t5_0; return s0; }, residual: (o, a, b) => Math.abs(((b + ((o * o) * o)) + (o * a))) },
+  quintic: { solve: (a, b) => { let s0 = 0.0; const t0_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t0_0; const t1_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t1_0; const t2_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t2_0; const t3_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t3_0; const t4_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t4_0; const t5_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t5_0; const t6_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t6_0; const t7_0 = ((1.0 / (a + (5.0 * (((s0 * s0) * s0) * s0)))) * ((-1.0 * b) + (4.0 * ((((s0 * s0) * s0) * s0) * s0)))); s0 = t7_0; return s0; }, residual: (o, a, b) => Math.abs(((b + ((((o * o) * o) * o) * o)) + (o * a))) },
+  pendulum: { solve: (a, b) => { let s0 = 1.0; let s1 = Math.sqrt((1.0 + (-1.0 * (a * a)))); const t0_0 = ((0.5 * s0) + (0.5 * s1)); const t0_1 = (Math.sqrt(s0) * Math.sqrt(s1)); s0 = t0_0; s1 = t0_1; const t1_0 = ((0.5 * s0) + (0.5 * s1)); const t1_1 = (Math.sqrt(s0) * Math.sqrt(s1)); s0 = t1_0; s1 = t1_1; const t2_0 = ((0.5 * s0) + (0.5 * s1)); const t2_1 = (Math.sqrt(s0) * Math.sqrt(s1)); s0 = t2_0; s1 = t2_1; const t3_0 = ((0.5 * s0) + (0.5 * s1)); const t3_1 = (Math.sqrt(s0) * Math.sqrt(s1)); s0 = t3_0; s1 = t3_1; const t4_0 = ((0.5 * s0) + (0.5 * s1)); const t4_1 = (Math.sqrt(s0) * Math.sqrt(s1)); s0 = t4_0; s1 = t4_1; const t5_0 = ((0.5 * s0) + (0.5 * s1)); const t5_1 = (Math.sqrt(s0) * Math.sqrt(s1)); s0 = t5_0; s1 = t5_1; return (1.0 / s0); }, residual: null },
+  chaos: { solve: (a, b) => { let s0 = b; const t0_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t0_0; const t1_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t1_0; const t2_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t2_0; const t3_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t3_0; const t4_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t4_0; const t5_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t5_0; const t6_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t6_0; const t7_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t7_0; const t8_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t8_0; const t9_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t9_0; const t10_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t10_0; const t11_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t11_0; const t12_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t12_0; const t13_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t13_0; const t14_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t14_0; const t15_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t15_0; const t16_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t16_0; const t17_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t17_0; const t18_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t18_0; const t19_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t19_0; const t20_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t20_0; const t21_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t21_0; const t22_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t22_0; const t23_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t23_0; const t24_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t24_0; const t25_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t25_0; const t26_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t26_0; const t27_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t27_0; const t28_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t28_0; const t29_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t29_0; const t30_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t30_0; const t31_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t31_0; const t32_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t32_0; const t33_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t33_0; const t34_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t34_0; const t35_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t35_0; const t36_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t36_0; const t37_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t37_0; const t38_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t38_0; const t39_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t39_0; const t40_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t40_0; const t41_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t41_0; const t42_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t42_0; const t43_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t43_0; const t44_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t44_0; const t45_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t45_0; const t46_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t46_0; const t47_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t47_0; const t48_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t48_0; const t49_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t49_0; const t50_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t50_0; const t51_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t51_0; const t52_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t52_0; const t53_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t53_0; const t54_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t54_0; const t55_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t55_0; const t56_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t56_0; const t57_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t57_0; const t58_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t58_0; const t59_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t59_0; const t60_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t60_0; const t61_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t61_0; const t62_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t62_0; const t63_0 = ((a * s0) * (1.0 + (-1.0 * s0))); s0 = t63_0; return s0; }, residual: null },
+};
+
+const HC = navigator.hardwareConcurrency || 4;
+const WORKER_COUNT = Math.max(1, Math.min(8, HC - 1));
+document.getElementById("env").textContent =
+  `${HC} logical cores · pool of ${WORKER_COUNT} workers`;
+
+/* Deterministic inputs by per-index hash (splitmix32-style): any tier —
+   main thread, any worker, the JS reference — reproduces element i
+   bitwise without streaming a shared PRNG, so workers generate their own
+   slices and only OUTPUTS cross the postMessage boundary.  The worker
+   blob embeds these two functions via toString(), one definition total. */
+function inputAt(index, lane) {
+  let h = (Math.imul(index, 0x9E3779B9) ^ Math.imul(lane + 1, 0x85EBCA6B)) >>> 0;
+  h = Math.imul(h ^ (h >>> 16), 0x21F0AAAD) >>> 0;
+  h = Math.imul(h ^ (h >>> 15), 0x735A2D97) >>> 0;
+  h = (h ^ (h >>> 15)) >>> 0;
+  return h / 4294967296;
+}
+function fillInputs(view0, view1, start, count, ranges) {
+  const low0 = ranges[0][0], span0 = ranges[0][1] - ranges[0][0];
+  const low1 = ranges[1][0], span1 = ranges[1][1] - ranges[1][0];
+  for (let index = 0; index < count; index++) {
+    view0[index] = low0 + span0 * inputAt(start + index, 0);
+    view1[index] = low1 + span1 * inputAt(start + index, 1);
+  }
+}
+
+
+/* ---- serial runner: one instance per (problem, element count) ---- */
+const serialContexts = new Map();
+async function serialContext(key, count) {
+  const cacheKey = `${key}:${count}`;
+  if (serialContexts.has(cacheKey)) return serialContexts.get(cacheKey);
+  const problem = DATA.problems[key];
+  if (!problem.module) {
+    const bytes = Uint8Array.from(
+      atob(problem.wasm_base64), (c) => c.charCodeAt(0),
+    );
+    problem.module = await WebAssembly.compile(bytes);
+  }
+  const instance = await WebAssembly.instantiate(problem.module);
+  const memory = instance.exports.memory;
+  // Arrays live BEYOND the module's own pages: base is the old end, so
+  // the growth is always the full 3-array footprint.
+  const base = memory.buffer.byteLength;
+  memory.grow(Math.ceil((3 * count * 8 + 8) / 65536));
+  const context = {
+    solve: instance.exports.solve_span,
+    memory,
+    offsets: [base, base + count * 8, base + 2 * count * 8],
+    count,
+  };
+  // Inputs are a pure function of the index: fill once at creation, and
+  // every timed repeat is the kernel alone.
+  fillInputs(
+    new Float64Array(memory.buffer, context.offsets[0], count),
+    new Float64Array(memory.buffer, context.offsets[1], count),
+    0, count, problem.input_ranges,
+  );
+  serialContexts.set(cacheKey, context);
+  return context;
+}
+
+function runSerial(context) {
+  const { offsets, count } = context;
+  context.solve(
+    offsets[0], offsets[1], offsets[2], BigInt(0), BigInt(count),
+  );
+  return new Float64Array(context.memory.buffer, offsets[2], count);
+}
+
+/* ---- worker pool: the browser shell's design, one pool for all
+   kernels. Workers hold one compiled module PER PROBLEM KEY (the
+   original sin of a single shared module slot: kernel A answering for
+   kernel B — caught by the cross-check below).  Inputs are generated
+   in-worker from the shared per-index hash, so only outputs cross the
+   boundary. ---- */
+const WORKER_SOURCE = `
+  ${inputAt.toString()}
+  ${fillInputs.toString()}
+  const modules = new Map();
+  const contexts = new Map();
+  onmessage = async (event) => {
+    const message = event.data;
+    if (message.type === "module") {
+      modules.set(message.key, message.module);
+      postMessage({ type: "ready", key: message.key });
+      return;
+    }
+    try {
+      const { taskId, key, start, stop, ranges } = message;
+      const count = stop - start;
+      const contextKey = key + ":" + start + ":" + count;
+      let context = contexts.get(contextKey);
+      if (!context) {
+        const instance = await WebAssembly.instantiate(modules.get(key));
+        const memory = instance.exports.memory;
+        const base = memory.buffer.byteLength;
+        memory.grow(Math.ceil((3 * count * 8 + 8) / 65536));
+        context = { solve: instance.exports.solve_span, memory,
+                    offsets: [base, base + count * 8, base + 2 * count * 8] };
+        // Inputs are a pure function of the global index: fill once at
+        // context creation, mirroring the serial tier, so timed repeats
+        // measure the kernel plus output marshaling only.
+        fillInputs(
+          new Float64Array(memory.buffer, context.offsets[0], count),
+          new Float64Array(memory.buffer, context.offsets[1], count),
+          start, count, ranges,
+        );
+        contexts.set(contextKey, context);
+      }
+      const { memory, offsets } = context;
+      context.solve(offsets[0], offsets[1], offsets[2], BigInt(0), BigInt(count));
+      const out = new Float64Array(count);
+      out.set(new Float64Array(memory.buffer, offsets[2], count));
+      postMessage({ type: "done", taskId, out }, [out.buffer]);
+    } catch (error) {
+      postMessage({ type: "error", taskId: message.taskId, error: String(error) });
+    }
+  };
+`;
+
+let pool = null;
+const configuredProblems = new Set();
+function ensurePool() {
+  if (pool) return pool;
+  const url = URL.createObjectURL(
+    new Blob([WORKER_SOURCE], { type: "text/javascript" }),
+  );
+  pool = [];
+  for (let index = 0; index < WORKER_COUNT; index++) {
+    pool.push(new Worker(url));
+  }
+  return pool;
+}
+
+function configureProblem(key, module) {
+  if (configuredProblems.has(key)) return Promise.resolve();
+  configuredProblems.add(key);
+  return Promise.all(ensurePool().map((worker) =>
+    new Promise((resolve, reject) => {
+      const handler = (event) => {
+        if (event.data.type !== "ready" || event.data.key !== key) return;
+        worker.removeEventListener("message", handler);
+        resolve();
+      };
+      worker.addEventListener("message", handler);
+      worker.onerror = (event) => reject(event.message || "worker failed");
+      worker.postMessage({ type: "module", key, module });
+    })
+  ));
+}
+
+let nextTask = 1;
+function runTile(worker, key, start, stop, ranges) {
+  return new Promise((resolve, reject) => {
+    const taskId = nextTask++;
+    const handler = (event) => {
+      if (event.data.taskId !== taskId) return;
+      worker.removeEventListener("message", handler);
+      if (event.data.type === "error") reject(new Error(event.data.error));
+      else resolve(event.data.out);
+    };
+    worker.addEventListener("message", handler);
+    worker.postMessage({ taskId, key, start, stop, ranges });
+  });
+}
+
+async function runPooled(key, count, ranges, out) {
+  const workers = ensurePool();
+  const per = Math.ceil(count / workers.length);
+  const jobs = [];
+  for (let index = 0; index < workers.length; index++) {
+    const start = index * per;
+    const stop = Math.min(start + per, count);
+    if (start >= stop) break;
+    jobs.push(
+      runTile(workers[index], key, start, stop, ranges)
+        .then((slice) => out.set(slice, start)),
+    );
+  }
+  await Promise.all(jobs);
+}
+
+/* ---- timing ---- */
+async function bestOf(runs, thunk) {
+  let best = Infinity;
+  for (let index = 0; index < runs; index++) {
+    const started = performance.now();
+    await thunk();
+    best = Math.min(best, performance.now() - started);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  return best;
+}
+
+const fmt = (ms) => ms >= 100 ? ms.toFixed(0) : ms.toFixed(1);
+const rate = (count, ms) => (count / ms / 1e3).toFixed(1);
+
+/* ---- per-kernel benchmark ---- */
+let benchmarkRunning = false;
+function setAllButtons(disabled) {
+  for (const button of document.querySelectorAll("button")) {
+    button.disabled = disabled;
+  }
+}
+
+async function benchmark(key) {
+  // One measurement at a time: concurrent benchmarks would share the
+  // worker pool and contaminate each other's timings.  Returns false
+  // when the lock is held so a sequential caller can retry instead of
+  // silently skipping.
+  if (benchmarkRunning) return false;
+  benchmarkRunning = true;
+  const problem = DATA.problems[key];
+  const card = document.getElementById(`card-${key}`);
+  const status = card.querySelector(".status");
+  const count = parseInt(document.getElementById("elements").value, 10);
+  setAllButtons(true);
+  const say = (text, cls) => {
+    status.textContent = text;
+    status.className = "status" + (cls ? " " + cls : "");
+  };
+  try {
+    say("compiling wasm module…");
+    const context = await serialContext(key, count);
+
+    say("correctness gate…");
+    const sample = 4096;
+    const sampleOut = runSerial(await serialContext(key, sample));
+    const reference = JS_REFERENCE[key];
+    const ranges = problem.input_ranges;
+    const [[low0, high0], [low1, high1]] = ranges;
+    let disagreement = 0;
+    let residual = 0;
+    for (let index = 0; index < sample; index++) {
+      const a = low0 + (high0 - low0) * inputAt(index, 0);
+      const b = low1 + (high1 - low1) * inputAt(index, 1);
+      disagreement = Math.max(disagreement, Math.abs(
+        sampleOut[index] - reference.solve(a, b),
+      ));
+      if (reference.residual) {
+        residual = Math.max(
+          residual, reference.residual(sampleOut[index], a, b),
+        );
+      }
+    }
+    if (disagreement > 1e-12) {
+      say(`gate FAILED: wasm vs reference differs by ${disagreement.toExponential(2)}`, "bad");
+      return;
+    }
+    if (reference.residual && residual > 1e-6) {
+      // Agreement proves translation; the residual proves the ANSWER —
+      // plug the root back into its own equation.
+      say(`gate FAILED: equation residual ${residual.toExponential(2)}`, "bad");
+      return;
+    }
+
+    say("serial (main thread)…");
+    let serialOut;
+    const serialMs = await bestOf(3, () => {
+      serialOut = runSerial(context);
+    });
+
+    say("pooled (" + WORKER_COUNT + " workers)…");
+    let pooledMs = null;
+    let poolNote = "";
+    try {
+      await configureProblem(key, problem.module);
+      const pooledOut = new Float64Array(count);
+      await runPooled(key, count, ranges, pooledOut);
+      // Full elementwise scan: a stride would let a worker-boundary
+      // off-by-one hide between samples.
+      for (let index = 0; index < count; index++) {
+        if (pooledOut[index] !== serialOut[index]) {
+          throw new Error(
+            `pooled differs at element ${index}: ` +
+            `${pooledOut[index]} vs ${serialOut[index]}`,
+          );
+        }
+      }
+      pooledMs = await bestOf(3, () =>
+        runPooled(key, count, ranges, pooledOut));
+    } catch (error) {
+      poolNote = `workers unavailable here (${error.message || error})`;
+    }
+
+    /* paint */
+    const maxMs = Math.max(serialMs, pooledMs || 0);
+    const serialFill = card.querySelector(".bar-fill.serial");
+    const serialLabel = card.querySelector(".bar-row.serial .bar-label");
+    serialFill.style.width = (serialMs / maxMs * 100) + "%";
+    serialLabel.textContent =
+      `${fmt(serialMs)} ms · ${rate(count, serialMs)} Melem/s`;
+    const pooledRow = card.querySelector(".bar-row.pooled");
+    if (pooledMs !== null) {
+      pooledRow.querySelector(".bar-fill").style.width =
+        (pooledMs / maxMs * 100) + "%";
+      pooledRow.querySelector(".bar-label").textContent =
+        `${fmt(pooledMs)} ms · ${rate(count, pooledMs)} Melem/s`;
+      card.querySelector(".speedup").textContent =
+        `pool ${(serialMs / pooledMs).toFixed(2)}× vs serial ` +
+        `on your ${HC}-core machine`;
+      card.querySelector(".speedup").style.display = "inline-block";
+      say(`verified bit-exact, ${count.toLocaleString()} elements`, "ok");
+    } else {
+      pooledRow.querySelector(".bar-label").textContent = poolNote;
+      say(`verified bit-exact; serial only — ${poolNote}`, "ok");
+    }
+  } catch (error) {
+    say(`failed: ${error.message || error}`, "bad");
+  } finally {
+    benchmarkRunning = false;
+    setAllButtons(false);
+  }
+  return true;
+}
+
+/* ---- build the cards ---- */
+const container = document.getElementById("kernels");
+for (const [key, problem] of Object.entries(DATA.problems)) {
+  const native = problem.native;
+  const card = document.createElement("article");
+  card.className = "kernel";
+  card.id = `card-${key}`;
+  card.innerHTML = `
+    <div class="kernel-head">
+      <h2>${problem.title}</h2>
+      <span class="equation">${problem.equation_html}</span>
+    </div>
+    <p class="physics">${problem.physics}</p>
+    <div class="law">${problem.law_label
+      .replaceAll("&", "&amp;").replaceAll("<", "&lt;")}   ·   ${
+      problem.steps} steps · ${problem.ir_lines} lines of IR · ${
+      problem.wasm_bytes} B wasm</div>
+    <div class="instrument">
+      <div class="run-row">
+        <button>run on this machine</button>
+        <span class="status">idle — wasm embedded, nothing fetched</span>
+      </div>
+      <div class="legend">
+        <span class="swatch" style="background:var(--serial)"></span>serial, main thread
+        <span class="swatch" style="background:var(--pooled)"></span>pooled, ${WORKER_COUNT} workers
+        &nbsp;·&nbsp; lower is better
+      </div>
+      <div class="bars">
+        <div class="bar-row serial">
+          <div class="bar-name">wasm serial</div>
+          <div class="bar-track"><div class="bar-fill serial"></div>
+            <div class="bar-label"></div></div>
+        </div>
+        <div class="bar-row pooled">
+          <div class="bar-name">wasm pooled</div>
+          <div class="bar-track"><div class="bar-fill pooled"></div>
+            <div class="bar-label"></div></div>
+        </div>
+      </div>
+      <span class="speedup" style="display:none"></span>
+      <div class="reference">
+        reference marks · native AOT on the build machine
+        <table>
+          <tr><th>tier</th><th>time</th><th>rate</th></tr>
+          <tr><td>numpy · lambdify, as generated</td>
+              <td>${fmt(native.numpy_ms)} ms</td>
+              <td>${rate(native.elements, native.numpy_ms)} Melem/s</td></tr>
+          <tr><td>numpy · hand-tuned, in-place</td>
+              <td>${fmt(native.numpy_fast_ms)} ms</td>
+              <td>${rate(native.elements, native.numpy_fast_ms)} Melem/s</td></tr>
+          <tr><td>llvm serial</td>
+              <td>${fmt(native.serial_ms)} ms</td>
+              <td>${rate(native.elements, native.serial_ms)} Melem/s</td></tr>
+          <tr><td>llvm pooled · ${native.workers} workers</td>
+              <td>${fmt(native.pooled_ms)} ms</td>
+              <td>${rate(native.elements, native.pooled_ms)} Melem/s</td></tr>
+        </table>
+        ${native.elements.toLocaleString()} elements · ${DATA.machine}
+      </div>
+    </div>`;
+  card.querySelector("button").addEventListener("click", () => benchmark(key));
+  container.appendChild(card);
+}
+
+document.getElementById("run-all").addEventListener("click", async () => {
+  for (const key of Object.keys(DATA.problems)) {
+    while (!(await benchmark(key))) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+  }
+});
+</script>

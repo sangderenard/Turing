@@ -7,6 +7,83 @@ from typing import Tuple, Optional
 import math
 
 
+# ── Error channels as spans, not as a dict ────────────────────────────────
+#
+# ``Metrics.error_channels`` is a ``dict[str, float]``, and a dict does not
+# lower: it becomes a keyed store addressed by string tokens, and every
+# consultation of it on the step path is a string hash.  Today that is four
+# hashes per declared channel per attempt (the proposal's penalty, the soft
+# band, the rollback band, plus the rebuild in ``coerce_metrics``).
+#
+# The same information crosses as three ALIGNED SPANS instead:
+#
+#     ids     monotonic channel id, one per channel
+#     values  the measure itself
+#     names   every name packed into one byte array, with start offsets
+#
+# The id is stated rather than left implicit in the position because a
+# stage publishes SEVERAL channels -- there is no reason a sim has only one
+# error metric -- so a consumer holding column 7 has to know WHICH criterion
+# that is, not merely where it sat in someone's list.  Ids are handed out
+# once, at declaration time, and the id IS the index into the registry.
+#
+# ``names`` exists for one purpose: printing a console line or a refusal.
+# Nothing on the step path may read it.  Resolving a name to an id is a
+# build-time act; the loop that judges a step indexes and never hashes.
+
+_CHANNEL_NAMES: list[str] = []
+_CHANNEL_BY_NAME: dict[str, int] = {}
+
+
+def declare_channel(name: str) -> int:
+    """The monotonic id for ``name``, assigning one on first sight.
+
+    BUILD TIME ONLY.  This is the one function that looks a channel up by
+    string; it exists so that nothing else ever has to.
+    """
+    key = str(name)
+    existing = _CHANNEL_BY_NAME.get(key)
+    if existing is not None:
+        return existing
+    ident = len(_CHANNEL_NAMES)
+    _CHANNEL_NAMES.append(key)
+    _CHANNEL_BY_NAME[key] = ident
+    return ident
+
+
+def channel_name(channel_id: int) -> str:
+    """The declared name of a channel.  Reporting only -- never on the path."""
+    return _CHANNEL_NAMES[int(channel_id)]
+
+
+def declared_channels() -> tuple[str, ...]:
+    """Every channel declared so far, in id order."""
+    return tuple(_CHANNEL_NAMES)
+
+
+def packed_channel_names(ids) -> tuple[bytes, tuple[int, ...]]:
+    """``(blob, offsets)`` for these channel ids: the names as one minimal
+    byte array plus one start offset per id, the last offset being the end.
+
+    This is the whole textual surface of the channel system, and it is what
+    a log line or a refusal reads.  It is built once and carried alongside;
+    a step never touches it.
+    """
+    chunks: list[bytes] = []
+    offsets: list[int] = [0]
+    for channel_id in ids:
+        chunks.append(_CHANNEL_NAMES[int(channel_id)].encode("utf-8"))
+        offsets.append(offsets[-1] + len(chunks[-1]))
+    return b"".join(chunks), tuple(offsets)
+
+
+def unpack_channel_name(blob: bytes, offsets, index: int) -> str:
+    """One name back out of ``packed_channel_names``.  Reporting only."""
+    start = int(offsets[int(index)])
+    stop = int(offsets[int(index) + 1])
+    return blob[start:stop].decode("utf-8")
+
+
 @dataclass
 class Metrics:
     """Simulation diagnostics collected during a micro-step.
@@ -37,29 +114,72 @@ class Metrics:
     error_channels: dict[str, float] = field(default_factory=dict)
     hard_failure: bool = False
     advanced_dt: float | None = None
+    # Stable diagnostic tokens attached by the controller when it proceeds
+    # unresolved.  This is a total record field: ordinary and hard-failure
+    # metrics carry the empty report, so native record state never has to
+    # encode Python's dynamic-attribute absence as an anonymous input.
+    unresolved_report: list[str] = field(default_factory=list)
+
+
+def _scalar(value, default: float = 0.0) -> float:
+    """A Python float from a number or a 0-d tensor, never truncated.
+
+    ``float(tensor)`` on an AbstractTensor falls through ``__index__`` and
+    TRUNCATES (0.51 -> 0.0), which silently zeroed every sub-metre-per-second
+    velocity a tensor-publishing core reported and left the CFL proposal
+    unbounded.  ``.item()`` is the exact conversion.
+    """
+
+    if value is None:
+        return float(default)
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return float(item())
+        except (TypeError, ValueError):
+            pass
+    return float(value)
 
 
 def coerce_metrics(value) -> Metrics:
     """Normalize legacy metric-shaped records into the canonical contract."""
 
-    if isinstance(value, Metrics):
-        return value
     if value is None:
         raise TypeError("simulation advance returned no metrics")
-    return Metrics(
-        max_vel=float(getattr(value, "max_vel", 0.0)),
-        max_flux=float(getattr(value, "max_flux", 0.0)),
-        div_inf=float(getattr(value, "div_inf", 0.0)),
-        mass_err=float(getattr(value, "mass_err", 0.0)),
+    # A core that computes its metrics as 0-d tensors returns a genuine
+    # Metrics whose fields are tensors; every comparison and ``float()`` the
+    # controller then makes would truncate them.  Normalize BOTH shapes of
+    # record to exact Python floats here, once.
+    dt_limit = getattr(value, "dt_limit", None)
+    advanced_dt = getattr(value, "advanced_dt", None)
+    channels = {
+        str(name): _scalar(channel)
+        for name, channel in (getattr(value, "error_channels", {}) or {}).items()
+    }
+    normalized = Metrics(
+        max_vel=_scalar(getattr(value, "max_vel", 0.0)),
+        max_flux=_scalar(getattr(value, "max_flux", 0.0)),
+        div_inf=_scalar(getattr(value, "div_inf", 0.0)),
+        mass_err=_scalar(getattr(value, "mass_err", 0.0)),
         osc_flag=bool(getattr(value, "osc_flag", False)),
         stiff_flag=bool(getattr(value, "stiff_flag", False)),
         sim_frame=int(getattr(value, "sim_frame", 0)),
-        proc_ms=float(getattr(value, "proc_ms", 0.0)),
-        dt_limit=getattr(value, "dt_limit", None),
-        error_channels=dict(getattr(value, "error_channels", {}) or {}),
+        proc_ms=_scalar(getattr(value, "proc_ms", 0.0)),
+        dt_limit=None if dt_limit is None else _scalar(dt_limit),
+        error_channels=channels,
         hard_failure=bool(getattr(value, "hard_failure", False)),
-        advanced_dt=getattr(value, "advanced_dt", None),
+        advanced_dt=None if advanced_dt is None else _scalar(advanced_dt),
+        unresolved_report=list(getattr(value, "unresolved_report", ())),
     )
+    if isinstance(value, Metrics):
+        # Keep the caller's object identity (diagnostics such as
+        # ``unresolved_report`` are attached to it later) but with exact
+        # scalar fields.
+        for name in ("max_vel", "max_flux", "div_inf", "mass_err", "proc_ms",
+                     "dt_limit", "error_channels", "advanced_dt"):
+            setattr(value, name, getattr(normalized, name))
+        return value
+    return normalized
 
 
 class ScalerControl:

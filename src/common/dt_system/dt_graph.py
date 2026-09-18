@@ -389,7 +389,15 @@ class MetaLoopRunner:
                     clamped=False,
                     metrics=None,
                 )
-            for adv, alloc in zip(self._schedule, self._realtime_allocations):
+            # `compile_allocations` returns a MAPPING keyed by id(adv), not a
+            # sequence. Zipping the schedule against the mapping itself walks
+            # its KEYS, so every engine was handed a pointer address as its
+            # millisecond allocation -- measured: 2429530572816 ms, a step_dt
+            # of 2.4e9 seconds, which is how a car came to travel 1.8e21 m in
+            # 120 frames. Look each one up by the identity it was keyed under.
+            allocations = self._realtime_allocations or {}
+            for adv in self._schedule:
+                alloc = allocations.get(id(adv))
                 step_dt_ms = alloc if alloc is not None else dt*1000.0 if dt is not None else 1.0
                 step_dt = step_dt_ms / 1000.0  # convert ms to seconds
                 t0 = time.perf_counter()
@@ -459,7 +467,20 @@ class MetaLoopRunner:
                 eps=round_node.plan.eps,
                 event_boundaries=round_node.plan.event_boundaries,
                 attempt_log=attempt_log,
+                rollback_threshold_multiplier=(
+                    round_node.plan.rollback_threshold_multiplier
+                ),
+                rollback=round_node.plan.rollback,
+                distribution=round_node.distribution,
             )
+            if (
+                float(total) < float(window) - round_node.plan.eps
+                or bool(getattr(metrics, "hard_failure", False))
+            ):
+                raise RuntimeError(
+                    "scientific dt controller failed to complete its window: "
+                    f"advanced={float(total):.17g} window={float(window):.17g}"
+                )
         except Exception:
             transaction.restore(window_checkpoint)
             del round_stats.attempted[attempted_before:]

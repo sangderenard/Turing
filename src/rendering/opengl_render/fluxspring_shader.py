@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import ast
 from pathlib import Path
+
+from ...compiler.shader_extractor import extract_shader_compile_calls
 
 
 def load_fluxspring_graph_shaders() -> tuple[str, str]:
@@ -21,23 +22,14 @@ def load_fluxspring_graph_shaders() -> tuple[str, str]:
         / "autoautograd"
         / "spring_async_toy.py"
     )
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    values: dict[str, str] = {}
-    for statement in ast.walk(tree):
-        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-        value = statement.value
-        for target in targets:
-            if isinstance(target, ast.Name) and target.id in {"vsrc", "fsrc"}:
-                literal = ast.literal_eval(value)
-                if not isinstance(literal, str):
-                    raise TypeError(f"{target.id} in {path} is not literal shader text")
-                values[target.id] = literal
-    missing = {"vsrc", "fsrc"} - values.keys()
+    shaders = extract_shader_compile_calls(path)
+    by_stage = {shader.stage: shader.source for shader in shaders}
+    missing = {"vertex", "fragment"} - by_stage.keys()
     if missing:
-        raise RuntimeError(f"FluxSpring live shader is missing {sorted(missing)}")
-    return values["vsrc"], values["fsrc"]
+        raise RuntimeError(
+            f"FluxSpring live shader compiler calls are missing {sorted(missing)}"
+        )
+    return by_stage["vertex"], by_stage["fragment"]
 
 
 __all__ = ["load_fluxspring_graph_shaders"]

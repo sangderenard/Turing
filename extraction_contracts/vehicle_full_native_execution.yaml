@@ -1,0 +1,17 @@
+version: 1
+
+# Execution overlay for the Python-authored vehicle graph. Callable
+# classification still comes from program_extraction.yaml; this sheet changes
+# what constitutes a successful deployment. No Python-resident remainder or
+# callback is an acceptable vehicle executable.
+execution:
+  host_runtime: native
+  dependency_search: reachable
+  native_lowering: required
+  dispatch_unit: whole_program
+  unlowered_behavior: reject
+  require_full_native: true
+  backward_source: process_graph
+  python_callbacks: reject
+  numeric_semantics: abstract_tensor
+  scalar_promotion: all_numeric

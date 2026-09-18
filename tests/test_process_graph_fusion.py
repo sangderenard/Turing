@@ -2,7 +2,12 @@ from src.common.tensors.accelerator_backends.glsl_backend import (
     GLSL_OPS,
     emit_multi_output_program_source,
 )
-from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
+from src.common.tensors.fused_ir import (
+    FusedProgram,
+    Meta,
+    OpStep,
+    canonicalize_elementwise_steps,
+)
 from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.compression.jpeg.frame import (
     encode_color_jfif,
@@ -16,6 +21,7 @@ from src.compiler.process_graph_fusion import (
     fused_program_to_process_graph,
     plan_process_graph_dispatches,
 )
+from src.transmogrifier.graph.graph_express2 import ProcessGraph
 from src.compiler.torch_process_graph import compile_process_graph_torch
 
 
@@ -53,6 +59,30 @@ def test_process_graph_planner_keeps_shared_multi_output_producer_in_one_region(
     lowered = dispatch_region_to_fused_program(graph, region)
     assert [step.op_name for step in lowered.steps] == ["add", "sin", "cos"]
     assert lowered.outputs == {"sine": 4, "cosine": 5}
+
+
+def test_string_control_comparison_never_becomes_numeric_dispatch_region():
+    program = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[
+            OpStep(
+                0, "tensor_from_list", [],
+                attrs={"values": "delete"}, result_id=2,
+            ),
+            OpStep(1, "equal", [1, 2], result_id=3),
+        ],
+        outputs={"selected": 3},
+    )
+    graph = fused_program_to_process_graph(program)
+
+    plan = plan_process_graph_dispatches(
+        graph,
+        BackendFusionProfile("glsl", frozenset(GLSL_OPS)),
+    )
+
+    assert plan.regions == ()
+    assert 3 in plan.uncovered_nodes
 
 
 def test_multi_output_glsl_emitter_writes_all_results_in_one_shader():
@@ -130,6 +160,51 @@ def test_dynamic_scalar_dependencies_remain_runtime_feeds():
 
     assert id(control) in captured.program.feeds
     assert any(step.result_id == id(bounded) for step in captured.program.steps)
+
+
+def test_binary_python_max_with_scalar_is_not_misclassified_as_reduction():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.add_node(1, op="input", type="input")
+    graph.G.add_node(2, op="const", type="const", constant=1.0e-30)
+    graph.G.add_node(
+        3,
+        op="max",
+        type="max",
+        parents=((1, "lhs"), (2, "rhs")),
+    )
+
+    lowered = dispatch_region_to_fused_program(
+        graph,
+        DispatchRegion(
+            node_ids=(3,),
+            input_ids=(1,),
+            outputs=(("result", 3),),
+            score=0.0,
+        ),
+    )
+
+    assert lowered.steps[0].op_name == "maximum"
+    assert lowered.steps[0].input_ids == [1]
+    assert lowered.steps[0].attrs["right_scalar"] == 1.0e-30
+
+
+def test_common_ir_canonicalizes_binary_extrema_but_preserves_reductions():
+    program = FusedProgram(
+        version=1,
+        feeds={1, 2},
+        steps=[
+            OpStep(0, "max", [1, 2], result_id=3),
+            OpStep(1, "min", [3], {"right_scalar": 0.0}, result_id=4),
+            OpStep(2, "max", [4], {"axis": 0}, result_id=5),
+        ],
+        outputs={"result": 5},
+    )
+
+    normalized = canonicalize_elementwise_steps(program)
+
+    assert [step.op_name for step in normalized.steps] == [
+        "maximum", "minimum", "max",
+    ]
 
 
 def test_standalone_tensor_from_list_becomes_a_const_node():

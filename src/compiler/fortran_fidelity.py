@@ -194,8 +194,10 @@ def verify_fortran_module(
                     argument_types.append(ctype)
                     continue
                 value_id = int(parameter.name[1:])
-                if parameter.role == "input":
+                if parameter.role in {"input", "inout"}:
                     array = _ordered(inputs[value_id], dtype_name)
+                    if parameter.role == "inout":
+                        native_arrays[value_id] = array
                 else:
                     shape = tuple(parameter.shape)
                     array = _ordered(np.empty(shape or (), dtype=_NUMPY_DTYPES.get(
