@@ -4328,6 +4328,22 @@ def emit_ssa_module_to_c(
                     integer_ids.add(result_id)
                     kind = _scalar_c_type(instruction.res.dtype)
                     left, right = args
+                    # These are integer operations by definition and C
+                    # refuses a floating operand outright ("invalid operands
+                    # to binary expression ('double' and 'int64_t')"), so
+                    # the operands are made integral here rather than relying
+                    # on each one arriving that way.  LLVM's own lowering of
+                    # the same opcodes does exactly this -- ``fptosi double
+                    # %a to i64`` on both sides before the shift, then
+                    # ``sitofp`` on the result -- and the declared result
+                    # kind below still carries the conversion back.
+                    #
+                    # ``shl`` reached the C compiler with a double left
+                    # operand while the ``shr`` beside it was integral, so
+                    # this was decided per operand somewhere upstream; an
+                    # integer operation should not depend on that.
+                    left = f"(int64_t)({left})"
+                    right = f"(int64_t)({right})"
                     if op in {"LShr", "Shr"}:
                         left = f"({_unsigned_c_type(instruction.args[0].dtype)})({left})"
                     declared = (

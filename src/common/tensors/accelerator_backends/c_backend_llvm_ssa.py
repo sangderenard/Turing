@@ -273,7 +273,7 @@ declare double @asinh(double)
 declare double @acosh(double)
 declare double @atanh(double)
 
-define void @fill_double(ptr %out, double %value, i32 %n) {
+define internal void @fill_double(ptr %out, double %value, i32 %n) {
 entry:
   br label %loop.header
 
@@ -293,7 +293,7 @@ exit:
   ret void
 }
 
-define void @pad_double_nd(
+define internal void @pad_double_nd(
     ptr %input, ptr %output, ptr %shape, ptr %new_shape,
     ptr %left_pad, i32 %dims, double %value) {
 entry:
@@ -519,7 +519,7 @@ invalid:
   ret double 0x7FF8000000000000
 }
 
-define void @binary_double(ptr %a, ptr %b, ptr %out, i32 %n, i32 %op) {
+define internal void @binary_double(ptr %a, ptr %b, ptr %out, i32 %n, i32 %op) {
 entry:
   br label %loop.header
 
@@ -544,7 +544,7 @@ exit:
   ret void
 }
 
-define void @binary_scalar_double(
+define internal void @binary_scalar_double(
     ptr %a, double %b, ptr %out, i32 %n, i32 %op, i32 %reverse) {
 entry:
   %is.reverse = icmp ne i32 %reverse, 0
@@ -571,7 +571,7 @@ exit:
   ret void
 }
 
-define void @unary_double(ptr %a, ptr %out, i32 %n, i32 %op) {
+define internal void @unary_double(ptr %a, ptr %out, i32 %n, i32 %op) {
 entry:
   br label %loop.header
 
@@ -765,7 +765,7 @@ exit:
   ret void
 }
 
-define void @where_double(
+define internal void @where_double(
     ptr %condition, ptr %x, ptr %y, ptr %out, i32 %n) {
 entry:
   br label %loop.header
@@ -794,7 +794,7 @@ exit:
   ret void
 }
 
-define void @broadcast_double(
+define internal void @broadcast_double(
     ptr %input, ptr %output, ptr %input_shape, i32 %input_ndim,
     ptr %output_shape, i32 %output_ndim) {
 entry:
@@ -907,7 +907,7 @@ exit:
   ret void
 }
 
-define void @slice_copy_double(
+define internal void @slice_copy_double(
     ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
     i32 %start, i32 %step, i32 %count) {
 entry:
@@ -998,7 +998,7 @@ exit:
   ret void
 }
 
-define void @index_select_double(
+define internal void @index_select_double(
     ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
     ptr %indices, i32 %index.count) {
 entry:
@@ -1093,7 +1093,7 @@ exit:
   ret void
 }
 
-define void @gather_values_double(
+define internal void @gather_values_double(
     ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
     ptr %indices, i32 %index.count) {
 entry:
@@ -1189,7 +1189,7 @@ exit:
   ret void
 }
 
-define void @index_assign_double(
+define internal void @index_assign_double(
     ptr %target, ptr %shape, i32 %ndim, ptr %axis.offsets,
     ptr %axis.indices, ptr %values, i32 %value.count) {
 entry:
@@ -1300,7 +1300,7 @@ exit:
   ret void
 }
 
-define void @index_set_double(
+define internal void @index_set_double(
     ptr %input, ptr %output, ptr %shape, i32 %ndim,
     ptr %axis.offsets, ptr %axis.indices, ptr %values, i32 %value.count) {
 entry:
@@ -1332,7 +1332,7 @@ copy:
   ret void
 }
 
-define void @unfold2d_double(
+define internal void @unfold2d_double(
     ptr %input, ptr %output,
     i32 %n, i32 %c, i32 %h, i32 %w,
     i32 %kh.count, i32 %kw.count,
@@ -1424,7 +1424,7 @@ exit:
   ret void
 }
 
-define void @fold2d_double(
+define internal void @fold2d_double(
     ptr %columns, ptr %output,
     i32 %n, i32 %c, i32 %h, i32 %w,
     i32 %kh.count, i32 %kw.count,
@@ -1517,7 +1517,7 @@ exit:
   ret void
 }
 
-define void @sign_double(ptr %input, ptr %output, i32 %n) {
+define internal void @sign_double(ptr %input, ptr %output, i32 %n) {
 entry:
   br label %loop.header
 
@@ -1543,7 +1543,7 @@ exit:
   ret void
 }
 
-define i32 @count_true_double(ptr %mask, i32 %n) {
+define internal i32 @count_true_double(ptr %mask, i32 %n) {
 entry:
   br label %loop.header
 
@@ -1567,7 +1567,7 @@ exit:
   ret i32 %count
 }
 
-define void @mask_select_double(ptr %input, ptr %mask, ptr %output, i32 %n) {
+define internal void @mask_select_double(ptr %input, ptr %mask, ptr %output, i32 %n) {
 entry:
   br label %loop.header
 
@@ -1607,7 +1607,7 @@ exit:
   ret void
 }
 
-define void @increment_mask_double(ptr %input, ptr %mask, i32 %n) {
+define internal void @increment_mask_double(ptr %input, ptr %mask, i32 %n) {
 entry:
   br label %loop.header
 
@@ -1638,7 +1638,7 @@ exit:
   ret void
 }
 
-define void @cast_double_to_int_values(ptr %a, ptr %out, i32 %n) {
+define internal void @cast_double_to_int_values(ptr %a, ptr %out, i32 %n) {
 entry:
   br label %loop.header
 
@@ -1662,7 +1662,7 @@ exit:
   ret void
 }
 
-define void @cast_double_to_float_values(ptr %a, ptr %out, i32 %n) {
+define internal void @cast_double_to_float_values(ptr %a, ptr %out, i32 %n) {
 entry:
   br label %loop.header
 
@@ -1686,7 +1686,7 @@ exit:
   ret void
 }
 
-define void @cast_double_to_double_values(ptr %a, ptr %out, i32 %n) {
+define internal void @cast_double_to_double_values(ptr %a, ptr %out, i32 %n) {
 entry:
   br label %loop.header
 
@@ -1708,7 +1708,7 @@ exit:
   ret void
 }
 
-define void @cast_double_to_bool_values(ptr %a, ptr %out, i32 %n) {
+define internal void @cast_double_to_bool_values(ptr %a, ptr %out, i32 %n) {
 entry:
   br label %loop.header
 
@@ -1732,7 +1732,7 @@ exit:
   ret void
 }
 
-define double @sum_double(ptr %a, i32 %n) {
+define internal double @sum_double(ptr %a, i32 %n) {
 entry:
   br label %loop.header
 
@@ -1754,7 +1754,7 @@ exit:
   ret double %sum
 }
 
-define void @create_arange(double %start, double %step, i32 %n, ptr %out) {
+define internal void @create_arange(double %start, double %step, i32 %n, ptr %out) {
 entry:
   br label %loop.header
 
@@ -1777,7 +1777,7 @@ exit:
   ret void
 }
 
-define void @matmul_double(
+define internal void @matmul_double(
     ptr %a, ptr %b, ptr %out, i32 %m, i32 %n, i32 %p) {
 entry:
   br label %i.header
@@ -1838,7 +1838,7 @@ exit:
   ret void
 }
 
-define void @batched_matmul_indexed_double(
+define internal void @batched_matmul_indexed_double(
     ptr %a, ptr %b, ptr %out, ptr %a_offsets, ptr %b_offsets,
     i32 %batch_count, i32 %m, i32 %n, i32 %p) {
 entry:
@@ -1873,7 +1873,7 @@ exit:
   ret void
 }
 
-define void @cumsum_dim_double(
+define internal void @cumsum_dim_double(
     ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim) {
 entry:
   br label %before.header
@@ -1958,7 +1958,7 @@ exit:
   ret void
 }
 
-define void @reduce_dim_double(
+define internal void @reduce_dim_double(
     ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim, i32 %op) {
 entry:
   br label %before.header
@@ -2076,7 +2076,7 @@ exit:
   ret void
 }
 
-define void @transpose_double(
+define internal void @transpose_double(
     ptr %input, ptr %output, ptr %shape, ptr %axes, i32 %ndim) {
 entry:
   br label %total.header
@@ -2174,7 +2174,7 @@ exit:
   ret void
 }
 
-define void @stack_double(
+define internal void @stack_double(
     ptr %tensors, i32 %num.tensors, ptr %shape, i32 %ndim,
     i32 %dim, ptr %output) {
 entry:
@@ -2257,7 +2257,7 @@ exit:
   ret void
 }
 
-define void @cat_double(
+define internal void @cat_double(
     ptr %tensors, ptr %dim.sizes, i32 %num.tensors, ptr %shape,
     i32 %ndim, i32 %dim, ptr %output) {
 entry:
