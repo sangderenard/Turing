@@ -99,7 +99,11 @@ def main() -> int:
         accounting = value.accounting or {}
         field = accounting.get("program_abi_field")
         if field is not None:
-            field_lookup[(accounting.get("program_abi_record"), field)] = value
+            record = str(accounting.get("program_abi_record") or "")
+            # The record identity is the dotted class path; key by its last
+            # component so the feeds below name records the way the contract
+            # names them.
+            field_lookup[(record.rsplit(".", 1)[-1], field)] = value
 
     metrics = Metrics(max_vel=2.0, max_flux=2.0, div_inf=0.1, mass_err=0.05,
                        hard_failure=0.0)
@@ -140,6 +144,52 @@ def main() -> int:
                       and v.dtype == "float64"), None)
     if dx_value is not None:
         arguments[int(dx_value.id)] = dx
+
+    # Linked call-frame storage formals are the callee's scratch (keyed lookup
+    # status cells, sequence extents) propagated to the root signature.  A
+    # native host allocates them zeroed (see _managed_native_feeds_by_id); the
+    # reference evaluator needs the same, or it reports the unfed formal as a
+    # use before definition.
+    import numpy as np
+    for value in function.args:
+        if int(value.id) in arguments:
+            continue
+        accounting = value.accounting or {}
+        if accounting.get("program_abi_storage") == "keyed":
+            # The keyed handle is a structural descriptor naming its
+            # length/keys/values slots, never a buffer (see the C backend).
+            arguments[int(value.id)] = 0
+            continue
+        if accounting.get("program_abi_keyed_part") == "status":
+            # A keyed lookup's per-frame status cell (found/missing) starts
+            # cleared, exactly as the native host allocates it.
+            arguments[int(value.id)] = np.zeros(tuple(value.shape or ()) or (1,), dtype="int64")
+            continue
+        if not (accounting.get("linked_call_frame_storage")
+                or accounting.get("compiler_frame_storage")):
+            continue
+        shape = tuple(value.shape or ())
+        dtype = "int64" if str(value.dtype or "") in {"int64", "int", "int32", "unknown", "None", ""} else "float64"
+        arguments[int(value.id)] = np.zeros(shape, dtype=dtype) if shape else (0 if dtype == "int64" else 0.0)
+
+    for value in function.args:
+        if int(value.id) in arguments:
+            continue
+        accounting = value.accounting or {}
+        # Optional record fields the probe does not set: absent, with a
+        # zeroed payload -- the host's representation of an unset optional.
+        if accounting.get("program_abi_optional_presence"):
+            arguments[int(value.id)] = False
+        elif accounting.get("program_abi_optional_payload"):
+            arguments[int(value.id)] = 0.0
+    from src.compiler.identity_concordance import concordance_report
+    print(concordance_report(module))
+    print("parameter_names:", function.metadata.get("parameter_names"))
+    unfed = [(int(v.id), v.dtype, tuple(v.shape or ()), dict(v.accounting or {})) for v in function.args if int(v.id) not in arguments]
+    if unfed:
+        print("UNFED root formals (the evaluator will report the first as undefined):")
+        for item in unfed:
+            print("   ", item)
 
     evaluator = SSAReferenceEvaluator(module)
     try:

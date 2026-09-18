@@ -644,6 +644,34 @@ class SSAReferenceEvaluator:
             )
             return
 
+        if operation in {"Deploy", "Join"}:
+            # Deployment markers (deployment_ssa_binding): serial semantics
+            # are untouched by them -- a Join performs no numeric work and
+            # every consumer keeps reading the lane values.  The reference
+            # lane is the serial lane, so the markers are receipts here; a
+            # token result is defined as the marker itself.
+            if result is not None:
+                values[int(result.id)] = None
+            return
+
+        if operation == "extent" and instruction.args:
+            # ``extent(source)`` is the structural row/element count the
+            # shell emits for a span whose static shape it could not prove
+            # (``tensor_numel``): with ``extent_kind == "numel"`` it is the
+            # total element count, otherwise the size along ``dim``.  A
+            # projected keyed-mapping row (``for k, v in m.items()``) is a
+            # Python list here, so the count is its length.
+            payload = self._operand(values, instruction.args[0])
+            attributes = instruction.attributes or {}
+            array = np.asarray(payload)
+            if str(attributes.get("extent_kind") or "numel") == "numel":
+                extent = int(array.size)
+            else:
+                dim = int(attributes.get("dim", 0))
+                extent = int(array.shape[dim]) if array.ndim else 0
+            values[int(result.id)] = np.int64(extent)
+            return
+
         raise SSAEvaluationError(
             f"{function.name}: no reference semantics for {operation!r}. "
             "Add it deliberately rather than letting the evaluator guess."

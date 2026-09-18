@@ -5688,6 +5688,7 @@ def _field_slot_ops(
     *,
     retained_storage_identities: frozenset[str] = frozenset(),
     keyed_table_fields: frozenset[str] = frozenset(),
+    keyed_writable_fields: frozenset[str] = frozenset(),
 ):
     """Recover a method's instance-field accesses as slot loads and stores.
 
@@ -6732,8 +6733,16 @@ def _field_slot_ops(
     declared_ids = {
         int(sequence_id) for sequence_id, *_rest in sequence_declarations
     }
+    # A contract-declared keyed field is writable exactly when the contract
+    # says so (``mutable: true``): its store helper is refused as a read-only
+    # destination otherwise.
+    writable_keyed_table_ids = {
+        int(sequence_id)
+        for field_name, sequence_id in keyed_field_sequence_ids.items()
+        if str(field_name) in keyed_writable_fields
+    }
     sequence_declarations.extend(
-        (int(sequence_id), "unique", 2, False)
+        (int(sequence_id), "unique", 2, int(sequence_id) in writable_keyed_table_ids)
         for sequence_id in sorted(field_table_ids & referenced_table_ids)
         if int(sequence_id) not in declared_ids
     )
@@ -8400,7 +8409,7 @@ def _nest_lexical_conditionals_in_loops(
         if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
             return node_position(int(block.source_node_id))
         if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
-            return node_position(int(block.site_node_id))
+            return _loop_control_block_position(graph.G, block, node_position)
         if isinstance(block, (LoopBlock, WhileBlock)):
             source_id = getattr(block, "source_loop_node_id", None)
             if source_id is not None:
@@ -8616,6 +8625,48 @@ def _flattened_sequence_children(block) -> tuple:
     return tuple(flat)
 
 
+def _loop_control_block_position(
+    graph_obj: Any, block: Any, node_position: Any,
+) -> tuple[int, int, int]:
+    """Lexical position of a ``LoopControlBlock`` for source-ordered placement.
+
+    A ``break``/``continue`` sits at its statement.  A ``return`` is anchored
+    at its returned expression -- for ``return a, f(x), g(y)`` that is the
+    Tuple, whose source position is the START of the expression (the opening
+    column), i.e. BEFORE every call written inside it.  Sorting the edge by
+    that start put it ahead of the ``__plan_callsite_N__`` markers for
+    ``f(x)`` and ``g(y)``, so the edge consumed values produced after it and
+    the SSA scheduler refused with ``control effect order conflicts with
+    value dependencies`` (step_with_dt_control_used's in-loop ``return
+    metrics, _restore_type(dt_next, ref), _restore_type(dt_tensor, ref)``).
+    A return executes once its expression is fully evaluated, so its position
+    is the END of that expression: the latest end coordinate over the site
+    and the exact slot values the edge carries (``return_value_ids``), which
+    every call inside the expression precedes.
+    """
+
+    site_id = int(block.site_node_id)
+    candidates = [node_position(site_id)]
+    if block.action != "return":
+        return candidates[0]
+    for value_id in (site_id, *(
+        int(value_id) for value_id in block.return_value_ids
+        if value_id is not None
+    )):
+        if value_id not in graph_obj:
+            continue
+        expression = graph_obj.nodes[value_id].get("expr_obj")
+        end_line = getattr(expression, "end_lineno", None)
+        if end_line is None:
+            continue
+        candidates.append((
+            int(end_line),
+            int(getattr(expression, "end_col_offset", 0) or 0),
+            site_id,
+        ))
+    return max(candidates)
+
+
 def _authored_node_position(graph_obj: Any, node_id: int) -> tuple[int, int, int]:
     """Source position of a graph node, or of the control record it left.
 
@@ -8718,7 +8769,7 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
         if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
             return node_position(int(block.source_node_id))
         if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
-            return node_position(int(block.site_node_id))
+            return _loop_control_block_position(graph.G, block, node_position)
         if isinstance(block, (LoopBlock, WhileBlock)):
             source_id = getattr(block, "source_loop_node_id", None)
             if source_id is not None:
@@ -8918,7 +8969,7 @@ def _place_plan_callsites_lexically(
         if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
             return node_position(int(block.source_node_id))
         if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
-            return node_position(int(block.site_node_id))
+            return _loop_control_block_position(graph.G, block, node_position)
         if isinstance(block, (LoopBlock, WhileBlock)):
             source_id = getattr(block, "source_loop_node_id", None)
             if source_id is not None:
@@ -9478,7 +9529,7 @@ def _install_lexical_sequence_mutations(
         if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
             return node_position(int(block.source_node_id))
         if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
-            return node_position(int(block.site_node_id))
+            return _loop_control_block_position(graph.G, block, node_position)
         if isinstance(block, (LoopBlock, WhileBlock)):
             source_id = getattr(block, "source_loop_node_id", None)
             if source_id is not None:
@@ -13151,6 +13202,203 @@ def _apply_phi_initial_identity_repairs_to_control(control, receipts):
     return replace(control, root=rewrite(control.root))
 
 
+def _drop_formals_and_call_operands(
+    all_functions: Mapping[str, Any],
+    function: Any,
+    dropped_positions: Iterable[int],
+) -> None:
+    """Drop formals by position and the matching operand at every call site.
+
+    A formal exists only together with the operand every caller feeds it.
+    Dropping the formal alone leaves each call site one operand too long,
+    and the public-span origin walk skips calls whose arity disagrees --
+    silently severing every span reached through this function for every
+    caller above it.  ``callee_input_ids`` receipts are trimmed in step.
+    """
+
+    dropped = set(map(int, dropped_positions))
+    if not dropped:
+        return
+    original_arity = len(function.args)
+    function.args = [
+        value
+        for position, value in enumerate(function.args)
+        if position not in dropped
+    ]
+    function_symbol = next(
+        (
+            candidate_symbol
+            for candidate_symbol, candidate in all_functions.items()
+            if candidate is function
+        ),
+        None,
+    )
+    if function_symbol is None:
+        return
+    for caller in all_functions.values():
+        for block in caller.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    instruction.op != "Call"
+                    or str(
+                        instruction.attributes.get("callee") or ""
+                    ) != function_symbol
+                    or len(instruction.args) != original_arity
+                ):
+                    continue
+                instruction.args = [
+                    argument
+                    for position, argument in enumerate(instruction.args)
+                    if position not in dropped
+                ]
+                declared = instruction.attributes.get("callee_input_ids")
+                if declared is not None:
+                    instruction.attributes["callee_input_ids"] = tuple(
+                        value_id for position, value_id in enumerate(declared)
+                        if position not in dropped
+                    )
+
+
+def _strip_dead_cell_bookkeeping(function: Any, members: set[int]) -> set[int]:
+    """Remove the bookkeeping of storage cells nothing reads anymore.
+
+    ``members`` are cell ids (a retired sequence's handle, columns, length,
+    capacity, status).  Their bookkeeping is the address derivation over a
+    cell (``GetElementPtr``/casts, ``ssa_local_sequence_length``) and the
+    stores through those addresses (``ssa_local_sequence_initialize``,
+    ``ssa_sequence_clear``).  A store touches the derived address, not the
+    cell, so the closure runs forward over address derivation first; then
+    every instruction that touches a member and whose result feeds nothing
+    else is removed, to a fixed point, so the derivation goes once its
+    store is gone.  A ``Load`` whose result is consumed is a real read and
+    keeps the cell alive: it is left in place and the caller keeps the
+    formal.  Returns the enlarged member set.
+    """
+
+    members = set(map(int, members))
+    address_ops = {"GetElementPtr", "gep", "Cast", "cast_like", "BitCast"}
+    grown = True
+    while grown:
+        grown = False
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.res is None or instruction.op not in address_ops:
+                    continue
+                if any(int(argument.id) in members for argument in instruction.args):
+                    if int(instruction.res.id) not in members:
+                        members.add(int(instruction.res.id))
+                        grown = True
+    changed = True
+    while changed:
+        changed = False
+        consumers: dict[int, int] = {}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                for argument in instruction.args:
+                    consumers[int(argument.id)] = (
+                        consumers.get(int(argument.id), 0) + 1
+                    )
+        for block in function.blocks.values():
+            kept = []
+            for instruction in block.instrs:
+                touches = any(
+                    int(argument.id) in members for argument in instruction.args
+                )
+                result_id = (
+                    None if instruction.res is None else int(instruction.res.id)
+                )
+                unused_result = (
+                    result_id is None or consumers.get(result_id, 0) == 0
+                )
+                if (
+                    touches
+                    and unused_result
+                    and instruction.op not in {
+                        "Call", "call", "Ret", "ret", "Br", "CondBr",
+                    }
+                ):
+                    if result_id is not None:
+                        members.add(result_id)
+                    changed = True
+                    continue
+                kept.append(instruction)
+            block.instrs = kept
+    return members
+
+
+def _prune_dead_local_sequences(
+    all_functions: Mapping[str, Any],
+    all_sequence_tables: Mapping[str, Any],
+) -> int:
+    """Remove sequence descriptors whose storage the function never has.
+
+    Structural specialization can select away the producer of a local
+    sequence -- ``channels = metrics.error_channels or {}`` keeps the field
+    and drops the ``{}`` -- while the descriptor minted for that literal
+    survives, together with the length/status cells it was given as leased
+    frame formals and the entry ``clear`` store into them.  Nothing ever
+    defines the descriptor's handle or columns, so nothing can read the
+    sequence; the leftover is a formal every caller must lease storage for
+    and a store into it, i.e. exactly the "no caller can know what to pass"
+    signature (identity_concordance: ``descriptor-member-unknown``).
+
+    A descriptor is dead when neither its handle nor any column is a formal
+    or defined by an instruction of the function.  Its bookkeeping is
+    removed (any instruction touching only its cells whose result is
+    otherwise unused), the descriptor is unregistered, and member formals
+    left without a consumer are dropped with their call operands.  Returns
+    the number of descriptors removed.
+    """
+
+    removed = 0
+    for symbol, function in all_functions.items():
+        table = all_sequence_tables.get(str(symbol))
+        if table is None or not table.sequences:
+            continue
+        formal_ids = {int(value.id) for value in function.args}
+        defined_ids = {
+            int(instruction.res.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
+        for sequence_id, descriptor in tuple(table.sequences.items()):
+            handle = int(descriptor.sequence_id)
+            columns = tuple(map(int, descriptor.column_value_ids))
+            if any(
+                value_id in formal_ids or value_id in defined_ids
+                for value_id in (handle, *columns)
+            ):
+                continue
+            members = {
+                handle, *columns,
+                int(descriptor.length_address_id),
+                int(descriptor.capacity_value_id),
+                *((int(descriptor.status_address_id),)
+                  if descriptor.status_address_id is not None else ()),
+                *((int(descriptor.live_flags_value_id),)
+                  if descriptor.live_flags_value_id is not None else ()),
+            }
+            members = _strip_dead_cell_bookkeeping(function, members)
+            del table.sequences[sequence_id]
+            removed += 1
+            still_consumed = {
+                int(argument.id)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                for argument in instruction.args
+            }
+            _drop_formals_and_call_operands(
+                all_functions, function, [
+                    position
+                    for position, value in enumerate(function.args)
+                    if int(value.id) in members
+                    and int(value.id) not in still_consumed
+                ],
+            )
+            formal_ids = {int(value.id) for value in function.args}
+    return removed
+
 def _class_surface_ssa_program(
     compilation: Any,
     artifact_name: str,
@@ -13609,6 +13857,13 @@ def _class_surface_ssa_program(
         for _field_name, _field in dict(_record.get("fields") or {}).items()
         if str(_field.get("storage") or "") == "keyed"
     )
+    keyed_writable_fields = frozenset(
+        str(_field_name)
+        for _record in dict(program_abi.get("records") or {}).values()
+        for _field_name, _field in dict(_record.get("fields") or {}).items()
+        if str(_field.get("storage") or "") == "keyed"
+        and bool(_field.get("mutable", False))
+    )
     shell_sequence_evidence: list[dict[str, Any]] = []
     for shell in planned_shells:
         graph = getattr(shell, "process_graph", None)
@@ -13626,6 +13881,7 @@ def _class_surface_ssa_program(
             graph_obj,
             retained_storage_identities=frozenset(retained_storage_identities),
             keyed_table_fields=keyed_table_fields,
+            keyed_writable_fields=keyed_writable_fields,
         )
         shell_sequence_evidence.append({
             "function_name": str(
@@ -14441,6 +14697,15 @@ def _class_surface_ssa_program(
                     _record.get("fields") or {}
                 ).items()
                 if str(_field.get("storage") or "") == "keyed"
+            ),
+            keyed_writable_fields=frozenset(
+                str(_field_name)
+                for _record in dict(program_abi.get("records") or {}).values()
+                for _field_name, _field in dict(
+                    _record.get("fields") or {}
+                ).items()
+                if str(_field.get("storage") or "") == "keyed"
+                and bool(_field.get("mutable", False))
             ),
         )
         sequence_initializations = tuple(dict.fromkeys((
@@ -22996,6 +23261,45 @@ def _class_surface_ssa_program(
                                     )
                                 )
                                 receiver_fields[field.name] = resident
+                        if (
+                            resident is None
+                            and not field.value_ids
+                            and (
+                                field.sequence_id is None
+                                or callee_result_sequences is None
+                                or callee_result_sequences.by_id(
+                                    int(field.sequence_id)
+                                ) is None
+                            )
+                        ):
+                            # The callee publishes this field with no
+                            # physical storage at all -- no value ids and no
+                            # sequence descriptor (an untouched
+                            # default-empty table such as
+                            # ``Metrics.unresolved_report``).  There is
+                            # nothing to write back into the receiver, so a
+                            # receiver that never materialized the field is
+                            # not missing anything.  Record the fact and
+                            # move on; only a field with real storage the
+                            # receiver cannot hold is a contract failure.
+                            receipts = list(
+                                all_functions[caller_symbol].metadata.get(
+                                    "unbound_empty_result_fields", ()
+                                ) or ()
+                            )
+                            receipt = {
+                                "callee": str(callee_symbol),
+                                "callsite_id": int(planned_call.callsite_id),
+                                "record": str(root.identity),
+                                "field": str(field.name),
+                                "storage": str(field.storage.value),
+                            }
+                            if receipt not in receipts:
+                                receipts.append(receipt)
+                            all_functions[caller_symbol].metadata[
+                                "unbound_empty_result_fields"
+                            ] = tuple(receipts)
+                            continue
                         if resident is None or (
                             resident.storage != field.storage
                             or resident.storage_identity != field.storage_identity
@@ -29912,6 +30216,17 @@ def _class_surface_ssa_program(
                             # A pointer formal describes the address ABI, not
                             # a competing numerical dtype for its buffer.
                             continue
+                        if any(
+                            (value.accounting or {}).get("program_abi_storage")
+                            == "keyed"
+                            for value in (actual, formal)
+                        ):
+                            # A keyed mapping's own occurrence is a descriptor
+                            # naming its length/keys/values slots (the
+                            # backends treat it as structural); its dtype is
+                            # the sequence convention's column-0 placeholder,
+                            # not a buffer representation to unify here.
+                            continue
                         formal_accounting = dict(formal.accounting or {})
                         formal_is_physical = bool(
                             formal_accounting.get("physical_dtype")
@@ -31167,6 +31482,7 @@ def _class_surface_ssa_program(
         if not parts_by_owner:
             continue
         replaced_storage_ids: set[int] = set()
+        keyed_storage_remap: dict[int, int] = {}
         for block in function.blocks.values():
             for instruction in block.instrs:
                 owner_name = instruction.attributes.get("keyed_lookup_owner")
@@ -31199,10 +31515,29 @@ def _class_surface_ssa_program(
                 replaced_storage_ids.update(
                     int(argument.id) for argument in instruction.args[:4]
                 )
+                for old_argument, part in zip(
+                    instruction.args[:4],
+                    (parts["keys"], parts["values"],
+                     parts["length"], parts["length"]),
+                ):
+                    keyed_storage_remap.setdefault(
+                        int(old_argument.id), int(part.id)
+                    )
                 instruction.args[0] = parts["keys"]
                 instruction.args[1] = parts["values"]
                 instruction.args[2] = parts["length"]
                 instruction.args[3] = parts["length"]
+                if sequence_operation != "contains" and len(instruction.args) > 4:
+                    # The status cell is the lookup's own per-frame scratch
+                    # (found/missing).  It stays frame-allocated, but it is
+                    # this owner's cell: say so, or the formal carrying it
+                    # has no identity claim at all.
+                    status = instruction.args[4]
+                    status.accounting = {
+                        **dict(status.accounting or {}),
+                        "program_abi_keyed_owner": str(owner_name),
+                        "program_abi_keyed_part": "status",
+                    }
                 helper = all_functions.get(
                     str(instruction.attributes.get("callee") or "")
                 )
@@ -31277,6 +31612,85 @@ def _class_surface_ssa_program(
                                     helper_instruction.res.dtype = element
         if not replaced_storage_ids:
             continue
+        # The mapping's sequence descriptor was minted over the same
+        # anonymous storage the helper calls just stopped using.  Left as
+        # it was, the function carried the field twice -- the owner's parts
+        # (``error_channels.length/keys/values``, bound exactly at every
+        # call) and a private descriptor whose ids nothing binds -- so the
+        # caller-side propagation below mapped the private ids onto fresh
+        # frame slots and then registered a second descriptor for a
+        # sequence the caller already owned (``conflicting SSA sequence
+        # descriptor``, _propose_dt_pen -> _energy_time_limit over
+        # metrics.error_channels).  Move the descriptor onto the parts too:
+        # keys are its handle, values its second column, and the owner's
+        # length fills both length and capacity, exactly as the helper call
+        # was rebound above.  The status cell stays frame-allocated scratch.
+        keyed_symbol = next(
+            (
+                candidate_symbol
+                for candidate_symbol, candidate in all_functions.items()
+                if candidate is function
+            ),
+            None,
+        )
+        keyed_table = (
+            None if keyed_symbol is None
+            else all_sequence_tables.get(keyed_symbol)
+        )
+        if keyed_table is not None:
+            remapped: dict[int, Any] = {}
+            for old_sequence_id, descriptor in tuple(
+                keyed_table.sequences.items()
+            ):
+                touched = {
+                    int(descriptor.sequence_id),
+                    *map(int, descriptor.column_value_ids),
+                    int(descriptor.length_address_id),
+                    int(descriptor.capacity_value_id),
+                }
+                if not touched & set(keyed_storage_remap):
+                    remapped[int(old_sequence_id)] = descriptor
+                    continue
+                moved = replace(
+                    descriptor,
+                    sequence_id=keyed_storage_remap.get(
+                        int(descriptor.sequence_id),
+                        int(descriptor.sequence_id),
+                    ),
+                    column_value_ids=tuple(
+                        keyed_storage_remap.get(int(value_id), int(value_id))
+                        for value_id in descriptor.column_value_ids
+                    ),
+                    length_address_id=keyed_storage_remap.get(
+                        int(descriptor.length_address_id),
+                        int(descriptor.length_address_id),
+                    ),
+                    capacity_value_id=keyed_storage_remap.get(
+                        int(descriptor.capacity_value_id),
+                        int(descriptor.capacity_value_id),
+                    ),
+                )
+                incumbent = remapped.get(int(moved.sequence_id))
+                if incumbent is not None and incumbent != moved:
+                    raise ValueError(
+                        "keyed mapping descriptors disagree after binding "
+                        f"to their owner's parts in {keyed_symbol}: "
+                        f"{incumbent!r} vs {moved!r}"
+                    )
+                remapped[int(moved.sequence_id)] = moved
+            keyed_table.sequences = remapped
+        # The anonymous cells the helper calls no longer read keep only
+        # their own entry initialisation (``ssa_local_sequence_length`` +
+        # ``ssa_local_sequence_initialize``); strip it so the leased
+        # formals below are genuinely unconsumed and get dropped.
+        part_ids = {
+            int(part.id)
+            for parts in parts_by_owner.values()
+            for part in parts.values()
+        }
+        _strip_dead_cell_bookkeeping(
+            function, set(keyed_storage_remap) - part_ids,
+        )
         still_consumed = {
             int(argument.id)
             for block in function.blocks.values()
@@ -31291,49 +31705,13 @@ def _class_surface_ssa_program(
         ]
         if not dropped_positions:
             continue
-        original_arity = len(function.args)
-        function.args = [
-            value
-            for position, value in enumerate(function.args)
-            if position not in set(dropped_positions)
-        ]
-        # A formal exists only together with the operand every caller feeds
-        # it.  Dropping the formal alone leaves each call site one operand
-        # too long, and the public-span origin walk skips calls whose arity
-        # disagrees -- silently severing every span reached through this
-        # function for every caller above it.
-        function_symbol = next(
-            (
-                candidate_symbol
-                for candidate_symbol, candidate in all_functions.items()
-                if candidate is function
-            ),
-            None,
+        _drop_formals_and_call_operands(
+            all_functions, function, dropped_positions,
         )
-        if function_symbol is None:
-            continue
-        for caller in all_functions.values():
-            for block in caller.blocks.values():
-                for instruction in block.instrs:
-                    if (
-                        instruction.op != "Call"
-                        or str(
-                            instruction.attributes.get("callee") or ""
-                        ) != function_symbol
-                        or len(instruction.args) != original_arity
-                    ):
-                        continue
-                    instruction.args = [
-                        argument
-                        for position, argument in enumerate(instruction.args)
-                        if position not in set(dropped_positions)
-                    ]
-                    declared = instruction.attributes.get("callee_input_ids")
-                    if declared is not None:
-                        instruction.attributes["callee_input_ids"] = tuple(
-                            value_id for position, value_id in enumerate(declared)
-                            if position not in set(dropped_positions)
-                        )
+
+    # A local sequence whose producer specialization selected away leaves a
+    # descriptor over storage nothing defines; retire it and its leased cells.
+    _prune_dead_local_sequences(all_functions, all_sequence_tables)
 
     # Reconcile public source provenance after the linked-frame fixed point.
     # Storage may be allocated during initial discovery or during a later
@@ -31830,6 +32208,27 @@ def _class_surface_ssa_program(
                         # length/capacity contract.
                         continue
                     mapped_sequence_id = frame_map[int(descriptor.sequence_id)]
+                    incumbent = caller_sequences.by_id(mapped_sequence_id)
+                    if (
+                        incumbent is not None
+                        and tuple(map(int, incumbent.column_value_ids))
+                        == tuple(map(int, mapped_columns))
+                        and int(incumbent.length_address_id)
+                        == frame_map[int(descriptor.length_address_id)]
+                        and int(incumbent.capacity_value_id)
+                        == frame_map[int(descriptor.capacity_value_id)]
+                        and tuple(incumbent.key_columns)
+                        == tuple(descriptor.key_columns)
+                        and tuple(incumbent.column_dtypes)
+                        == tuple(descriptor.column_dtypes)
+                    ):
+                        # The caller already owns this sequence with exactly
+                        # this storage; the callee's view differs at most in
+                        # its status/live-flag scratch cells, which are
+                        # per-frame and never part of the sequence identity.
+                        # The incumbent stays; registering the view would
+                        # only raise a false descriptor conflict.
+                        continue
                     caller_sequences.register(SSASequenceDescriptor(
                         sequence_id=mapped_sequence_id,
                         column_value_ids=mapped_columns,
@@ -34477,6 +34876,9 @@ def lower_ast_source_to_ssa(
             piece_root.metadata["llvm_piece"] = {
                 "symbol": str(piece.artifact.name),
                 "llvm_ir": str(piece.artifact.llvm_ir),
+                # the piece's already-built DLL, for a C lane that links the
+                # piece dynamically instead of recompiling its IR
+                "library_path": str(piece.artifact.library_path) if getattr(piece.artifact, "library_path", None) else "",
                 "buffer_order": tuple(int(v) for v in piece.artifact.buffer_order),
                 "extent_order": tuple(
                     (int(v), str(kind), None if axis is None else int(axis))

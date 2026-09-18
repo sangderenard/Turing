@@ -42,13 +42,26 @@ def main() -> int:
         )
         entry = next(n for n in module.functions if n.endswith("__root"))
         function = module.functions[entry]
-        length_value, keys_value, values_value = function.args
         channels = {"a": 3.0, "b": 4.0, "c": 5.0}
-        arguments = {
-            int(length_value.id): len(channels),
-            int(keys_value.id): list(channels.keys()),
-            int(values_value.id): list(channels.values()),
-        }
+        # A bare keyed-mapping parameter lowers to its projected row columns
+        # (keys, values) with the row count recovered by ``extent``; the older
+        # (length, keys, values) triple is still accepted.
+        if len(function.args) == 3:
+            length_value, keys_value, values_value = function.args
+            arguments = {
+                int(length_value.id): len(channels),
+                int(keys_value.id): list(channels.keys()),
+                int(values_value.id): list(channels.values()),
+            }
+        else:
+            columns = sorted(
+                function.args,
+                key=lambda a: int((a.accounting or {}).get("projected_row_column", 0)),
+            )
+            arguments = {
+                int(columns[0].id): list(channels.keys()),
+                int(columns[1].id): list(channels.values()),
+            }
         evaluator = SSAReferenceEvaluator(module)
         try:
             result = evaluator.run(entry, arguments)

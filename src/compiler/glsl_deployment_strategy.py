@@ -2165,9 +2165,19 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     or graph.G.nodes.get(int(parent), {}).get("type")
                     or ""
                 ).casefold()
+                # The same holds for a conditional merge: a ``Phi`` is the
+                # reducer's exact, control-aware definition of the name after
+                # an ``if`` (``dt_next = minimum(...)`` in one arm, the
+                # pi_update value otherwise).  A Phi has no source position,
+                # so the source-ordered candidate scan below can never select
+                # it and instead picks the arm-local producer, which does not
+                # dominate the call (step_with_dt_control_used:
+                # ``_apply_energy_sidechain(dt_next, ...)`` was bound to the
+                # ``minimum`` inside ``if metrics.dt_limit is not None`` and
+                # refused as an undefined operand).  Never override a merge.
                 if (
                     isinstance(argument_expression, ast.Name)
-                    and parent_operation not in {"loopresult", "loopexit"}
+                    and parent_operation not in {"loopresult", "loopexit", "phi"}
                 ):
                     call_position = source_position(int(node_id))
                     # ``state, out = f(state)`` spells its targets left of
@@ -4476,7 +4486,27 @@ def _build_hierarchical_glsl_artifact(shell: Any):
             ) in argument_sources:
                 # An explicitly bound argument is a value edge, regardless of
                 # whether its runtime payload is a tensor or aggregate.  It
-                # cannot be the omitted/default None branch.
+                # cannot be the omitted/default None branch -- unless the
+                # bound value itself is declared None: a caller forwarding a
+                # parameter whose ProgramABI fact is ``builtins.NoneType``
+                # (``distribution`` through ``_propose_dt_pen``), or passing
+                # the literal ``None``.  Treating that edge as "not None"
+                # selected ``return distribution(...)`` over an opaque
+                # callable and emptied the specialized callee.
+                bound = leaves(int(closure_id), int(parameter_ids[0]))
+                endpoint = bound.get(()) if len(bound) == 1 else None
+                fact = (
+                    unresolved_static if endpoint is None
+                    else static_endpoint_value(endpoint)
+                )
+                declared_none = fact is None or (
+                    isinstance(fact, _ProgramABIValueFact)
+                    and str(fact.python_type) in {
+                        "builtins.NoneType", "NoneType",
+                    }
+                )
+                if declared_none:
+                    return isinstance(expression.ops[0], ast.Is)
                 return isinstance(expression.ops[0], ast.IsNot)
         parents = {
             str(role): int(parent)
@@ -16468,6 +16498,12 @@ def _tensor_descriptor(
                 ),
                 "dtype": str(boundary.get("dtype") or "float64"),
             }
+            # The declared Python type travels with the descriptor.  A
+            # callee re-deriving the type from the dtype alone turned a
+            # declared ``builtins.NoneType`` scalar into ``builtins.int``
+            # and folded ``distribution is not None`` the wrong way.
+            if boundary.get("python_type"):
+                tensor["python_type"] = str(boundary["python_type"])
     if "shape" not in tensor:
         operation = str(data.get("op") or data.get("type") or "").casefold()
         if operation in {
@@ -16658,6 +16694,13 @@ def _tensor_descriptor(
             {"device": tensor["device"]}
             if tensor.get("device") is not None else {}
         ),
+        # A declared Python type is part of the boundary fact; it rides
+        # along so a callee specialization sees ``builtins.NoneType`` and
+        # not a type re-derived from the dtype.
+        **(
+            {"python_type": str(tensor["python_type"])}
+            if tensor.get("python_type") else {}
+        ),
     }
 
 
@@ -16804,6 +16847,44 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             "dtype": "float64" if field_dtype is None else str(field_dtype),
         }
 
+    def _declared_record_span_descriptor(node_id: int) -> dict[str, Any] | None:
+        """Shape/dtype of a record-field read from the ProgramABI declaration.
+
+        The same declared-field lookup ``_tensor_descriptor`` performs for a
+        ``GetAttr`` on a record receiver, restated here so the shape walk can
+        recognise a declared span as a boundary without accepting an
+        inferred (possibly provisional) ``tensor`` fact on the node.
+        """
+
+        node = graph.G.nodes.get(int(node_id), {})
+        if str(node.get("op") or node.get("type") or "").casefold() != "getattr":
+            return None
+        field_name = str((node.get("attributes") or {}).get("attribute") or "")
+        receiver = next((
+            int(parent)
+            for parent, role in node.get("parents") or ()
+            if str(role) in {"value", "base", "object", "receiver"}
+            and int(parent) in graph.G
+        ), None)
+        if receiver is None:
+            return None
+        receiver_binding = str(
+            (graph.G.nodes[receiver].get("attributes") or {}).get("binding_name") or ""
+        )
+        if not receiver_binding:
+            return None
+        record = (graph.G.graph.get("parameter_record_abi") or {}).get(receiver_binding)
+        field = (
+            (record.get("fields") or {}).get(field_name)
+            if isinstance(record, Mapping) else None
+        )
+        if not (isinstance(field, Mapping) and field.get("shape") is not None):
+            return None
+        return {
+            "shape": tuple(map(int, field["shape"])),
+            "dtype": str(field.get("dtype") or "float64"),
+        }
+
     def descriptor_attribute(parent: int, attribute: str) -> Any:
         descriptor = _tensor_descriptor(graph, parent)
         if descriptor is None:
@@ -16824,7 +16905,24 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                     continue
                 # A declared record span supplies its own shape boundary;
                 # the opaque receiver is not an untyped tensor parameter.
-                if operation == "getattr" and _record_field_descriptor(current) is not None:
+                # That boundary is stated two ways: a bound planner
+                # specialization (a real object supplied at the entry) or
+                # the ProgramABI record declaration itself.  A method on
+                # ``self`` in a contract-only lowering has no bound object,
+                # so only the declaration can answer -- and without it this
+                # walk reached the record receiver, found no tensor
+                # descriptor on it, and returned unresolved for a field whose
+                # shape was declared.  ``self.memory.ndim`` then never
+                # folded, the ingestion expansion of ``self.memory[...]``
+                # (``tuple([slice(None)] * (self.memory.ndim - 0))``) stayed
+                # a live expression, and the store lowered as a
+                # resident-sequence replace with hidden length formals plus
+                # a one-element write (PieceState.restore in the dt system:
+                # 416 storage formals, 104 unnamed).
+                if operation == "getattr" and (
+                    _record_field_descriptor(current) is not None
+                    or _declared_record_span_descriptor(current) is not None
+                ):
                     continue
                 pending_inputs.extend(
                     int(value) for value, role in source.get("parents") or ()
@@ -17030,7 +17128,11 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             descriptor = _tensor_descriptor(graph, int(node_id))
             if descriptor is not None:
                 dtype = str(descriptor.get("dtype") or "unknown")
-                python_type = {
+                # A descriptor that carries the declared Python type (a
+                # caller's declared scalar forwarded across the call) is
+                # the fact; the dtype map is only the fallback for
+                # inferred tensor values.
+                python_type = str(descriptor.get("python_type") or "") or {
                     "bool": "builtins.bool",
                     "int": "builtins.int",
                     "int32": "builtins.int",
@@ -17236,6 +17338,16 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 # such a value therefore cannot be Python ``None``.  Restrict
                 # the fold to identity-with-None so no equality or truthiness is
                 # inferred from the schema fact itself.
+                #
+                # The one exception is a fact whose declared Python type IS
+                # ``NoneType``: the contract states the value is None (a
+                # ``distribution=None`` forwarded as a declared scalar).  Then
+                # ``is None`` holds and ``is not None`` does not; folding it
+                # the other way selected ``return distribution(...)`` over an
+                # opaque callable and emptied the specialized callee.
+                fact = left if isinstance(left, _ProgramABIValueFact) else right
+                if str(fact.python_type) in {"builtins.NoneType", "NoneType"}:
+                    return isinstance(comparison_node, ast.Is)
                 return isinstance(comparison_node, ast.IsNot)
             if isinstance(left, _ProgramABIValueFact) or isinstance(
                 right, _ProgramABIValueFact
@@ -18451,21 +18563,66 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             identities = graph.G.graph.get("identity_table") or {}
             if selected_return_id is not None:
                 graph.roots = [int(selected_return_id)]
-                for output_name in tuple(
+                # ``selected_return_id`` is the return STATEMENT's value: for
+                # ``return a, b, c`` that is the Tuple node, not any slot.
+                # The per-slot values of every return site are recorded by
+                # the reducer in ``return_slot_values``, keyed by the source
+                # span of the returned expression; that ledger is the
+                # authority for what each output slot carries at this site.
+                # The reducer's own convention (its Return handling) is that
+                # a positional slot's identity history lists the return-site
+                # values, while a name-spelled slot IS a variable whose own
+                # binding history already holds the returned value.  Writing
+                # the whole Tuple under every output name -- including a
+                # variable's name such as ``metrics`` -- rebinds that variable
+                # to the 3-tuple in the identity table; the planner's
+                # name-history repair then feeds the tuple to
+                # ``_propose_dt_pen(metrics, ...)`` and refuses the call with
+                # ``aggregate call binding for 'metrics' ... 3 != 0``.
+                returned_expression = selected_statements[-1].value
+                selected_span = (
+                    int(returned_expression.lineno),
+                    int(getattr(returned_expression, "col_offset", -1)),
+                    int(getattr(returned_expression, "end_lineno", -1)),
+                    int(getattr(returned_expression, "end_col_offset", -1)),
+                ) if getattr(returned_expression, "lineno", None) is not None else None
+                return_slots = dict(graph.G.graph.get("return_slot_values") or {})
+                selected_slot_values = tuple(
+                    return_slots.get(selected_span, ())
+                ) if selected_span is not None else ()
+                output_names = tuple(
                     graph.G.graph.get("function_outputs") or ()
-                ):
-                    identities[str(output_name)] = (
-                        int(selected_return_id),
+                )
+                positional_names = set(map(
+                    str, graph.G.graph.get("positional_output_names") or ()
+                ))
+                for index, output_name in enumerate(output_names):
+                    if str(output_name) not in positional_names:
+                        continue
+                    slot_value = (
+                        selected_slot_values[index]
+                        if index < len(selected_slot_values)
+                        else None
                     )
+                    if slot_value is None and len(output_names) == 1:
+                        # A single-slot return has no container: the
+                        # statement's value is the slot's value.
+                        slot_value = int(selected_return_id)
+                    if slot_value is not None and int(slot_value) in graph.G:
+                        identities[str(output_name)] = (int(slot_value),)
                 if source_index is not None:
                     # The source return ledger is also an output authority.
                     # A proven top-level terminal arm makes later return
                     # sites unreachable; retaining their slots can otherwise
                     # restore the rejected fallback during SSA publication.
-                    return_slots = dict(graph.G.graph.get("return_slot_values") or {})
+                    # The selected site is identified by its span (the
+                    # ledger's own key); comparing slot tuples against the
+                    # statement's value id only ever matched single-slot
+                    # returns.
                     selected_sites = {
                         site: slots for site, slots in return_slots.items()
-                        if tuple(slots) == (int(selected_return_id),)
+                        if site == selected_span
+                        or tuple(slots) == (int(selected_return_id),)
                     }
                     if selected_sites:
                         graph.G.graph["return_slot_values"] = selected_sites
