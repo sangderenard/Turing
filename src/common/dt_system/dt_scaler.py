@@ -31,57 +31,21 @@ import math
 # Nothing on the step path may read it.  Resolving a name to an id is a
 # build-time act; the loop that judges a step indexes and never hashes.
 
-_CHANNEL_NAMES: list[str] = []
-_CHANNEL_BY_NAME: dict[str, int] = {}
-
-
-def declare_channel(name: str) -> int:
-    """The monotonic id for ``name``, assigning one on first sight.
-
-    BUILD TIME ONLY.  This is the one function that looks a channel up by
-    string; it exists so that nothing else ever has to.
-    """
-    key = str(name)
-    existing = _CHANNEL_BY_NAME.get(key)
-    if existing is not None:
-        return existing
-    ident = len(_CHANNEL_NAMES)
-    _CHANNEL_NAMES.append(key)
-    _CHANNEL_BY_NAME[key] = ident
-    return ident
-
-
-def channel_name(channel_id: int) -> str:
-    """The declared name of a channel.  Reporting only -- never on the path."""
-    return _CHANNEL_NAMES[int(channel_id)]
-
-
-def declared_channels() -> tuple[str, ...]:
-    """Every channel declared so far, in id order."""
-    return tuple(_CHANNEL_NAMES)
-
-
-def packed_channel_names(ids) -> tuple[bytes, tuple[int, ...]]:
-    """``(blob, offsets)`` for these channel ids: the names as one minimal
-    byte array plus one start offset per id, the last offset being the end.
-
-    This is the whole textual surface of the channel system, and it is what
-    a log line or a refusal reads.  It is built once and carried alongside;
-    a step never touches it.
-    """
-    chunks: list[bytes] = []
-    offsets: list[int] = [0]
-    for channel_id in ids:
-        chunks.append(_CHANNEL_NAMES[int(channel_id)].encode("utf-8"))
-        offsets.append(offsets[-1] + len(chunks[-1]))
-    return b"".join(chunks), tuple(offsets)
-
-
-def unpack_channel_name(blob: bytes, offsets, index: int) -> str:
-    """One name back out of ``packed_channel_names``.  Reporting only."""
-    start = int(offsets[int(index)])
-    stop = int(offsets[int(index) + 1])
-    return blob[start:stop].decode("utf-8")
+# ONE registry, in error_channels.  This module used to define its own
+# ``_CHANNEL_NAMES``/``declare_channel``/``channel_name``/
+# ``declared_channels``, identical in name and text to the pair in
+# ``error_channels`` and independent of them.  Since the id IS the span
+# index, two registries meant the same name could be id 0 here and id 3
+# there, and any span built through one and read through the other was
+# silently misindexed -- the precise failure both modules were written to
+# prevent.  The names are re-exported so either spelling keeps working.
+from .error_channels import (  # noqa: F401
+    channel_name,
+    declare_channel,
+    declared_channels,
+    packed_channel_names,
+    unpack_channel_name,
+)
 
 
 @dataclass

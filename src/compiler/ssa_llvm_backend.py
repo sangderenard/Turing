@@ -874,7 +874,14 @@ def _kernel_signature(symbol: str) -> tuple[str, tuple[str, ...]]:
     )
     if match is None:
         raise ValueError(f"authored kernel {symbol!r} has no parseable define")
-    returns = match.group(1).strip()
+    # Everything between ``define`` and the symbol is captured, and that span
+    # holds more than the type: a definition may carry linkage and attributes
+    # first (``define internal void @k``).  Those belong to the definition, not
+    # to a call, and keeping them made the return type the string
+    # "internal void" -- which is a syntax error where a call renders its type,
+    # and which also failed the ``== "void"`` test, so a void kernel was
+    # emitted as if it produced a value.  The type is the last token.
+    returns = match.group(1).strip().split()[-1]
     arguments = tuple(
         parameter.strip().split()[0]
         for parameter in match.group(2).split(",")

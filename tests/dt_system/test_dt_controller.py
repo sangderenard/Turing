@@ -84,6 +84,13 @@ def test_no_dt_min_no_max_retries_still_terminates_deterministically():
     deterministic hard failure once halving a float64 value genuinely stops
     changing it -- the true mathematical floor, not an earlier
     approximation of it -- reached in well under 2000 ``advance`` calls.
+
+    ``rollback=True`` is not decoration here, it is the configuration this
+    behaviour lives in.  A retry re-attempts from the PRE-advance state, so it
+    needs the snapshot; ``rollback=False`` is the no-save lane that commits
+    whatever ``advance`` left behind and returns on its first pass, never
+    reaching any exhaustion rule at all.  Asserting a halving search in that
+    lane asserts something the lane does not do.
     """
 
     state = DummyState()
@@ -98,7 +105,7 @@ def test_no_dt_min_no_max_retries_still_terminates_deterministically():
 
     metrics, dt_next, dt_used = step_with_dt_control_used(
         state, 1e-3, dx, targets, ctrl, always_rejects,
-        max_retries=None, allow_unresolved=False,
+        max_retries=None, allow_unresolved=False, rollback=True,
     )
 
     assert calls["count"] < 2000
@@ -116,6 +123,9 @@ def test_no_dt_min_no_max_retries_honours_allow_unresolved():
     never become True, so this flag had no effect and the search still ran
     away.  The numeric-underflow exhaustion condition now makes the
     caller's explicit "accept an unresolved step eventually" reachable.
+
+    Same configuration note as above: the search that can be exhausted only
+    exists in the ``rollback=True`` lane.
     """
 
     state = DummyState()
@@ -130,7 +140,7 @@ def test_no_dt_min_no_max_retries_honours_allow_unresolved():
 
     metrics, dt_next, dt_used = step_with_dt_control_used(
         state, 1e-3, dx, targets, ctrl, always_rejects,
-        max_retries=None, allow_unresolved=True,
+        max_retries=None, allow_unresolved=True, rollback=True,
     )
 
     assert calls["count"] < 2000

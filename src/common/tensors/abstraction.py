@@ -321,6 +321,25 @@ class AbstractTensor:
         item_fn = getattr(self, "item_")
         value = item_fn()
         return int(value)
+
+    def __float__(self) -> float:
+        """The scalar value, as a float.
+
+        Without this, ``float(tensor)`` did not fail -- it silently TRUNCATED.
+        Python's ``float()`` accepts ``__index__`` as a fallback, so every
+        ``float(tensor)`` call site read the value truncated toward zero: a
+        determinant of 0.877 came back 0.0, which looks like a singular matrix
+        rather than a conversion bug, and a trace of 3.5 came back 3.0.  Nothing
+        raised, so nothing said so.
+
+        ``item`` already carries the scalar contract -- it returns the value for
+        a single-element tensor and raises for anything larger, the same rule
+        NumPy and PyTorch use -- so a many-element tensor refuses conversion
+        here instead of quietly yielding its first element.
+        """
+
+        return float(self.item())
+
     def argwhere(self) -> "AbstractTensor":
         """Return the indices where condition is True. Like np.argwhere, always returns a 2D array of indices."""
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))

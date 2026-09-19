@@ -63,6 +63,29 @@ def declared_channels() -> tuple[str, ...]:
     return tuple(_CHANNEL_NAMES)
 
 
+def packed_channel_names(ids) -> tuple[bytes, tuple[int, ...]]:
+    """``(blob, offsets)`` for these channel ids: the names as one minimal
+    byte array plus one start offset per id, the last offset being the end.
+
+    This is the whole textual surface of the channel system, and it is what
+    a log line or a refusal reads.  It is built once and carried alongside;
+    a step never touches it.
+    """
+    chunks: list[bytes] = []
+    offsets: list[int] = [0]
+    for channel_id in ids:
+        chunks.append(_CHANNEL_NAMES[int(channel_id)].encode("utf-8"))
+        offsets.append(offsets[-1] + len(chunks[-1]))
+    return b"".join(chunks), tuple(offsets)
+
+
+def unpack_channel_name(blob: bytes, offsets, index: int) -> str:
+    """One name back out of ``packed_channel_names``.  Reporting only."""
+    start = int(offsets[int(index)])
+    stop = int(offsets[int(index) + 1])
+    return blob[start:stop].decode("utf-8")
+
+
 @dataclass(frozen=True)
 class ChannelSpans:
     """What one step published, as aligned spans over the channel registry.
@@ -132,6 +155,143 @@ class ChannelLimits:
             limits=AbstractTensor.tensor(limits or [0.0]),
             present=AbstractTensor.tensor(present or [False]),
         )
+
+
+@dataclass(frozen=True)
+class ParticipantChannels:
+    """What EVERY participant published this step: participants x channels.
+
+    ``ChannelSpans`` carries one participant's worth.  This carries the whole
+    set, because the amalgamation and the gating want different things from it
+    and both want them at once:
+
+    * **summed** across participants for a system extensive -- total stored
+      energy, total power, total conservation discrepancy.  The system view is
+      a sum because those quantities are extensive; a max would report one
+      participant's share as the system's.
+    * **per participant** for a trip.  A stability limit or a custom limit is
+      an individual gate: a participant trips on its own measure against its
+      own limit, and it does not become everyone's step.  That is the whole
+      difference from folding first and judging afterwards, where seven quiet
+      participants and one loud one are indistinguishable.
+
+    The participant axis is inside the arrays rather than outside them, so the
+    judging stays one masked reduction over everything and the channel id keeps
+    being the index along the second axis.  Nothing hashes, and the shape is the
+    same shape the state columns already have.
+    """
+
+    values: Any    # (participants, channels)
+    present: Any   # (participants, channels)
+
+    @classmethod
+    def of(cls, published: Iterable[Mapping[str, float] | None]) -> "ParticipantChannels":
+        from ...common.tensors import AbstractTensor
+
+        rows_values: list[list[float]] = []
+        rows_present: list[list[bool]] = []
+        for entry in published:
+            entry = entry or {}
+            values: list[float] = []
+            present: list[bool] = []
+            for name in _CHANNEL_NAMES:
+                measure = entry.get(name)
+                values.append(0.0 if measure is None else float(measure))
+                present.append(measure is not None)
+            rows_values.append(values or [0.0])
+            rows_present.append(present or [False])
+        if not rows_values:
+            rows_values, rows_present = [[0.0]], [[False]]
+        return cls(values=AbstractTensor.tensor(rows_values),
+                   present=AbstractTensor.tensor(rows_present))
+
+
+@dataclass(frozen=True)
+class ParticipantLimits:
+    """Each participant's own limits, indexed the same way.
+
+    A participant may be judged against the defaults or against its own: a
+    custom limit is how one participant is held to a standard the others are
+    not, which is what makes the gate individual rather than a property of the
+    step.  ``None`` for a participant means "the defaults apply to it".
+    """
+
+    limits: Any    # (participants, channels)
+    present: Any   # (participants, channels)
+
+    @classmethod
+    def of(
+        cls,
+        per_participant: Iterable[Mapping[str, float] | None],
+        default: Mapping[str, float] | None = None,
+    ) -> "ParticipantLimits":
+        from ...common.tensors import AbstractTensor
+
+        default = default or {}
+        rows_limits: list[list[float]] = []
+        rows_present: list[list[bool]] = []
+        for entry in per_participant:
+            declared = dict(default)
+            if entry:
+                declared.update(entry)
+            limits: list[float] = []
+            present: list[bool] = []
+            for name in _CHANNEL_NAMES:
+                limit = declared.get(name)
+                limits.append(0.0 if limit is None else float(limit))
+                present.append(limit is not None)
+            rows_limits.append(limits or [0.0])
+            rows_present.append(present or [False])
+        if not rows_limits:
+            rows_limits, rows_present = [[0.0]], [[False]]
+        return cls(limits=AbstractTensor.tensor(rows_limits),
+                   present=AbstractTensor.tensor(rows_present))
+
+
+def system_totals(channels: ParticipantChannels):
+    """Summed across participants: one extensive total per channel.
+
+    Also returns which channels anybody published at all, because a channel no
+    participant reported is not a total of zero.
+    """
+    published = channels.present
+    contributed = channels.values * published
+    return contributed.sum(dim=0), (published.sum(dim=0) > 0.0)
+
+
+def participant_penalties(channels: ParticipantChannels,
+                          limits: ParticipantLimits):
+    """``measure / limit`` per participant per channel, zero where unjudged.
+
+    One masked division over the whole set -- the same law ``penalties`` applies
+    to a single participant, applied to all of them without folding first.
+    """
+    from ...common.tensors import AbstractTensor
+
+    mask = channels.present * limits.present
+    safe = AbstractTensor.where(limits.limits != 0.0, limits.limits,
+                                AbstractTensor.ones_like(limits.limits))
+    return AbstractTensor.where(mask, channels.values / safe,
+                                AbstractTensor.zeros_like(channels.values))
+
+
+def trips(channels: ParticipantChannels, limits: ParticipantLimits,
+          names: Iterable[str] | None = None) -> tuple[tuple[Any, str, float], ...]:
+    """Every individual gate that opened: ``(participant, channel, ratio)``.
+
+    A trip belongs to the participant that tripped.  ``names`` labels the
+    participants for reporting; without it they are their own indices.  Names
+    appear here and nowhere else on this path.
+    """
+    ratios = participant_penalties(channels, limits).tolist()
+    labels = list(names) if names is not None else None
+    opened: list[tuple[Any, str, float]] = []
+    for index, row in enumerate(ratios):
+        who = labels[index] if labels is not None and index < len(labels) else index
+        for channel_id, ratio in enumerate(row):
+            if float(ratio) > 1.0:
+                opened.append((who, channel_name(channel_id), float(ratio)))
+    return tuple(opened)
 
 
 def judged_mask(spans: ChannelSpans, limits: ChannelLimits):

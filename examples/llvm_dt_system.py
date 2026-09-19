@@ -27,6 +27,8 @@ import numpy as np
 
 from src.common.dt_system.dt_controller import STController, Targets, run_superstep
 from src.common.dt_system.dt_scaler import Metrics
+from src.common.dt_system.participants import Publication
+from src.common.dt_system.time_contracts import BIND, HOLD, ParticipantRegistry
 from src.compiler.native_law_kernels import LLVMPiece
 
 C_BACKEND = "c"
@@ -103,6 +105,50 @@ def piece_source(pieces):
             if name in folds:
                 folds[name].append(output)
 
+    # Each law publishes what IT measured, keyed by its own identity, in the
+    # order the laws ran -- which is the causal order, because law i may consume
+    # what law i-1 just published.  dt_system amalgamates what is system-wide
+    # and gates what is individual; this step's job is to report honestly, not
+    # to decide.
+    lines.append("")
+    lines.append("    # what each law measured, in causal order")
+    for index, piece in enumerate(pieces):
+        published = set(piece.output_names)
+        lines.append(f"    # -- {piece.entry}")
+        for name in METRIC_FIELDS:
+            if name not in published:
+                continue
+            reducer = "min" if name == "dt_limit" else "max"
+            lines.append(f"    m{index}_{name} = o{index}_{name}.{reducer}().item()")
+        # tau is this law's own energy over its own power: the time it would
+        # take to exchange its stored energy at the rate it is exchanging now.
+        # That is the quantity the blended energy/power pin always computed --
+        # here it stays attached to the law that measured it.
+        if "energy_j" in published and "power_w" in published:
+            lines.append(
+                f"    t{index}_tau = (m{index}_energy_j / m{index}_power_w"
+                f" if m{index}_power_w > 0.0 else None)")
+        else:
+            lines.append(f"    t{index}_tau = None")
+
+    lines.append("")
+    lines.append("    state.publications = {")
+    for index, piece in enumerate(pieces):
+        published = set(piece.output_names)
+        channels = [name for name in ("energy_j", "power_w", "div_inf", "mass_err")
+                    if name in published]
+        channel_text = ", ".join(
+            f'"{name}": m{index}_{name}' for name in channels)
+        floor = (f"m{index}_dt_limit" if "dt_limit" in published else "None")
+        lines.append(f'        "{piece.entry}": Publication(')
+        lines.append(f"            channels={{{channel_text}}},")
+        lines.append(f"            dt_limit={floor},")
+        lines.append(f"            tau_s=t{index}_tau,")
+        lines.append(f"            contract=(BIND if t{index}_tau is not None"
+                     f" else HOLD),")
+        lines.append("        ),")
+    lines.append("    }")
+
     def fold(operator, terms, empty):
         if not terms:
             return empty
@@ -110,13 +156,23 @@ def piece_source(pieces):
             return terms[0]
         return f"{operator}({', '.join(terms)})"
 
+    # The returned Metrics is the amalgamated REPORT, not the decision: the
+    # per-law rows above are what the controller gates on.  Extensives are
+    # summed because energy and power are extensive; the error measures are
+    # maxed, which is a worst-offender report and says nothing about WHICH law
+    # it came from -- the rows do.
+    lines.append("")
+    lines.append("    # the amalgamated report; the rows above are the decision")
     for name in ("max_vel", "max_flux", "div_inf", "mass_err"):
-        terms = [f"float({o}.max())" for o in folds[name]]
+        terms = [f"m{index}_{name}" for index, piece in enumerate(pieces)
+                 if name in set(piece.output_names)]
         lines.append(f"    {name} = " + fold("max", terms, "0.0"))
-    terms = [f"float({o}.min())" for o in folds["dt_limit"]]
+    terms = [f"m{index}_dt_limit" for index, piece in enumerate(pieces)
+             if "dt_limit" in set(piece.output_names)]
     lines.append("    dt_limit = " + fold("min", terms, 'float("inf")'))
     for name in ("energy_j", "power_w"):
-        terms = " + ".join(f"float({o}.max())" for o in folds[name])
+        terms = " + ".join(f"m{index}_{name}" for index, piece in enumerate(pieces)
+                           if name in set(piece.output_names))
         lines.append(f"    {name} = {terms or '0.0'}")
     lines.append("    metrics = Metrics(")
     lines.append("        max_vel=max_vel, max_flux=max_flux, div_inf=div_inf,")
@@ -136,11 +192,31 @@ def bind_pieces(pieces):
     module: the Python path runs the very text the lowering is given."""
 
     bindings = {f"step_{index}": piece for index, piece in enumerate(pieces)}
-    namespace = {"np": np, "Metrics": Metrics, **bindings}
+    namespace = {
+        "np": np, "Metrics": Metrics,
+        # the dt system's own publication vocabulary: a law states what it
+        # measured and how its tau participates, and nothing here decides
+        "Publication": Publication, "BIND": BIND, "HOLD": HOLD,
+        **bindings,
+    }
     exec(generated_source(pieces), namespace)
     globals()["PieceState"] = namespace["PieceState"]
     globals()["advance_pieces"] = namespace["advance_pieces"]
     return bindings
+
+
+def participant_registry(pieces):
+    """Declare each law as a participant, once, in causal order.
+
+    Identity is assigned at declaration and the id IS the index into every span
+    the dt system builds, so this is a build-time act and the order is the order
+    the laws run in.
+    """
+
+    registry = ParticipantRegistry()
+    for piece in pieces:
+        registry.declare(str(piece.entry))
+    return registry
 
 
 def dt_system_over(state, targets, controller, round_dt, dt_initial, dx):
@@ -171,12 +247,28 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
     batch = pieces[0].batch
     names = column_names_of(pieces)
     targets = targets or Targets(cfl=0.5, div_max=1e9, mass_max=1e-3, energy_exchange_fraction=0.2)
-    controller = controller or STController()
+    # A floor, always.  Without ``dt_min`` a step that keeps being rejected
+    # halves until halving a float64 stops changing it -- about 1074 times, and
+    # ``run_superstep`` may do that for up to ``max_iters`` substeps, each
+    # halving calling every law again.  The result is not an error but a run
+    # that appears to hang, which is the worst of the three outcomes.
+    #
+    # The floor is a fraction of the window rather than an invented constant,
+    # because this is supposed to work for any simulation and an absolute
+    # number cannot be right for all of them.  A step smaller than a millionth
+    # of the window means over a million substeps to cross it once: that is a
+    # failure to report, not progress to keep making.  A caller who knows its
+    # own physical floor passes its own controller and that wins.
+    controller = controller or STController(dt_min=float(round_dt) * 1e-6)
     state = PieceState(
         *(np.array(columns[name], dtype=np.float64) for name in names),
         np.zeros((batch,), dtype=np.float64),
         np.zeros((len(TELEMETRY_FIELDS),), dtype=np.float64),
     )
+    # The laws declare themselves once, in causal order, and the state carries
+    # the registry so the controller can index the rows the step publishes.
+    state.participants = participant_registry(pieces)
+    state.participant_limits = dict(targets.error_limits or {})
     dt = round_dt
     results = []
     for _round in range(rounds):
@@ -226,12 +318,31 @@ def dt_system_contract(entry, columns, batch):
 
 
 def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimization="O2",
-                   link="static"):
+                   link="static", piece_mode="link"):
     """Lower ``dt_system_over`` to ``backend`` and return the compiled artifact.
 
     The pieces are bound by name (``step_i``) and called by name in the
     generated ``advance_pieces``, so the lowering notices each call as an
     LLVM piece and the backend calls the piece's entry and links its module.
+
+    ``piece_mode`` chooses what the laws are to this program:
+
+    ``"link"``
+        Each law stays the artifact it was built as.  Its LLVM is linked in
+        and the call site is a call, so the law is compiled once and reused,
+        and this program only has to know its ABI.
+
+    ``"inline"``
+        Each law becomes part of this program.  The lowering has already put
+        the law's authored AbstractTensor source in the module and lowered it
+        -- that is where its SSA comes from -- and the ``llvm_piece`` receipt
+        on the law's root is the only thing that then tells a backend to call
+        the prebuilt LLVM instead of emitting that body.  Dropping the receipt
+        replaces the call with the law itself, so the result is one program
+        with no external symbol and nothing that is already machine code.
+        That is what a target which cannot link LLVM needs -- a shader
+        dispatch has no linker -- and it is also the only form in which a
+        whole-program pass can see through a law rather than around it.
     """
     import inspect
     from pathlib import Path
@@ -254,6 +365,26 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
         runtime_closure_only=True, name="llvm_dt_system",
         extraction_contract=dt_system_contract(entry, column_names_of(pieces), batch),
     )
+    if piece_mode not in {"link", "inline"}:
+        raise ValueError(f"piece_mode={piece_mode!r}: 'link' or 'inline'")
+    if piece_mode == "inline":
+        # The law's body is already here: `linked_repository_ssa` merged the SSA
+        # that its authored AbstractTensor source lowered to.  The receipt on
+        # the law's root is what makes a backend call the prebuilt LLVM instead
+        # of emitting that body, so removing it substitutes the law for the
+        # call.  Nothing is re-lowered and no source is re-parsed -- the choice
+        # is only whether the emitter looks through the law or at its symbol.
+        inlined = [
+            name for name, function in module.functions.items()
+            if function.metadata.pop("llvm_piece", None) is not None
+        ]
+        if not inlined:
+            raise RuntimeError(
+                "piece_mode='inline' but no law carried an llvm_piece receipt; "
+                "the pieces were not recognised as pieces"
+            )
+        print(f"[llvm_dt_system] inlined {len(inlined)} law(s): {inlined}",
+              flush=True)
     build = Path(directory) if directory is not None else Path.cwd() / "build" / "llvm_dt_system"
     if link != "static" and backend != C_BACKEND:
         raise NotImplementedError(f"link={link!r}: only the C lane links pieces dynamically")
@@ -276,21 +407,167 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
         raise NotImplementedError("the Fortran deployment route is not built for this program yet")
     else:
         raise ValueError(f"unknown backend {backend!r}")
-    return NativeSystem(compiled, module, exports[0], pieces)
+    return NativeSystem(compiled, module, exports[0], pieces,
+                        columns=column_names_of(pieces), batch=batch)
 
 
 class NativeSystem:
-    """The compiled dt-system window plus the repository SSA it was emitted
-    from (the module's root formals carry the ABI accounting that maps
-    authored feeds onto the artifact's buffers)."""
+    """The compiled dt-system window, the repository SSA it was emitted from,
+    and the accounting a caller needs to actually drive it.
 
-    def __init__(self, artifact, module, entry, pieces):
+    The module's root formals carry the ABI accounting that maps authored feeds
+    onto the artifact's buffers, and for a while this class held only the module
+    and left every caller to dig that out again.  Three different hosts then
+    rediscovered the same four facts -- which formal is which state field, which
+    buffer index that formal is, what the round's own scalars are, and how long
+    each buffer is -- and each rediscovery was a chance to get it subtly
+    different.  They are published here instead, because this window is meant to
+    be driven by many things.
+    """
+
+    def __init__(self, artifact, module, entry, pieces, *,
+                 columns=(), batch=1):
         self.artifact = artifact
         self.module = module
         self.entry = entry
         self.pieces = pieces
+        #: the state's span fields, in the order ``PieceState`` takes them
+        self.columns = tuple(columns)
+        #: cells per column; the batch the pieces were built at
+        self.batch = int(batch)
 
     # ``_managed_native_feeds_by_id`` reads these two names.
     @property
     def root_name(self):
         return self.entry
+
+    @property
+    def root(self):
+        """The root function, whose formals hold the ABI accounting."""
+        return self.module.functions[self.entry]
+
+    # ------------------------------------------------------------------ ABI
+    def state_field_ids(self):
+        """``state`` field name -> root formal value id.
+
+        This is the mapping that says which physical buffer carries ``T``, or
+        ``telemetry``, or any other declared field.
+        """
+        found = {}
+        for argument in self.root.args:
+            accounting = dict(argument.accounting or {})
+            if accounting.get("program_abi_parameter") == "state":
+                found[str(accounting.get("program_abi_field"))] = int(argument.id)
+        return found
+
+    def scalar_ids(self):
+        """``round_dt``/``dt_initial``/``dx`` -> root formal value id.
+
+        A host that wants to hand the next round the dt this one proposed has to
+        write into the right buffer, and nothing else records which that is.
+        """
+        names = {
+            int(value_id): str(name)
+            for name, value_id in self.root.metadata.get("parameter_names", ())
+        }
+        wanted = {"round_dt", "dt_initial", "dx"}
+        found = {}
+        for argument in self.root.args:
+            accounting = dict(argument.accounting or {})
+            if accounting.get("program_abi_field") is not None:
+                continue
+            name = accounting.get("program_abi_parameter") or names.get(int(argument.id))
+            if name in wanted:
+                found[str(name)] = int(argument.id)
+        return found
+
+    def buffer_index_of(self, value_id):
+        """Where a value id sits in the artifact's ``void **buffers`` table."""
+        for index, held in enumerate(self.artifact.buffer_order):
+            if int(held) == int(value_id):
+                return index
+        return None
+
+    def feeds(self, state, targets, controller, round_dt, dt_initial, dx):
+        """The physical feed mapping, flattened onto root formals."""
+        from src.compiler.vehicle_python_compilation import (
+            _managed_native_feeds_by_id,
+        )
+
+        return _managed_native_feeds_by_id(self, {
+            "state": state, "targets": targets, "controller": controller,
+            "round_dt": round_dt, "dt_initial": dt_initial, "dx": dx,
+        })
+
+    def prepare(self, state, targets, controller, round_dt, dt_initial, dx):
+        """Allocate the public buffers from real values, ready to step."""
+        return self.artifact.prepare_execution(
+            self.feeds(state, targets, controller, round_dt, dt_initial, dx)
+        )
+
+    def layout(self, execution=None):
+        """Everything a host needs, as plain data.
+
+        Buffer lengths are only truthful once something has been fed -- a
+        region formal's declared shape is ``()`` whether it is a scalar or the
+        base of a million-element array -- so pass the ``execution`` from
+        :meth:`prepare` to have the real counts included.
+        """
+        fields = self.state_field_ids()
+        scalars = self.scalar_ids()
+        table = []
+        for index, value_id in enumerate(self.artifact.buffer_order):
+            entry = {"index": index, "value_id": int(value_id),
+                     "dtype": str(self.artifact.buffer_dtypes[index])}
+            if execution is not None:
+                held = execution.buffers[int(value_id)]
+                entry["count"] = int(held.size)
+                entry["itemsize"] = int(held.dtype.itemsize)
+            table.append(entry)
+        return {
+            "entry": self.artifact.name,
+            "module_source": f"{self.artifact.name}.c",
+            "library": (str(self.artifact.library_path)
+                        if getattr(self.artifact, "library_path", None) else None),
+            "batch": self.batch,
+            "columns": list(self.columns),
+            "laws": [str(piece.entry) for piece in self.pieces],
+            "linked_llvm": [symbol for symbol, _ir
+                            in getattr(self.artifact, "linked_llvm", ())],
+            "buffers": table,
+            "state_fields": {name: self.buffer_index_of(value_id)
+                             for name, value_id in fields.items()},
+            "state_field_value_ids": fields,
+            "scalars": {name: self.buffer_index_of(value_id)
+                        for name, value_id in scalars.items()},
+            "total_bytes": (sum(item["count"] * item["itemsize"]
+                                for item in table)
+                            if execution is not None else None),
+        }
+
+    def write_layout(self, directory, execution=None):
+        """Write ``layout.json`` beside the artifact."""
+        import json
+        from pathlib import Path
+
+        path = Path(directory) / "layout.json"
+        path.write_text(json.dumps(self.layout(execution), indent=2),
+                        encoding="utf-8")
+        return path
+
+    def write_state(self, directory, execution):
+        """Write ``initial-state.bin``: every buffer, in ``buffer_order``.
+
+        The same order and packing the tree's own generated standalone host
+        reads back, so a host can allocate one buffer per entry and read
+        sequentially.
+        """
+        import numpy as np
+        from pathlib import Path
+
+        path = Path(directory) / "initial-state.bin"
+        with path.open("wb") as stream:
+            for value_id in self.artifact.buffer_order:
+                stream.write(np.ascontiguousarray(
+                    execution.buffers[int(value_id)]).tobytes(order="C"))
+        return path

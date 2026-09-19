@@ -106,8 +106,53 @@ def _no_exchange_observed(metrics: Metrics, targets: "Targets") -> bool:
     )
 
 
-def _apply_energy_sidechain(dt_next, dt_tensor, metrics: Metrics, targets: "Targets"):
+def _participant_bound(state, dt_proposed, dt_current, fraction):
+    """The step bound by each participant's own tau, when the state publishes.
+
+    A state opts in by carrying two things, the same way it already carries
+    ``dt_limit_hint``: ``participants`` (a ``ParticipantRegistry``) and
+    ``publications`` (that registry's names mapped to ``Publication``).  A state
+    that carries neither gets exactly the behaviour it had before, which is why
+    this returns ``None`` rather than an empty amalgamation.
+
+    The point of consulting it here is that ``_energy_time_limit`` below is the
+    SAME law for a single blended participant -- ``fraction * energy / power``
+    is ``fraction * tau`` -- so this is that pin applied per participant
+    instead of over a total, and a stiff participant stays visible instead of
+    being averaged into one.
+    """
+
+    registry = getattr(state, "participants", None)
+    published = getattr(state, "publications", None)
+    if registry is None or not published:
+        return None
+    from .participants import StepSpans, tau_bound
+
+    spans = published if isinstance(published, StepSpans) else StepSpans.of(
+        registry, published,
+        default_limits=getattr(state, "participant_limits", None),
+    )
+    return tau_bound(spans, float(fraction), float(dt_proposed),
+                     None if dt_current is None else float(dt_current))
+
+
+def _apply_energy_sidechain(dt_next, dt_tensor, metrics: Metrics, targets: "Targets",
+                            state=None):
     """Pin the next proposal by the energy/power time scale, if published."""
+
+    # Per participant first, when the state publishes that way: each binding
+    # tau applies as itself, a dilating or subcycling participant pins nobody,
+    # and a HOLD prevents growth beyond the current step without shrinking it.
+    if state is not None:
+        fraction = getattr(targets, "energy_exchange_fraction", None)
+        if fraction is not None:
+            bound = _participant_bound(
+                state, float(dt_next.item()) if hasattr(dt_next, "item") else dt_next,
+                float(dt_tensor.item()) if hasattr(dt_tensor, "item") else dt_tensor,
+                fraction,
+            )
+            if bound is not None:
+                dt_next = AbstractTensor.minimum(dt_next, bound)
 
     limit = _energy_time_limit(metrics, targets)
     if limit is not None:
@@ -170,11 +215,34 @@ class STController:
 DistributionFn = Callable[[Metrics, "Targets", float], "AbstractTensor | float"]
 
 
+def _published_spans(state):
+    """This step's publications as spans, when the state publishes that way.
+
+    Returns ``None`` for a state that does not, so every existing caller keeps
+    exactly the behaviour it had.  A state may carry the spans directly, or the
+    ``Publication`` builders that make them.
+    """
+
+    published = getattr(state, "publications", None)
+    if not published:
+        return None
+    from .participants import StepSpans
+
+    if isinstance(published, StepSpans):
+        return published
+    registry = getattr(state, "participants", None)
+    if registry is None:
+        return None
+    return StepSpans.of(registry, published,
+                        default_limits=getattr(state, "participant_limits", None))
+
+
 def _propose_dt_pen(
     metrics: Metrics,
     targets: "Targets",
     dx,
     distribution,
+    spans=None,
 ):
     """Map (metrics, targets, dx) -> dt_pen (smaller is stricter).
 
@@ -192,13 +260,31 @@ def _propose_dt_pen(
     energy_limit = _energy_time_limit(metrics, targets)
     if energy_limit is not None:
         dt_cfl = min(float(dt_cfl), energy_limit)
+    # The worst judged ratio across every declared channel.  With published
+    # spans this is one reduction over a (participants x channels) array; the
+    # dict form below hashes a channel name per channel per attempt, and reads
+    # an unpublished channel as a measure of zero -- which cannot change THIS
+    # result only because a max against 1.0 discards it.
+    if spans is not None:
+        from .participants import worst_penalty
+
+        channel_penalty = float(worst_penalty(spans).item())
+    else:
+        # A list, not unpacked arguments: with no declared limits the unpacked
+        # form collapses to ``max(1.0)``, which asks max for an iterable and
+        # raises.  The original spelling only avoided that because two other
+        # ratios preceded the unpacking.
+        channel_penalty = max([
+            1.0,
+            *(
+                float(metrics.error_channels.get(name, 0.0)) / max(float(limit), 1e-30)
+                for name, limit in targets.error_limits.items()
+            ),
+        ])
     penalty = max(
         metrics.div_inf / targets.div_max,
         metrics.mass_err / targets.mass_max,
-        *(
-            float(metrics.error_channels.get(name, 0.0)) / max(float(limit), 1e-30)
-            for name, limit in targets.error_limits.items()
-        ),
+        channel_penalty,
         1.0,
     )
     return dt_cfl / penalty
@@ -310,7 +396,8 @@ def step_with_dt_control_used(state,
                 channels = dict(metrics.error_channels or {})
                 channels.setdefault("dt_unresolved", float(dt_for_advance))
                 metrics.error_channels = channels
-            dt_pen = _propose_dt_pen(metrics, targets, dx, distribution)
+            dt_pen = _propose_dt_pen(metrics, targets, dx, distribution,
+                                 _published_spans(state))
             dt_next = ctrl.pi_update(
                 dt_prev=dt_tensor,
                 dt_pen=dt_pen,
@@ -318,7 +405,7 @@ def step_with_dt_control_used(state,
             )
             if metrics.dt_limit is not None:
                 dt_next = AbstractTensor.minimum(dt_next, metrics.dt_limit)
-            dt_next = _apply_energy_sidechain(dt_next, dt_tensor, metrics, targets)
+            dt_next = _apply_energy_sidechain(dt_next, dt_tensor, metrics, targets, state)
             ctrl.update_dt_max(metrics.max_vel, dx)
             return metrics, _restore_type(dt_next, ref), _restore_type(dt_tensor, ref)
         floor_reasons: tuple[str, ...] = ()
@@ -378,9 +465,29 @@ def step_with_dt_control_used(state,
         #     still bounded (this is what makes the loop conversion above
         #     safe at all) and still cheap: a few thousand pure-arithmetic
         #     halvings costs nothing next to even one ``advance`` call.
+        #  3. There is no sense subdividing past the point where the step can
+        #     no longer move the clock.  The test below used to be
+        #     ``dt * 0.5 == dt`` -- machine epsilon of ZERO, reached only when
+        #     dt denormalises, about 1074 halvings down.  But a step stops being
+        #     a smaller step long before that: once ``scale + dt == scale`` for
+        #     the scale it started from, adding it changes nothing, and every
+        #     candidate below it is arithmetically distinct and physically
+        #     identical.  From a 1e-3 window that point is near 2e-19, so the
+        #     old rule spent roughly a THOUSAND further halvings, each one
+        #     calling every law again, exploring steps that could not advance
+        #     time.  The comment above claimed those halvings were pure
+        #     arithmetic; they are not, the retry calls ``advance``.
+        #
+        #     The reported reason has always said "machine epsilon of its
+        #     starting scale".  This is that rule, now actually implemented.
+        scale = abs(float(_scalar(ref)))
+        step = abs(float(dt_tensor.item()))
         numerically_exhausted = (
             ctrl.dt_min is None
-            and float(dt_tensor.item() * 0.5) == float(dt_tensor.item())
+            and (
+                step * 0.5 == step                       # denormalised: nothing smaller
+                or (scale > 0.0 and scale + step == scale)  # cannot move the clock
+            )
         )
         retries_exhausted = (
             (max_retries is not None and retries >= max_retries)
@@ -484,7 +591,8 @@ def step_with_dt_control_used(state,
             retries += 1
             continue
 
-        dt_pen = _propose_dt_pen(metrics, targets, dx, distribution)
+        dt_pen = _propose_dt_pen(metrics, targets, dx, distribution,
+                                 _published_spans(state))
         dt_next = ctrl.pi_update(
             dt_prev=dt_tensor,
             dt_pen=dt_pen,
@@ -493,7 +601,7 @@ def step_with_dt_control_used(state,
         # Sidechain limiter: clamp dt_next to any engine-provided absolute limit
         if metrics.dt_limit is not None:
             dt_next = AbstractTensor.minimum(dt_next, metrics.dt_limit)
-        dt_next = _apply_energy_sidechain(dt_next, dt_tensor, metrics, targets)
+        dt_next = _apply_energy_sidechain(dt_next, dt_tensor, metrics, targets, state)
         ctrl.update_dt_max(metrics.max_vel, dx)
         return metrics, _restore_type(dt_next, ref), _restore_type(dt_tensor, ref)
 
