@@ -221,10 +221,20 @@ ADVANCE_METRICS = '''    position = material.tire_state[0, :, :, 0:3]
     material.telemetry[6] = max(material.telemetry[6], displacement)
     material.telemetry[7] = stored_energy
     material.telemetry[8] = exchange_power
+    channel_values = AbstractTensor.tensor([stored_energy, exchange_power, 0.0, 0.0, 0.0, 0.0, 0.0, displacement, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    channel_present = AbstractTensor.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    tau_present = exchange_power > 0.0
     return physical, Metrics(max_vel=maximum_velocity, max_flux=maximum_velocity,
-        div_inf=0.0, mass_err=0.0, error_channels={
-            "maximum_substep_displacement_m": displacement,
-            "energy_j": stored_energy, "power_w": exchange_power}, advanced_dt=dt)
+        div_inf=0.0, mass_err=0.0, error_channels=channel_values,
+        error_present=channel_present, advanced_dt=dt,
+        pub_tau=AbstractTensor.tensor([stored_energy / exchange_power if tau_present else 0.0]),
+        pub_tau_present=AbstractTensor.tensor([float(tau_present)]),
+        pub_contract=AbstractTensor.tensor([1.0 if tau_present else 0.0]),
+        pub_dt_limit=AbstractTensor.tensor([0.0]),
+        pub_dt_limit_present=AbstractTensor.tensor([0.0]),
+        pub_values=channel_values, pub_present=channel_present,
+        pub_limits=AbstractTensor.zeros_like(channel_values),
+        pub_limits_present=AbstractTensor.zeros_like(channel_present))
 '''
 
 
@@ -261,7 +271,8 @@ def simulation_inputs(batch_size=8):
         material=ValidatorSimulationState(**values),
         controller=STController(dt_min=None, dt_max=1.0 / 1024.0),
         targets=Targets(cfl=0.22, div_max=1.0, mass_max=1.0,
-                        error_limits={"maximum_substep_displacement_m": 0.006},
+                        error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.006, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                        error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
                         energy_exchange_fraction=0.1),
     )
 

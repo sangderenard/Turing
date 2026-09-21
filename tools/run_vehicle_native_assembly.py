@@ -780,7 +780,8 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
     wait_seconds = [0.0]
     targets = Targets(
         cfl=0.22, div_max=1.0, mass_max=1.0,
-        error_limits={"maximum_substep_displacement_m": 0.006},
+        error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.006, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         energy_exchange_fraction=(
             None if args.dt_energy_fraction <= 0.0 else float(args.dt_energy_fraction)),
     )
@@ -1106,11 +1107,8 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
         return physical, Metrics(
             max_vel=maximum_velocity, max_flux=maximum_velocity,
             div_inf=0.0, mass_err=0.0,
-            error_channels={
-                "maximum_substep_displacement_m": displacement,
-                "energy_j": stored_energy,
-                "power_w": exchange_power,
-            },
+            error_channels=AbstractTensor.tensor([stored_energy, exchange_power, 0.0, 0.0, 0.0, 0.0, 0.0, displacement, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            error_present=AbstractTensor.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
             advanced_dt=dt_value)
 
     def worker() -> None:
@@ -1155,8 +1153,8 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
                         offender = np.unravel_index(int(np.argmax(error_matrix)), error_matrix.shape)
                         accepted_clock[0] += advanced
                         metrics = Metrics(max_vel=float(observed[5]), max_flux=float(observed[5]),
-                                          div_inf=0.0, mass_err=0.0, error_channels={
-                            "maximum_substep_displacement_m": float(observed[4])})
+                                          div_inf=0.0, mass_err=0.0, error_channels=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, float(observed[4]), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            error_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
                         with status_lock:
                             live.update(
                                 sim_time=accepted_clock[0], accepted_time=accepted_clock[0],

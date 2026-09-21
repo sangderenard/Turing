@@ -2667,10 +2667,36 @@ class LoopComposer:
                 for condition in expression.ifs
                 for member in ast.walk(condition)
             )
+            comprehension_target_bindings = {
+                str(name): int(value_id)
+                for name, value_id in (
+                    attributes.get("loop_target_bindings") or {}
+                ).items()
+            }
+
+            def comprehension_graph_node(member: ast.AST) -> int | None:
+                # The reducer removes a comprehension target's authored Name
+                # node after binding it.  The generic Name fallback then sees
+                # the function-wide identity history and can select a later
+                # same-spelled assignment.  In
+                # ``{name: index for index, name in ...}`` followed by
+                # ``index = node_index[name]``, that made the later lookup part
+                # of the comprehension body and gave two sibling loops the
+                # same scheduled region.  The generator already carries the
+                # exact scoped source/value correlation; consume it here.
+                if (
+                    isinstance(member, ast.Name)
+                    and member.id in comprehension_target_bindings
+                ):
+                    return comprehension_target_bindings[member.id]
+                return graph_node_for_ast(member)
+
             element_nodes = tuple(dict.fromkeys(
                 member_node
                 for member in authored_members
-                if (member_node := graph_node_for_ast(member)) is not None
+                if (
+                    member_node := comprehension_graph_node(member)
+                ) is not None
             ))
             # A load resolved inside the element may name a value defined
             # before the comprehension -- the mapping being looked up, a bound

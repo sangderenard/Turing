@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 from .node_special_cases import SpecialCase, context_scope_statements
 from .python_identity_programs import resolve_python_identity
+from ...common.tensors.operator_catalog import canonical_operator_name
 
 
 _EXTRACTION_ACTIONS = frozenset({
@@ -760,7 +761,16 @@ def interpret_python_special_case(node: Any) -> SpecialCase | None:
     """
 
     if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
-        return SpecialCase("GetAttr", {"attribute": node.attr}, None)
+        attributes = {"attribute": node.attr}
+        canonical = canonical_operator_name(node.attr)
+        # ``real`` and ``imag`` are property spellings in NumPy/Torch but
+        # ordinary abstract tensor operators in the compiler.  Record the
+        # candidate at ingestion without asserting that an arbitrary object's
+        # equally named field is a tensor operation; grounding proves that
+        # later from the receiver's tensor descriptor.
+        if canonical in {"real", "imag"}:
+            attributes["tensor_candidate"] = canonical
+        return SpecialCase("GetAttr", attributes, None)
 
     if not isinstance(node, ast.Call):
         return None

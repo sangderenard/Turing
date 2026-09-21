@@ -90,9 +90,8 @@ def release_advance(advance: Callable[[Any, Any], tuple[Any, Any]]):
         ok, metrics = advance(state.core, dt)
         state.elapsed_s += float(dt)
         metrics = coerce_metrics(metrics)
-        channels = dict(metrics.error_channels or {})
-        channels["damping_factor"] = float(factor)
-        metrics.error_channels = channels
+        metrics.error_channels[14] = float(factor)
+        metrics.error_present[14] = 1.0
         return ok, metrics
 
     return advance_released

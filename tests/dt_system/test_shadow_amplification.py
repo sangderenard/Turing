@@ -49,7 +49,7 @@ def test_shadow_measures_the_exact_step_amplification():
     advance = shadow_advance(_advance_linear)
     dt = 4.0e-3                                  # growth = 1 + 50 * 0.004 = 1.2
     _ok, metrics = advance(state, dt)
-    assert metrics.error_channels["shadow_growth"] == pytest.approx(1.2, rel=1.0e-6)
+    assert metrics.error_channels[2].item() == pytest.approx(1.2, rel=1.0e-6)
     # Renormalised: the perturbation is back at its target size.
     assert state.perturbation_norm == pytest.approx(state._scale())
 
@@ -65,7 +65,7 @@ def test_shadow_growth_pins_the_next_step():
         state, 4.0e-3, 4.0e-3, 1.0, targets, ctrl, shadow_advance(_advance_linear),
         allow_increase_mid_round=True, attempt_log=log, max_iters=50)
     assert float(total) >= 4.0e-3 - 1.0e-15
-    first_growth = log[0]["metrics"].error_channels["shadow_growth"]
+    first_growth = log[0]["metrics"].error_channels[2].item()
     assert first_growth == pytest.approx(1.2, rel=1.0e-6)
     # Every later attempt was held under the growth-derived limit.
     limit = shadow_dt_limit(4.0e-3, first_growth, 1.05)
@@ -78,7 +78,7 @@ def test_shadow_growth_pins_the_next_step():
 def test_decaying_system_is_never_pinned_by_the_shadow():
     state = _shadowed(rate=-50.0)
     _ok, metrics = shadow_advance(_advance_linear)(state, 4.0e-3)
-    growth = metrics.error_channels["shadow_growth"]
+    growth = metrics.error_channels[2].item()
     assert growth == pytest.approx(0.8, rel=1.0e-6)
     assert shadow_dt_limit(4.0e-3, growth, 1.05) is None
 

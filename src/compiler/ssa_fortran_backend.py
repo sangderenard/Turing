@@ -4484,6 +4484,12 @@ def emit_module(
                 int(pool.length_value_id),
                 int(pool.capacity_value_id),
                 int(pool.row_stride_value_id),
+                *((int(pool.shape_value_id),)
+                  if pool.shape_value_id is not None else ()),
+                *((int(pool.rank_value_id),)
+                  if pool.rank_value_id is not None else ()),
+                *((int(pool.shape_stride_value_id),)
+                  if pool.shape_stride_value_id is not None else ()),
                 *((int(pool.status_value_id),) if pool.status_value_id is not None else ()),
                 *((int(pool.live_flags_value_id),) if pool.live_flags_value_id is not None else ()),
             }
@@ -6416,5 +6422,4 @@ class FortranCoreNative:
         return FortranCoreExecution(
             buffers, self._packed, pointers, len(slots),
         )
-
 

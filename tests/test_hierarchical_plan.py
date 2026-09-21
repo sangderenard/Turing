@@ -148,6 +148,11 @@ def test_direct_aggregate_return_binds_call_from_source_span_and_backing_storage
     )
     returned = ast.parse("def leaf(value):\n    return bytes(value)\n").body[0]
     return_call = returned.body[0].value
+    # Synthesized/copied AST values may retain their authored start while the
+    # optional end coordinates are unset.  Identity still comes from the
+    # complete source signature; it must not require integer end positions.
+    return_call.end_lineno = None
+    return_call.end_col_offset = None
     child_graph.add_node(
         9,
         type="Call",

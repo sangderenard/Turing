@@ -265,6 +265,10 @@ HOST_BOUNDARY_OPERATORS = frozenset(
 # Public compatibility spellings are retained at graph boundaries and resolve
 # to one canonical operation before backend planning.
 OPERATOR_ALIASES = {
+    # Frontend tensor constructors lose their library qualifier at AST
+    # ingestion.  ``Tensor(...)`` is the public constructor spelling left by
+    # that step; repository IR owns the canonical ``tensor(...)`` operation.
+    "Tensor": "tensor",
     "abs_": "abs",
     "argmax_": "argmax",
     "argmin_": "argmin",
@@ -397,6 +401,20 @@ def canonical_operator_name(name: str) -> str:
     """Resolve a public compatibility spelling to the canonical vocabulary."""
 
     return OPERATOR_ALIASES.get(name, name)
+
+
+def compositional_tensor_source_references():
+    """Canonical operations whose implementation is authored from other ops.
+
+    These callables are compiler source, never runtime callbacks.  They are
+    supplied only for operations that have no repository kernel of their own,
+    so source pursuit exposes the existing AbstractTensor construction without
+    replacing a working primitive lowering.
+    """
+
+    from .linalg import solve
+
+    return {"solve": solve}
 
 
 def include_ast_parent_outside_abstract_tensor(value) -> bool:

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -52,54 +53,89 @@ def _col(value) -> np.ndarray:
     return np.asarray([float(value)], dtype=np.float64)
 
 
-def build_wide(demo, shape: tuple[int, int, int], dx: float = 0.25, T0: float = 295.0, T_plate: float = 270.0):
-    """The demo's chamber at a wider shape: the same air, water, surface and
-    pool parameters, with a cold-plate surface on EVERY top-layer voxel and
-    a floor surface on every bottom-layer voxel, all floors draining to the
-    one pool.  ``demo.build()`` (shape (1,1,8)) stays the untouched default;
-    this exists so a recording can have a volume to look at.  Flat index is
-    chamber_sim's ``x + nx*(y + ny*z)`` with z vertical."""
-    import math as _m
+def build_native(demo, laws, shape: tuple[int, int, int], *,
+                 plate_temperature: float | None = None,
+                 top_surface_areas: dict[int, float] | None = None):
+    """Build the declared chamber over the existing LLVM pieces."""
+    from chamber_dt_join import CompiledLaw
+    from chamber_sim import ChamberSim, PoolSpec, SurfaceSpec, column
+    from src.compiler.native_law_kernels import LLVMPiece
+
     nx, ny, nz = shape
     n = nx * ny * nz
+    dx = float(demo.GEOMETRY["dx"])
+    T0 = float(demo.INITIAL["T0"])
+    T_plate = float(demo.INITIAL["T_plate"] if plate_temperature is None else plate_temperature)
     V = dx ** 3
-    m_a = 1.2 * V
-    m_v = demo.esat(T0) * V / (461.5 * T0)
-    col = demo.sim_mod.column
-    # reuse the demo's own parameter dicts by building its default chamber once
-    ref = demo.build(nz=1, dx=dx, T0=T0, T_plate=T_plate)
-    air_params = dict(ref.air.params); air_params.pop("dx", None)
-    water_params = dict(ref.species["water"].params); water_params.pop("dx", None)
-    ceiling_params = dict(ref.surfaces[0][0].params)
-    floor_params = dict(ref.surfaces[1][0].params)
-    pool_params = dict(ref.pools[0][0].params)
-    air_state = {"m_a": col([m_a] * n), "T": col([T0] * n)}
-    water_state = {"m_v": col([m_v] * n), "m_l": col([0.0] * n), "m_i": col([0.0] * n), "m_r": col([0.0] * n)}
-    surface_state = lambda T_s: {"m_film": col([1e-9]), "n_s_film": col([0.0]), "m_frost": col([0.0]),  # noqa: E731
-                                 "rho_frost": col([100.0]), "m_crust": col([0.0]), "m_sed": col([0.0]), "T_s": col([T_s])}
+    m_a = float(demo.INITIAL["rho_air"]) * V
+    e_sat = float(demo.WATER["P_tp"]) * math.exp(
+        (float(demo.WATER["L_v"]) / float(demo.WATER["R_v"]))
+        * (1.0 / float(demo.WATER["T_tp"]) - 1.0 / T0)
+    )
+    m_v = e_sat * V / (float(demo.WATER["R_v"]) * T0)
+    air_state = {"m_a": column([m_a] * n), "T": column([T0] * n)}
+    water_state = {
+        "m_v": column([m_v] * n), "m_l": column([0.0] * n),
+        "m_i": column([0.0] * n), "m_r": column([0.0] * n),
+    }
+    surface_state = lambda T_s: {  # noqa: E731
+        **{name: column([value]) for name, value in demo.SURFACE_SEED.items()},
+        "T_s": column([T_s]),
+    }
     surfaces = []
+    top_cells = {
+        x + nx * (y + ny * (nz - 1)): dx * dx
+        for y in range(ny) for x in range(nx)
+    } if top_surface_areas is None else dict(top_surface_areas)
+    for top, area in top_cells.items():
+        surfaces.append(SurfaceSpec(
+            voxel=top, state=surface_state(T_plate),
+            params={**demo.SURFACE_PARAMS, "A_s": float(area),
+                    "T_plate": T_plate,
+                    "tilt": 0.0, "dcos_hyst": 0.1, "phi_drop": 0.0},
+        ))
     for y in range(ny):
         for x in range(nx):
-            top = x + nx * (y + ny * (nz - 1))
             bottom = x + nx * (y + ny * 0)
-            surfaces.append(demo.sim_mod.SurfaceSpec(voxel=top, state=surface_state(T_plate), params=ceiling_params))
-            surfaces.append(demo.sim_mod.SurfaceSpec(voxel=bottom, state=surface_state(T0), pool=0, catches_rain=True,
-                                                     params=floor_params))
-    pool_params = {**pool_params, "A_floor": dx * dx * nx * ny}
-    pool = demo.sim_mod.PoolSpec(voxel=0, state={"m_p": col([1e-6]), "n_s_pool": col([0.0]), "T_l": col([T0])},
-                                 params=pool_params)
-    return demo.sim_mod.ChamberSim(demo.laws, shape=(nx, ny, nz), dx=dx, air_state=air_state, air_params=air_params,
-                                   species={"water": (water_state, water_params)}, surfaces=surfaces, pools=[pool])
+            surfaces.append(SurfaceSpec(
+                voxel=bottom, state=surface_state(T0), pool=0,
+                catches_rain=True,
+                params={**demo.SURFACE_PARAMS, "T_plate": T0,
+                        "tilt": 0.3, "dcos_hyst": 0.05},
+            ))
+    pool = PoolSpec(
+        voxel=0,
+        state={"m_p": column([demo.POOL_SEED["m_p"]]),
+               "n_s_pool": column([demo.POOL_SEED["n_s_pool"]]),
+               "T_l": column([T0])},
+        params={**demo.POOL_PARAMS, "A_floor": dx * dx * nx * ny},
+    )
+    pieces = HERE.parent / "artifacts" / "llvm_pieces"
+    load = lambda law, batch: CompiledLaw.from_piece(LLVMPiece.load(  # noqa: E731
+        pieces / law / f"b{batch}" / f"{law}.piece"
+    ))
+    compiled = {
+        "voxel_air_step": load("voxel_air_step", n),
+        "voxel_species_step": load("voxel_species_step", n),
+        "surface_step": load("surface_step", 1),
+        "pool_step": load("pool_step", 1),
+    }
+    return ChamberSim(
+        laws, shape=(nx, ny, nz), dx=dx,
+        air_state=air_state, air_params=dict(demo.AIR_PARAMS),
+        species={"water": (water_state, dict(demo.WATER_PARAMS))},
+        surfaces=surfaces, pools=[pool], compiled_laws=compiled,
+    )
 
 
 def record(seconds: float = 60.0, out: str | Path = HERE / "chamber_raincloud_run.npz",
            *, log_every: float = 1.0, shape: tuple[int, int, int] | None = None) -> Path:
     demo = _load_demo()
+    from chamber_dt_join import load_law_module_cached
     from src.common.dt_system.dt_controller import STController, Targets, run_superstep
 
-    # shape None -> the demo's own build(), the exact run you already trust
-    sim = demo.build() if shape is None else build_wide(demo, shape)
-    laws = demo.laws
+    laws = load_law_module_cached(HERE / "symbolic_chamber_solvers.py")
+    sim = build_native(demo, laws, shape or tuple(demo.GEOMETRY["shape"]))
     nx, ny, nz = sim.shape
 
     # semantic + unit per published output, from the laws' own declaration

@@ -1,0 +1,110 @@
+# Frozen pre-span schema for keyed-record compiler regressions only.
+# Live dt callers use program_extraction.yaml.
+records:
+  Metrics:
+    identity: src.common.dt_system.dt_scaler.Metrics
+    fields:
+      max_vel:
+        storage: scalar
+        dtype: float64
+        mutable: true
+      max_flux:
+        storage: scalar
+        dtype: float64
+        mutable: true
+      div_inf:
+        storage: scalar
+        dtype: float64
+        mutable: true
+      mass_err:
+        storage: scalar
+        dtype: float64
+        mutable: true
+      osc_flag:
+        storage: scalar
+        dtype: bool
+        mutable: true
+        default: false
+      stiff_flag:
+        storage: scalar
+        dtype: bool
+        mutable: true
+        default: false
+      sim_frame:
+        storage: scalar
+        dtype: int64
+        mutable: true
+        default: 0
+      proc_ms:
+        storage: scalar
+        dtype: float64
+        mutable: true
+        default: 0.0
+      dt_limit:
+        storage: scalar
+        dtype: float64
+        mutable: true
+        optional: true
+        default: null
+      error_channels:
+        storage: keyed
+        dtype: float64
+        mutable: true
+      hard_failure:
+        storage: scalar
+        dtype: bool
+        mutable: true
+        default: false
+      advanced_dt:
+        storage: scalar
+        dtype: float64
+        mutable: true
+        optional: true
+        default: null
+      unresolved_report:
+        storage: table
+        rank: 1
+        mutable: true
+        columns:
+        - name: token
+          dtype: int64
+  Targets:
+    identity: src.common.dt_system.dt_controller.Targets
+    fields:
+      cfl:
+        storage: scalar
+        dtype: float64
+        mutable: false
+      div_max:
+        storage: scalar
+        dtype: float64
+        mutable: false
+      mass_max:
+        storage: scalar
+        dtype: float64
+        mutable: false
+      energy_exchange_fraction:
+        storage: scalar
+        dtype: float64
+        mutable: false
+        optional: true
+      shadow_growth_max:
+        storage: scalar
+        dtype: float64
+        mutable: false
+        optional: true
+      error_limits:
+        storage: keyed
+        dtype: float64
+        mutable: false
+bindings:
+- function: '*'
+  parameter: targets
+  record: Targets
+- function: '*'
+  parameter: metrics
+  record: Metrics
+- function: '*coerce_metrics'
+  parameter: value
+  record: Metrics
+values: []

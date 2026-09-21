@@ -9,6 +9,7 @@ import pytest
 from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )
+from src.common.tensors import AbstractTensor
 from src.common.tensors.accelerator_backends.aot_compile import (
     _source_dependency_is_not_tensor_primitive,
 )
@@ -423,10 +424,11 @@ def root(value):
 
 def test_tensor_code_reference_is_ingested_as_a_process_graph_definition():
     graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"AbstractTensor": AbstractTensor}
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(
             ast.parse(
-                "def root(value):\n"
+                "def root(value: AbstractTensor):\n"
                 "    return value.neg()\n"
             ),
             resolve_unresolved_parents=True,
@@ -461,6 +463,30 @@ def test_tensor_code_reference_is_ingested_as_a_process_graph_definition():
         data.get("type") in {"Neg", "UnaryOp"}
         or data.get("op") in {"neg", "Neg"}
         for _node_id, data in callee.graph.G.nodes(data=True)
+    )
+
+
+def test_abstract_tensor_primitive_method_stays_at_operator_boundary():
+    graph = _ingest(
+        "def root(value: AbstractTensor):\n"
+        "    return value.dim()\n",
+        {"AbstractTensor": AbstractTensor},
+    )
+
+    assert not _definitions(graph, "dim")
+    call = next(
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and tensor_operation_name(data["expr_obj"]) == "dim"
+    )
+    assert "resolved_ast_parent" not in call.get("attributes", {})
+
+    reduce_abstract_tensor_topology(graph)
+    root = graph.function_table.entry("root").graph
+    assert any(
+        data.get("op") == "dim"
+        for _node_id, data in root.G.nodes(data=True)
     )
 
 

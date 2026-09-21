@@ -267,9 +267,9 @@ def _defers_to_reflected(other: Any) -> bool:
     it.
     """
 
-    from .extended_precision import Precision
+    from .extended_precision import ComplexPrecision, Precision
 
-    return isinstance(other, Precision)
+    return isinstance(other, (Precision, ComplexPrecision))
 
 
 class AbstractTensor:

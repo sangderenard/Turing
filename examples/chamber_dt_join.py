@@ -21,6 +21,8 @@ errors, min for the stability limit).  Any parameter may itself be a column.
 
 from __future__ import annotations
 
+from src.common.dt_system.error_channels import DT_CHANNEL_NAMES
+
 import math
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
@@ -58,6 +60,29 @@ class CompiledLaw:
             name, module.LAWS[name],
             publications=getattr(module, "LAW_PUBLICATIONS", {}).get(name, ()),
             dtype=getattr(module, "DTYPE", "float64"))
+
+    @classmethod
+    def from_piece(cls, piece):
+        """Use an existing LLVMPiece as this engine's compiled law."""
+        import numpy as np
+
+        def stage(*columns):
+            arrays = tuple(
+                np.asarray(
+                    column.tolist() if isinstance(column, AbstractTensor) else column,
+                    dtype=np.float64,
+                )
+                for column in columns
+            )
+            return tuple(
+                AbstractTensor.tensor(np.asarray(value, dtype=np.float64).tolist())
+                for value in piece(*arrays)
+            )
+
+        return cls(
+            str(piece.entry), tuple(piece.argument_names),
+            tuple(piece.output_names), stage, piece,
+        )
 
     def __call__(self, **columns) -> dict[str, Any]:
         missing = [name for name in self.argument_names if name not in columns]
@@ -222,7 +247,11 @@ class LawEngine:
             **{name: _reduce(out.get(name, 0.0), "max") for name in METRIC_FIELDS},
             sim_frame=self.frame,
             dt_limit=_reduce(out["dt_limit"], "min") if "dt_limit" in out else None,
-            error_channels={name: _reduce(out[name], "max") for name in CHANNEL_FIELDS if name in out},
+            error_channels=AbstractTensor.tensor([
+                _reduce(out[name], "max") if name in out and name in CHANNEL_FIELDS else 0.0
+                for name in DT_CHANNEL_NAMES]),
+            error_present=AbstractTensor.tensor([
+                float(name in out and name in CHANNEL_FIELDS) for name in DT_CHANNEL_NAMES]),
             hard_failure=not finite,
         )
         state.dt_limit_hint = metrics.dt_limit

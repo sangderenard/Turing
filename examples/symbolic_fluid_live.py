@@ -128,7 +128,8 @@ def main() -> int:
         cfl=0.45,
         div_max=1.0,
         mass_max=1.0e-8,
-        error_limits={"height_positivity": 0.0, "tracer_bounds": 0.0},
+        error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
     )
     controller = STController(dt_min=1.0e-8, dt_max=args.frame_duration)
     dt = float(args.dt)

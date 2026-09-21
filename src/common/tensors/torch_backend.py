@@ -120,6 +120,15 @@ class PyTorchTensorOperations(AbstractTensor):
             )
         return torch.minimum(self.data, other)
 
+    def complex_(self, imag):
+        import torch
+        imag = imag.data if isinstance(imag, AbstractTensor) else imag
+        if not isinstance(imag, torch.Tensor):
+            imag = torch.as_tensor(
+                imag, dtype=self.data.dtype, device=self.data.device,
+            )
+        return torch.complex(self.data, imag)
+
     def clamp_(self, min_val=None, max_val=None):
         import torch
         return torch.clamp(self.data, min=min_val, max=max_val)
@@ -163,6 +172,12 @@ class PyTorchTensorOperations(AbstractTensor):
     def log_(self):
         import torch
         return torch.log(self.data)
+
+    def real_(self):
+        return self.data.real
+
+    def imag_(self):
+        return self.data.imag
 
     def neg_(self):
         return -self.data
@@ -759,8 +774,13 @@ class PyTorchTensorOperations(AbstractTensor):
             return self.data.byte()
         elif dtype in ("bool",):
             return self.data.bool()
-        else:
-            return self.data.float()
+        elif dtype in ("complex64", "c64"):
+            return self.data.to(torch.complex64)
+        elif dtype in ("complex128", "c128", "cdouble"):
+            return self.data.to(torch.complex128)
+        raise ValueError(
+            f"PyTorchTensorOperations.to_dtype_: unrecognised dtype {dtype!r}"
+        )
 
     def repeat_(self, repeats: Any = None, dim: int = 0):
         """Repeat tensor data along ``dim`` ``repeats`` times.

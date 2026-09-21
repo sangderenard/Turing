@@ -1,4 +1,5 @@
 from src.common.dt_system.dt_controller import STController, Targets, run_superstep
+from src.common.dt_system.error_channels import channel_fields
 from src.compiler.symbolic_fluid_dt import SymbolicFluidGridState
 from src.compiler.symbolic_fluid_native_runtime import (
     compile_native_symbolic_fluid_step,
@@ -24,7 +25,7 @@ def test_native_sympy_fluid_step_rejects_rolls_back_and_lands_on_frame(tmp_path)
             cfl=0.45,
             div_max=1.0,
             mass_max=1.0e-8,
-            error_limits={"height_positivity": 0.0, "tracer_bounds": 0.0},
+            **channel_fields({"height_positivity": 0.0, "tracer_bounds": 0.0}, limits=True),
         ),
         STController(dt_min=1.0e-8, dt_max=0.2),
         advance,

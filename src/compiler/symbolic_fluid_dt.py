@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from src.common.tensors import AbstractTensor
+
 from dataclasses import dataclass
 from typing import Any
 
@@ -186,10 +188,8 @@ def symbolic_fluid_advance(state, dt):
         div_inf=0.0,
         mass_err=mass_error,
         dt_limit=dt_stable_limit,
-        error_channels={
-            "height_positivity": max_height_violation,
-            "tracer_bounds": max_tracer_violation,
-        },
+        error_channels=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, max_height_violation, max_tracer_violation, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        error_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
     )
     state.last_wave_speed = max_wave_speed + 0.0
     state.last_height_violation = max_height_violation + 0.0
@@ -240,10 +240,8 @@ def capture_symbolic_fluid_dt_program(
                 cfl=0.45,
                 div_max=1.0,
                 mass_max=1.0e-8,
-                error_limits={
-                    "height_positivity": 0.0,
-                    "tracer_bounds": 0.0,
-                },
+                error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
             ),
             "controller": STController(dt_min=1.0e-8, dt_max=frame_duration),
             "frame_duration": float(frame_duration),

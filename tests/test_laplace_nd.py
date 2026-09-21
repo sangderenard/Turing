@@ -29,6 +29,60 @@ def test_laplace_builds_with_numpy():
     assert L_dense is not None or L_scipy is not None
 
 
+def test_laplace_uses_declared_material_fields():
+    """The public tension/density fields must reach the built operator."""
+    N = 3
+    transform = laplace.RectangularTransform(
+        Lx=1.0, Ly=1.0, Lz=1.0, device="cpu")
+    grid_u, grid_v, grid_w = transform.create_grid_mesh(N, N, N)
+    grid_domain = laplace.GridDomain.generate_grid_domain(
+        coordinate_system="rectangular", N_u=N, N_v=N, N_w=N,
+        Lx=1.0, Ly=1.0, Lz=1.0, device="cpu")
+
+    base = laplace.BuildLaplace3D(
+        grid_domain=grid_domain, precision=None, resolution=N)
+    L_base, _, _ = base.build_general_laplace(
+        grid_u, grid_v, grid_w,
+        boundary_conditions=("dirichlet",) * 6, device="cpu")
+
+    scaled = laplace.BuildLaplace3D(
+        grid_domain=grid_domain, precision=None, resolution=N,
+        tension_func=lambda u, v, w: AbstractTensor.ones_like(u) * 6.0,
+        density_func=lambda u, v, w: AbstractTensor.ones_like(u) * 3.0)
+    L_scaled, _, package = scaled.build_general_laplace(
+        grid_u, grid_v, grid_w,
+        boundary_conditions=("dirichlet",) * 6, device="cpu",
+        return_package=True)
+
+    assert AbstractTensor.allclose(L_scaled, L_base * 2.0)
+    assert AbstractTensor.allclose(
+        package["material"]["tension"], AbstractTensor.ones_like(grid_u) * 6.0)
+    assert AbstractTensor.allclose(
+        package["material"]["density"], AbstractTensor.ones_like(grid_u) * 3.0)
+
+
+def test_neumann_laplace_preserves_a_constant_field():
+    N = 3
+    transform = laplace.RectangularTransform(
+        Lx=0.09, Ly=0.17, Lz=0.09, device="cpu")
+    grid_u, grid_v, grid_w = transform.create_grid_mesh(N, N, N)
+    grid_domain = laplace.GridDomain.generate_grid_domain(
+        coordinate_system="rectangular", N_u=N, N_v=N, N_w=N,
+        Lx=0.09, Ly=0.17, Lz=0.09, device="cpu")
+    builder = laplace.BuildLaplace3D(
+        grid_domain=grid_domain, precision=None, resolution=N)
+    operator, sparse, _ = builder.build_general_laplace(
+        grid_u, grid_v, grid_w,
+        boundary_conditions=("neumann",) * 6, device="cpu")
+    constant = AbstractTensor.ones((N * N * N,)) * 80.0
+    assert AbstractTensor.allclose(operator @ constant,
+                                   AbstractTensor.zeros_like(constant),
+                                   atol=1e-10)
+    assert AbstractTensor.allclose(sparse.to_dense() @ constant,
+                                   AbstractTensor.zeros_like(constant),
+                                   atol=1e-10)
+
+
 @pytest.mark.xfail(
     reason="dtype identity is not normalised across backends: a numpy-backed "
     "tensor reports torch.int64 while AbstractTensor.long_dtype_ is the string "

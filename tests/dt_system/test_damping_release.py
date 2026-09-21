@@ -51,7 +51,7 @@ def _run(initial_factor: float, seconds: float, dt: float = 1.0e-3):
     while t < seconds:
         _ok, metrics = advance(state, dt)
         energies.append(core.energy())
-        factors.append(metrics.error_channels["damping_factor"])
+        factors.append(metrics.error_channels[14].item())
         t += dt
     return state, energies, factors
 
@@ -94,5 +94,5 @@ def test_release_runs_under_the_dt_controller_unchanged():
     total, _dt_next, metrics = run_superstep(
         state, 0.02, 1.0e-3, 1.0, targets, ctrl, release_advance(_advance), max_iters=500)
     assert float(total) >= 0.02 - 1.0e-15
-    assert 1.0 < metrics.error_channels["damping_factor"] < 10.0
+    assert 1.0 < metrics.error_channels[14].item() < 10.0
     assert math.isfinite(core.energy())

@@ -448,11 +448,8 @@ def balloon_tire_managed_advance(material, dt):
         max_flux=maximum_velocity,
         div_inf=0.0,
         mass_err=0.0,
-        error_channels={
-            "maximum_substep_displacement_m": maximum_displacement,
-            "energy_j": stored_energy.max(),
-            "power_w": exchange_power.max(),
-        },
+        error_channels=AbstractTensor.tensor([stored_energy.max().item(), exchange_power.max().item(), 0.0, 0.0, 0.0, 0.0, 0.0, maximum_displacement, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        error_present=AbstractTensor.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         # This core has no additional post-step ceiling. The largest finite
         # float is the neutral value for the controller's minimum clamp while
         # retaining one physical scalar ABI across the returned record.
@@ -577,7 +574,7 @@ def balloon_tire_managed_extraction_contract(
     base = policy.program_abi.receipt()
     retained_records = {
         name: base["records"][name]
-        for name in ("Targets", "STController", "Metrics")
+        for name in ("Targets", "STController", "Metrics", "StepSpans")
     }
     retained_records["BalloonTireManagedState"] = {
         "identity": (
@@ -626,7 +623,7 @@ def balloon_tire_managed_extraction_contract(
     }
     retained_bindings = [
         binding for binding in base["bindings"]
-        if binding["record"] in {"Targets", "STController", "Metrics"}
+        if binding["record"] in {"Targets", "STController", "Metrics", "StepSpans"}
     ]
     retained_bindings.append({
         "function": "*", "parameter": "material",
@@ -811,11 +808,8 @@ def balloon_tire_managed_python_compilation_inputs(
                 cfl=1.0,
                 div_max=1.0,
                 mass_max=1.0,
-                error_limits={
-                    "maximum_substep_displacement_m": (
-                        material.displacement_criticality_m
-                    ),
-                },
+                error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, material.displacement_criticality_m, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
                 # One step may exchange at most a tenth of the tire's stored
                 # energy; measured from the tire's own energy/power channels.
                 energy_exchange_fraction=0.1,

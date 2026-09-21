@@ -16,6 +16,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 from .dt_scaler import Metrics, _scalar, coerce_metrics
 from .dt import SuperstepPlan, SuperstepResult
+from .error_channels import empty_channels, ENERGY_J, POWER_W, SHADOW_GROWTH
 
 # This module's debug-logging calls (``if is_enabled(): dbg(...).debug(...)``)
 # were removed entirely, not just guarded. Neither a runtime function-call
@@ -47,7 +48,8 @@ class Targets:
     cfl: float
     div_max: float
     mass_max: float
-    error_limits: dict[str, float] = field(default_factory=dict)
+    error_limits: AbstractTensor = field(default_factory=empty_channels)
+    error_limits_present: AbstractTensor = field(default_factory=empty_channels)
     # Energy/power time scale.  When set, a core that publishes the error
     # channels ``energy_j`` (stored energy) and ``power_w`` (magnitude of the
     # rate at which energy is being exchanged) is pinned so one step may
@@ -70,92 +72,77 @@ def _shadow_dt_limit(dt_tensor, metrics: Metrics, targets: "Targets"):
     growth_max = getattr(targets, "shadow_growth_max", None)
     if growth_max is None:
         return None
-    channels = metrics.error_channels or {}
-    if "shadow_growth" not in channels:
+    channels = metrics.error_channels
+    if not bool(metrics.error_present[SHADOW_GROWTH].item()):
         return None
     from .shadow import shadow_dt_limit
 
     return shadow_dt_limit(
-        float(dt_tensor.item()), _scalar(channels["shadow_growth"]), float(growth_max),
+        float(dt_tensor.item()), _scalar(channels[SHADOW_GROWTH]), float(growth_max),
     )
 
 
 def _energy_time_limit(metrics: Metrics, targets: "Targets"):
-    """``fraction * energy / power`` when the core published both, else None."""
+    """The energy time limit and its presence, as two numerical outputs.
+
+    Absence must cross the helper boundary explicitly. An optional Python
+    return loses its presence in native linking and reads back as a present
+    zero, which would clamp the next step to zero.
+    """
 
     fraction = getattr(targets, "energy_exchange_fraction", None)
     if fraction is None:
-        return None
-    channels = metrics.error_channels or {}
-    if "energy_j" not in channels or "power_w" not in channels:
-        return None
-    energy = _scalar(channels["energy_j"])
-    power = _scalar(channels["power_w"])
-    if not (math.isfinite(energy) and math.isfinite(power)) or power <= 0.0 or energy <= 0.0:
-        return None
-    return float(fraction) * energy / power
+        return 0.0, 0.0
+    energy = metrics.error_channels[ENERGY_J:ENERGY_J + 1]
+    power = metrics.error_channels[POWER_W:POWER_W + 1]
+    present = (metrics.error_present[ENERGY_J:ENERGY_J + 1] * metrics.error_present[POWER_W:POWER_W + 1]
+               * energy.isfinite() * power.isfinite() * (energy > 0.0) * (power > 0.0))
+    safe_power = AbstractTensor.where(power > 0.0, power, AbstractTensor.ones_like(power))
+    limit = AbstractTensor.where(
+        present, float(fraction) * energy / safe_power, AbstractTensor.zeros_like(energy))
+    return float(limit.item()), float(present.item())
 
 
 def _no_exchange_observed(metrics: Metrics, targets: "Targets") -> bool:
     fraction = getattr(targets, "energy_exchange_fraction", None)
-    channels = metrics.error_channels or {}
+    channels = metrics.error_channels
     return (
         fraction is not None
-        and "power_w" in channels
-        and _scalar(channels["power_w"]) <= 0.0
+        and bool(metrics.error_present[POWER_W].item())
+        and _scalar(channels[POWER_W]) <= 0.0
     )
 
 
-def _participant_bound(state, dt_proposed, dt_current, fraction):
-    """The step bound by each participant's own tau, when the state publishes.
+def _participant_bound(spans, dt_proposed, dt_current, fraction):
+    """Apply the existing per-participant time law to declared spans."""
 
-    A state opts in by carrying two things, the same way it already carries
-    ``dt_limit_hint``: ``participants`` (a ``ParticipantRegistry``) and
-    ``publications`` (that registry's names mapped to ``Publication``).  A state
-    that carries neither gets exactly the behaviour it had before, which is why
-    this returns ``None`` rather than an empty amalgamation.
+    from .participants import tau_bound
 
-    The point of consulting it here is that ``_energy_time_limit`` below is the
-    SAME law for a single blended participant -- ``fraction * energy / power``
-    is ``fraction * tau`` -- so this is that pin applied per participant
-    instead of over a total, and a stiff participant stays visible instead of
-    being averaged into one.
-    """
-
-    registry = getattr(state, "participants", None)
-    published = getattr(state, "publications", None)
-    if registry is None or not published:
-        return None
-    from .participants import StepSpans, tau_bound
-
-    spans = published if isinstance(published, StepSpans) else StepSpans.of(
-        registry, published,
-        default_limits=getattr(state, "participant_limits", None),
-    )
     return tau_bound(spans, float(fraction), float(dt_proposed),
                      None if dt_current is None else float(dt_current))
 
 
-def _apply_energy_sidechain(dt_next, dt_tensor, metrics: Metrics, targets: "Targets",
-                            state=None):
-    """Pin the next proposal by the energy/power time scale, if published."""
+def _apply_energy_sidechain(dt_next, dt_tensor, metrics: Metrics, targets: "Targets"):
+    """Pin the next proposal by the energy/power time scale, if published.
+
+    Metrics carries this attempt's publication buffers directly.
+    """
 
     # Per participant first, when the state publishes that way: each binding
     # tau applies as itself, a dilating or subcycling participant pins nobody,
     # and a HOLD prevents growth beyond the current step without shrinking it.
-    if state is not None:
+    if int(metrics.pub_tau.shape[0]) > 0:
         fraction = getattr(targets, "energy_exchange_fraction", None)
         if fraction is not None:
             bound = _participant_bound(
-                state, float(dt_next.item()) if hasattr(dt_next, "item") else dt_next,
-                float(dt_tensor.item()) if hasattr(dt_tensor, "item") else dt_tensor,
+                metrics, float(dt_next.item()), float(dt_tensor.item()),
                 fraction,
             )
             if bound is not None:
                 dt_next = AbstractTensor.minimum(dt_next, bound)
 
-    limit = _energy_time_limit(metrics, targets)
-    if limit is not None:
+    limit, limit_present = _energy_time_limit(metrics, targets)
+    if limit_present:
         dt_next = AbstractTensor.minimum(dt_next, AbstractTensor.tensor(limit))
     if _no_exchange_observed(metrics, targets):
         dt_next = AbstractTensor.minimum(dt_next, dt_tensor)
@@ -215,34 +202,11 @@ class STController:
 DistributionFn = Callable[[Metrics, "Targets", float], "AbstractTensor | float"]
 
 
-def _published_spans(state):
-    """This step's publications as spans, when the state publishes that way.
-
-    Returns ``None`` for a state that does not, so every existing caller keeps
-    exactly the behaviour it had.  A state may carry the spans directly, or the
-    ``Publication`` builders that make them.
-    """
-
-    published = getattr(state, "publications", None)
-    if not published:
-        return None
-    from .participants import StepSpans
-
-    if isinstance(published, StepSpans):
-        return published
-    registry = getattr(state, "participants", None)
-    if registry is None:
-        return None
-    return StepSpans.of(registry, published,
-                        default_limits=getattr(state, "participant_limits", None))
-
-
 def _propose_dt_pen(
     metrics: Metrics,
     targets: "Targets",
     dx,
     distribution,
-    spans=None,
 ):
     """Map (metrics, targets, dx) -> dt_pen (smaller is stricter).
 
@@ -257,30 +221,22 @@ def _propose_dt_pen(
     # Default: CFL from the one velocity metric, softened by the worst ratio
     # across every declared error channel (never just one field alone).
     dt_cfl = targets.cfl * dx / max(metrics.max_vel, 1e-30)
-    energy_limit = _energy_time_limit(metrics, targets)
-    if energy_limit is not None:
+    energy_limit, energy_present = _energy_time_limit(metrics, targets)
+    if energy_present:
         dt_cfl = min(float(dt_cfl), energy_limit)
-    # The worst judged ratio across every declared channel.  With published
-    # spans this is one reduction over a (participants x channels) array; the
-    # dict form below hashes a channel name per channel per attempt, and reads
-    # an unpublished channel as a measure of zero -- which cannot change THIS
-    # result only because a max against 1.0 discards it.
-    if spans is not None:
+    # The aggregate channel span is always judged against the controller's
+    # configured defaults. Participant rows add their own explicitly declared
+    # gates; they do not replace the aggregate judgment.
+    ratios = AbstractTensor.where(
+        metrics.error_present * targets.error_limits_present,
+        metrics.error_channels / AbstractTensor.maximum(targets.error_limits, 1e-30),
+        AbstractTensor.zeros_like(metrics.error_channels),
+    )
+    channel_penalty = float(AbstractTensor.maximum(ratios.max(), 1.0).item())
+    if int(metrics.pub_values.shape[0]) > 0:
         from .participants import worst_penalty
 
-        channel_penalty = float(worst_penalty(spans).item())
-    else:
-        # A list, not unpacked arguments: with no declared limits the unpacked
-        # form collapses to ``max(1.0)``, which asks max for an iterable and
-        # raises.  The original spelling only avoided that because two other
-        # ratios preceded the unpacking.
-        channel_penalty = max([
-            1.0,
-            *(
-                float(metrics.error_channels.get(name, 0.0)) / max(float(limit), 1e-30)
-                for name, limit in targets.error_limits.items()
-            ),
-        ])
+        channel_penalty = max(channel_penalty, float(worst_penalty(metrics).item()))
     penalty = max(
         metrics.div_inf / targets.div_max,
         metrics.mass_err / targets.mass_max,
@@ -340,6 +296,9 @@ def step_with_dt_control_used(state,
         saved = state.copy_shallow() if rollback else None
         ok, metrics = advance(state, dt_for_advance)
         metrics = coerce_metrics(metrics)
+        # Advance fills the attempt's declared publication buffers.
+        spans = metrics
+        has_participants = int(metrics.pub_tau.shape[0]) > 0
         rollback_scale = float(rollback_threshold_multiplier)
         # A value between its ordinary limit and rollback_scale * limit is kept.
         # It still contributes its full ratio to the PI penalty below, so the next
@@ -350,13 +309,15 @@ def step_with_dt_control_used(state,
         div_rollback_limit = float(targets.div_max) * 10.0
         if metrics.div_inf > div_rollback_limit:
             soft_reasons.append("div_inf")
-        for name, limit in targets.error_limits.items():
-            channel_error = float(metrics.error_channels.get(name, 0.0))
-            if channel_error > float(limit):
-                # Numeric values remain in metrics.error_channels.  The resident
-                # reason sequence carries only a stable rule identity so the same
-                # authored controller has a fixed native storage representation.
-                soft_reasons.append(name)
+        channel_values = metrics.error_channels
+        channel_limits = targets.error_limits
+        channel_mask = metrics.error_present * targets.error_limits_present
+        soft_channels = channel_mask * (channel_values > channel_limits)
+        participant_soft = metrics.pub_present * metrics.pub_limits_present * (
+            metrics.pub_values > metrics.pub_limits)
+        if bool(soft_channels.any().item()) or (
+                has_participants and bool(participant_soft.any().item())):
+            soft_reasons.append("channel limit")
 
         # Physical invalidity and an engine-declared hard failure never enter the
         # soft band. Numeric error channels roll back only at N times the same
@@ -370,11 +331,13 @@ def step_with_dt_control_used(state,
             reasons.append("mass_err rollback limit")
         if metrics.div_inf > div_rollback_limit * rollback_scale:
             reasons.append("div_inf rollback limit")
-        for name, limit in targets.error_limits.items():
-            channel_error = float(metrics.error_channels.get(name, 0.0))
-            channel_rollback_limit = float(limit) * rollback_scale
-            if channel_error > channel_rollback_limit:
-                reasons.append("channel rollback limit")
+        rollback_channels = channel_mask * (
+            channel_values > channel_limits * rollback_scale)
+        participant_rollback = metrics.pub_present * metrics.pub_limits_present * (
+            metrics.pub_values > metrics.pub_limits * rollback_scale)
+        if bool(rollback_channels.any().item()) or (
+                has_participants and bool(participant_rollback.any().item())):
+            reasons.append("channel rollback limit")
         rejected = bool(reasons)
         if not rollback:
             # No ``saved`` snapshot exists to restore, and retrying would need
@@ -388,16 +351,17 @@ def step_with_dt_control_used(state,
                     "dt": float(dt_for_advance),
                     "accepted": not rejected,
                     "metrics": metrics,
+                    "soft_channel_mask": soft_channels.copy(),
+                    "rollback_channel_mask": rollback_channels.copy(),
                     "reasons": tuple(reasons),
-                    "soft_reasons": (() if rejected else tuple(soft_reasons)),
+                    "soft_reasons": soft_reasons,
                     "dt_min_retained_reasons": (),
                 })
             if rejected:
-                channels = dict(metrics.error_channels or {})
-                channels.setdefault("dt_unresolved", float(dt_for_advance))
-                metrics.error_channels = channels
-            dt_pen = _propose_dt_pen(metrics, targets, dx, distribution,
-                                 _published_spans(state))
+                metrics.control_values[0] = float(dt_for_advance)
+                metrics.control_present[0] = 1.0
+
+            dt_pen = _propose_dt_pen(metrics, targets, dx, distribution)
             dt_next = ctrl.pi_update(
                 dt_prev=dt_tensor,
                 dt_pen=dt_pen,
@@ -405,7 +369,7 @@ def step_with_dt_control_used(state,
             )
             if metrics.dt_limit is not None:
                 dt_next = AbstractTensor.minimum(dt_next, metrics.dt_limit)
-            dt_next = _apply_energy_sidechain(dt_next, dt_tensor, metrics, targets, state)
+            dt_next = _apply_energy_sidechain(dt_next, dt_tensor, metrics, targets)
             ctrl.update_dt_max(metrics.max_vel, dx)
             return metrics, _restore_type(dt_next, ref), _restore_type(dt_tensor, ref)
         floor_reasons: tuple[str, ...] = ()
@@ -424,19 +388,23 @@ def step_with_dt_control_used(state,
                 reasons.clear()
                 rejected = False
                 ctrl.clamp_events += 1
-                channels = dict(metrics.error_channels or {})
-                channels["dt_min_retained"] = float(dt_for_advance)
-                channels["dt_min_retained_violation_count"] = float(
-                    len(floor_reasons))
-                metrics.error_channels = channels
+                metrics.control_values[2] = float(dt_for_advance)
+                metrics.control_present[2] = 1.0
+                metrics.control_values[3] = float(
+                    len(floor_reasons) - int(bool(rollback_channels.any().item()))
+                    + int(rollback_channels.sum().item()))
+                metrics.control_present[3] = 1.0
+
                 metrics.hard_failure = False
         if attempt_log is not None:
             attempt_log.append({
                 "dt": float(dt_for_advance),
                 "accepted": not rejected,
                 "metrics": metrics,
+                "soft_channel_mask": soft_channels.copy(),
+                "rollback_channel_mask": rollback_channels.copy(),
                 "reasons": tuple(reasons),
-                "soft_reasons": (() if rejected else tuple(soft_reasons)),
+                "soft_reasons": soft_reasons,
                 "dt_min_retained_reasons": floor_reasons,
             })
         # ``retries_exhausted`` has TWO independent, differently-justified
@@ -499,10 +467,11 @@ def step_with_dt_control_used(state,
             # default is rollback, never silent commitment of a violating state.
             ctrl.clamp_events += 1
             metrics.hard_failure = True
-            channels = dict(metrics.error_channels or {})
-            channels["dt_unresolved"] = float(dt_for_advance)
-            channels["dt_unresolved_attempts"] = float(len(failures) + 1)
-            metrics.error_channels = channels
+            metrics.control_values[0] = float(dt_for_advance)
+            metrics.control_present[0] = 1.0
+            metrics.control_values[1] = float(len(failures) + 1)
+            metrics.control_present[1] = 1.0
+
             # The trace rides on the metrics; a substep must not narrate. At a
             # pinned audio-rate interior this runs thousands of times a frame, and
             # printing each one buries the very thing it is reporting.
@@ -530,7 +499,8 @@ def step_with_dt_control_used(state,
                     "  every attempt was rejected for the same reason at every dt, "
                     "so subdividing further could not have resolved it."
                 )
-            channels["dt_unresolved_report"] = 0.0
+            metrics.control_values[9] = 0.0
+            metrics.control_present[9] = 1.0
             metrics.unresolved_report = list(lines)
             # Fall through to the ordinary accepted path so the proposal for the
             # next step is computed the same way it always is.
@@ -563,10 +533,11 @@ def step_with_dt_control_used(state,
                     )
                 print("\n".join(lines))
                 metrics.hard_failure = True
-                channels = dict(metrics.error_channels or {})
-                channels["dt_unresolved"] = float(dt_for_advance)
-                channels["dt_unresolved_attempts"] = float(len(failures))
-                metrics.error_channels = channels
+                metrics.control_values[0] = float(dt_for_advance)
+                metrics.control_present[0] = 1.0
+                metrics.control_values[1] = float(len(failures))
+                metrics.control_present[1] = 1.0
+
                 # A zero used-dt is the native-safe failure status.  The caller can
                 # report a partial window without relying on Python exception
                 # semantics, which repository SSA does not yet represent.
@@ -591,8 +562,7 @@ def step_with_dt_control_used(state,
             retries += 1
             continue
 
-        dt_pen = _propose_dt_pen(metrics, targets, dx, distribution,
-                                 _published_spans(state))
+        dt_pen = _propose_dt_pen(metrics, targets, dx, distribution)
         dt_next = ctrl.pi_update(
             dt_prev=dt_tensor,
             dt_pen=dt_pen,
@@ -601,7 +571,7 @@ def step_with_dt_control_used(state,
         # Sidechain limiter: clamp dt_next to any engine-provided absolute limit
         if metrics.dt_limit is not None:
             dt_next = AbstractTensor.minimum(dt_next, metrics.dt_limit)
-        dt_next = _apply_energy_sidechain(dt_next, dt_tensor, metrics, targets, state)
+        dt_next = _apply_energy_sidechain(dt_next, dt_tensor, metrics, targets)
         ctrl.update_dt_max(metrics.max_vel, dx)
         return metrics, _restore_type(dt_next, ref), _restore_type(dt_tensor, ref)
 
@@ -757,7 +727,7 @@ def run_superstep(state,
             distribution=distribution,
         )
         last_metrics = metrics
-        if float((metrics.error_channels or {}).get("dt_unresolved", 0.0)) > 0.0:
+        if float(metrics.control_values[0].item()) > 0.0:
             unresolved.append(metrics)
         if dt_used <= 0.0:
             break
@@ -794,7 +764,7 @@ def run_superstep(state,
         print(
             f"{len(unresolved)} of {iters} substep(s) advanced unresolved; "
             f"first at dt="
-            f"{float(first.error_channels.get('dt_unresolved', 0.0)):.6g}"
+            f"{float(first.control_values[0].item()):.6g}"
         )
         for line in getattr(first, "unresolved_report", ())[1:]:
             print(f"  {line.strip()}")
@@ -802,14 +772,18 @@ def run_superstep(state,
     if remaining > eps:
         # last_metrics is never None now (see its initialization above), so
         # there is no fallback construction left to bind here.
-        channels = dict(last_metrics.error_channels or {})
-        channels["superstep_window_requested_s"] = float(round_max_t.item())
-        channels["superstep_window_advanced_s"] = float(total.item())
-        channels["superstep_window_remaining_s"] = remaining
-        channels["superstep_iteration_count"] = float(iters)
+        last_metrics.control_values[4] = float(round_max_t.item())
+        last_metrics.control_present[4] = 1.0
+        last_metrics.control_values[5] = float(total.item())
+        last_metrics.control_present[5] = 1.0
+        last_metrics.control_values[6] = remaining
+        last_metrics.control_present[6] = 1.0
+        last_metrics.control_values[7] = float(iters)
+        last_metrics.control_present[7] = 1.0
         if iteration_cap_hit:
-            channels["superstep_iteration_cap_hit"] = float(max_iters)
-        last_metrics.error_channels = channels
+            last_metrics.control_values[8] = float(max_iters)
+            last_metrics.control_present[8] = 1.0
+
 
     total_out = _restore_type(total, ref_dt)
     dt_next_out = _restore_type(last_dt_next, ref_dt)

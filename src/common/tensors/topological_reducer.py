@@ -12,6 +12,7 @@ import inspect
 import json
 import logging
 import re
+import symtable
 import textwrap
 import types
 from typing import Any, Callable, Mapping
@@ -21,6 +22,7 @@ import networkx as nx
 from ...compiler.native_compiler_accelerators import (
     lexicographical_topological_order,
 )
+from ...compiler.identity_concordance import current_identity_book
 from .abstract_nn.token_encoder import encode_identity_tokens
 from .abstract_nn.token_lexicon import structural_context_tokens
 
@@ -44,6 +46,7 @@ from ...transmogrifier.graph.python_special_cases import (
     interpret_python_special_case,
     interpret_python_static_value,
 )
+from ...transmogrifier.graph.node_special_cases import tensor_annotation_identity
 
 
 logger = logging.getLogger(__name__)
@@ -1445,6 +1448,87 @@ def _normalize_lexical_values(
         ingestion_definitions.setdefault(name, []).append((value, {}))
         return value
 
+    lexical_free_names_by_reference: dict[int, tuple[str, ...]] = {}
+
+    def captured_authored_parameters() -> tuple[str, ...]:
+        """Authored parameters read by a nested lexical scope.
+
+        Python's symbol table is the authoritative closure record. Without
+        materializing these outer identities, ``root(..., gain)`` where only
+        ``blend`` reads ``gain`` loses the outer Input and grows one anonymous
+        frame slot per callsite. The same loss removes ``static_bindings``
+        from ``_normalize_lexical_values`` even though nested
+        ``resolve_expression`` consumes that mapping.
+        """
+
+        try:
+            source = ast.unparse(ast.Module(body=[statement], type_ignores=[]))
+            module_table = symtable.symtable(
+                source, "<turing-closure-parameters>", "exec",
+            )
+            owner = next(
+                child for child in module_table.get_children()
+                if child.get_name() == statement.name
+            )
+        except (StopIteration, SyntaxError, TypeError, ValueError):
+            return ()
+        free_names: set[str] = set()
+        pending = list(owner.get_children())
+        while pending:
+            child = pending.pop()
+            child_free_names = tuple(
+                symbol.get_name()
+                for symbol in child.get_symbols()
+                if symbol.is_free()
+            )
+            free_names.update(child_free_names)
+            reference = (lexical_function_bindings or {}).get(
+                child.get_name()
+            )
+            if reference is not None:
+                lexical_free_names_by_reference[int(reference.address)] = (
+                    child_free_names
+                )
+            pending.extend(child.get_children())
+        # A nested function can capture a sibling function whose own closure
+        # owns the data cell.  The compiler flattens that Python function-cell
+        # indirection into call boundaries, so carry the sibling's data
+        # requirements transitively.  For example ``reduce_statement``
+        # captures ``resolve_expression`` and the latter captures the outer
+        # ``static_bindings`` parameter; the outer parameter must remain live
+        # at calls to ``reduce_statement`` even though that spelling is not a
+        # direct free symbol in its Python symbol table.
+        changed = True
+        while changed:
+            changed = False
+            for reference_address, names in tuple(
+                lexical_free_names_by_reference.items()
+            ):
+                expanded = list(names)
+                for name in names:
+                    dependency = (lexical_function_bindings or {}).get(name)
+                    if dependency is None:
+                        continue
+                    expanded.extend(lexical_free_names_by_reference.get(
+                        int(dependency.address), (),
+                    ))
+                normalized = tuple(dict.fromkeys(expanded))
+                if normalized != names:
+                    lexical_free_names_by_reference[reference_address] = (
+                        normalized
+                    )
+                    changed = True
+        return tuple(
+            name for name in function_parameter_names(statement)
+            if name in free_names
+        )
+
+    # These are existing authored parameter identities, not new ABI values.
+    # Establish them before nested-call reconstruction so every closure edge
+    # carries the same object from its enclosing frame.
+    for captured_parameter in captured_authored_parameters():
+        input_value(captured_parameter, binding_kind="parameter")
+
     def record_ingestion_definition(
         name: str, value: int, target: ast.AST,
     ) -> None:
@@ -1626,6 +1710,14 @@ def _normalize_lexical_values(
                 "first_class_function_ref": address,
                 "reference_kind": "function_subgraph",
             },
+        )
+        current_identity_book().page("callable_identity_concordance").set(
+            (
+                str(graph.G.graph.get("function_name") or "<module>"),
+                int(node_id),
+            ),
+            0,
+            int(address),
         )
         first_class_function_nodes[address] = node_id
         return node_id
@@ -2101,6 +2193,87 @@ def _normalize_lexical_values(
                         },
                     )
                     materialized_attribute_nodes[expression_id] = attribute_id
+                # A field read immediately from an authored record
+                # construction is the exact constructor argument.  Preserve
+                # that identity directly, especially when the argument is a
+                # first-class function reference: manufacturing a GetAttr
+                # value here loses the function-table address before record
+                # materialization and leaves a later call with no callee.
+                receiver_data = graph.G.nodes.get(int(receiver), {})
+                receiver_expression = receiver_data.get("expr_obj")
+                receiver_class = (
+                    receiver_data.get("attributes") or {}
+                ).get("class_ref")
+                records = dict(
+                    (graph.G.graph.get("program_abi") or {}).get("records")
+                    or {}
+                )
+                matching_records = tuple(
+                    record
+                    for name, record in records.items()
+                    if receiver_class is not None
+                    and (
+                        str(name) == str(receiver_class)
+                        or str(record.get("identity") or name)
+                        == str(receiver_class)
+                        or str(record.get("identity") or name).endswith(
+                            "." + str(receiver_class)
+                        )
+                    )
+                )
+                if (
+                    isinstance(receiver_expression, ast.Call)
+                    and len(matching_records) == 1
+                ):
+                    field_names = tuple(
+                        map(
+                            str,
+                            dict(matching_records[0].get("fields") or {}),
+                        )
+                    )
+                    field_expression = next((
+                        keyword.value
+                        for keyword in receiver_expression.keywords
+                        if keyword.arg == expression.attr
+                    ), None)
+                    if field_expression is None and expression.attr in field_names:
+                        position = field_names.index(expression.attr)
+                        if position < len(receiver_expression.args):
+                            field_expression = receiver_expression.args[position]
+                    if field_expression is not None:
+                        field_value = resolve_expression(field_expression)
+                        if isinstance(field_value, int):
+                            field_attributes = (
+                                graph.G.nodes.get(field_value, {}).get(
+                                    "attributes"
+                                ) or {}
+                            )
+                            function_ref = field_attributes.get(
+                                "first_class_function_ref"
+                            )
+                            if function_ref is not None:
+                                page = current_identity_book().page(
+                                    "callable_identity_concordance"
+                                )
+                                row = (
+                                    str(graph.G.graph.get("function_name")
+                                        or "<module>"),
+                                    int(field_value),
+                                )
+                                recorded = page.latest(row)
+                                if recorded is None:
+                                    page.set(row, 0, int(function_ref))
+                                elif int(recorded) != int(function_ref):
+                                    raise ValueError(
+                                        "callable identity concordance "
+                                        f"disagrees for {row!r}: "
+                                        f"{recorded!r} != {function_ref!r}"
+                                    )
+                                page.set(row, 1, int(function_ref))
+                            _redirect_value(
+                                graph, int(attribute_id), int(field_value)
+                            )
+                            return int(field_value)
                 read_inputs: list[tuple[int, str]] = [(receiver, "value")]
                 last_write = attribute_effect_nodes.get(
                     (receiver, expression.attr)
@@ -2155,6 +2328,104 @@ def _normalize_lexical_values(
                         receiver_attributes.get("class_ref"),
                     )
                 )
+                declared_callable_field = None
+                declared_receiver_field = None
+                if receiver_class is not None:
+                    repository_records = dict(
+                        (graph.G.graph.get("program_abi") or {}).get(
+                            "records"
+                        ) or {}
+                    )
+                    matching_receiver_records = tuple(
+                        record
+                        for name, record in repository_records.items()
+                        if (
+                            str(name) == str(receiver_class)
+                            or str(record.get("identity") or name)
+                            == str(receiver_class)
+                            or str(record.get("identity") or name).endswith(
+                                "." + str(receiver_class)
+                            )
+                        )
+                    )
+                    receiver_binding_name = receiver_attributes.get(
+                        "binding_name"
+                    )
+                    parameter_receiver_record = dict(
+                        graph.G.graph.get("parameter_record_abi") or {}
+                    ).get(str(receiver_binding_name))
+                    if parameter_receiver_record is not None:
+                        matching_receiver_records = (
+                            *matching_receiver_records,
+                            parameter_receiver_record,
+                        )
+                    matching_receiver_records = tuple({
+                        repr(record): record
+                        for record in matching_receiver_records
+                    }.values())
+                    if len(matching_receiver_records) == 1:
+                        candidate_field = dict(
+                            matching_receiver_records[0].get("fields") or {}
+                        ).get(str(expression.attr))
+                        if isinstance(candidate_field, Mapping):
+                            declared_receiver_field = dict(candidate_field)
+                        if (
+                            isinstance(candidate_field, Mapping)
+                            and str(candidate_field.get("storage") or "")
+                            == "reference"
+                            and candidate_field.get("callable_signature")
+                            is not None
+                        ):
+                            declared_callable_field = dict(candidate_field)
+                if (
+                    declared_receiver_field is not None
+                    and str(declared_receiver_field.get("storage") or "")
+                    == "keyed"
+                ):
+                    graph.G.nodes[attribute_id].setdefault(
+                        "attributes", {}
+                    ).update({
+                        "producer_kind": "record_field",
+                        "aggregate_kind": "dict",
+                        "sequence_key_columns": (0,),
+                        "sequence_column_count": 2,
+                        "sequence_writable": bool(
+                            declared_receiver_field.get("mutable", False)
+                        ),
+                        "record_field": (
+                            str(receiver_class), str(expression.attr)
+                        ),
+                        "mapping_key_dtype": "int64",
+                        "mapping_value_dtype": str(
+                            declared_receiver_field.get("dtype") or "unknown"
+                        ),
+                        **({
+                            "mapping_value_tensor": True,
+                            "mapping_value_python_type": "AbstractTensor",
+                        } if declared_receiver_field.get("value_tensor") else {}),
+                        **({
+                            "mapping_value_record": str(
+                                declared_receiver_field["value_record"]
+                            ),
+                        } if declared_receiver_field.get("value_record")
+                           is not None else {}),
+                    })
+                if declared_callable_field is not None:
+                    graph.G.nodes[attribute_id].setdefault(
+                        "attributes", {}
+                    ).update({
+                        "producer_kind": "record_field",
+                        "record_field": (
+                            str(receiver_class), str(expression.attr)
+                        ),
+                        "callable_reference_field": True,
+                        "callable_signature": str(
+                            declared_callable_field["callable_signature"]
+                        ),
+                        "callable_optional": bool(
+                            declared_callable_field.get("optional", False)
+                        ),
+                    })
                 field_kind = (
                     (class_field_aggregate_kinds or {}).get((
                         str(receiver_class), str(expression.attr)
@@ -2339,6 +2610,35 @@ def _normalize_lexical_values(
                             graph,
                             node_id,
                             (*call_inputs, (callee, "callee")),
+                        )
+                if (
+                    callee_attributes.get("callable_reference_field")
+                    and node_id in graph.G
+                ):
+                    call_attributes = graph.G.nodes[node_id].setdefault(
+                        "attributes", {}
+                    )
+                    call_attributes.update({
+                        "indirect_callable_id": int(callee),
+                        "callable_signature": str(
+                            callee_attributes["callable_signature"]
+                        ),
+                        "callable_optional": bool(
+                            callee_attributes.get("callable_optional", False)
+                        ),
+                    })
+                    call_inputs = tuple(
+                        graph.G.nodes[node_id].get("parents") or ()
+                    )
+                    if not any(
+                        int(parent) == int(callee)
+                        and str(role) in {"callee", "function", "func"}
+                        for parent, role in call_inputs
+                    ):
+                        _replace_inputs(
+                            graph,
+                            node_id,
+                            (*call_inputs, (int(callee), "callee")),
                         )
             if isinstance(callee, _StaticPythonReference) and node_id in graph.G:
                 reference_node_id = static_reference_node(callee)
@@ -2577,6 +2877,27 @@ def _normalize_lexical_values(
                         resolved_inputs.append((
                             resolved,
                             f"kw:{keyword.arg}" if keyword.arg else "kwargs",
+                        ))
+                callee_reference = call_attributes.get(
+                    "callee_ref", call_attributes.get("method_ref")
+                )
+                for closure_name in lexical_free_names_by_reference.get(
+                    int(callee_reference)
+                    if callee_reference is not None
+                    else -1,
+                    (),
+                ):
+                    closure_value = environment.get(closure_name)
+                    if (
+                        closure_value is None
+                        and closure_name in parameter_names
+                    ):
+                        closure_value = input_value(
+                            closure_name, binding_kind="parameter",
+                        )
+                    if isinstance(closure_value, int):
+                        resolved_inputs.append((
+                            closure_value, f"closure:{closure_name}",
                         ))
                 _replace_inputs(graph, node_id, tuple(resolved_inputs))
                 if (
@@ -3666,6 +3987,7 @@ def _normalize_lexical_values(
                         "GetAttr", f"getattr[{attribute_name}]",
                         attributes=initial_attributes,
                         parents=((int(receiver_id), "value"),),
+                        source=body_statement,
                     )
                     before_attribute_values[field_key] = initial
                     for branch_values, branch_effects in (
@@ -3962,7 +4284,7 @@ def _normalize_lexical_values(
                 ):
                     input_value(read_name, binding_kind="parameter")
             if isinstance(body_statement, ast.For):
-                resolve_expression(body_statement.iter)
+                iterator_value = resolve_expression(body_statement.iter)
                 # Parameter/external bindings are materialized lazily at
                 # their first lexical read.  Resolve the loop domain before
                 # taking the initial-state snapshot so a value first read by
@@ -3970,6 +4292,50 @@ def _normalize_lexical_values(
                 # when the body writes it.
                 before_loop = dict(environment)
                 bind_loop_target(body_statement.target)
+                # ``for key, row in mapping.items()`` carries the mapping's
+                # declared value-record identity onto the exact row binding.
+                # The mapping field annotation is the authority; neither the
+                # loop variable's spelling nor a runtime sample is used.
+                mapping_value_record = None
+                pending_iterator_values = (
+                    [int(iterator_value)]
+                    if isinstance(iterator_value, int) else []
+                )
+                visited_iterator_values: set[int] = set()
+                while pending_iterator_values and mapping_value_record is None:
+                    candidate = pending_iterator_values.pop()
+                    if (
+                        candidate in visited_iterator_values
+                        or candidate not in graph.G
+                    ):
+                        continue
+                    visited_iterator_values.add(candidate)
+                    candidate_data = graph.G.nodes[candidate]
+                    mapping_value_record = (
+                        candidate_data.get("attributes") or {}
+                    ).get("mapping_value_record")
+                    if mapping_value_record is None:
+                        pending_iterator_values.extend(
+                            int(parent)
+                            for parent, role in candidate_data.get(
+                                "parents", ()
+                            )
+                            if str(role) in {
+                                "operand", "value", "base", "object",
+                                "receiver",
+                            }
+                        )
+                if (
+                    mapping_value_record is not None
+                    and isinstance(body_statement.target, (ast.Tuple, ast.List))
+                    and len(body_statement.target.elts) >= 2
+                ):
+                    row_target = body_statement.target.elts[1]
+                    row_value = loop_target_bindings_by_ast.get(id(row_target))
+                    if row_value is not None and row_value in graph.G:
+                        graph.G.nodes[row_value].setdefault(
+                            "attributes", {}
+                        )["result_class_ref"] = str(mapping_value_record)
             else:
                 resolve_expression(body_statement.test)
                 # The same ordering is essential for while loops: a parameter
@@ -4992,6 +5358,24 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             lexical_parent_by_function[id(node)] = self.owner_id
 
         def visit_ClassDef(self, node):
+            # A class body is not itself a closure scope, but methods of a
+            # class defined inside a function can close directly over that
+            # function. ``interchange_reduction_loops`` does exactly this:
+            # ``_RegisterBlockRewriter.visit_For`` writes the outer
+            # ``state: dict``. Skipping the class body left the method with no
+            # lexical parent, so closure aggregate discovery rebuilt ``state``
+            # from its live Python value as ``static:state``. The indexed
+            # store then disagreed with the authored dict identity and failed
+            # during lexical reduction. Record methods against the enclosing
+            # function; their own nested definitions are visited later from
+            # the method's function record.
+            for member in node.body:
+                if isinstance(
+                    member, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
+                ):
+                    lexical_parent_by_function[id(member)] = self.owner_id
+                elif isinstance(member, ast.ClassDef):
+                    self.visit_ClassDef(member)
             return None
 
     for owner_id, definition in function_definitions.items():
@@ -5004,13 +5388,50 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             visitor.visit(body_member)
 
     def local_aggregate_kinds(definition: Any) -> dict[str, str]:
-        """Return aggregate storage explicitly constructed in one scope."""
+        """Return aggregate storage owned by one lexical scope.
+
+        Parameters are part of that scope's storage contract too. A nested
+        function captures the outer parameter object, not a new untyped host
+        value. ``_bind_sequence_storage_members.bind`` captures the annotated
+        ``storage_bindings: dict[int, int]`` parameter and mutates it. Omitting
+        annotated parameters here made that exact mapping reappear as a static
+        Python closure value at the nested boundary.
+        """
 
         if not isinstance(
             definition, (ast.FunctionDef, ast.AsyncFunctionDef)
         ):
             return {}
+        def annotated_kind(annotation: ast.AST | None) -> str | None:
+            if isinstance(annotation, ast.Name) and annotation.id in {
+                "list", "set", "dict", "tuple", "bytes", "bytearray",
+            }:
+                return annotation.id
+            if isinstance(annotation, ast.Subscript):
+                return annotated_kind(annotation.value)
+            if isinstance(annotation, ast.BinOp) and isinstance(
+                annotation.op, ast.BitOr,
+            ):
+                alternatives = tuple(filter(None, (
+                    annotated_kind(annotation.left),
+                    annotated_kind(annotation.right),
+                )))
+                return (
+                    alternatives[0]
+                    if alternatives and len(set(alternatives)) == 1
+                    else None
+                )
+            return None
+
         kinds: dict[str, str] = {}
+        for argument in (
+            *definition.args.posonlyargs,
+            *definition.args.args,
+            *definition.args.kwonlyargs,
+        ):
+            kind = annotated_kind(argument.annotation)
+            if kind is not None:
+                kinds[argument.arg] = kind
         pending = list(reversed(definition.body))
         while pending:
             member = pending.pop()
@@ -5187,7 +5608,28 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     )
     class_field_mapping_contracts: dict[
         tuple[str, str], dict[str, Any]
-    ] = {}
+    ] = {
+        (str(owner), str(field)): {
+            "mapping_key_dtype": "int64",
+            "mapping_value_dtype": str(
+                receipt.get("dtype") or "unknown"
+            ),
+            **({
+                "mapping_value_tensor": True,
+                "mapping_value_python_type": "AbstractTensor",
+            } if receipt.get("value_tensor") else {}),
+            **({
+                "mapping_value_record": str(receipt["value_record"]),
+            } if receipt.get("value_record") is not None else {}),
+            "mapping_value_optional": bool(
+                receipt.get("value_optional", False)
+            ),
+        }
+        for (owner, field), receipt in dict(
+            graph.G.graph.get("declared_class_field_contracts") or {}
+        ).items()
+        if str(receipt.get("storage") or "") == "keyed"
+    }
     class_field_sequence_dtypes: dict[
         tuple[str, str], tuple[str, ...]
     ] = {}
@@ -5223,6 +5665,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         }.get(str(name))
         if dtype is not None:
             return {"dtype": dtype}
+        if tensor_annotation_identity(
+            annotation, getattr(graph, "python_bindings", {}) or {},
+        ) is not None:
+            return {
+                "dtype": "unknown",
+                "tensor": True,
+                "python_type": "AbstractTensor",
+            }
         if name:
             # Repository records cross table boundaries by a deterministic
             # integer row handle; their physical fields remain described by
@@ -5256,6 +5706,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         return {
             "mapping_key_dtype": str(key["dtype"]),
             "mapping_value_dtype": str(value["dtype"]),
+            **({
+                "mapping_value_tensor": True,
+                "mapping_value_python_type": "AbstractTensor",
+            } if value.get("tensor") else {}),
             **({
                 "mapping_value_record": str(value["record"]),
             } if value.get("record") is not None else {}),

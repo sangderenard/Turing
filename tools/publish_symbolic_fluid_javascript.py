@@ -68,9 +68,8 @@ def main() -> int:
             "targets.cfl": 0.45,
             "targets.div_max": 1.0,
             "targets.mass_max": 1.0e-8,
-            "targets.error_limits.length": 0,
-            "targets.error_limits.keys": [],
-            "targets.error_limits.values": [],
+            "targets.error_limits": [0.0] * 15,
+            "targets.error_limits_present": [0.0] * 15,
         },
         "display": [
             {"label": "height", "field": "state.height"},

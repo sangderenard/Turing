@@ -10,6 +10,9 @@ attempts exercise one orchestration program.
 
 from __future__ import annotations
 
+from src.common.dt_system.error_channels import DT_CHANNEL_NAMES
+from src.common.tensors import AbstractTensor
+
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -474,10 +477,10 @@ class NativeSymbolicFluidAdvance:
             div_inf=self._read(by_kwarg.get("div_inf")),
             mass_err=self._read(by_kwarg.get("mass_err")),
             dt_limit=self._read(by_kwarg.get("dt_limit")),
-            error_channels={
-                name: self._read(value_id, required=True)
-                for name, value_id in channels.items()
-            },
+            error_channels=AbstractTensor.tensor([
+                self._read(channels[name], required=True) if name in channels else 0.0
+                for name in DT_CHANNEL_NAMES]),
+            error_present=AbstractTensor.tensor([float(name in channels) for name in DT_CHANNEL_NAMES]),
         )
         return ok, metrics
 

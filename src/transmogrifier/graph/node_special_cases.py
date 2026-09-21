@@ -760,8 +760,54 @@ def tensor_operation_name(node: Any) -> Optional[str]:
         return None
     canonical = canonical_operator_name(name)
     if canonical in CANONICAL_ABSTRACT_TENSOR_OPERATORS:
+        # Canonicalize the call at the ingestion seam itself.  In particular,
+        # a frontend-qualified constructor has already become ``Tensor(...)``
+        # here; downstream graph/SSA code must see the abstract operation
+        # ``tensor(...)``, never a record or concrete frontend type named
+        # ``Tensor``.
+        frontend_root = func
+        while isinstance(frontend_root, ast.Attribute):
+            frontend_root = frontend_root.value
+        frontend_qualified = (
+            isinstance(func, ast.Attribute)
+            and isinstance(frontend_root, ast.Name)
+            and frontend_root.id in {"torch", "numpy", "np"}
+        )
+        if frontend_qualified:
+            # Concrete frontend namespaces are syntax, not numerical
+            # identity.  Strip torch/numpy (including nested namespaces such
+            # as ``torch.linalg``) at ingestion so their operation is pursued
+            # or lowered through the AbstractTensor vocabulary and the
+            # concrete package never survives into ProcessGraph/SSA.
+            node._abstract_tensor_frontend_reference = canonical
+            if canonical == "tensor":
+                node.func = ast.copy_location(
+                    ast.Name(id=canonical, ctx=ast.Load()), func,
+                )
+        elif isinstance(func, ast.Name) and func.id != canonical:
+            func.id = canonical
         return canonical
     return None
+
+
+def tensor_annotation_identity(
+    annotation: ast.AST,
+    bindings: dict[str, Any] | None = None,
+) -> Optional[str]:
+    """Return the abstract identity stated by a tensor annotation spelling.
+
+    This is deliberately syntax-only.  AST ingestion has no permission to
+    import, inspect, or preserve a frontend tensor class.  A terminal
+    ``Tensor`` annotation is the frontend spelling of ``AbstractTensor``.
+    """
+
+    del bindings
+    name = (
+        annotation.id if isinstance(annotation, ast.Name)
+        else annotation.attr if isinstance(annotation, ast.Attribute)
+        else ""
+    )
+    return "AbstractTensor" if name in {"Tensor", "AbstractTensor"} else None
 
 
 def is_reduction_operation(name: str) -> bool:

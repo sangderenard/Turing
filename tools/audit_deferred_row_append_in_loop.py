@@ -157,7 +157,7 @@ def _base_records():
 def main() -> int:
     variant = sys.argv[1] if len(sys.argv) > 1 else "flat"
     root_source = ROOTS[variant]
-    parts = [inspect.getsource(_scalar), inspect.getsource(coerce_metrics)]
+    parts = ["from src.common.tensors import AbstractTensor", inspect.getsource(_scalar), inspect.getsource(coerce_metrics)]
     if variant.startswith("tuple"):
         parts.append(PAIR_SOURCE)
     if variant == "flat_scalar_in":
@@ -165,7 +165,7 @@ def main() -> int:
             "def fresh(scale):\n"
             "    return Metrics(max_vel=scale, max_flux=scale, div_inf=scale, "
             "mass_err=scale, osc_flag=False, stiff_flag=False, sim_frame=0, "
-            "proc_ms=scale, dt_limit=scale, error_channels={'residual': scale}, "
+            "proc_ms=scale, dt_limit=scale, error_channels=AbstractTensor.tensor([0.0, 0.0, 0.0, scale, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]), error_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]), "
             "hard_failure=False, advanced_dt=scale)\n"
         )
     parts.append(root_source)

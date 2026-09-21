@@ -73,7 +73,7 @@ def _run(rollback: bool, *, windows: int = WINDOWS, max_iters: int = 48):
             "advanced": float(advanced), "dt_next": float(dt_next),
             "attempts": [(float(r["dt"]), bool(r["accepted"]), float(r["metrics"].max_vel))
                          for r in log[before:]],
-            "capped": "superstep_iteration_cap_hit" in (metrics.error_channels or {}),
+            "capped": bool(metrics.control_present[8].item()),
             "finite": bool(np.isfinite(np.asarray(material.state.data)).all()),
         })
     return rows, window
@@ -114,8 +114,8 @@ def test_tire_publishes_a_positive_energy_time_scale():
     for _step in range(3):
         _ok, metrics = advance(material, 2.44140625e-4)
     channels = metrics.error_channels
-    energy = float(channels["energy_j"].item())
-    power = float(channels["power_w"].item())
+    energy = float(channels[0].item())
+    power = float(channels[1].item())
     assert energy > 0.0 and power > 0.0, (energy, power)
     assert prepared.feeds["targets"].energy_exchange_fraction == 0.1
     assert material.dt_limit_hint() == 2.44140625e-4

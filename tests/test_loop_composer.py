@@ -1189,6 +1189,36 @@ def test_comprehension_result_is_resident_sequence_for_following_loop():
     ).get("producer_kind") == "sequence_materialization"
 
 
+def test_comprehension_body_keeps_scoped_target_identity_from_later_names():
+    graph = _function_graph(
+        "def kernel(nodes, rows):\n"
+        "    node_index = {name: index for index, name in enumerate(nodes)}\n"
+        "    result = []\n"
+        "    for name, value in rows:\n"
+        "        index = node_index[name]\n"
+        "        result.append(index + value)\n"
+        "    return result\n",
+        "kernel",
+    )
+
+    plans = _glsl_composer().discover(graph)
+    comprehension = next(
+        plan for plan in plans if plan.loop.source_type == "comprehension"
+    )
+    later_lookup = next(
+        node_id
+        for node_id, data in graph.G.nodes(data=True)
+        if data.get("type") == "Indexed"
+        and (data.get("source_span") or {}).get("line") == 5
+    )
+
+    assert later_lookup not in comprehension.loop.body_nodes
+    assert all(
+        (graph.G.nodes[node_id].get("source_span") or {}).get("line") != 5
+        for node_id in comprehension.loop.body_nodes
+    )
+
+
 def test_comprehension_clause_has_no_statement_body_for_return_analysis():
     graph = _function_graph(
         "def kernel(values):\n"
@@ -1833,6 +1863,34 @@ def test_while_ternary_assignment_is_explicit_loop_carried_state():
     assert carried["data"][0] != carried["data"][1]
     assert plan.loop.condition_nodes
     assert plan.loop.body_nodes
+
+
+def test_synthesized_record_field_seed_keeps_loop_ownership():
+    graph = _function_graph(
+        "class Metrics:\n"
+        "    def __init__(self):\n"
+        "        self.value = 0.0\n"
+        "\n"
+        "def kernel(metrics: Metrics, keep):\n"
+        "    while keep:\n"
+        "        if keep:\n"
+        "            metrics.value = 1.0\n"
+        "        keep = False\n"
+        "    return metrics\n",
+        "kernel",
+    )
+
+    plan, = _glsl_composer().discover(graph)
+    seed, = (
+        node_id
+        for node_id, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get(
+            "initial_record_field_state"
+        )
+    )
+
+    assert graph.G.nodes[seed]["source_span"]["line"] == 7
+    assert seed in plan.loop.body_nodes
 
 
 def test_multi_carried_recurrence_preservation_outranks_unrolling():

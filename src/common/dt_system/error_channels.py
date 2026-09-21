@@ -1,6 +1,6 @@
 """Error channels as id-indexed spans, not a string-keyed dict.
 
-``Metrics.error_channels`` is a ``dict[str, float]``, and a dict does not
+``Metrics.error_channels`` was a ``dict[str, float]``. A dict does not
 lower well: it becomes a keyed store addressed by string tokens, and every
 consultation on the step path is a hash.  Worse, those tokens are fnv1a-**64**
 values, which do not survive a float64 column (53-bit mantissa) -- the exact
@@ -35,6 +35,48 @@ from typing import Any, Iterable, Mapping
 
 _CHANNEL_NAMES: list[str] = []
 _CHANNEL_BY_NAME: dict[str, int] = {}
+
+# The shared dt program's ABI, explicitly ordered and independent of declaration
+# history. Programs extending this layout append their own columns and declare
+# the resulting extent in their extraction contract. Never use the process-wide
+# registry to reconstruct a compiled artifact's column order.
+DT_CHANNEL_NAMES = (
+    "energy_j", "power_w", "shadow_growth", "div_inf", "mass_err",
+    "height_positivity", "tracer_bounds", "maximum_substep_displacement_m",
+    "causal_dt_excess", "time_slip", "spring_causal_dt_excess",
+    "world_sparse_shape", "columnar_material_unit_error", "columnar_nonfinite",
+    "damping_factor",
+)
+ENERGY_J, POWER_W, SHADOW_GROWTH = 0, 1, 2
+
+
+def empty_channels():
+    from ..tensors import AbstractTensor
+
+    return AbstractTensor.zeros((len(DT_CHANNEL_NAMES),))
+
+
+def channel_fields(published, *, names=DT_CHANNEL_NAMES, limits=False):
+    """Build-time adapter for named configuration; never called by a step.
+
+    Return constructor fields with explicit values and presence. Unknown names
+    are errors, not silently dropped columns. The caller owns the layout.
+    """
+    if tuple(names[:len(DT_CHANNEL_NAMES)]) != DT_CHANNEL_NAMES:
+        raise ValueError("dt channel layouts must retain the shared ABI prefix")
+    unknown = set(published).difference(names)
+    if unknown:
+        raise ValueError(f"undeclared channels: {sorted(unknown)}")
+    spans = ChannelSpans.of(published, names=names)
+    if limits:
+        return {"error_limits": spans.values, "error_limits_present": spans.present}
+    return {"error_channels": spans.values, "error_present": spans.present}
+
+
+def channel_report(values, present, names=DT_CHANNEL_NAMES):
+    """Resolve column names only at the reporting boundary."""
+    return {name: float(value) for name, value, flag in
+            zip(names, values.tolist(), present.tolist()) if flag}
 
 
 def declare_channel(name: str) -> int:
@@ -101,13 +143,13 @@ class ChannelSpans:
     present: Any
 
     @classmethod
-    def of(cls, published: Mapping[str, float] | None = None) -> "ChannelSpans":
+    def of(cls, published: Mapping[str, float] | None = None, *, names=None) -> "ChannelSpans":
         from ...common.tensors import AbstractTensor
 
         published = published or {}
         values: list[float] = []
         present: list[bool] = []
-        for name in _CHANNEL_NAMES:
+        for name in (_CHANNEL_NAMES if names is None else names):
             measure = published.get(name)
             values.append(0.0 if measure is None else float(measure))
             present.append(measure is not None)
@@ -118,14 +160,14 @@ class ChannelSpans:
 
     def has(self, channel_id: int) -> bool:
         """Whether this channel was published -- never "is it nonzero"."""
-        return bool(self.present.tolist()[int(channel_id)])
+        return bool(self.present[int(channel_id)].item())
 
     def value(self, channel_id: int) -> float | None:
         """This channel's measure, or None when it was not published."""
         index = int(channel_id)
         if not self.has(index):
             return None
-        return float(self.values.tolist()[index])
+        return float(self.values[index].item())
 
 
 @dataclass(frozen=True)
@@ -269,8 +311,7 @@ def participant_penalties(channels: ParticipantChannels,
     from ...common.tensors import AbstractTensor
 
     mask = channels.present * limits.present
-    safe = AbstractTensor.where(limits.limits != 0.0, limits.limits,
-                                AbstractTensor.ones_like(limits.limits))
+    safe = AbstractTensor.maximum(limits.limits, 1e-30)
     return AbstractTensor.where(mask, channels.values / safe,
                                 AbstractTensor.zeros_like(channels.values))
 
@@ -316,13 +357,10 @@ def penalties(spans: ChannelSpans, limits: ChannelLimits):
     from ...common.tensors import AbstractTensor
 
     mask = judged_mask(spans, limits)
-    safe = AbstractTensor.where(
-        limits.limits != 0.0, limits.limits,
-        AbstractTensor.tensor([1.0] * len(limits.limits.tolist())),
-    )
+    safe = AbstractTensor.maximum(limits.limits, 1e-30)
     return AbstractTensor.where(
         mask, spans.values / safe,
-        AbstractTensor.tensor([0.0] * len(spans.values.tolist())),
+        AbstractTensor.zeros_like(spans.values),
     )
 
 

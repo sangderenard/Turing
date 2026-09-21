@@ -467,7 +467,8 @@ def advance_bound_spring(
             div_inf=0.0,
             mass_err=0.0,
             dt_limit=ceiling,
-            error_channels={"spring_causal_dt_excess": float(dt) - ceiling},
+            error_channels=AT.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, float(dt) - ceiling, 0.0, 0.0, 0.0, 0.0]),
+            error_present=AT.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
             advanced_dt=0.0,
         )
     state.spring_rest_length[:edge_count] = proposed_rest_length
@@ -555,7 +556,8 @@ def advance_bound_spring(
         div_inf=0.0,
         mass_err=0.0,
         dt_limit=_causal_limit(state, parameters, *_forces(state, parameters)),
-        error_channels={"spring_causal_dt_excess": 0.0},
+        error_channels=AT.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        error_present=AT.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
         advanced_dt=float(dt),
     )
 

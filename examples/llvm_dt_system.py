@@ -27,7 +27,9 @@ import numpy as np
 
 from src.common.dt_system.dt_controller import STController, Targets, run_superstep
 from src.common.dt_system.dt_scaler import Metrics
-from src.common.dt_system.participants import Publication
+from src.common.dt_system.participants import StepSpans
+from src.common.dt_system.error_channels import DT_CHANNEL_NAMES
+from src.common.tensors import AbstractTensor
 from src.common.dt_system.time_contracts import BIND, HOLD, ParticipantRegistry
 from src.compiler.native_law_kernels import LLVMPiece
 
@@ -53,7 +55,7 @@ def column_names_of(pieces):
     return tuple(names)
 
 
-def state_source(columns):
+def state_source(columns, participants=1):
     """Spell ``PieceState`` for these columns: one span field per column,
     the ``dt`` column the step fills, and the window's telemetry span.
     ``copy_shallow``/``restore`` are the tire's: copies out, in-place back."""
@@ -64,6 +66,11 @@ def state_source(columns):
     for name in fields:
         lines.append(f"        self.{name} = {name}")
     lines.append("        self.telemetry = telemetry")
+    lines.append(f"        self.channel_names = {DT_CHANNEL_NAMES!r}")
+    for field in ("pub_tau", "pub_tau_present", "pub_contract", "pub_dt_limit", "pub_dt_limit_present"):
+        lines.append(f"        self.{field} = AbstractTensor.zeros(({participants},))")
+    for field in ("pub_values", "pub_present", "pub_limits", "pub_limits_present"):
+        lines.append(f"        self.{field} = AbstractTensor.zeros(({participants * len(DT_CHANNEL_NAMES)},))")
     lines.append("")
     lines.append("    def copy_shallow(self):")
     lines.append("        return (")
@@ -119,35 +126,34 @@ def piece_source(pieces):
             if name not in published:
                 continue
             reducer = "min" if name == "dt_limit" else "max"
-            lines.append(f"    m{index}_{name} = o{index}_{name}.{reducer}().item()")
+            # Keep the reduced 0-d tensor in the tensorized report. The dt
+            # boundary's ``coerce_metrics`` returns canonical Metrics records
+            # unchanged; extracting here would split the tensorized handoff
+            # with a structural scalar call result.
+            lines.append(f"    m{index}_{name} = o{index}_{name}.{reducer}()")
         # tau is this law's own energy over its own power: the time it would
         # take to exchange its stored energy at the rate it is exchanging now.
         # That is the quantity the blended energy/power pin always computed --
         # here it stays attached to the law that measured it.
+        # Write declared buffers directly. No Publication constructor or keyed
+        # table result crosses this call boundary. Every attempt writes its masks.
         if "energy_j" in published and "power_w" in published:
-            lines.append(
-                f"    t{index}_tau = (m{index}_energy_j / m{index}_power_w"
-                f" if m{index}_power_w > 0.0 else None)")
+            lines.append(f"    state.pub_tau_present[{index}] = float(m{index}_power_w > 0.0)")
+            lines.append(f"    state.pub_tau[{index}] = m{index}_energy_j / m{index}_power_w if m{index}_power_w > 0.0 else 0.0")
+            lines.append(f"    state.pub_contract[{index}] = BIND if m{index}_power_w > 0.0 else HOLD")
         else:
-            lines.append(f"    t{index}_tau = None")
-
-    lines.append("")
-    lines.append("    state.publications = {")
-    for index, piece in enumerate(pieces):
-        published = set(piece.output_names)
-        channels = [name for name in ("energy_j", "power_w", "div_inf", "mass_err")
-                    if name in published]
-        channel_text = ", ".join(
-            f'"{name}": m{index}_{name}' for name in channels)
-        floor = (f"m{index}_dt_limit" if "dt_limit" in published else "None")
-        lines.append(f'        "{piece.entry}": Publication(')
-        lines.append(f"            channels={{{channel_text}}},")
-        lines.append(f"            dt_limit={floor},")
-        lines.append(f"            tau_s=t{index}_tau,")
-        lines.append(f"            contract=(BIND if t{index}_tau is not None"
-                     f" else HOLD),")
-        lines.append("        ),")
-    lines.append("    }")
+            lines.append(f"    state.pub_tau[{index}] = 0.0")
+            lines.append(f"    state.pub_tau_present[{index}] = 0.0")
+            lines.append(f"    state.pub_contract[{index}] = HOLD")
+        floor = f"m{index}_dt_limit" if "dt_limit" in published else "0.0"
+        lines.append(f"    state.pub_dt_limit[{index}] = {floor}")
+        lines.append(f"    state.pub_dt_limit_present[{index}] = {float('dt_limit' in published)}")
+        for channel, name in enumerate(DT_CHANNEL_NAMES):
+            slot = index * len(DT_CHANNEL_NAMES) + channel
+            measured = name in published and name in METRIC_FIELDS
+            value = f"m{index}_{name}" if measured else "0.0"
+            lines.append(f"    state.pub_values[{slot}] = {value}")
+            lines.append(f"    state.pub_present[{slot}] = {float(measured)}")
 
     def fold(operator, terms, empty):
         if not terms:
@@ -177,14 +183,25 @@ def piece_source(pieces):
     lines.append("    metrics = Metrics(")
     lines.append("        max_vel=max_vel, max_flux=max_flux, div_inf=div_inf,")
     lines.append("        mass_err=mass_err, dt_limit=dt_limit,")
-    lines.append('        error_channels={"energy_j": energy_j, "power_w": power_w},')
+    report = [name if any(name in p.output_names for p in pieces) else "0.0"
+              for name in DT_CHANNEL_NAMES]
+    # Only fields reduced above are part of the aggregate report.
+    report = [value if name in METRIC_FIELDS else "0.0"
+              for name, value in zip(DT_CHANNEL_NAMES, report)]
+    flags = [float(name in METRIC_FIELDS and any(name in p.output_names for p in pieces))
+             for name in DT_CHANNEL_NAMES]
+    lines.append(f"        error_channels=AbstractTensor.tensor([{', '.join(report)}]),")
+    lines.append(f"        error_present=AbstractTensor.tensor({flags}),")
+    for field in ("pub_tau", "pub_tau_present", "pub_contract", "pub_dt_limit", "pub_dt_limit_present",
+                  "pub_values", "pub_present", "pub_limits", "pub_limits_present"):
+        lines.append(f"        {field}=state.{field},")
     lines.append("    )")
     lines.append("    return True, metrics")
     return "\n".join(lines) + "\n"
 
 
 def generated_source(pieces):
-    return state_source(column_names_of(pieces)) + "\n\n" + piece_source(pieces)
+    return state_source(column_names_of(pieces), len(pieces)) + "\n\n" + piece_source(pieces)
 
 
 def bind_pieces(pieces):
@@ -196,7 +213,7 @@ def bind_pieces(pieces):
         "np": np, "Metrics": Metrics,
         # the dt system's own publication vocabulary: a law states what it
         # measured and how its tau participates, and nothing here decides
-        "Publication": Publication, "BIND": BIND, "HOLD": HOLD,
+        "StepSpans": StepSpans, "AbstractTensor": AbstractTensor, "BIND": BIND, "HOLD": HOLD,
         **bindings,
     }
     exec(generated_source(pieces), namespace)
@@ -268,7 +285,7 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
     # The laws declare themselves once, in causal order, and the state carries
     # the registry so the controller can index the rows the step publishes.
     state.participants = participant_registry(pieces)
-    state.participant_limits = dict(targets.error_limits or {})
+    configure_publication_limits(state, targets)
     dt = round_dt
     results = []
     for _round in range(rounds):
@@ -279,7 +296,16 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
     return state, controller, results
 
 
-def dt_system_contract(entry, columns, batch):
+def configure_publication_limits(state, targets):
+    """Build-time defaults for the declared participant/channel buffers."""
+    for index in range(int(state.pub_tau.shape[0])):
+        start = index * len(DT_CHANNEL_NAMES)
+        stop = start + len(DT_CHANNEL_NAMES)
+        state.pub_limits[start:stop] = targets.error_limits
+        state.pub_limits_present[start:stop] = targets.error_limits_present
+
+
+def dt_system_contract(entry, columns, batch, participants=1):
     """The state's span fields plus the dt system's own records.
 
     ``Targets``, ``STController`` and ``Metrics`` are retained exactly as
@@ -304,8 +330,23 @@ def dt_system_contract(entry, columns, batch):
         "fields": {
             **{name: span(batch) for name in (*columns, "dt")},
             "telemetry": span(len(TELEMETRY_FIELDS)),
+            **{name: span(participants) for name in
+               ("pub_tau", "pub_tau_present", "pub_contract", "pub_dt_limit", "pub_dt_limit_present")},
+            **{name: span(participants * len(DT_CHANNEL_NAMES)) for name in
+               ("pub_values", "pub_present", "pub_limits", "pub_limits_present")},
         },
     }
+    records["StepSpans"] = {
+        "identity": "src.common.dt_system.participants.StepSpans",
+        "fields": {
+            **{name: span(participants) for name in
+               ("pub_tau", "pub_tau_present", "pub_contract", "pub_dt_limit", "pub_dt_limit_present")},
+            **{name: span(participants * len(DT_CHANNEL_NAMES)) for name in
+               ("pub_values", "pub_present", "pub_limits", "pub_limits_present")},
+        },
+    }
+    records["Metrics"]["fields"].update(records["StepSpans"]["fields"])
+    bindings.append({"function": "*", "parameter": "spans", "record": "StepSpans"})
     bindings.append({"function": "*", "parameter": "state", "record": "PieceState"})
     values = [
         {"function": entry, "parameter": name, "storage": "scalar",
@@ -318,7 +359,7 @@ def dt_system_contract(entry, columns, batch):
 
 
 def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimization="O2",
-                   link="static", piece_mode="link"):
+                   link="static", piece_mode="link", progress=None):
     """Lower ``dt_system_over`` to ``backend`` and return the compiled artifact.
 
     The pieces are bound by name (``step_i``) and called by name in the
@@ -353,6 +394,12 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
     )
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
+    if progress is None:
+        progress = lambda message: print(
+            f"[llvm_dt_system] {message}", file=sys.stderr, flush=True,
+        )
+
+    progress(f"loading {len(piece_files)} compiled law piece(s)")
     pieces = [LLVMPiece.load(path) for path in piece_files]
     bindings = bind_pieces(pieces)
     batch = pieces[0].batch
@@ -363,7 +410,8 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
         python_bindings={"AbstractTensor": AbstractTensor, **bindings},
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         runtime_closure_only=True, name="llvm_dt_system",
-        extraction_contract=dt_system_contract(entry, column_names_of(pieces), batch),
+        extraction_contract=dt_system_contract(entry, column_names_of(pieces), batch, len(pieces)),
+        progress=progress,
     )
     if piece_mode not in {"link", "inline"}:
         raise ValueError(f"piece_mode={piece_mode!r}: 'link' or 'inline'")
@@ -391,13 +439,16 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
     if backend == C_BACKEND:
         from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 
+        progress("emitting linked repository SSA to C")
         artifact = emit_ssa_module_to_c(module, exports[0])
         if not artifact.complete:
             raise RuntimeError("C emission shortfalls: " + "; ".join(
                 f"{s.operation}: {s.reason}" for s in artifact.shortfalls[:6]))
         # link="static": each piece's LLVM IR is compiled into this module.
         # link="dynamic": the module calls the pieces' own DLLs by symbol.
+        progress(f"compiling native artifact in {build}")
         compiled = artifact.compile(build, optimization=optimization, link=link)
+        progress("native artifact compiled")
     elif backend == LLVM_BACKEND:
         from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
 
@@ -501,6 +552,7 @@ class NativeSystem:
 
     def prepare(self, state, targets, controller, round_dt, dt_initial, dx):
         """Allocate the public buffers from real values, ready to step."""
+        configure_publication_limits(state, targets)
         return self.artifact.prepare_execution(
             self.feeds(state, targets, controller, round_dt, dt_initial, dx)
         )
@@ -531,6 +583,7 @@ class NativeSystem:
                         if getattr(self.artifact, "library_path", None) else None),
             "batch": self.batch,
             "columns": list(self.columns),
+            "channel_names": list(DT_CHANNEL_NAMES),
             "laws": [str(piece.entry) for piece in self.pieces],
             "linked_llvm": [symbol for symbol, _ir
                             in getattr(self.artifact, "linked_llvm", ())],

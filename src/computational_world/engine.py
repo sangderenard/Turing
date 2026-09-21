@@ -186,12 +186,12 @@ class ComputationalWorld(AbstractTensorStateMachine):
             div_inf=0.0,
             mass_err=0.0,
             dt_limit=spring_metrics.dt_limit,
-            error_channels={
-                "world_sparse_shape": 0.0,
-                **dict(spring_metrics.error_channels),
-            },
+            error_channels=spring_metrics.error_channels.copy(),
+            error_present=spring_metrics.error_present.copy(),
             advanced_dt=float(dt),
         )
+        metrics.error_channels[11] = 0.0
+        metrics.error_present[11] = 1.0
         return True, metrics, state
 
     def publish_committed(
@@ -269,10 +269,8 @@ class WorldTickLease:
                 cfl=1.0,
                 div_max=1.0,
                 mass_max=1.0,
-                error_limits={
-                    "world_sparse_shape": 0.0,
-                    "spring_causal_dt_excess": 0.0,
-                },
+                error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
             ),
             controller=controller or STController(dt_min=1.0e-9),
             generation=generation,

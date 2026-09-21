@@ -1,0 +1,81 @@
+# DEPRECATED -- DO NOT USE, DO NOT IMPORT, DO NOT REVIVE.
+#
+# These "negotiation helpers" operate on an abstraction ("claims") that the
+# llvm dt system does not have: a piece produces next-state, not a claim; a
+# causal order is a re-execution of engines, not a permutation of numbers;
+# the window (copy_shallow/restore inside run_superstep) is where any such
+# choice would have to live, and nothing here can reach it or lower.
+# Reordering engines inside the window would also be slower than scientific
+# mode and would break every downstream expectation of causality.  If a
+# negotiation of this kind ever makes sense it is at a molecular causal
+# boundary of the sim, not in the dt system.  Kept only as a record of a
+# wrong turn (2026-09-17).
+#
+"""Negotiation helpers, moved out of llvm_dt_system.py so they can be looked
+at on their own.  Not wired to anything.  Not run."""
+
+import numpy as np
+
+
+def negotiate_fcfs(supply, claims, order):
+    """First-come-first-serve: claimant ``order[0]`` takes what it asked for
+    up to the supply, ``order[1]`` takes from what is left, and so on."""
+    ordered = claims[order]
+    before = np.cumsum(ordered, axis=0) - ordered
+    granted = np.minimum(np.maximum(ordered, 0.0), np.maximum(supply - before, 0.0))
+    grants = np.empty_like(granted)
+    grants[order] = granted
+    return grants
+
+
+def negotiate_prorata(supply, claims):
+    """Every claim scaled by the one factor that makes the total fit."""
+    positive = np.maximum(claims, 0.0)
+    total = positive.sum(axis=0)
+    scale = np.minimum(1.0, supply / np.maximum(total, 1e-300))
+    return positive * scale
+
+
+def negotiate_average(supply, claims):
+    """Straight averaging: an equal share of the supply, capped by the claim."""
+    share = supply / claims.shape[0]
+    return np.minimum(np.maximum(claims, 0.0), share)
+
+
+def regime_weight(amount, unit):
+    """How continuous the quantity is: N = amount / unit counts the discrete
+    things it holds; N / (1 + N) is 0 below one, 1/2 at one, 1 for a crowd."""
+    n = amount / unit
+    return n / (1.0 + n)
+
+
+def drawn_order(rng, n_claimants):
+    """A causal order drawn per step, so no fixed priority burns a pattern in."""
+    return rng.permutation(n_claimants)
+
+
+def negotiate(supply, claims, order, weight):
+    """Stages 1-4 together: pro-rata weighted by the continuum fraction,
+    first-come-first-serve (in the drawn order) by the rest, then one guard
+    scale so the blend's total never exceeds the supply."""
+    blended = weight * negotiate_prorata(supply, claims) + (1.0 - weight) * negotiate_fcfs(supply, claims, order)
+    total = blended.sum(axis=0)
+    return blended * np.minimum(1.0, supply / np.maximum(total, 1e-300))
+
+
+def claims_with_debt(claims, debt):
+    """What each claimant asks for this step: its claim plus what it is owed."""
+    return claims + debt
+
+
+def settle_debt(claims, grants, debt, unit):
+    """The residual each claimant was not served is carried forward as debt,
+    to be paid when the supply allows -- capped at one unit either way, so a
+    claimant is never owed more than one grace note."""
+    return np.clip(debt + claims - grants, -unit, unit)
+
+
+def quantum_dt(rate, unit):
+    """The window below which this rate moves less than one unit: the floor
+    at which time stops being subdivided and the transfer is rounded."""
+    return unit / np.maximum(np.abs(rate), 1e-300)

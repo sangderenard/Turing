@@ -314,19 +314,12 @@ def test_captured_local_binds_to_its_enclosing_producer(tmp_path):
     np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
 
 
-@pytest.mark.xfail(
-    reason='an enclosing parameter consumed only through a nested closure is '
-           'dropped from the enclosing signature and replaced by one '
-           'anonymous formal per callsite; reproduces identically at 3af7d206',
-    strict=False,
-)
 def test_captured_enclosing_parameter_keeps_its_signature_slot(tmp_path):
     """Capturing a parameter must not delete it from the enclosing ABI.
 
     ``gain`` is an authored parameter of ``root`` read only inside ``blend``.
-    The lowered ``root`` loses it and mints a fresh shapeless formal for each
-    callsite instead, so no caller can supply the value and the compiled
-    program reads uninitialized storage.
+    Both calls must bind that same outer identity rather than minting
+    callsite-specific frame storage.
     """
 
     module, root = _lower(

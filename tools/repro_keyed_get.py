@@ -19,6 +19,12 @@ CONTRACT = (
     / "program_extraction.yaml"
 )
 
+# Freeze the keyed compiler reproduction; dt itself now uses span records.
+from src.compiler.extraction_contract import ExtractionContract
+import yaml
+CONTRACT = ExtractionContract(CONTRACT).with_program_abi(yaml.safe_load(
+    (Path(__file__).resolve().parents[1] / "tests/fixtures/keyed_dt_record_abi.yaml").read_text()))
+
 CASES = {
     "iterate": (
         "def root(metrics):\n"

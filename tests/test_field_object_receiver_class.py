@@ -243,6 +243,45 @@ def test_a_declared_source_lets_the_imported_field_class_be_pursued(
     assert "loop_body" in entry.blocks, list(entry.blocks)
 
 
+def test_constructor_parameter_annotation_carries_field_receiver_identity(
+    tmp_path, monkeypatch,
+):
+    import ast
+    import importlib
+    import inspect
+
+    (tmp_path / "held_registry.py").write_text(
+        "class Registry:\n"
+        "    def solve(self, value):\n"
+        "        return value + 1.0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    source = """
+from held_registry import Registry
+
+class Sim:
+    def __init__(self, registry: Registry):
+        self.registry = registry
+
+    def step(self, value):
+        return self.registry.solve(value)
+"""
+    tree = ast.parse(source)
+    sim = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Sim"
+    )
+    resolved = graph_express2._resolve_ast_parent_reference(
+        ast.parse("self.registry").body[0].value,
+        {"self": sim, "Registry": importlib.import_module(
+            "held_registry"
+        ).Registry},
+    )
+    assert inspect.isclass(resolved)
+    assert resolved.__name__ == "Registry"
+
+
 def test_an_undeclared_source_is_named_by_the_refusal(tmp_path, monkeypatch):
     source = _imported_module(tmp_path, monkeypatch, "held_module_c")
     with pytest.raises(CompilationSubdivisionRequired) as refusal:

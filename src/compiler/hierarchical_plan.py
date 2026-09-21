@@ -51,6 +51,10 @@ class PlanClosure:
     # per-node domain so the lowered SSA values are the arrays they are, not
     # shapeless scalars. ``(value_id, shape, dtype)`` per value.
     value_shapes: tuple[tuple[int, tuple[int, ...], str], ...] = ()
+    # Dynamic spans have declared rank while their concrete extents remain
+    # ordinary runtime SSA. Keep that fact separate from the static shape so
+    # an empty tuple cannot silently turn a span into rank-zero arithmetic.
+    value_ranks: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -213,6 +217,9 @@ def plan_region_to_ssa_instrs(
     dtype_of = {
         int(value_id): dtype for value_id, _shape, dtype in region.value_shapes
     }
+    rank_of = {
+        int(value_id): int(rank) for value_id, rank in region.value_ranks
+    }
     # The graph domain is deliberately permissive and often records scalar
     # control values with its default numerical dtype.  Operator semantics are
     # authoritative where they are stricter: comparisons/logical operations
@@ -353,6 +360,12 @@ def plan_region_to_ssa_instrs(
             value_id,
             dtype=dtype_of.get(value_id, "float64"),
             shape=shape_of.get(value_id, ()),
+            accounting={
+                "program_abi_rank": rank_of[value_id],
+                "program_abi_storage": "span",
+            } if rank_of.get(value_id, 0) > len(
+                shape_of.get(value_id, ())
+            ) else {},
         )
         values[value_id] = made
         return made
@@ -364,6 +377,7 @@ def plan_region_to_ssa_instrs(
             value_id,
             dtype=result.dtype,
             shape=tuple(result.shape),
+            accounting=dict(result.accounting or {}),
         )
         values[value_id] = made
         return made
@@ -423,8 +437,19 @@ def plan_region_to_ssa_instrs(
         scalar_spelling = TENSOR_OPERATION_SCALAR_SPELLING
         is_scalar = (
             result is not None
-            and not tuple(result.shape)
-            and all(not tuple(value(value_id).shape) for value_id in semantic_inputs)
+            and max(
+                len(tuple(result.shape)),
+                int((result.accounting or {}).get("program_abi_rank", 0)),
+            ) == 0
+            and all(
+                max(
+                    len(tuple(value(value_id).shape)),
+                    int((value(value_id).accounting or {}).get(
+                        "program_abi_rank", 0
+                    )),
+                ) == 0
+                for value_id in semantic_inputs
+            )
         )
         semantic_opcode = str(
             attributes.get("tensor_operation")
@@ -584,6 +609,7 @@ def reduce_hierarchy_identities(
                 tuple(items),
                 closure.closure_id,
                 closure.value_shapes,
+                closure.value_ranks,
             )
 
         updated = rewrite(current)
@@ -639,6 +665,7 @@ def assign_hierarchy_ids(
             items,
             closure_id,
             closure.value_shapes,
+            closure.value_ranks,
         )
 
     planned = number(root)

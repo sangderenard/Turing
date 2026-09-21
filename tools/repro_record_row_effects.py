@@ -41,22 +41,23 @@ from src.common.dt_system.dt_scaler import Metrics  # noqa: E402
 CONTRACTS = Path(__file__).resolve().parents[1] / "extraction_contracts"
 
 SOURCE = '''
+from src.common.tensors import AbstractTensor
 def advance(metrics, dt):
     return True, Metrics(
         max_vel=float(metrics.max_vel),
         max_flux=float(metrics.max_flux),
         div_inf=0.0,
         mass_err=float(metrics.mass_err) + float(dt),
-        error_channels={
-            "maximum_substep_displacement_m": float(dt),
-            "energy_j": float(metrics.max_flux),
-        },
+        error_channels=AbstractTensor.tensor([float(metrics.max_flux), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, float(dt), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        error_present=AbstractTensor.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
     )
 
 
 def tag_unresolved(metrics, dt, attempts):
-    metrics.error_channels["dt_unresolved"] = float(dt)
-    metrics.error_channels["dt_unresolved_attempts"] = float(attempts)
+    metrics.control_values[0] = float(dt)
+    metrics.control_present[0] = 1.0
+    metrics.control_values[1] = float(attempts)
+    metrics.control_present[1] = 1.0
     return metrics
 
 

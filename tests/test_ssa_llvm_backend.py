@@ -49,6 +49,32 @@ def _native_scalar_buffers(artifact, values):
     return buffers, pointers, extents
 
 
+def test_structural_tokens_absence_and_copy_emit_in_repository_llvm(tmp_path):
+    token = SSAValue(0, "int64")
+    absent = SSAValue(1, "int64")
+    copied = SSAValue(2, "int64")
+    function = Function("structural_values", [], {
+        "entry": BasicBlock("entry", [
+            Instr("string_token", [], token, attributes={"token": 73}),
+            Instr("NoneValue", [], absent),
+            Instr("copy", [token], copied),
+            Instr("Ret", [token, absent, copied], None),
+        ]),
+    })
+
+    artifact = emit_ssa_function_to_llvm(
+        IRModule({function.name: function}), function.name,
+    )
+
+    assert artifact.shortfalls == ()
+    native = compile_artifact(artifact, directory=tmp_path / "structural_values")
+    execution = prepare_artifact_execution(native, {})
+    execution.run()
+    assert int(execution.buffers[token.id]) == 73
+    assert int(execution.buffers[absent.id]) == 0
+    assert int(execution.buffers[copied.id]) == 73
+
+
 def test_pointer_array_materializes_repository_pointer_table():
     left = SSAValue(0, "float64", (2,))
     right = SSAValue(1, "float64", (2,))

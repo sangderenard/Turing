@@ -74,11 +74,33 @@ def test_pure_hierarchy_rank_cannot_force_predicate_after_accept_call():
     assert scheduled.root.blocks == (predicate, conditional, query, terminal, call, accept)
 
 
+def test_flat_hierarchy_order_does_not_cross_a_terminal_control_boundary():
+    region = lambda i: StatementBlock((f'__scheduled_region_{i}__',))
+    before = region(1)
+    terminal = LoopControlBlock('return', return_value_ids=(30,), site_node_id=31)
+    call = StatementBlock(('__plan_callsite_20__',))
+    after = region(0)
+    hierarchy = PlanClosure('root', (), (
+        PlanCall(20, PlanClosure('late_value', (), ()), result_value_ids=(10,)),
+        PlanClosure('region_0', (), ()),
+        PlanClosure('region_1', (), ()),
+    ))
+    scheduled, _ = _schedule_loop_callsites(
+        ControlProgram(SequenceBlock((before, terminal, call, after)), region_indices=(0, 1)),
+        hierarchy,
+        {0: ((10,), (20,)), 1: ((), (30,))},
+    )
+    assert scheduled.root.blocks == (before, terminal, call, after)
+
+
 def test_conflicting_effect_and_value_orders_are_a_diagnostic():
     append = SequenceMutationBlock(ControlSequenceMutation(30, 'append', (3,), 40))
     conditional = ConditionalBlock(50, SequenceBlock((append,)), source_node_id=11)
     query = SequenceQueryBlock(50, 30, 'truth', source_call_node_id=51)
-    with pytest.raises(ValueError, match='control effect order conflicts'):
+    with pytest.raises(ValueError, match='control effect order conflicts') as caught:
         _schedule_loop_callsites(
             ControlProgram(SequenceBlock((conditional, query))), PlanClosure('root', (), ()), {},
         )
+    message = str(caught.value)
+    assert "('value', 50)" in message
+    assert "('sequence_raw', 30)" in message

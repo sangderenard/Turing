@@ -823,6 +823,32 @@ def test_pure_region_dce_preserves_an_exact_required_source_feed():
     )
 
 
+@pytest.mark.parametrize("use", ["dead", "return", "required", "phi", "effect", "inout"])
+def test_pure_call_dce_preserves_results_and_effects(use):
+    from src.compiler.ir_identities import drop_dead_pure_region_calls
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    formal, actual, result = SSAValue(1), SSAValue(2), SSAValue(3)
+    body = [Instr("Ret", [formal], None)]
+    if use == "effect":
+        body.insert(0, Instr("Store", [formal, formal], None))
+    if use == "inout":
+        body.insert(0, Instr("Add", [formal, formal], formal))
+    helper = Function("identity", [formal], {"entry": BasicBlock("entry", body)})
+    instructions = [Instr("Call", [actual], result, attributes={"callee": helper.name})]
+    if use == "return":
+        instructions.append(Instr("Ret", [result], None))
+    if use == "phi":
+        instructions.append(Instr("Phi", [], SSAValue(4), attributes={
+            "incoming": (("entry", result),),
+        }))
+    caller = Function("caller", [actual], {"entry": BasicBlock("entry", instructions)},
+                      metadata={"required_source_value_ids": (3,) if use == "required" else ()})
+    removed = drop_dead_pure_region_calls({caller.name: caller, helper.name: helper})
+    assert removed == (1 if use == "dead" else 0)
+    assert any(i.op == "Call" for i in caller.blocks["entry"].instrs) == (use != "dead")
+
+
 def test_pure_region_dce_discards_only_an_outputless_uncalled_integral():
     from src.compiler.ir_identities import drop_dead_pure_region_calls
     from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue

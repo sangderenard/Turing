@@ -45,6 +45,31 @@ def test_explicit_broadcast_shape_owns_allocation_before_call_settlement(operati
     assert descriptor.owns_allocation
 
 
+def test_call_metadata_shares_owner_regions_but_not_unrelated_local_ids():
+    actual = SSAValue(90, "bool")
+    formal = SSAValue(68)
+    sibling_value = SSAValue(68)
+    unrelated_value = SSAValue(68, "double")
+    callee = Function("owner__planned_region_0", [formal], {
+        "entry": BasicBlock("entry", [Instr("Ret", [formal], None)]),
+    }, metadata={"source_region_integral": {"owner": "owner"}})
+    sibling = Function("owner__planned_region_1", [sibling_value], {
+        "entry": BasicBlock("entry", [Instr("Ret", [sibling_value], None)]),
+    }, metadata={"source_region_integral": {"owner": "owner"}})
+    unrelated = Function("binary_value", [unrelated_value], {
+        "entry": BasicBlock("entry", [Instr("Ret", [unrelated_value], None)]),
+    })
+    caller = Function("caller", [actual], {
+        "entry": BasicBlock("entry", [Instr("Call", [actual], None,
+            attributes={"callee": callee.name})]),
+    })
+    propagate_repository_ssa_call_metadata(IRModule({
+        f.name: f for f in (caller, callee, sibling, unrelated)
+    }))
+    assert formal.dtype == sibling_value.dtype == "bool"
+    assert unrelated_value.dtype == "double"
+
+
 def test_materialized_call_operand_shape_wins_over_an_aliased_feed_view():
     """A semantic feed id may name several reshape views of one storage id."""
 

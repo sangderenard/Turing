@@ -39,6 +39,7 @@ means "not measured"; it never means "agrees".
 """
 from __future__ import annotations
 
+
 import argparse
 import sys
 from pathlib import Path
@@ -46,6 +47,8 @@ from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from src.common.dt_system.error_channels import channel_report, empty_channels
 
 import numpy as np
 
@@ -68,7 +71,7 @@ def _observables(state: Any, metrics: Any) -> dict[str, np.ndarray]:
         value = getattr(metrics, field, None)
         if value is not None:
             found[f"metrics.{field}"] = np.asarray(value, dtype=float)
-    for name, value in dict(getattr(metrics, "error_channels", {}) or {}).items():
+    for name, value in channel_report(metrics.error_channels, metrics.error_present).items():
         found[f"channel.{name}"] = np.asarray(value, dtype=float)
     for field in STATE_FIELDS:
         if hasattr(state, field):
@@ -211,7 +214,8 @@ class _NoMetrics:
     the kind of manufactured evidence this tree has been bitten by before.
     """
 
-    error_channels: dict = {}
+    error_channels = empty_channels()
+    error_present = empty_channels()
 
 
 def run_fortran(grid: int, dt: float, build: Path) -> dict[str, np.ndarray]:

@@ -34,6 +34,7 @@ from src.compiler.precompile_to_ssa import (
 )
 from src.compiler.ssa_fortran_backend import compile_module, emit_module, fortran_compiler
 from src.compiler.tensor_ssa_lowering import lower_tensor_calls_to_repository_ssa
+from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
 from src.compiler.ssa_features import (
     RANDOM_SSA_MODULE,
     XOROSHIRO128SS_FILL,
@@ -268,6 +269,35 @@ def test_whole_module_tensor_recipes_expand_views_transpose_reduction_cast_and_c
     assert reduction.args[0].shape == viewed.shape
     emitted = emit_module(module, name="whole_tensor_recipes")
     assert emitted.complete, [item.format() for item in emitted.shortfalls]
+
+
+def test_linked_llvm_accepts_explicit_cast_output_and_count_operands():
+    source = SSAValue(2050, dtype="float64", shape=(4,))
+    result = SSAValue(2051, dtype="float64", shape=(4,))
+    count = SSAValue(2052, dtype="int32")
+    function = Function("linked_cast", [source], {
+        "entry": BasicBlock("entry", [
+            Instr(Handler.Const.value, [], count, attributes={"constant": 4}),
+            Instr(
+                Handler.Call.value,
+                [source, result, count],
+                result,
+                attributes={
+                    "callee": "cast_double_to_float_values",
+                    "ssa_output_argument": 1,
+                },
+            ),
+            Instr(Handler.Ret.value, [result], None),
+        ]),
+    })
+    module = IRModule({function.name: function})
+
+    emitted = emit_ssa_function_to_llvm(
+        module, function.name, entry_name="linked_cast_entry"
+    )
+
+    assert emitted.shortfalls == ()
+    assert "call void @cast_double_to_float_values" in emitted.llvm_ir
 
 
 def test_unknown_tensor_extent_is_not_silently_compiled_as_one_element():

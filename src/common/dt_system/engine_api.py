@@ -11,6 +11,8 @@ nonlinearize dt proposals relative to metric ranges.
 """
 from __future__ import annotations
 
+from src.common.tensors import AbstractTensor
+
 from dataclasses import dataclass
 import math
 from typing import Callable, Optional, Iterable, Mapping, Any, Sequence
@@ -204,7 +206,8 @@ class DtCompatibleEngine:
                     div_inf=0.0,
                     mass_err=0.0,
                     dt_limit=ceiling,
-                    error_channels={"causal_dt_excess": slip},
+                    error_channels=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, slip, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                    error_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
                     advanced_dt=0.0,
                 ),
                 state,
@@ -239,8 +242,8 @@ class DtCompatibleEngine:
                     else min(float(m.dt_limit), ceiling)
                 )
             if slip > 0.0:
-                m.error_channels = dict(m.error_channels)
-                m.error_channels["time_slip"] = slip
+                m.error_channels[9] = slip
+                m.error_present[9] = 1.0
         state = self.get_state() if state is None else state
         return ok, m, state
 

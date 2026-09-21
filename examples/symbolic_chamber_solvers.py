@@ -377,7 +377,12 @@ VOXEL_SPECIES_STEP = [
     named("drizzle_out", drizzle_out),
     named("cond_rate", dm_cond / dt),
     named("auto_rate", dm_auto / dt),
-    named("rain_fraction", dm_auto / (m_l1 + TINY)),
+    # ``m_l1`` can be the exact cancellation ``m_l + (-m_l)`` while cloud
+    # evaporates.  Writing ``m_l1 + TINY`` is not enough: canonical CSE may
+    # legally evaluate it as ``(TINY + m_l) + dm_cond``, losing TINY before
+    # the cancellation and turning the dry-cloud diagnostic into 0/0.  The
+    # floor must be applied after the complete available-liquid expression.
+    named("rain_fraction", dm_auto / sp.Max(m_l1, TINY)),
     named("dt_limit", sp.Min(
         dx**2 / (6 * D_v + EPS), tau_cond, tau_freeze,
         dx / (sp.Max(w_l, w_i, w_r) + EPS),

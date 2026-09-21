@@ -1,3 +1,5 @@
+
+from src.common.tensors import AbstractTensor
 import math
 from dataclasses import dataclass
 import pytest
@@ -60,7 +62,7 @@ def test_superstep_runs_until_the_requested_window_is_complete():
     assert advanced == pytest.approx(1.0)
     assert state.value == pytest.approx(1.0)
     assert metrics.hard_failure is False
-    assert "superstep_window_remaining_s" not in metrics.error_channels
+    assert not bool(metrics.control_present[6].item())
 
 
 @pytest.mark.dt
@@ -87,7 +89,7 @@ def test_superstep_dead_ends_before_advancing_a_collapsed_proposal(collapsed_lim
     assert attempted == [0.25]
     assert advanced == pytest.approx(0.25)
     assert state.value == pytest.approx(0.25)
-    assert metrics.error_channels["superstep_window_remaining_s"] == pytest.approx(0.75)
+    assert metrics.control_values[6].item() == pytest.approx(0.75)
 
 
 @pytest.mark.dt
@@ -102,14 +104,16 @@ def test_soft_error_band_retains_state_and_steers_next_dt():
             max_flux=1.0,
             div_inf=0.0,
             mass_err=0.0,
-            error_channels={"shape_error": 1.5},
+            error_channels=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5]),
+            error_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
         )
 
     _metrics, dt_next, dt_used = step_with_dt_control_used(
         state,
         0.1,
         1.0,
-        Targets(1.0, 1.0, 1.0, error_limits={"shape_error": 1.0}),
+        Targets(1.0, 1.0, 1.0, error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+                               error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])),
         STController(),
         advance,
         attempt_log=attempts,
@@ -122,7 +126,7 @@ def test_soft_error_band_retains_state_and_steers_next_dt():
     assert dt_next < 1.0
     assert attempts[0]["accepted"] is True
     assert attempts[0]["reasons"] == ()
-    assert "shape_error" in attempts[0]["soft_reasons"][0]
+    assert attempts[0]["soft_channel_mask"].tolist()[15] == 1.0
 
 
 @pytest.mark.dt
@@ -148,7 +152,7 @@ def test_builtin_error_reasons_are_stable_rule_tokens():
         return attempts[0]
 
     soft = run(1.5, 15.0, 2.0)
-    assert soft["soft_reasons"] == ("mass_err", "div_inf")
+    assert soft["soft_reasons"] == ["mass_err", "div_inf"]
     hard = run(2.5, 25.0, 2.0)
     assert hard["reasons"] == (
         "mass_err rollback limit",
@@ -169,16 +173,19 @@ def test_error_beyond_soft_band_restores_then_retries():
             max_flux=1.0,
             div_inf=0.0,
             mass_err=0.0,
-            error_channels={"shape_error": error},
+            error_channels=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, error]),
+            error_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
         )
 
     _metrics, _dt_next, dt_used = step_with_dt_control_used(
         state,
         0.1,
         1.0,
-        Targets(1.0, 1.0, 1.0, error_limits={"shape_error": 1.0}),
+        Targets(1.0, 1.0, 1.0, error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+                               error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])),
         STController(),
         advance,
+        rollback=True,
         attempt_log=attempts,
         rollback_threshold_multiplier=2.0,
     )
@@ -205,6 +212,7 @@ def test_physical_failure_ignores_soft_error_band():
         Targets(1.0, 1.0, 1.0),
         STController(),
         advance,
+        rollback=True,
         rollback_threshold_multiplier=100.0,
     )
 
@@ -222,16 +230,19 @@ def test_dt_floor_retains_even_a_hard_proposal_without_restore():
         state_local.value += float(dt)
         return False, Metrics(
             1.0, 1.0, 0.0, 0.0, hard_failure=True,
-            error_channels={"shape_error": 100.0},
+            error_channels=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100.0]),
+            error_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
         )
 
     metrics, _dt_next, dt_used = step_with_dt_control_used(
         state,
         1.0 / 1024.0,
         1.0,
-        Targets(1.0, 1.0, 1.0, error_limits={"shape_error": 1.0}),
+        Targets(1.0, 1.0, 1.0, error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+                               error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])),
         STController(dt_min=1.0 / 1024.0),
         advance,
+        rollback=True,
         attempt_log=attempts,
         rollback_threshold_multiplier=2.0,
     )
@@ -240,7 +251,7 @@ def test_dt_floor_retains_even_a_hard_proposal_without_restore():
     assert state.value == pytest.approx(1.0 / 1024.0)
     assert state.restore_count == 0
     assert metrics.hard_failure is False
-    assert metrics.error_channels["dt_min_retained"] == pytest.approx(dt_used)
+    assert metrics.control_values[2].item() == pytest.approx(dt_used)
     assert attempts[0]["accepted"] is True
     assert attempts[0]["dt_min_retained_reasons"]
 

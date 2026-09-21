@@ -43,6 +43,15 @@ Findings (each is one concrete disagreement, with the two claims):
     read (Phi operands exempt; they arrive over predecessor edges).
 ``alias-target-missing``
     a recorded value alias points at a value the function never defines.
+``alias-not-concorded``
+    a durable function-local alias receipt is absent from, or disagrees with,
+    the shared planning identity page.
+``source-field-identity-disagreement``
+    repeated source-stage reads assign different class identities to one
+    authored object field.
+``callable-identity-disagreement``
+    one exact source value is assigned different function-table addresses as
+    it moves from first-class function syntax through a callable record field.
 """
 
 from __future__ import annotations
@@ -192,6 +201,13 @@ class CorrelationTable:
                 continue
             self.claim(name, alias, "alias-of", int(target),
                        "metadata.value_aliases")
+        for pair in metadata.get("output_identity_aliases", ()) or ():
+            try:
+                alias, target = pair
+            except (TypeError, ValueError):
+                continue
+            self.claim(name, alias, "alias-of", int(target),
+                       "metadata.output_identity_aliases")
         for block_name, block in function.blocks.items():
             for index, instruction in enumerate(block.instrs):
                 if instruction.res is not None:
@@ -253,6 +269,74 @@ class CorrelationTable:
             found.extend(self._function_findings(module, str(name), function))
         found.extend(self._sequence_descriptor_findings(module))
         found.extend(self._binding_kind_findings(module))
+        found.extend(self._source_field_identity_findings(module))
+        found.extend(self._callable_identity_findings(module))
+        return found
+
+    @staticmethod
+    def _callable_identity_findings(module: Any) -> list[Finding]:
+        """Report a first-class callable whose exact address changed."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "callable_identity_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            history = page.history(row)
+            distinct = tuple(dict.fromkeys(
+                int(fact) for _column, fact in history
+            ))
+            if len(distinct) <= 1:
+                continue
+            function, value_id = (
+                row if isinstance(row, tuple) and len(row) == 2
+                else (str(row), None)
+            )
+            found.append(Finding(
+                "callable-identity-disagreement",
+                str(function),
+                None if value_id is None else int(value_id),
+                "first-class callable changed function-table address across "
+                f"source stages: {distinct!r}",
+            ))
+        return found
+
+    @staticmethod
+    def _source_field_identity_findings(module: Any) -> list[Finding]:
+        """Report a field whose source-class identity changed between reads."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "source_field_identity_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            history = page.history(row)
+            distinct = tuple(dict.fromkeys(repr(fact) for _column, fact in history))
+            if len(distinct) <= 1:
+                continue
+            owner, field = (
+                row if isinstance(row, tuple) and len(row) == 2
+                else (row, "?")
+            )
+            found.append(Finding(
+                "source-field-identity-disagreement",
+                str(owner),
+                None,
+                f"field {field!r} changed identity across source stages: "
+                f"{distinct!r}",
+            ))
         return found
 
     @staticmethod
@@ -382,6 +466,7 @@ class CorrelationTable:
     def _function_findings(self, module: Any, name: str,
                            function: Any) -> list[Finding]:
         found: list[Finding] = []
+        metadata = dict(getattr(function, "metadata", {}) or {})
         authored = self._is_authored(function)
         formals = {int(formal.id): formal for formal in function.args}
         rows = {
@@ -529,6 +614,50 @@ class CorrelationTable:
                         "alias-target-missing", name, value_id,
                         f"alias of {claim.key} which is never defined",
                     ))
+        # A private alias snapshot is allowed only as a durable copy of the
+        # shared authority. This catches the exact class of failure where a
+        # late pass proves an identity in ``metadata.value_aliases`` but the
+        # next pass reads only ``planning_value_concordance`` (or vice versa).
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "planning_value_concordance"
+            )
+        )
+        if book is not None:
+            durable_aliases: list[tuple[str, int, int]] = []
+            local_aliases = metadata.get("value_aliases", ()) or ()
+            local_pairs = (
+                local_aliases.items()
+                if isinstance(local_aliases, Mapping) else local_aliases
+            )
+            durable_aliases.extend(
+                ("metadata.value_aliases", int(alias), int(target))
+                for alias, target in local_pairs
+            )
+            durable_aliases.extend(
+                (
+                    "metadata.output_identity_aliases",
+                    int(alias), int(target),
+                )
+                for alias, target in (
+                    metadata.get("output_identity_aliases", ()) or ()
+                )
+            )
+            for source, alias, target in durable_aliases:
+                concorded = (
+                    None if page is None else page.latest((name, alias))
+                )
+                if concorded is not None and int(concorded) == target:
+                    continue
+                found.append(Finding(
+                    "alias-not-concorded", name, alias,
+                    f"{source} says {target}, planning_value_concordance "
+                    f"says {concorded!r}",
+                ))
         return found
 
     def _abi_or_member_key(self, function: str, formal: Any) -> str | None:
@@ -713,6 +842,50 @@ class IdentityPage:
             self.columns.append(column)
         self.cells[(row, column)] = fact
 
+    def latest(self, row: Any, default: Any = None) -> Any:
+        """Return the most recently recorded fact for ``row``."""
+        entries = self.history(row)
+        return entries[-1][1] if entries else default
+
+    def bind_alias(self, scope: Any, alias: int, resident: int) -> None:
+        """Concord one planning value occurrence with its resident identity.
+
+        Rebinding a row appends a new column so the page remains both the live
+        planning authority and the history of every decision it supplied.
+        """
+        row = (scope, int(alias))
+        entries = self.history(row)
+        column = entries[-1][0] + 1 if entries else 0
+        self.set(row, column, int(resident))
+
+    def alias_bindings(self, scope: Any) -> dict[int, int]:
+        """Materialize the latest alias facts owned by one planning scope."""
+        return {
+            int(row[1]): int(self.latest(row))
+            for row in self.rows()
+            if (
+                isinstance(row, tuple)
+                and len(row) == 2
+                and row[0] == scope
+            )
+        }
+
+    def resolve_alias(self, scope: Any, value_id: int) -> int:
+        """Resolve one value through this page's current planning facts."""
+        current = int(value_id)
+        path: list[int] = []
+        while True:
+            target = self.latest((scope, current))
+            if target is None or int(target) == current:
+                return current
+            if current in path:
+                raise ValueError(
+                    f"cyclic planning identity concordance for {scope!r}: "
+                    f"{tuple((*path, current))}"
+                )
+            path.append(current)
+            current = int(target)
+
     def rows(self) -> tuple[Any, ...]:
         return tuple(dict.fromkeys(row for row, _ in self.cells))
 
@@ -801,6 +974,96 @@ class IdentityBook:
         return None
 
 
+@dataclass(frozen=True)
+class SequenceContract:
+    """The physical row contract owned by one resident sequence identity."""
+
+    policy: str
+    column_count: int
+    writable: bool
+
+
+def committed_sequence_contract(
+    scope: Any,
+    sequence_id: int,
+    *,
+    page: IdentityPage | None = None,
+) -> SequenceContract | None:
+    """Read the sequence contract already committed for this exact identity."""
+
+    if page is None:
+        page = current_identity_book().page("sequence_contract_concordance")
+    fact = page.latest((scope, int(sequence_id)))
+    if fact is None:
+        return None
+    return SequenceContract(
+        policy=str(fact[0]),
+        column_count=int(fact[1]),
+        writable=bool(fact[2]),
+    )
+
+
+def commit_sequence_contract(
+    scope: Any,
+    sequence_id: int,
+    policy: str,
+    column_count: int,
+    writable: bool,
+    *,
+    source: str,
+    page: IdentityPage | None = None,
+) -> SequenceContract:
+    """Commit or verify one resident sequence's physical row contract.
+
+    The first source-stage fact owns policy and row width. Later compiler
+    stages may repeat that contract and may prove the same storage writable,
+    but they may not silently replace its policy or width. Every accepted
+    statement is retained in the page history together with its source stage.
+    """
+
+    if page is None:
+        page = current_identity_book().page("sequence_contract_concordance")
+    row = (scope, int(sequence_id))
+    proposed = SequenceContract(
+        policy=str(policy),
+        column_count=int(column_count),
+        writable=bool(writable),
+    )
+    if proposed.column_count < 1:
+        raise ValueError(
+            f"sequence contract for {scope!r} value {sequence_id} declares "
+            f"invalid column count {proposed.column_count} at {source}"
+        )
+    incumbent = committed_sequence_contract(scope, sequence_id, page=page)
+    if incumbent is not None and (
+        incumbent.policy != proposed.policy
+        or incumbent.column_count != proposed.column_count
+    ):
+        prior = page.latest(row)
+        raise ValueError(
+            f"sequence contract concordance disagreement for {scope!r} "
+            f"value {sequence_id}: {prior[3]} committed "
+            f"{incumbent.policy}/{incumbent.column_count}, {source} says "
+            f"{proposed.policy}/{proposed.column_count}"
+        )
+    resolved = SequenceContract(
+        policy=proposed.policy,
+        column_count=proposed.column_count,
+        writable=bool(proposed.writable or (
+            incumbent.writable if incumbent is not None else False
+        )),
+    )
+    history = page.history(row)
+    column = history[-1][0] + 1 if history else 0
+    page.set(row, column, (
+        resolved.policy,
+        resolved.column_count,
+        resolved.writable,
+        str(source),
+    ))
+    return resolved
+
+
 # One book per top-level compile, reachable from anywhere in the call stack
 # without a `module` argument -- a contextvar rather than module.metadata,
 # because the module a mid-pipeline pass is building is not always the same
@@ -840,6 +1103,113 @@ def current_identity_book() -> IdentityBook:
         book = IdentityBook()
         _ACTIVE_IDENTITY_BOOK.set(book)
     return book
+
+
+def concordant_alias_bindings(
+    scope: Any,
+    *ledgers: Mapping[int, int] | Iterable[tuple[int, int]],
+    page: IdentityPage | None = None,
+) -> dict[int, int]:
+    """Return one checked alias ledger for a planning scope.
+
+    ``planning_value_concordance`` is the shared identity authority.  Some
+    finished SSA functions also retain a local ``value_aliases`` snapshot or
+    an ``output_identity_aliases`` receipt because backends need the facts
+    after the active compile context has closed.  A consumer must not choose
+    one of those records and silently ignore the others: combine them here,
+    and refuse any disagreement about the same alias.
+
+    The page is read last only to make the authority explicit; agreement is
+    required, so insertion order never decides an identity.
+    """
+
+    if page is None:
+        page = current_identity_book().page("planning_value_concordance")
+    sources: list[tuple[str, Iterable[tuple[int, int]]]] = []
+    for index, ledger in enumerate(ledgers):
+        pairs = ledger.items() if isinstance(ledger, Mapping) else ledger
+        sources.append((f"ledger[{index}]", pairs))
+    sources.append((page.name, page.alias_bindings(scope).items()))
+
+    result: dict[int, int] = {}
+    owners: dict[int, str] = {}
+    for source, pairs in sources:
+        for alias, resident in pairs:
+            alias = int(alias)
+            resident = int(resident)
+            incumbent = result.get(alias)
+            if incumbent is not None and incumbent != resident:
+                raise ValueError(
+                    f"identity concordance disagreement for {scope!r} "
+                    f"value {alias}: {owners[alias]} says {incumbent}, "
+                    f"{source} says {resident}"
+                )
+            result[alias] = resident
+            owners.setdefault(alias, source)
+    return result
+
+
+def resolved_concordant_alias_bindings(
+    scope: Any,
+    *ledgers: Mapping[int, int] | Iterable[tuple[int, int]],
+    page: IdentityPage | None = None,
+) -> dict[int, int]:
+    """Merge exact alias receipts and resolve every transitive chain.
+
+    Each input ledger may own a different segment of one identity path. A
+    consumer must not stop at the boundary between pages: ``a -> b`` on the
+    planning page and ``b -> resident`` on the control page are one proven
+    identity. Cycles remain an error and name the complete path.
+    """
+
+    sources: list[tuple[str, Iterable[tuple[int, int]]]] = []
+    for index, ledger in enumerate(ledgers):
+        pairs = ledger.items() if isinstance(ledger, Mapping) else ledger
+        sources.append((f"ledger[{index}]", pairs))
+    if page is None:
+        page = current_identity_book().page("planning_value_concordance")
+    sources.append((page.name, page.alias_bindings(scope).items()))
+
+    edges: dict[int, list[tuple[int, str]]] = defaultdict(list)
+    for source, pairs in sources:
+        for alias, target in pairs:
+            edge = (int(target), str(source))
+            if edge not in edges[int(alias)]:
+                edges[int(alias)].append(edge)
+
+    memo: dict[int, int] = {}
+
+    def resolve(value_id: int, path: tuple[int, ...] = ()) -> int:
+        value_id = int(value_id)
+        if value_id in memo:
+            return memo[value_id]
+        if value_id in path:
+            raise ValueError(
+                f"cyclic planning identity concordance for {scope!r}: "
+                f"{(*path, value_id)}"
+            )
+        targets = tuple(
+            target for target, _source in edges.get(value_id, ())
+            if int(target) != value_id
+        )
+        if not targets:
+            memo[value_id] = value_id
+            return value_id
+        roots = {
+            resolve(target, (*path, value_id)) for target in targets
+        }
+        if len(roots) != 1:
+            claims = tuple(edges.get(value_id, ()))
+            raise ValueError(
+                f"identity concordance disagreement for {scope!r} value "
+                f"{value_id}: claims={claims!r}, terminal residents="
+                f"{tuple(sorted(roots))!r}"
+            )
+        root = next(iter(roots))
+        memo[value_id] = root
+        return root
+
+    return {alias: resolve(alias) for alias in edges}
 
 
 def end_identity_book(

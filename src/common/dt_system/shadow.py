@@ -138,9 +138,8 @@ def shadow_advance(advance: Callable[[Any, Any], tuple[Any, Any]]):
         advance(state.shadow, dt)
         growth = state.measure_and_renormalise()
         metrics = coerce_metrics(metrics)
-        channels = dict(metrics.error_channels or {})
-        channels["shadow_growth"] = float(growth)
-        metrics.error_channels = channels
+        metrics.error_channels[2] = float(growth)
+        metrics.error_present[2] = 1.0
         return ok, metrics
 
     return advance_both

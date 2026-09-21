@@ -40,6 +40,7 @@ final field, because the intermediate is upstream of it.
 """
 from __future__ import annotations
 
+
 import argparse
 import sys
 from pathlib import Path
@@ -47,6 +48,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from src.common.dt_system.error_channels import channel_report
 
 import numpy as np
 
@@ -218,8 +221,8 @@ def main() -> int:
         if not same:
             findings.append((f"metrics.{field}", detail))
 
-    reference_channels = dict(reference_metrics.error_channels or {})
-    native_channels = dict(native_metrics.error_channels or {})
+    reference_channels = channel_report(reference_metrics.error_channels, reference_metrics.error_present)
+    native_channels = channel_report(native_metrics.error_channels, native_metrics.error_present)
     for channel in sorted(set(reference_channels) | set(native_channels)):
         same, detail = compare(
             channel,

@@ -37,6 +37,9 @@ from .python_special_cases import (
     python_dispatch_entry_expressions,
 )
 from .python_identity_programs import resolve_python_identity
+from ...common.tensors.operator_catalog import (
+    include_ast_parent_outside_abstract_tensor,
+)
 import colorsys
 import random
 import time
@@ -257,46 +260,53 @@ def _class_body_field_values(definition, attribute):
     """
 
     receivers = {"self", "cls"}
-    for statement in ast.walk(definition):
-        if isinstance(statement, ast.Assign):
-            if statement.value is not None and any(
-                isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Name)
-                and target.value.id in receivers
-                and target.attr == attribute
-                for target in statement.targets
-            ):
-                yield statement.value, False
-        elif isinstance(statement, ast.AnnAssign):
-            target = statement.target
-            if (
-                isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Name)
-                and target.value.id in receivers
-                and target.attr == attribute
-            ):
-                if statement.value is not None:
-                    yield statement.value, False
+    for member in definition.body:
+        if isinstance(member, ast.AnnAssign):
+            target = member.target
+            if isinstance(target, ast.Name) and target.id == attribute:
+                yield member.annotation, True, None
+            continue
+        if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        # Keep the lexical method beside every expression.  Resolving a field
+        # assignment needs that method's annotated parameters, and a single
+        # walk here avoids the quadratic "find this statement's method" scan.
+        for statement in ast.walk(member):
+            if isinstance(statement, ast.Assign):
+                if statement.value is not None and any(
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in receivers
+                    and target.attr == attribute
+                    for target in statement.targets
+                ):
+                    yield statement.value, False, member
+            elif isinstance(statement, ast.AnnAssign):
+                target = statement.target
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in receivers
+                    and target.attr == attribute
+                    and statement.value is not None
+                ):
+                    yield statement.value, False, member
             elif (
-                isinstance(target, ast.Name)
-                and target.id == attribute
-                and statement in definition.body
+                isinstance(statement, ast.Call)
+                and isinstance(statement.func, ast.Name)
+                and statement.func.id == "setattr"
+                and len(statement.args) == 3
+                and isinstance(statement.args[0], ast.Name)
+                and statement.args[0].id in receivers
+                and isinstance(statement.args[1], ast.Constant)
+                and statement.args[1].value == attribute
             ):
-                yield statement.annotation, True
-        elif (
-            isinstance(statement, ast.Call)
-            and isinstance(statement.func, ast.Name)
-            and statement.func.id == "setattr"
-            and len(statement.args) == 3
-            and isinstance(statement.args[0], ast.Name)
-            and statement.args[0].id in receivers
-            and isinstance(statement.args[1], ast.Constant)
-            and statement.args[1].value == attribute
-        ):
-            yield statement.args[2], False
+                yield statement.args[2], False, member
 
 
-def _resolve_class_body_field(definition, attribute, field_bindings, seen):
+def _resolve_class_body_field(
+    definition, attribute, field_bindings, seen, *, owner_identity=None,
+):
     """Resolve one field of a class body to the class it holds, or ``None``.
 
     Conservative exactly as before: every stated value must resolve, and the
@@ -306,13 +316,23 @@ def _resolve_class_body_field(definition, attribute, field_bindings, seen):
 
     values = []
     unresolved = False
-    for expression, is_annotation in _class_body_field_values(
+    for expression, is_annotation, scope in _class_body_field_values(
         definition, attribute
     ):
+        # An assignment in ``__init__`` is resolved in that method's lexical
+        # environment.  In particular, ``self.registry = registry`` carries
+        # the exact class identity stated by ``registry: Registry``.  Reading
+        # the assignment with module imports alone discarded that identity
+        # before source pursuit could link ``self.registry.solve``.
+        expression_bindings = (
+            field_bindings
+            if scope is None
+            else _ast_local_constructor_bindings(scope, field_bindings)
+        )
         resolved = (
-            _resolve_ast_parent_reference(expression, field_bindings, seen)
+            _resolve_ast_parent_reference(expression, expression_bindings, seen)
             if is_annotation
-            else _resolve_ast_value_reference(expression, field_bindings, seen)
+            else _resolve_ast_value_reference(expression, expression_bindings, seen)
         )
         if is_annotation and not inspect.isclass(resolved):
             resolved = None
@@ -325,7 +345,32 @@ def _resolve_class_body_field(definition, attribute, field_bindings, seen):
     result = values[0]
     for value in values[1:]:
         result = _merge_ast_reference(result, value)
-    return result
+    # Field provenance is consumed more than once: source pursuit first uses
+    # it to find a callee, then graph reduction uses the resulting class on
+    # the field read.  One side used to repeat this inference from a weaker
+    # lexical environment and silently lose constructor-parameter types.
+    # Publish the exact reference once and require every later lookup to read
+    # the same row from the shared concordance.
+    from ...compiler.identity_concordance import current_identity_book
+
+    source_identity = getattr(definition, "_python_source_identity", None)
+    owner_key = owner_identity or (
+        ".".join(map(str, source_identity))
+        if source_identity else str(definition.name)
+    )
+    row = (str(owner_key), str(attribute))
+    page = current_identity_book().page("source_field_identity_concordance")
+    incumbent = page.latest(row)
+    if incumbent is None:
+        page.set(row, 0, result)
+        return result
+    if not _same_ast_reference(incumbent, result):
+        raise ValueError(
+            "source field identity concordance disagreement for "
+            f"{owner_key}.{attribute}: recorded={incumbent!r}, "
+            f"resolved={result!r}"
+        )
+    return incumbent
 
 
 def _class_field_reference(owner, attribute, seen):
@@ -345,7 +390,11 @@ def _class_field_reference(owner, attribute, seen):
     field_bindings.setdefault("self", owner)
     field_bindings.setdefault("cls", owner)
     return _resolve_class_body_field(
-        definition, attribute, field_bindings, {*seen, key}
+        definition, attribute, field_bindings, {*seen, key},
+        owner_identity=(
+            f"{getattr(owner, '__module__', '')}."
+            f"{getattr(owner, '__qualname__', getattr(owner, '__name__', ''))}"
+        ).strip("."),
     )
 
 
@@ -1522,6 +1571,22 @@ def _expand_unresolved_ast_parents(
         after ingestion.
         """
 
+        tensor_name = tensor_operation_name(call)
+        if (
+            tensor_name is not None
+            and getattr(call, "_abstract_tensor_frontend_reference", None)
+            == tensor_name
+        ):
+            # ``torch``/``numpy`` qualifiers have already been erased at the
+            # AST seam.  Resolving the rewritten free name against Python
+            # builtins (notably max/min/abs) would put the concrete frontend
+            # back into the program.  A supplied source reference is the
+            # implementation; otherwise the canonical op remains a primitive.
+            referenced = tensor_code_references.get(str(tensor_name))
+            if referenced is not None:
+                call._tensor_code_reference = str(tensor_name)
+            return referenced
+
         lexical_target = _resolve_ast_parent_reference(call.func, call_bindings)
         if (
             include is not None
@@ -1557,9 +1622,22 @@ def _expand_unresolved_ast_parents(
                     call._extraction_occurrences = tuple(receipts)
                     if occurrence_mode == "source_definition":
                         admit_occurrence_class(occurrence)
+        if (
+            lexical_target is not None
+            and tensor_name is not None
+            and not include_ast_parent_outside_abstract_tensor(lexical_target)
+        ):
+            # A method resolved on AbstractTensor has reached the canonical
+            # operator boundary.  Keep primitive operators as graph
+            # operations instead of opening their Python dispatch bodies.
+            # Only the catalog's explicit compositional references are source
+            # programs (for example linalg.solve).
+            referenced = tensor_code_references.get(str(tensor_name))
+            if referenced is not None:
+                call._tensor_code_reference = str(tensor_name)
+            return referenced
         if lexical_target is not None:
             return lexical_target
-        tensor_name = tensor_operation_name(call)
         if tensor_name is not None:
             referenced = tensor_code_references.get(str(tensor_name))
             if referenced is not None:

@@ -62,7 +62,7 @@ def test_realtime_causal_clip_reports_slip_and_actual_advance():
     assert engine.world_time == pytest.approx(0.1)
     assert engine.observer_time == pytest.approx(0.1)
     assert metrics.advanced_dt == pytest.approx(0.1)
-    assert metrics.error_channels["time_slip"] == pytest.approx(0.1)
+    assert metrics.error_channels[9].item() == pytest.approx(0.1)
 
 
 def test_engine_owned_clock_is_not_double_advanced():

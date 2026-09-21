@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from src.common.tensors import AbstractTensor
+
 import argparse
 import json
 from pathlib import Path
@@ -72,10 +74,8 @@ def run_managed_frame(state, config):
             cfl=1.0,
             div_max=1.0,
             mass_max=1.0e-6,
-            error_limits={
-                "columnar_material_unit_error": 1.0e-6,
-                "columnar_nonfinite": 0.0,
-            },
+            error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0e-6, 0.0, 0.0]),
+            error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0]),
         ),
         controller=STController(dt_min=1.0e-8),
         initial_time=0.0,

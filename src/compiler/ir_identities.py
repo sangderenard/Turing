@@ -225,6 +225,30 @@ def drop_dead_pure_structural_instructions(functions) -> int:
                 protected.add(int(named_output[1]))
             except (TypeError, ValueError, IndexError):
                 continue
+        # Dynamic tensor descriptors refer to their shape/rank/count through
+        # SSA accounting.  Those are real uses even though they are not
+        # ordinary instruction operands; deleting their Const producers leaves
+        # the descriptor naming an unavailable value at backend emission.
+        for value in (
+            *function.args,
+            *(
+                occurrence
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                for occurrence in (
+                    *instruction.args,
+                    *((instruction.res,) if instruction.res is not None else ()),
+                )
+            ),
+        ):
+            accounting = dict(value.accounting or {})
+            for key in (
+                "tensor_shape_value_id",
+                "tensor_rank_value_id",
+                "tensor_element_count_value_id",
+            ):
+                if accounting.get(key) is not None:
+                    protected.add(int(accounting[key]))
         changed = True
         while changed:
             changed = False
@@ -266,7 +290,7 @@ def drop_dead_pure_structural_instructions(functions) -> int:
 
 
 def drop_dead_pure_region_calls(functions) -> int:
-    """Remove aggregate region-call groups whose projections nobody reads.
+    """Remove pure calls whose scalar results or aggregate projections are dead.
 
     Catalogue section 2.2's first load-bearing inhabitant, motivated by
     completeness rather than speed: the planner occasionally carves a
@@ -341,8 +365,6 @@ def drop_dead_pure_region_calls(functions) -> int:
             for index, instruction in enumerate(block.instrs):
                 if (
                     instruction.op not in ("Call", "call")
-                    or instruction.attributes.get("result_convention")
-                    != "ssa.aggregate"
                     or instruction.res is None
                 ):
                     continue
@@ -356,6 +378,27 @@ def drop_dead_pure_region_calls(functions) -> int:
                 ):
                     continue
                 aggregate_id = int(instruction.res.id)
+                if instruction.attributes.get("result_convention") != "ssa.aggregate":
+                    # Record specialization can reduce a normalization helper
+                    # to ``return receiver``. Its fields already alias their
+                    # declared spans; an unused conceptual handle must not keep
+                    # an otherwise dead receiver in the physical call frame.
+                    # Only a bare return is sufficient proof here: numerical
+                    # instructions can define in/out formals without a Store.
+                    if any(body_instruction.op != "Ret"
+                           for body_block in callee.blocks.values()
+                           for body_instruction in body_block.instrs):
+                        continue
+                    if consumers.get(aggregate_id, 0) or aggregate_id in protected:
+                        continue
+                    function.metadata["discarded_pure_call_sites"] = (
+                        *function.metadata.get("discarded_pure_call_sites", ()),
+                        (instruction.attributes.get("plan_callsite_id"), callee.name),
+                    )
+                    drop.add(index)
+                    removed_total += 1
+                    removed_callees.add(str(instruction.attributes.get("callee") or ""))
+                    continue
                 group = [index]
                 pointer_ids: set[int] = set()
                 load_results: list = []

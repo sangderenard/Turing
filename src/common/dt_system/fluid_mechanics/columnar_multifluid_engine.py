@@ -955,10 +955,8 @@ class ColumnarMultifluidEngine(AbstractTensorStateMachine):
             div_inf=0.0,
             mass_err=float(material_error),
             dt_limit=dt_limit,
-            error_channels={
-                "columnar_material_unit_error": float(material_error),
-                "columnar_nonfinite": 0.0,
-            },
+            error_channels=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, float(material_error), 0.0, 0.0]),
+            error_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0]),
             advanced_dt=float(dt),
         )
         return True, metrics, state

@@ -1,6 +1,8 @@
 import inspect
 from pathlib import Path
 
+from src.common.tensors import AbstractTensor
+from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import c_backend_repository_ssa_reference
 from src.common.dt_system import dt_controller
 from src.common.dt_system.dt_scaler import _scalar
 from src.compiler.extraction_contract import ExtractionContract
@@ -113,11 +115,13 @@ def test_energy_limit_exact_helper_has_closed_optional_and_structural_abi():
     ).with_program_abi(strict.program_abi.receipt())
     source = "\n\n".join((
         "import math",
+        "from src.common.tensors import AbstractTensor",
+        "from src.common.dt_system.error_channels import ENERGY_J, POWER_W",
         inspect.getsource(_scalar),
         inspect.getsource(dt_controller._energy_time_limit),
         "def root(metrics, targets):\n"
-        "    limit = _energy_time_limit(metrics, targets)\n"
-        "    return limit if limit is not None else -1.0\n",
+        "    limit, present = _energy_time_limit(metrics, targets)\n"
+        "    return limit if present else -1.0\n",
     ))
     resolved = []
 
@@ -127,6 +131,8 @@ def test_energy_limit_exact_helper_has_closed_optional_and_structural_abi():
         name="test_energy_limit_optional",
         extraction_contract=contract,
         resolved_process_graph_sink=resolved.append,
+        python_bindings={"AbstractTensor": AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
     )
 
     assert check_formal_parity(module) == []
@@ -139,34 +145,11 @@ def test_energy_limit_exact_helper_has_closed_optional_and_structural_abi():
         (argument.accounting or {}).get("program_abi_optional_payload")
         for argument in helper.args
     )
-    assert any(
-        instruction.op == "isfinite"
-        and instruction.attributes.get("structural_operation") == "isfinite"
-        for block in helper.blocks.values()
+    assert not any(
+        instruction.attributes.get("ssa_sequence_operation") in ("contains", "table_load")
+        for function in module.functions.values()
+        for block in function.blocks.values()
         for instruction in block.instrs
-    )
-    contains = [
-        instruction
-        for block in helper.blocks.values()
-        for instruction in block.instrs
-        if instruction.attributes.get("ssa_sequence_operation") == "contains"
-    ]
-    assert len(contains) == 2
-    contains_results = {instruction.res.id for instruction in contains}
-    membership_nots = [
-        instruction
-        for block in helper.blocks.values()
-        for instruction in block.instrs
-        if instruction.attributes.get("membership_negated") is True
-    ]
-    assert len(membership_nots) == 2
-    assert all(instruction.op == "LNot" for instruction in membership_nots)
-    assert {instruction.args[0].id for instruction in membership_nots} == (
-        contains_results
-    )
-    assert all(
-        instruction.attributes["transformation_tie_policy"] == "incumbent"
-        for instruction in membership_nots
     )
     energy_graph = next(
         entry.graph.G for entry in resolved[0].function_table

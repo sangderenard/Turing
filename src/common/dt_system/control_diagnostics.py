@@ -21,16 +21,36 @@ caused two concrete defects:
 * Injected keys changed ``error_channels.length``, so the controller's own
   bookkeeping altered a quantity the compiled ABI measures.
 
-Here the controller owns its record, mutates it freely, and no engine's
-span is disturbed.  These are ordinary fields, not spans: there is a fixed,
-known set of them, they are written once per step by one writer, and
-nothing indexes them in a hot loop.
+The controller writes fixed value/presence spans on Metrics. The named record
+below is their reporting view; neither view changes the engine's measures.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from typing import Any
+
+
+# The numerical controller ABI. Names are consumed only by reporting.
+CONTROL_NAMES = (
+    "dt_unresolved", "dt_unresolved_attempts", "dt_min_retained",
+    "dt_min_retained_violation_count", "superstep_window_requested_s",
+    "superstep_window_advanced_s", "superstep_window_remaining_s",
+    "superstep_iteration_count", "superstep_iteration_cap_hit",
+    "dt_unresolved_report",
+)
+
+
+def empty_control():
+    from ..tensors import AbstractTensor
+    return AbstractTensor.zeros((len(CONTROL_NAMES),))
+
+
+def control_report(metrics):
+    """Named diagnostics at the reporting boundary, preserving absence."""
+    return {name: float(value) for name, value, present in zip(
+        CONTROL_NAMES, metrics.control_values.tolist(), metrics.control_present.tolist())
+        if present}
 
 
 @dataclass
@@ -58,6 +78,12 @@ class ControlDiagnostics:
     #: representation, and a name is resolved for display only.
     soft_reasons: tuple[str, ...] = ()
     rollback_reasons: tuple[str, ...] = ()
+
+    @classmethod
+    def from_metrics(cls, metrics):
+        values = control_report(metrics)
+        values.pop("dt_unresolved_report", None)
+        return cls(**values)
 
     def recorded(self) -> dict[str, Any]:
         """Only what actually arose, for a log line or an attempt record.

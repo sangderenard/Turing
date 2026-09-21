@@ -32,6 +32,7 @@ Method follows ``tools/frame_parity.py`` rather than inventing a third one:
 
 from __future__ import annotations
 
+
 import math
 import random
 import sys
@@ -39,6 +40,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+from src.common.tensors import AbstractTensor
 
 from src.common.dt_system.dt_controller import Targets, _energy_time_limit  # noqa: E402
 from src.common.dt_system.dt_scaler import Metrics  # noqa: E402
@@ -60,7 +63,8 @@ def _registry(*names):
 def blended(energy, power, fraction, dt_proposed):
     """Today's pin: one participant's energy and power, through Targets."""
     metrics = Metrics(max_vel=0.0, max_flux=0.0, div_inf=0.0, mass_err=0.0,
-                      error_channels={"energy_j": energy, "power_w": power})
+                      error_channels=AbstractTensor.tensor([energy, power, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                      error_present=AbstractTensor.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
     targets = Targets(cfl=0.5, div_max=1e9, mass_max=1e-3,
                       energy_exchange_fraction=fraction)
     limit = _energy_time_limit(metrics, targets)

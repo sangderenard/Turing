@@ -1129,6 +1129,63 @@ def order_control_region_dependencies(
     """
     edges = tuple((int(a), int(b)) for a, b in dependencies if a != b)
 
+    def marker_only(block):
+        if isinstance(block, StatementBlock):
+            return _region_marker(block) is not None
+        if isinstance(block, SequenceBlock):
+            return bool(block.blocks) and all(marker_only(child)
+                                              for child in block.blocks)
+        return False
+
+    def cyclic_components(prerequisites):
+        """Return SCCs in the child dependency quotient graph."""
+        adjacency = {index: set() for index in prerequisites}
+        for consumer, producers in prerequisites.items():
+            for producer in producers:
+                adjacency[producer].add(consumer)
+        next_index = 0
+        indices, lowlinks = {}, {}
+        stack, on_stack, found = [], set(), []
+
+        def strongconnect(vertex):
+            nonlocal next_index
+            indices[vertex] = lowlinks[vertex] = next_index
+            next_index += 1
+            stack.append(vertex)
+            on_stack.add(vertex)
+            for successor in adjacency[vertex]:
+                if successor not in indices:
+                    strongconnect(successor)
+                    lowlinks[vertex] = min(
+                        lowlinks[vertex], lowlinks[successor])
+                elif successor in on_stack:
+                    lowlinks[vertex] = min(
+                        lowlinks[vertex], indices[successor])
+            if lowlinks[vertex] == indices[vertex]:
+                component = set()
+                while True:
+                    member = stack.pop()
+                    on_stack.remove(member)
+                    component.add(member)
+                    if member == vertex:
+                        break
+                if len(component) > 1:
+                    found.append(component)
+
+        for vertex in adjacency:
+            if vertex not in indices:
+                strongconnect(vertex)
+        return found
+
+    def sink_into_body(block, additions):
+        """Refine one over-coarse loop atom with bracketed region blocks."""
+        if not isinstance(block, (LoopBlock, WhileBlock, ResourceScopeBlock)):
+            return None
+        body = block.body
+        body_blocks = body.blocks if isinstance(body, SequenceBlock) else (body,)
+        return replace(
+            block, body=SequenceBlock((*body_blocks, *additions)))
+
     def visit(block):
         if isinstance(block, StatementBlock):
             region = _region_marker(block)
@@ -1150,6 +1207,40 @@ def order_control_region_dependencies(
                 left, right = owners.get(producer), owners.get(consumer)
                 if left is not None and right is not None and left != right:
                     prerequisites[right].add(left)
+
+            # Collapsing a lexical loop to one child can create a cycle in
+            # this quotient even when the underlying region graph is acyclic:
+            # an omitted loop-owned region B appears beside a loop containing
+            # A and C while the real order is A -> B -> C.  B must execute per
+            # iteration, between A and C.  Refine the over-coarse loop atom by
+            # sinking marker-only numerical regions into its body, then order
+            # that body with the original dependency graph.  Controls and
+            # effectful blocks are never guessed into a new lexical scope.
+            for component in cyclic_components(prerequisites):
+                containers = [
+                    index for index in component
+                    if len(memberships[index]) > 1
+                    and isinstance(children[index], (
+                        LoopBlock, WhileBlock, ResourceScopeBlock))
+                ]
+                movable = sorted(component - set(containers))
+                if (len(containers) == 1 and movable
+                        and all(marker_only(children[index])
+                                for index in movable)):
+                    container = containers[0]
+                    refined = sink_into_body(
+                        children[container],
+                        tuple(children[index] for index in movable),
+                    )
+                    if refined is not None:
+                        rewritten_children = [
+                            child for index, child in enumerate(children)
+                            if index not in movable
+                        ]
+                        rewritten_container = container - sum(
+                            index < container for index in movable)
+                        rewritten_children[rewritten_container] = refined
+                        return visit(SequenceBlock(tuple(rewritten_children)))
             ordered, active, complete = [], set(), set()
 
             def schedule(index):
@@ -1187,6 +1278,127 @@ def order_control_region_dependencies(
 
     root, _regions = visit(program.root)
     return replace(program, root=root)
+
+
+def place_loop_carried_region_producers(
+    program: "ControlProgram",
+    region_outputs: Mapping[int, Iterable[int]],
+    value_aliases: Mapping[int, int] | None = None,
+) -> "ControlProgram":
+    """Put an exact loop-carried producer in the loop that carries it.
+
+    Region scheduling and lexical-control composition are separate stages.
+    The latter can therefore replace the first region marker in a loop with
+    the whole loop while leaving the region that publishes the loop's updated
+    value beside it.  ``LoopBlock.carried_aliases`` and ``result_ports`` are
+    the durable identity receipt proving that publication belongs on the
+    latch.  Consume that receipt here; never ask SSA lowering to invent a
+    producer for a value whose real region was left outside the loop.
+
+    Only marker-only siblings move.  Moving another control or an effectful
+    block would guess at lexical semantics and remains deliberately refused.
+    """
+
+    aliases = {
+        int(alias): int(resident)
+        for alias, resident in (value_aliases or {}).items()
+    }
+
+    def resident(value_id: int) -> int:
+        """Return the concorded storage identity for one planning value."""
+
+        current = int(value_id)
+        path: set[int] = set()
+        while current in aliases and aliases[current] != current:
+            if current in path:
+                raise ValueError(
+                    "cyclic loop-region identity concordance: "
+                    f"{tuple((*path, current))!r}"
+                )
+            path.add(current)
+            current = int(aliases[current])
+        return current
+
+    outputs = {
+        int(region): frozenset(resident(value) for value in values)
+        for region, values in region_outputs.items()
+    }
+
+    def carried_updates(block: ControlBlock) -> frozenset[int]:
+        if not isinstance(block, (LoopBlock, WhileBlock)):
+            return frozenset()
+        return frozenset((
+            *(resident(updated) for updated, _initial in block.carried_aliases),
+            *(
+                resident(updated)
+                for _port, _initial, updated in block.result_ports
+            ),
+        ))
+
+    def marker_regions(block: ControlBlock) -> frozenset[int]:
+        if isinstance(block, StatementBlock):
+            region = _region_marker(block)
+            return frozenset() if region is None else frozenset((region,))
+        if isinstance(block, SequenceBlock):
+            found: set[int] = set()
+            for child in block.blocks:
+                child_regions = marker_regions(child)
+                if not child_regions:
+                    return frozenset()
+                found.update(child_regions)
+            return frozenset(found)
+        return frozenset()
+
+    def append_to_body(block: ControlBlock, additions: tuple[ControlBlock, ...]):
+        body = block.body
+        body_blocks = body.blocks if isinstance(body, SequenceBlock) else (body,)
+        return replace(block, body=SequenceBlock((*body_blocks, *additions)))
+
+    def visit(block: ControlBlock) -> ControlBlock:
+        if isinstance(block, SequenceBlock):
+            children = [visit(child) for child in block.blocks]
+            claimed: set[int] = set()
+            additions: dict[int, list[ControlBlock]] = {}
+            for owner_index, owner in enumerate(children):
+                updates = carried_updates(owner)
+                if not updates:
+                    continue
+                for candidate_index, candidate in enumerate(children):
+                    if candidate_index == owner_index or candidate_index in claimed:
+                        continue
+                    regions = marker_regions(candidate)
+                    if not regions:
+                        continue
+                    if any(outputs.get(region, frozenset()) & updates
+                           for region in regions):
+                        claimed.add(candidate_index)
+                        additions.setdefault(owner_index, []).append(candidate)
+            rewritten = []
+            for index, child in enumerate(children):
+                if index in claimed:
+                    continue
+                if index in additions:
+                    child = append_to_body(child, tuple(additions[index]))
+                    child = visit(child)
+                rewritten.append(child)
+            return replace(block, blocks=tuple(rewritten))
+        if isinstance(block, ConditionalBlock):
+            return replace(
+                block,
+                body=visit(block.body),
+                orelse=None if block.orelse is None else visit(block.orelse),
+            )
+        if isinstance(block, WhileBlock):
+            return replace(
+                block, condition=visit(block.condition), body=visit(block.body),
+            )
+        if isinstance(block, (LoopBlock, ResourceScopeBlock)):
+            return replace(block, body=visit(block.body))
+        if isinstance(block, CallBlock):
+            return replace(block, callee=visit(block.callee))
+        return block
+
+    return replace(program, root=visit(program.root))
 
 
 def _anchored_control(control: "ControlProgram") -> bool:

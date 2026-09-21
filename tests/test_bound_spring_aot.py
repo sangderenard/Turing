@@ -163,10 +163,8 @@ def test_managed_time_runtime_captures_real_world_spring_chain():
             cfl=1.0,
             div_max=1.0,
             mass_max=1.0,
-            error_limits={
-                "world_sparse_shape": 0.0,
-                "spring_causal_dt_excess": 0.0,
-            },
+            error_limits=AbstractTensor.zeros((15,)),
+            error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
         ),
         controller=STController(dt_min=1.0e-9),
     )

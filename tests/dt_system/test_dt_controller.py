@@ -1,3 +1,5 @@
+
+from src.common.tensors import AbstractTensor
 import copy
 import pytest
 
@@ -149,13 +151,14 @@ def test_no_dt_min_no_max_retries_honours_allow_unresolved():
     # that IS the true float64 floor, not a leftover nonzero remainder --
     # so the attempt count, not dt's own value, is the meaningful signal
     # that the exhaustion path actually ran.
-    assert float(metrics.error_channels.get("dt_unresolved_attempts", 0.0)) > 0.0
+    assert float(metrics.control_values[1].item()) > 0.0
 
 
 def _metrics_with(energy, power):
     return Metrics(
         max_vel=0.0, max_flux=0.0, div_inf=0.0, mass_err=0.0,
-        error_channels={"energy_j": energy, "power_w": power},
+        error_channels=AbstractTensor.tensor([energy, power, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        error_present=AbstractTensor.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
     )
 
 

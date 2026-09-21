@@ -21,6 +21,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from src.common.tensors import AbstractTensor
 
 import pickle
 import sys as _sys
@@ -138,19 +139,15 @@ def build(pkl_path: Path, directory: Path, *, grid: int = 32,
         cfl=0.45,
         div_max=1.0,
         mass_max=1.0e-8,
-        error_limits={
-            "height_positivity": 0.0,
-            "tracer_bounds": 0.0,
-        },
+        error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
     )
     controller = STController(dt_min=1.0e-8, dt_max=frame_duration)
-    from types import SimpleNamespace
+    from src.common.dt_system.dt_scaler import Metrics
 
-    metrics_seed = SimpleNamespace(
-        error_channels={
-            "height_positivity": 0.0,
-            "tracer_bounds": 0.0,
-        },
+    metrics_seed = Metrics(
+        error_channels=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            error_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         advanced_dt=0.0,
         max_vel=0.0,
         max_flux=0.0,

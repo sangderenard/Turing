@@ -30,7 +30,15 @@ def test_nested_loop_prerequisite_stays_inside_outer_loop():
     assert result.root.body.blocks == (region(2), inner)
 
 
-def test_control_dependency_cycle_is_a_refusal():
+def test_region_bracketed_by_one_loop_is_sunk_into_that_loop():
     program = ControlProgram(SequenceBlock((loop(1, 3), region(2))), (1, 2, 3))
+    result = order_control_region_dependencies(program, ((1, 2), (2, 3)))
+    assert result.root.blocks == (loop(1, 2, 3),)
+
+
+def test_cycle_between_two_atomic_loops_is_still_a_refusal():
+    program = ControlProgram(
+        SequenceBlock((loop(1, 3), loop(2, 4))), (1, 2, 3, 4))
     with pytest.raises(ValueError, match='atomic control boundaries cyclically'):
-        order_control_region_dependencies(program, ((1, 2), (2, 3)))
+        order_control_region_dependencies(
+            program, ((1, 2), (2, 3), (3, 4), (4, 1)))

@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import networkx as nx
+import pytest
 import sympy
 
 from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
@@ -14,9 +15,12 @@ from src.compiler.process_graph_function_linking import link_process_graph_funct
 from src.compiler.fortran_c_shell import (
     _dispatch_region_completion_positions,
     _frame_binding_value_ids,
+    _is_dead_conceptual_record_argument,
     _lower_planned_region_record_projection_captures,
     _linked_sequence_propagation_kind,
     _linked_frame_physical_shape,
+    _same_declared_span_storage,
+    _publish_concordant_function_aliases,
     _linked_frame_storage_role,
     _linked_frame_storage_owner,
     _monotonic_ssa_ids,
@@ -53,6 +57,14 @@ CONTRACT = (
     / "extraction_contracts"
     / "program_extraction.yaml"
 )
+
+
+# These fixtures exercise keyed records independently of the live dt span ABI.
+from src.compiler.extraction_contract import ExtractionContract
+import yaml
+KEYED_CONTRACT = ExtractionContract(CONTRACT).with_program_abi(yaml.safe_load(
+    (Path(__file__).parent / "fixtures/keyed_dt_record_abi.yaml").read_text()))
+
 
 
 def test_duplicate_record_result_position_uses_first_physical_incumbent():
@@ -374,18 +386,26 @@ def test_atomic_region_uses_its_completion_position_for_field_effect_order():
     assert positions[1] < positions[0]
 
 
-def test_planned_region_captures_proven_incumbent_record_scalar_once():
+@pytest.mark.parametrize(("actual_record_id", "record_aliases", "keep_source_attribute", "keep_descriptor"), (
+    (7, {}, True, True),
+    (70, {7: 70}, True, True),
+    (70, {7: 70}, False, True),
+    (70, {7: 70}, False, False),
+))
+def test_planned_region_captures_proven_incumbent_record_scalar_once(
+    actual_record_id, record_aliases, keep_source_attribute, keep_descriptor,
+):
     owner_name = "controller"
     region_name = "controller__planned_region_0"
     dt = SSAValue(9, dtype="float64")
-    record = SSAValue(7, dtype="ssa.aggregate")
+    record = SSAValue(actual_record_id, dtype="ssa.aggregate")
     clamp_events = SSAValue(124, dtype="int64")
     call_result = SSAValue(680, dtype="ssa.aggregate")
     call = Instr(
         "Call", [dt, record], call_result,
         attributes={
             "callee": region_name,
-            "feed_ids": (9, 7),
+            "feed_ids": (9, actual_record_id),
             "feed_shapes": ((), ()),
             "feed_dtypes": ("float64", "ssa.aggregate"),
             "output_ids": (43, 311, 312),
@@ -396,7 +416,9 @@ def test_planned_region_captures_proven_incumbent_record_scalar_once():
         owner_name,
         [dt, record, clamp_events],
         {"entry": BasicBlock("entry", [call])},
-        metadata={"value_aliases": {311: 124, 312: 124}},
+        metadata={"value_aliases": {
+            311: 124, 312: 124, **record_aliases,
+        }},
     )
 
     region_dt = SSAValue(9, dtype="float64")
@@ -411,17 +433,17 @@ def test_planned_region_captures_proven_incumbent_record_scalar_once():
             Instr("Cast", [region_dt], converted_dt),
             Instr(
                 "getattr", [region_record], first_projection,
-                attributes={
+                attributes=({
                     "attribute": "clamp_events",
                     "initial_record_field_state": True,
-                },
+                } if keep_source_attribute else {}),
             ),
             Instr(
                 "getattr", [region_record], second_projection,
-                attributes={
+                attributes=({
                     "attribute": "clamp_events",
                     "initial_record_field_state": True,
-                },
+                } if keep_source_attribute else {}),
             ),
             Instr("Ret", [converted_dt, first_projection, second_projection], None),
         ])},
@@ -432,24 +454,25 @@ def test_planned_region_captures_proven_incumbent_record_scalar_once():
         }},
     )
     records = SSARecordTable()
-    records.register(SSARecordDescriptor(
-        7,
-        "STController",
-        fields=(SSARecordFieldDescriptor(
-            "clamp_events",
-            SSARecordFieldStorage.SCALAR,
-            storage_identity="STController.clamp_events",
-            value_ids=(124, 328, 126),
-            dtype="int64",
-        ),),
-    ))
+    if keep_descriptor:
+        records.register(SSARecordDescriptor(
+            7,
+            "STController",
+            fields=(SSARecordFieldDescriptor(
+                "clamp_events",
+                SSARecordFieldStorage.SCALAR,
+                storage_identity="STController.clamp_events",
+                value_ids=(124, 328, 126),
+                dtype="int64",
+            ),),
+        ))
     functions = {owner_name: owner, region_name: region}
 
     assert _lower_planned_region_record_projection_captures(
         functions, {owner_name: records},
     ) == 2
     assert [value.id for value in region.args] == [9, 7, 124]
-    assert [value.id for value in call.args] == [9, 7, 124]
+    assert [value.id for value in call.args] == [9, actual_record_id, 124]
     projections = region.blocks["entry"].instrs[1:3]
     assert [instruction.op for instruction in projections] == ["Cast", "Cast"]
     assert [instruction.args[0].id for instruction in projections] == [124, 124]
@@ -457,8 +480,8 @@ def test_planned_region_captures_proven_incumbent_record_scalar_once():
         9, 124,
     )
     assert region.metadata["lowered_record_projection_captures"] == (
-        (311, "clamp_events", 7, 124),
-        (312, "clamp_events", 7, 124),
+        (311, "clamp_events" if keep_descriptor else "", 7, 124),
+        (312, "clamp_events" if keep_descriptor else "", 7, 124),
     )
 
     assert _prune_unused_callee_formals(functions) == 1
@@ -467,6 +490,269 @@ def test_planned_region_captures_proven_incumbent_record_scalar_once():
     assert call.attributes["feed_ids"] == (9, 124)
     assert call.attributes["feed_shapes"] == ((), ())
     assert call.attributes["feed_dtypes"] == ("float64", "int64")
+
+
+def test_planned_region_record_projection_reads_shared_concordance():
+    from src.compiler.identity_concordance import (
+        begin_identity_book,
+        current_identity_book,
+        end_identity_book,
+    )
+
+    owner_name = "controller"
+    region_name = "controller__planned_region_31"
+    dt = SSAValue(9, dtype="float64")
+    actual_record = SSAValue(70, dtype="ssa.aggregate")
+    resident = SSAValue(124, dtype="int64")
+    call = Instr(
+        "Call", [dt, actual_record], SSAValue(680, dtype="ssa.aggregate"),
+        attributes={
+            "callee": region_name,
+            "feed_ids": (9, 70),
+            "feed_shapes": ((), ()),
+            "feed_dtypes": ("float64", "ssa.aggregate"),
+            "output_ids": (43, 311, 312),
+            "result_convention": "ssa.aggregate",
+        },
+    )
+    owner = Function(
+        owner_name, [dt, actual_record, resident],
+        {"entry": BasicBlock("entry", [call])},
+    )
+    region_record = SSAValue(7, dtype="ssa.aggregate")
+    first = SSAValue(311, dtype="int64")
+    second = SSAValue(312, dtype="int64")
+    region = Function(
+        region_name, [SSAValue(9, dtype="float64"), region_record],
+        {"entry": BasicBlock("entry", [
+            Instr("getattr", [region_record], first,
+                  attributes={"attribute": "clamp_events"}),
+            Instr("getattr", [region_record], second,
+                  attributes={"attribute": "clamp_events"}),
+            Instr("Ret", [first, second], None),
+        ])},
+        metadata={"source_region_integral": {
+            "owner": owner_name,
+            "capture_value_ids": (9, 7),
+            "output_value_ids": (311, 312),
+        }},
+    )
+    records = SSARecordTable()
+    records.register(SSARecordDescriptor(
+        7, "STController",
+        fields=(SSARecordFieldDescriptor(
+            "clamp_events", SSARecordFieldStorage.SCALAR,
+            storage_identity="STController.clamp_events",
+            value_ids=(124,), dtype="int64",
+        ),),
+    ))
+
+    _book, token = begin_identity_book()
+    try:
+        concordance = current_identity_book().page(
+            "planning_value_concordance"
+        )
+        concordance.bind_alias(owner_name, 70, 7)
+        concordance.bind_alias(owner_name, 311, 124)
+        concordance.bind_alias(owner_name, 312, 124)
+
+        assert _lower_planned_region_record_projection_captures(
+            {owner_name: owner, region_name: region},
+            {owner_name: records},
+        ) == 2
+    finally:
+        end_identity_book(token)
+
+    assert [instruction.op for instruction in region.blocks["entry"].instrs[:2]] == [
+        "Cast", "Cast",
+    ]
+    assert [value.id for value in call.args] == [9, 70, 124]
+    assert region.metadata["source_region_integral"]["capture_value_ids"] == (
+        9, 124,
+    )
+
+
+def test_identity_audit_rejects_private_alias_snapshot():
+    from src.compiler.identity_concordance import (
+        IdentityBook,
+        concordance_report,
+    )
+
+    function = Function(
+        "owner", [SSAValue(1), SSAValue(2)],
+        {"entry": BasicBlock("entry", [])},
+        metadata={"value_aliases": {2: 1}},
+    )
+    module = IRModule({"owner": function})
+    book = IdentityBook()
+    module.metadata["identity_book"] = book
+
+    assert "[alias-not-concorded] x1" in concordance_report(module)
+
+    book.page("planning_value_concordance").bind_alias("owner", 2, 1)
+    assert "alias-not-concorded" not in concordance_report(module)
+
+
+def test_identity_audit_reads_source_field_identity_history():
+    from src.compiler.identity_concordance import (
+        IdentityBook,
+        concordance_report,
+    )
+
+    module = IRModule({})
+    book = IdentityBook()
+    module.metadata["identity_book"] = book
+    page = book.page("source_field_identity_concordance")
+    page.set(("Sim", "registry"), 0, "RegistryA")
+    page.set(("Sim", "registry"), 1, "RegistryB")
+
+    report = concordance_report(module)
+    assert "[source-field-identity-disagreement] x1" in report
+    assert "field 'registry' changed identity" in report
+
+
+def test_identity_audit_reads_callable_identity_history():
+    from src.compiler.identity_concordance import (
+        IdentityBook,
+        concordance_report,
+    )
+
+    module = IRModule({})
+    book = IdentityBook()
+    module.metadata["identity_book"] = book
+    page = book.page("callable_identity_concordance")
+    page.set(("root", 17), 0, 3)
+    page.set(("root", 17), 1, 4)
+
+    report = concordance_report(module)
+    assert "[callable-identity-disagreement] x1" in report
+    assert "changed function-table address" in report
+
+
+def test_output_alias_publication_advances_durable_snapshot_with_concordance():
+    from src.compiler.identity_concordance import (
+        begin_identity_book,
+        current_identity_book,
+        end_identity_book,
+    )
+
+    function = Function(
+        "step", [], {"entry": BasicBlock("entry", [])},
+        metadata={"value_aliases": {376: 375}},
+    )
+    _book, token = begin_identity_book()
+    try:
+        page = current_identity_book().page("planning_value_concordance")
+        page.bind_alias("step", 376, 375)
+
+        aliases = _publish_concordant_function_aliases(
+            function, {376: 2305843010213698294},
+        )
+
+        assert aliases[376] == 2305843010213698294
+        assert function.metadata["value_aliases"][376] == 2305843010213698294
+        assert page.latest(("step", 376)) == 2305843010213698294
+    finally:
+        end_identity_book(token)
+
+
+def test_public_source_compiler_reports_progress_by_default(monkeypatch, capsys):
+    import src.compiler.fortran_c_shell as shell
+
+    def fake_lower(*_args, progress, **_kwargs):
+        progress("test phase")
+        return "module", {}, ()
+
+    monkeypatch.setattr(shell, "_lower_ast_source_to_ssa_impl", fake_lower)
+
+    assert shell.lower_ast_source_to_ssa("pass") == ("module", {}, ())
+    assert "[compiler] test phase" in capsys.readouterr().err
+
+
+def test_dead_conceptual_record_recognition_uses_field_accounting_not_dtype():
+    conceptual = SSAValue(7, dtype="float64")
+    physical = SSAValue(
+        7, dtype="float64",
+        accounting={
+            "program_abi_record": "Metrics",
+            "program_abi_parameter": "metrics",
+            "program_abi_field": "max_vel",
+            "program_abi_storage": "scalar",
+        },
+    )
+
+    assert _is_dead_conceptual_record_argument(conceptual, {7}, set())
+    assert not _is_dead_conceptual_record_argument(physical, {7}, set())
+    assert not _is_dead_conceptual_record_argument(conceptual, {7}, {7})
+
+
+def test_unused_authored_record_handle_is_pruned_after_fields_expand():
+    conceptual = SSAValue(
+        2, dtype="float64",
+        accounting={"program_abi_parameter": "metrics"},
+    )
+    physical = SSAValue(
+        8, dtype="float64",
+        accounting={
+            "program_abi_parameter": "metrics",
+            "program_abi_field": "max_vel",
+            "program_abi_storage": "scalar",
+        },
+    )
+    callee = Function(
+        "consume", [conceptual, physical],
+        {"entry": BasicBlock("entry", [Instr("Ret", [physical], None)])},
+        metadata={
+            "parameter_names": (("metrics", 2),),
+            "parameter_record_abi": {"metrics": {"identity": "Metrics"}},
+        },
+    )
+    call = Instr(
+        "Call", [SSAValue(102), SSAValue(108, dtype="float64")], SSAValue(200),
+        attributes={"callee": "consume", "callee_input_ids": (2, 8)},
+    )
+    caller = Function(
+        "root", [], {"entry": BasicBlock("entry", [call])},
+    )
+
+    assert _prune_unused_callee_formals({"root": caller, "consume": callee}) == 1
+    assert [value.id for value in callee.args] == [8]
+    assert [value.id for value in call.args] == [108]
+    assert call.attributes["callee_input_ids"] == (8,)
+
+
+def test_dead_generated_entry_formal_needs_no_external_operand():
+    authored = SSAValue(1, dtype="float64")
+    identity_result = SSAValue(5, dtype="float64")
+    root = Function(
+        "root", [authored, identity_result],
+        {"entry": BasicBlock("entry", [Instr("Ret", [authored], None)])},
+        metadata={"parameter_names": (("value", 1),)},
+    )
+
+    assert _prune_dead_entry_field_aliases({"root": root}, {}) == 1
+    assert [value.id for value in root.args] == [1]
+
+
+def test_declared_span_storage_survives_distinct_call_frame_occurrences():
+    first = SSARecordFieldDescriptor(
+        "pub_tau", SSARecordFieldStorage.SPAN,
+        storage_identity="Metrics.pub_tau", value_ids=(101,),
+        dtype="float64",
+    )
+    second = SSARecordFieldDescriptor(
+        "pub_tau", SSARecordFieldStorage.SPAN,
+        storage_identity="Metrics.pub_tau", value_ids=(202,),
+        dtype="float64",
+    )
+    scalar_version = SSARecordFieldDescriptor(
+        "pub_tau", SSARecordFieldStorage.SCALAR,
+        storage_identity="Metrics.pub_tau", value_ids=(202,),
+        dtype="float64",
+    )
+
+    assert _same_declared_span_storage(first, second)
+    assert not _same_declared_span_storage(first, scalar_version)
 
 
 def _pursued_tail_retry(value):
@@ -1463,7 +1749,7 @@ def test_linked_record_result_expands_as_typed_sequence_row():
         "root",
         name="linked_record_row_append",
         python_bindings={"Metrics": Metrics},
-        extraction_contract=CONTRACT,
+        extraction_contract=KEYED_CONTRACT,
     )
 
     root = module.functions["linked_record_row_append__root"]
@@ -1499,7 +1785,7 @@ def test_linked_returned_record_mapping_keeps_authored_capacity():
         "root",
         name="linked_returned_mapping_capacity",
         python_bindings={"Metrics": Metrics},
-        extraction_contract=CONTRACT,
+        extraction_contract=KEYED_CONTRACT,
     )
 
     make = module.functions["linked_returned_mapping_capacity__make"]
@@ -1902,7 +2188,7 @@ def test_keyed_mapping_lowers_to_token_and_value_vectors():
         "    return metrics.error_channels\n",
         "root",
         name="keyed_mapping",
-        extraction_contract=CONTRACT,
+        extraction_contract=KEYED_CONTRACT,
     )
 
     root = module.functions["keyed_mapping__root"]
@@ -1969,7 +2255,7 @@ def test_dynamic_dict_literal_is_populated_and_returned_with_its_record():
         "root",
         name="dynamic_keyed_record_literal",
         python_bindings={"Metrics": Metrics},
-        extraction_contract=CONTRACT,
+        extraction_contract=KEYED_CONTRACT,
     )
 
     root = module.functions["dynamic_keyed_record_literal__root"]
@@ -2109,7 +2395,7 @@ def test_mapping_iteration_walks_its_own_key_and_value_vectors():
         "    return total\n",
         "root",
         name="mapping_iteration",
-        extraction_contract=CONTRACT,
+        extraction_contract=KEYED_CONTRACT,
     )
 
     root = module.functions["mapping_iteration__root"]
@@ -2167,7 +2453,7 @@ def test_defensive_mapping_items_reuse_declared_slots_and_key_tokens():
         "    }\n",
         "root",
         name="defensive_mapping_iteration",
-        extraction_contract=CONTRACT,
+        extraction_contract=KEYED_CONTRACT,
     )
 
     root = module.functions["defensive_mapping_iteration__root"]
@@ -2237,7 +2523,7 @@ def test_comprehension_element_is_evaluated_inside_its_own_loop():
         "    )\n",
         "root",
         name="comprehension_element",
-        extraction_contract=CONTRACT,
+        extraction_contract=KEYED_CONTRACT,
     )
 
     root = module.functions["comprehension_element__root"]
@@ -2304,7 +2590,7 @@ def test_comprehension_reduction_reads_the_collection_the_loop_publishes():
         "    )\n",
         "root",
         name="comprehension_reduction",
-        extraction_contract=CONTRACT,
+        extraction_contract=KEYED_CONTRACT,
     )
 
     root = module.functions["comprehension_reduction__root"]
@@ -2355,7 +2641,7 @@ def test_declared_mapping_or_default_keeps_the_mapping():
         "    return metrics.error_channels or {}\n",
         "root",
         name="reference_default",
-        extraction_contract=CONTRACT,
+        extraction_contract=KEYED_CONTRACT,
     )
 
     root = module.functions["reference_default__root"]
@@ -2392,7 +2678,7 @@ def test_declared_mapping_or_empty_get_uses_resident_lookup_with_default():
         "    ))\n",
         "root",
         name="reference_default_get",
-        extraction_contract=CONTRACT,
+        extraction_contract=KEYED_CONTRACT,
     )
 
     root = module.functions["reference_default_get__root"]
@@ -2439,7 +2725,7 @@ def test_declared_mapping_lookup_owned_only_by_source_call_is_materialized():
         "    return scalar(channels['power_w'])\n",
         "root",
         name="reference_call_lookup",
-        extraction_contract=CONTRACT,
+        extraction_contract=KEYED_CONTRACT,
     )
 
     root = module.functions["reference_call_lookup__root"]
@@ -2512,6 +2798,28 @@ def test_record_field_storage_identity_crosses_the_call_frame():
         # call time, so naming symbolic axes there would corrupt every buffer
         # size derived from it.
         assert tuple(value.shape or ()) == (), name
+
+
+def test_tensor_parameter_annotations_publish_dynamic_span_value_abi():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "import torch\n\n"
+        "def root(left: torch.Tensor, right: torch.Tensor):\n"
+        "    return left + right\n",
+        "root",
+        name="annotated_tensor_span",
+        extraction_contract=ExtractionContract(CONTRACT),
+    )
+
+    root = module.functions["annotated_tensor_span__root"]
+    assert tuple(root.metadata["authored_parameters"]) == ("left", "right")
+    for formal in root.args[:2]:
+        accounting = formal.accounting or {}
+        assert accounting["program_abi_storage"] == "span"
+        assert accounting["program_abi_rank"] == 1
+        assert accounting["tensor_metadata_state"] == "dynamic"
+        assert accounting["linked_parameter_provenance"] == (
+            "exact_call_argument_value"
+        )
 
 
 def test_distinct_record_fields_do_not_label_one_generic_callee_formal():
@@ -2959,6 +3267,86 @@ def test_shape_constant_waits_for_authoritative_callsite_descriptor():
     assert graph.G.nodes[5]["constant"] == 128
 
 
+def test_declared_span_shape_folds_through_record_return_class():
+    from src.compiler.glsl_deployment_strategy import (
+        _fold_callsite_structural_values,
+    )
+
+    process = nx.DiGraph()
+    process.graph["program_abi"] = {"records": {
+        "Metrics": {
+            "identity": "example.Metrics",
+            "fields": {
+                "pub_tau": {
+                    "storage": "span", "dtype": "float64", "shape": [2],
+                },
+            },
+        },
+    }}
+    process.add_node(
+        1, type="Call", op="Call",
+        attributes={"result_class_ref": "Metrics"},
+        parents=(), expr_obj=ast.parse("coerce(value)", mode="eval").body,
+    )
+    process.add_node(
+        2, type="GetAttr", op="GetAttr",
+        attributes={"attribute": "pub_tau"}, parents=((1, "value"),),
+        expr_obj=ast.parse("metrics.pub_tau", mode="eval").body,
+    )
+    process.add_node(
+        3, type="GetAttr", op="GetAttr",
+        attributes={"attribute": "shape"}, parents=((2, "value"),),
+        expr_obj=ast.parse("metrics.pub_tau.shape", mode="eval").body,
+    )
+    process.add_node(
+        4, type="Constant", op="const", constant=0,
+        attributes={"value": 0}, parents=(),
+    )
+    process.add_node(
+        5, type="Indexed", op="indexed",
+        attributes={}, parents=((3, "base"), (4, "index")),
+        expr_obj=ast.parse("metrics.pub_tau.shape[0]", mode="eval").body,
+    )
+    process.add_edges_from(((1, 2), (2, 3), (3, 5), (4, 5)))
+    graph = SimpleNamespace(G=process, roots=[5])
+
+    _fold_callsite_structural_values(graph)
+
+    assert process.nodes[5]["type"] == "Constant"
+    assert process.nodes[5]["constant"] == 2
+
+
+def test_tensor_item_capability_guard_is_structural():
+    from src.compiler.glsl_deployment_strategy import (
+        _fold_callsite_structural_values,
+    )
+
+    process = nx.DiGraph()
+    process.graph["identity_table"] = {"value": (1,)}
+    process.add_node(
+        1, type="Input", op="input",
+        attributes={"binding_name": "value"}, parents=(),
+        tensor={"shape": (), "dtype": "float64"},
+    )
+    process.add_node(
+        2, type="Constant", op="const", constant="item",
+        attributes={"value": "item"}, parents=(),
+    )
+    process.add_node(
+        3, type="Call", op="Call",
+        attributes={"extraction_identity": "builtins.hasattr"},
+        parents=((1, "arg:0"), (2, "arg:1")),
+        expr_obj=ast.parse("hasattr(value, 'item')", mode="eval").body,
+    )
+    process.add_edges_from(((1, 3), (2, 3)))
+    graph = SimpleNamespace(G=process, roots=[3])
+
+    _fold_callsite_structural_values(graph)
+
+    assert process.nodes[3]["type"] == "Constant"
+    assert process.nodes[3]["constant"] is True
+
+
 def test_returned_record_fields_feed_structural_call_argument():
     module, outputs, _exports = lower_ast_source_to_ssa(
         "def child(flag):\n"
@@ -3108,6 +3496,37 @@ def test_specialized_function_argument_is_erased_from_runtime_frame():
     )
     assert len(specialized.args) == 1
     assert outputs[root.name]
+
+
+def test_callable_dataclass_field_preserves_function_identity():
+    module, outputs, _exports = lower_ast_source_to_ssa(
+        "from dataclasses import dataclass\n"
+        "from typing import Callable\n\n"
+        "@dataclass\n"
+        "class Law:\n"
+        "    advance: Callable[[float], float]\n\n"
+        "def increment(value):\n"
+        "    return value + 1.0\n\n"
+        "def root(value):\n"
+        "    law = Law(increment)\n"
+        "    return law.advance(value)\n",
+        "root",
+        name="callable_record_field",
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["callable_record_field__root"]
+    call = next(iter(module.call_table[root.name]))
+    assert call.callee_symbol == "callable_record_field__increment"
+    assert call.resolution == "native_call"
+    assert outputs[root.name]
+
+    page = module.metadata["identity_book"].page(
+        "callable_identity_concordance"
+    )
+    rows = page.rows()
+    assert len(rows) == 1
+    assert tuple(fact for _column, fact in page.history(rows[0])) == (0, 0)
 
 
 def _default_identity_child(value=None):

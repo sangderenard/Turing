@@ -77,6 +77,12 @@ from .time_contracts import BIND, HOLD, ParticipantRegistry
 EXACT_LIMBS = 2
 
 
+def empty_publication():
+    """No participant rows. This is a zero-length span, never a None record."""
+    from ..tensors import AbstractTensor
+    return AbstractTensor.zeros((0,))
+
+
 @dataclass(frozen=True)
 class Publication:
     """What one participant published this step.  A BUILDER, not the path.
@@ -105,30 +111,32 @@ class StepSpans:
 
     Per participant, shape ``(P,)``::
 
-        tau_s              its own time constant
-        tau_present        whether it published one at all
-        contract           HOLD / BIND / DILATE / SUBCYCLE
-        dt_limit           its own stability floor
-        dt_limit_present   whether it published one at all
+        pub_tau                its own time constant
+        pub_tau_present        whether it published one at all
+        pub_contract           HOLD / BIND / DILATE / SUBCYCLE
+        pub_dt_limit           its own stability floor
+        pub_dt_limit_present   whether it published one at all
 
-    Per participant and channel, shape ``(P, C)``::
+    Per participant and channel, flattened shape ``(P * C,)``::
 
-        values / present           what it measured, and whether it did
-        limits / limits_present    what it is judged against, and whether it is
+        pub_values / pub_present           what it measured, and whether it did
+        pub_limits / pub_limits_present    what it is judged against, and whether it is
 
-    ``P`` is in causal order.  ``C`` is the channel registry, whole, so a
-    channel id keeps being its index no matter who publishes.
+    ``P`` is in causal order. ``C`` follows the program's declared channel order;
+    compiled dt uses DT_CHANNEL_NAMES, independent of the process registry.
     """
 
-    tau_s: Any
-    tau_present: Any
-    contract: Any
-    dt_limit: Any
-    dt_limit_present: Any
-    values: Any
-    present: Any
-    limits: Any
-    limits_present: Any
+    pub_tau: Any
+    pub_tau_present: Any
+    pub_contract: Any
+    pub_dt_limit: Any
+    pub_dt_limit_present: Any
+    pub_values: Any
+    pub_present: Any
+    pub_limits: Any
+    pub_limits_present: Any
+    # Build-time/reporting metadata; excluded from the native numerical ABI.
+    channel_names: tuple[str, ...] = ()
 
     @classmethod
     def of(
@@ -137,6 +145,7 @@ class StepSpans:
         published: Mapping[str, Publication],
         *,
         default_limits: Mapping[str, float] | None = None,
+        channel_names: Sequence[str] | None = None,
     ) -> "StepSpans":
         """Build the spans from what each declared participant published.
 
@@ -146,7 +155,8 @@ class StepSpans:
         """
         from ...common.tensors import AbstractTensor
 
-        channels = declared_channels() or ("",)
+        channels = tuple(channel_names) if channel_names is not None else declared_channels()
+        channels = channels or ("",)
         default_limits = default_limits or {}
 
         tau_s: list[float] = []
@@ -188,16 +198,17 @@ class StepSpans:
 
         tensor = AbstractTensor.tensor
         return cls(
-            tau_s=tensor(tau_s), tau_present=tensor(tau_present),
-            contract=tensor(contract),
-            dt_limit=tensor(dt_limit), dt_limit_present=tensor(dt_limit_present),
-            values=tensor(values), present=tensor(present),
-            limits=tensor(limits), limits_present=tensor(limits_present),
+            pub_tau=tensor(tau_s), pub_tau_present=tensor(tau_present),
+            pub_contract=tensor(contract),
+            pub_dt_limit=tensor(dt_limit), pub_dt_limit_present=tensor(dt_limit_present),
+            pub_values=tensor(values).reshape((-1,)), pub_present=tensor(present).reshape((-1,)),
+            pub_limits=tensor(limits).reshape((-1,)), pub_limits_present=tensor(limits_present).reshape((-1,)),
+            channel_names=tuple(channels),
         )
 
     @property
     def participants(self) -> int:
-        return int(self.tau_s.shape[0])
+        return int(self.pub_tau.shape[0])
 
 
 # --------------------------------------------------------------------- summed
@@ -217,12 +228,14 @@ def system_totals(spans: StepSpans, *, limbs: int = EXACT_LIMBS):
     from ...common.tensors import AbstractTensor
     from ...common.tensors.extended_precision import add_expansions
 
-    contributed = spans.values * spans.present
+    values = spans.pub_values.reshape((int(spans.pub_tau.shape[0]), -1))
+    present = spans.pub_present.reshape((int(spans.pub_tau.shape[0]), -1))
+    contributed = AbstractTensor.where(present, values, AbstractTensor.zeros_like(values))
     accumulator = [AbstractTensor.zeros_like(contributed[0])
                    for _ in range(max(1, int(limbs)))]
-    for index in range(spans.participants):
+    for index in range(int(spans.pub_tau.shape[0])):
         accumulator = add_expansions(accumulator, [contributed[index]], limbs)
-    reported = spans.present.sum(dim=0) > 0.0
+    reported = present.sum(dim=0) > 0.0
     return accumulator[0], reported
 
 
@@ -230,13 +243,13 @@ def system_totals(spans: StepSpans, *, limbs: int = EXACT_LIMBS):
 
 
 def judged(spans: StepSpans):
-    """Where a measure meets a limit: ``(P, C)``.
+    """Where a measure meets a limit: flattened ``(P * C,)``.
 
     A measure with no limit is not a failure to judge -- nobody asked for it to
     be judged.  A limit with no measure is not a violation either; the step did
     not report on it.  Only the intersection is judged.
     """
-    return spans.present * spans.limits_present
+    return spans.pub_present * spans.pub_limits_present
 
 
 def penalties(spans: StepSpans):
@@ -247,20 +260,20 @@ def penalties(spans: StepSpans):
     """
     from ...common.tensors import AbstractTensor
 
-    safe = AbstractTensor.where(spans.limits != 0.0, spans.limits,
-                                AbstractTensor.ones_like(spans.limits))
-    return AbstractTensor.where(judged(spans), spans.values / safe,
-                                AbstractTensor.zeros_like(spans.values))
+    # Same denominator floor as the controller's original channel proposal.
+    safe = AbstractTensor.maximum(spans.pub_limits, 1e-30)
+    return AbstractTensor.where(judged(spans), spans.pub_values / safe,
+                                AbstractTensor.zeros_like(spans.pub_values))
 
 
 def tripped(spans: StepSpans):
-    """Which individual gates opened: ``(P, C)`` of bool."""
+    """Which individual gates opened: flattened ``(P * C,)`` of bool."""
     return penalties(spans) > 1.0
 
 
 def any_tripped(spans: StepSpans):
     """Whether each participant tripped anything: ``(P,)`` of bool."""
-    return tripped(spans).sum(dim=1) > 0.0
+    return tripped(spans).reshape((int(spans.pub_tau.shape[0]), -1)).sum(dim=1) > 0.0
 
 
 def worst_penalty(spans: StepSpans, floor: float = 1.0):
@@ -279,9 +292,12 @@ def worst_penalty(spans: StepSpans, floor: float = 1.0):
     """
     from ...common.tensors import AbstractTensor
 
-    ratios = penalties(spans)
-    if int(ratios.shape[0]) == 0:
+    # The publication's declared extent is the ABI fact. Consulting the shape
+    # of a returned temporary makes native linking capture an anonymous shape
+    # scalar, which reads as zero and incorrectly takes this empty branch.
+    if int(spans.pub_values.shape[0]) == 0:
         return AbstractTensor.tensor(float(floor))
+    ratios = penalties(spans)
     return AbstractTensor.maximum(ratios.max(), AbstractTensor.tensor(float(floor)))
 
 
@@ -304,17 +320,17 @@ def tau_bound(spans: StepSpans, fraction: float, dt_proposed, dt_current=None):
     """
     from ...common.tensors import AbstractTensor
 
-    binding = (spans.contract == BIND) * spans.tau_present
+    binding = (spans.pub_contract == BIND) * spans.pub_tau_present
     limit = AbstractTensor.tensor(float(dt_proposed))
     if bool(binding.any().item()):
         # non-binding rows are lifted to the proposal so they cannot win the
         # minimum: a masked reduction, not a filtered list
         pinned = AbstractTensor.where(
-            binding, spans.tau_s * float(fraction),
-            AbstractTensor.ones_like(spans.tau_s) * float(dt_proposed),
+            binding, spans.pub_tau * float(fraction),
+            AbstractTensor.ones_like(spans.pub_tau) * float(dt_proposed),
         )
         limit = AbstractTensor.minimum(limit, pinned.min())
-    if dt_current is not None and bool((spans.contract == HOLD).any().item()):
+    if dt_current is not None and bool((spans.pub_contract == HOLD).any().item()):
         limit = AbstractTensor.minimum(limit,
                                        AbstractTensor.tensor(float(dt_current)))
     return limit
@@ -329,7 +345,7 @@ def stability_gates(spans: StepSpans):
     receives the span and the presence mask and decides what to do per
     participant.
     """
-    return spans.dt_limit, spans.dt_limit_present
+    return spans.pub_dt_limit, spans.pub_dt_limit_present
 
 
 # ------------------------------------------------------------------ reporting
@@ -346,8 +362,8 @@ def trip_report(
     record is read by a person, so it resolves indices back to words at the
     boundary rather than carrying strings through the step.
     """
-    names = list(channel_names) if channel_names is not None else list(declared_channels())
-    ratios = penalties(spans).tolist()
+    names = list(channel_names) if channel_names is not None else list(spans.channel_names)
+    ratios = penalties(spans).reshape((int(spans.pub_tau.shape[0]), -1)).tolist()
     opened: list[tuple[str, str, float]] = []
     for index, row in enumerate(ratios):
         who = (participant_names[index] if index < len(participant_names)
@@ -362,7 +378,7 @@ def trip_report(
 def totals_report(spans: StepSpans) -> dict[str, float]:
     """The system totals, as words.  REPORTING ONLY."""
     totals, reported = system_totals(spans)
-    names = declared_channels()
+    names = spans.channel_names
     values = totals.tolist()
     flags = reported.tolist()
     return {names[index]: float(values[index])

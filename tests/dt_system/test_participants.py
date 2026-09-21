@@ -124,11 +124,11 @@ def test_a_trip_is_per_participant_per_channel():
          "loud": Publication(channels={"mass_err": 2e-3})},
         default_limits={"mass_err": 1e-3},
     )
-    gates = tripped(spans).tolist()
+    gates = tripped(spans).reshape((spans.participants, -1)).tolist()
     assert gates[0][mass] is False or gates[0][mass] == False  # noqa: E712
     assert bool(gates[1][mass]) is True
     assert [bool(x) for x in any_tripped(spans).tolist()] == [False, True]
-    assert penalties(spans).tolist()[1][mass] == pytest.approx(2.0)
+    assert penalties(spans).reshape((spans.participants, -1)).tolist()[1][mass] == pytest.approx(2.0)
 
 
 @pytest.mark.dt
@@ -218,9 +218,9 @@ def test_silence_is_not_a_published_zero():
         registry, {"present": Publication(channels={"energy_j": 3.0})})
     assert "absent" in registry.declared()
     # the absent participant has a row, and every presence bit in it is False
-    assert [bool(x) for x in spans.present.tolist()[1]] == [False] * 3
-    assert bool(spans.dt_limit_present.tolist()[1]) is False
-    assert bool(spans.tau_present.tolist()[1]) is False
+    assert [bool(x) for x in spans.pub_present.reshape((spans.participants, -1)).tolist()[1]] == [False] * 3
+    assert bool(spans.pub_dt_limit_present.tolist()[1]) is False
+    assert bool(spans.pub_tau_present.tolist()[1]) is False
     totals, _ = system_totals(spans)
     assert _column(totals, energy) == pytest.approx(3.0)
 

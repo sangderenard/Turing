@@ -424,12 +424,25 @@ class SSARecordTable:
                     existing.instance_pool or descriptor.instance_pool,
                 )
             else:
+                overlap_diagnostics = {
+                    name: {
+                        "existing": existing_fields[name].to_mapping(),
+                        "incoming": incoming_fields[name].to_mapping(),
+                    }
+                    for name in existing_fields.keys() & incoming_fields.keys()
+                    if not same_physical_field(
+                        existing_fields[name], incoming_fields[name]
+                    )
+                }
                 raise ValueError(
                     f"conflicting SSA record descriptor {descriptor.record_id}: "
                     f"existing_identity={existing.identity!r} "
                     f"existing_fields={tuple(field.name for field in existing.fields)!r} "
                     f"incoming_identity={descriptor.identity!r} "
-                    f"incoming_fields={tuple(field.name for field in descriptor.fields)!r}"
+                    f"incoming_fields={tuple(field.name for field in descriptor.fields)!r} "
+                    f"overlap_mismatches={overlap_diagnostics!r} "
+                    f"existing_instance_pool={existing.instance_pool!r} "
+                    f"incoming_instance_pool={descriptor.instance_pool!r}"
                 )
         self.records[descriptor.record_id] = descriptor
         return descriptor
@@ -680,6 +693,14 @@ class SSAChildTablePoolDescriptor:
     length_value_id: int
     capacity_value_id: int
     row_stride_value_id: int
+    # A nested Tensor row carries the same three ordinary-SSA extent facts as
+    # every other dynamic tensor. ``shape_value_id`` is a flattened shape
+    # arena, ``rank_value_id`` is indexed by child handle, and
+    # ``shape_stride_value_id`` gives the shape-arena row width.  Non-tensor
+    # child tables leave all three absent.
+    shape_value_id: int | None = None
+    rank_value_id: int | None = None
+    shape_stride_value_id: int | None = None
     status_value_id: int | None = None
     live_flags_value_id: int | None = None
     column_dtypes: tuple[str, ...] = ()
@@ -694,11 +715,25 @@ class SSAChildTablePoolDescriptor:
             self.length_value_id,
             self.capacity_value_id,
             self.row_stride_value_id,
+            *((self.shape_value_id,) if self.shape_value_id is not None else ()),
+            *((self.rank_value_id,) if self.rank_value_id is not None else ()),
+            *((self.shape_stride_value_id,) if self.shape_stride_value_id is not None else ()),
             *((self.status_value_id,) if self.status_value_id is not None else ()),
             *((self.live_flags_value_id,) if self.live_flags_value_id is not None else ()),
         )
         if any(int(value_id) < 0 for value_id in ids):
             raise ValueError("child-table pool value ids must be non-negative")
+        extent_members = (
+            self.shape_value_id,
+            self.rank_value_id,
+            self.shape_stride_value_id,
+        )
+        if any(value is not None for value in extent_members) and not all(
+            value is not None for value in extent_members
+        ):
+            raise ValueError(
+                "nested tensor child pool requires shape, rank, and shape-stride identities"
+            )
         if self.column_dtypes and len(self.column_dtypes) != len(
             self.column_value_ids
         ):
@@ -716,6 +751,9 @@ class SSAChildTablePoolDescriptor:
             "length_value_id": int(self.length_value_id),
             "capacity_value_id": int(self.capacity_value_id),
             "row_stride_value_id": int(self.row_stride_value_id),
+            "shape_value_id": self.shape_value_id,
+            "rank_value_id": self.rank_value_id,
+            "shape_stride_value_id": self.shape_stride_value_id,
             "status_value_id": self.status_value_id,
             "live_flags_value_id": self.live_flags_value_id,
             "column_dtypes": list(self.column_dtypes),

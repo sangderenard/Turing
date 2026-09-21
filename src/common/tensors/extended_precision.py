@@ -115,6 +115,23 @@ def limb_element_facts(element: Any = None) -> dict:
     return LIMB_ELEMENTS[name]
 
 
+def _complex_dtype(value: Any) -> bool:
+    """Whether ``value`` uses a native complex scalar dtype.
+
+    A floating expansion's error-free transforms apply to one real IEEE
+    operation. Native complex multiplication is already a compound of real
+    operations, so it cannot be treated as one error-free limb operation.
+    """
+
+    dtype = getattr(value, "dtype", None)
+    if dtype is None:
+        try:
+            dtype = value.get_dtype()
+        except (AttributeError, NotImplementedError):
+            dtype = getattr(getattr(value, "data", None), "dtype", None)
+    return "complex" in str(dtype).casefold()
+
+
 # Dekker's splitting constant for binary64: 2**27 + 1. The binary64 alias
 # survives because the eager path below IS binary64; element-aware callers
 # read ``limb_element_facts`` instead.
@@ -565,6 +582,16 @@ class Precision:
             parts = [
                 limb(value, index, self.limbs) for index in range(self.limbs)
             ]
+        if any(
+            _complex_dtype(part) or isinstance(part, complex)
+            for part in parts
+        ):
+            raise TypeError(
+                "Precision limbs must be real IEEE tensors; native complex "
+                "multiplication is compound and cannot be used as an "
+                "error-free limb operation. Use ComplexPrecision so real "
+                "and imaginary coefficients are widened independently."
+            )
         # The limbs are a LEADING AXIS, not a tuple and not channels.
         #
         # A tuple is planar but it is not a tensor, so the value has no
@@ -606,6 +633,12 @@ class Precision:
         """Promote an ordinary tensor. This is where width is decided."""
 
         width = max(int(limbs), 1)
+        if _complex_dtype(value) or isinstance(value, complex):
+            raise TypeError(
+                "Precision.of() accepts real coefficients only. Use "
+                "ComplexPrecision.of() to widen real and imaginary "
+                "coefficients independently."
+            )
         zero = plain(value, "mul", 0.0)
         return cls([value] + [zero] * (width - 1), width)
 
@@ -1183,4 +1216,159 @@ class Precision:
         """
 
         return self.sum() / float(max(self.element_count(), 1))
+
+
+class ComplexPrecision:
+    """A complex value with independent real precision expansions.
+
+    This composes the complex algebra with the existing ``Precision``
+    coefficient type. It deliberately does not store native complex limbs:
+    Dekker/Knuth transforms prove one rounded real operation, while a native
+    complex multiply has already rounded several real operations.
+    """
+
+    __slots__ = ("real", "imag", "limbs")
+
+    @classmethod
+    def __class_getitem__(cls, width):
+        import types
+
+        return types.GenericAlias(cls, width)
+
+    def __init__(self, real: Any, imag: Any, limbs: int = 2):
+        width = max(
+            int(limbs), Precision.width_of(real), Precision.width_of(imag), 1
+        )
+        self.real = self._coefficient(real, width)
+        self.imag = self._coefficient(imag, width, like=self.real)
+        self.limbs = width
+
+    @staticmethod
+    def _coefficient(
+        value: Any, width: int, like: Precision | None = None,
+    ) -> Precision:
+        if isinstance(value, Precision):
+            return Precision(value.terms(width), width)
+        if _complex_dtype(value) or isinstance(value, complex):
+            raise TypeError(
+                "ComplexPrecision components must be real; split a native "
+                "complex tensor with ComplexPrecision.of()."
+            )
+        if like is not None and not hasattr(value, "shape"):
+            value = like.term(0) * 0.0 + value
+        return Precision.of(value, width)
+
+    @classmethod
+    def of(cls, value: Any, limbs: int = 2) -> "ComplexPrecision":
+        """Promote a native complex tensor, component pair, or real value."""
+
+        from .abstraction import AbstractTensor
+
+        if isinstance(value, cls):
+            width = max(int(limbs), value.limbs)
+            return cls(value.real, value.imag, width)
+        if isinstance(value, (tuple, list)) and len(value) == 2:
+            return cls(value[0], value[1], limbs)
+        if isinstance(value, complex):
+            return cls(
+                AbstractTensor.get_tensor(value.real),
+                AbstractTensor.get_tensor(value.imag),
+                limbs,
+            )
+        if _complex_dtype(value):
+            tensor = (
+                value if isinstance(value, AbstractTensor)
+                else AbstractTensor.get_tensor(value)
+            )
+            return cls(
+                AbstractTensor.real(tensor), AbstractTensor.imag(tensor), limbs,
+            )
+        tensor = (
+            value if hasattr(value, "shape")
+            else AbstractTensor.get_tensor(value)
+        )
+        return cls(tensor, tensor * 0.0, limbs)
+
+    @property
+    def shape(self):
+        return self.real.shape
+
+    def components(self) -> tuple[Precision, Precision]:
+        """Compiler-facing planar pair: real expansion, imaginary expansion."""
+
+        return self.real, self.imag
+
+    def collapse_components(self):
+        return self.real.collapse(), self.imag.collapse()
+
+    def collapse(self):
+        from .abstraction import AbstractTensor
+
+        real, imag = self.collapse_components()
+        return AbstractTensor.complex(real, imag)
+
+    def conjugate(self) -> "ComplexPrecision":
+        return type(self)(self.real, -self.imag, self.limbs)
+
+    conj = conjugate
+
+    def norm2(self) -> Precision:
+        return self.real * self.real + self.imag * self.imag
+
+    def __abs__(self) -> Precision:
+        return self.norm2().sqrt()
+
+    def _pair(self, other: Any) -> "ComplexPrecision":
+        return type(self).of(other, self.limbs)
+
+    def __add__(self, other):
+        other = self._pair(other)
+        return type(self)(
+            self.real + other.real, self.imag + other.imag,
+            max(self.limbs, other.limbs),
+        )
+
+    def __radd__(self, other):
+        return self + other
+
+    def __sub__(self, other):
+        other = self._pair(other)
+        return type(self)(
+            self.real - other.real, self.imag - other.imag,
+            max(self.limbs, other.limbs),
+        )
+
+    def __rsub__(self, other):
+        return self._pair(other) - self
+
+    def __neg__(self):
+        return type(self)(-self.real, -self.imag, self.limbs)
+
+    def __mul__(self, other):
+        other = self._pair(other)
+        real = self.real * other.real - self.imag * other.imag
+        imag = self.real * other.imag + self.imag * other.real
+        return type(self)(real, imag, max(self.limbs, other.limbs))
+
+    def __rmul__(self, other):
+        return self * other
+
+    def __truediv__(self, other):
+        other = self._pair(other)
+        denominator = other.real * other.real + other.imag * other.imag
+        real = (self.real * other.real + self.imag * other.imag) / denominator
+        imag = (self.imag * other.real - self.real * other.imag) / denominator
+        return type(self)(real, imag, max(self.limbs, other.limbs))
+
+    def __rtruediv__(self, other):
+        return self._pair(other) / self
+
+    def sum(self) -> "ComplexPrecision":
+        return type(self)(self.real.sum(), self.imag.sum(), self.limbs)
+
+    def mean(self) -> "ComplexPrecision":
+        return type(self)(self.real.mean(), self.imag.mean(), self.limbs)
+
+    def __repr__(self) -> str:
+        return f"ComplexPrecision(limbs={self.limbs}, shape={self.shape!r})"
 

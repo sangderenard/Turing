@@ -64,11 +64,9 @@ program_abi:
         mass_max: {storage: scalar, dtype: float64, mutable: false}
         energy_exchange_fraction: {storage: scalar, dtype: float64, mutable: false, optional: true}
         shadow_growth_max: {storage: scalar, dtype: float64, mutable: false, optional: true}
-        # Keyed by scientific channel name. The keys are words, so they lower
-        # to the repository's universal string tokens rather than to one
-        # opaque handle; a constant channel name and one derived at run time
-        # resolve to the same slot.
-        error_limits: {storage: keyed, dtype: float64, mutable: false}
+        # Explicit DT_CHANNEL_NAMES order; presence never means a zero value.
+        error_limits: {storage: span, dtype: float64, rank: 1, shape: [15], mutable: false, default: 0.0}
+        error_limits_present: {storage: span, dtype: float64, rank: 1, shape: [15], mutable: false, default: 0.0}
     STController:
       identity: src.common.dt_system.dt_controller.STController
       fields:
@@ -93,7 +91,19 @@ program_abi:
         sim_frame: {storage: scalar, dtype: int64, mutable: true, default: 0}
         proc_ms: {storage: scalar, dtype: float64, mutable: true, default: 0.0}
         dt_limit: {storage: scalar, dtype: float64, mutable: true, optional: true, default: null}
-        error_channels: {storage: keyed, dtype: float64, mutable: true}
+        error_channels: {storage: span, dtype: float64, rank: 1, shape: [15], mutable: true, default: 0.0}
+        error_present: {storage: span, dtype: float64, rank: 1, shape: [15], mutable: true, default: 0.0}
+        control_values: {storage: span, dtype: float64, rank: 1, shape: [10], mutable: true, default: 0.0}
+        control_present: {storage: span, dtype: float64, rank: 1, shape: [10], mutable: true, default: 0.0}
+        pub_tau: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
+        pub_tau_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
+        pub_contract: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
+        pub_dt_limit: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
+        pub_dt_limit_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
+        pub_values: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
+        pub_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
+        pub_limits: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
+        pub_limits_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
         hard_failure: {storage: scalar, dtype: bool, mutable: true, default: false}
         advanced_dt: {storage: scalar, dtype: float64, mutable: true, optional: true, default: null}
         unresolved_report:
@@ -102,6 +112,18 @@ program_abi:
           mutable: true
           columns:
             - {name: token, dtype: int64}
+    StepSpans:
+      identity: src.common.dt_system.participants.StepSpans
+      fields:
+        pub_tau: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
+        pub_tau_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
+        pub_contract: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
+        pub_dt_limit: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
+        pub_dt_limit_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
+        pub_values: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
+        pub_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
+        pub_limits: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
+        pub_limits_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
     # Compiler bootstrap boundary.  The graph and its nested DiGraph are
     # structural records; their deterministic SSA/node identities are never
     # renumbered at this boundary.  ``nodes`` and graph metadata remain named
@@ -169,6 +191,7 @@ program_abi:
     - {function: "*", parameter: controller, record: STController}
     - {function: "*", parameter: ctrl, record: STController}
     - {function: "*", parameter: metrics, record: Metrics}
+    - {function: "*", parameter: spans, record: StepSpans}
     - {function: "*coerce_metrics", parameter: value, record: Metrics}
     - {function: _dependency_order, parameter: graph, record: CompilerProcessGraph}
     - {function: _source_static_value, parameter: graph, record: CompilerProcessGraph}

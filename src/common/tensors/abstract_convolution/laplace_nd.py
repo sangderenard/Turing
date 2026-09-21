@@ -659,8 +659,32 @@ class BuildLaplace3D:
                 dXdv, dYdv, dZdv,
                 dXdw, dYdw, dZdw,
             )
-            tension = AbstractTensor.ones_like(det_g)
-            density = AbstractTensor.ones_like(det_g)
+
+            def _material_field(spec, label):
+                """Resolve a declared scalar field on this manifold grid.
+
+                ``density_func`` and ``tension_func`` have always been part of
+                the public builder contract, but the direct-metric path used
+                to replace both with ones.  A callable receives the intrinsic
+                coordinates, matching ``metric_tensor_func``'s first three
+                arguments; a tensor/scalar is broadcast across the grid.
+                """
+                if spec is None:
+                    value = AbstractTensor.ones_like(det_g)
+                elif callable(spec):
+                    value = AbstractTensor.get_tensor(
+                        spec(grid_u, grid_v, grid_w), like=det_g)
+                else:
+                    value = AbstractTensor.get_tensor(spec, like=det_g)
+                if tuple(value.shape) != tuple(det_g.shape):
+                    value = AbstractTensor.ones_like(det_g) * value
+                _label_tensor(value, label)
+                return value
+
+            tension = _material_field(
+                tension_func, "laplace_nd.material.tension")
+            density = _material_field(
+                density_func, "laplace_nd.material.density")
         else:
             state_output = local_state_network(
                 grid_u, grid_v, grid_w,
@@ -774,6 +798,21 @@ class BuildLaplace3D:
         if True or self.resolution <= 50 and dense:
             logger.debug("Converting Laplacian to dense tensor.")
             laplacian_tensor = laplacian_coo.to_dense()
+            # A homogeneous Neumann boundary has zero outward flux.  Missing
+            # neighbours therefore contribute neither an off-diagonal entry
+            # nor a diagonal penalty.  The historical fixed six-neighbour
+            # diagonal retained those penalties and made L @ constant
+            # nonzero at every boundary, creating or destroying conserved
+            # quantities such as heat.  Rebalance the diagonal from the
+            # assembled rows so the constant field is in the nullspace.
+            if all(condition == "neumann" for condition in boundary_conditions):
+                row_residual = laplacian_tensor.sum(dim=1)
+                corrected_diag = laplacian_diag.reshape(-1) - row_residual
+                val_list[-1] = corrected_diag
+                values = AbstractTensor.cat(val_list)
+                laplacian_coo = COOMatrix(indices_tensor, values,
+                                          (total_size, total_size))
+                laplacian_tensor = laplacian_coo.to_dense()
             _label_tensor(laplacian_tensor, "laplace_nd.laplacian.dense")
             logger.debug(f"Dense Laplacian tensor created with shape {laplacian_tensor.shape} on device {device}.")
 
@@ -883,6 +922,10 @@ class BuildLaplace3D:
                 "inv_g": locals().get("g_inv"),
                 "det_g": locals().get("det_g"),
                 "sqrt_det_g": sqrt_det_g,
+            },
+            "material": {
+                "tension": locals().get("tension"),
+                "density": locals().get("density"),
             },
             "frame": {
                 "normals": normals_safe,
@@ -1012,6 +1055,143 @@ class BuildLaplace3D:
 import matplotlib.pyplot as plt
 
 
+def _corner_normal(v0, v1, v2):
+    """``(v1 - v0) x (v2 - v0)`` for three single vertices.
+
+    ``AbstractTensor.cross`` takes its component axis with
+    ``_take_along_dim``, which collapses a bare ``(3,)`` vector to a
+    scalar and then has nothing to stack -- so the obvious spelling
+    raises ``AttributeError`` on exactly the one-vector-at-a-time case
+    every caller here has.  Presenting the vectors as ``(1, 3)`` keeps
+    the component axis alive and takes the documented path.
+    """
+    normal = AbstractTensor.cross(
+        (v1 - v0).reshape(1, 3), (v2 - v0).reshape(1, 3))
+    return normal.reshape(3)
+
+
+def ring_key(ring):
+    """Rotation- and reflection-invariant identity of an oriented ring.
+
+    Two walks around the same face differ by where they started and
+    which way they went, and neither changes the face.  Sorting the ring
+    would also identify them -- and would destroy the orientation that
+    ``d1`` needs a sign from -- so the ring is canonicalised here and
+    kept intact by the caller.
+    """
+    ring = [int(v) for v in ring]
+    size = len(ring)
+    reversed_ring = list(reversed(ring))
+    candidates = [tuple(ring[i:] + ring[:i]) for i in range(size)]
+    candidates += [tuple(reversed_ring[i:] + reversed_ring[:i]) for i in range(size)]
+    return min(candidates)
+
+
+def _edge_lookup(edge_index):
+    """``(pairs, index_of)`` for one edge index.
+
+    ``pairs`` is each edge as the DIRECTED pair it is stored as, and
+    ``index_of`` maps its undirected endpoints back to its position, so a
+    cell that walks through an edge can find it and then discover whether
+    it is walking with the edge or against it.
+    """
+    pairs = [tuple(int(v) for v in pair) for pair in edge_index.tolist()]
+    index_of = {}
+    for position, (src, tgt) in enumerate(pairs):
+        index_of.setdefault((src, tgt) if src <= tgt else (tgt, src), position)
+    return pairs, index_of
+
+
+def face_edge_indices(edge_index, faces):
+    """``{face: (edge, ...)}`` -- which edges each oriented ring walks.
+
+    The 3-cell search needs this and nothing else about a face: a shell
+    closes when every edge in it is used twice, which is a statement
+    about edge sets, not about geometry.
+    """
+    pairs, index_of = _edge_lookup(edge_index)
+    used = {}
+    for key, ring in faces.items():
+        ring = [int(v) for v in ring]
+        walk = []
+        for position, tail in enumerate(ring):
+            head = ring[(position + 1) % len(ring)]
+            undirected = (tail, head) if tail <= head else (head, tail)
+            edge = index_of.get(undirected)
+            if edge is None:
+                raise ValueError(
+                    f"face {key} traverses {tail}->{head}, which is not an edge")
+            walk.append(edge)
+        used[key] = tuple(walk)
+    return used
+
+
+def build_face_incidence(edge_index, faces, *, device="cpu"):
+    """Signed edge-to-face incidence ``d1``, shape ``(F, E)``.
+
+    ``faces`` is the ``{face_index: [v0, v1, ...]}`` map
+    :class:`FaceMapGenerator` produces: each value is an ORIENTED ring
+    whose closing edge ``v_last -> v0`` is implied and not repeated.
+    ``d1[f, e]`` is ``+1`` where face ``f`` traverses edge ``e`` in the
+    direction ``edge_index`` stores it and ``-1`` where it traverses it
+    backwards.  That sign is the whole content of the operator: it is
+    what makes ``d1 @ d0 == 0`` an identity of the complex rather than a
+    property of one mesh, and therefore what makes ``div`` of a curl
+    vanish structurally instead of being cleaned up numerically.
+
+    ``faces is None`` returns ``None``.  A complex whose 2-cells have not
+    been detected has no ``d1`` at all, which is a different statement
+    from having one with no rows, and the caller can tell them apart.
+    """
+    if faces is None:
+        return None
+    rows, columns, signs, shape = face_incidence_triples(edge_index, faces)
+    d1 = AbstractTensor.zeros(shape, device=device)
+    for row, column, sign in zip(rows, columns, signs):
+        d1[row, column] = sign
+    _label_tensor(d1, "laplace_nd.DEC.d1")
+    return d1
+
+
+def face_incidence_triples(edge_index, faces):
+    """``(rows, columns, signs, shape)`` -- ``d1`` as coordinates.
+
+    The same operator :func:`build_face_incidence` materialises, but left
+    as the sparse triples it naturally is.  A mesh with a hundred thousand
+    edges cannot afford a dense ``(F, E)``, and every consumer that
+    APPLIES ``d1`` rather than printing it wants these.
+
+    Each row is the boundary CHAIN of one oriented ring, so signs
+    accumulate: a walk that crosses an edge both ways contributes nothing
+    to it, and writing instead of adding would leave a stray +/-1 that
+    breaks ``d1 @ d0 == 0`` for exactly those rings.
+    """
+    pairs, index_of = _edge_lookup(edge_index)
+    keys = sorted(faces)
+    rows, columns, signs = [], [], []
+    for row, key in enumerate(keys):
+        ring = [int(v) for v in faces[key]]
+        if len(ring) < 3:
+            raise ValueError(
+                f"face {key} is not a ring: {ring}; a 2-cell needs three corners")
+        chain = {}
+        for position, tail in enumerate(ring):
+            head = ring[(position + 1) % len(ring)]
+            undirected = (tail, head) if tail <= head else (head, tail)
+            edge = index_of.get(undirected)
+            if edge is None:
+                raise ValueError(
+                    f"face {key} traverses {tail}->{head}, which is not an edge")
+            sign = 1 if pairs[edge] == (tail, head) else -1
+            chain[edge] = chain.get(edge, 0) + sign
+        for edge, sign in sorted(chain.items()):
+            if sign:
+                rows.append(row)
+                columns.append(edge)
+                signs.append(float(sign))
+    return rows, columns, signs, (len(keys), len(pairs))
+
+
 class FaceMapGenerator:
     def __init__(self, vertices, edges, device="cpu"):
         """
@@ -1033,7 +1213,40 @@ class FaceMapGenerator:
             graph[v].append(u)
         return graph
 
-    def find_edge_loops(self, max_face_size=6):
+    def is_chordless(self, ring):
+        """Whether a ring is an INDUCED cycle.
+
+        A chord is an edge joining two of the ring's vertices that is not
+        one of the ring's own edges, and it means the ring encloses other
+        faces: two squares of a lattice share an edge, and the six-ring
+        around their outline has exactly that shared edge as its chord.
+        Such a ring is the SUM of the faces it encloses, so admitting it
+        puts a dependent row in ``d1`` and counts the same area twice in
+        the 2-form Hodge star.  Genuine hexagonal faces have no chord, so
+        this rejects composites without lowering ``max_face_size``.
+        """
+        size = len(ring)
+        on_ring = {(ring[i], ring[(i + 1) % size]) for i in range(size)}
+        on_ring |= {(head, tail) for tail, head in on_ring}
+        for i in range(size):
+            for j in range(i + 1, size):
+                tail, head = ring[i], ring[j]
+                if (tail, head) in on_ring:
+                    continue
+                if head in self.graph[tail]:
+                    return False
+        return True
+
+    def find_edge_loops(self, max_face_size=6, induced_only=True):
+        """Closed edge cycles, as ORIENTED vertex rings ``[v0, v1, ...]``.
+
+        The closing edge ``v_last -> v0`` is implied and is not repeated
+        in the ring, so a quad comes back with four entries, not five.
+        Orientation is the point: it is the only thing ``d1`` can take a
+        sign from, so duplicates are eliminated through :func:`ring_key`,
+        which is invariant under rotation and reversal, rather than by
+        sorting the ring into a vertex set.
+        """
         visited_edges = set()
         faces = []
 
@@ -1043,8 +1256,15 @@ class FaceMapGenerator:
             for neighbor in self.graph[current]:
                 edge = tuple(sorted((current, neighbor)))
                 if neighbor == start and len(path) > 2:
-                    faces.append(path + [start])
-                    return
+                    # The walk closes here, but the other neighbours of
+                    # this vertex still bound their own faces; a return
+                    # would abandon every one of them.  Only edges are
+                    # marked on the way down, so a walk may come back
+                    # through a vertex it already used -- that is a
+                    # figure of eight, not a loop, and it is not a face.
+                    if len(set(path)) == len(path):
+                        faces.append(list(path))
+                    continue
                 if edge not in visited_edges:
                     visited_edges.add(edge)
                     dfs(neighbor, start, path + [neighbor])
@@ -1053,34 +1273,106 @@ class FaceMapGenerator:
         for start in range(self.vertices.shape[0]):
             dfs(start, start, [start])
 
-        # Eliminate duplicates
-        unique_faces = set(tuple(sorted(face)) for face in faces)
-        return [list(face) for face in unique_faces]
+        unique = {}
+        for face in faces:
+            unique.setdefault(ring_key(face), face)
+        rings = [unique[key] for key in sorted(unique)]
+        if induced_only:
+            rings = [ring for ring in rings if self.is_chordless(ring)]
+        return rings
 
-    def is_planar(self, face):
+    def is_planar(self, face, atol=1e-6):
+        """Whether an oriented ring's corners share one plane.
+
+        The test is on DIRECTION, which is what the comment here has
+        always said it was: two triangles of the same fan can have very
+        different areas and still be coplanar, so the normals are
+        compared after normalisation instead of as raw cross products.
+        A degenerate triangle spans no plane and constrains nothing, so
+        it is skipped rather than counted as a disagreement.
+        """
         v0 = self.vertices[face[0]]
         normal = None
         for i in range(1, len(face)-1):
-            edge1 = self.vertices[face[i]] - v0
-            edge2 = self.vertices[face[i+1]] - v0
+            edge1 = (self.vertices[face[i]] - v0).reshape(1, 3)
+            edge2 = (self.vertices[face[i+1]] - v0).reshape(1, 3)
             cross_product = AbstractTensor.cross(edge1, edge2)
+            magnitude = float(AbstractTensor.linalg.norm(cross_product))
+            if magnitude <= atol:
+                continue
+            cross_product = cross_product / magnitude
             if normal is None:
                 normal = cross_product
             else:
-                # If not approximately parallel (same direction), not planar
-                if not AbstractTensor.allclose(normal, cross_product, atol=1e-6):
+                # Either sense of the same plane is the same plane.
+                if not (AbstractTensor.allclose(normal, cross_product, atol=atol)
+                        or AbstractTensor.allclose(normal, -cross_product, atol=atol)):
                     return False
         return True
 
-    def generate_face_map(self, check_planarity=True):
+    def generate_face_map(self, check_planarity=True, induced_only=True):
         face_map = {}
-        candidate_faces = self.find_edge_loops()
+        candidate_faces = self.find_edge_loops(induced_only=induced_only)
         face_index = 0
         for face in candidate_faces:
             if not check_planarity or self.is_planar(face):
                 face_map[face_index] = face
                 face_index += 1
         return face_map
+
+def build_volume_incidence(d1, volumes, *, device="cpu"):
+    """Signed face-to-volume incidence ``d2``, shape ``(C, F)``.
+
+    A shell fixes its own signs.  Two of its faces meeting at an edge
+    must contribute opposite amounts there, or the surface they lie on
+    is not closed; propagating that rule outward from any one face
+    determines every other, up to the shell's overall orientation.  The
+    result therefore satisfies ``d2 @ d1 == 0`` by construction -- and it
+    is checked anyway, because a shell whose signs cannot be made
+    consistent is one-sided and is not the boundary of anything.
+
+    ``volumes is None`` returns ``None``, as ``faces is None`` does one
+    dimension down.
+    """
+    if volumes is None:
+        return None
+    rows = [[float(value) for value in row] for row in d1.tolist()]
+    num_faces = len(rows)
+    walked = {f: {e for e, value in enumerate(row) if value} for f, row in enumerate(rows)}
+
+    keys = sorted(volumes)
+    d2 = AbstractTensor.zeros((len(keys), num_faces), device=device)
+    for row, key in enumerate(keys):
+        shell = [int(f) for f in volumes[key]]
+        if len(shell) < 4:
+            raise ValueError(
+                f"volume {key} is bounded by {len(shell)} faces; a 3-cell needs four")
+        sign = {shell[0]: 1.0}
+        frontier = [shell[0]]
+        while frontier:
+            here = frontier.pop()
+            for other in shell:
+                if other in sign:
+                    continue
+                shared = walked[here] & walked[other]
+                if not shared:
+                    continue
+                edge = min(shared)
+                sign[other] = -sign[here] * rows[here][edge] / rows[other][edge]
+                frontier.append(other)
+        if len(sign) != len(shell):
+            raise ValueError(
+                f"volume {key} is not one connected shell: {sorted(shell)}")
+        for edge in set().union(*(walked[f] for f in shell)):
+            total = sum(sign[f] * rows[f][edge] for f in shell)
+            if abs(total) > 1e-9:
+                raise ValueError(
+                    f"volume {key} cannot be oriented: edge {edge} carries {total}")
+        for face, value in sign.items():
+            d2[row, face] = value
+    _label_tensor(d2, "laplace_nd.DEC.d2")
+    return d2
+
 
 class VolumeMapGenerator:
     def __init__(self, vertices, edges, faces, device="cpu"):
@@ -1089,13 +1381,61 @@ class VolumeMapGenerator:
         self.faces = faces
         self.device = device
 
-    def generate_volume_map(self):
-        # Placeholder for future logic.
-        # Could detect 3D volumes (tetrahedra) from faces.
-        # For now, return an empty dict or a passthrough.
-        print("Volume detection not implemented yet.")
-        return {}
-    
+    def generate_volume_map(self, max_volume_faces=8, edge_index=None):
+        """Minimal closed shells of faces: the complex's 3-cells.
+
+        A surface is closed exactly when every edge it uses is used by
+        two of its faces, so a shell is grown by repeatedly picking its
+        lowest OPEN edge and trying each face that could close it.  That
+        is the same move the face walk makes one dimension down, and it
+        prunes hard: an edge already used twice may not be used again, so
+        most branches die immediately.
+
+        Shells that properly contain another shell are dropped.  Two
+        cubes side by side have a closed outer surface, and it is the sum
+        of the two cubes rather than a third cell -- the same composite
+        that :meth:`FaceMapGenerator.is_chordless` rejects for faces.
+        """
+        if not self.faces:
+            return {}
+        index = self.edges if edge_index is None else edge_index
+        walked = face_edge_indices(index, self.faces)
+        keys = sorted(walked)
+        edge_faces = {}
+        for key in keys:
+            for edge in walked[key]:
+                edge_faces.setdefault(edge, []).append(key)
+
+        found = {}
+
+        def grow(shell, open_edges, closed_edges):
+            if not open_edges:
+                if len(shell) >= 4:
+                    found.setdefault(frozenset(shell), sorted(shell))
+                return
+            if len(shell) >= max_volume_faces:
+                return
+            edge = min(open_edges)
+            for candidate in edge_faces.get(edge, ()):
+                if candidate in shell:
+                    continue
+                walk = set(walked[candidate])
+                if walk & closed_edges:
+                    continue
+                closing = walk & open_edges
+                grow(shell | {candidate},
+                     (open_edges - closing) | (walk - open_edges),
+                     closed_edges | closing)
+
+        for key in keys:
+            grow({key}, set(walked[key]), set())
+
+        minimal = [shell for shell in found.values()
+                   if not any(set(other) < set(shell) for other in found.values())]
+        minimal.sort()
+        return {position: tuple(shell) for position, shell in enumerate(minimal)}
+
+
 
 import hashlib
 
@@ -1176,7 +1516,7 @@ class HodgeStarBuilder:
             face_tensor = AbstractTensor.tensor(face, device=self.device)
             face_tensors.append(face_tensor)
             v0, v1, v2 = vertices[face_tensor[0]], vertices[face_tensor[1]], vertices[face_tensor[2]]
-            area = 0.5 * AbstractTensor.norm(AbstractTensor.cross(v1 - v0, v2 - v0))
+            area = 0.5 * AbstractTensor.norm(_corner_normal(v0, v1, v2))
             # Distribute area equally among vertices for volume approximation
             for vert in face:
                 vertex_volumes[vert] += area/3.0
@@ -1201,7 +1541,7 @@ class HodgeStarBuilder:
             dual_area = 0.0
             for f in shared_faces:
                 v0, v1, v2 = vertices[f[0]], vertices[f[1]], vertices[f[2]]
-                area = 0.5 * AbstractTensor.norm(AbstractTensor.cross(v1 - v0, v2 - v0))
+                area = 0.5 * AbstractTensor.norm(_corner_normal(v0, v1, v2))
                 dual_area += area/3.0
             edge_dual_areas[i] = dual_area if dual_area > 0 else 1.0  # fallback
 
@@ -1210,7 +1550,7 @@ class HodgeStarBuilder:
         for f in faces.values():
             f_tensor = AbstractTensor.tensor(f, device=self.device)
             v0, v1, v2 = vertices[f_tensor[0]], vertices[f_tensor[1]], vertices[f_tensor[2]]
-            area = 0.5 * AbstractTensor.norm(AbstractTensor.cross(v1 - v0, v2 - v0))
+            area = 0.5 * AbstractTensor.norm(_corner_normal(v0, v1, v2))
             face_areas.append(area)
         face_areas = AbstractTensor.tensor(face_areas, device=self.device)
         has_faces = face_areas.numel() > 0
@@ -1298,6 +1638,12 @@ class TransformHub:
                 face_map = face_generator.generate_face_map()
                 geometry["DEC"]["faces"] = face_map
 
+                # d1 is defined on the 2-cells, so the d operators are
+                # completed here rather than left standing at d0 alone.
+                d_operators = self.build_d_operators(
+                    edge_index, network_profile, faces=face_map)
+                geometry["DEC"]["d_operators"] = d_operators
+
                 # Update Hodge stars now that we have faces
                 hodge_stars = hodge_builder.build_full_hodge_star(vertex_reference, edge_index, face_map)
                 geometry["DEC"]["hodge_stars"] = hodge_stars
@@ -1305,8 +1651,17 @@ class TransformHub:
             # Optional: Enhanced detection of volumes (3-simplices)
             if detect_volumes:
                 volume_generator = VolumeMapGenerator(vertex_reference, edge_index, geometry["DEC"].get("faces", None), device=self.device)
-                volume_map = volume_generator.generate_volume_map()
+                volume_map = volume_generator.generate_volume_map(
+                    edge_index=edge_index)
                 geometry["DEC"]["volumes"] = volume_map
+
+                # d2 lives on the 3-cells, so the operators are completed
+                # again here, one level up.
+                d_operators = self.build_d_operators(
+                    edge_index, network_profile,
+                    faces=geometry["DEC"].get("faces", None),
+                    volumes=volume_map)
+                geometry["DEC"]["d_operators"] = d_operators
                 # Extend Hodge stars further with volume information if needed
                 # hodge_stars = self.hodge_builder.build_3d_hodge_star(vertices, edge_index, face_map, volume_map)
                 # geometry["DEC"]["hodge_stars"] = hodge_stars
@@ -1336,10 +1691,21 @@ class TransformHub:
         }
 
 
-    def build_d_operators(self, edge_index, network_profile):
+    def build_d_operators(self, edge_index, network_profile, faces=None,
+                          volumes=None):
+        """The exterior derivative at every level the complex reaches.
+
+        ``d0`` (E, N) always; ``d1`` (F, E) once the 2-cells are known;
+        ``d2`` (C, F) once the 3-cells are.  ``faces`` is the oriented
+        ring map from :meth:`FaceMapGenerator.generate_face_map` and
+        ``volumes`` the shell map from
+        :meth:`VolumeMapGenerator.generate_volume_map`.  Omitting either
+        keeps the operator ``None`` at that level, which is what a
+        complex that does not reach it has.
+        """
         num_vertices = network_profile["num_vertices"]
         num_edges = network_profile["num_edges"]
-        
+
         print(edge_index)
         d0 = AbstractTensor.zeros((num_edges, num_vertices), device=self.device)
         print(d0)
@@ -1348,11 +1714,11 @@ class TransformHub:
             d0[i, tgt] = 1
         _label_tensor(d0, "laplace_nd.DEC.d0")
 
-        # d1 placeholder if we have faces defined
-        # This can be constructed similarly if face maps are available
-        d1 = None
+        d1 = build_face_incidence(edge_index, faces, device=self.device)
+        d2 = (None if d1 is None
+              else build_volume_incidence(d1, volumes, device=self.device))
 
-        return {"d0": d0, "d1": d1}
+        return {"d0": d0, "d1": d1, "d2": d2}
 
     def compute_frobenius_norm(self, g_ij):
         """
@@ -1751,10 +2117,20 @@ def validate_transform_hub():
     num_vertices = U.numel()
     vertices = AbstractTensor.arange(num_vertices)
 
-    # Simple edge index: connect each vertex to next in a line for demonstration
+    # Lattice edges, not a line: a line graph has no cycles, so it has no
+    # faces, and the face branch of calculate_geometry was never reached
+    # by the only validation that called it.
     edges = []
-    for i in range(num_vertices-1):
-        edges.append([i, i + 1])
+    for i in range(N):
+        for j in range(N):
+            for k in range(N):
+                tail = (i * N + j) * N + k
+                if i + 1 < N:
+                    edges.append([tail, ((i + 1) * N + j) * N + k])
+                if j + 1 < N:
+                    edges.append([tail, (i * N + j + 1) * N + k])
+                if k + 1 < N:
+                    edges.append([tail, (i * N + j) * N + k + 1])
     edge_index = AbstractTensor.tensor(edges, dtype=AbstractTensor.long_dtype_)
 
     hub = IdentityTransform(1.0, 1.0, (True, True, True, True))
@@ -1771,7 +2147,17 @@ def validate_transform_hub():
         row_sum, AbstractTensor.zeros_like(row_sum), atol=1e-8
     ), "Edge incidences should sum to zero."
 
-    print("Validation successful. Edge incidences sum to zero and faces detected (if any).")
+    # And the defining identity of the complex: the boundary of a
+    # boundary is empty.  This is the statement d0 alone cannot make,
+    # and it is what having a real d1 is for.
+    d1 = geometry["DEC"]["d_operators"]["d1"]
+    faces = geometry["DEC"]["faces"]
+    assert d1 is not None and len(faces) > 0, "no 2-cells were detected"
+    violation = float(AbstractTensor.linalg.norm(d1 @ d0))
+    assert violation < 1e-8, f"DEC violation: ||d1 @ d0|| = {violation:.3e}"
+
+    print(f"Validation successful. {len(faces)} faces detected; "
+          f"edge incidences sum to zero and ||d1 @ d0|| = {violation:.3e}.")
 
 if __name__ == "__main__":
     validate_transform_hub()

@@ -7,45 +7,14 @@ from typing import Tuple, Optional
 import math
 
 
-# ── Error channels as spans, not as a dict ────────────────────────────────
-#
-# ``Metrics.error_channels`` is a ``dict[str, float]``, and a dict does not
-# lower: it becomes a keyed store addressed by string tokens, and every
-# consultation of it on the step path is a string hash.  Today that is four
-# hashes per declared channel per attempt (the proposal's penalty, the soft
-# band, the rollback band, plus the rebuild in ``coerce_metrics``).
-#
-# The same information crosses as three ALIGNED SPANS instead:
-#
-#     ids     monotonic channel id, one per channel
-#     values  the measure itself
-#     names   every name packed into one byte array, with start offsets
-#
-# The id is stated rather than left implicit in the position because a
-# stage publishes SEVERAL channels -- there is no reason a sim has only one
-# error metric -- so a consumer holding column 7 has to know WHICH criterion
-# that is, not merely where it sat in someone's list.  Ids are handed out
-# once, at declaration time, and the id IS the index into the registry.
-#
-# ``names`` exists for one purpose: printing a console line or a refusal.
-# Nothing on the step path may read it.  Resolving a name to an id is a
-# build-time act; the loop that judges a step indexes and never hashes.
-
-# ONE registry, in error_channels.  This module used to define its own
-# ``_CHANNEL_NAMES``/``declare_channel``/``channel_name``/
-# ``declared_channels``, identical in name and text to the pair in
-# ``error_channels`` and independent of them.  Since the id IS the span
-# index, two registries meant the same name could be id 0 here and id 3
-# there, and any span built through one and read through the other was
-# silently misindexed -- the precise failure both modules were written to
-# prevent.  The names are re-exported so either spelling keeps working.
-from .error_channels import (  # noqa: F401
-    channel_name,
-    declare_channel,
-    declared_channels,
-    packed_channel_names,
-    unpack_channel_name,
+# Build-time channel declarations and the explicit shared dt layout.
+from .error_channels import (
+    channel_name, declare_channel, declared_channels, packed_channel_names,
+    unpack_channel_name, empty_channels,
 )
+from ..tensors import AbstractTensor
+from .control_diagnostics import empty_control
+from .participants import empty_publication
 
 
 @dataclass
@@ -75,7 +44,21 @@ class Metrics:
     dt_limit: float | None = None
     # Named scientific error channels. Controllers compare these against
     # Targets.error_limits without forcing every engine into fluid terminology.
-    error_channels: dict[str, float] = field(default_factory=dict)
+    error_channels: AbstractTensor = field(default_factory=empty_channels)
+    error_present: AbstractTensor = field(default_factory=empty_channels)
+    # Controller-owned diagnostics have fixed columns, separate from measures.
+    control_values: AbstractTensor = field(default_factory=empty_control)
+    control_present: AbstractTensor = field(default_factory=empty_control)
+    # Participant rows forwarded from the producer's declared storage.
+    pub_tau: AbstractTensor = field(default_factory=empty_publication)
+    pub_tau_present: AbstractTensor = field(default_factory=empty_publication)
+    pub_contract: AbstractTensor = field(default_factory=empty_publication)
+    pub_dt_limit: AbstractTensor = field(default_factory=empty_publication)
+    pub_dt_limit_present: AbstractTensor = field(default_factory=empty_publication)
+    pub_values: AbstractTensor = field(default_factory=empty_publication)
+    pub_present: AbstractTensor = field(default_factory=empty_publication)
+    pub_limits: AbstractTensor = field(default_factory=empty_publication)
+    pub_limits_present: AbstractTensor = field(default_factory=empty_publication)
     hard_failure: bool = False
     advanced_dt: float | None = None
     # Stable diagnostic tokens attached by the controller when it proceeds
@@ -106,44 +89,14 @@ def _scalar(value, default: float = 0.0) -> float:
 
 
 def coerce_metrics(value) -> Metrics:
-    """Normalize legacy metric-shaped records into the canonical contract."""
+    """Return the canonical tensorized Metrics record without conversion.
 
-    if value is None:
-        raise TypeError("simulation advance returned no metrics")
-    # A core that computes its metrics as 0-d tensors returns a genuine
-    # Metrics whose fields are tensors; every comparison and ``float()`` the
-    # controller then makes would truncate them.  Normalize BOTH shapes of
-    # record to exact Python floats here, once.
-    dt_limit = getattr(value, "dt_limit", None)
-    advanced_dt = getattr(value, "advanced_dt", None)
-    channels = {
-        str(name): _scalar(channel)
-        for name, channel in (getattr(value, "error_channels", {}) or {}).items()
-    }
-    normalized = Metrics(
-        max_vel=_scalar(getattr(value, "max_vel", 0.0)),
-        max_flux=_scalar(getattr(value, "max_flux", 0.0)),
-        div_inf=_scalar(getattr(value, "div_inf", 0.0)),
-        mass_err=_scalar(getattr(value, "mass_err", 0.0)),
-        osc_flag=bool(getattr(value, "osc_flag", False)),
-        stiff_flag=bool(getattr(value, "stiff_flag", False)),
-        sim_frame=int(getattr(value, "sim_frame", 0)),
-        proc_ms=_scalar(getattr(value, "proc_ms", 0.0)),
-        dt_limit=None if dt_limit is None else _scalar(dt_limit),
-        error_channels=channels,
-        hard_failure=bool(getattr(value, "hard_failure", False)),
-        advanced_dt=None if advanced_dt is None else _scalar(advanced_dt),
-        unresolved_report=list(getattr(value, "unresolved_report", ())),
-    )
-    if isinstance(value, Metrics):
-        # Keep the caller's object identity (diagnostics such as
-        # ``unresolved_report`` are attached to it later) but with exact
-        # scalar fields.
-        for name in ("max_vel", "max_flux", "div_inf", "mass_err", "proc_ms",
-                     "dt_limit", "error_channels", "advanced_dt"):
-            setattr(value, name, getattr(normalized, name))
-        return value
-    return normalized
+    The name remains as a compatibility boundary for existing dt callers.
+    Producers own the Metrics ABI and its declared spans; this function does
+    not construct a second record or extract tensor scalars.
+    """
+
+    return value
 
 
 class ScalerControl:

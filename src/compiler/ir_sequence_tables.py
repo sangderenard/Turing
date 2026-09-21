@@ -213,6 +213,9 @@ def _child_pool_identity_ids(
         pool.length_value_id,
         pool.capacity_value_id,
         pool.row_stride_value_id,
+        *((pool.shape_value_id,) if pool.shape_value_id is not None else ()),
+        *((pool.rank_value_id,) if pool.rank_value_id is not None else ()),
+        *((pool.shape_stride_value_id,) if pool.shape_stride_value_id is not None else ()),
         *((pool.status_value_id,) if pool.status_value_id is not None else ()),
         *((pool.live_flags_value_id,) if pool.live_flags_value_id is not None else ()),
     ))

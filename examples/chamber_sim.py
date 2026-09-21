@@ -32,10 +32,18 @@ is zero and nothing flows through it.
 
 from __future__ import annotations
 
+import copy
+
+from src.common.dt_system.error_channels import (
+    DT_CHANNEL_NAMES, empty_channels, channel_report,
+)
+from src.common.dt_system.time_contracts import BIND, HOLD
+
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from src.common.dt_system.dt_scaler import Metrics
+from src.common.dt_system.engine_api import DtCompatibleEngine
 from src.common.tensors import AbstractTensor
 
 from chamber_dt_join import CompiledLaw, LawEngine, LawState, METRIC_FIELDS, _as_tensor, _reduce
@@ -85,21 +93,30 @@ class PackageState:
         self.dt_limit_hint = snap.dt_limit_hint
 
 
-class ChamberSim:
+class ChamberSim(DtCompatibleEngine):
     def __init__(self, laws, *, shape: tuple[int, int, int], dx: float,
                  air_state: Mapping[str, Any], air_params: Mapping[str, Any],
                  species: Mapping[str, tuple[Mapping[str, Any], Mapping[str, Any]]],
                  aerosol: tuple[Mapping[str, Any], Mapping[str, Any]] | None = None,
                  surfaces: Sequence[SurfaceSpec] = (), pools: Sequence[PoolSpec] = (),
-                 water: str = "water", monitor: "CascadeMonitor | None" = None):
+                 water: str = "water", monitor: "CascadeMonitor | None" = None,
+                 compiled_laws: Mapping[str, CompiledLaw] | None = None):
         self.laws = laws
         self.shape = shape
         self.dx = dx
         self.n = shape[0] * shape[1] * shape[2]
         self.water = water
         self.neighbours = self._neighbour_tables()
-        compiled = {name: CompiledLaw.from_module(laws, name) for name in (
-            "voxel_air_step", "voxel_species_step", "aerosol_step", "surface_step", "pool_step")}
+        compiled = dict(compiled_laws or {})
+        required = (
+            "voxel_air_step", "voxel_species_step",
+            *(("aerosol_step",) if aerosol is not None else ()),
+            *(("surface_step",) if surfaces else ()),
+            *(("pool_step",) if pools else ()),
+        )
+        for name in required:
+            if name not in compiled:
+                compiled[name] = CompiledLaw.from_module(laws, name)
 
         self.air = LawEngine(compiled["voxel_air_step"], air_state, {**air_params, "dx": dx})
         self.species = {
@@ -127,7 +144,64 @@ class ChamberSim:
                            + (["aerosol"] if self.aerosol is not None else []))
         self.metrics_by_law: dict[str, Metrics] = {}
         self.frame = 0
+        self.world_time = 0.0
+        self.observer_time = 0.0
         self.monitor = monitor if monitor is not None else CascadeMonitor()
+
+    def causal_ceiling_dt(self) -> float:
+        """The most recently measured chamber-law stability ceiling."""
+        hint = self.state.dt_limit_hint
+        return float("inf") if hint is None else float(hint)
+
+    def step(self, dt: float, state=None, state_table=None):
+        active = self.state if state is None else state
+        ok, metrics = self.advance(active, float(dt))
+        return ok, metrics, active
+
+    def get_state(self, state=None):
+        return self.state if state is None else state
+
+    def snapshot(self):
+        return {
+            "state": self.state.copy_shallow(),
+            "frame": int(self.frame),
+            "law_frames": tuple(
+                int(engine.frame) for engine in (
+                    [self.air]
+                    + list(self.species.values())
+                    + ([self.aerosol] if self.aerosol is not None else [])
+                    + [engine for _spec, engine in self.surfaces]
+                    + [engine for _spec, engine in self.pools]
+                )
+            ),
+            "metrics_by_law": copy.deepcopy(self.metrics_by_law),
+            "monitor": copy.deepcopy(vars(self.monitor)),
+            "world_time": float(self.world_time),
+            "observer_time": float(self.observer_time),
+            "boundary_state": (
+                self.boundary_state.copy_shallow()
+                if hasattr(self, "boundary_state") else None),
+        }
+
+    def restore(self, snapshot) -> None:
+        self.state.restore(snapshot["state"])
+        self.frame = int(snapshot["frame"])
+        engines = (
+            [self.air]
+            + list(self.species.values())
+            + ([self.aerosol] if self.aerosol is not None else [])
+            + [engine for _spec, engine in self.surfaces]
+            + [engine for _spec, engine in self.pools]
+        )
+        for engine, frame in zip(engines, snapshot["law_frames"]):
+            engine.frame = int(frame)
+        self.metrics_by_law = copy.deepcopy(snapshot["metrics_by_law"])
+        vars(self.monitor).clear()
+        vars(self.monitor).update(copy.deepcopy(snapshot["monitor"]))
+        self.world_time = float(snapshot.get("world_time", 0.0))
+        self.observer_time = float(snapshot.get("observer_time", 0.0))
+        if snapshot["boundary_state"] is not None:
+            self.boundary_state.restore(snapshot["boundary_state"])
 
     # ------------------------------------------------------------ topology
     def _neighbour_tables(self) -> dict[str, list[int]]:
@@ -216,7 +290,8 @@ class ChamberSim:
                 Q_lat = Q_lat + engine.state.outputs["Q_lat"]
         P = m_a * p["R_a"] * T / V + P_vap
         self.air.feeds = {**self._gather_faces("P", P), **self._gather_faces("T", T),
-                          "P_vap": P_vap, "C_cond": C_cond, "Q_ext": Q_lat + Q_gas}
+                          "P_vap": P_vap, "C_cond": C_cond,
+                          "Q_ext": Q_lat + Q_gas}
         ok, m = self.air.advance(self.air.state, dt)
         ok_all &= ok; metrics_all.append(m)
         F = {f"F_{face}": self.air.state.outputs[f"F_{face}"] for face in FACES}
@@ -261,15 +336,37 @@ def _scatter_one(value: AbstractTensor, index: int, n: int) -> AbstractTensor:
 
 def merge_metrics(rows: Sequence[Metrics], frame: int) -> Metrics:
     limits = [m.dt_limit for m in rows if m.dt_limit is not None]
-    channels: dict[str, float] = {}
+    channels = empty_channels()
+    present = empty_channels()
     for m in rows:
-        for key, value in (m.error_channels or {}).items():
-            channels[key] = channels.get(key, 0.0) + float(value)
+        channels = channels + AbstractTensor.where(
+            m.error_present, m.error_channels, AbstractTensor.zeros_like(m.error_channels))
+        present = AbstractTensor.maximum(present, m.error_present)
+    energy_slot = DT_CHANNEL_NAMES.index("energy_j")
+    power_slot = DT_CHANNEL_NAMES.index("power_w")
+    energy = float(channels[energy_slot].item())
+    power = float(channels[power_slot].item())
+    tau_present = bool(present[energy_slot].item()) and bool(
+        present[power_slot].item()) and power > 0.0
+    dt_limit = min(limits) if limits else None
+    # The chamber is one top-level simulation.  Its surfaces, pools, air,
+    # species and aerosol keep their causal order and local metrics internally;
+    # they do not become dt-system participants individually.
     return Metrics(
         **{name: max(float(getattr(m, name)) for m in rows) for name in METRIC_FIELDS},
         sim_frame=frame,
-        dt_limit=min(limits) if limits else None,
+        dt_limit=dt_limit,
         error_channels=channels,
+        error_present=present,
+        pub_tau=AbstractTensor.tensor([energy / power if tau_present else 0.0]),
+        pub_tau_present=AbstractTensor.tensor([float(tau_present)]),
+        pub_contract=AbstractTensor.tensor([BIND if tau_present else HOLD]),
+        pub_dt_limit=AbstractTensor.tensor([0.0 if dt_limit is None else dt_limit]),
+        pub_dt_limit_present=AbstractTensor.tensor([float(dt_limit is not None)]),
+        pub_values=channels.copy(),
+        pub_present=present.copy(),
+        pub_limits=AbstractTensor.zeros_like(channels),
+        pub_limits_present=AbstractTensor.zeros_like(present),
         hard_failure=any(m.hard_failure for m in rows),
     )
 
@@ -305,8 +402,8 @@ def _member_max(sim, output: str) -> float:
 def energy_cascade(fraction: float = 0.5) -> CascadeRule:
     """More than ``fraction`` of the stored energy moved in one step."""
     def check(sim, metrics, dt):
-        e = metrics.error_channels.get("energy_j", 0.0)
-        pw = metrics.error_channels.get("power_w", 0.0)
+        e = float(metrics.error_channels[0].item())
+        pw = float(metrics.error_channels[1].item())
         if e > 0 and pw * float(dt) > fraction * e:
             return f"power {pw:.3g} W over dt {float(dt):.3g} s moved {pw * float(dt) / e:.2%} of {e:.3g} J"
         return None
@@ -401,7 +498,7 @@ def publish_state(sim, *, before: PackageState | None = None, metrics: Metrics |
     if metrics is not None:
         bundle["metrics"] = {
             **{k: float(getattr(metrics, k)) for k in METRIC_FIELDS},
-            "dt_limit": metrics.dt_limit, "error_channels": dict(metrics.error_channels or {}),
+            "dt_limit": metrics.dt_limit, "error_channels": channel_report(metrics.error_channels, metrics.error_present),
             "hard_failure": bool(metrics.hard_failure),
         }
     if path is not None:
