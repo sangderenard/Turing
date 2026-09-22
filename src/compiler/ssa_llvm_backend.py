@@ -2097,7 +2097,22 @@ def _emit_repository_call_module(
                     )
                     if descriptor is not None:
                         source = pointers.get(int(descriptor.data_value_id))
-                if source is None or source == destination:
+                if source is None:
+                    # Refusing to publish a declared output is not a
+                    # formatting detail: the caller is handed a buffer nobody
+                    # wrote, which reads as a plausible zero rather than as a
+                    # failure.  Name it like any other emission gap.
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, "Ret",
+                        f"declared output {output_index} (value "
+                        f"{int(output.id)}) has no readable storage; "
+                        "returned values were "
+                        + repr([
+                            int(value.id) for value in returned_values
+                        ])
+                    ))
+                    continue
+                if source == destination:
                     continue
                 llvm_type = _value_llvm_type(output)
                 count = _value_element_count(output)
