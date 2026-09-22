@@ -17206,6 +17206,31 @@ def _tensor_descriptor_rule(
                     ):
                         continue
                     sides[index] = {"shape": (), "dtype": "float64"}
+                # An empty shape is a rank-0 scalar only when the node
+                # produces a scalar.  For a tensor-producing node it is what
+                # the query returns while its extents are still unsettled,
+                # and broadcasting against it yields an answer that LOOKS
+                # complete -- (2,) against an unknown gives (1,) -- which the
+                # proof short-circuit then makes permanent, so no later round
+                # ever revises it.  This is the rule already stated above for
+                # a side with NO descriptor; a side whose descriptor STATES
+                # nothing is the same case, and a known dtype does not turn an
+                # unsettled extent into a fact.  A call's result is included:
+                # its extents arrive when the callee settles, and until then
+                # the honest answer is that we do not know.
+                for index, (side, operand) in enumerate(zip(sides, operands)):
+                    if side is None or tuple(side.get("shape") or ()):
+                        continue
+                    node = graph.G.nodes[operand]
+                    attributes = node.get("attributes") or {}
+                    if (
+                        node.get("tensor")
+                        or attributes.get("tensor_candidate")
+                        or str(
+                            node.get("op") or node.get("type") or ""
+                        ).casefold() == "call"
+                    ):
+                        sides[index] = None
                 if all(side is not None for side in sides) and all(
                     descriptor_states_a_shape(side) for side in sides
                 ):
