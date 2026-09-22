@@ -61,6 +61,29 @@ _TEMPORAL_LOOP_ARGUMENT_BINDINGS = frozenset({
 })
 
 
+def _loop_rebound_value_ids(function: Any) -> frozenset:
+    """Caller ids a loop rebinds, so a bare id cannot name them.
+
+    Empty when the function declares no loop scope, which is the common
+    case and costs one page lookup.
+    """
+
+    try:
+        from .identity_concordance import (
+            current_identity_book, loop_scope_declarations,
+        )
+
+        return frozenset(
+            int(rebind["outer"])
+            for declaration in loop_scope_declarations(
+                current_identity_book(), str(function.name),
+            )
+            for rebind in declaration["rebinds"]
+        )
+    except Exception:
+        return frozenset()
+
+
 def _concordant_function_aliases(
     function: Any, *, include_output_identities: bool = False,
 ) -> dict[int, int]:
@@ -35034,12 +35057,21 @@ def _class_surface_ssa_program(
     # receipt once so emitted calls and their provenance table end on the same
     # resident identity.  Equal-priority duplicates keep the receipt's first
     # incumbent; no new identity or schema relation is inferred here.
+    #
+    # The receipt stores a BARE caller id and resolves it against a value
+    # table with one answer per id for the whole function.  That is
+    # authoritative over a value with one generation and says nothing about
+    # a value a loop rebinds, where the single answer is the one from before
+    # the first iteration.  Such an operand was already resolved at its
+    # position by the callsite, so the receipt abstains rather than
+    # overwrite a more specific fact with a less specific one.
     post_aggregate_frame_reconciliations = []
     for caller_name, records in lowered_module.call_table.items():
         caller = lowered_module.functions.get(str(caller_name))
         if caller is None:
             continue
         caller_values = function_values(caller)
+        generational_ids = _loop_rebound_value_ids(caller)
         for record in records:
             frame = {}
             for callee_id, kind, caller_id in record.frame_bindings:
@@ -35066,10 +35098,16 @@ def _class_surface_ssa_program(
             if linked_call is None:
                 continue
             changed_positions = []
+            abstained_positions = []
             for position, callee_id in enumerate(map(
                 int, linked_call.attributes.get("callee_input_ids", ())
             )):
                 caller_id = frame.get(callee_id)
+                if caller_id is not None and int(caller_id) in generational_ids:
+                    abstained_positions.append((
+                        position, callee_id, int(caller_id),
+                    ))
+                    continue
                 resident = (
                     None if caller_id is None
                     else caller_values.get(int(caller_id))
@@ -35084,6 +35122,10 @@ def _class_surface_ssa_program(
                 changed_positions.append((
                     position, callee_id, int(caller_id),
                 ))
+            if abstained_positions:
+                linked_call.attributes[
+                    "post_aggregate_frame_abstained"
+                ] = tuple(abstained_positions)
             if changed_positions:
                 linked_call.attributes[
                     "post_aggregate_frame_reconciled"

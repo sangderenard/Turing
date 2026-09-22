@@ -2943,6 +2943,29 @@ class _ControlSSABuilder:
             self.nested_child_rows[child_key] = child
         return child
 
+    def _note_callsite_arguments(
+        self, callsite_id: int, argument_ids, arguments,
+    ) -> None:
+        """Record what one scheduled callsite resolved its arguments to.
+
+        A graph id that resolves to itself inside a loop body means the
+        carried machinery did not map it to the current iteration.
+        """
+
+        try:
+            from .identity_concordance import current_identity_book
+
+            page = current_identity_book().page("callsite_argument")
+            for position, (graph_id, value) in enumerate(
+                zip(argument_ids, arguments)
+            ):
+                row = (str(self.function_name), int(callsite_id), position)
+                page.set(row, len(page.history(row)), (
+                    int(graph_id), int(value.id), bool(self.loop_targets),
+                ))
+        except Exception:
+            pass
+
     def emit_plan_callsite(self, callsite_id: int, *, location: str) -> None:
         """Lower a scheduled call statement to a placeholder Call.
 
@@ -2966,6 +2989,7 @@ class _ControlSSABuilder:
         arguments = [
             self.external_value(int(value_id)) for value_id in argument_ids
         ]
+        self._note_callsite_arguments(callsite_id, argument_ids, arguments)
         for index, value in enumerate(arguments):
             if self._value_dominates_current_edge(value):
                 continue
