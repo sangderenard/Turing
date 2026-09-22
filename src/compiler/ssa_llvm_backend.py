@@ -2090,6 +2090,23 @@ def _emit_repository_call_module(
                 if source is None:
                     source = pointers.get(int(output.id))
                 if source is None:
+                    # A callee output is rendered through `output_pointer`,
+                    # not through `pointer()`, so it never enters `pointers`.
+                    # That map is exactly the record of where this value's
+                    # storage is; the publication has to consult it or a
+                    # value that IS written looks like one that has no
+                    # storage at all.
+                    for candidate in (
+                        *(
+                            (int(returned_values[output_index].id),)
+                            if output_index < len(returned_values) else ()
+                        ),
+                        int(output.id),
+                    ):
+                        source = output_pointer.get(candidate)
+                        if source is not None:
+                            break
+                if source is None:
                     tensor_table = getattr(module, "tensor_tables", {}).get(name)
                     descriptor = (
                         tensor_table.by_id(int(output.id))
