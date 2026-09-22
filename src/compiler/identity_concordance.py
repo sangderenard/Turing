@@ -267,10 +267,252 @@ class CorrelationTable:
         found: list[Finding] = []
         for name, function in module.functions.items():
             found.extend(self._function_findings(module, str(name), function))
+            found.extend(
+                self._undefined_operand_findings(str(name), function)
+            )
+            declared = self._loop_scope_findings(module, str(name), function)
+            found.extend(declared)
+            # The inferred check recovers the scope from branch topology; it
+            # covers loops built by a path that does not declare one.  Where a
+            # declaration exists it is authoritative, so do not report twice.
+            if not loop_scope_declarations(identity_book(module), str(name)):
+                found.extend(
+                    self._stale_carried_read_findings(str(name), function)
+                )
         found.extend(self._sequence_descriptor_findings(module))
         found.extend(self._binding_kind_findings(module))
         found.extend(self._source_field_identity_findings(module))
         found.extend(self._callable_identity_findings(module))
+        return found
+
+    @staticmethod
+    def _loop_scope_findings(
+        module: Any, name: str, function: Any,
+    ) -> list[Finding]:
+        """Rule on a loop against the scope it declared.
+
+        These are the checks that no amount of shape, dominance or type
+        agreement can supply, because every name involved has the same
+        shape, the same dtype, and a definition that dominates every use.
+        The only thing separating them is which generation they speak
+        for, and that is knowable only from the declaration.
+        """
+
+        book = identity_book(module)
+        declarations = loop_scope_declarations(book, name)
+        if not declarations:
+            return []
+
+        definitions: dict[int, str] = {}
+        for block_name, block in function.blocks.items():
+            for instruction in block.instrs:
+                if instruction.res is not None:
+                    definitions[int(instruction.res.id)] = str(block_name)
+
+        found: list[Finding] = []
+        for declaration in declarations:
+            header, latch, exit_block = declaration["boundary"]
+            inside = _blocks_between(function, header, latch)
+            if not inside:
+                continue
+            for rebind in declaration["rebinds"]:
+                outer = rebind["outer"]
+                carried = rebind["carried"]
+                inner = rebind["inner"]
+
+                # Rule 1 -- inside the scope the outer generation is not
+                # in scope.  A use of it reads the value as it was before
+                # the first iteration, on every iteration.
+                for block_name in sorted(inside):
+                    block = function.blocks.get(block_name)
+                    if block is None:
+                        continue
+                    for index, instruction in enumerate(block.instrs):
+                        if str(instruction.op).lower() == "phi":
+                            continue
+                        for position, argument in enumerate(instruction.args):
+                            if getattr(argument, "id", None) is None:
+                                continue
+                            if int(argument.id) != outer:
+                                continue
+                            found.append(Finding(
+                                "loop-scope-outer-read", name, outer,
+                                f"{block_name}#{index} {instruction.op} "
+                                f"operand {position} names the outer "
+                                f"generation of a value the loop rebinds; "
+                                f"in scope it is {carried} (carried) or "
+                                f"{inner} (inner)",
+                            ))
+
+                # Rule 2 -- the backedge must carry the declared inner
+                # name.  An outlined body whose result returns through an
+                # aggregate arrives under a name the parent minted after
+                # the crossing; the value is right, the identity is lost.
+                phi = _carried_phi(function, header, carried)
+                if phi is not None and len(phi.args) == 2:
+                    incoming = phi.attributes.get("incoming_blocks") or ()
+                    for origin, argument in zip(incoming, phi.args):
+                        if str(origin) != str(latch):
+                            continue
+                        if getattr(argument, "id", None) is None:
+                            continue
+                        if int(argument.id) == inner:
+                            continue
+                        found.append(Finding(
+                            "loop-scope-latch-renamed", name, inner,
+                            f"{header} Phi {carried} takes "
+                            f"{int(argument.id)} from {latch}, but the "
+                            f"loop declared its inner generation as "
+                            f"{inner}; a transformation renamed the value "
+                            "crossing the boundary without re-declaring "
+                            "it",
+                        ))
+
+                # Rule 3 -- the inner generation must be defined inside
+                # the scope.  A seed in the preheader is storage
+                # initialization and is correct; a seed that is its ONLY
+                # definition means the body never wrote the slot.
+                where = definitions.get(inner)
+                if where is not None and where not in inside:
+                    found.append(Finding(
+                        "loop-scope-inner-outside", name, inner,
+                        f"the inner generation is defined in {where}, "
+                        f"outside the scope ({header}..{latch}); nothing "
+                        "in the body redefines it",
+                    ))
+        return found
+
+    @staticmethod
+    def _stale_carried_read_findings(
+        name: str, function: Any,
+    ) -> list[Finding]:
+        """A loop body reading the value its carried Phi superseded.
+
+        The Phi names two generations of one value: what it held on entry and
+        what the latch produced.  Inside the loop only the Phi speaks for it.
+        An instruction that still names the entry generation is reading the
+        value as it was before the first iteration, every iteration -- the
+        accumulation silently does not accumulate.
+        """
+
+        successors: dict[str, set[str]] = {}
+        for block_name, block in function.blocks.items():
+            targets: set[str] = set()
+            for instruction in block.instrs:
+                for key in ("target", "true_target", "false_target"):
+                    declared = instruction.attributes.get(key)
+                    if declared is not None:
+                        targets.add(str(declared))
+            successors[str(block_name)] = targets
+
+        def reaches(source: str, goal: str) -> set[str]:
+            """Blocks on some path from `source` to `goal`, inclusive."""
+
+            forward: set[str] = set()
+            frontier = [source]
+            while frontier:
+                current = frontier.pop()
+                if current in forward:
+                    continue
+                forward.add(current)
+                frontier.extend(successors.get(current, ()))
+            backward: set[str] = set()
+            frontier = [goal]
+            while frontier:
+                current = frontier.pop()
+                if current in backward:
+                    continue
+                backward.add(current)
+                for candidate, onward in successors.items():
+                    if current in onward:
+                        frontier.append(candidate)
+            return forward & backward
+
+        found: list[Finding] = []
+        for header_name, header in function.blocks.items():
+            for phi in header.instrs:
+                if str(phi.op).lower() != "phi":
+                    continue
+                if phi.attributes.get("binding") != "loop_carried":
+                    continue
+                incoming = phi.attributes.get("incoming_blocks") or ()
+                if len(incoming) != len(phi.args):
+                    continue
+                latches = [
+                    str(origin) for origin in incoming
+                    if str(header_name) in reaches(str(header_name), str(origin))
+                ]
+                if not latches:
+                    continue
+                body = set()
+                for latch in latches:
+                    body |= reaches(str(header_name), latch)
+                stale = {
+                    int(argument.id)
+                    for origin, argument in zip(incoming, phi.args)
+                    if str(origin) not in latches
+                    and getattr(argument, "id", None) is not None
+                }
+                if not stale:
+                    continue
+                for block_name in sorted(body):
+                    block = function.blocks.get(block_name)
+                    if block is None:
+                        continue
+                    for index, instruction in enumerate(block.instrs):
+                        if str(instruction.op).lower() == "phi":
+                            continue
+                        for position, argument in enumerate(instruction.args):
+                            argument_id = getattr(argument, "id", None)
+                            if argument_id is None:
+                                continue
+                            if int(argument_id) not in stale:
+                                continue
+                            found.append(Finding(
+                                "stale-carried-read", name, int(argument_id),
+                                f"{block_name}#{index} {instruction.op} operand "
+                                f"{position} names the pre-loop value carried by "
+                                f"{header_name} Phi {int(phi.res.id)}; inside the "
+                                "loop only the Phi speaks for it",
+                            ))
+        return found
+
+    @staticmethod
+    def _undefined_operand_findings(
+        name: str, function: Any,
+    ) -> list[Finding]:
+        """An operand no instruction defines and no formal supplies.
+
+        Reading such a value yields whatever its storage happened to hold, so
+        the program computes an answer from uninitialized memory instead of
+        failing.  The latch incoming of a loop-carried Phi is where this hides:
+        the body computes the update and stores it somewhere other than the
+        slot the Phi names, and every later stage -- emission, the LLVM
+        verifier, execution -- accepts the result.
+        """
+
+        found: list[Finding] = []
+        formals = {int(value.id) for value in getattr(function, "args", ())}
+        defined: set[int] = set()
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.res is not None:
+                    defined.add(int(instruction.res.id))
+        for block_name, block in function.blocks.items():
+            for index, instruction in enumerate(block.instrs):
+                for position, argument in enumerate(instruction.args):
+                    argument_id = getattr(argument, "id", None)
+                    if argument_id is None:
+                        continue
+                    argument_id = int(argument_id)
+                    if argument_id in formals or argument_id in defined:
+                        continue
+                    found.append(Finding(
+                        "operand-never-written", name, argument_id,
+                        f"{block_name}#{index} {instruction.op} operand "
+                        f"{position} is neither a formal nor defined by any "
+                        "instruction",
+                    ))
         return found
 
     @staticmethod
@@ -829,6 +1071,53 @@ def concordance_report(module: Any, *, limit: int = 12) -> str:
 # --------------------------------------------------------------------------
 
 
+def _blocks_between(function: Any, header: str, latch: str) -> set[str]:
+    """Blocks on some path from the declared header to the declared latch."""
+
+    successors: dict[str, set[str]] = {}
+    for block_name, block in function.blocks.items():
+        targets: set[str] = set()
+        for instruction in block.instrs:
+            for key in ("target", "true_target", "false_target"):
+                declared = instruction.attributes.get(key)
+                if declared is not None:
+                    targets.add(str(declared))
+        successors[str(block_name)] = targets
+    forward: set[str] = set()
+    frontier = [str(header)]
+    while frontier:
+        current = frontier.pop()
+        if current in forward:
+            continue
+        forward.add(current)
+        frontier.extend(successors.get(current, ()))
+    backward: set[str] = set()
+    frontier = [str(latch)]
+    while frontier:
+        current = frontier.pop()
+        if current in backward:
+            continue
+        backward.add(current)
+        for candidate, onward in successors.items():
+            if current in onward:
+                frontier.append(candidate)
+    return forward & backward
+
+
+def _carried_phi(function: Any, header: str, carried_id: int) -> Any:
+    """The header Phi that speaks for one declared carried generation."""
+
+    block = function.blocks.get(str(header))
+    for instruction in (block.instrs if block is not None else ()):
+        if str(instruction.op).lower() != "phi":
+            continue
+        if instruction.res is None:
+            continue
+        if int(instruction.res.id) == int(carried_id):
+            return instruction
+    return None
+
+
 @dataclass
 class IdentityPage:
     """One pipeline stage's row (identity) x column (round) table of facts."""
@@ -1266,6 +1555,77 @@ def authored_function_name(name: Any) -> str:
     # an authored name that itself begins with an underscore makes the last
     # separator fall inside ``___``, which would eat that underscore.
     return text.split("__", 1)[-1] if "__" in text else text
+
+
+OUTER, CARRIED, INNER = 0, 1, 2
+
+_GENERATION_NAMES = {OUTER: "outer", CARRIED: "carried", INNER: "inner"}
+
+
+def declare_loop_scope(
+    function: Any, loop_node_id: Any, header: str, latch: str,
+    exit_block: str, rebinds: Any,
+) -> None:
+    """Declare one loop as a scope whose bindings evolve per iteration.
+
+    A nested scope binds a name once for its whole extent.  A loop body
+    binds it differently on every entry, so the page's COLUMN is the
+    generation -- outer, carried, inner -- rather than a round.  The
+    boundary is recorded with the rebinds because a transformation that
+    moves code across it must be able to ask where it is, instead of
+    recovering it from block names or branch topology that the
+    transformation itself may have rewritten.
+    """
+
+    page = current_identity_book().page("loop_scope")
+    scope = (authored_function_name(function), int(loop_node_id))
+    page.set(
+        (*scope, "boundary"), 0,
+        (str(header), str(latch), str(exit_block)),
+    )
+    for outer_id, carried_id, inner_id, graph_outer, graph_inner in rebinds:
+        row = (*scope, int(outer_id))
+        page.set(row, OUTER, int(outer_id))
+        page.set(row, CARRIED, int(carried_id))
+        page.set(row, INNER, int(inner_id))
+        page.set(row, INNER + 1, ("graph", int(graph_outer), int(graph_inner)))
+
+
+def loop_scope_declarations(book: Any, function: Any) -> list[dict]:
+    """Every loop scope declared for one authored function."""
+
+    page = book.page("loop_scope")
+    wanted = authored_function_name(function)
+    scopes: dict[int, dict] = {}
+    for row in page.rows():
+        if not (isinstance(row, tuple) and len(row) == 3):
+            continue
+        name, loop_node_id, key = row
+        if name != wanted:
+            continue
+        record = scopes.setdefault(
+            int(loop_node_id),
+            {
+                "loop_node_id": int(loop_node_id),
+                "boundary": None,
+                "rebinds": [],
+            },
+        )
+        if key == "boundary":
+            record["boundary"] = page.latest(row)
+            continue
+        generations = dict(page.history(row))
+        if (
+            OUTER in generations
+            and CARRIED in generations
+            and INNER in generations
+        ):
+            record["rebinds"].append({
+                "outer": int(generations[OUTER]),
+                "carried": int(generations[CARRIED]),
+                "inner": int(generations[INNER]),
+            })
+    return [record for record in scopes.values() if record["boundary"]]
 
 
 def record_proven_shape(

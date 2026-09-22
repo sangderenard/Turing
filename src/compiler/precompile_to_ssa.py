@@ -6563,12 +6563,40 @@ class _ControlSSABuilder:
                     "initial_value_id": initial_id,
                     "updated_value_id": updated_id,
                     "recursion_region_id": recursion_region_id,
+                    # The loop this generation belongs to, so a consumer
+                    # can reach the scope declaration without recovering
+                    # it from branch topology a transformation may have
+                    # rewritten.
+                    "source_loop_node_id": loop.source_loop_node_id,
                 },
             )
             carried_phis[updated_id] = self.current.instrs[-1]
             if initial_id not in bound_initial_ids:
                 self.external_values[initial_id] = current_value
                 bound_initial_ids.add(initial_id)
+        # Declare the loop as an evolving scope.  The rebind table is
+        # exactly what ``carried`` already holds; what was missing is any
+        # statement that these three names are one quantity at three
+        # generations, which is why three of them could disagree in
+        # silence.
+        try:
+            from .identity_concordance import declare_loop_scope
+
+            declare_loop_scope(
+                self.function_name, loop.source_loop_node_id,
+                header.name, latch.name, exit_block.name,
+                tuple(
+                    (
+                        int(_initial.id), int(_current.id),
+                        int(_updated.id), int(_initial_id),
+                        int(_updated_id),
+                    )
+                    for _updated_id, _initial_id, _initial, _updated,
+                    _current in carried
+                ),
+            )
+        except Exception:
+            pass
         break_bound_initials = {
             int(initial_id): self.external_value(int(initial_id))
             for _port_id, initial_id, updated_id
@@ -7313,12 +7341,40 @@ class _ControlSSABuilder:
                     "initial_value_id": initial_id,
                     "updated_value_id": updated_id,
                     "recursion_region_id": recursion_region_id,
+                    # The loop this generation belongs to, so a consumer
+                    # can reach the scope declaration without recovering
+                    # it from branch topology a transformation may have
+                    # rewritten.
+                    "source_loop_node_id": loop.source_loop_node_id,
                 },
             )
             carried_phis[updated_id] = self.current.instrs[-1]
             if initial_id not in bound_initial_ids:
                 self.external_values[initial_id] = current
                 bound_initial_ids.add(initial_id)
+        # Declare the loop as an evolving scope.  The rebind table is
+        # exactly what ``carried`` already holds; what was missing is any
+        # statement that these three names are one quantity at three
+        # generations, which is why three of them could disagree in
+        # silence.
+        try:
+            from .identity_concordance import declare_loop_scope
+
+            declare_loop_scope(
+                self.function_name, loop.source_loop_node_id,
+                header.name, latch.name, exit_block.name,
+                tuple(
+                    (
+                        int(_initial.id), int(_current.id),
+                        int(_updated.id), int(_initial_id),
+                        int(_updated_id),
+                    )
+                    for _updated_id, _initial_id, _initial, _updated,
+                    _current in carried
+                ),
+            )
+        except Exception:
+            pass
         break_bound_initials = {
             int(initial_id): self.external_value(int(initial_id))
             for _port_id, initial_id, updated_id
