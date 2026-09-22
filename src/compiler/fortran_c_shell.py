@@ -14118,10 +14118,21 @@ def _class_surface_ssa_program(
     section_outputs: dict[str, tuple[Any, ...]] = {}
     export_symbols: list[str] = []
     lowering_failures: list[tuple[str, Any]] = []
+    # The definition catalogue is not the program.  `_walk_planned_shells`
+    # says so itself: compiling ONE entrypoint must not mistake catalogue
+    # entries for executed children.  Its `function_shells` are the
+    # UNSPECIALIZED graphs -- no caller, so no callsite literal and no caller
+    # shape -- while `callsite_function_shells` is the activation tree that
+    # actually runs, each shell carrying the facts its caller proved.  Gating
+    # on `runtime_closure_only` alone lowered both, so a helper whose count
+    # arrives as `n=2` at every real callsite was ALSO lowered from a copy
+    # where `n` is a bare formal, and that copy is what could not emit its
+    # `arange`.  The catalogue belongs only to a whole-source compile, which
+    # is exactly what `prepare_complete_catalogue` states.
     discovered_planned_shells = tuple(_walk_planned_shells(
         compilation.deployment,
-        include_function_registry=not bool(getattr(
-            compilation.deployment, "runtime_closure_only", False
+        include_function_registry=bool(getattr(
+            compilation.deployment, "prepare_complete_catalogue", False
         )),
     ))
     planned_shells = tuple(
@@ -14337,10 +14348,6 @@ def _class_surface_ssa_program(
     # A formal given two different literals by two callsites is parametric,
     # exactly as a formal given two shapes is.
     literal_conflicts: set[tuple[int, str]] = set()
-
-    # What set ``changed`` this round, so a loop that will not settle can say
-    # which fact keeps being rewritten rather than only that it is busy.
-    settlement_witnesses: list[tuple[str, int, str]] = []
     changed = True
     settlement_round = 0
     while changed:
@@ -14352,23 +14359,11 @@ def _class_surface_ssa_program(
         settled = sum(
             len(contracts) for contracts in linked_value_abi_by_graph.values()
         )
-        # A fact can cross at most one call edge per round, so once the round
-        # count passes the edge count nothing can still be propagating and a
-        # further change is something toggling.  Refuse loudly, naming the
-        # witnesses, instead of spinning: this loop has no other bound.
-        if settlement_round > len(linked_value_edges) + 16:
-            raise ValueError(
-                "Program-ABI settlement did not converge after "
-                f"{settlement_round} rounds over {len(linked_value_edges)} "
-                f"call edge(s); {settled} contract(s) and "
-                f"{len(polymorphic_formals)} polymorphic formal(s) are no "
-                "longer moving, so a fact is being rewritten in place. "
-                "Last writers: "
-                + "; ".join(
-                    f"{function} value {value_id} key {key}"
-                    for function, value_id, key in settlement_witnesses[:8]
-                )
-            )
+        report(
+            f"abi: settlement round {settlement_round}, "
+            f"{settled} contract(s) over {len(linked_value_edges)} call "
+            f"edge(s), {len(polymorphic_formals)} shape-polymorphic formal(s)"
+        )
         settlement_witnesses = []
         # A phase with no bound of its own must say which round it is on AND
         # how much it is still moving: a count that climbs by one per round is
@@ -14470,35 +14465,16 @@ def _class_surface_ssa_program(
             literal = graph_constants(caller_graph).get(
                 int(caller_id), _LITERAL_ABSENT
             )
-            if literal is not _LITERAL_ABSENT and isinstance(
-                literal, (int, float, bool, str, tuple)
-            ):
-                parameter = parameter_of(callee_graph, int(callee_id))
-                if parameter is not None:
-                    conflict_key = (id(callee_graph), parameter)
-                    specializations = callee_graph.graph.setdefault(
-                        "planner_specializations", {}
-                    )
-                    if conflict_key in literal_conflicts:
-                        pass
-                    elif parameter not in specializations:
-                        specializations[parameter] = literal
-                        changed = True
-                        settlement_witnesses.append((
-                            str(callee_graph.graph.get("function_name")),
-                            int(callee_id), f"literal:{parameter}",
-                        ))
-                    else:
-                        try:
-                            agrees = bool(
-                                specializations[parameter] == literal
-                            )
-                        except Exception:
-                            agrees = False
-                        if not agrees:
-                            specializations.pop(parameter, None)
-                            literal_conflicts.add(conflict_key)
-                            changed = True
+            if literal is _LITERAL_ABSENT:
+                # This caller instance did not fold it; another copy of the
+                # same function may have.  The book is keyed by identity.
+                literal = _shape_book().page("proven_literal").latest(
+                    (
+                        str(caller_graph.graph.get("function_name")),
+                        int(caller_id),
+                    ),
+                    _LITERAL_ABSENT,
+                )
             existing = destination.get(int(callee_id))
             marker = (id(callee_graph), int(callee_id))
             if existing is None:

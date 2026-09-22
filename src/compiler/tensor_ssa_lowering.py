@@ -2458,6 +2458,50 @@ def lower_tensor_calls_to_repository_ssa(
                 # result's shape/dtype annotation while aliasing its storage.
                 if operation in _VIEW_OPERATIONS and args:
                     source = args[0]
+                    if operation in {"unsqueeze", "squeeze"}:
+                        # These CHANGE the axes, and the annotation they were
+                        # given may predate the moment the operand's shape was
+                        # proven.  The axis is right here, so state the result
+                        # from the operand rather than trusting whatever the
+                        # annotation held: ``b.unsqueeze(-1)`` carrying ``b``'s
+                        # own shape made the matmul that consumes it read a
+                        # column as a vector.
+                        extents = tuple(int(e) for e in (source.shape or ()))
+                        axis = _attribute(instruction.attributes, "dim", "axis")
+                        if axis is None and len(args) > 1:
+                            axis = next((
+                                int(literal)
+                                for argument in args[1:]
+                                for literal in (
+                                    constants.get(int(argument.id)),
+                                )
+                                if isinstance(literal, int)
+                                and not isinstance(literal, bool)
+                            ), None)
+                        if extents and axis is not None:
+                            axis = int(axis)
+                            if operation == "unsqueeze":
+                                position = (
+                                    axis if axis >= 0
+                                    else axis + len(extents) + 1
+                                )
+                                if 0 <= position <= len(extents):
+                                    result.shape = (
+                                        extents[:position] + (1,)
+                                        + extents[position:]
+                                    )
+                            else:
+                                position = (
+                                    axis if axis >= 0 else axis + len(extents)
+                                )
+                                if (
+                                    0 <= position < len(extents)
+                                    and extents[position] == 1
+                                ):
+                                    result.shape = (
+                                        extents[:position]
+                                        + extents[position + 1:]
+                                    )
                     if operation in {"reshape", "view"} and len(args) > 1:
                         requested = _as_sequence(constants.get(int(args[1].id)))
                         if requested is not None:

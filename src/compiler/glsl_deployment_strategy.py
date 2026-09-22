@@ -15481,6 +15481,103 @@ def _compile_whole_process_graph(
     return shell
 
 
+_FORMAL_LITERAL_CONFLICT = object()
+
+
+def _publish_formal_literal(
+    function: str, parameter: str, value: Any, caller: str,
+) -> None:
+    """Record that a callsite proved one literal for one formal."""
+
+    try:
+        from .identity_concordance import current_identity_book
+
+        page = current_identity_book().page("formal_literal")
+        row = (str(function), str(parameter))
+        previous = page.latest(row)
+        if previous is None:
+            page.set(row, 0, ("proven", value, caller))
+            return
+        if previous[0] == "conflicting":
+            return
+        try:
+            agrees = bool(previous[1] == value)
+        except Exception:
+            agrees = False
+        if not agrees:
+            # Genuinely parametric: two callsites, two values.
+            page.set(
+                row, len(page.history(row)),
+                ("conflicting", (previous[1], value), caller),
+            )
+    except Exception:
+        pass
+
+
+def _publish_formal_shape(
+    function: str, parameter: str, descriptor: Any, caller: str,
+) -> None:
+    """Record that a callsite proved one shape for one formal."""
+
+    try:
+        from .identity_concordance import current_identity_book
+
+        extents = tuple(int(e) for e in (descriptor.get("shape") or ()))
+        dtype = str(descriptor.get("dtype") or "float64")
+        page = current_identity_book().page("formal_shape")
+        row = (str(function), str(parameter))
+        previous = page.latest(row)
+        if previous is None:
+            page.set(row, 0, ("proven", extents, dtype, caller))
+        elif previous[0] == "proven" and tuple(previous[1]) != extents:
+            page.set(
+                row, len(page.history(row)),
+                ("conflicting", extents, dtype, caller),
+            )
+    except Exception:
+        pass
+
+
+def _proven_formal_shape(graph: Any, name: Any) -> Any:
+    """The shape every callsite agrees this formal carries, if any."""
+
+    if not name:
+        return None
+    try:
+        from .identity_concordance import current_identity_book
+
+        page = current_identity_book().page("formal_shape")
+        row = (str(graph.G.graph.get("function_name")), str(name))
+        proven = page.latest(row)
+    except Exception:
+        return None
+    if proven is None or proven[0] != "proven":
+        return None
+    return {
+        "shape": tuple(proven[1]),
+        "dtype": str(proven[2]),
+        "rank": len(tuple(proven[1])),
+    }
+
+
+def _proven_formal_literal(graph: Any, name: Any) -> Any:
+    """The literal every callsite agrees this formal carries, if any."""
+
+    if not name:
+        return _FORMAL_LITERAL_CONFLICT
+    try:
+        from .identity_concordance import current_identity_book
+
+        page = current_identity_book().page("formal_literal")
+        row = (str(graph.G.graph.get("function_name")), str(name))
+        proven = page.latest(row)
+    except Exception:
+        return _FORMAL_LITERAL_CONFLICT
+    if proven is None or proven[0] != "proven":
+        return _FORMAL_LITERAL_CONFLICT
+    return proven[1]
+
+
 def _source_static_value(graph: Any, node_id: int, visiting=None) -> bool:
     """Whether a call argument is structural source data, not runtime data."""
 
@@ -15515,7 +15612,14 @@ def _source_static_value(graph: Any, node_id: int, visiting=None) -> bool:
         return True
     if data.get("type") == "Input":
         name = (data.get("attributes") or {}).get("binding_name")
-        return name in (graph.G.graph.get("planner_specializations") or {})
+        if name in (graph.G.graph.get("planner_specializations") or {}):
+            return True
+        # Not told HERE is not the same as unknown.  Copies of one function
+        # share its formals; if every callsite that proved this one agrees,
+        # the value is a literal in all of them.
+        return _proven_formal_literal(
+            graph, name
+        ) is not _FORMAL_LITERAL_CONFLICT
     expression = data.get("expr_obj")
     if isinstance(expression, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
         return all(
@@ -15552,6 +15656,9 @@ def _source_static_literal(
         specializations = graph.G.graph.get("planner_specializations") or {}
         if name in specializations:
             return specializations[name]
+        proven = _proven_formal_literal(graph, name)
+        if proven is not _FORMAL_LITERAL_CONFLICT:
+            return proven
         raise ValueError("input has no source-static planner binding")
     expression = data.get("expr_obj")
     parents = tuple(data.get("parents") or ())
@@ -16819,6 +16926,11 @@ def _tensor_descriptor_rule(
                 tensor["dtype"] = "float64"
     if "shape" not in tensor and data.get("type") == "Input":
         binding_name = (data.get("attributes") or {}).get("binding_name")
+        # A copy with no caller was told nothing; the formal still has the
+        # shape its callsites proved.
+        agreed = _proven_formal_shape(graph, binding_name)
+        if agreed is not None:
+            return agreed
         boundary = (
             graph.G.graph.get("planner_tensor_descriptors") or {}
         ).get(str(binding_name))
@@ -17028,6 +17140,26 @@ def _tensor_descriptor_rule(
                             if isinstance(literal, (int, float, bool)):
                                 side = {"shape": (), "dtype": "float64"}
                     sides.append(side)
+                # A HOST SCALAR broadcasts against anything.  ``index >= k``
+                # compares a vector with an ordinary Python ``int`` argument,
+                # which has no tensor descriptor and never will; demanding one
+                # from both sides refused valid source and left every mask
+                # built that way shapeless.  A side with no descriptor counts
+                # as rank 0 only when its node produces no tensor -- no tensor
+                # metadata, no catalogued tensor operation -- so a tensor whose
+                # shape merely failed to derive still refuses.
+                for index, (side, operand) in enumerate(zip(sides, operands)):
+                    if side is not None:
+                        continue
+                    node = graph.G.nodes[operand]
+                    attributes = node.get("attributes") or {}
+                    if node.get("tensor") or attributes.get("tensor_candidate"):
+                        continue
+                    if str(node.get("op") or node.get("type") or "").casefold() in (
+                        _ELEMENTWISE_BINARY_OPERATIONS
+                    ):
+                        continue
+                    sides[index] = {"shape": (), "dtype": "float64"}
                 if all(side is not None for side in sides) and all(
                     descriptor_states_a_shape(side) for side in sides
                 ):
@@ -18404,6 +18536,28 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             "parents": [], "attributes": attributes,
             "constant": copy.deepcopy(value), "expr_obj": None,
         })
+        # A proven literal belongs to the VALUE, not to the graph instance
+        # that happened to fold it.  Several planned shells share one function
+        # name, each with its own copy, so a fact folded in one is invisible
+        # to a call edge that names another.  The book is keyed by identity,
+        # which is what makes it readable from any of them.
+        try:
+            from .identity_concordance import current_identity_book
+
+            if isinstance(value, (int, float, bool, str, tuple)):
+                literal_page = current_identity_book().page("proven_literal")
+                literal_row = (
+                    str(graph.G.graph.get("function_name")),
+                    int(data.get("value_id", node_id)),
+                )
+                if literal_page.latest(literal_row) != value:
+                    literal_page.set(
+                        literal_row,
+                        len(literal_page.history(literal_row)),
+                        value,
+                    )
+        except Exception:
+            pass
 
     def remove_node(node_id: int) -> None:
         nonlocal topology_changed
@@ -18877,6 +19031,15 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 positional_values = []
                 for position, parent in enumerate(positional(data)):
                     value = known.get(int(parent), unresolved)
+                    if value is unresolved:
+                        # Unresolved HERE only means this copy was not told.
+                        # The bound is a formal whose callsites may all have
+                        # proved the same literal, and that is a fact about
+                        # the formal.
+                        try:
+                            value = _source_static_literal(graph, int(parent))
+                        except (ValueError, KeyError, TypeError):
+                            value = unresolved
                     if value is unresolved:
                         positional_values = []
                         break
@@ -20174,6 +20337,23 @@ def _callsite_specialized_shell_type(
                 )
             except ValueError:
                 pass
+            else:
+                _publish_formal_literal(
+                    str(original.G.graph.get("function_name")),
+                    parameter,
+                    specializations[parameter],
+                    str(caller.G.graph.get("function_name")),
+                )
+        proven_descriptor = tensor_descriptors.get(parameter)
+        if proven_descriptor is not None and tuple(
+            proven_descriptor.get("shape") or ()
+        ):
+            _publish_formal_shape(
+                str(original.G.graph.get("function_name")),
+                parameter,
+                proven_descriptor,
+                str(caller.G.graph.get("function_name")),
+            )
     for parameter, default in (
         original.G.graph.get("parameter_defaults") or {}
     ).items():
