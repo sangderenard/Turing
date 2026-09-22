@@ -8127,6 +8127,14 @@ def _canonicalize_non_dominating_loop_result_uses(
                 if str(instruction.op).casefold() == "phi" else ()
             )
             resolved_args = list(instruction.args)
+            import os as _rc_os
+            if _rc_os.environ.get("TURING_TRACE_RECONCILE") and str(
+                block_name
+            ) == "loop_body" and "lu_decompose" in str(function.name):
+                print("RC", str(function.name)[-14:], block_name,
+                      instruction_index, instruction.op,
+                      [int(getattr(a, "id", -1)) for a in instruction.args][:8],
+                      flush=True)
             for argument_index, argument in enumerate(instruction.args):
                 def _note(outcome: str, detail: Any = None) -> None:
                     """Record this argument's reconciliation decision."""
@@ -8152,6 +8160,14 @@ def _canonicalize_non_dominating_loop_result_uses(
                         pass
 
                 replacement = port_values.get(int(argument.id))
+                if replacement is argument:
+                    # A ledger entry mapping a port to ITSELF is not an
+                    # equivalence, and taking it as one made this pass decline
+                    # silently: the single case it exists to repair -- a loop
+                    # body reading its own result port -- is exactly the case
+                    # the ledger records that way.  Treat it as no recorded
+                    # equivalence and let the CFG supply the candidate.
+                    replacement = None
                 if replacement is None:
                     # A result port with no recorded equivalence still states
                     # one itself: an exit Phi with a SINGLE incoming says the
