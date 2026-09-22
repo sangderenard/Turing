@@ -2723,6 +2723,14 @@ class _FunctionEmitter:
         ):
             return None
         source = self._operand(instr.args[0])
+        if self._is_logical(instr.args[0]):
+            # Every cast kernel spelling above expects a REAL operand -- a
+            # comparison's LOGICAL result reaching one directly (for example
+            # ``(a == b).to_dtype("float64")``) makes gfortran refuse the
+            # conversion outright. Every other backend already stores a
+            # comparison as a plain 0.0/1.0 double; normalize to that same
+            # value here before applying the requested cast.
+            source = _UNARY["bool_to_float64"].format(source)
         self._locals[instr.res.id] = self._typed(instr.res)
         return [f"    {_name(instr.res)} = {spelling.format(source)}"]
 

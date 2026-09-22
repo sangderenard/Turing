@@ -17271,6 +17271,12 @@ def _tensor_descriptor_rule(
         if operation in {
             "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
             "tanh", "clone", "copy", "identity", "real", "imag", "conj",
+            # A prefix scan is not a reduction: it emits one element per
+            # input element, so it keeps its operand's shape exactly.  With
+            # no rule here it answered nothing, its result was never proven,
+            # and the cast that consumed it read a rank-0 scalar and wrote
+            # no elements at all.
+            "cumsum", "cumprod",
         }:
             parents = tuple(
                 int(parent) for parent, role in data.get("parents") or ()

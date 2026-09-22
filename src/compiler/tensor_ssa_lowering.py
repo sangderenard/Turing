@@ -275,6 +275,19 @@ _SHAPED_SSA_OPERATIONS = {
     "Sub": "sub", "sub": "sub",
     "Mul": "mul", "Mult": "mul", "mul": "mul",
     "Div": "truediv", "truediv": "truediv",
+    # Comparisons are catalogued elementwise kernels too.  Without these
+    # spellings a tensor comparison fell through to the scalar emitter, which
+    # computed element zero and left the rest of the buffer as the allocation
+    # found it -- the same failure the mod/floordiv note below describes.  A
+    # scalar comparison is unaffected: the gate still requires an operand
+    # with real extents, so loop conditions stay scalar.
+    "Eq": "equal", "eq": "equal", "equal": "equal",
+    "Ne": "not_equal", "ne": "not_equal", "not_equal": "not_equal",
+    "Lt": "less", "lt": "less", "less": "less",
+    "Le": "less_equal", "le": "less_equal", "less_equal": "less_equal",
+    "Gt": "greater", "gt": "greater", "greater": "greater",
+    "Ge": "greater_equal", "ge": "greater_equal",
+    "greater_equal": "greater_equal",
     # Tensor ``%`` and ``//`` are catalogued binary kernels (CT_OP_MOD and
     # CT_OP_FLOORDIV).  Without these spellings they fell through to the
     # scalar instruction emitter, which computed element zero only and
@@ -1981,6 +1994,17 @@ def lower_tensor_calls_to_repository_ssa(
                         )
                     rewritten.append(instruction)
                     continue
+                # Whether this opcode is a TENSOR operation is judged below
+                # from its operands' extents.  Those are fields somebody filled
+                # in when the value was created, and a consumer holds its own
+                # SSAValue carrying the same id, so an operand whose shape was
+                # proven after that moment still reads as rank 0 here -- and
+                # the opcode falls through to the scalar emitter, which writes
+                # element zero and leaves the rest of the buffer untouched.
+                # Take the settled fact for the identity before deciding.
+                _settle_operand_shapes(function_name, instruction.args)
+                if instruction.res is not None:
+                    _settle_operand_shapes(function_name, (instruction.res,))
                 candidate_only = bool(
                     instruction.attributes.get("tensor_candidate") is not None
                     and instruction.attributes.get("tensor_operation") is None
@@ -3088,6 +3112,28 @@ def lower_tensor_calls_to_repository_ssa(
                     ))
 
                 elif operation in _CAST_OPERATIONS and source is not None:
+                    # A value cast changes dtype, never extents.  The result's
+                    # annotation was taken when it was created, which may have
+                    # been before the operand's own shape settled; an empty
+                    # one then makes the element loop below write nothing.
+                    # The fact belongs to the identity, because the consumer
+                    # holds a different SSAValue with the same id.
+                    if not tuple(result.shape or ()) and tuple(
+                        source.shape or ()
+                    ):
+                        result.shape = tuple(source.shape)
+                        try:
+                            from .identity_concordance import (
+                                record_proven_shape,
+                            )
+
+                            record_proven_shape(
+                                function_name, int(result.id),
+                                tuple(source.shape),
+                                result.dtype or source.dtype,
+                            )
+                        except Exception:
+                            pass
                     callee = _CAST_OPERATIONS[operation]
                     dtype_hint = str(
                         _attribute(instruction.attributes, "dtype", "target_dtype")
@@ -3255,6 +3301,34 @@ def lower_tensor_calls_to_repository_ssa(
                         ))
 
                 elif operation == "cumsum" and source is not None and source.shape:
+                    # A prefix scan does not change shape.  The kernel's shape
+                    # vector is built from the operand below, but the RESULT
+                    # kept whatever annotation it arrived with -- for an
+                    # intermediate that is ``()``, which the next operation
+                    # reads as a rank-0 scalar and whose element loop then
+                    # writes nothing.  ``hot.cumsum(dim=-1).to_dtype(...)``
+                    # left its output buffer untouched for exactly this
+                    # reason, and every value above it in the pivot search
+                    # read the uninitialized result.  Returning the cumsum
+                    # directly hid it, because the published contract stamped
+                    # the shape back on.
+                    if not tuple(result.shape or ()):
+                        result.shape = tuple(source.shape)
+                        result.dtype = result.dtype or source.dtype
+                    # Setting the field only fixes THIS object.  The consumer
+                    # holds a different SSAValue carrying the same id, so the
+                    # fact belongs to the identity, not to the occurrence --
+                    # record it where every occurrence can read it.
+                    try:
+                        from .identity_concordance import record_proven_shape
+
+                        record_proven_shape(
+                            function_name, int(result.id),
+                            tuple(source.shape),
+                            result.dtype or source.dtype,
+                        )
+                    except Exception:
+                        pass
                     axis = _attribute(instruction.attributes, "axis", "dim")
                     if axis is None:
                         axis = next((item for item in metadata if isinstance(item, (int, float))), 0)
