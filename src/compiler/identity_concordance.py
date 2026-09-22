@@ -1628,6 +1628,40 @@ def loop_scope_declarations(book: Any, function: Any) -> list[dict]:
     return [record for record in scopes.values() if record["boundary"]]
 
 
+def materializing_binding_kind(
+    book: Any, callee_symbol: Any, formal_id: int, source_id: int, kind: Any,
+) -> str:
+    """The kind that can materialize one caller slot, across every callsite.
+
+    A frame binding's kind is not a label on the slot; it selects which
+    machinery may supply the argument.  ``caller_storage`` can restore a slot
+    a structural cleanup removed, ``caller_alias`` and ``caller_value``
+    cannot.  Each callsite decides the kind from its own private map in its
+    own order, so two callsites can name the same slot under different kinds
+    and the one that cannot materialize it reports ``missing_<kind>`` and
+    refuses the call -- after which the callee's output is never written and
+    whatever reads it gets uninitialized memory, with no shortfall anywhere.
+
+    The decisions are already written to the shared page precisely so this is
+    answerable.  If any callsite proved the slot is caller storage, that is
+    what it is, and every callsite naming it gets the kind that works.
+    """
+
+    page = book.page("argument_binding")
+    row = (str(callee_symbol), int(formal_id), "binding")
+    for _column, fact in page.history(row):
+        if not (isinstance(fact, tuple) and len(fact) == 2):
+            continue
+        recorded_kind, recorded_source = fact
+        if not isinstance(recorded_source, int):
+            continue
+        if int(recorded_source) != int(source_id):
+            continue
+        if str(recorded_kind) == "caller_storage":
+            return "caller_storage"
+    return str(kind)
+
+
 def record_proven_shape(
     function: Any, value_id: int, extents: Any, dtype: Any, level: int = 0,
 ) -> None:

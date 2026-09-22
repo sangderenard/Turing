@@ -28922,6 +28922,23 @@ def _class_surface_ssa_program(
                             eligible = False
                             break
                         kind, source = binding
+                        # The kind belongs to the slot, not to this callsite's
+                        # private map.  Ask the shared page which kind can
+                        # actually materialize it; otherwise one callsite
+                        # restores the slot and another refuses the call.
+                        try:
+                            from .identity_concordance import (
+                                current_identity_book,
+                                materializing_binding_kind,
+                            )
+
+                            kind = materializing_binding_kind(
+                                current_identity_book(),
+                                record.callee_symbol or callee.name,
+                                int(argument.id), int(source), kind,
+                            )
+                        except Exception:
+                            pass
                         if kind in {
                             "caller_value", "caller_alias", "caller_storage"
                         }:

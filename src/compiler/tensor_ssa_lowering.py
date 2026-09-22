@@ -311,6 +311,16 @@ def _settle_operand_shapes(function_name: str, values: Any) -> None:
     except Exception:
         return
     for value in values or ():
+        # A shaped view shares its storage owner's value id and nothing else.
+        # The resolver is keyed by that id, so asking it here answers with the
+        # OWNER's shape and restamps every view with it: ``index.unsqueeze(-1)``
+        # and ``index.unsqueeze(-2)`` both became plain ``index``, the
+        # comparison between them went elementwise instead of broadcasting,
+        # and half the (2, 2) result was never written.  The view already
+        # states its own extents, and ``ssa_storage_view`` is the declaration
+        # that it speaks for itself.
+        if (value.accounting or {}).get("ssa_storage_view"):
+            continue
         try:
             settled = proven_shape_of(function_name, int(value.id))
         except Exception:
