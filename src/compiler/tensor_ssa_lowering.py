@@ -638,14 +638,33 @@ def propagate_repository_ssa_call_metadata(
         function, value_id: int, source: SSAValue, *, authoritative: bool = False,
     ) -> bool:
         changed = False
+        source_accounting = dict(source.accounting or {})
         source_shape = tuple(source.shape or ())
         source_dtype = source.dtype
         source_aggregate = tuple(
-            (source.accounting or {}).get("ssa_aggregate_outputs", ())
+            source_accounting.get("ssa_aggregate_outputs", ())
         )
-        source_physical_dtype = (source.accounting or {}).get(
-            "physical_dtype"
+        source_physical_dtype = source_accounting.get("physical_dtype")
+        # These fields are one indivisible dynamic tensor contract.  Shape,
+        # rank, and element-count are ordinary SSA identities minted by the
+        # caller that owns the public span; a specialized region formal must
+        # retain those exact identities so its tensor descriptor and every
+        # backend can follow the call edge back to that span.  Previously this
+        # fixed point propagated only the display shape/dtype, leaving the
+        # formal ``unresolved`` even though the actual was fully accounted.
+        tensor_contract_keys = (
+            "program_abi_storage",
+            "program_abi_rank",
+            "tensor_metadata_state",
+            "tensor_shape_value_id",
+            "tensor_rank_value_id",
+            "tensor_element_count_value_id",
         )
+        source_tensor_contract = {
+            key: source_accounting[key]
+            for key in tensor_contract_keys
+            if source_accounting.get(key) is not None
+        }
         fixed_constant = int(value_id) in constant_result_ids(function)
         for value in occurrences_of(int(value_id), function):
             # An occurrence that declares itself an exact view of this same
@@ -718,6 +737,18 @@ def propagate_repository_ssa_call_metadata(
                 value.accounting = {
                     **dict(value.accounting or {}),
                     "ssa_aggregate_outputs": source_aggregate,
+                }
+                changed = True
+            for key, source_contract_value in source_tensor_contract.items():
+                old_contract_value = (value.accounting or {}).get(key)
+                if old_contract_value is not None and not authoritative:
+                    continue
+                if old_contract_value == source_contract_value:
+                    continue
+                _log(key, old_contract_value, source_contract_value)
+                value.accounting = {
+                    **dict(value.accounting or {}),
+                    key: source_contract_value,
                 }
                 changed = True
         return changed
@@ -851,6 +882,17 @@ def propagate_repository_ssa_call_metadata(
                         "ssa_aggregate_outputs", ()
                     )
                 ),
+                tuple(
+                    (key, (value.accounting or {}).get(key))
+                    for key in (
+                        "program_abi_storage",
+                        "program_abi_rank",
+                        "tensor_metadata_state",
+                        "tensor_shape_value_id",
+                        "tensor_rank_value_id",
+                        "tensor_element_count_value_id",
+                    )
+                ),
             )
             for function_name, function in module.functions.items()
             for occurrence, value in enumerate(values(function))
@@ -872,53 +914,32 @@ def propagate_repository_ssa_call_metadata(
         )
         return value_state, descriptor_state
 
-    # Which functions genuinely hold each numbered value.  A per-function
-    # cache (``values_by_id`` above) only ever answers "who shares this id
-    # WITHIN one function" -- it cannot see that the SAME numbered frame-
-    # storage slot is ALSO held by a caller several levels up the chain, so
-    # filling it here can leave a stale copy up there to later revert the
-    # fix (the ``restore`` paradox this diagnostic exists to name).  Trying
-    # to recognize this by accounting tag (``linked_call_frame_storage`` and
-    # its kin) is not reliable -- a plain, genuinely shared formal can carry
-    # empty accounting.  One reference count over the whole module, run
-    # once, answers the real structural question directly instead: does
-    # more than one function actually hold this id.  Funneled onto the
-    # shared book (not kept private) so it is inspectable and cross-
-    # checkable the same way every other page is, including in the always-
-    # on log.
-    reference_counts: dict[int, set[str]] = {}
+    # Source regions share their owner's value space, exactly as
+    # settle_canonical_value_metadata records above. Equal local integers in
+    # unrelated functions are not identities: energy helper value 68 (bool)
+    # used to retype binary_value's unrelated value 68 (double), poisoning
+    # subsequent native channel arithmetic. Cross-owner propagation follows
+    # the actual/formal call edges below, never a module-wide integer match.
+    scopes = {
+        id(function): str((function.metadata.get("source_region_integral") or {}).get(
+            "owner") or function.name)
+        for function in module.functions.values()
+    }
+    scoped_values: dict[tuple[str, int], dict[int, SSAValue]] = {}
+    reference_counts: dict[tuple[str, int], set[str]] = {}
     for owner_name, owner_function in module.functions.items():
         for value in values(owner_function):
-            reference_counts.setdefault(int(value.id), set()).add(owner_name)
-    shared_value_ids = {
-        value_id for value_id, owners in reference_counts.items()
-        if len(owners) > 1
-    }
-    reference_count_page = identity_book(module).page(
-        "cross_function_references"
-    )
-    for value_id in shared_value_ids:
-        reference_count_page.set(
-            value_id, 0, tuple(sorted(reference_counts[value_id]))
-        )
+            key = (scopes[id(owner_function)], int(value.id))
+            scoped_values.setdefault(key, {})[id(value)] = value
+            reference_counts.setdefault(key, set()).add(owner_name)
+    reference_count_page = identity_book(module).page("cross_function_references")
+    for key, owners in reference_counts.items():
+        if len(owners) > 1:
+            reference_count_page.set(key, 0, tuple(sorted(owners)))
 
     def occurrences_of(value_id: int, function: Any) -> tuple[SSAValue, ...]:
-        """Every live occurrence of ``value_id`` this enrichment must keep
-        synchronized: just this function's own cache for an ordinary,
-        function-local id, but every occurrence across every function that
-        holds it once the reference count says it is genuinely shared."""
-        if int(value_id) not in shared_value_ids:
-            return values_by_id(function).get(int(value_id), ())
-        seen: list[SSAValue] = []
-        seen_ids: set[int] = set()
-        for other_function in module.functions.values():
-            for candidate in values_by_id(other_function).get(
-                int(value_id), ()
-            ):
-                if id(candidate) not in seen_ids:
-                    seen_ids.add(id(candidate))
-                    seen.append(candidate)
-        return tuple(seen)
+        """Occurrences in this source owner's canonical value space."""
+        return tuple(scoped_values.get((scopes[id(function)], int(value_id)), {}).values())
 
     changed = True
     settle_exact_formals = True
@@ -1328,6 +1349,140 @@ def lower_tensor_calls_to_repository_ssa(
     as a one-element tensor.
     """
 
+    # A keyed Tensor child is physically selected in the control function and
+    # numerically consumed in a planned region.  The lookup commits its span
+    # identities to the shared concordance after the region was first built;
+    # transfer that exact contract onto every occurrence before tensor
+    # recognition.  This is identity transport, not shape inference.
+    shape_page = identity_book(module).pages.get("tensor_shape_concordance")
+    if shape_page is not None:
+        contract_keys = (
+            "program_abi_storage",
+            "program_abi_rank",
+            "tensor_metadata_state",
+            "tensor_shape_value_id",
+            "tensor_rank_value_id",
+            "tensor_element_count_value_id",
+        )
+        for function_name, function in module.functions.items():
+            owner_name = str(function.metadata.get(
+                "tensor_shape_concordance_scope"
+            ) or str(function_name).split("__planned_region_", 1)[0])
+            occurrences = [*function.args]
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    occurrences.extend(instruction.args)
+                    if instruction.res is not None:
+                        occurrences.append(instruction.res)
+            for value in occurrences:
+                fact = shape_page.latest((owner_name, int(value.id)))
+                if not isinstance(fact, Mapping):
+                    continue
+                transferred = {
+                    key: fact[key]
+                    for key in contract_keys
+                    if fact.get(key) is not None
+                }
+                if transferred:
+                    value.accounting = {
+                        **dict(value.accounting or {}),
+                        **transferred,
+                    }
+
+        # The metadata identities are produced beside the selected child span
+        # in the control function.  Make them ordinary call operands/formals
+        # at the same boundary.  Keeping an id only in accounting would name a
+        # value the planned function cannot read; the concordance contract is
+        # complete only when its shape/rank/count values cross the call too.
+        function_values: dict[str, dict[int, SSAValue]] = {}
+        for function_name, function in module.functions.items():
+            occurrences = [*function.args]
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    occurrences.extend(instruction.args)
+                    if instruction.res is not None:
+                        occurrences.append(instruction.res)
+            function_values[str(function_name)] = {
+                int(value.id): value for value in occurrences
+            }
+        metadata_keys = (
+            "tensor_shape_value_id",
+            "tensor_rank_value_id",
+            "tensor_element_count_value_id",
+        )
+        for callee_name, callee in module.functions.items():
+            if "__planned_region_" not in str(callee_name):
+                continue
+            original_formals = tuple(callee.args)
+            metadata_formals: list[SSAValue] = []
+            for formal in original_formals:
+                accounting = dict(formal.accounting or {})
+                if accounting.get("program_abi_storage") != "span":
+                    continue
+                for key in metadata_keys:
+                    value_id = accounting.get(key)
+                    if value_id is None or any(
+                        int(existing.id) == int(value_id)
+                        for existing in (*callee.args, *metadata_formals)
+                    ):
+                        continue
+                    metadata_formals.append(SSAValue(
+                        int(value_id), dtype="int32",
+                        accounting={
+                            "tensor_extent_for": int(formal.id),
+                            "tensor_extent_kind": key.removeprefix(
+                                "tensor_"
+                            ).removesuffix("_value_id"),
+                        },
+                    ))
+            if not metadata_formals:
+                continue
+            callee.args.extend(metadata_formals)
+            integral = dict(callee.metadata.get(
+                "source_region_integral", {}
+            ))
+            if integral:
+                integral["capture_value_ids"] = tuple(dict.fromkeys((
+                    *map(int, integral.get("capture_value_ids", ())),
+                    *(int(value.id) for value in metadata_formals),
+                )))
+                callee.metadata["source_region_integral"] = integral
+            for caller_name, caller in module.functions.items():
+                caller_values = function_values[str(caller_name)]
+                for block in caller.blocks.values():
+                    for instruction in block.instrs:
+                        if (
+                            instruction.op not in {"Call", "call"}
+                            or instruction.attributes.get("callee")
+                            != callee_name
+                        ):
+                            continue
+                        actuals = []
+                        for formal in metadata_formals:
+                            actual = caller_values.get(int(formal.id))
+                            if actual is None:
+                                raise ValueError(
+                                    "tensor shape concordance names unavailable "
+                                    f"caller value %{formal.id} for "
+                                    f"{caller_name} -> {callee_name}"
+                                )
+                            actuals.append(actual)
+                        instruction.args.extend(actuals)
+                        attributes = dict(instruction.attributes)
+                        attributes["feed_ids"] = tuple(dict.fromkeys((
+                            *map(int, attributes.get("feed_ids", ())),
+                            *(int(value.id) for value in actuals),
+                        )))
+                        attributes["feed_shapes"] = tuple((
+                            *attributes.get("feed_shapes", ()),
+                            *(tuple(value.shape or ()) for value in actuals),
+                        ))
+                        attributes["feed_dtypes"] = tuple((
+                            *attributes.get("feed_dtypes", ()),
+                            *(str(value.dtype or "int32") for value in actuals),
+                        ))
+                        instruction.attributes = attributes
+
     # Direct source compilation and autograd both consume the same repository
     # SSA.  Region calls must therefore settle their exact actual/formal and
     # return metadata here, at the common tensor boundary, rather than relying
@@ -1460,8 +1615,19 @@ def lower_tensor_calls_to_repository_ssa(
             if existing is not None:
                 return existing
             shape = tuple(map(int, value.shape))
+            value_accounting = dict(value.accounting or {})
+            declared_rank = int(
+                value_accounting.get("program_abi_rank", 0) or 0
+            )
+            declared_dynamic = (
+                str(value_accounting.get("tensor_metadata_state") or "")
+                == "dynamic"
+                or declared_rank > len(shape)
+            )
             state = metadata_state or (
-                "unresolved"
+                "dynamic"
+                if declared_dynamic
+                else "unresolved"
                 if tensor_id in unresolved_argument_ids
                 else "static"
             )
@@ -1482,12 +1648,26 @@ def lower_tensor_calls_to_repository_ssa(
             # inheriting a dynamic source's state inherits its extents too
             # (elementwise results share the source's runtime metadata).
             extent_ids: dict[str, int | None] = {
-                "shape_value_id": None,
-                "rank_value_id": None,
-                "element_count_value_id": None,
+                "shape_value_id": value_accounting.get(
+                    "tensor_shape_value_id"
+                ),
+                "rank_value_id": value_accounting.get(
+                    "tensor_rank_value_id"
+                ),
+                "element_count_value_id": value_accounting.get(
+                    "tensor_element_count_value_id"
+                ),
             }
             if state == "dynamic":
-                if extent_ids_from is None or extent_ids_from.shape_value_id is None:
+                if all(value_id is not None for value_id in extent_ids.values()):
+                    extent_ids = {
+                        key: int(value_id)
+                        for key, value_id in extent_ids.items()
+                    }
+                elif (
+                    extent_ids_from is None
+                    or extent_ids_from.shape_value_id is None
+                ):
                     state = "unresolved"
                 else:
                     extent_ids = {
@@ -1765,6 +1945,21 @@ def lower_tensor_calls_to_repository_ssa(
                     and (
                         tuple(instruction.res.shape)
                         or any(tuple(argument.shape) for argument in instruction.args)
+                        # Dynamic tensor spans deliberately have no invented
+                        # static extents.  Their tensor identity is carried by
+                        # the shape concordance as ordinary SSA accounting;
+                        # accept that contract here instead of falling through
+                        # to generic pointer indexing merely because ``shape``
+                        # is empty.
+                        or any(
+                            int((argument.accounting or {}).get(
+                                "program_abi_rank", 0
+                            ) or 0) > 0
+                            and str((argument.accounting or {}).get(
+                                "program_abi_storage", ""
+                            )) == "span"
+                            for argument in instruction.args
+                        )
                         # Symbolic shapes prove nothing either way; an operand
                         # already registered as a tensor descriptor (a kernel
                         # call's result) is proof enough of tensorhood.
@@ -1888,6 +2083,160 @@ def lower_tensor_calls_to_repository_ssa(
                     raw_axes = instruction.attributes.get(
                         "basic_index_axes"
                     )
+                    if (
+                        operation == "basic_index"
+                        and raw_axes is None
+                        and args
+                    ):
+                        source = args[0]
+                        source_accounting = dict(source.accounting or {})
+                        source_rank = int(source_accounting.get(
+                            "program_abi_rank", 0
+                        ) or 0)
+                        authored_indices = args[1:]
+                        decoded_indices = tuple(
+                            constants.get(int(value.id), value)
+                            for value in authored_indices
+                        )
+                        selected_axes = tuple(
+                            axis for axis, value in enumerate(decoded_indices)
+                            if not (
+                                isinstance(value, slice)
+                                and value.start is None
+                                and value.stop is None
+                                and value.step is None
+                            )
+                        )
+                        # A trailing scalar selection such as ``x[:, i]`` is
+                        # the dynamic counterpart of the existing static
+                        # basic-index path.  Its runtime shape/rank/count are
+                        # the concorded span operands above; submit the same
+                        # repository index-select law instead of flattening a
+                        # Python slice token into an address.
+                        if (
+                            source_rank > 1
+                            and len(authored_indices) == source_rank
+                            and selected_axes == (source_rank - 1,)
+                        ):
+                            shape_id = source_accounting.get(
+                                "tensor_shape_value_id"
+                            )
+                            rank_id = source_accounting.get(
+                                "tensor_rank_value_id"
+                            )
+                            values_by_id = {
+                                int(value.id): value
+                                for value in function.args
+                            }
+                            if shape_id is None or rank_id is None:
+                                shortfalls.append(TensorSSALoweringShortfall(
+                                    function_name,
+                                    block_name,
+                                    operation,
+                                    "dynamic basic index has no concorded "
+                                    "shape/rank operands",
+                                ))
+                                rewritten.append(instruction)
+                                continue
+                            shape_value = values_by_id.get(int(shape_id))
+                            rank_value = values_by_id.get(int(rank_id))
+                            if shape_value is None or rank_value is None:
+                                shortfalls.append(TensorSSALoweringShortfall(
+                                    function_name,
+                                    block_name,
+                                    operation,
+                                    "dynamic basic index shape/rank identities "
+                                    "are not region formals",
+                                ))
+                                rewritten.append(instruction)
+                                continue
+                            source_descriptor = register_tensor(
+                                source,
+                                storage=(
+                                    "input"
+                                    if int(source.id) in function_argument_ids
+                                    else "temporary"
+                                ),
+                            )
+                            dynamic_index = authored_indices[-1]
+                            index_vector = fresh(shape=(1,), dtype="int32")
+                            register_tensor(
+                                index_vector, storage="temporary"
+                            )
+                            output_rank, output_rank_def = constant(
+                                source_rank - 1, "int32"
+                            )
+                            output_count = fresh(dtype="int32")
+                            axis_value, axis_def = constant(
+                                source_rank - 1, "int32"
+                            )
+                            selection_count, selection_count_def = constant(
+                                1, "int32"
+                            )
+                            result.accounting = {
+                                **dict(result.accounting or {}),
+                                "program_abi_storage": "span",
+                                "program_abi_rank": source_rank - 1,
+                                "tensor_metadata_state": "dynamic",
+                                # Dropping the final axis leaves the leading
+                                # source extents contiguous at this pointer.
+                                "tensor_shape_value_id": int(shape_value.id),
+                                "tensor_rank_value_id": int(output_rank.id),
+                                "tensor_element_count_value_id": int(
+                                    output_count.id
+                                ),
+                            }
+                            register_tensor(result, storage="temporary")
+                            slice_ids = {
+                                int(value.id)
+                                for value, decoded in zip(
+                                    authored_indices, decoded_indices
+                                )
+                                if isinstance(decoded, slice)
+                            }
+                            if slice_ids:
+                                rewritten = [
+                                    prior for prior in rewritten
+                                    if not (
+                                        prior.op == Handler.Const.value
+                                        and prior.res is not None
+                                        and int(prior.res.id) in slice_ids
+                                    )
+                                ]
+                            prefix.extend((
+                                Instr(
+                                    Handler.Store.value,
+                                    [dynamic_index, index_vector],
+                                    None,
+                                    attributes={
+                                        "binding": "dynamic-index-vector",
+                                    },
+                                ),
+                                output_rank_def,
+                                Instr(
+                                    Handler.Load.value,
+                                    [shape_value],
+                                    output_count,
+                                    attributes={
+                                        "binding": "dynamic-index-output-count",
+                                    },
+                                ),
+                                axis_def,
+                                selection_count_def,
+                            ))
+                            emitted.append(call(
+                                "index_select_double",
+                                [
+                                    source, result, shape_value, rank_value,
+                                    axis_value, index_vector,
+                                    selection_count,
+                                ],
+                                result,
+                                instruction,
+                                output_argument=1,
+                            ))
+                            rewritten.extend((*prefix, *emitted))
+                            continue
                     if raw_axes is not None and args:
                         axes = tuple(
                             (tuple(map(int, indices)), bool(drop_axis))
@@ -2775,6 +3124,27 @@ def lower_tensor_calls_to_repository_ssa(
                         emitted.append(call(
                             "reduce_dim_double", [source, result, shape_value, ndim, dim, code],
                             result, instruction, output_argument=1,
+                        ))
+                    elif (
+                        axis is not None
+                        and source_count is not None
+                        and result_count is not None
+                        and source_count == result_count
+                    ):
+                        # The reduced axis has extent one: that extent IS the
+                        # ratio of the operand's element count to the result's.
+                        # Summing, multiplying or selecting over a single
+                        # element returns that element, so every reduction code
+                        # agrees with the repository's shape-only alias and no
+                        # reduction kernel is required.  Region planning
+                        # produces exactly this case -- a specialized slice of
+                        # length one arrives as one element with no axis left
+                        # to spell -- and the counts still refuse a genuine
+                        # multi-element axis, whose ratio is greater than one.
+                        emitted.append(Instr(
+                            "clone", [source], result,
+                            attributes={"lowered_from": operation},
+                            source_span=instruction.source_span,
                         ))
 
                 elif operation == "cumsum" and source is not None and source.shape:

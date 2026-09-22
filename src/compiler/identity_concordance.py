@@ -1233,9 +1233,18 @@ def identity_book(module: Any) -> IdentityBook:
     ``IRModule``, inspected after the fact) and code with only the ambient
     compile context (a pass mid-construction, or an exception handler with
     no module at all) read the exact same instance."""
-    book = current_identity_book()
     metadata = getattr(module, "metadata", None)
-    if metadata is not None and metadata.get("identity_book") is None:
+    # The compile closes its book in a ``finally`` before returning, so after
+    # that point ``current_identity_book()`` mints a fresh EMPTY one.  A
+    # caller holding the finished module would then read an empty book and
+    # conclude the compile recorded nothing -- which is the opposite of what
+    # this function promises.  The module's own attached book wins whenever
+    # there is one.
+    attached = None if metadata is None else metadata.get("identity_book")
+    if attached is not None:
+        return attached
+    book = current_identity_book()
+    if metadata is not None:
         metadata["identity_book"] = book
     return book
 

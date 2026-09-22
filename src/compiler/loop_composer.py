@@ -5060,8 +5060,28 @@ def analyze_shader_loop_reductions(
                     source_loop_node_id=int(loop.node_id),
                     terminal_controls=terminal_controls,
                 )
+            step_expression = (
+                bound_expressions.get("step", "1")
+                if loop.step is None else str(loop.step)
+            )
+            # A counted loop's exclusive bound is only a ceiling while the
+            # step is positive.  ``range(n - 1, -1, -1)`` counts DOWN, and its
+            # ``-1`` is a floor: the forward ``lt`` test is false on the first
+            # iteration, so the body never runs and every value the loop was
+            # to publish stays at its seed.  The adjoint lowering already
+            # states this pairing (a negative step with ``gt``); an authored
+            # reverse range is the same loop and gets the same comparison.
+            # Only a step PROVEN negative flips it -- a step that is still an
+            # expression keeps the forward reading it has always had.
+            try:
+                literal_step = int(str(step_expression).strip())
+            except ValueError:
+                literal_step = None
             return LoopBlock(
                 induction=induction_name,
+                comparison="gt" if (
+                    literal_step is not None and literal_step < 0
+                ) else "lt",
                 result_ports=result_ports,
                 control_site_ids=control_site_ids,
                 carried_seeds=carried_seeds,
@@ -5088,10 +5108,7 @@ def analyze_shader_loop_reductions(
                         "stop", f"u_control_{loop.stop_node}"
                     )
                 ),
-                step=(
-                    bound_expressions.get("step", "1")
-                    if loop.step is None else str(loop.step)
-                ),
+                step=step_expression,
                 body=scheduled_body,
                 carried_aliases=carried_aliases,
                 parallel_iterations=bool(

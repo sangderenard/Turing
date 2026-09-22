@@ -791,6 +791,7 @@ def tensor_likeness(operation: str) -> str | None:
 
 import ctypes as _ctypes
 import math as _math
+import operator as _operator
 import re as _re
 import struct as _struct
 import subprocess as _subprocess
@@ -850,6 +851,9 @@ _LLVM_INTRINSIC_DECLARATIONS: dict[str, str] = {
     # Entry-frame storage past ``_FRAME_HEAP_BYTES`` lives on the heap.
     "malloc": "declare ptr @malloc(i64)",
     "free": "declare void @free(ptr)",
+    "turing_validation_error": (
+        "declare void @turing_validation_error(i32)"
+    ),
 }
 
 
@@ -1386,6 +1390,21 @@ def _emit_repository_call_module(
         return False
 
     callee_aggregate_parameter_positions: dict[str, set[int]] = {}
+
+    def integral_offset(value: _Any) -> int | None:
+        """Return an exact integral selector without coercing other records."""
+
+        try:
+            return int(_operator.index(value))
+        except TypeError:
+            return None
+
+    def positive_integral_offset(value: _Any) -> bool:
+        """Whether a constant is an addressable aggregate slot ordinal."""
+
+        offset = integral_offset(value)
+        return offset is not None and offset >= 1
+
     for callee_name in reachable:
         callee_function = module.functions[callee_name]
         parameter_ids = [int(parameter.id) for parameter in callee_function.args]
@@ -1430,7 +1449,7 @@ def _emit_repository_call_module(
                     )
                     if (
                         constant_offset is not None
-                        and int(constant_offset) >= 1
+                        and positive_integral_offset(constant_offset)
                         and instruction.res is not None
                         and _gep_result_is_dereferenced(
                             callee_function, int(instruction.res.id)
@@ -1438,7 +1457,7 @@ def _emit_repository_call_module(
                     ):
                         positions.add(parameter_ids.index(base_id))
                     continue
-                if offset is not None and int(offset) >= 1:
+                if offset is not None and positive_integral_offset(offset):
                     positions.add(parameter_ids.index(base_id))
         if positions:
             callee_aggregate_parameter_positions[callee_name] = positions
@@ -1775,8 +1794,20 @@ def _emit_repository_call_module(
         aggregate_members: dict[int, dict[int, str]] = {}
         address_members: dict[int, str] = {}
         address_slots: dict[int, str] = {}
-        span_addresses: dict[int, str] = {}
-        span_address_types: dict[int, str] = {}
+        # Dynamic tensor metadata crosses planned-region calls as ordinary SSA
+        # formals.  A ``shape`` formal is an i32 span address, so a Load from
+        # it reads the first extent just as a GEP-derived span address does.
+        # Rank and element-count formals remain scalar cells.
+        span_addresses: dict[int, str] = {
+            int(value.id): pointers[int(value.id)]
+            for value in function.args
+            if (value.accounting or {}).get("tensor_extent_kind") == "shape"
+        }
+        span_address_types: dict[int, str] = {
+            int(value.id): "i32"
+            for value in function.args
+            if (value.accounting or {}).get("tensor_extent_kind") == "shape"
+        }
         allocated: set[int] = set()
         output_pointer = {
             int(value.id): f"%out.{index}"
@@ -2270,6 +2301,36 @@ def _emit_repository_call_module(
                     payload = instruction.attributes.get("values")
                 if payload is None and "value" in instruction.attributes:
                     payload = instruction.attributes.get("value")
+                if isinstance(payload, slice):
+                    uses = tuple(
+                        (consumer, position)
+                        for candidate_block in function.blocks.values()
+                        for consumer in candidate_block.instrs
+                        for position, argument in enumerate(consumer.args)
+                        if int(argument.id) == result_id
+                    )
+                    if (
+                        uses
+                        and all(
+                            consumer.op in {"GetElementPtr", "getelementptr"}
+                            and position == 1
+                            for consumer, position in uses
+                        )
+                        and payload.start in {None, 0}
+                        and payload.step in {None, 1}
+                    ):
+                        # Structural sequence slicing carries its resulting
+                        # length in the sequence descriptor.  The SSA value
+                        # consumed by GEP is only the contiguous slice's start
+                        # address; ``[:-1]`` and ``[:-2]`` both begin at zero.
+                        payload = 0
+                    else:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation,
+                            "structural slice selector reached LLVM without "
+                            "a contiguous sequence-address use",
+                        ))
+                        continue
                 target = pointer(result)
                 if isinstance(payload, (tuple, list)):
                     for index, item in enumerate(payload):
@@ -2290,6 +2351,30 @@ def _emit_repository_call_module(
                         )
                     else:
                         register_cache.clear()
+                continue
+
+            if operation == "string_token" and result is not None:
+                target = pointer(result)
+                llvm_type = _value_llvm_type(result)
+                body.append(
+                    f"  store {llvm_type} "
+                    f"{literal(int(instruction.attributes.get('token', 0)), llvm_type)}, "
+                    f"ptr {target}, align {_align(llvm_type)}"
+                )
+                register_cache.clear()
+                continue
+
+            if operation in {"NoneValue", "nonevalue"} and result is not None:
+                # Structural absence uses the same zero sentinel as the C
+                # repository emitter. It is an ordinary ABI cell, not a
+                # retained Python object.
+                target = pointer(result)
+                llvm_type = _value_llvm_type(result)
+                body.append(
+                    f"  store {llvm_type} {literal(0, llvm_type)}, "
+                    f"ptr {target}, align {_align(llvm_type)}"
+                )
+                register_cache.clear()
                 continue
 
             if operation in {"Phi", "phi"} and result is not None:
@@ -2464,6 +2549,20 @@ def _emit_repository_call_module(
                     pointers[result_id] = destination
                 else:
                     pointers[result_id] = source_pointer
+                continue
+
+            if (
+                operation in {"clone", "copy", "detach"}
+                and result is not None
+                and len(instruction.args) == 1
+            ):
+                source = instruction.args[0]
+                body.append(
+                    "  call void @llvm.memcpy.p0.p0.i64("
+                    f"ptr {pointer(result)}, ptr {pointer(source)}, "
+                    f"i64 {_value_block_bytes(result)}, i1 false)"
+                )
+                register_cache.clear()
                 continue
 
             if operation in {"zeros_like", "zeros"} and result is not None:
@@ -2738,6 +2837,16 @@ def _emit_repository_call_module(
                 # call must not serve reads after it.
                 register_cache.clear()
                 symbol = str(callee)
+                if symbol == "turing_validation_error":
+                    error_code = int(instruction.attributes.get(
+                        "error_code", 0
+                    ))
+                    body.append(
+                        "  call void @turing_validation_error"
+                        f"(i32 {error_code})"
+                    )
+                    kernels_used.add(symbol)
+                    continue
                 tensor_operation = instruction.attributes.get("tensor_operation")
                 if (
                     instruction.res is not None
@@ -2858,15 +2967,39 @@ def _emit_repository_call_module(
                     "cast_double_to_double_values",
                     "cast_double_to_bool_values",
                 }:
-                    if len(instruction.args) != 1 or result is None:
+                    arguments = list(instruction.args)
+                    output_argument = instruction.attributes.get(
+                        "ssa_output_argument"
+                    )
+                    if output_argument is not None:
+                        position = int(output_argument)
+                        if (
+                            position < len(arguments)
+                            and result is not None
+                            and int(arguments[position].id) == int(result.id)
+                        ):
+                            del arguments[position]
+                    if len(arguments) not in {1, 2} or result is None:
                         shortfalls.append(LLVMEmissionShortfall(
                             name, symbol,
-                            "semantic cast call requires one authored operand",
+                            "semantic cast call requires one source and an "
+                            "optional explicit element count",
                         ))
                         continue
+                    destination = (
+                        output_pointer.get(result_id) or pointer(result)
+                    )
+                    count = (
+                        str(result_count)
+                        if len(arguments) == 1 else
+                        load_as(
+                            arguments[1], "i32",
+                            f"semantic.cast.count.{result_id}",
+                        )
+                    )
                     body.append(
-                        f"  call void @{symbol}(ptr {pointer(instruction.args[0])}, "
-                        f"ptr {destination}, i32 {result_count})"
+                        f"  call void @{symbol}(ptr {pointer(arguments[0])}, "
+                        f"ptr {destination}, i32 {count})"
                     )
                     kernels_used.add(symbol)
                     continue
@@ -3853,6 +3986,9 @@ class LLVMFunctionArtifact:
     #: fine", which is the failure mode this whole mechanism exists to end.
     watch_shortfalls: tuple[tuple[int, str], ...] = ()
     _entry: _Any = _field(default=None, repr=False)
+    _library: _Any = _field(default=None, repr=False)
+    _validation_error_reset: _Any = _field(default=None, repr=False)
+    _validation_error_take: _Any = _field(default=None, repr=False)
 
     @property
     def complete(self) -> bool:
@@ -3862,8 +3998,8 @@ class LLVMFunctionArtifact:
         if self.library_path is None:
             raise RuntimeError("artifact was not compiled")
         if self._entry is None:
-            library = _ctypes.CDLL(str(self.library_path))
-            function = getattr(library, self.name)
+            self._library = _ctypes.CDLL(str(self.library_path))
+            function = getattr(self._library, self.name)
             function.restype = None
             function.argtypes = [
                 _ctypes.POINTER(_ctypes.c_void_p),
@@ -3871,6 +4007,28 @@ class LLVMFunctionArtifact:
             ]
             self._entry = function
         return self._entry
+
+    def reset_validation_error(self) -> None:
+        if "@turing_validation_error(" not in self.llvm_ir:
+            return
+        self.entry()
+        if self._validation_error_reset is None:
+            reset = getattr(self._library, "turing_validation_error_reset")
+            reset.restype = None
+            reset.argtypes = []
+            self._validation_error_reset = reset
+        self._validation_error_reset()
+
+    def take_validation_error(self) -> int:
+        if "@turing_validation_error(" not in self.llvm_ir:
+            return 0
+        self.entry()
+        if self._validation_error_take is None:
+            take = getattr(self._library, "turing_validation_error_take")
+            take.restype = _ctypes.c_uint32
+            take.argtypes = []
+            self._validation_error_take = take
+        return int(self._validation_error_take())
 
 
 @_dataclass
@@ -3886,7 +4044,13 @@ class LLVMExecution:
     scalar_index: dict = _field(default_factory=dict)
 
     def run(self) -> "LLVMExecution":
+        self.artifact.reset_validation_error()
         self.artifact.entry()(self.pointers, self.extents)
+        validation_error = self.artifact.take_validation_error()
+        if validation_error:
+            raise RuntimeError(
+                f"LLVM runtime validation failed with code {validation_error}"
+            )
         return self
 
 
@@ -4990,6 +5154,21 @@ def emit_ssa_function_to_llvm(
                 )
                 continue
 
+            if operation == "string_token" and instruction.res is not None:
+                scalars[result_id] = (
+                    str(int(instruction.attributes.get("token", 0))),
+                    _value_llvm_type(instruction.res),
+                )
+                continue
+
+            if operation in {"NoneValue", "nonevalue"} and (
+                instruction.res is not None
+            ):
+                scalars[result_id] = (
+                    "0", _value_llvm_type(instruction.res),
+                )
+                continue
+
             if operation in {"GetElementPtr", "getelementptr"} and (
                 instruction.res is not None and len(instruction.args) >= 2
             ):
@@ -5164,6 +5343,30 @@ def emit_ssa_function_to_llvm(
                 else:
                     buffer_aliases[result_id] = source_id
                     scalars[result_id] = (buffer(source_id), "ptr")
+                continue
+
+            if (
+                operation in {"clone", "copy", "detach"}
+                and instruction.res is not None
+                and len(instruction.args) == 1
+            ):
+                source_id = int(instruction.args[0].id)
+                known = scalars.get(source_id)
+                if known is not None and known[1] != "ptr":
+                    scalars[result_id] = known
+                else:
+                    source_pointer = (
+                        known[0]
+                        if known is not None and known[1] == "ptr"
+                        else buffer(source_id)
+                    )
+                    destination = buffer(result_id)
+                    lines.append(
+                        "  call void @llvm.memcpy.p0.p0.i64("
+                        f"ptr {destination}, ptr {source_pointer}, "
+                        f"i64 {_value_block_bytes(instruction.res)}, i1 false)"
+                    )
+                    scalars[result_id] = (destination, "ptr")
                 continue
 
             callee = instruction.attributes.get("callee")
@@ -5617,6 +5820,12 @@ def compile_artifact(
             _Path(__file__).resolve().parents[1]
             / "common" / "tensors" / "accelerator_backends" / "c_backend"
             / "turing_stream_buffer.c"
+        ))
+    if "@turing_validation_error(" in artifact.llvm_ir:
+        command.append(str(
+            _Path(__file__).resolve().parents[1]
+            / "common" / "tensors" / "accelerator_backends" / "c_backend"
+            / "turing_validation_runtime.c"
         ))
     # zig's bundled runtimes (compiler_rt, mingw CRT) build on demand into a
     # shared cache, and back-to-back invocations occasionally lose that race

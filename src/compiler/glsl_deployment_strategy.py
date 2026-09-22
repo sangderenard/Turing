@@ -2124,7 +2124,7 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         Return.value to its graph value without restoring transient ids.
         """
 
-        return_spans = set()
+        return_signatures = set()
         for _candidate_id, candidate_data in child_graph.nodes(data=True):
             expression = candidate_data.get("expr_obj")
             if not isinstance(expression, ast.AST):
@@ -2132,24 +2132,13 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             for nested in ast.walk(expression):
                 if not isinstance(nested, ast.Return) or nested.value is None:
                     continue
-                return_spans.add((
-                    int(getattr(nested.value, "lineno", -1)),
-                    int(getattr(nested.value, "col_offset", -1)),
-                    int(getattr(nested.value, "end_lineno", -1)),
-                    int(getattr(nested.value, "end_col_offset", -1)),
-                ))
+                return_signatures.add(_ast_source_signature(nested.value))
         matched = []
         for candidate_id, candidate_data in child_graph.nodes(data=True):
             expression = candidate_data.get("expr_obj")
             if not isinstance(expression, ast.AST):
                 continue
-            span = (
-                int(getattr(expression, "lineno", -1)),
-                int(getattr(expression, "col_offset", -1)),
-                int(getattr(expression, "end_lineno", -1)),
-                int(getattr(expression, "end_col_offset", -1)),
-            )
-            if span not in return_spans:
+            if _ast_source_signature(expression) not in return_signatures:
                 continue
             value_id = int(candidate_data.get("value_id", candidate_id))
             attributes = candidate_data.get("attributes") or {}
@@ -2305,6 +2294,8 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                 ):
                     name = receiver_parameter
                 elif role.startswith("kw:"):
+                    name = role.split(":", 1)[1]
+                elif role.startswith("closure:"):
                     name = role.split(":", 1)[1]
                 else:
                     name = None
@@ -2851,12 +2842,27 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             parents = numerical_region_parents(value)
             opcode = str(node_data.get("op") or node_data.get("type"))
             line_attributes = dict(node_data.get("attributes") or {})
-            if isinstance(expression, ast.Attribute):
-                # The graph may retain the frontend spelling ``Attribute``;
-                # repository SSA uses the semantic memory operation and must
-                # retain the selected field name in its record ABI.
-                opcode = "GetAttr"
-                line_attributes.setdefault("attribute", expression.attr)
+            if (
+                isinstance(expression, ast.Attribute)
+                or (
+                    str(node_data.get("op") or node_data.get("type") or "")
+                    .casefold() == "getattr"
+                    and line_attributes.get("tensor") is not None
+                )
+            ):
+                tensor_property = line_attributes.get("tensor")
+                if tensor_property in abstract_tensor_funcs:
+                    # NumPy/Torch expose ``real``/``imag`` as properties;
+                    # after receiver grounding they are the same abstract
+                    # tensor operations as ``AbstractTensor.real(x)`` and
+                    # ``AbstractTensor.imag(x)``.
+                    opcode = str(tensor_property)
+                else:
+                    # The graph may retain the frontend spelling ``Attribute``;
+                    # repository SSA uses the semantic memory operation and must
+                    # retain the selected field name in its record ABI.
+                    opcode = "GetAttr"
+                    line_attributes.setdefault("attribute", expression.attr)
             elif opcode in {"Call", "call"} and str(
                 line_attributes.get("tensor") or ""
             ) in abstract_tensor_funcs:
@@ -2974,14 +2980,21 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                             int(extent)
                             for extent in (abi_entry.get("shape") or ())
                         )
-                shape = tuple(
-                    tensor.get("shape") or specialized_shape or abi_shape or ()
-                )
-                if not shape:
+                tensor_shape_declared = "shape" in tensor
+                if tensor_shape_declared:
+                    # An empty static extent tuple can be the exact companion
+                    # to a nonzero dynamic rank.  It means "runtime extents",
+                    # not "consult the padded DomainNode default".
+                    shape = tuple(tensor.get("shape") or ())
+                elif specialized_shape:
+                    shape = specialized_shape
+                elif abi_shape:
+                    shape = abi_shape
+                else:
                     shape = tuple(getattr(domain, "shape", ()) or ())
                 logical = (
                     tuple(map(int, shape))
-                    if tensor.get("shape") is not None
+                    if tensor_shape_declared
                     or specialized_shape
                     or abi_shape
                     else tuple(int(dim) for dim in shape if int(dim) != 1)
@@ -3209,11 +3222,23 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             _value_shape_dtype(value_id)
             for value_id in (*region_nodes, *region_captures)
         )
+        value_ranks = tuple(
+            (
+                int(value_id),
+                int((descriptor or {}).get(
+                    "rank", len(tuple((descriptor or {}).get("shape") or ()))
+                )),
+            )
+            for value_id in (*region_nodes, *region_captures)
+            for descriptor in (_tensor_descriptor(graph, int(value_id)),)
+            if descriptor is not None
+        )
         items.append(PlanClosure(
             name=f"region_{region_index}",
             captures=region_captures,
             items=(*const_lines, *compute_lines),
             value_shapes=value_shapes,
+            value_ranks=value_ranks,
         ))
     control_values = set(_control_dependency_value_ids(
         getattr(shell, "shell_control_program", None)
@@ -3512,6 +3537,8 @@ def _refresh_hierarchy_control_captures(
         tuple(dict.fromkeys((*closure.captures, *sorted(values)))),
         tuple(refreshed_items),
         closure.closure_id,
+        closure.value_shapes,
+        closure.value_ranks,
     )
 
 
@@ -6720,6 +6747,21 @@ def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
             for name in ("callee_ref", "method_ref", "class_ref")
         )
     ):
+        return False
+    if (
+        str(data.get("op") or node_type).casefold() == "getattr"
+        and str(attributes.get("tensor") or "")
+        in abstract_tensor_funcs
+        and attributes.get("tensor_candidate") == attributes.get("tensor")
+        and not any(
+            attributes.get(name) is not None
+            for name in ("callee_ref", "method_ref", "class_ref")
+        )
+    ):
+        # A receiver-grounded NumPy/Torch tensor property is numerical work,
+        # despite retaining its authored Attribute syntax.  The source
+        # candidate plus the exact receiver tensor descriptor is the proof;
+        # an ordinary object field with the same name never reaches here.
         return False
     if node_type == "BitLength" and bool(
         (data.get("attributes") or {}).get("python_scalar_intrinsic")
@@ -15995,15 +16037,57 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                     copy.deepcopy(tuple(nested))
                 )
             else:
-                output_descriptors.append(
-                    _structured_output_descriptor(specialized, value_id)
+                descriptor = _structured_output_descriptor(
+                    specialized, value_id,
                 )
+                if isinstance(descriptor, Mapping) and not (
+                    descriptor_states_a_shape(descriptor)
+                ):
+                    # The identity table lists every value that IS this
+                    # binding; they are one storage by construction.  The last
+                    # resident one is what the return names, but a store or a
+                    # loop-carried port among them can answer the descriptor
+                    # query with nothing at all.  Read the shape from whichever
+                    # identity states it rather than publish a factless return
+                    # that every caller installs as a rank-0 scalar.
+                    for candidate in reversed(output_ids):
+                        if int(candidate) == value_id:
+                            continue
+                        alternative = _structured_output_descriptor(
+                            specialized, int(candidate),
+                        )
+                        if isinstance(alternative, Mapping) and (
+                            descriptor_states_a_shape(alternative)
+                        ):
+                            descriptor = alternative
+                            break
+                output_descriptors.append(descriptor)
 
         def any_descriptor(item: Any) -> bool:
             if isinstance(item, tuple):
                 return any(any_descriptor(member) for member in item)
             return item is not None
 
+        # Record this round's decision in the concordance.  The
+        # specialization fixed point below has no bound of its own: it repeats
+        # until nothing changes.  Writing each round's published return shape
+        # to its own page means ``IdentityPage.oscillating_rows`` can name a
+        # row that leaves a shape and comes back to it -- a round trip, which
+        # a settling fixed point never makes -- instead of the whole compile
+        # merely looking slow from outside.
+        from .identity_concordance import current_identity_book
+
+        _page = current_identity_book().page("callsite_return_specialization")
+        _row = (
+            str(caller.G.graph.get("function_name")),
+            str(callee.G.graph.get("function_name")),
+            int(node_id),
+        )
+        _page.set(_row, len(_page.history(_row)), tuple(
+            None if item is None or not isinstance(item, Mapping)
+            else (tuple(item.get("shape") or ()), str(item.get("dtype") or ""))
+            for item in output_descriptors
+        ))
         return (
             tuple(copy.deepcopy(output_descriptors))
             if any(any_descriptor(item) for item in output_descriptors)
@@ -16427,7 +16511,14 @@ class _ProgramABIValueFact:
     # fact about the lookup result, not a second identity for the lookup or its
     # deterministic key.
     value_python_type: str | None = None
+    value_storage: str | None = None
     token_vocabulary: tuple[str, ...] | None = None
+    shape: tuple[int, ...] | None = None
+    # Logical tensor rank is distinct from the flat span used to carry its
+    # elements.  ``None`` means the annotation did not state a rank; tensor
+    # operations may constrain it without inventing extents.
+    rank: int | None = None
+    value_rank: int | None = None
 
 
 def _contains_program_abi_fact(value: Any) -> bool:
@@ -16497,7 +16588,119 @@ _DTYPE_CAST_OPERATIONS = frozenset({
 })
 
 
+# Elementwise operations whose result shape is the broadcast of its operands.
+# ``matmul`` is deliberately absent: it contracts rather than broadcasts and
+# has its own rule where it is lowered.
+def _attribute_axis(data: Any) -> int | None:
+    """The axis an operation names in its own attributes, when it names one."""
+
+    attributes = data.get("attributes") or {}
+    for key in ("dim", "axis", "dims", "axes"):
+        value = attributes.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return int(value)
+    return None
+
+
+# Spellings are the CATALOG's, not Python's: a comparison arrives as
+# ``equal`` / ``greater_equal``, never ``eq`` / ``ge``.  Guessing the names
+# here meant the rule silently never fired on any comparison, which is what
+# builds every mask in axis-oriented source.
+_ELEMENTWISE_BINARY_OPERATIONS = frozenset({
+    "add", "sub", "mul", "div", "truediv", "floordiv", "mod", "pow",
+    "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
+    "eq", "ne", "lt", "le", "gt", "ge",
+    "maximum", "minimum", "clamp_min", "clamp_max",
+    "logical_and", "logical_or", "logical_xor",
+    "bitwise_and", "bitwise_or", "bitwise_xor",
+})
+
+
+def descriptor_states_a_shape(descriptor: Any) -> bool:
+    """True only when a tensor descriptor actually states its extents.
+
+    ``_tensor_descriptor`` answers every query, so its answer must be read
+    for what it says.  Two of its answers state nothing:
+
+    * ``rank`` larger than the extents listed -- a flat span whose extent is
+      still unknown, which is not the rank-0 scalar ``shape=()`` reads as;
+    * an empty shape with an unknown dtype -- what the query returns when
+      recovery stops, as it does on a loop-carried result.
+
+    An empty shape WITH a known dtype is a genuine rank-0 scalar and is a
+    fact.  Treating the other two as facts retyped a matrix as one number at
+    a call edge and folded ``get_shape()`` to ``()`` inside the callee.
+    """
+
+    if not isinstance(descriptor, Mapping):
+        return False
+    shape = tuple(descriptor.get("shape") or ())
+    if int(descriptor.get("rank", len(shape))) != len(shape):
+        return False
+    return bool(shape) or str(
+        descriptor.get("dtype") or "unknown"
+    ) != "unknown"
+
+
 def _tensor_descriptor(
+    graph: Any, node_id: int, _seen: set[int] | None = None,
+) -> dict[str, Any] | None:
+    """The compiler-owned shape query, with its answer recorded."""
+
+    row = None
+    page = None
+    try:
+        from .identity_concordance import current_identity_book
+
+        data = graph.G.nodes[int(node_id)] if int(node_id) in graph.G else {}
+        page = current_identity_book().page("proven_shape")
+        row = (
+            str(graph.G.graph.get("function_name")),
+            int(data.get("value_id", node_id)),
+        )
+        proven = page.latest(row)
+        if proven is not None and proven[0] != "conflicting":
+            # Already proven.  Answering from the page is what makes the
+            # query a function of the value rather than of the moment.
+            return {
+                "shape": tuple(proven[1]),
+                "dtype": str(proven[2]),
+                "rank": len(tuple(proven[1])),
+            }
+    except Exception:
+        row = None
+
+    answer = _tensor_descriptor_rule(graph, node_id, _seen)
+
+    if row is not None and page is not None:
+        try:
+            extents = tuple(answer.get("shape") or ()) if answer else ()
+            dynamic = bool(
+                answer and str(answer.get("metadata_state") or "") == "dynamic"
+            )
+            # Only an answer with real extents is a proof.  An empty shape is
+            # never cemented: it is indistinguishable from "recovery stopped".
+            if extents and not dynamic:
+                dtype = str((answer or {}).get("dtype") or "float64")
+                previous = page.latest(row)
+                if previous is None:
+                    page.set(row, 0, ("proven", extents, dtype))
+                elif previous[0] == "proven" and tuple(previous[1]) != extents:
+                    # Two derivations prove two different shapes for one
+                    # identity.  Record it and stop answering from the page
+                    # rather than let whichever asked first speak for both.
+                    page.set(
+                        row, len(page.history(row)),
+                        ("conflicting", extents, dtype),
+                    )
+        except Exception:
+            pass
+    return answer
+
+
+def _tensor_descriptor_rule(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
     """Return compiler-owned tensor facts without inspecting a runtime value."""
@@ -16510,15 +16713,56 @@ def _tensor_descriptor(
     seen.add(int(node_id))
     data = graph.G.nodes[int(node_id)]
     tensor = dict(data.get("tensor") or {})
+    # A generic tensor annotation publishes flat native span storage before a
+    # caller is known, so its graph node deliberately starts with dynamic
+    # metadata and an empty static shape.  Whole-program planning later puts
+    # the exact caller contract on this value identity.  Read that contract
+    # before the provisional local descriptor: otherwise ``Tensor``'s flat
+    # span rank wins over a caller's logical ``(m, n)`` shape and fundamental
+    # operations such as get_shape()/dim() are frozen as runtime scalar feeds.
+    linked = (
+        graph.G.graph.get("linked_value_abi") or {}
+    ).get(int(data.get("value_id", node_id)))
+    if (
+        isinstance(linked, Mapping)
+        and linked.get("shape") is not None
+    ):
+        linked_shape = tuple(map(int, linked["shape"]))
+        tensor = {
+            **tensor,
+            "shape": linked_shape,
+            "dtype": str(
+                linked.get("dtype") or tensor.get("dtype") or "float64"
+            ),
+            "rank": len(linked_shape),
+        }
+        tensor.pop("metadata_state", None)
+    descriptor_operation = str(
+        data.get("op") or data.get("type") or ""
+    ).casefold()
+    provisional_tensor = None
+    if tensor.get("metadata_state") == "dynamic" or (
+        descriptor_operation in {
+            "identity", "loopresult", "loopexit", "loopstateport",
+        }
+        and not tuple(tensor.get("shape") or ())
+        and str(tensor.get("dtype") or "unknown") == "unknown"
+    ):
+        # Dynamic metadata is a physical span/rank fallback, not a settled
+        # logical shape.  Give exact operator identity (clone, loop result,
+        # indexing, cast, and call-result projection) a chance to recover the
+        # caller-proven descriptor before returning that fallback.
+        provisional_tensor = dict(tensor)
+        tensor = {}
+    declared_rank = int(
+        (data.get("attributes") or {}).get("program_abi_rank", 0) or 0
+    )
     if "shape" not in tensor:
         # Whole-object lowering propagates exact Program-ABI contracts over
         # PlanCall argument bindings by SSA value identity. A callee input
         # need not have a useful local binding-name contract, so consult that
         # shared value ledger before attempting operation inference. This is
         # the same declared boundary fact, not backend shape recovery.
-        linked = (
-            graph.G.graph.get("linked_value_abi") or {}
-        ).get(int(data.get("value_id", node_id)))
         if isinstance(linked, Mapping) and linked.get("shape") is not None:
             tensor = {
                 "shape": tuple(map(int, linked["shape"])),
@@ -16566,6 +16810,13 @@ def _tensor_descriptor(
                 "shape": tuple(map(int, field["shape"])),
                 "dtype": str(field.get("dtype") or "float64"),
             }
+        elif field_name in {"real", "imag"} and receiver is not None:
+            inherited = _tensor_descriptor(graph, receiver, seen)
+            if inherited is not None:
+                tensor = dict(inherited)
+                # Both projections expose real-valued elements while
+                # preserving the source tensor's storage/rank contract.
+                tensor["dtype"] = "float64"
     if "shape" not in tensor and data.get("type") == "Input":
         binding_name = (data.get("attributes") or {}).get("binding_name")
         boundary = (
@@ -16623,17 +16874,200 @@ def _tensor_descriptor(
                         f"edges={sources!r}"
                     )
                 sources = (declared_source,)
-            if len(sources) == 1:
-                return _tensor_descriptor(graph, sources[0], seen)
+            inherited = (
+                _tensor_descriptor(graph, sources[0], seen)
+                if len(sources) == 1 else None
+            )
+            # EXTENTS, not merely "states a shape".  A carried matrix whose
+            # update resolves to a bare rank-0 answer is not a scalar -- it is
+            # the query giving up -- and accepting it here meant the seed,
+            # which knows the real shape, was never consulted.  A genuinely
+            # scalar carried value (a running sign, a counter) resolves to the
+            # same rank-0 answer through the seed below, so preferring extents
+            # costs it nothing.
+            if inherited is not None and tuple(inherited.get("shape") or ()):
+                return inherited
+            # The carried chain is a CYCLE: the updated value is produced from
+            # the port itself, so following it alone stops at the recursion
+            # guard and publishes an empty descriptor.  The loop node declares
+            # the pairing -- ``loop_carried_bindings[name] = (initial,
+            # updated)`` -- and a carried binding is ONE storage across the
+            # loop, so the seed states this port's storage exactly.  Reading
+            # it here keeps a loop-carried matrix (LU) shaped for every callee
+            # it is then passed to.
+            attributes = data.get("attributes") or {}
+            binding_name = str(attributes.get("binding_name") or "")
+            loop_id = attributes.get("loop_id")
+            if (
+                str(attributes.get("result_kind") or "") == "carried"
+                and binding_name
+                and loop_id is not None
+                and int(loop_id) in graph.G
+            ):
+                carried_binding = (
+                    (graph.G.nodes[int(loop_id)].get("attributes") or {})
+                    .get("loop_carried_bindings") or {}
+                ).get(binding_name)
+                if carried_binding:
+                    initial_id = int(tuple(carried_binding)[0])
+                    if initial_id in graph.G and initial_id not in seen:
+                        seeded = _tensor_descriptor(graph, initial_id, seen)
+                        if seeded is not None:
+                            return seeded
+            if inherited is not None:
+                return inherited
         # Shape-preserving unary expressions are ordinary dynamic tensor
         # values too.  Callsite specialization used to see ``-g`` as having
         # no descriptor, specialize the callee only for its static shape
         # argument, and accidentally erase G from that callee's ABI.  Follow
         # the exact unary data edge so nested calls retain their numerical
         # argument without inspecting any runtime payload.
+        if operation in {"unsqueeze", "squeeze", "expand", "broadcast_to"}:
+            parents = data.get("parents") or ()
+            source_id = next((
+                int(parent)
+                for parent, role in parents
+                if str(role).casefold() in {
+                    "operand", "value", "base", "input", "self", "receiver",
+                }
+                and int(parent) in graph.G
+            ), None)
+
+            def _axis_literal(candidate: int) -> Any:
+                node = graph.G.nodes[int(candidate)]
+                literal = node.get("constant")
+                if literal is None:
+                    literal = (node.get("attributes") or {}).get("value")
+                return literal
+
+            arguments = [
+                _axis_literal(int(parent))
+                for parent, role in parents
+                if str(role).casefold().startswith("arg:")
+                and int(parent) in graph.G
+            ]
+            declared_axis = _attribute_axis(data)
+            if declared_axis is not None:
+                arguments = [declared_axis, *arguments]
+            if source_id is not None:
+                base = _tensor_descriptor(graph, source_id, seen)
+                if base is not None and descriptor_states_a_shape(base):
+                    extents = tuple(int(e) for e in (base.get("shape") or ()))
+                    dtype = str(base.get("dtype") or "float64")
+                    settled = None
+                    first = arguments[0] if arguments else None
+                    if operation == "unsqueeze" and isinstance(first, int):
+                        # A new axis of length one; a negative position counts
+                        # from the END OF THE RESULT, which is one longer.
+                        position = (
+                            first if first >= 0 else first + len(extents) + 1
+                        )
+                        if 0 <= position <= len(extents):
+                            settled = (
+                                extents[:position] + (1,) + extents[position:]
+                            )
+                    elif operation == "squeeze":
+                        if isinstance(first, int):
+                            position = (
+                                first if first >= 0 else first + len(extents)
+                            )
+                            if (
+                                0 <= position < len(extents)
+                                and extents[position] == 1
+                            ):
+                                settled = (
+                                    extents[:position]
+                                    + extents[position + 1:]
+                                )
+                        elif not arguments:
+                            settled = tuple(e for e in extents if e != 1)
+                    else:
+                        requested = (
+                            first
+                            if isinstance(first, (tuple, list))
+                            else tuple(arguments)
+                        )
+                        if requested and all(
+                            isinstance(extent, int) and not isinstance(
+                                extent, bool
+                            )
+                            for extent in requested
+                        ):
+                            settled = tuple(int(e) for e in requested)
+                    if settled is not None:
+                        return {
+                            "shape": settled,
+                            "dtype": dtype,
+                            "rank": len(settled),
+                        }
+        if operation in _ELEMENTWISE_BINARY_OPERATIONS:
+            operands = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role).casefold() in {
+                    "lhs", "rhs", "left", "right", "operand", "value", "other",
+                }
+                and int(parent) in graph.G
+            )
+            if len(operands) == 2:
+                sides = []
+                for operand in operands:
+                    side = _tensor_descriptor(graph, operand, seen)
+                    if side is None:
+                        # An authored scalar literal is rank 0, the same
+                        # reading `_operand_descriptor` gives it.
+                        node = graph.G.nodes[operand]
+                        if str(node.get("type")) in {
+                            "Constant", "Const", "const",
+                        }:
+                            literal = node.get("constant")
+                            if literal is None:
+                                literal = (
+                                    node.get("attributes") or {}
+                                ).get("value")
+                            if isinstance(literal, (int, float, bool)):
+                                side = {"shape": (), "dtype": "float64"}
+                    sides.append(side)
+                if all(side is not None for side in sides) and all(
+                    descriptor_states_a_shape(side) for side in sides
+                ):
+                    left_shape = tuple(sides[0].get("shape") or ())
+                    right_shape = tuple(sides[1].get("shape") or ())
+                    rank = max(len(left_shape), len(right_shape))
+                    left_aligned = (1,) * (rank - len(left_shape)) + left_shape
+                    right_aligned = (
+                        (1,) * (rank - len(right_shape)) + right_shape
+                    )
+                    broadcast: list[int] = []
+                    compatible = True
+                    for left_extent, right_extent in zip(
+                        left_aligned, right_aligned
+                    ):
+                        if left_extent == right_extent:
+                            broadcast.append(int(left_extent))
+                        elif left_extent == 1:
+                            broadcast.append(int(right_extent))
+                        elif right_extent == 1:
+                            broadcast.append(int(left_extent))
+                        else:
+                            # Not broadcastable: say nothing rather than
+                            # invent an extent neither operand has.
+                            compatible = False
+                            break
+                    if compatible:
+                        dtype = next((
+                            str(side.get("dtype"))
+                            for side in sides
+                            if str(side.get("dtype") or "unknown") != "unknown"
+                        ), "float64")
+                        return {
+                            "shape": tuple(broadcast),
+                            "dtype": dtype,
+                            "rank": len(broadcast),
+                        }
         if operation in {
             "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
-            "tanh", "clone", "copy", "identity",
+            "tanh", "clone", "copy", "identity", "real", "imag", "conj",
         }:
             parents = tuple(
                 int(parent) for parent, role in data.get("parents") or ()
@@ -16651,7 +17085,20 @@ def _tensor_descriptor(
                 if str(role) not in {"callee", "func", "definition"}
                 and int(parent) in graph.G
             )
-            tensor_parents = tuple(
+            # The VALUE being cast is the one in an operand role.  Counting
+            # every non-constant parent made ``x.to_dtype(y.get_dtype())``
+            # look like two tensor operands -- the dtype argument is a
+            # computed call, not a literal -- so the rule declined and every
+            # mask built with a dtype taken from another tensor lost its
+            # shape at the cast.
+            operand_roles = {"operand", "value", "base", "self", "receiver"}
+            by_role = tuple(
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role).casefold() in operand_roles
+                and int(parent) in graph.G
+            )
+            tensor_parents = by_role or tuple(
                 parent for parent in parents
                 if str(
                     graph.G.nodes[parent].get("type") or ""
@@ -16660,13 +17107,23 @@ def _tensor_descriptor(
             if len(tensor_parents) == 1:
                 inherited = _tensor_descriptor(graph, tensor_parents[0], seen)
                 if inherited is not None:
+                    def _literal_dtype(candidate: int) -> str | None:
+                        # The dtype argument may be a computed call --
+                        # ``other.get_dtype()`` -- which carries no literal at
+                        # all.  That is not an error: the cast then keeps the
+                        # operand's dtype, which is what the source means.
+                        try:
+                            literal = _constant_value(graph.G.nodes[candidate])
+                        except (KeyError, TypeError, ValueError):
+                            return None
+                        return str(literal) if isinstance(literal, str) else None
+
                     cast_dtype = next((
-                        str(_constant_value(graph.G.nodes[parent]))
+                        named
                         for parent in parents
                         if parent not in tensor_parents
-                        and isinstance(
-                            _constant_value(graph.G.nodes[parent]), str
-                        )
+                        for named in (_literal_dtype(parent),)
+                        if named is not None
                     ), None)
                     result = dict(inherited)
                     if cast_dtype:
@@ -16779,10 +17236,30 @@ def _tensor_descriptor(
                     return _tensor_descriptor(
                         graph, leaves[index % len(leaves)], seen
                     )
-        return None
+        if provisional_tensor is not None:
+            tensor = provisional_tensor
+        elif declared_rank > 0:
+            tensor = {
+                "shape": (),
+                "dtype": str(
+                    (data.get("attributes") or {}).get(
+                        "program_abi_dtype", "unknown"
+                    )
+                ),
+                "rank": declared_rank,
+                "metadata_state": "dynamic",
+            }
+        else:
+            return None
+    static_shape = tuple(tensor.get("shape") or ())
     return {
-        "shape": tuple(tensor.get("shape") or ()),
+        "shape": static_shape,
         "dtype": str(tensor.get("dtype") or "float64"),
+        "rank": int(tensor.get("rank", len(static_shape))),
+        **(
+            {"metadata_state": str(tensor["metadata_state"])}
+            if tensor.get("metadata_state") is not None else {}
+        ),
         **(
             {"device": tensor["device"]}
             if tensor.get("device") is not None else {}
@@ -16847,6 +17324,64 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             if position is not None:
                 indexed.append((position, int(parent)))
         return tuple(parent for _position, parent in sorted(indexed))
+
+    def exact_return_formal_actual(
+        node_id: int, data: Mapping[str, Any],
+    ) -> int | None:
+        """Map a one-result call returning a formal to its exact actual.
+
+        Return-slot identity is available before SSA linking.  Reading it here
+        lets structural facts attached to an argument (in particular a
+        ProgramABI record and its declared span fields) cross a source helper
+        which returns that argument unchanged.  The call itself remains in the
+        graph: returning a formal does not prove that the callee has no side
+        effects on the referenced storage.
+        """
+
+        attributes = data.get("attributes") or {}
+        reference = attributes.get("callee_ref", attributes.get("method_ref"))
+        function_table = getattr(graph, "function_table", None)
+        if reference is None or function_table is None:
+            return None
+        try:
+            child = function_table.entry(int(reference)).graph
+        except (KeyError, TypeError, ValueError):
+            return None
+        child_graph = getattr(child, "G", None)
+        if child_graph is None:
+            return None
+        sites = tuple(
+            tuple(slots)
+            for slots in (child_graph.graph.get("return_slot_values") or {}).values()
+        )
+        if (
+            not sites
+            or any(len(slots) != 1 for slots in sites)
+            or any(slots[0] is None for slots in sites)
+            or len({int(slots[0]) for slots in sites}) != 1
+        ):
+            return None
+        formal_id = int(sites[0][0])
+        formal = child_graph.nodes.get(formal_id, {})
+        formal_attributes = formal.get("attributes") or {}
+        formal_name = formal_attributes.get("binding_name")
+        parameters = tuple(map(
+            str, child_graph.graph.get("function_parameters") or (),
+        ))
+        if (
+            formal_attributes.get("binding_kind") != "parameter"
+            or formal_name is None
+            or str(formal_name) not in parameters
+        ):
+            return None
+        parameter_index = parameters.index(str(formal_name))
+        actuals = {
+            str(role): int(parent)
+            for parent, role in data.get("parents") or ()
+        }
+        return actuals.get(
+            f"arg:{parameter_index}", actuals.get(f"kw:{formal_name}"),
+        )
 
     def structural_call_argument(
         data: Mapping[str, Any],
@@ -17152,19 +17687,44 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 "float64": "builtins.float",
             }.get(str(dtype), str(dtype or "unknown"))
         )
-        return _ProgramABIValueFact(
-            python_type,
-            str(field.get("storage") or "unknown"),
-            None if dtype is None else str(dtype),
-            (
+        value_python_type = (
+            str(field.get("value_python_type") or "") or None
+            if field.get("value_tensor")
+            else (
                 None
                 if value_record is None
                 else str(
                     value_record.get("identity")
                     or field.get("value_record")
                 )
+            )
+        )
+        return _ProgramABIValueFact(
+            python_type,
+            str(field.get("storage") or "unknown"),
+            None if dtype is None else str(dtype),
+            value_python_type,
+            (
+                "span"
+                if field.get("value_tensor")
+                else "record" if value_record is not None else None
             ),
             tuple(map(str, field.get("token_vocabulary") or ())) or None,
+            (
+                None
+                if field.get("shape") is None
+                else tuple(map(int, field["shape"]))
+            ),
+            (
+                None
+                if field.get("rank") is None
+                else int(field["rank"])
+            ),
+            (
+                None
+                if field.get("value_rank") is None
+                else int(field["value_rank"])
+            ),
         )
 
     def evaluate(node_id: int, data: Mapping[str, Any]) -> Any:
@@ -17206,10 +17766,35 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 graph.G.graph.get("parameter_value_abi") or {}
             ).get(str(binding_name))
             if value_abi is not None:
+                linked_abi = (
+                    graph.G.graph.get("linked_value_abi") or {}
+                ).get(int(data.get("value_id", node_id)))
+                effective_abi = {
+                    **dict(value_abi),
+                    **(
+                        dict(linked_abi)
+                        if isinstance(linked_abi, Mapping) else {}
+                    ),
+                }
+                effective_shape = (
+                    None
+                    if effective_abi.get("shape") is None
+                    else tuple(map(int, effective_abi["shape"]))
+                )
                 return _ProgramABIValueFact(
                     str(value_abi["python_type"]),
-                    str(value_abi["storage"]),
-                    value_abi.get("dtype"),
+                    str(effective_abi["storage"]),
+                    effective_abi.get("dtype"),
+                    shape=effective_shape,
+                    rank=(
+                        len(effective_shape)
+                        if effective_shape is not None
+                        else (
+                            None
+                            if effective_abi.get("rank") is None
+                            else int(effective_abi["rank"])
+                        )
+                    ),
                 )
             record_abi = (
                 graph.G.graph.get("parameter_record_abi") or {}
@@ -17290,10 +17875,20 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 or getattr(expression, "attr", "")
             )
             if parent is not None:
+                owner_fact = known.get(parent, unresolved)
+                if (
+                    isinstance(owner_fact, _ProgramABIValueFact)
+                    and owner_fact.shape is not None
+                    and attribute in {"shape", "ndim", "ndims"}
+                ):
+                    return (
+                        owner_fact.shape
+                        if attribute == "shape"
+                        else len(owner_fact.shape)
+                    )
                 fixed = descriptor_attribute(parent, attribute)
                 if fixed is not unresolved:
                     return fixed
-                owner_fact = known.get(parent, unresolved)
                 field_fact = declared_record_field(owner_fact, attribute)
                 if field_fact is not unresolved:
                     return field_fact
@@ -17312,7 +17907,49 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 and base_fact.value_python_type is not None
             ):
                 return _ProgramABIValueFact(
-                    base_fact.value_python_type, "record", None,
+                    base_fact.value_python_type,
+                    base_fact.value_storage or "record",
+                    base_fact.dtype,
+                    rank=(
+                        int((data.get("attributes") or {}).get(
+                            "program_abi_rank"
+                        ))
+                        if (data.get("attributes") or {}).get(
+                            "program_abi_rank"
+                        ) is not None
+                        else base_fact.value_rank
+                    ),
+                )
+            if (
+                isinstance(base_fact, _ProgramABIValueFact)
+                and base_fact.storage == "span"
+                and isinstance(expression, ast.Subscript)
+            ):
+                source_rank, result_rank = symbolic_basic_index_ranks(
+                    expression.slice, base_fact.rank
+                )
+                if base is not None and int(base) in graph.G:
+                    base_data = graph.G.nodes[int(base)]
+                    base_attributes = dict(base_data.get("attributes") or {})
+                    base_attributes.update({
+                        "program_abi_storage": "span",
+                        "program_abi_rank": int(source_rank),
+                    })
+                    base_data["attributes"] = base_attributes
+                    base_tensor = dict(base_data.get("tensor") or {})
+                    base_tensor.update({
+                        "shape": tuple(base_fact.shape or ()),
+                        "dtype": str(base_fact.dtype or "unknown"),
+                        "rank": int(source_rank),
+                        "metadata_state": "dynamic",
+                    })
+                    base_data["tensor"] = base_tensor
+                return _ProgramABIValueFact(
+                    base_fact.python_type,
+                    "span",
+                    base_fact.dtype,
+                    shape=None,
+                    rank=int(result_rank),
                 )
             index_facts = tuple(
                 known.get(int(parent), unresolved)
@@ -17333,7 +17970,7 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                     return base_fact[index]
                 except (IndexError, KeyError, TypeError):
                     return unresolved
-        if operation in {"numel", "ndim", "ndims"}:
+        if operation in {"get_shape", "dim", "numel", "ndim", "ndims"}:
             parent = next((
                 int(parent)
                 for parent, role in (data.get("parents") or ())
@@ -17343,6 +17980,21 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 graph, parent
             )
             if descriptor is not None:
+                # Read the descriptor for what it states.  ``LU.get_shape()``
+                # folded to ``()`` here while LU's descriptor said nothing at
+                # all, and ``shp[-1]`` -- the matrix order every loop in the
+                # substitution helpers counts with -- then became a formal no
+                # caller could fill.
+                if not descriptor_states_a_shape(descriptor):
+                    return unresolved
+                if operation == "get_shape":
+                    if descriptor.get("metadata_state") == "dynamic":
+                        return unresolved
+                    return tuple(descriptor["shape"])
+                if operation == "dim":
+                    if descriptor.get("metadata_state") == "dynamic":
+                        return unresolved
+                    return len(descriptor["shape"])
                 if operation in {"ndim", "ndims"}:
                     return len(descriptor["shape"])
                 count = 1
@@ -17390,8 +18042,47 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 str(role): int(parent)
                 for parent, role in (data.get("parents") or ())
             }
-            left = known.get(parents.get("lhs", parents.get("left")), unresolved)
-            right = known.get(parents.get("rhs", parents.get("right")), unresolved)
+            left_id = parents.get("lhs", parents.get("left"))
+            right_id = parents.get("rhs", parents.get("right"))
+            left = known.get(left_id, unresolved)
+            right = known.get(right_id, unresolved)
+            if isinstance(expression.op, ast.Add):
+                # Concatenating an EMPTY sequence is an identity on the other
+                # sequence, and it stays an identity when that sequence holds
+                # a runtime member.  Authored ``LU[..., i, i+1:]`` arrives as
+                # ``() + (i, slice(i + 1, None))`` once the ellipsis prefix
+                # proves empty; leaving it unresolved kept a Python
+                # concatenation in the graph that later lowering read as an
+                # arithmetic Add on a float index.
+                # Only for TUPLES: an empty list concatenation produces a
+                # new, separately mutable list, so aliasing it would merge two
+                # storage identities the source keeps apart.
+                for empty, other_id in ((left, right_id), (right, left_id)):
+                    if (
+                        isinstance(empty, tuple)
+                        and not empty
+                        and other_id is not None
+                        and int(other_id) in graph.G
+                        and str((
+                            graph.G.nodes[int(other_id)].get("attributes")
+                            or {}
+                        ).get("aggregate_kind") or "") == "tuple"
+                        # ...and only where the concatenation is READ as a
+                        # subscript.  An index is consumed, never mutated, so
+                        # merging it with the sequence it concatenates cannot
+                        # merge two mutable storage identities.
+                        and bool(data.get("children"))
+                        and all(
+                            str(role) == "index"
+                            for _child, role in data.get("children") or ()
+                        )
+                    ):
+                        other = known.get(int(other_id), unresolved)
+                        return (
+                            _StructuralValueAlias(int(other_id))
+                            if other is unresolved
+                            else other
+                        )
             if left is unresolved or right is unresolved:
                 return unresolved
             # A program-ABI fact states the runtime representation/type; it
@@ -17497,6 +18188,26 @@ def _fold_callsite_structural_values(graph: Any) -> None:
         )
         arguments = positional(data)
         values = tuple(known.get(argument, unresolved) for argument in arguments)
+        identity_actual = exact_return_formal_actual(node_id, data)
+        if identity_actual is not None:
+            identity_fact = known.get(identity_actual, unresolved)
+            if isinstance(identity_fact, _ProgramABIValueFact):
+                return identity_fact
+        result_class = (data.get("attributes") or {}).get("result_class_ref")
+        if result_class is not None:
+            records = tuple(
+                record
+                for record in dict(
+                    (graph.G.graph.get("program_abi") or {}).get("records") or {}
+                ).values()
+                if str(record.get("identity") or "") == str(result_class)
+                or str(record.get("identity") or "").rsplit(".", 1)[-1]
+                == str(result_class).rsplit(".", 1)[-1]
+            )
+            if len(records) == 1:
+                return _ProgramABIValueFact(
+                    str(records[0]["identity"]), "record", None,
+                )
         if (name == "callable" and len(arguments) == 1
                 and (data.get("attributes") or {}).get("extraction_identity") == "builtins.callable"
                 and (graph.G.nodes[arguments[0]].get("attributes") or {}).get("bound_method_ref") is not None):
@@ -17513,6 +18224,25 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             # invoking it. In particular callable(None) must remove its dead
             # call arm, not become an unexplained runtime predicate input.
             return callable(values[0])
+        if name == "hasattr" and len(arguments) == 2:
+            attribute = values[1]
+            if isinstance(attribute, str) and not attribute.startswith("_"):
+                owner_id = int(arguments[0])
+                descriptor = _tensor_descriptor(graph, owner_id)
+                if descriptor is not None and attribute in {
+                    "item", "shape", "dtype", "ndim", "ndims", "numel",
+                }:
+                    # Repository tensors, including rank-zero tensors, expose
+                    # this fixed structural surface. ``item`` on a scalar is
+                    # the native scalar extraction already represented by the
+                    # pursued item node; its presence is not runtime data.
+                    return True
+                if descriptor_attribute(owner_id, attribute) is not unresolved:
+                    return True
+                if declared_record_field(
+                    known.get(owner_id, unresolved), attribute,
+                ) is not unresolved:
+                    return True
         if name == "get" and values:
             receiver = next((
                 int(parent)
@@ -17847,6 +18577,45 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             return tuple(basic_index(item) for item in node.elts)
         raise ValueError("index is not a basic literal")
 
+    def symbolic_basic_index_ranks(
+        selector: ast.AST, declared_rank: int | None,
+    ) -> tuple[int, int]:
+        """Constrain rank from basic-index syntax without guessing extents."""
+
+        items = tuple(selector.elts) if isinstance(selector, ast.Tuple) else (
+            selector,
+        )
+        consumed = sum(
+            1 for item in items
+            if not (
+                isinstance(item, ast.Constant)
+                and item.value in {None, Ellipsis}
+            )
+        )
+        has_ellipsis = any(
+            isinstance(item, ast.Constant) and item.value is Ellipsis
+            for item in items
+        )
+        source_rank = max(int(declared_rank or 0), consumed)
+        if has_ellipsis and declared_rank is None:
+            # Ellipsis alone does not state how many axes it spans.  Preserve
+            # the minimum proven by explicit selectors; later operations may
+            # strengthen the same graph identity.
+            source_rank = consumed
+        dropped = sum(
+            1 for item in items
+            if not isinstance(item, ast.Slice)
+            and not (
+                isinstance(item, ast.Constant)
+                and item.value in {None, Ellipsis}
+            )
+        )
+        added = sum(
+            1 for item in items
+            if isinstance(item, ast.Constant) and item.value is None
+        )
+        return source_rank, max(0, source_rank - dropped + added)
+
     def retained_basic_index(data, expression):
         # Structural reduction may fold an authored ndim-driven index while
         # retaining the original AST. Consume that exact graph constant first.
@@ -17919,8 +18688,14 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                         "neg", "abs", "sin", "cos", "tan", "exp", "log",
                         "sqrt", "tanh", "clone", "copy", "identity", "indexedstore",
                         "index_set", "setitem", "indexed", "getitem",
-                        "subscript",
+                        "subscript", "real", "imag", "conj",
                     }
+                    or (
+                        operation == "getattr"
+                        and str((data.get("attributes") or {}).get(
+                            "attribute", ""
+                        )) in {"real", "imag"}
+                    )
                     or operation in _DTYPE_CAST_OPERATIONS
                 )
             ):
@@ -18431,6 +19206,38 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             if value is unresolved:
                 continue
             if (
+                isinstance(value, _ProgramABIValueFact)
+                and value.storage == "span"
+            ):
+                # The Program ABI has already proved this value is a tensor
+                # span. A keyed Tensor lookup has runtime extents, so its
+                # static shape is empty while its physical rank remains one.
+                # Publish that exact distinction on the graph node before the
+                # hierarchy freezes region values; otherwise the empty shape
+                # is interpreted as a scalar and tensor operators are split
+                # away from the lookup that produced their storage.
+                rank = (
+                    len(value.shape)
+                    if value.shape is not None
+                    else int(value.rank or 1)
+                )
+                attributes = dict(data.get("attributes") or {})
+                attributes.update({
+                    "program_abi_storage": "span",
+                    "program_abi_rank": int(rank),
+                    "program_abi_dtype": str(value.dtype or "unknown"),
+                })
+                data["attributes"] = attributes
+                data["tensor"] = {
+                    "shape": tuple(value.shape or ()),
+                    "dtype": str(value.dtype or "unknown"),
+                    "rank": int(rank),
+                    **(
+                        {"metadata_state": "dynamic"}
+                        if value.shape is None else {}
+                    ),
+                }
+            if (
                 node_id in loop_carried_initial_ids
                 and not isinstance(value, _ProgramABIValueFact)
             ) or (
@@ -18780,9 +19587,23 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                     "AbstractTensor."
                 )
             )
+            # A structurally folded constant is a PROVEN literal standing in
+            # for an authored producer, and other layers still name that value
+            # identity -- a loop's bound expression renders each leaf as the
+            # leaf's literal when it is resident and as a uniform reference
+            # when it is not.  Pruning it because its only consumer folded too
+            # is what made ``n`` (the matrix order) a formal that no caller
+            # could fill inside the substitution helpers, while the same fold
+            # in _masked_pivot_rows -- whose constant kept a consumer -- read
+            # as the literal 2.  An unconsumed Const costs one instruction the
+            # backend drops.
             if (
                 int(node_id) not in protected_values
                 and graph.G.out_degree(int(node_id)) == 0
+                and not (
+                    str(data.get("type")) in {"Constant", "Const", "const"}
+                    and attributes.get("structural_specialization")
+                )
                 and (
                     str(data.get("type")) in {
                         "GetAttr", "Attribute", "StaticReference",
@@ -19696,7 +20517,10 @@ def _resolve_grounded_method_references(graph: Any) -> None:
     linked_calls = {
         int(node_id) for node_id, data in graph.G.nodes(data=True)
         if any((data.get("attributes") or {}).get(key) is not None
-               for key in ("method_ref", "callee_ref", "resolved_ast_parent"))
+               for key in (
+                   "method_ref", "callee_ref", "resolved_ast_parent",
+                   "indirect_callable_id",
+               ))
     }
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}
@@ -19729,7 +20553,8 @@ def _resolve_grounded_tensor_operations(graph: Any) -> None:
     tensor_values = {
         int(node_id)
         for node_id, data in graph.G.nodes(data=True)
-        if (data.get("attributes") or {}).get("tensor") is not None
+        if data.get("tensor") is not None
+        or (data.get("attributes") or {}).get("tensor") is not None
         or (
             data.get("type") == "Input"
             and is_tensor_value(specializations.get(str(
@@ -19750,7 +20575,13 @@ def _resolve_grounded_tensor_operations(graph: Any) -> None:
         for node_id, data in graph.G.nodes(data=True):
             attributes = data.get("attributes") or {}
             candidate = attributes.get("tensor_candidate")
-            if int(node_id) in tensor_values:
+            if (
+                int(node_id) in tensor_values
+                and (
+                    candidate is None
+                    or attributes.get("tensor") is not None
+                )
+            ):
                 continue
             if (
                 str(data.get("type") or data.get("op"))
@@ -19767,15 +20598,23 @@ def _resolve_grounded_tensor_operations(graph: Any) -> None:
             if candidate is None:
                 continue
             expression = data.get("expr_obj")
-            if not (
+            property_access = (
+                isinstance(expression, ast.Attribute)
+                or str(data.get("op") or data.get("type") or "").casefold()
+                == "getattr"
+            )
+            method_call = (
                 isinstance(expression, ast.Call)
                 and isinstance(expression.func, ast.Attribute)
-            ):
+            )
+            if not (property_access or method_call):
                 continue
             receiver = next((
                 int(parent)
                 for parent, role in (data.get("parents") or ())
-                if str(role) in {"operand", "receiver"}
+                if str(role) in {
+                    "operand", "receiver", "value", "base", "object",
+                }
             ), None)
             if receiver not in tensor_values:
                 continue

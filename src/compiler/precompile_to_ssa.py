@@ -15,6 +15,7 @@ import networkx as nx
 
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from .id_space import serial_of as _id_serial_of
+from .identity_concordance import IdentityPage
 from .control_source import (
     CallBlock,
     ConditionalBlock,
@@ -732,6 +733,7 @@ class ResolvedSequenceSchema:
     writable: bool
     retains_deleted_rows: bool
     nested_table: bool
+    nested_tensor: bool = False
     nested_value_dtype: str | None = None
 
 
@@ -756,6 +758,7 @@ def resolve_sequence_schemas(
     writable_union: dict[int, bool] = {}
     retains_union: dict[int, bool] = {}
     nested_union: dict[int, bool] = {}
+    nested_tensor_union: dict[int, bool] = {}
     conflicted: set[int] = set()
     shortfalls: list[SSALoweringShortfall] = []
 
@@ -799,6 +802,9 @@ def resolve_sequence_schemas(
         deletion_ids.update(int(sid) for sid in shell.get("retained_sequence_ids", ()))
         deletion_ids.update(int(sid) for sid in shell.get("deletion_sequence_ids", ()))
         nested_ids = {int(sid) for sid in shell.get("nested_sequence_ids", ())}
+        nested_tensor_ids = {
+            int(sid) for sid in shell.get("nested_tensor_sequence_ids", ())
+        }
         for sequence_id, policy, column_count, writable in shell.get(
             "sequence_declarations", ()
         ):
@@ -808,6 +814,10 @@ def resolve_sequence_schemas(
             sid = int(sequence_id)
             retains_union[sid] = retains_union.get(sid, False) or sid in deletion_ids
             nested_union[sid] = nested_union.get(sid, False) or sid in nested_ids
+            nested_tensor_union[sid] = (
+                nested_tensor_union.get(sid, False)
+                or sid in nested_tensor_ids
+            )
         for sequence_id, policy, column_count in shell.get(
             "sequence_initializations", ()
         ):
@@ -826,6 +836,10 @@ def resolve_sequence_schemas(
             sid = int(sequence_id)
             retains_union[sid] = retains_union.get(sid, False) or sid in deletion_ids
             nested_union[sid] = nested_union.get(sid, False) or sid in nested_ids
+            nested_tensor_union[sid] = (
+                nested_tensor_union.get(sid, False)
+                or sid in nested_tensor_ids
+            )
 
     resolved = {
         sid: ResolvedSequenceSchema(
@@ -834,6 +848,7 @@ def resolve_sequence_schemas(
             writable=writable_union.get(sid, False),
             retains_deleted_rows=retains_union.get(sid, False),
             nested_table=nested_union.get(sid, False),
+            nested_tensor=nested_tensor_union.get(sid, False),
         )
         for sid in column_counts
         if sid not in conflicted
@@ -872,6 +887,8 @@ class _ControlSSABuilder:
         ] | None,
         region_feed_meta: Mapping[int, tuple[Meta, ...]] | None = None,
         region_value_meta: Mapping[int, Meta] | None = None,
+        region_value_ranks: Mapping[int, int] | None = None,
+        tensor_shape_concordance_scope: str | None = None,
         plan_callsite_bindings: Mapping[
             int, tuple[tuple[int, ...], tuple[int, ...]]
         ] | None = None,
@@ -902,6 +919,7 @@ class _ControlSSABuilder:
         ] = (),
         retained_sequence_ids: tuple[int, ...] = (),
         nested_sequence_ids: tuple[int, ...] = (),
+        nested_tensor_sequence_ids: tuple[int, ...] = (),
         joined_sequence_ids: tuple[int, ...] = (),
         joined_singleton_values: Mapping[int, int] | None = None,
         nested_row_target_ids: tuple[int, ...] = (),
@@ -931,10 +949,22 @@ class _ControlSSABuilder:
         self._evolution_source = None
         self._evolution_instruction = 0
         self.region_value_meta = dict(region_value_meta or {})
+        self.region_value_ranks = {
+            int(value_id): int(rank)
+            for value_id, rank in (region_value_ranks or {}).items()
+        }
+        self.tensor_shape_concordance_scope = str(
+            tensor_shape_concordance_scope or function_name
+        )
         self.value_aliases = {
             int(alias): int(source)
             for alias, source in (value_aliases or {}).items()
         }
+        # The live alias map is temporarily rewritten while a loop body is
+        # lowered so exit spellings denote the current carried value.  Keep
+        # the resolved planning-concordance snapshot immutable for identity
+        # and shape decisions that must survive those lexical rewrites.
+        self.concorded_value_aliases = dict(self.value_aliases)
         self.inout_value_ids = set(map(int, inout_value_ids))
         # Authored literals the control function owns; a use before any
         # region published them is materialized by
@@ -1326,6 +1356,9 @@ class _ControlSSABuilder:
         }
         deletion_sequence_ids.update(map(int, retained_sequence_ids))
         nested_sequence_ids = set(map(int, nested_sequence_ids))
+        nested_tensor_sequence_ids = set(map(
+            int, nested_tensor_sequence_ids
+        ))
         nested_value_dtypes: dict[int, str] = {}
         lookup_sequence_by_result = {
             int(result_id): int(sequence_id)
@@ -1336,7 +1369,17 @@ class _ControlSSABuilder:
             target_meta = self.region_value_meta.get(int(target_id))
             if sequence_id is not None and target_meta is not None:
                 nested_value_dtypes[sequence_id] = str(target_meta.dtype)
+        from .identity_concordance import commit_sequence_contract
+
         for sequence_id, policy, column_count, writable in sequence_declarations:
+            committed = commit_sequence_contract(
+                function_name,
+                int(sequence_id),
+                str(policy),
+                int(column_count),
+                bool(writable),
+                source="SSA sequence declaration",
+            )
             authored_column_dtypes = tuple(
                 (sequence_column_dtypes or {}).get(int(sequence_id), ())
             )
@@ -1366,12 +1409,15 @@ class _ControlSSABuilder:
                     column_dtypes[-1] = str(value_meta.dtype)
             self._sequence_descriptor(
                 int(sequence_id),
-                policy=str(policy),
-                writable=bool(writable),
+                policy=committed.policy,
+                writable=committed.writable,
                 location=f"{function_name}.sequence_declaration",
-                column_count=int(column_count),
+                column_count=committed.column_count,
                 retains_deleted_rows=int(sequence_id) in deletion_sequence_ids,
                 nested_table=int(sequence_id) in nested_sequence_ids,
+                nested_tensor=(
+                    int(sequence_id) in nested_tensor_sequence_ids
+                ),
                 nested_value_dtype=nested_value_dtypes.get(int(sequence_id)),
                 element_dtype=(
                     "int" if int(sequence_id) in self.joined_sequence_ids
@@ -1471,6 +1517,9 @@ class _ControlSSABuilder:
                 column_count=int(column_count),
                 retains_deleted_rows=int(sequence_id) in deletion_sequence_ids,
                 nested_table=int(sequence_id) in nested_sequence_ids,
+                nested_tensor=(
+                    int(sequence_id) in nested_tensor_sequence_ids
+                ),
                 nested_value_dtype=nested_value_dtypes.get(int(sequence_id)),
                 element_dtype=element_dtype,
             )
@@ -1705,18 +1754,31 @@ class _ControlSSABuilder:
             first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
         )
         self._register_sequence_lowering(lowering)
-        result = SSAValue(
-            int(result_id),
-            dtype=("int" if descriptor.child_table_pool is not None
-                   else descriptor.column_dtypes[
-                       next(
-                           column
-                           for column in range(len(descriptor.column_value_ids))
-                           if column not in descriptor.key_columns
-                       )
-                   ]),
+        pool = descriptor.child_table_pool
+        tensor_child = bool(
+            pool is not None
+            and not pool.key_columns
+            and len(pool.column_value_ids) == 1
         )
-        self.external_values[int(result_id)] = result
+        result = (
+            self.fresh_value(dtype="int")
+            if tensor_child
+            else SSAValue(
+                int(result_id),
+                dtype=("int" if pool is not None
+                       else descriptor.column_dtypes[
+                           next(
+                               column
+                               for column in range(
+                                   len(descriptor.column_value_ids)
+                               )
+                               if column not in descriptor.key_columns
+                           )
+                       ]),
+            )
+        )
+        if not tensor_child:
+            self.external_values[int(result_id)] = result
         default_operands: tuple[SSAValue, ...] = ()
         if default_literal is not None:
             value_columns = tuple(
@@ -1752,10 +1814,125 @@ class _ControlSSABuilder:
                 "ssa_lookup_owner_ids": tuple(map(int, owner_ids)),
             },
         )
-        if descriptor.child_table_pool is not None:
+        if pool is not None:
             self.child_table_selections[int(result_id)] = (
-                descriptor.child_table_pool, result
+                pool, result
             )
+        if tensor_child:
+            # A keyed Tensor value is a child-row handle at the outer lookup
+            # boundary and a span at every numerical consumer. Materialize
+            # that existing child-pool address contract here, while the exact
+            # handle and pool identities are both present. No backend should
+            # reconstruct a Python mapping or guess which arena the handle
+            # selects.
+            offset = self.fresh_value(dtype="int64")
+            row_base = self.produced_value(
+                int(result_id),
+                dtype=str(pool.column_dtypes[0] or "unknown"),
+                claim_provisional_definition=True,
+            )
+            self.emit(
+                Handler.Mul,
+                [result, self.external_value(pool.row_stride_value_id)],
+                offset,
+                attributes={"binding": "keyed_tensor_row_offset"},
+            )
+            self.emit(
+                Handler.GetElementPtr,
+                [self.external_value(pool.column_value_ids[0]), offset],
+                row_base,
+                attributes={"binding": "keyed_tensor_row_base"},
+            )
+            if (
+                pool.shape_value_id is None
+                or pool.rank_value_id is None
+                or pool.shape_stride_value_id is None
+            ):
+                raise ValueError(
+                    f"keyed Tensor sequence {sequence_id} has no concorded "
+                    "shape/rank child-pool contract"
+                )
+            shape_offset = self.fresh_value(dtype="int64")
+            shape_address = self.fresh_value(dtype="int32")
+            rank_address = self.fresh_value(dtype="int32")
+            rank = self.fresh_value(dtype="int32")
+            element_count = self.fresh_value(dtype="int32")
+            self.emit(
+                Handler.Mul,
+                [result, self.external_value(pool.shape_stride_value_id)],
+                shape_offset,
+                attributes={"binding": "keyed_tensor_shape_offset"},
+            )
+            self.emit(
+                Handler.GetElementPtr,
+                [self.external_value(pool.shape_value_id), shape_offset],
+                shape_address,
+                attributes={"binding": "keyed_tensor_row_shape"},
+            )
+            self.emit(
+                Handler.GetElementPtr,
+                [self.external_value(pool.rank_value_id), result],
+                rank_address,
+                attributes={"binding": "keyed_tensor_row_rank_address"},
+            )
+            self.emit(
+                Handler.Load,
+                [rank_address],
+                rank,
+                attributes={"binding": "keyed_tensor_row_rank"},
+            )
+            length_address = self.fresh_value(dtype="int32")
+            self.emit(
+                Handler.GetElementPtr,
+                [self.external_value(pool.length_value_id), result],
+                length_address,
+                attributes={"binding": "keyed_tensor_row_length_address"},
+            )
+            self.emit(
+                Handler.Load,
+                [length_address],
+                element_count,
+                attributes={"binding": "keyed_tensor_row_length"},
+            )
+            row_base.accounting = {
+                **dict(row_base.accounting or {}),
+                "program_abi_storage": "span",
+                "program_abi_rank": max(
+                    1, int(self.region_value_ranks.get(int(result_id), 1))
+                ),
+                "tensor_metadata_state": "dynamic",
+                "tensor_shape_value_id": int(shape_address.id),
+                "tensor_rank_value_id": int(rank.id),
+                "tensor_element_count_value_id": int(element_count.id),
+                "keyed_tensor_handle_value_id": int(result.id),
+            }
+            # This lookup is the stage that owns the physical child-span
+            # identities.  Commit the complete contract under the authored
+            # result identity so the planned numerical occurrence can recover
+            # it without rediscovering shape from flat storage.
+            from .identity_concordance import current_identity_book
+            shape_page = current_identity_book().page(
+                "tensor_shape_concordance"
+            )
+            shape_row = (
+                self.tensor_shape_concordance_scope, int(result_id)
+            )
+            shape_page.set(
+                shape_row,
+                max(shape_page.columns, default=-1) + 1,
+                {
+                    "program_abi_storage": "span",
+                    "program_abi_rank": int(
+                        row_base.accounting["program_abi_rank"]
+                    ),
+                    "tensor_metadata_state": "dynamic",
+                    "tensor_shape_value_id": int(shape_address.id),
+                    "tensor_rank_value_id": int(rank.id),
+                    "tensor_element_count_value_id": int(element_count.id),
+                    "source": "control-keyed-tensor-lookup",
+                },
+            )
+            self.external_values[int(result_id)] = row_base
     def _emit_table_store(
         self, _effect_id: int, key_id: int | tuple[int, ...],
         value_id: int, sequence_id: int
@@ -2474,6 +2651,7 @@ class _ControlSSABuilder:
         value_id: int,
         *,
         dtype: str | None = None,
+        follow_aliases: bool = True,
     ) -> SSAValue:
         value_id = int(value_id)
         field_effect = self.scalar_field_effect_destinations.get(value_id)
@@ -2503,10 +2681,11 @@ class _ControlSSABuilder:
                     },
                 )
                 self.external_values[value_id] = value
-        seen: set[int] = set()
-        while value_id in self.value_aliases and value_id not in seen:
-            seen.add(value_id)
-            value_id = int(self.value_aliases[value_id])
+        if follow_aliases:
+            seen: set[int] = set()
+            while value_id in self.value_aliases and value_id not in seen:
+                seen.add(value_id)
+                value_id = int(self.value_aliases[value_id])
         self.declared_parameter_only_ids.discard(value_id)
         value = self.external_values.get(value_id)
         if value is None:
@@ -4372,6 +4551,7 @@ class _ControlSSABuilder:
         column_count: int | None = None,
         retains_deleted_rows: bool = False,
         nested_table: bool = False,
+        nested_tensor: bool = False,
         nested_value_dtype: str | None = None,
         element_dtype: str | None = None,
         column_dtypes: tuple[str | None, ...] = (),
@@ -4409,6 +4589,7 @@ class _ControlSSABuilder:
                 retains_deleted_rows or resolved.retains_deleted_rows
             )
             nested_table = bool(nested_table or resolved.nested_table)
+            nested_tensor = bool(nested_tensor or resolved.nested_tensor)
             nested_value_dtype = nested_value_dtype or resolved.nested_value_dtype
         key_columns = (
             tuple(range(max(1, int(column_count) - 1)))
@@ -4522,18 +4703,38 @@ class _ControlSSABuilder:
         child_table_pool = None
         child_pool_values: tuple[SSAValue, ...] = ()
         if nested_table:
-            child_keys = self.fresh_value(dtype="unknown")
+            child_keys = (
+                None
+                if nested_tensor
+                else self.fresh_value(dtype="unknown")
+            )
             child_values = self.fresh_value(
                 dtype=nested_value_dtype or "unknown"
             )
             child_lengths = self.fresh_value(dtype="int")
             child_capacity = self.fresh_value(dtype="int")
             child_stride = self.fresh_value(dtype="int")
+            child_shapes = (
+                self.fresh_value(dtype="int32") if nested_tensor else None
+            )
+            child_ranks = (
+                self.fresh_value(dtype="int32") if nested_tensor else None
+            )
+            child_shape_stride = (
+                self.fresh_value(dtype="int64") if nested_tensor else None
+            )
             child_status = self.fresh_value(dtype="int")
             child_live = self.fresh_value(dtype="bool")
+            child_columns = (
+                (child_values,) if child_keys is None
+                else (child_keys, child_values)
+            )
             child_pool_values = (
-                child_keys, child_values, child_lengths, child_capacity,
-                child_stride, child_status, child_live,
+                *child_columns, child_lengths, child_capacity,
+                child_stride,
+                *((child_shapes, child_ranks, child_shape_stride)
+                  if nested_tensor else ()),
+                child_status, child_live,
             )
             self.arguments.extend(child_pool_values)
             self.external_values.update(
@@ -4541,16 +4742,31 @@ class _ControlSSABuilder:
             )
             child_table_pool = SSAChildTablePoolDescriptor(
                 handle_column=1,
-                column_value_ids=(int(child_keys.id), int(child_values.id)),
+                column_value_ids=tuple(
+                    int(column.id) for column in child_columns
+                ),
                 length_value_id=int(child_lengths.id),
                 capacity_value_id=int(child_capacity.id),
                 row_stride_value_id=int(child_stride.id),
+                shape_value_id=(
+                    None if child_shapes is None else int(child_shapes.id)
+                ),
+                rank_value_id=(
+                    None if child_ranks is None else int(child_ranks.id)
+                ),
+                shape_stride_value_id=(
+                    None
+                    if child_shape_stride is None
+                    else int(child_shape_stride.id)
+                ),
                 status_value_id=int(child_status.id),
                 live_flags_value_id=int(child_live.id),
                 column_dtypes=(
-                    "unknown", nested_value_dtype or "unknown"
+                    (nested_value_dtype or "unknown",)
+                    if nested_tensor
+                    else ("unknown", nested_value_dtype or "unknown")
                 ),
-                key_columns=(0,),
+                key_columns=(() if nested_tensor else (0,)),
                 writable=bool(writable),
             )
         descriptor = SSASequenceDescriptor(
@@ -6251,7 +6467,13 @@ class _ControlSSABuilder:
         for updated_id, initial_id in loop.carried_aliases:
             updated_id = int(updated_id)
             initial_id = int(initial_id)
-            initial_value = self.external_value(initial_id)
+            # The concordance can prove that the initial, updated, and exit
+            # values occupy one storage slot.  Their temporal SSA identities
+            # remain distinct: the preheader must read the value that exists
+            # before the loop, not its result port after the loop.
+            initial_value = self.external_value(
+                initial_id, follow_aliases=False,
+            )
             updated_value = SSAValue(
                 updated_id,
                 dtype=initial_value.dtype,
@@ -6764,6 +6986,117 @@ class _ControlSSABuilder:
         }
         for updated_id, _initial_id, _initial, updated, _current in carried:
             if id(carried_updates[updated_id]) not in produced_results:
+                declared_outputs = tuple(
+                    region_index
+                    for region_index, (_feeds, outputs)
+                    in self.region_signatures.items()
+                    if updated_id in outputs
+                )
+                alias_source = self.value_aliases.get(updated_id)
+                def concorded_resident(value_id: int) -> int:
+                    current = int(value_id)
+                    seen: set[int] = set()
+                    while current in self.concorded_value_aliases:
+                        if current in seen:
+                            raise ValueError(
+                                "cyclic durable planning concordance for "
+                                f"{self.function_name!r}: {current}"
+                            )
+                        seen.add(current)
+                        target = int(
+                            self.concorded_value_aliases[current]
+                        )
+                        if target == current:
+                            break
+                        current = target
+                    return current
+
+                resident_id = concorded_resident(updated_id)
+                identity_occurrences = tuple(dict.fromkeys((
+                    int(updated_id), int(resident_id),
+                    *(
+                        int(value_id)
+                        for value_id in self.region_value_meta
+                        if concorded_resident(value_id) == resident_id
+                    ),
+                )))
+                updated_meta = next((
+                    self.region_value_meta.get(value_id)
+                    for value_id in identity_occurrences
+                    if tuple(getattr(
+                        self.region_value_meta.get(value_id), "shape", ()
+                    ) or ())
+                ), None)
+                storage_shape = tuple(
+                    getattr(updated_meta, "shape", ()) or ()
+                )
+                from .identity_concordance import current_identity_book
+
+                shape_page = current_identity_book().page(
+                    "tensor_shape_concordance"
+                )
+                shape_contract = (
+                    shape_page.latest((
+                        self.tensor_shape_concordance_scope,
+                        int(updated_id),
+                    ))
+                    or shape_page.latest((
+                        self.tensor_shape_concordance_scope,
+                        int(resident_id),
+                    ))
+                )
+                if shape_contract is None and storage_shape:
+                    shape_contract = {
+                        "program_abi_storage": "span",
+                        "program_abi_rank": len(storage_shape),
+                        "tensor_metadata_state": "static",
+                        "shape": storage_shape,
+                        "source": "concorded-loop-resident-meta",
+                    }
+                    for value_id in dict.fromkeys((
+                        int(resident_id), int(updated_id),
+                    )):
+                        shape_page.set(
+                            (
+                                self.tensor_shape_concordance_scope,
+                                value_id,
+                            ),
+                            max(shape_page.columns, default=-1) + 1,
+                            shape_contract,
+                        )
+                storage_rank = int(
+                    (shape_contract or {}).get("program_abi_rank", 0) or 0
+                )
+                storage_is_span = (
+                    (shape_contract or {}).get("program_abi_storage")
+                    == "span"
+                )
+                if (
+                    not declared_outputs
+                    and alias_source is not None
+                    and (
+                        storage_shape
+                        or storage_is_span
+                        or storage_rank > 0
+                        or int(alias_source) in self.sequence_descriptors
+                    )
+                ):
+                    # Indexed stores mutate their resident span.  A nested
+                    # retained loop can therefore publish no new pointer
+                    # value even though its body produced every authored
+                    # store.  Carry the current resident pointer across the
+                    # enclosing latch, exactly as the while-loop path below
+                    # does for a producerless identity backedge.  Restrict
+                    # this to graph-proven shaped storage or a resident
+                    # sequence descriptor built from the concorded contract:
+                    # an ordinary scalar recurrence must still name a real
+                    # producer.
+                    current = carried_phis[updated_id].args[0]
+                    carried_phis[updated_id].args[1] = current
+                    carried_updates[updated_id] = current
+                    self.external_values[updated_id] = current
+                    current.accounting["ssa_storage_identity_backedge"] = True
+                    continue
                 self.shortfalls.append(
                     SSALoweringShortfall(
                         "control",
@@ -6771,13 +7104,8 @@ class _ControlSSABuilder:
                         f"{path}.body",
                         f"carried update value {updated_id} has no producer "
                         "inside the loop body; "
-                        f"alias_source={self.value_aliases.get(updated_id)!r}; "
-                        "declared_region_outputs={}".format(tuple(
-                            region_index
-                            for region_index, (_feeds, outputs)
-                            in self.region_signatures.items()
-                            if updated_id in outputs
-                        )),
+                        f"alias_source={alias_source!r}; "
+                        f"declared_region_outputs={declared_outputs}",
                     )
                 )
         for source_id, collection_id, induction_name, start in (
@@ -6930,7 +7258,11 @@ class _ControlSSABuilder:
         for updated_id, initial_id in loop.carried_aliases:
             updated_id = int(updated_id)
             initial_id = int(initial_id)
-            initial_value = self.external_value(initial_id)
+            # Storage concordance does not erase the temporal distinction
+            # between the preheader seed and the loop backedge value.
+            initial_value = self.external_value(
+                initial_id, follow_aliases=False,
+            )
             updated_value = SSAValue(
                 updated_id,
                 dtype=initial_value.dtype,
@@ -7828,6 +8160,8 @@ def lower_control_program_to_ssa(
     ] | None = None,
     region_feed_meta: Mapping[int, tuple[Meta, ...]] | None = None,
     region_value_meta: Mapping[int, Meta] | None = None,
+    region_value_ranks: Mapping[int, int] | None = None,
+    tensor_shape_concordance_scope: str | None = None,
     plan_callsite_bindings: Mapping[
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
@@ -7858,6 +8192,7 @@ def lower_control_program_to_ssa(
     ] = (),
     retained_sequence_ids: tuple[int, ...] = (),
     nested_sequence_ids: tuple[int, ...] = (),
+    nested_tensor_sequence_ids: tuple[int, ...] = (),
     joined_sequence_ids: tuple[int, ...] = (),
     joined_singleton_values: Mapping[int, int] | None = None,
     nested_row_target_ids: tuple[int, ...] = (),
@@ -7879,6 +8214,8 @@ def lower_control_program_to_ssa(
         region_signatures=region_signatures,
         region_feed_meta=region_feed_meta,
         region_value_meta=region_value_meta,
+        region_value_ranks=region_value_ranks,
+        tensor_shape_concordance_scope=tensor_shape_concordance_scope,
         plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=value_aliases,
         inout_value_ids=inout_value_ids,
@@ -7901,6 +8238,7 @@ def lower_control_program_to_ssa(
         table_deletions=table_deletions,
         retained_sequence_ids=retained_sequence_ids,
         nested_sequence_ids=nested_sequence_ids,
+        nested_tensor_sequence_ids=nested_tensor_sequence_ids,
         joined_sequence_ids=joined_sequence_ids,
         joined_singleton_values=joined_singleton_values,
         nested_row_target_ids=nested_row_target_ids,
@@ -9285,6 +9623,15 @@ def _schedule_loop_callsites(
                     for output in signature[1]:
                         producers.setdefault(int(output), []).append(position)
                 dependencies: list[set[int]] = []
+                dependency_reasons: dict[tuple[int, int], list[Any]] = {}
+
+                def require(
+                    current: int, prerequisite: int, reason: Any,
+                ) -> None:
+                    dependencies[current].add(prerequisite)
+                    dependency_reasons.setdefault(
+                        (int(prerequisite), int(current)), []
+                    ).append(reason)
                 for position, signature in enumerate(signatures):
                     assert signature is not None
                     required: set[int] = set()
@@ -9293,52 +9640,120 @@ def _schedule_loop_callsites(
                         prior = [candidate for candidate in candidates if candidate < position]
                         later = [candidate for candidate in candidates if candidate > position]
                         if prior:
-                            required.add(max(prior))
+                            prerequisite = max(prior)
+                            required.add(prerequisite)
+                            dependency_reasons.setdefault(
+                                (int(prerequisite), int(position)), []
+                            ).append(("value", int(feed)))
                         elif later:
-                            required.add(min(later))
+                            prerequisite = min(later)
+                            required.add(prerequisite)
+                            dependency_reasons.setdefault(
+                                (int(prerequisite), int(position)), []
+                            ).append(("value", int(feed)))
                     dependencies.append(required)
                 hierarchy_positions = [
                     hierarchy_statement_position(child) for child in run
                 ]
-                ranked = sorted(
-                    (
-                        (int(hierarchy_position), position)
-                        for position, hierarchy_position
-                        in enumerate(hierarchy_positions)
-                        if hierarchy_position is not None
-                    ),
-                )
-                for (_prior_rank, prior), (_rank, current) in zip(
-                    ranked, ranked[1:]
-                ):
-                    dependencies[current].add(prior)
+                # The hierarchy is a flat data/effect plan; a lexical terminal
+                # is a control boundary absent from that flat ordering. Chaining
+                # ranked statements across one can order fallthrough work before
+                # the guarded return/break/continue that precedes it. Combined
+                # with the terminal guard below, that manufactures a cycle even
+                # though the two orders describe mutually exclusive paths.
+                # Preserve hierarchy precedence independently on each side.
+                terminal_segments: list[int] = []
+                terminal_segment = 0
+                for child in run:
+                    terminal_segments.append(terminal_segment)
+                    if isinstance(child, LoopControlBlock):
+                        terminal_segment += 1
+                ranked_by_segment: dict[int, list[tuple[int, int]]] = {}
+                for position, hierarchy_position in enumerate(hierarchy_positions):
+                    if hierarchy_position is None:
+                        continue
+                    ranked_by_segment.setdefault(
+                        terminal_segments[position], []
+                    ).append((int(hierarchy_position), position))
+                for ranked in ranked_by_segment.values():
+                    ranked.sort()
+                    for (_prior_rank, prior), (_rank, current) in zip(
+                        ranked, ranked[1:]
+                    ):
+                        require(current, prior, (
+                            "hierarchy", int(_prior_rank), int(_rank)
+                        ))
 
                 def sequence_accesses(candidate):
-                    accesses = set()
+                    """One arena's reads and its writes, told apart.
+
+                    These used to be one set, and every pair of accesses to an
+                    arena was then ordered -- including READ AFTER READ, which
+                    needs no ordering at all because two reads of the same
+                    sequence commute.  Those spurious edges are not merely
+                    conservative: chained with a real dependency they close
+                    cycles that do not exist, and the scheduler then refuses a
+                    whole program with "control effect order conflicts with
+                    value dependencies".  One such refusal chained three pure
+                    readers of one arena into a path from a placed callsite to
+                    the loop's own control block, which the terminal-guard rule
+                    below independently orders the other way.
+
+                    A mutation writes its sequence; a ``replace`` also READS the
+                    values it writes in; a query reads.
+                    """
+                    reads, writes = set(), set()
                     if isinstance(candidate, SequenceMutationBlock):
-                        accesses.add(int(candidate.mutation.sequence_value_id))
+                        writes.add(int(candidate.mutation.sequence_value_id))
                         if candidate.mutation.operator == "replace":
-                            accesses.update(map(int, candidate.mutation.argument_value_ids))
+                            reads.update(map(int, candidate.mutation.argument_value_ids))
                     elif isinstance(candidate, SequenceQueryBlock):
                         if candidate.producer_loop_node_id is None:
-                            accesses.add(int(candidate.sequence_value_id))
+                            reads.add(int(candidate.sequence_value_id))
                     for mutation in getattr(candidate, 'sequence_mutations', ()):
-                        accesses.add(int(mutation.sequence_value_id))
+                        writes.add(int(mutation.sequence_value_id))
                     for child in getattr(candidate, 'blocks', ()):
-                        accesses.update(sequence_accesses(child))
+                        child_reads, child_writes = sequence_accesses(child)
+                        reads |= child_reads
+                        writes |= child_writes
                     for field in ('condition', 'body', 'orelse', 'callee'):
                         child = getattr(candidate, field, None)
                         if child is not None:
-                            accesses.update(sequence_accesses(child))
-                    return accesses
+                            child_reads, child_writes = sequence_accesses(child)
+                            reads |= child_reads
+                            writes |= child_writes
+                    return reads, writes
 
-                last_access = {}
+                # Three of the four dependence kinds, and not the fourth:
+                #   RAW  a read after a write   -- last_write
+                #   WAR  a write after a read   -- last_access
+                #   WAW  a write after a write  -- last_access
+                #   RAR  a read after a read    -- NONE, reads commute
+                last_access: dict[int, int] = {}
+                last_write: dict[int, int] = {}
                 last_terminal = None
                 for position, child in enumerate(run):
-                    for arena in sequence_accesses(child):
+                    reads, writes = sequence_accesses(child)
+                    for arena in reads:
+                        if arena in last_write:
+                            require(position, last_write[arena], (
+                                "sequence_raw", int(arena)
+                            ))
+                    for arena in writes:
                         if arena in last_access:
-                            dependencies[position].add(last_access[arena])
+                            access_kind = (
+                                "sequence_waw"
+                                if arena in last_write
+                                and last_write[arena] == last_access[arena]
+                                else "sequence_war"
+                            )
+                            require(position, last_access[arena], (
+                                access_kind, int(arena)
+                            ))
+                    for arena in reads | writes:
                         last_access[arena] = position
+                    for arena in writes:
+                        last_write[arena] = position
                     # A source-placed call following a guarded continue/return
                     # must not execute on that terminal edge while waiting for
                     # the guard's numerical producer.
@@ -9350,7 +9765,7 @@ def _schedule_loop_callsites(
                             and int(match.group(1)) in placed_callsites
                             for line in child.lines
                         ):
-                            dependencies[position].add(last_terminal)
+                            require(position, last_terminal, ("terminal_guard",))
 
                 placed, active = set(), set()
 
@@ -9360,16 +9775,34 @@ def _schedule_loop_callsites(
                     if position in active:
                         def label(index):
                             child = run[index]
+                            if isinstance(child, StatementBlock):
+                                call_ids = tuple(
+                                    int(match.group(1))
+                                    for line in child.lines
+                                    if (match := _CALLSITE_MARKER.fullmatch(str(line)))
+                                )
+                                if call_ids and len(call_ids) == len(child.lines):
+                                    return tuple(
+                                        (
+                                            "PlanCall", callsite_id,
+                                            planned_calls[callsite_id].callee.name
+                                            if callsite_id in planned_calls else None,
+                                        )
+                                        for callsite_id in call_ids
+                                    )
                             return (
                                 child.lines if isinstance(child, StatementBlock)
                                 else (type(child).__name__,
                                       getattr(child, 'source_node_id', None),
                                       getattr(child, 'source_call_node_id', None),
-                                      getattr(child, 'predicate_value_id', None))
+                                      getattr(child, 'predicate_value_id', None),
+                                      getattr(child, 'action', None),
+                                      getattr(child, 'site_node_id', None))
                             )
                         raise ValueError(
                             'control effect order conflicts with value dependencies: '
-                            f'cycle={[(i, label(i), sorted(dependencies[i]), signatures[i]) for i in sorted(active)]}'
+                            f'cycle={[(i, label(i), sorted(dependencies[i]), signatures[i]) for i in sorted(active)]}; '
+                            f'edges={[(prerequisite, current, tuple(reasons)) for (prerequisite, current), reasons in sorted(dependency_reasons.items()) if prerequisite in active and current in active]}'
                         )
                     active.add(position)
                     for dependency in sorted(dependencies[position]):
@@ -9752,7 +10185,7 @@ def lower_control_sections_to_ssa(
     control: ControlProgram,
     *,
     hierarchy_plan: PlanClosure | None = None,
-    preloaded_value_aliases: Mapping[int, int] | None = None,
+    value_concordance: IdentityPage | None = None,
     control_name: str = "planned_control",
     identity_table: Mapping[str, tuple[int, ...]] | None = None,
     function_outputs: tuple[str, ...] = (),
@@ -9794,6 +10227,7 @@ def lower_control_sections_to_ssa(
     ] = (),
     retained_sequence_ids: tuple[int, ...] = (),
     nested_sequence_ids: tuple[int, ...] = (),
+    nested_tensor_sequence_ids: tuple[int, ...] = (),
     joined_sequence_ids: tuple[int, ...] = (),
     joined_singleton_values: Mapping[int, int] | None = None,
     nested_record_fields: tuple[tuple[int, str, int], ...] = (),
@@ -9823,6 +10257,7 @@ def lower_control_sections_to_ssa(
     string_table: Any = None,
     tensor_ssa_reference: Any = None,
     resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[
     IRModule,
     tuple[SSALoweringShortfall, ...],
@@ -9842,6 +10277,15 @@ def lower_control_sections_to_ssa(
     SSA values of each region function, which the target must declare as that
     function's ``intent(out)`` dummies (a region has no explicit return).
     """
+
+    def report(message: str) -> None:
+        if progress is not None:
+            progress(f"ssa-section {control_name}: {message}")
+
+    report(
+        f"start; regions={len(tuple(control.region_indices))} "
+        f"hierarchy_items={len(tuple(getattr(hierarchy_plan, 'items', ()) or ()))}"
+    )
 
     functions: dict[str, Function] = {}
     region_callees: dict[int, str] = {}
@@ -9870,12 +10314,16 @@ def lower_control_sections_to_ssa(
     known_value_ids.update(map(int, record_field_write_value_ids))
     for region_outputs in (region_output_value_ids or {}).values():
         known_value_ids.update(map(int, region_outputs))
+    planning_aliases = (
+        value_concordance.alias_bindings(control_name)
+        if value_concordance is not None else {}
+    )
     for mapping in (value_dtypes, value_shapes, constant_values,
-                    preloaded_value_aliases, sequence_length_values,
+                    planning_aliases, sequence_length_values,
                     joined_singleton_values, field_const_sources):
         known_value_ids.update(int(value_id) for value_id in (mapping or {}))
     known_value_ids.update(
-        int(value_id) for value_id in (preloaded_value_aliases or {}).values()
+        int(value_id) for value_id in planning_aliases.values()
     )
     known_value_ids.update(
         int(sequence_id)
@@ -10353,9 +10801,124 @@ def lower_control_sections_to_ssa(
     # buffer instead of materializing a fresh, unconnected formal -- the
     # defect that silently dropped the first of two sequential loops
     # storing to one array (pinned in test_compiled_linalg.py).
-    region_value_aliases: dict[int, int] = dict(
-        preloaded_value_aliases or {}
+    if value_concordance is None:
+        value_concordance = IdentityPage("planning_value_concordance")
+
+    # ``ControlProgram.value_aliases`` is an equivalence ledger assembled by
+    # lexical control composition.  Once a component contains exactly one
+    # declared resident sequence, its other spellings are proven logical
+    # versions of that sequence.  This is NOT necessarily physical in-place
+    # storage: a conditional ``where`` can compute the next whole mapping.
+    # Publish it on its own concordance page so region output construction does
+    # not mistake a computed replacement for an IndexedStore, then give it to
+    # control SSA only after region signatures are settled.
+    declared_sequence_arenas = {
+        *(int(sequence_id) for sequence_id, *_rest in sequence_declarations),
+        *(int(sequence_id) for sequence_id, *_rest in sequence_initializations),
+        *map(int, source_sequence_ids),
+        *map(int, retained_sequence_ids),
+        *map(int, nested_sequence_ids),
+        *map(int, joined_sequence_ids),
+    }
+    from .identity_concordance import current_identity_book
+
+    control_value_concordance = current_identity_book().page(
+        "control_value_concordance"
     )
+    # A source method can be lowered more than once while specializations are
+    # assembled.  Its authored value ids repeat, while the physical metadata
+    # ids minted by each lowering do not.  Scope tensor rows to this exact
+    # control instance so one lowering cannot read another's shape address.
+    tensor_shape_concordance_scope = (
+        f"{control_name}@control:{id(control):x}"
+    )
+    alias_neighbors: dict[int, set[int]] = {}
+    for left, right in control.value_aliases:
+        left, right = int(left), int(right)
+        alias_neighbors.setdefault(left, set()).add(right)
+        alias_neighbors.setdefault(right, set()).add(left)
+    visited_aliases: set[int] = set()
+    for seed in tuple(alias_neighbors):
+        if seed in visited_aliases:
+            continue
+        component, frontier = set(), [seed]
+        while frontier:
+            value_id = frontier.pop()
+            if value_id in component:
+                continue
+            component.add(value_id)
+            frontier.extend(alias_neighbors.get(value_id, ()))
+        visited_aliases.update(component)
+        residents = component & declared_sequence_arenas
+        if len(residents) != 1:
+            continue
+        resident_id = next(iter(residents))
+        for alias_id in sorted(component - {resident_id}):
+            incumbent = control_value_concordance.latest(
+                (control_name, int(alias_id))
+            )
+            if incumbent is None:
+                control_value_concordance.bind_alias(
+                    control_name, int(alias_id), int(resident_id)
+                )
+            elif control_value_concordance.resolve_alias(
+                control_name, int(alias_id)
+            ) != control_value_concordance.resolve_alias(
+                control_name, int(resident_id)
+            ):
+                raise ValueError(
+                    "control sequence identity disagrees with planning "
+                    f"concordance for {control_name!r}: "
+                    f"alias={alias_id}, control_resident={resident_id}, "
+                    f"concordance_resident={incumbent}"
+                )
+    from .identity_concordance import resolved_concordant_alias_bindings
+
+    region_value_aliases = resolved_concordant_alias_bindings(
+        control_name,
+        control_value_concordance.alias_bindings(control_name),
+        page=value_concordance,
+    )
+    # Publish the resolved roots back to the live authority. Later passes and
+    # the durable function snapshot must see the same complete identity, not
+    # whichever half of the chain their stage happened to author.
+    for alias_id, resident_id in region_value_aliases.items():
+        if value_concordance.latest(
+            (control_name, int(alias_id))
+        ) != int(resident_id):
+            value_concordance.bind_alias(
+                control_name, int(alias_id), int(resident_id)
+            )
+
+    def bind_resident(alias_id: int, resident_id: int) -> None:
+        """Publish a planning alias, then mirror the concorded fact for SSA."""
+        alias_id, resident_id = int(alias_id), int(resident_id)
+        alias_root = value_concordance.resolve_alias(control_name, alias_id)
+        resident_root = value_concordance.resolve_alias(
+            control_name, resident_id
+        )
+        if alias_root == resident_root:
+            # A later stage may encounter the same resident relationship in
+            # the opposite syntactic direction (loop-result versus final
+            # IndexedStore).  It is already one concordance row; recording the
+            # reverse edge would manufacture a cycle from an agreement.
+            region_value_aliases[alias_id] = resident_root
+            return
+        if alias_root != alias_id:
+            raise ValueError(
+                "planning identity concordance disagreement for "
+                f"{control_name!r}: alias {alias_id} already resolves to "
+                f"{alias_root}, cannot bind it to {resident_root}"
+            )
+        value_concordance.bind_alias(
+            control_name, alias_id, resident_root
+        )
+        region_value_aliases[alias_id] = resident_root
+
+    def resident_root(value_id: int) -> int:
+        """Canonical planning identity for one value occurrence."""
+
+        return value_concordance.resolve_alias(control_name, value_id)
     # An in-place pursued call can publish a result identity that is never an
     # operand of a later numerical region: the resident arena itself carries
     # the effect.  Such calls still execute at their authored position.  Use
@@ -10392,7 +10955,7 @@ def lower_control_sections_to_ssa(
             if next_region is None:
                 continue
             region_index = int(next_region.name.rsplit("_", 1)[1])
-            region_value_aliases[int(result_id)] = int(sequence_id)
+            bind_resident(result_id, sequence_id)
             table_region_operations.setdefault(region_index, []).append((
                 "pack_bits",
                 (
@@ -10532,6 +11095,10 @@ def lower_control_sections_to_ssa(
             # the control call the lowering emits already targets this symbol.
             region_name = f"{control_name}__planned_region_{region_index}"
             instructions = region_instructions(region)
+            report(
+                f"region {region_index}: lowering {len(instructions)} "
+                "planned instruction(s)"
+            )
             # A resident generator query (currently ``sum(1 for ...)`` or
             # ``next(..., default)``) is emitted in lexical control beside its
             # producer loop. Remove only that replaced operator from the
@@ -10623,7 +11190,7 @@ def lower_control_sections_to_ssa(
                     ))
                 for operation in row_stores:
                     result_id, sequence_id = map(int, operation[:2])
-                    region_value_aliases[result_id] = sequence_id
+                    bind_resident(result_id, sequence_id)
                     table_region_operations.setdefault(
                         region_index, []
                     ).append(("row_store", operation))
@@ -10802,7 +11369,7 @@ def lower_control_sections_to_ssa(
                     destination_id, source_id = sequence_augment_by_result[
                         result_id
                     ]
-                    region_value_aliases[result_id] = destination_id
+                    bind_resident(result_id, destination_id)
                     table_region_post_operations.setdefault(
                         region_index, []
                     ).append((
@@ -10838,7 +11405,7 @@ def lower_control_sections_to_ssa(
                     ) = sequence_concat_by_result[
                         result_id
                     ]
-                    region_value_aliases[result_id] = result_id
+                    bind_resident(result_id, result_id)
                     scheduled = table_region_operations.setdefault(
                         region_index, []
                     )
@@ -10884,7 +11451,7 @@ def lower_control_sections_to_ssa(
                     destination_id, literal, count_id = (
                         sequence_append_fill_by_result[result_id]
                     )
-                    region_value_aliases[result_id] = destination_id
+                    bind_resident(result_id, destination_id)
                     table_region_post_operations.setdefault(
                         region_index, []
                     ).append((
@@ -10908,7 +11475,7 @@ def lower_control_sections_to_ssa(
                     destination_id, source_id, lower_id, upper_id = (
                         sequence_append_slice_by_result[result_id]
                     )
-                    region_value_aliases[result_id] = destination_id
+                    bind_resident(result_id, destination_id)
                     table_region_post_operations.setdefault(
                         region_index, []
                     ).append((
@@ -10929,7 +11496,7 @@ def lower_control_sections_to_ssa(
                 for instruction in prepend_instructions:
                     result_id = int(instruction.res.id)
                     sequence_id, value_id = prepend_by_result[result_id]
-                    region_value_aliases[result_id] = sequence_id
+                    bind_resident(result_id, sequence_id)
                     table_region_post_operations.setdefault(
                         region_index, []
                     ).append(("prepend", (sequence_id, value_id)))
@@ -10952,7 +11519,7 @@ def lower_control_sections_to_ssa(
                     ) = packed_by_concat[
                         result_id
                     ]
-                    region_value_aliases[result_id] = destination_id
+                    bind_resident(result_id, destination_id)
                 instructions = [
                     instruction for instruction in instructions
                     if instruction not in packed_instructions
@@ -10984,14 +11551,14 @@ def lower_control_sections_to_ssa(
                             sequence_id, width, callee_reference,
                             pack_callsite_id,
                         ) = prior_pack
-                        region_value_aliases[next(
+                        bind_resident(next(
                             result_id for result_id, contract
                             in inplace_pack_by_result.items()
                             if contract == prior_pack
                             and result_id in {
                                 int(value.id) for value in instruction.args
                             }
-                        )] = sequence_id
+                        ), sequence_id)
                         table_region_operations.setdefault(
                             region_index, []
                         ).append((
@@ -11041,7 +11608,7 @@ def lower_control_sections_to_ssa(
                 ) = inplace_pack_by_result[
                     result_id
                 ]
-                region_value_aliases[result_id] = sequence_id
+                bind_resident(result_id, sequence_id)
                 table_region_operations.setdefault(region_index, []).append((
                     "pack_bits",
                     (
@@ -11058,8 +11625,8 @@ def lower_control_sections_to_ssa(
                     # IndexedStore versions resident memory; it does not return
                     # a new scalar payload.  Preserve the authored result ID as
                     # an alias of the base arena across subsequent regions.
-                    region_value_aliases[int(instruction.res.id)] = int(
-                        instruction.args[0].id
+                    bind_resident(
+                        int(instruction.res.id), int(instruction.args[0].id),
                     )
             instructions = [instruction for instruction in instructions
                             if not (instruction.op == "IndexedStore"
@@ -11327,16 +11894,35 @@ def lower_control_sections_to_ssa(
                 ))
                 | set(map(int, record_field_write_value_ids))
             )
-            def resident_root(value_id: int) -> int:
-                current = int(value_id)
-                seen: set[int] = set()
-                while (
-                    current in region_value_aliases
-                    and current not in seen
-                ):
-                    seen.add(current)
-                    current = int(region_value_aliases[current])
-                return current
+            # Captures cross from the authored control frame into a planned
+            # region. Resolve them through the planning concordance before
+            # either side's ABI is constructed. Otherwise an exact-return
+            # helper can leave the region formal under its result spelling
+            # while the caller has already resolved the same occurrence to
+            # the returned argument spelling.
+            capture_rebindings = {
+                int(value_id): resident_root(int(value_id))
+                for value_id in effective_captures
+                if resident_root(int(value_id)) != int(value_id)
+            }
+            if capture_rebindings:
+                for instruction in instructions:
+                    instruction.args = [
+                        SSAValue(
+                            capture_rebindings[int(argument.id)],
+                            dtype=argument.dtype,
+                            shape=tuple(argument.shape or ()),
+                            device=argument.device,
+                            accounting=dict(argument.accounting or {}),
+                        )
+                        if int(argument.id) in capture_rebindings
+                        else argument
+                        for argument in instruction.args
+                    ]
+                effective_captures = tuple(dict.fromkeys(
+                    resident_root(int(value_id))
+                    for value_id in effective_captures
+                ))
 
             # An IndexedStore versions resident memory: every version id in
             # ``region_value_aliases`` names the SAME storage as its root
@@ -11403,10 +11989,29 @@ def lower_control_sections_to_ssa(
                     for instruction in instructions
                     for argument in instruction.args
                     if int(argument.id) == int(value_id)
-                    and tuple(argument.shape or ())
+                    and (
+                        tuple(argument.shape or ())
+                        or (argument.accounting or {}).get(
+                            "program_abi_storage"
+                        ) == "span"
+                        or (argument.accounting or {}).get(
+                            "tensor_metadata_state"
+                        ) == "dynamic"
+                    )
                 )
                 contracts = {
-                    (tuple(value.shape), str(value.dtype or ""))
+                    (
+                        tuple(value.shape),
+                        str(value.dtype or ""),
+                        (value.accounting or {}).get("program_abi_storage"),
+                        (value.accounting or {}).get("program_abi_rank"),
+                        (value.accounting or {}).get("tensor_metadata_state"),
+                        (value.accounting or {}).get("tensor_shape_value_id"),
+                        (value.accounting or {}).get("tensor_rank_value_id"),
+                        (value.accounting or {}).get(
+                            "tensor_element_count_value_id"
+                        ),
+                    )
                     for value in occurrences
                 }
                 # A sole concrete use is the exact ordered region view. When
@@ -11444,6 +12049,9 @@ def lower_control_sections_to_ssa(
                 "capture_value_ids": tuple(map(int, effective_captures)),
                 "output_value_ids": tuple(map(int, outputs)),
             }
+            region_function.metadata[
+                "tensor_shape_concordance_scope"
+            ] = tensor_shape_concordance_scope
             region_function.metadata["scalar_variant_argument_ids"] = tuple(
                 sorted(
                     value_id
@@ -11497,6 +12105,11 @@ def lower_control_sections_to_ssa(
             # renders ``equal`` as ``(a == b)`` though ``Handler`` only knows
             # ``Eq``. The target's own emit reports any op it genuinely cannot
             # express, with a message accurate to that target.
+            report(
+                f"region {region_index}: complete; "
+                f"captures={len(effective_captures)} outputs={len(outputs)} "
+                f"instructions={len(instructions)}"
+            )
     table_epilogue_operations: list[tuple[str, tuple[Any, ...]]] = []
     iterable_source_ids = {
         int(binding[0]) for binding in control.iterable_bindings
@@ -11653,6 +12266,141 @@ def lower_control_sections_to_ssa(
         )))
         for uniform in control.uniforms
     ))
+    report(
+        f"control lowering start; region_functions={len(region_callees)}"
+    )
+    from .control_source import place_loop_carried_region_producers
+
+    final_value_aliases = resolved_concordant_alias_bindings(
+        control_name,
+        region_value_aliases,
+        control_value_concordance.alias_bindings(control_name),
+        page=value_concordance,
+    )
+    tensor_shape_concordance = current_identity_book().page(
+        "tensor_shape_concordance"
+    )
+
+    def final_resident(value_id: int) -> int:
+        return int(final_value_aliases.get(int(value_id), int(value_id)))
+
+    # IndexedStore is the numerical stage's exact proof that a result versions
+    # resident tensor storage. Publish that storage contract for every
+    # concorded spelling before lexical loop lowering temporarily rewrites
+    # result-port aliases. A loop backedge can then recognize the resident as
+    # a span even when no stage-local Meta uses the final loop-result id.
+    for instructions in planned_region_instructions.values():
+        for instruction in instructions:
+            if (
+                str(instruction.op).casefold() != "indexedstore"
+                or not instruction.args
+                or instruction.res is None
+            ):
+                continue
+            base, result = instruction.args[0], instruction.res
+            resident_id = final_resident(base.id)
+            rank = max(
+                len(tuple(base.shape or ())),
+                len(tuple(result.shape or ())),
+                int((base.accounting or {}).get("program_abi_rank", 0) or 0),
+                int((result.accounting or {}).get(
+                    "program_abi_rank", 0
+                ) or 0),
+            )
+            contract = {
+                "program_abi_storage": "span",
+                "program_abi_rank": int(rank),
+                "tensor_metadata_state": (
+                    "static" if rank > 0 else "unknown"
+                ),
+                "shape": tuple(base.shape or result.shape or ()),
+                "source": "planned-region-indexed-store",
+            }
+            spellings = (
+                int(base.id), int(result.id), int(resident_id),
+                *(
+                    int(alias_id)
+                    for alias_id, target_id in final_value_aliases.items()
+                    if int(target_id) == resident_id
+                ),
+            )
+            for value_id in dict.fromkeys(spellings):
+                incumbent = tensor_shape_concordance.latest((
+                    tensor_shape_concordance_scope, value_id,
+                ))
+                committed = dict(contract)
+                if incumbent is not None:
+                    committed = {
+                        **contract,
+                        **dict(incumbent),
+                        "program_abi_storage": "span",
+                        "program_abi_rank": max(
+                            int(rank),
+                            int(dict(incumbent).get(
+                                "program_abi_rank", 0
+                            ) or 0),
+                        ),
+                    }
+                tensor_shape_concordance.set(
+                    (tensor_shape_concordance_scope, value_id),
+                    max(tensor_shape_concordance.columns, default=-1) + 1,
+                    committed,
+                )
+    control = place_loop_carried_region_producers(
+        control,
+        {
+            region_index: tuple(
+                int(instruction.res.id)
+                for instruction in instructions
+                if instruction.res is not None
+            )
+            for region_index, instructions in planned_region_instructions.items()
+        },
+        # Region results and loop-result nodes are transient spellings of the
+        # same resident tensor after an in-place store.  This map has already
+        # been merged with and resolved through planning_value_concordance;
+        # schedule by that identity instead of comparing stage-local ids.
+        value_aliases=final_value_aliases,
+    )
+    # A keyed Tensor lookup is materialized by the control function while its
+    # numerical uses live in planned regions.  Commit the region's logical
+    # rank claim under the lookup's exact value identity, then give that fact
+    # to the control builder when it binds the selected child span.  The flat
+    # child arena is not rank one merely because its storage is flat.
+    region_value_ranks: dict[int, int] = {}
+    for region_index, instructions in planned_region_instructions.items():
+        for instruction in instructions:
+            for value in (
+                *instruction.args,
+                *((instruction.res,) if instruction.res is not None else ()),
+            ):
+                value_id = int(value.id)
+                if value_id not in table_lookup_result_ids:
+                    continue
+                rank = max(
+                    len(tuple(value.shape or ())),
+                    int((value.accounting or {}).get(
+                        "program_abi_rank", 0
+                    ) or 0),
+                )
+                if rank <= 0:
+                    continue
+                tensor_shape_concordance.set(
+                    (tensor_shape_concordance_scope, value_id),
+                    max(tensor_shape_concordance.columns, default=-1) + 1,
+                    {
+                        "program_abi_storage": "span",
+                        "program_abi_rank": int(rank),
+                        "tensor_metadata_state": "dynamic",
+                        "tensor_shape_value_id": None,
+                        "tensor_rank_value_id": None,
+                        "tensor_element_count_value_id": None,
+                        "source": "planned-region-rank",
+                    },
+                )
+                region_value_ranks[value_id] = max(
+                    int(rank), region_value_ranks.get(value_id, 0)
+                )
     control_function, control_shortfalls = lower_control_program_to_ssa(
         control,
         function_name=control_name,
@@ -11661,8 +12409,10 @@ def lower_control_sections_to_ssa(
         region_signatures=region_signatures,
         region_feed_meta=region_feed_meta,
         region_value_meta=region_value_meta,
+        region_value_ranks=region_value_ranks,
+        tensor_shape_concordance_scope=tensor_shape_concordance_scope,
         plan_callsite_bindings=plan_callsite_bindings,
-        value_aliases=region_value_aliases,
+        value_aliases=final_value_aliases,
         inout_value_ids=tuple(map(int, record_field_write_value_ids)),
         constant_value_ids=tuple(map(int, constant_values or {})),
         output_value_ids=tuple(map(int, required_output_value_ids)),
@@ -11686,6 +12436,7 @@ def lower_control_sections_to_ssa(
         table_deletions=table_deletions,
         retained_sequence_ids=retained_sequence_ids,
         nested_sequence_ids=nested_sequence_ids,
+        nested_tensor_sequence_ids=nested_tensor_sequence_ids,
         joined_sequence_ids=joined_sequence_ids,
         joined_singleton_values=joined_singleton_values,
         nested_row_target_ids=tuple(sorted(
@@ -11715,6 +12466,13 @@ def lower_control_sections_to_ssa(
         },
         table_epilogue_operations=tuple(table_epilogue_operations),
     )
+    report(
+        f"control lowering complete; blocks={len(control_function.blocks)} "
+        f"shortfalls={len(control_shortfalls)}"
+    )
+    control_function.metadata[
+        "tensor_shape_concordance_scope"
+    ] = tensor_shape_concordance_scope
     debug_region_output_loads(control_function, "after-control-lowering")
     control_function = _materialize_control_constants(
         control_function,
@@ -11956,6 +12714,12 @@ def lower_control_sections_to_ssa(
                             descriptor.child_table_pool.length_value_id,
                             descriptor.child_table_pool.capacity_value_id,
                             descriptor.child_table_pool.row_stride_value_id,
+                            *((descriptor.child_table_pool.shape_value_id,)
+                              if descriptor.child_table_pool.shape_value_id is not None else ()),
+                            *((descriptor.child_table_pool.rank_value_id,)
+                              if descriptor.child_table_pool.rank_value_id is not None else ()),
+                            *((descriptor.child_table_pool.shape_stride_value_id,)
+                              if descriptor.child_table_pool.shape_stride_value_id is not None else ()),
                             *((descriptor.child_table_pool.status_value_id,)
                               if descriptor.child_table_pool.status_value_id is not None else ()),
                             *((descriptor.child_table_pool.live_flags_value_id,)
@@ -12055,6 +12819,9 @@ def lower_control_sections_to_ssa(
             propagate_repository_ssa_call_metadata,
         )
 
+        report(
+            f"tensor repository linking start; functions={len(module.functions)}"
+        )
         tensor_reference_shortfalls = tuple(
             SSALoweringShortfall(
                 "tensor-ssa-reference",
@@ -12066,11 +12833,19 @@ def lower_control_sections_to_ssa(
                 module, tensor_ssa_reference
             )
         )
+        report(
+            "tensor repository linking complete; "
+            f"shortfalls={len(tensor_reference_shortfalls)}"
+        )
     from .ir_indexing import lower_indexing_to_ssa_addressing
 
     lower_indexing_to_ssa_addressing(module.functions)
     if tensor_ssa_reference is not None and legalize_aggregate_adapters(module):
         propagate_repository_ssa_call_metadata(module)
+    report(
+        f"complete; functions={len(module.functions)} "
+        f"shortfalls={len(shortfalls) + len(control_shortfalls) + len(tensor_reference_shortfalls)}"
+    )
     return module, tuple((
         *shortfalls,
         *control_shortfalls,

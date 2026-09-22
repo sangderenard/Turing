@@ -686,6 +686,21 @@ def test_record_field_getattr_becomes_a_loaded_region_capture():
     assert "Load" in control_operations
 
 
+def test_control_section_lowering_reports_phase_progress():
+    events = []
+    control = ControlProgram(StatementBlock(()), region_indices=())
+
+    module, shortfalls, _outputs = lower_control_sections_to_ssa(
+        control, progress=events.append,
+    )
+
+    assert shortfalls == ()
+    assert "planned_control" in module.functions
+    assert any("start; regions=0" in event for event in events)
+    assert any("control lowering complete" in event for event in events)
+    assert any("complete; functions=" in event for event in events)
+
+
 def test_region_body_free_value_supplements_planner_captures():
     from src.compiler.hierarchical_plan import PlanClosure, PlanLine
 
@@ -714,6 +729,87 @@ def test_region_body_free_value_supplements_planner_captures():
     assert lowered.metadata["source_region_integral"][
         "capture_value_ids"
     ] == (2, 1)
+
+
+def test_planning_concordance_canonicalizes_region_capture_and_call():
+    from src.compiler.hierarchical_plan import PlanClosure, PlanLine
+    from src.compiler.identity_concordance import IdentityPage
+
+    region = PlanClosure(
+        "region_0",
+        captures=(378, 49),
+        items=(PlanLine.create("Add", inputs=(378, 49), outputs=(385,)),),
+        value_shapes=tuple(
+            (value_id, (), "float64") for value_id in (49, 377, 378, 385)
+        ),
+    )
+    control = ControlProgram(
+        StatementBlock(("__scheduled_region_0__",)),
+        region_indices=(0,),
+    )
+
+    concordance = IdentityPage("planning_value_concordance")
+    concordance.bind_alias("planned_control", 378, 377)
+    module, shortfalls, _outputs = lower_control_sections_to_ssa(
+        control,
+        hierarchy_plan=PlanClosure("root", (), (region,)),
+        value_concordance=concordance,
+        required_output_value_ids=(385,),
+    )
+
+    assert shortfalls == ()
+    lowered = module.functions["planned_control__planned_region_0"]
+    assert [value.id for value in lowered.args] == [377, 49]
+    assert [value.id for value in lowered.blocks["entry"].instrs[0].args] == [
+        377, 49,
+    ]
+    caller = module.functions["planned_control"]
+    call = next(
+        instruction
+        for block in caller.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+    )
+    assert [value.id for value in call.args] == [377, 49]
+    assert call.attributes["feed_ids"] == (377, 49)
+    assert concordance.resolve_alias("planned_control", 378) == 377
+
+
+def test_planning_concordance_owns_alias_chains_and_rejects_cycles():
+    import pytest
+
+    from src.compiler.identity_concordance import IdentityPage
+
+    concordance = IdentityPage("planning_value_concordance")
+    concordance.bind_alias("step", 380, 379)
+    concordance.bind_alias("step", 379, 377)
+
+    assert concordance.resolve_alias("step", 380) == 377
+    assert concordance.alias_bindings("step") == {380: 379, 379: 377}
+
+    concordance.bind_alias("step", 377, 380)
+    with pytest.raises(ValueError, match="cyclic planning identity concordance"):
+        concordance.resolve_alias("step", 380)
+
+
+def test_concordant_alias_bindings_reject_private_disagreement():
+    import pytest
+
+    from src.compiler.identity_concordance import (
+        IdentityPage,
+        concordant_alias_bindings,
+    )
+
+    concordance = IdentityPage("planning_value_concordance")
+    concordance.bind_alias("step", 376, 375)
+
+    assert concordant_alias_bindings(
+        "step", {376: 375}, page=concordance,
+    ) == {376: 375}
+    with pytest.raises(ValueError, match="identity concordance disagreement"):
+        concordant_alias_bindings(
+            "step", {376: 374}, page=concordance,
+        )
 
 
 def test_verified_source_region_link_replaces_only_an_exact_structural_abi():
@@ -2181,6 +2277,48 @@ def test_loop_carried_value_is_a_phi_with_the_region_update():
     )
 
 
+def test_loop_carried_temporal_versions_survive_storage_concordance():
+    control = ControlProgram(
+        LoopBlock(
+            "iteration",
+            "0",
+            "4",
+            "1",
+            StatementBlock(("__scheduled_region_3__",)),
+            carried_aliases=((20, 10),),
+            result_ports=((30, 10, 20),),
+        ),
+        region_indices=(3,),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_signatures={3: ((10,), (20,))},
+        value_aliases={10: 30, 20: 30},
+    )
+
+    assert shortfalls == ()
+    seed = next(
+        instruction
+        for instruction in function.blocks["entry"].instrs
+        if instruction.attributes.get("binding") == "loop_carried_seed"
+    )
+    carried = next(
+        instruction
+        for instruction in function.blocks["loop_header"].instrs
+        if instruction.attributes.get("binding") == "loop_carried"
+    )
+    result = next(
+        instruction
+        for instruction in function.blocks["loop_exit"].instrs
+        if instruction.attributes.get("binding") == "loop_result_port"
+    )
+    assert seed.args[0].id == 10
+    assert [argument.id for argument in carried.args] == [10, 20]
+    assert result.res.id == 30
+
+
 def test_nested_loop_final_value_drives_enclosing_carried_phi():
     inner = LoopBlock(
         "inner",
@@ -2224,6 +2362,32 @@ def test_nested_loop_final_value_drives_enclosing_carried_phi():
         instruction.res is outer_phi.args[1]
         for block in function.blocks.values()
         for instruction in block.instrs
+    )
+
+
+def test_nested_resident_mapping_carry_uses_concorded_storage_backedge():
+    inner = LoopBlock(
+        "column", "0", "4", "1", SequenceBlock(()),
+        result_ports=((440, 284, 288),),
+    )
+    outer = LoopBlock(
+        "row", "0", "4", "1", inner,
+        carried_aliases=((440, 447),),
+    )
+    control = ControlProgram(outer)
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="nested_mapping",
+        first_value_id=1000,
+        value_aliases={284: 56, 288: 56, 440: 56, 447: 56},
+        sequence_declarations=((56, "unique", 2, True),),
+    )
+
+    assert shortfalls == ()
+    assert any(
+        value.accounting.get("ssa_storage_identity_backedge") is True
+        for value in function.args
     )
 
 
