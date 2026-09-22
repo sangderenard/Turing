@@ -8128,6 +8128,29 @@ def _canonicalize_non_dominating_loop_result_uses(
             )
             resolved_args = list(instruction.args)
             for argument_index, argument in enumerate(instruction.args):
+                def _note(outcome: str, detail: Any = None) -> None:
+                    """Record this argument's reconciliation decision."""
+
+                    try:
+                        from .identity_concordance import (
+                            current_identity_book,
+                        )
+
+                        page = current_identity_book().page(
+                            "loop_result_reconciliation"
+                        )
+                        row = (
+                            str(function.name), int(argument.id),
+                        )
+                        page.set(row, len(page.history(row)), (
+                            outcome,
+                            f"{block_name}#{instruction_index}",
+                            str(instruction.op),
+                            detail,
+                        ))
+                    except Exception:
+                        pass
+
                 replacement = port_values.get(int(argument.id))
                 if replacement is None:
                     # A result port with no recorded equivalence still states
@@ -8148,7 +8171,12 @@ def _canonicalize_non_dominating_loop_result_uses(
                             and len(defining.args) == 1
                         ):
                             replacement = defining.args[0]
-                if replacement is None or replacement is argument:
+                if replacement is None:
+                    _note("no-candidate", tuple(
+                        definition_sites.get(int(argument.id), ())
+                    )[:3])
+                    continue
+                if replacement is argument:
                     continue
                 incoming_block = (
                     str(incoming_blocks[argument_index])
@@ -8157,11 +8185,23 @@ def _canonicalize_non_dominating_loop_result_uses(
                 if dominates(
                     argument, block_name, instruction_index, incoming_block
                 ):
+                    _note("argument-dominates", (
+                        int(argument.id) in argument_ids,
+                        tuple(definition_sites.get(int(argument.id), ()))[:2],
+                    ))
                     continue
+                _note("argument-not-dominating", tuple(
+                    definition_sites.get(int(argument.id), ())
+                )[:3])
                 if not dominates(
                     replacement, block_name, instruction_index, incoming_block
                 ):
+                    _note("candidate-not-dominating", (
+                        int(replacement.id),
+                        tuple(definition_sites.get(int(replacement.id), ()))[:3],
+                    ))
                     continue
+                _note("replaced", int(replacement.id))
                 resolved_args[argument_index] = replacement
                 receipts.append((
                     str(block_name), int(instruction_index),

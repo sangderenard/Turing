@@ -34930,29 +34930,6 @@ def _class_surface_ssa_program(
             )
 
     report("final repository module assembly and aggregate legalization start")
-    # Region calls are linked after each section lowers, so a loop body
-    # reading its own result port is not yet visible when the per-section
-    # reconciliation runs.  Repeat it here, where every use exists and the
-    # CFG is complete.  The pass substitutes only what dominance proves, so
-    # running it again is idempotent where it already succeeded.
-    from .precompile_to_ssa import (
-        _canonicalize_non_dominating_loop_result_uses as
-        _reconcile_loop_result_uses,
-    )
-
-    reconciled = 0
-    for _function in all_functions.values():
-        receipts = _reconcile_loop_result_uses(_function)
-        if receipts:
-            reconciled += len(receipts)
-            _function.metadata["loop_result_use_rebindings"] = tuple((
-                *_function.metadata.get("loop_result_use_rebindings", ()),
-                *receipts,
-            ))
-    if reconciled:
-        report(
-            f"loop-result uses reconciled after linking: {reconciled}"
-        )
     lowered_module = IRModule(
             all_functions,
             **(
@@ -35028,6 +35005,30 @@ def _class_surface_ssa_program(
         propagate_repository_ssa_call_metadata(lowered_module)
     legalize_aggregate_output_views(lowered_module)
     _reconcile_post_aggregate_record_results(lowered_module)
+
+    # Aggregate legalization rewrites call arguments, so a loop body reading
+    # its own result port only becomes visible HERE -- the reconciliation that
+    # ran before module assembly examined 282 arguments of this function and
+    # the offending one was not yet among them.  The pass substitutes only
+    # what dominance proves, so running it on the finished module is safe and
+    # is the first point at which every use exists.
+    from .precompile_to_ssa import (
+        _canonicalize_non_dominating_loop_result_uses as
+        _reconcile_loop_result_uses,
+    )
+
+    reconciled = 0
+    for _function in lowered_module.functions.values():
+        receipts = _reconcile_loop_result_uses(_function)
+        if receipts:
+            reconciled += len(receipts)
+            _function.metadata["loop_result_use_rebindings"] = tuple((
+                *_function.metadata.get("loop_result_use_rebindings", ()),
+                *receipts,
+            ))
+    report(
+        f"loop-result uses reconciled after legalization: {reconciled}"
+    )
     # Aggregate legalization can rewrite positional projection occurrences
     # after the linked call-table fixed point.  Reapply the final exact frame
     # receipt once so emitted calls and their provenance table end on the same
@@ -37712,6 +37713,55 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     ok = False
     try:
         result = _lower_ast_source_to_ssa_impl(*args, **kwargs)
+        # The LAST point at which every use exists.  Earlier placements of
+        # this reconciliation -- per section, after linking, after aggregate
+        # legalization -- each examined the offending function and did not
+        # yet see the argument the concordance reports, because a later pass
+        # installs it.  Dominance decides every substitution, so running it
+        # on the module the caller receives adds no risk and closes the gap.
+        from .precompile_to_ssa import (
+            _canonicalize_non_dominating_loop_result_uses as
+            _reconcile_loop_result_uses,
+        )
+
+        module = result[0] if isinstance(result, tuple) else result
+        reconciled = 0
+        for _function in getattr(module, "functions", {}).values():
+            receipts = _reconcile_loop_result_uses(_function)
+            if receipts:
+                reconciled += len(receipts)
+                _function.metadata["loop_result_use_rebindings"] = tuple((
+                    *_function.metadata.get(
+                        "loop_result_use_rebindings", ()
+                    ),
+                    *receipts,
+                ))
+        _progress = kwargs.get("progress")
+        # Ask the concordance's own detector the same question here, so a
+        # disagreement between the two walks is reported where it happens
+        # rather than inferred from a failure three stages later.
+        _unresolved = ()
+        try:
+            from .identity_concordance import CorrelationTable
+
+            _table = CorrelationTable.build(module)
+            _unresolved = tuple(
+                finding for finding in _table.findings(module)
+                if finding.kind == "use-not-dominated"
+            )
+        except Exception as _error:
+            _unresolved = (f"detector failed: {_error}",)
+        if _progress is not None:
+            _progress(
+                "ssa-program: loop-result uses reconciled at the module "
+f"boundary: {reconciled}; detector still reports "
+                f"{len(_unresolved)}: "
+                + "; ".join(
+                    f"{getattr(f, 'function', '?')} value "
+                    f"{getattr(f, 'value_id', '?')} {getattr(f, 'detail', f)}"
+                    for f in _unresolved[:2]
+                )
+            )
         ok = True
         return result
     finally:
