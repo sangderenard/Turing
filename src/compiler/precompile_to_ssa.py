@@ -8039,7 +8039,11 @@ def _canonicalize_non_dominating_loop_result_uses(
     port_values = dict(
         function.metadata.get("carried_port_values") or {}
     )
-    if not port_values or not function.blocks:
+    # An empty ledger is not evidence of nothing to do.  A single-incoming
+    # exit Phi states its own equivalence, and the dominance checks below
+    # still decide every substitution, so the pass runs on CFG evidence
+    # whether or not a recorded ledger accompanies it.
+    if not function.blocks:
         return ()
 
     block_names = tuple(function.blocks)
@@ -8125,6 +8129,25 @@ def _canonicalize_non_dominating_loop_result_uses(
             resolved_args = list(instruction.args)
             for argument_index, argument in enumerate(instruction.args):
                 replacement = port_values.get(int(argument.id))
+                if replacement is None:
+                    # A result port with no recorded equivalence still states
+                    # one itself: an exit Phi with a SINGLE incoming says the
+                    # port IS that incoming value.  A use the exit cannot
+                    # dominate -- the loop body reading its own result -- may
+                    # therefore read the incoming instead.  The dominance
+                    # checks below still decide; this only supplies the
+                    # candidate the recorded ledger was missing.
+                    sites = definition_sites.get(int(argument.id), ())
+                    if len(sites) == 1:
+                        site_block, site_index = sites[0]
+                        defining = function.blocks[site_block].instrs[
+                            site_index
+                        ]
+                        if (
+                            str(defining.op).casefold() == "phi"
+                            and len(defining.args) == 1
+                        ):
+                            replacement = defining.args[0]
                 if replacement is None or replacement is argument:
                     continue
                 incoming_block = (

@@ -295,6 +295,56 @@ _SHAPED_SSA_OPERATIONS = {
 }
 
 
+def _settle_operand_shapes(function_name: str, values: Any) -> None:
+    """Read each operand's shape from the concordance before dispatching.
+
+    An SSAValue's shape is a field somebody filled in at construction, and
+    nothing re-read it, so every lowering guard was a race against when that
+    annotation happened to be taken -- ``b.unsqueeze(-1)`` proven ``(2, 1)``
+    still arrived at its consumer carrying ``(2,)``.  The resolver holds the
+    fact for the identity; taking it here makes the guard depend on what is
+    known rather than on what was cached.
+    """
+
+    try:
+        from .identity_concordance import proven_shape_of
+    except Exception:
+        return
+    for value in values or ():
+        try:
+            settled = proven_shape_of(function_name, int(value.id))
+        except Exception:
+            continue
+        if settled and tuple(value.shape or ()) != settled:
+            value.shape = settled
+
+
+def _record_ssa_shape(function_name: str, value: Any) -> None:
+    """What the lowering actually reads, under the authored function's name.
+
+    The SSA name carries the module prefix and the callsite specialization
+    hash; the other stores are keyed by the authored name, so strip both or
+    the rows never line up and every value looks like it has one source.
+    """
+
+    try:
+        from .identity_concordance import current_identity_book
+
+        extents = tuple(int(e) for e in (value.shape or ()))
+        if not extents:
+            return
+        name = str(function_name)
+        if "__specialized_" in name:
+            name = name.split("__specialized_")[0]
+        if "__planned_region" in name:
+            name = name.split("__planned_region")[0]
+        name = name.rsplit("__", 1)[-1] if "__" in name else name
+        page = current_identity_book().page("shape.ssa")
+        page.set((name, int(value.id)), 0, extents)
+    except Exception:
+        pass
+
+
 def _used_value_ids(module: IRModule) -> set[int]:
     return {
         int(value.id)
@@ -2584,6 +2634,9 @@ def lower_tensor_calls_to_repository_ssa(
                 # structure (shape, axis, dtype, keepdim, ...).  Dropping a
                 # constant first operand made calls such as
                 # ``broadcast_to(1.0, (m, n))`` appear to have no source.
+                _settle_operand_shapes(function_name, args)
+                if instruction.res is not None:
+                    _settle_operand_shapes(function_name, (instruction.res,))
                 data_positions = (
                     frozenset({0, 1, 2})
                     if operation == "where" else frozenset({0})
@@ -3519,6 +3572,8 @@ def lower_tensor_calls_to_repository_ssa(
 
                 elif operation == "matmul" and len(data_args) == 2:
                     left, right = data_args
+                    _record_ssa_shape(function_name, left)
+                    _record_ssa_shape(function_name, right)
                     if len(left.shape) == len(right.shape) == 2 and left.shape[1] == right.shape[0]:
                         dimensions = []
                         for extent in (left.shape[0], left.shape[1], right.shape[1]):

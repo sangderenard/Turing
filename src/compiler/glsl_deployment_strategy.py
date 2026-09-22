@@ -16814,14 +16814,18 @@ def _tensor_descriptor(
             str(graph.G.graph.get("function_name")),
             int(data.get("value_id", node_id)),
         )
-        proven = _deepest_fact(page, row)
-        if proven is not None and proven[0] != "conflicting":
-            # Already proven.  Answering from the page is what makes the
-            # query a function of the value rather than of the moment.
+        from .identity_concordance import proven_shape_of
+
+        settled = proven_shape_of(row[0], row[1])
+        if settled:
+            # Already proven.  Answering from the concordance is what makes
+            # the query a function of the value rather than of the moment.
             return {
-                "shape": tuple(proven[1]),
-                "dtype": str(proven[2]),
-                "rank": len(tuple(proven[1])),
+                "shape": settled,
+                "dtype": str(
+                    (_deepest_fact(page, row) or ("", (), "float64"))[2]
+                ),
+                "rank": len(settled),
             }
     except Exception:
         row = None
@@ -16837,27 +16841,13 @@ def _tensor_descriptor(
             # Only an answer with real extents is a proof.  An empty shape is
             # never cemented: it is indistinguishable from "recovery stopped".
             if extents and not dynamic:
-                dtype = str((answer or {}).get("dtype") or "float64")
-                level = int(_dependency_levels(graph).get(int(node_id), 0))
-                previous = _deepest_fact(page, row)
-                recorded = dict(page.history(row))
-                if previous is None:
-                    page.set(row, level, ("proven", extents, dtype))
-                elif tuple(previous[1]) == extents:
-                    # The same answer from deeper in the program is still the
-                    # same answer; record it at its own position so the page
-                    # shows how far it has been confirmed.
-                    page.set(row, level, ("proven", extents, dtype))
-                elif int(level) > max(
-                    int(column) for column in recorded
-                ):
-                    # Derived from strictly more of the program than the
-                    # incumbent, so it supersedes rather than conflicts.
-                    page.set(row, level, ("proven", extents, dtype))
-                else:
-                    # Same position, different answer: concurrent and
-                    # genuinely in conflict.
-                    page.set(row, level, ("conflicting", extents, dtype))
+                from .identity_concordance import record_proven_shape
+
+                record_proven_shape(
+                    row[0], row[1], extents,
+                    (answer or {}).get("dtype"),
+                    int(_dependency_levels(graph).get(int(node_id), 0)),
+                )
         except Exception:
             pass
     return answer

@@ -14596,6 +14596,44 @@ def _class_surface_ssa_program(
                     if marker not in polymorphic_formals:
                         polymorphic_formals.add(marker)
                         changed = True
+    # One page per store, so a value whose stores disagree is a row rather
+    # than a hunt.
+    _node_page = _shape_book().page("shape.node")
+    _linked_page = _shape_book().page("shape.linked")
+    for _graph in planned_graphs_by_shell.values():
+        _name = str(_graph.graph.get("function_name"))
+        _contracts = linked_value_abi_by_graph.get(id(_graph), {})
+        for _node_id, _data in _graph.nodes(data=True):
+            _value_id = int(_data.get("value_id", _node_id))
+            _row = (_name, _value_id)
+            _tensor = _data.get("tensor") or {}
+            _extents = tuple(_tensor.get("shape") or ())
+            if _extents:
+                _node_page.set(_row, 0, _extents)
+            _contract = _contracts.get(_value_id) or {}
+            _declared = tuple(_contract.get("shape") or ())
+            if _declared:
+                _linked_page.set(_row, 0, tuple(map(int, _declared)))
+
+    # One page per store, so a value whose stores disagree is a row rather
+    # than a hunt.
+    _node_page = _shape_book().page("shape.node")
+    _linked_page = _shape_book().page("shape.linked")
+    for _graph in planned_graphs_by_shell.values():
+        _name = str(_graph.graph.get("function_name"))
+        _contracts = linked_value_abi_by_graph.get(id(_graph), {})
+        for _node_id, _data in _graph.nodes(data=True):
+            _value_id = int(_data.get("value_id", _node_id))
+            _row = (_name, _value_id)
+            _tensor = _data.get("tensor") or {}
+            _extents = tuple(_tensor.get("shape") or ())
+            if _extents:
+                _node_page.set(_row, 0, _extents)
+            _contract = _contracts.get(_value_id) or {}
+            _declared = tuple(_contract.get("shape") or ())
+            if _declared:
+                _linked_page.set(_row, 0, tuple(map(int, _declared)))
+
     for planned_graph in planned_graphs_by_shell.values():
         contracts = linked_value_abi_by_graph.get(id(planned_graph), {})
         if contracts:
@@ -34892,6 +34930,29 @@ def _class_surface_ssa_program(
             )
 
     report("final repository module assembly and aggregate legalization start")
+    # Region calls are linked after each section lowers, so a loop body
+    # reading its own result port is not yet visible when the per-section
+    # reconciliation runs.  Repeat it here, where every use exists and the
+    # CFG is complete.  The pass substitutes only what dominance proves, so
+    # running it again is idempotent where it already succeeded.
+    from .precompile_to_ssa import (
+        _canonicalize_non_dominating_loop_result_uses as
+        _reconcile_loop_result_uses,
+    )
+
+    reconciled = 0
+    for _function in all_functions.values():
+        receipts = _reconcile_loop_result_uses(_function)
+        if receipts:
+            reconciled += len(receipts)
+            _function.metadata["loop_result_use_rebindings"] = tuple((
+                *_function.metadata.get("loop_result_use_rebindings", ()),
+                *receipts,
+            ))
+    if reconciled:
+        report(
+            f"loop-result uses reconciled after linking: {reconciled}"
+        )
     lowered_module = IRModule(
             all_functions,
             **(
