@@ -53,7 +53,7 @@ callee formal it feeds, by name.
 from __future__ import annotations
 
 from dataclasses import dataclass, field as _field
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 
@@ -368,6 +368,7 @@ class SSAReferenceEvaluator:
         step_limit: int = 5_000_000,
         history: Iterable[int] = (),
         external_reference_host: Any = None,
+        trace: "Callable[[str, Any, dict[int, Any]], None] | None" = None,
     ) -> None:
         self.module = module
         self.functions = dict(getattr(module, "functions", {}) or {})
@@ -385,6 +386,16 @@ class SSAReferenceEvaluator:
         self.external_reference_host = external_reference_host
         self._external_reference_ids: dict[str, int] = {}
         self._external_request_id = 0
+        # A whole-program trace, unlike ``history``, is not scoped to the
+        # root frame: it fires for every instruction in every recursively
+        # executed callee too, with that callee's own local frame. This is
+        # how a defect that only appears inside a called function (not the
+        # entry) is located without editing the evaluator per-hunt -- the
+        # caller supplies the callback and can raise from it to unwind with
+        # the exact function/instruction/frame that reached the moment it
+        # was watching for, rather than guessing which frame to inspect
+        # after the fact.
+        self.trace = trace
 
     # -- public -----------------------------------------------------------
 
@@ -455,6 +466,8 @@ class SSAReferenceEvaluator:
                     break
 
                 self._step(function, instruction, values, previous)
+                if self.trace is not None:
+                    self.trace(str(function.name), instruction, values)
                 if self.history_ids and values is self._root_frame:
                     result = instruction.res
                     if result is not None:
@@ -670,6 +683,19 @@ class SSAReferenceEvaluator:
                 dim = int(attributes.get("dim", 0))
                 extent = int(array.shape[dim]) if array.ndim else 0
             values[int(result.id)] = np.int64(extent)
+            return
+
+        if operation in {"clone", "copy", "identity"} and instruction.args:
+            # A tensor-shaped structural op with no scalar spelling in
+            # TENSOR_OPERATION_SCALAR_SPELLING -- it is a genuine copy at
+            # every rank, not an arithmetic operator, so it has no entry
+            # there. Every backend allocates fresh storage for a clone; the
+            # evaluator must too, or a later Store into the "clone" would
+            # alias and mutate the source it was cloned from, which no
+            # compiled backend does.
+            values[int(result.id)] = np.array(
+                self._operand(values, instruction.args[0]), copy=True,
+            )
             return
 
         raise SSAEvaluationError(
