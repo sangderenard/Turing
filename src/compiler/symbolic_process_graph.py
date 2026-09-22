@@ -612,6 +612,120 @@ def ingest_sympy_expression(
             memo[value] = node_id
             return node_id
 
+        if isinstance(value, sympy.Derivative):
+            # Excise everything inside the Derivative, recursively build it
+            # as ordinary ProcessGraph nodes (add_node handles any sympy
+            # subtree already), then invert that subgraph with the existing
+            # process-graph reversal mechanism to obtain the derivative --
+            # no separate translation rule for Derivative is needed, and no
+            # tape-based autograd is used.
+            from .process_graph_autograd import obtain_graph_reverse
+
+            inner_id = add_node(value.expr)
+            # sympy.Derivative.variables repeats a symbol for higher orders
+            # (e.g. (x, x) for d^2/dx^2); this excises one order at a time by
+            # reversing w.r.t. the first variable and recursing on the rest.
+            wrt_symbol = value.variables[0]
+            wrt_id = add_node(wrt_symbol)
+            product = obtain_graph_reverse(graph, outputs=[inner_id], wrt=[wrt_id])
+            backward = product.graph
+            adjoint = product.adjoint
+
+            # `backward` is a genuinely separate ProcessGraph with its own
+            # 0-based id numbering (_AdjointBuilder.__init__ starts
+            # next_id at 0) -- it is NOT a subgraph sharing ids with `graph`.
+            # Any of its "input" nodes standing in for an already-built
+            # forward value carries that value's id as
+            # attributes['source_forward_id'] (_AdjointBuilder.input /
+            # saved_value); those redirect straight to the existing forward
+            # node instead of being duplicated. Every other backward node is
+            # a genuinely new computation and gets folded in via make_node,
+            # which already owns this graph's id counter and edge
+            # bookkeeping -- no hand-rolled id allocation here.
+            #
+            # `source_forward_id` is provenance metadata _AdjointBuilder.add
+            # attaches to nearly every backward node (which forward node a
+            # gradient contribution is FOR); it is not a redirect signal --
+            # every node carries it. Only two `binding_kind`s from
+            # _AdjointBuilder.input are real stand-ins:
+            #   "saved_forward"  -- reuses an already-computed forward value:
+            #                       redirect straight to that forward node.
+            #   "gradient_seed"  -- the incoming cotangent for one output;
+            #                       under unit_output_seed=True (the default
+            #                       obtain_graph_reverse uses) this is the
+            #                       constant 1.0, not a forward-graph alias.
+            remap: dict[int, int] = {}
+            for node_id, data in backward.G.nodes(data=True):
+                attrs = data.get("attributes") or {}
+                kind = attrs.get("binding_kind")
+                source_forward_id = attrs.get("source_forward_id")
+                if kind == "saved_forward" and source_forward_id is not None \
+                        and int(source_forward_id) in graph.G:
+                    remap[node_id] = int(source_forward_id)
+                elif kind == "gradient_seed":
+                    remap[node_id] = make_node(
+                        sympy.Integer(1),
+                        SympyProcessGraphRule("const", node_type="Constant"),
+                        (), (), {"value": 1},
+                    )
+
+            import networkx as nx
+
+            def _rehomed_callee_ref(old_ref: int) -> int:
+                """Copy one backward-rule function-table entry from
+                `backward` into `graph`'s own table (declare() itself
+                dedupes by qualified name, so shared rules like bw_mul/
+                bw_sin across several derivatives in one equation collapse
+                to one entry), and return the address to use in `graph`.
+                """
+                old_entry = backward.function_table.entry(old_ref)
+                new_ref = graph.function_table.declare(
+                    old_entry.name,
+                    qualified_name=old_entry.qualified_name,
+                    external=(old_entry.state.name == "EXTERNAL"),
+                    metadata=dict(old_entry.metadata),
+                    parameter_contracts=old_entry.parameter_contracts,
+                )
+                new_entry = graph.function_table.entry(new_ref)
+                if old_entry.graph is not None and new_entry.graph is None:
+                    graph.function_table.resolve_graph(new_ref, old_entry.graph)
+                if old_entry.python_callable is not None:
+                    graph.function_table.resolve_callable(
+                        new_ref, old_entry.python_callable)
+                for target, impl in old_entry.implementations.items():
+                    graph.function_table.install_implementation(new_ref, target, impl)
+                return int(new_ref.address) if hasattr(new_ref, "address") else int(new_ref)
+
+            for node_id in nx.topological_sort(backward.G):
+                if node_id in remap:
+                    continue
+                data = backward.G.nodes[node_id]
+                parent_ids = tuple(remap[p] for p, _role in data.get("parents", ()))
+                roles = tuple(role for _p, role in data.get("parents", ()))
+                rule = SympyProcessGraphRule(
+                    data.get("op") or "grad", node_type=data.get("type"))
+                attributes = dict(data.get("attributes") or {})
+                if attributes.get("callee_ref") is not None:
+                    attributes["callee_ref"] = _rehomed_callee_ref(attributes["callee_ref"])
+                placeholder = sympy.Symbol(f"_adjoint_{node_id}_{data.get('label', 'grad')}")
+                new_id = make_node(placeholder, rule, parent_ids, roles, attributes)
+                if data.get("tensor"):
+                    graph.G.nodes[new_id]["tensor"] = dict(data["tensor"])
+                remap[node_id] = new_id
+
+            grad_backward_id = adjoint.gradient_value_ids[wrt_id]
+            grad_id = remap[grad_backward_id]
+            remaining_variables = value.variables[1:]
+            if remaining_variables:
+                result_id = add_node(
+                    sympy.Derivative(graph.node_map.get(grad_id, sympy.Symbol(f"_grad_{grad_id}")),
+                                      *remaining_variables)
+                )
+            else:
+                result_id = grad_id
+            memo[value] = result_id
+            return result_id
+
         rule = _sympy_process_graph_rule(value)
         if rule is None:
             fallback_name = type(value).__name__
