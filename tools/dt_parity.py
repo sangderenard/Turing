@@ -1,9 +1,9 @@
-"""Per-participant tau against the blended energy/power pin.
+"""Per-participant exchange_time against the blended energy/power pin.
 
 The claim the whole port rests on is that these are the same law.
 ``_energy_time_limit`` pins the next step at ``fraction * energy / power`` for
-one blended participant; ``tau_bound`` pins it at ``fraction * tau`` per
-participant and takes the minimum.  tau IS energy/power, so with ONE
+one blended participant; ``exchange_time_bound`` pins it at ``fraction * exchange_time`` per
+participant and takes the minimum.  exchange_time IS energy/power, so with ONE
 participant the two must agree -- and if they do, replacing the blended pin is
 not a behaviour change for the single-participant case that everything shipping
 today relies on.
@@ -48,7 +48,7 @@ from src.common.dt_system.dt_scaler import Metrics  # noqa: E402
 from src.common.dt_system.participants import (  # noqa: E402
     Publication,
     StepSpans,
-    tau_bound,
+    exchange_time_bound,
 )
 from src.common.dt_system.time_contracts import BIND, ParticipantRegistry  # noqa: E402
 
@@ -71,15 +71,15 @@ def blended(energy, power, fraction, dt_proposed):
     return dt_proposed if limit is None else min(dt_proposed, limit)
 
 
-def per_participant(taus, fraction, dt_proposed):
-    """The port's pin: each participant's own tau, masked minimum over them."""
-    names = tuple(f"p{index}" for index in range(len(taus)))
+def per_participant(exchange_times, fraction, dt_proposed):
+    """The port's pin: each participant's own exchange_time, masked minimum over them."""
+    names = tuple(f"p{index}" for index in range(len(exchange_times)))
     spans = StepSpans.of(
         _registry(*names),
-        {name: Publication(tau_s=tau, contract=BIND)
-         for name, tau in zip(names, taus)},
+        {name: Publication(exchange_time_s=exchange_time, contract=BIND)
+         for name, exchange_time in zip(names, exchange_times)},
     )
-    return float(tau_bound(spans, fraction, dt_proposed).item())
+    return float(exchange_time_bound(spans, fraction, dt_proposed).item())
 
 
 def relative(reference, value, scale_floor):
@@ -151,7 +151,7 @@ def main(argv) -> int:
             worst = (error, energy, power, fraction, dt_proposed, reference, ported)
 
     exact = sum(1 for error in errors if error == 0.0)
-    print("ONE participant: tau_bound against the blended pin")
+    print("ONE participant: exchange_time_bound against the blended pin")
     print(f"  exactly equal              : {exact}/{count}"
           f"  ({100.0 * exact / count:.2f}%)")
     print(f"  relative error quartiles   : "
@@ -178,7 +178,7 @@ def main(argv) -> int:
         dt_proposed = 10.0 ** rng.uniform(-4, -1)
         # today: sum both, then divide once
         blended_limit = blended(sum(energies), sum(powers), fraction, dt_proposed)
-        # ported: each participant's own tau, minimum over them
+        # ported: each participant's own exchange_time, minimum over them
         ported_limit = per_participant(
             [e / p for e, p in zip(energies, powers)], fraction, dt_proposed)
         if blended_limit > 0.0:

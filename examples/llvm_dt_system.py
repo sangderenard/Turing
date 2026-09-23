@@ -13,15 +13,55 @@ of the dt system is needed -- no ``DtCompatibleEngine``, no ``StateTable``,
 no ``GraphBuilder``/``MetaLoopRunner`` (that layer is optional composition on
 top and has never been lowered; see llvm_dt_system.py.bak for the discovery).
 
+dt_graph's NODE TREE is how this module interprets its pieces
+(``dt_system_from_graph``): a ``RoundNode``'s children in order are the
+causal order, its ``schedule`` is the read discipline (``sequential`` --
+same-step reads; ``parallel`` -- start-of-step reads), an ``AdvanceNode``
+holds a piece in its ``StateNode`` (``piece_leaf``), and a nested
+``RoundNode`` is the dt system's own subdivision (``RoundPiece``).  The tree
+is read here; ``MetaLoopRunner`` does not run it.  Independent participants
+(``Subcycle``) are consulted without waiting, on their own threads.
+
 Python does the lowering.  The pieces decide the columns, so the state class
 (one span field per column, exactly the tire's ``BalloonTireManagedState``
 shape) and the advance function (one named call per piece) are spelled by
 Python for the piece set at hand -- ``state_source``/``piece_source`` -- and
 that same text is what runs in Python and what is handed to the compiler.
 The emitted unit is the run-many-times part.
+
+TIME VOCABULARY (decided 2026-09-22).  Three quantities that used to share
+the word "tau" are kept apart here:
+
+``exchange_time_s``
+    A law's exchangeable energy over its exchange power, E/P: the seconds it
+    would take its exchange to run its course at the rate it runs now.  E is
+    the law's ``exchangeable_energy_j`` -- measured from where the exchange
+    is going, so E/P is the true relaxation time -- falling back to its stored
+    ``energy_j`` for a law that has not declared one.  This is
+    the energy-stability metric that SCHEDULES dt, as
+    ``dt <= Targets.energy_exchange_fraction * exchange_time_s``.  It is
+    written into the dt system's per-participant scheduling slot,
+    ``pub_exchange_time``.
+Courant numbers
+    Tracked per law, information only: the energy Courant number
+    ``P * dt / E`` (the quantity the exchange fraction caps) and the transport
+    Courant number ``dt / dt_limit``.  Nothing schedules on them.
+``tau``
+    Time velocity: the world time a system actually advanced, over the world
+    time its reference asked for.  Measured, never set, and never an input to
+    scheduling.  In a lockstep window it is ``advanced / round_dt`` (telemetry
+    ``tau``).  For an independent ``Subcycle`` it is the participant's own world
+    time over the world time of the system consulting it.
+
+Wall cost (host seconds per world second) is a fourth, separate quantity:
+``WallCostLedger``, measured by the host around each call, always on, and
+information only.  It is never read by anything that chooses dt.
 """
 
+import math
 import sys
+import threading
+import time
 
 import numpy as np
 
@@ -30,7 +70,7 @@ from src.common.dt_system.dt_scaler import Metrics
 from src.common.dt_system.participants import StepSpans
 from src.common.dt_system.error_channels import DT_CHANNEL_NAMES
 from src.common.tensors import AbstractTensor
-from src.common.dt_system.time_contracts import BIND, HOLD, ParticipantRegistry
+from src.common.dt_system.time_contracts import BIND, DILATE, HOLD, SUBCYCLE, ParticipantRegistry
 from src.compiler.native_law_kernels import LLVMPiece
 
 C_BACKEND = "c"
@@ -38,9 +78,16 @@ LLVM_BACKEND = "llvm"
 FORTRAN_BACKEND = "fortran"
 
 METRIC_FIELDS = ("max_vel", "max_flux", "div_inf", "mass_err", "dt_limit",
-                 "energy_j", "power_w")
+                 "energy_j", "power_w", "exchangeable_energy_j")
 TELEMETRY_FIELDS = ("advanced", "dt_next", "max_vel", "max_flux", "div_inf",
-                    "mass_err", "dt_limit", "hard_failure")
+                    "mass_err", "dt_limit", "hard_failure", "tau")
+#: The dt system's own per-participant publication spans (the controller reads these).
+PUBLICATION_FIELDS = ("pub_exchange_time", "pub_exchange_time_present", "pub_contract", "pub_dt_limit",
+                      "pub_dt_limit_present")
+#: Per-law Courant numbers, tracked for information only; never passed to
+#: ``Metrics``, so nothing that chooses dt can read them.
+COURANT_FIELDS = ("pub_energy_courant", "pub_energy_courant_present",
+                  "pub_dt_courant", "pub_dt_courant_present")
 
 
 def column_names_of(pieces):
@@ -67,7 +114,7 @@ def state_source(columns, participants=1):
         lines.append(f"        self.{name} = {name}")
     lines.append("        self.telemetry = telemetry")
     lines.append(f"        self.channel_names = {DT_CHANNEL_NAMES!r}")
-    for field in ("pub_tau", "pub_tau_present", "pub_contract", "pub_dt_limit", "pub_dt_limit_present"):
+    for field in (*PUBLICATION_FIELDS, *COURANT_FIELDS):
         lines.append(f"        self.{field} = AbstractTensor.zeros(({participants},))")
     for field in ("pub_values", "pub_present", "pub_limits", "pub_limits_present"):
         lines.append(f"        self.{field} = AbstractTensor.zeros(({participants * len(DT_CHANNEL_NAMES)},))")
@@ -85,8 +132,21 @@ def state_source(columns, participants=1):
     return "\n".join(lines) + "\n"
 
 
-def piece_source(pieces):
+SCHEDULES = ("sequential", "parallel")
+
+
+def piece_source(pieces, schedule="sequential"):
     """Spell ``advance_pieces(state, dt)`` for exactly these pieces.
+
+    ``schedule`` is the round's read discipline, as ``dt_graph.RoundNode``
+    spells it: ``"sequential"`` -- piece i reads what pieces before it wrote
+    this step (each write lands before the next call); ``"parallel"`` -- every
+    piece reads the state the step started from, and the writes land after the
+    last call.  Which one is right is the modeller's choice at the coupling
+    (same-step versus lagged), stated in the graph rather than implied by list
+    position.  A piece may declare ``contract`` (``BIND``/``HOLD``/``DILATE``/
+    ``SUBCYCLE``); undeclared, it binds when it exchanges and holds when it
+    does not.
 
     Every piece is called by its own bound name (``step_0``, ``step_1``,
     ...) with its columns spelled out, every ``<name>_next`` output is
@@ -96,10 +156,14 @@ def piece_source(pieces):
     against it is a no-op), the energy/power channels summed.
     """
 
+    if schedule not in SCHEDULES:
+        raise NotImplementedError(
+            f"schedule={schedule!r}: llvm_dt_system interprets {SCHEDULES}")
     columns = column_names_of(pieces)
     lines = ["def advance_pieces(state, dt):"]
     lines.append("    state.dt[...] = dt")
     folds = {name: [] for name in METRIC_FIELDS}
+    deferred = []
     for index, piece in enumerate(pieces):
         arguments = ", ".join(f"state.{name}" for name in piece.argument_names)
         outputs = [f"o{index}_{name}" for name in piece.output_names]
@@ -108,9 +172,15 @@ def piece_source(pieces):
             if name.endswith("_next") and name[:-5] in columns:
                 # In place: the column is the caller's buffer (the same
                 # write ``restore`` makes), never a rebinding of the field.
-                lines.append(f"    state.{name[:-5]}[...] = {output}")
+                write = f"    state.{name[:-5]}[...] = {output}"
+                if schedule == "parallel":
+                    deferred.append(write)
+                else:
+                    lines.append(write)
             if name in folds:
                 folds[name].append(output)
+    # parallel: every piece read the start-of-step state; the writes land now
+    lines.extend(deferred)
 
     # Each law publishes what IT measured, keyed by its own identity, in the
     # order the laws ran -- which is the causal order, because law i may consume
@@ -131,23 +201,52 @@ def piece_source(pieces):
             # unchanged; extracting here would split the tensorized handoff
             # with a structural scalar call result.
             lines.append(f"    m{index}_{name} = o{index}_{name}.{reducer}()")
-        # tau is this law's own energy over its own power: the time it would
-        # take to exchange its stored energy at the rate it is exchanging now.
-        # That is the quantity the blended energy/power pin always computed --
-        # here it stays attached to the law that measured it.
-        # Write declared buffers directly. No Publication constructor or keyed
-        # table result crosses this call boundary. Every attempt writes its masks.
-        if "energy_j" in published and "power_w" in published:
-            lines.append(f"    state.pub_tau_present[{index}] = float(m{index}_power_w > 0.0)")
-            lines.append(f"    state.pub_tau[{index}] = m{index}_energy_j / m{index}_power_w if m{index}_power_w > 0.0 else 0.0")
-            lines.append(f"    state.pub_contract[{index}] = BIND if m{index}_power_w > 0.0 else HOLD")
+        # exchange_time_s is this law's own energy over its own power: the time
+        # it would take to exchange its stored energy at the rate it is
+        # exchanging now.  It is the energy-stability metric that schedules dt,
+        # so it goes into the dt system's scheduling slot
+        # (``pub_exchange_time``) and stays attached to the law that measured it.
+        # It is NOT this module's tau, which is time velocity (see the module
+        # docstring).  Write declared buffers directly. No Publication
+        # constructor or keyed table result crosses this call boundary. Every
+        # attempt writes its masks.
+        # The energy a law's exchange can actually move is measured from where
+        # that exchange is going (``exchangeable_energy_j``, derived by the law
+        # from its own Jacobian), not from absolute zero; a law that has not
+        # declared it falls back to its stored ``energy_j``.
+        energy = "exchangeable_energy_j" if "exchangeable_energy_j" in published else "energy_j"
+        if energy in published and "power_w" in published:
+            lines.append(f"    m{index}_exchange_time_s = m{index}_{energy} / m{index}_power_w if m{index}_power_w > 0.0 else 0.0")
+            lines.append(f"    state.pub_exchange_time_present[{index}] = float(m{index}_power_w > 0.0)")
+            lines.append(f"    state.pub_exchange_time[{index}] = m{index}_exchange_time_s")
+            declared = getattr(piece, "contract", None)
+            lines.append(f"    state.pub_contract[{index}] = "
+                         + (f"{float(declared)}" if declared is not None
+                            else f"BIND if m{index}_power_w > 0.0 else HOLD"))
+            # Energy Courant number, P*dt/E: the fraction of the stored energy
+            # exchanged in this step -- what energy_exchange_fraction caps.
+            # Tracked only; absent (not zero) when there is no stored energy.
+            lines.append(f"    state.pub_energy_courant_present[{index}] = float(m{index}_{energy} > 0.0)")
+            lines.append(f"    state.pub_energy_courant[{index}] = m{index}_power_w * dt / m{index}_{energy} if m{index}_{energy} > 0.0 else 0.0")
         else:
-            lines.append(f"    state.pub_tau[{index}] = 0.0")
-            lines.append(f"    state.pub_tau_present[{index}] = 0.0")
-            lines.append(f"    state.pub_contract[{index}] = HOLD")
+            lines.append(f"    state.pub_exchange_time[{index}] = 0.0")
+            lines.append(f"    state.pub_exchange_time_present[{index}] = 0.0")
+            declared = getattr(piece, "contract", None)
+            lines.append(f"    state.pub_contract[{index}] = "
+                         + (f"{float(declared)}" if declared is not None else "HOLD"))
+            lines.append(f"    state.pub_energy_courant[{index}] = 0.0")
+            lines.append(f"    state.pub_energy_courant_present[{index}] = 0.0")
         floor = f"m{index}_dt_limit" if "dt_limit" in published else "0.0"
         lines.append(f"    state.pub_dt_limit[{index}] = {floor}")
         lines.append(f"    state.pub_dt_limit_present[{index}] = {float('dt_limit' in published)}")
+        # Transport Courant number, dt/dt_limit: 1.0 is the law's own
+        # stability floor.  Tracked only.
+        if "dt_limit" in published:
+            lines.append(f"    state.pub_dt_courant_present[{index}] = float(m{index}_dt_limit > 0.0)")
+            lines.append(f"    state.pub_dt_courant[{index}] = dt / m{index}_dt_limit if m{index}_dt_limit > 0.0 else 0.0")
+        else:
+            lines.append(f"    state.pub_dt_courant[{index}] = 0.0")
+            lines.append(f"    state.pub_dt_courant_present[{index}] = 0.0")
         for channel, name in enumerate(DT_CHANNEL_NAMES):
             slot = index * len(DT_CHANNEL_NAMES) + channel
             measured = name in published and name in METRIC_FIELDS
@@ -192,7 +291,7 @@ def piece_source(pieces):
              for name in DT_CHANNEL_NAMES]
     lines.append(f"        error_channels=AbstractTensor.tensor([{', '.join(report)}]),")
     lines.append(f"        error_present=AbstractTensor.tensor({flags}),")
-    for field in ("pub_tau", "pub_tau_present", "pub_contract", "pub_dt_limit", "pub_dt_limit_present",
+    for field in (*PUBLICATION_FIELDS,
                   "pub_values", "pub_present", "pub_limits", "pub_limits_present"):
         lines.append(f"        {field}=state.{field},")
     lines.append("    )")
@@ -200,26 +299,44 @@ def piece_source(pieces):
     return "\n".join(lines) + "\n"
 
 
-def generated_source(pieces):
-    return state_source(column_names_of(pieces), len(pieces)) + "\n\n" + piece_source(pieces)
+def generated_source(pieces, schedule="sequential"):
+    return state_source(column_names_of(pieces), len(pieces)) + "\n\n" + piece_source(pieces, schedule)
 
 
-def bind_pieces(pieces):
-    """Bind ``PieceState`` and ``advance_pieces`` for these pieces in this
-    module: the Python path runs the very text the lowering is given."""
+def bind_namespace(pieces, *, wrap=None, schedule="sequential"):
+    """Exec the generated ``PieceState``/``advance_pieces`` for these pieces
+    into a fresh namespace and return it, touching no module global.
 
-    bindings = {f"step_{index}": piece for index, piece in enumerate(pieces)}
+    ``wrap(index, piece) -> callable`` lets the Python host put a measurement
+    around each call (the wall-cost ledger).  The generated text is the same
+    either way; only what ``step_i`` names differs, and only in Python.
+    """
+
+    bindings = {
+        f"step_{index}": piece if wrap is None else wrap(index, piece)
+        for index, piece in enumerate(pieces)
+    }
     namespace = {
         "np": np, "Metrics": Metrics,
         # the dt system's own publication vocabulary: a law states what it
-        # measured and how its tau participates, and nothing here decides
+        # measured and how its exchange time participates, and nothing here
+        # decides
         "StepSpans": StepSpans, "AbstractTensor": AbstractTensor, "BIND": BIND, "HOLD": HOLD,
+        "DILATE": DILATE, "SUBCYCLE": SUBCYCLE,
         **bindings,
     }
-    exec(generated_source(pieces), namespace)
+    exec(generated_source(pieces, schedule), namespace)
+    return namespace
+
+
+def bind_pieces(pieces, *, wrap=None, schedule="sequential"):
+    """Bind ``PieceState`` and ``advance_pieces`` for these pieces in this
+    module: the Python path runs the very text the lowering is given."""
+
+    namespace = bind_namespace(pieces, wrap=wrap, schedule=schedule)
     globals()["PieceState"] = namespace["PieceState"]
     globals()["advance_pieces"] = namespace["advance_pieces"]
-    return bindings
+    return {f"step_{index}": piece for index, piece in enumerate(pieces)}
 
 
 def participant_registry(pieces):
@@ -244,6 +361,19 @@ def dt_system_over(state, targets, controller, round_dt, dt_initial, dx):
 
     advanced, dt_next, metrics = run_superstep(
         state, round_dt, dt_initial, dx, targets, controller, advance_pieces)
+    publish_window(state, advanced, dt_next, metrics, round_dt)
+    return advanced, dt_next
+
+
+def publish_window(state, advanced, dt_next, metrics, round_dt):
+    """Write one window's results to ``state.telemetry``.
+
+    ``tau`` is the window's time velocity: world time advanced over world
+    time asked for.  It is 1.0 whenever the window landed, and less only when
+    ``run_superstep`` stopped short (``max_iters`` exhausted); it is measured
+    here and read by nothing that chooses dt.
+    """
+
     state.telemetry[0] = advanced
     state.telemetry[1] = dt_next
     state.telemetry[2] = metrics.max_vel
@@ -252,17 +382,505 @@ def dt_system_over(state, targets, controller, round_dt, dt_initial, dx):
     state.telemetry[5] = metrics.mass_err
     state.telemetry[6] = metrics.dt_limit if metrics.dt_limit is not None else 0.0
     state.telemetry[7] = float(metrics.hard_failure)
-    return advanced, dt_next
+    state.telemetry[8] = advanced / round_dt if round_dt > 0.0 else 0.0
 
 
-def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, controller=None):
+def load_pieces(piece_files):
+    """Pieces from ``.piece`` files; an item that already is a piece (it
+    declares ``argument_names``/``output_names``) is taken as it is."""
+
+    return [
+        item if hasattr(item, "argument_names") and hasattr(item, "output_names")
+        else LLVMPiece.load(item)
+        for item in piece_files
+    ]
+
+
+def owned_columns(pieces, columns=None):
+    """Columns these pieces write: every ``<name>_next`` output whose
+    ``<name>`` is one of the columns."""
+
+    columns = column_names_of(pieces) if columns is None else tuple(columns)
+    owned = []
+    for piece in pieces:
+        for name in piece.output_names:
+            if name.endswith("_next") and name[:-5] in columns and name[:-5] not in owned:
+                owned.append(name[:-5])
+    return tuple(owned)
+
+
+class WallCostLedger:
+    """Host seconds spent against world seconds advanced. INFORMATION ONLY.
+
+    Measured by the host around each piece call and each window, outside
+    anything that lowers: the compiled step is deterministic and has no wall
+    clock in it.  Always on, because a profiler that has to be switched on
+    measures a different program.  Nothing that chooses dt, fidelity or a
+    window reads this; it is a record, keyed by participant (the same causal
+    order ``participant_registry`` declares).
+    """
+
+    def __init__(self, names):
+        self.names = tuple(names)
+        self.calls = [0] * len(self.names)
+        self.piece_wall_s = [0.0] * len(self.names)
+        self.windows = 0
+        self.wall_s = 0.0
+        self.world_s = 0.0
+
+    def wrap(self, index, piece):
+        def measured(*columns):
+            start = time.perf_counter()
+            try:
+                return piece(*columns)
+            finally:
+                self.piece_wall_s[index] += time.perf_counter() - start
+                self.calls[index] += 1
+        measured.__name__ = f"measured_step_{index}"
+        return measured
+
+    def window(self, wall_s, world_s):
+        self.windows += 1
+        self.wall_s += float(wall_s)
+        self.world_s += float(world_s)
+
+    @property
+    def wall_cost(self):
+        """Host seconds per world second (above 1.0: slower than realtime)."""
+        return self.wall_s / self.world_s if self.world_s > 0.0 else float("inf")
+
+    def report(self):
+        return {
+            "windows": self.windows, "wall_s": self.wall_s, "world_s": self.world_s,
+            "wall_cost": self.wall_cost,
+            "participants": {
+                name: {"calls": calls, "wall_s": wall,
+                       "wall_cost": wall / self.world_s if self.world_s > 0.0 else float("inf")}
+                for name, calls, wall in zip(self.names, self.calls, self.piece_wall_s)
+            },
+        }
+
+
+class Subcycle:
+    """An INDEPENDENT participant: its own pieces, its own dt system, its own
+    clock, running on its own ``threading.Thread``.
+
+    This is what the ``SUBCYCLE`` contract means.  The system that consults
+    it is never lockstepped with it and never waits for it:
+
+    * ``consult()`` takes the latest publication under the condition and
+      returns at once -- the participant's owned columns, stamped with the
+      world time they are true at.  Whatever is not fresh is read lagged.
+    * ``offer(values, world_s)`` hands it the consulting system's current
+      columns and world time, and notifies it.  It reads those lagged too.
+    * It never runs more than ``lead_windows`` of its own windows ahead of the
+      world time it was last offered, so a fast participant waits for its
+      reference and a slow one simply falls behind.
+
+    ``tau`` is its time velocity: its world time over its reference's world
+    time.  ``slip_s`` is how far behind the reference its publication is.
+    Both are measured, never set.  Threading is the stdlib ``Thread``/
+    ``Condition``/``Event`` the compiler already recognises as dispatcher
+    operations (``python_special_cases.lower_python_threading``).
+    """
+
+    def __init__(self, piece_files, *, round_dt, dx, targets=None, controller=None,
+                 name="subcycle", lead_windows=1.0, wait_timeout_s=0.05,
+                 coupling=None, omega_ref_rad_s=0.0):
+        self.name = str(name)
+        #: What sits across the boundary to the consulting system: a joint
+        #: kind or a declared ``time_field.TimeAdaptor``.  Undeclared is
+        #: treated as RIGID by ``time_field.adaptor_for`` -- the conservative
+        #: answer -- so an independent participant coupled without a declared
+        #: rate freedom reports a shear whenever its gradient changes.
+        self.coupling = coupling
+        #: Reference angular rate of the coupling's freedom, for the shear
+        #: reaction and the slip rate.  0.0: not a rotating coupling, so the
+        #: store sees no power (the energy build-up stays at zero, honestly).
+        self.omega_ref_rad_s = float(omega_ref_rad_s)
+        self.pieces = load_pieces(piece_files)
+        self.round_dt = float(round_dt)
+        self.dx = float(dx)
+        self.targets = targets or Targets(cfl=0.5, div_max=1e9, mass_max=1e-3,
+                                          energy_exchange_fraction=0.2)
+        self.controller = controller or STController(dt_min=self.round_dt * 1e-6)
+        self.lead_windows = float(lead_windows)
+        self.wait_timeout_s = float(wait_timeout_s)
+        self.names = column_names_of(self.pieces)
+        self.owned = owned_columns(self.pieces, self.names)
+        self.ledger = WallCostLedger(str(piece.entry) for piece in self.pieces)
+        namespace = bind_namespace(self.pieces, wrap=self.ledger.wrap)
+        self._state_class = namespace["PieceState"]
+        self._advance = namespace["advance_pieces"]
+        self.state = None
+        self.condition = threading.Condition()
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.world_s = 0.0
+        self.reference_s = 0.0
+        self.windows = 0
+        self.error = None
+        self._inbox = {}
+        self._outbox = {}
+        self._stamp = 0.0
+
+    def attach(self, columns):
+        """Build this participant's own state from the shared columns."""
+        self.state = self._state_class(
+            *(np.array(columns[name], dtype=np.float64) for name in self.names),
+            np.zeros((self.pieces[0].batch,), dtype=np.float64),
+            np.zeros((len(TELEMETRY_FIELDS),), dtype=np.float64),
+        )
+        self.state.participants = participant_registry(self.pieces)
+        configure_publication_limits(self.state, self.targets)
+        self._outbox = {name: getattr(self.state, name).copy() for name in self.owned}
+        self._stamp = 0.0
+
+    def start(self):
+        if self.state is None:
+            raise RuntimeError(f"{self.name}: attach() before start()")
+        self.thread = threading.Thread(target=self._run, args=(self.stop_event,),
+                                       name=f"subcycle-{self.name}", daemon=True)
+        self.thread.start()
+
+    def _run(self, stop):
+        dt = self.round_dt
+        try:
+            while True:
+                with self.condition:
+                    while (not stop.is_set() and self.world_s
+                           >= self.reference_s + self.lead_windows * self.round_dt):
+                        self.condition.wait(timeout=self.wait_timeout_s)
+                    if stop.is_set():
+                        return
+                    for name, value in self._inbox.items():
+                        if name not in self.owned:
+                            getattr(self.state, name)[...] = value
+                start = time.perf_counter()
+                advanced, dt, metrics = run_superstep(
+                    self.state, self.round_dt, dt, self.dx, self.targets,
+                    self.controller, self._advance)
+                publish_window(self.state, advanced, dt, metrics, self.round_dt)
+                self.ledger.window(time.perf_counter() - start, float(advanced))
+                with self.condition:
+                    self.world_s += float(advanced)
+                    self.windows += 1
+                    self._outbox = {name: getattr(self.state, name).copy()
+                                    for name in self.owned}
+                    self._stamp = self.world_s
+                    self.condition.notify_all()
+        except BaseException as error:  # reported by consult()/stop(), never swallowed
+            with self.condition:
+                self.error = error
+                self.condition.notify_all()
+
+    def consult(self):
+        """``(publication, stamp_s)`` -- never waits for a window to finish."""
+        with self.condition:
+            if self.error is not None:
+                raise RuntimeError(f"subcycle {self.name!r} failed") from self.error
+            return dict(self._outbox), self._stamp
+
+    def offer(self, values, world_s):
+        with self.condition:
+            self._inbox = {name: np.array(value, dtype=np.float64, copy=True)
+                           for name, value in values.items()}
+            self.reference_s = float(world_s)
+            self.condition.notify_all()
+
+    def status(self):
+        with self.condition:
+            reference = self.reference_s
+            return {
+                "name": self.name, "windows": self.windows, "world_s": self.world_s,
+                "reference_s": reference, "published_stamp_s": self._stamp,
+                "tau": self.world_s / reference if reference > 0.0 else float("nan"),
+                "slip_s": reference - self._stamp,
+                "wall_cost": self.ledger.report(),
+            }
+
+    def stop(self, timeout_s=10.0):
+        self.stop_event.set()
+        with self.condition:
+            self.condition.notify_all()
+        if self.thread is not None:
+            self.thread.join(timeout=timeout_s)
+        if self.error is not None:
+            raise RuntimeError(f"subcycle {self.name!r} failed") from self.error
+
+
+def time_mechanics():
+    """The dt system's time-velocity mechanics: ``TimeField`` (log time
+    velocity and its derivative per node, nested scopes, adaptors, shear
+    reaction) and ``StoreLedger`` (the energy the time force store has had to
+    absorb), both in ``src/common/dt_system/time_field.py``."""
+
+    from src.common.dt_system import time_field
+
+    return time_field
+
+
+class TimeVelocityRecord:
+    """``llvm_dt_system``'s time-velocity record, kept in the time field.
+
+    Every scope is a ``TimeField`` node, nested the way the windows nest:
+    the lockstep system is the root, each lockstep piece runs in it, each
+    ``Subcycle`` is a child scope with its own pieces inside it.  After every
+    lockstep window the MEASURED time velocity of every scope goes into the
+    field -- never a target, and not rate limited on the way in (the same
+    choice ``time_trials/race.py`` makes): the lockstep root at
+    ``advanced / round_dt``, a subcycle at its published world time over the
+    reference world time.  The field then derives ``dlog_tau_dt``.
+
+    Each subcycle boundary is a coupling with a declared adaptor.  Per window
+    it reports the ratio and gradient across the joint, whether the joint
+    admits that gradient, the shear reaction while the gradient CHANGES, and
+    folds reaction * slip into a ``StoreLedger`` -- the energy build-up the
+    time force store is holding, with the asked/got shortfall as its leading
+    edge.  All of it is information: nothing here moves dt or any column.
+    """
+
+    def __init__(self, root, pieces, subcycles):
+        time_field = time_mechanics()
+        self._time_field = time_field
+        self.root = str(root)
+        # (node, parent, piece) for every scope, nested the way the windows
+        # nest: a RoundPiece's own pieces sit inside it, to any depth.
+        self._scopes = []
+
+        def declare(scope, owner, members):
+            for piece in members:
+                node = f"{scope}/{piece.entry}"
+                self._scopes.append((node, owner, piece))
+                inner = getattr(piece, "pieces", None)
+                if isinstance(piece, RoundPiece) and inner:
+                    declare(node, node, inner)
+
+        declare(self.root, self.root, pieces)
+        for sub in subcycles:
+            self._scopes.append((sub.name, self.root, sub))
+            declare(sub.name, sub.name, sub.pieces)
+        nodes = [self.root, *(node for node, _owner, _piece in self._scopes)]
+        if len(set(nodes)) != len(nodes):
+            raise ValueError(f"time scopes must be uniquely named: {nodes}")
+        self.field = time_field.TimeField.flat(nodes)
+        for node, owner, _piece in self._scopes:
+            self.field.set_parent(node, owner)
+        self.subcycles = tuple(subcycles)
+        self.ledgers = {sub.name: time_field.StoreLedger() for sub in self.subcycles}
+        self._seen_stamp = {sub.name: 0.0 for sub in self.subcycles}
+        self.log = []
+
+    def _measure(self, node, velocity, dt):
+        self.field.set_target(node, math.log(max(float(velocity), 1e-9)), dt, math.inf)
+
+    def window(self, advanced, round_dt, world_s):
+        """Fold one lockstep window into the field and the ledgers."""
+        dt = float(round_dt)
+        velocity = float(advanced) / dt if dt > 0.0 else 0.0
+        self._measure(self.root, velocity, dt)
+        for node, _owner, piece in self._scopes:
+            if isinstance(piece, Subcycle):
+                continue                       # measured against the reference below
+            # a piece runs at its scope's rate; a nested round at its own
+            # measured advanced/asked
+            self._measure(node, getattr(piece, "tau", 1.0) if isinstance(piece, RoundPiece) else 1.0, dt)
+        record = {"world_s": float(world_s), "tau": velocity, "subcycles": {}}
+        for sub in self.subcycles:
+            status = sub.status()
+            stamp = float(status["published_stamp_s"])
+            reference = float(status["reference_s"])
+            local = stamp / reference if reference > 0.0 else 1.0
+            self._measure(sub.name, local, dt)
+            kind = sub.coupling
+            ratio = self.field.ratio(sub.name, self.root)
+            reaction = self.field.shear_reaction_nm(sub.name, self.root, kind,
+                                                    sub.omega_ref_rad_s)
+            slip = sub.omega_ref_rad_s * abs(ratio - 1.0)
+            got = max(0.0, stamp - self._seen_stamp[sub.name])
+            self._seen_stamp[sub.name] = stamp
+            ledger = self.ledgers[sub.name]
+            ledger.observe(reaction_nm=reaction, slip_rad_s=slip, dt_s=dt,
+                           asked_s=float(advanced), got_s=got)
+            ledger.relax(dt)
+            adaptor = self._time_field.adaptor_for(kind)
+            record["subcycles"][sub.name] = {
+                "velocity": self.field.velocity(sub.name),
+                "effective_velocity": self.field.effective_velocity(sub.name),
+                "dlog_tau_dt": self.field.dlog_tau_dt[self.field.nodes.index(sub.name)],
+                "gradient": self.field.gradient(sub.name, self.root),
+                "gradient_rate": self.field.gradient_rate(sub.name, self.root),
+                "adaptor": adaptor.kind,
+                "admits": self.field.admits(sub.name, self.root, kind),
+                "reaction_nm": reaction,
+                "slip_rad_s": slip,
+                "stored_j": ledger.stored_j,
+                "persistence": ledger.persistence,
+                "shortfall_ema": ledger.shortfall_ema,
+                "slip_s": float(status["slip_s"]),
+            }
+        self.log.append(record)
+        return record
+
+
+# --------------------------------------------------------------------------
+# dt_graph: how llvm_dt_system interprets the pieces it is given
+# --------------------------------------------------------------------------
+
+def _interpreted_only(_state, _dt):
+    raise TypeError(
+        "this AdvanceNode names an llvm_dt_system piece; the tree is interpreted "
+        "by llvm_dt_system.dt_system_from_graph, not run by dt_graph.MetaLoopRunner")
+
+
+def piece_leaf(piece, label=None):
+    """A ``dt_graph.AdvanceNode`` naming ``piece``.
+
+    The piece is the leaf's ``StateNode.state`` -- the simulator subset it
+    advances -- and the node is read by ``dt_system_from_graph``; its
+    ``advance`` refuses to be called by any other runner.
+    """
+    from src.common.dt_system.dt_graph import AdvanceNode, StateNode
+
+    name = str(label or piece.entry)
+    return AdvanceNode(advance=_interpreted_only, state=StateNode(piece, label=name), label=name)
+
+
+class RoundPiece:
+    """A nested ``dt_graph.RoundNode`` as one piece of its parent's step.
+
+    This is subdivision BY THE DT SYSTEM -- not ``SUBCYCLE``.  Given the
+    parent's attempt ``dt``, it runs its own ``run_superstep`` over exactly
+    that window with its own controller (the node's ``ControllerNode``),
+    subdividing as its pieces' exchange times and ``dt_limit`` demand, and
+    must land it: a window it cannot land is refused, the dt_graph rule
+    ("restore its own checkpoint and raise; the parent attempt fails").  It
+    publishes no exchange time and no ``dt_limit`` -- it lands whatever the
+    parent asks -- so it binds nobody, and it declares ``BIND`` so that
+    absence reads as "no bound" rather than ``HOLD``'s "do not grow".
+    """
+
+    contract = BIND
+
+    def __init__(self, node, *, wrap=None):
+        self.node = node
+        self.entry = str(node.label)
+        self.pieces, self.schedule = interpret_round(node, wrap=wrap)
+        self.batch = self.pieces[0].batch
+        self.names = column_names_of(self.pieces)
+        self.owned = owned_columns(self.pieces, self.names)
+        self.argument_names = (*self.names, "dt")
+        self.output_names = tuple(f"{name}_next" for name in self.owned)
+        control = node.controller
+        self.targets = control.targets
+        self.controller = control.ctrl
+        self.dx = float(control.dx)
+        self.dt_inner = float(node.plan.dt_init)
+        namespace = bind_namespace(self.pieces, wrap=wrap, schedule=self.schedule)
+        self._advance = namespace["advance_pieces"]
+        self.state = namespace["PieceState"](
+            *(np.zeros(self.batch, dtype=np.float64) for _ in self.names),
+            np.zeros((self.batch,), dtype=np.float64),
+            np.zeros((len(TELEMETRY_FIELDS),), dtype=np.float64),
+        )
+        self.state.participants = participant_registry(self.pieces)
+        configure_publication_limits(self.state, self.targets)
+        #: time velocity of the last window: advanced / asked (1.0 when landed)
+        self.tau = 1.0
+
+    def __call__(self, *columns):
+        *values, dt = columns
+        window = float(np.asarray(dt).reshape(-1)[0])
+        for name, value in zip(self.names, values):
+            getattr(self.state, name)[...] = value
+        advanced, self.dt_inner, metrics = run_superstep(
+            self.state, window, self.dt_inner, self.dx, self.targets,
+            self.controller, self._advance)
+        publish_window(self.state, advanced, self.dt_inner, metrics, window)
+        self.tau = float(advanced) / window if window > 0.0 else 1.0
+        if abs(float(advanced) - window) > 1e-12 * max(1.0, window):
+            raise RuntimeError(
+                f"nested round {self.entry!r} advanced {float(advanced)!r} of "
+                f"{window!r}: a nested round must land its parent's window")
+        return tuple(getattr(self.state, name).copy() for name in self.owned)
+
+
+def interpret_round(node, *, wrap=None):
+    """``(pieces, schedule)`` for one ``dt_graph.RoundNode``.
+
+    Children in order are the causal order.  An ``AdvanceNode`` leaf is the
+    piece held in its ``StateNode``; a nested ``RoundNode`` is a
+    ``RoundPiece``.  ``schedule`` is the node's own.
+    """
+    from src.common.dt_system.dt_graph import AdvanceNode, RoundNode
+
+    if node.schedule not in SCHEDULES:
+        raise NotImplementedError(
+            f"RoundNode {node.label!r}: schedule={node.schedule!r}; "
+            f"llvm_dt_system interprets {SCHEDULES}")
+    pieces = []
+    for child in node.children:
+        if isinstance(child, RoundNode):
+            pieces.append(RoundPiece(child, wrap=wrap))
+        elif isinstance(child, AdvanceNode):
+            piece = child.state.state
+            if not (hasattr(piece, "argument_names") and hasattr(piece, "output_names")):
+                raise TypeError(f"AdvanceNode {child.label!r} does not hold a piece")
+            pieces.append(piece)
+        else:
+            raise TypeError(f"RoundNode {node.label!r}: unknown child {type(child).__name__}")
+    if not pieces:
+        raise ValueError(f"RoundNode {node.label!r} has no pieces")
+    return pieces, node.schedule
+
+
+def dt_system_from_graph(root, columns, *, rounds, subcycles=()):
+    """Run ``dt_system`` as the ``dt_graph.RoundNode`` tree ``root`` defines.
+
+    The root's ``plan.round_max`` is the window, its ``plan.dt_init`` the
+    first attempt, its ``ControllerNode`` the controller, targets and ``dx``,
+    its ``schedule`` the read discipline, its children the causal order and
+    its nested rounds the dt system's own subdivision.  ``subcycles`` are the
+    independent participants, consulted without waiting as in ``dt_system``.
+    """
+
+    pieces, schedule = interpret_round(root)
+    control = root.controller
+    return dt_system(pieces, columns, rounds=rounds, round_dt=float(root.plan.round_max),
+                     dx=float(control.dx), targets=control.targets, controller=control.ctrl,
+                     subcycles=subcycles, scope=str(root.label), schedule=schedule,
+                     dt_initial=float(root.plan.dt_init))
+
+
+def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, controller=None,
+              subcycles=(), scope="lockstep", schedule="sequential", dt_initial=None):
     """Load the pieces from their files and run ``rounds`` rounds of the dt
-    system over them in Python, the way the native unit will be driven."""
+    system over them in Python, the way the native unit will be driven.
 
-    pieces = [LLVMPiece.load(path) for path in piece_files]
-    bind_pieces(pieces)
+    ``subcycles`` are independent participants (``Subcycle``).  Each round
+    the lockstep system consults them without waiting, reads their owned
+    columns as published (lagged by ``slip_s``), steps, and offers them its
+    columns and world time.  A column has one owner: a lockstep piece may not
+    write a column a subcycle owns.
+
+    ``scope`` names the lockstep system's node in the time field.  After every
+    window the measured time velocities go into ``state.time_velocity``
+    (a ``TimeVelocityRecord``): the ``TimeField`` itself, a per-window log, and
+    one ``StoreLedger`` per subcycle coupling tracking the energy build-up.
+    """
+
+    pieces = load_pieces(piece_files)
+    ledger = WallCostLedger(str(piece.entry) for piece in pieces)
+    bind_pieces(pieces, wrap=ledger.wrap, schedule=schedule)
     batch = pieces[0].batch
     names = column_names_of(pieces)
+    subcycles = tuple(subcycles)
+    mine = set(owned_columns(pieces, names))
+    for sub in subcycles:
+        clash = mine.intersection(sub.owned)
+        if clash:
+            raise ValueError(f"columns {sorted(clash)} are written by both the lockstep "
+                             f"pieces and subcycle {sub.name!r}; a column has one owner")
     targets = targets or Targets(cfl=0.5, div_max=1e9, mass_max=1e-3, energy_exchange_fraction=0.2)
     # A floor, always.  Without ``dt_min`` a step that keeps being rejected
     # halves until halving a float64 stops changing it -- about 1074 times, and
@@ -285,20 +903,51 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
     # The laws declare themselves once, in causal order, and the state carries
     # the registry so the controller can index the rows the step publishes.
     state.participants = participant_registry(pieces)
+    state.wall_cost_ledger = ledger
     configure_publication_limits(state, targets)
-    dt = round_dt
+    for sub in subcycles:
+        sub.attach(columns)
+    for sub in subcycles:
+        sub.start()
+    # The time-velocity record: every scope a node of the time field, the
+    # measured velocities folded in after every window.  Information only.
+    time_record = TimeVelocityRecord(scope, pieces, subcycles)
+    state.time_velocity = time_record
+    dt = round_dt if dt_initial is None else float(dt_initial)
+    world_s = 0.0
     results = []
-    for _round in range(rounds):
-        total, dt = dt_system_over(state, targets, controller, round_dt, dt, dx)
-        results.append((total, dt, state.telemetry.copy()))
+    try:
+        for _round in range(rounds):
+            for sub in subcycles:
+                publication, _stamp = sub.consult()
+                for name, value in publication.items():
+                    if name in names:
+                        getattr(state, name)[...] = value
+            start = time.perf_counter()
+            total, dt = dt_system_over(state, targets, controller, round_dt, dt, dx)
+            ledger.window(time.perf_counter() - start, float(total))
+            world_s += float(total)
+            for sub in subcycles:
+                sub.offer({column: getattr(state, column) for column in sub.names
+                           if column in names}, world_s)
+            time_record.window(total, round_dt, world_s)
+            results.append((total, dt, state.telemetry.copy()))
+    finally:
+        for sub in subcycles:
+            sub.stop()
     for name in names:
         columns[name] = getattr(state, name)
+    for sub in subcycles:
+        # the owner's own latest value, not the lagged copy the lockstep side read
+        for name in sub.owned:
+            columns[name] = getattr(sub.state, name)
+    state.subcycle_status = tuple(sub.status() for sub in subcycles)
     return state, controller, results
 
 
 def configure_publication_limits(state, targets):
     """Build-time defaults for the declared participant/channel buffers."""
-    for index in range(int(state.pub_tau.shape[0])):
+    for index in range(int(state.pub_exchange_time.shape[0])):
         start = index * len(DT_CHANNEL_NAMES)
         stop = start + len(DT_CHANNEL_NAMES)
         state.pub_limits[start:stop] = targets.error_limits
@@ -330,8 +979,7 @@ def dt_system_contract(entry, columns, batch, participants=1):
         "fields": {
             **{name: span(batch) for name in (*columns, "dt")},
             "telemetry": span(len(TELEMETRY_FIELDS)),
-            **{name: span(participants) for name in
-               ("pub_tau", "pub_tau_present", "pub_contract", "pub_dt_limit", "pub_dt_limit_present")},
+            **{name: span(participants) for name in (*PUBLICATION_FIELDS, *COURANT_FIELDS)},
             **{name: span(participants * len(DT_CHANNEL_NAMES)) for name in
                ("pub_values", "pub_present", "pub_limits", "pub_limits_present")},
         },
@@ -339,8 +987,7 @@ def dt_system_contract(entry, columns, batch, participants=1):
     records["StepSpans"] = {
         "identity": "src.common.dt_system.participants.StepSpans",
         "fields": {
-            **{name: span(participants) for name in
-               ("pub_tau", "pub_tau_present", "pub_contract", "pub_dt_limit", "pub_dt_limit_present")},
+            **{name: span(participants) for name in PUBLICATION_FIELDS},
             **{name: span(participants * len(DT_CHANNEL_NAMES)) for name in
                ("pub_values", "pub_present", "pub_limits", "pub_limits_present")},
         },

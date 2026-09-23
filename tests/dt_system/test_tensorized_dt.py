@@ -124,7 +124,7 @@ def test_native_publication_uses_declared_participant_channel_extent(tmp_path):
         "def root(state):\n"
         "    metrics = Metrics(0.0, 0.0, 0.0, 0.0, "
         + ", ".join(f"{field}=state.{field}" for field in (
-            "pub_tau", "pub_tau_present", "pub_contract", "pub_dt_limit", "pub_dt_limit_present",
+            "pub_exchange_time", "pub_exchange_time_present", "pub_contract", "pub_dt_limit", "pub_dt_limit_present",
             "pub_values", "pub_present", "pub_limits", "pub_limits_present"))
         + ")\n"
         "    metrics = coerce_metrics(metrics)\n"
@@ -181,7 +181,7 @@ def test_coerced_metrics_uses_declared_publication_extent():
         "from src.common.dt_system.dt_scaler import coerce_metrics\n"
         "def root(metrics):\n"
         "    metrics = coerce_metrics(metrics)\n"
-        "    has_participants = int(metrics.pub_tau.shape[0]) > 0\n"
+        "    has_participants = int(metrics.pub_exchange_time.shape[0]) > 0\n"
         "    values = (metrics.error_channels if not has_participants "
         "else metrics.pub_values)\n"
         "    return values[0]\n"
@@ -242,7 +242,7 @@ def test_real_proposal_consumes_channel_spans_natively(tmp_path, participants):
     metrics = Metrics(2.0, 0.0, 0.0, 0.0)
     targets = Targets(1.0, 1.0, 1.0, **channel_fields({"height_positivity": 2.0}, limits=True))
     if participants:
-        for field in ("pub_tau", "pub_tau_present", "pub_contract", "pub_dt_limit", "pub_dt_limit_present"):
+        for field in ("pub_exchange_time", "pub_exchange_time_present", "pub_contract", "pub_dt_limit", "pub_dt_limit_present"):
             setattr(metrics, field, AbstractTensor.zeros((participants,)))
         for field in ("pub_values", "pub_present", "pub_limits", "pub_limits_present"):
             setattr(metrics, field, AbstractTensor.zeros((participants * len(DT_CHANNEL_NAMES),)))

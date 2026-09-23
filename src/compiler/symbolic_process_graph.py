@@ -472,6 +472,56 @@ def _sympy_process_graph_rule(
     return None
 
 
+def _exact_respelling(value):
+    """An exact identity into constructs this ingestion already lowers, or None.
+
+    Every entry is an identity, never an approximation: no smoothing width,
+    no tolerance.  A construct that needs a declared meaning (a Sum over a
+    symbolic bound, a domain integral, an operator on a field) is refused by
+    name instead of guessed.
+    """
+    if isinstance(value, sympy.Subs):
+        return value.doit()
+    if isinstance(value, (sympy.Sum, sympy.Product)):
+        reduced = value.doit()
+        if reduced.has(sympy.Sum, sympy.Product):
+            raise TypeError(
+                f"{type(value).__name__} survived symbolic evaluation (symbolic "
+                "bounds): declare its index axis (bitops.Sum over a Domain) so it "
+                f"lowers as a tensor reduction: {value!r}")
+        return reduced
+    if isinstance(value, sympy.sign):
+        (arg,) = value.args
+        return sympy.Piecewise((1, arg > 0), (-1, arg < 0), (0, True))
+    if isinstance(value, sympy.Heaviside):
+        arg = value.args[0]
+        at_zero = value.args[1] if len(value.args) > 1 else sympy.Rational(1, 2)
+        return sympy.Piecewise((1, arg > 0), (0, arg < 0), (at_zero, True))
+    if isinstance(value, sympy.coth):
+        return sympy.cosh(value.args[0]) / sympy.sinh(value.args[0])
+    if isinstance(value, sympy.cot):
+        return sympy.cos(value.args[0]) / sympy.sin(value.args[0])
+    if isinstance(value, sympy.sec):
+        return 1 / sympy.cos(value.args[0])
+    if isinstance(value, sympy.csc):
+        return 1 / sympy.sin(value.args[0])
+    return None
+
+
+#: Gauss-Legendre points used when an Integral survives symbolic
+#: integration (see ingest_sympy_expression).  Five matches the reduced tire
+#: contact law's verified quadrature: exact through degree 9.
+INTEGRAL_QUADRATURE_POINTS = 5
+
+
+def _gauss_legendre_rule(points: int = INTEGRAL_QUADRATURE_POINTS):
+    """(node, weight) pairs on [-1, 1], as exact SymPy Floats (17 digits)."""
+    from sympy.integrals.quadrature import gauss_legendre
+
+    nodes, weights = gauss_legendre(points, 17)
+    return tuple(zip(nodes, weights))
+
+
 def ingest_sympy_expression(
     graph: Any,
     expression: sympy.Basic,
@@ -613,12 +663,22 @@ def ingest_sympy_expression(
             return node_id
 
         if isinstance(value, sympy.Derivative):
-            # Excise everything inside the Derivative, recursively build it
-            # as ordinary ProcessGraph nodes (add_node handles any sympy
-            # subtree already), then invert that subgraph with the existing
-            # process-graph reversal mechanism to obtain the derivative --
-            # no separate translation rule for Derivative is needed, and no
-            # tape-based autograd is used.
+            # SymPy first.  sympy.diff is the exact closed-form derivative
+            # whenever the interior is explicit SymPy, and its result ingests
+            # through the ordinary add_node path like any other expression.
+            derivative = sympy.diff(value.expr, *value.variables)
+            if not derivative.has(sympy.Derivative):
+                result_id = add_node(derivative)
+                memo[value] = result_id
+                return result_id
+            # SymPy could not reduce the interior: it holds content SymPy
+            # cannot see into (an applied undefined function, a bound table
+            # or callee whose body exists only once ingested), so diff hands
+            # back an unevaluated Derivative.  Only then turn to the process
+            # graph itself: ingest the interior as ordinary nodes and invert
+            # that subgraph with the existing graph reversal, one order at a
+            # time (the nesting below).  No SymPy content survives ingestion,
+            # so this is the only place such a derivative can be taken.
             from .process_graph_autograd import obtain_graph_reverse
 
             inner_id = add_node(value.expr)
@@ -723,6 +783,63 @@ def ingest_sympy_expression(
                 )
             else:
                 result_id = grad_id
+            memo[value] = result_id
+            return result_id
+
+        respelled = _exact_respelling(value)
+        if respelled is not None:
+            result_id = add_node(respelled)
+            memo[value] = result_id
+            return result_id
+
+        if isinstance(value, sympy.Integral):
+            # An unbounded limit whose symbol does not appear in the
+            # integrand is a DOMAIN MEASURE (the catalogue's
+            # Integral(f, A) = integral of f over surface/volume A), not an
+            # antiderivative -- SymPy would silently return f*A, which is
+            # only right for an integrand uniform over the domain.  Refuse it
+            # before SymPy can guess.
+            for limit in value.limits:
+                if len(limit) == 1 and limit[0] not in value.function.free_symbols:
+                    raise TypeError(
+                        f"Integral over a bare domain {limit[0]} (a measure, not an "
+                        "antiderivative variable) needs a declared Domain: "
+                        f"{value!r}")
+            # SymPy first: a closed-form antiderivative ingests like any
+            # other expression.
+            integrated = value.doit()
+            if not integrated.has(sympy.Integral):
+                result_id = add_node(integrated)
+                memo[value] = result_id
+                return result_id
+            # SymPy could not integrate it.  An integral IS a sum over a
+            # continuous domain (bitops.Integral subclasses bitops.Sum), so a
+            # DEFINITE integral over finite bounds becomes a Gauss-Legendre
+            # sum unrolled into closed form -- the pattern the compiler
+            # already uses for the reduced tire contact law
+            # (vehicle_tire_reduced_contact_law.py), exact for polynomials up
+            # to degree 2n-1.  An integral over a bare domain symbol (a
+            # surface or volume with no finite bounds) has no domain to put
+            # nodes on; it is refused by name until a Domain is declared.
+            expanded = value.function
+            for limit in reversed(value.limits):
+                if len(limit) != 3:
+                    raise TypeError(
+                        "Integral survived symbolic integration over a bare domain "
+                        f"{limit!r}; a quadrature needs finite bounds or a declared "
+                        f"Domain: {value!r}")
+                var, lower, upper = limit
+                if lower.has(sympy.oo, -sympy.oo) or upper.has(sympy.oo, -sympy.oo):
+                    raise TypeError(
+                        "Integral survived symbolic integration with an infinite "
+                        f"bound; declare a mapped Domain before quadrature: {value!r}")
+                half = (upper - lower) / 2
+                mid = (upper + lower) / 2
+                total = sympy.Integer(0)
+                for node_x, weight in _gauss_legendre_rule():
+                    total += weight * expanded.subs(var, mid + half * node_x)
+                expanded = half * total
+            result_id = add_node(expanded)
             memo[value] = result_id
             return result_id
 

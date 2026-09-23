@@ -3960,6 +3960,12 @@ def _symbolic_wheel_contact_equations_authored() -> tuple[tuple[sympy.Equality, 
     residual_lateral_slip = s["slip_lateral"] - s["sidewall_deformation_velocity_lateral"]
     slip_speed = sympy.sqrt(residual_longitudinal_slip ** 2 + residual_lateral_slip ** 2
                             + epsilon ** 2)
+    # CAVEAT (textbook comparison, 2026-09-22): this is the LORENTZIAN Stribeck
+    # shape, mu_k + (mu_s - mu_k)/(1 + (v/v_s)^2). The textbook (Armstrong-
+    # Helouvry 1994) form is exponential, mu_k + (mu_s - mu_k)exp(-|v/v_s|^delta),
+    # delta ~ 1-2; the Lorentzian decays algebraically, so it keeps more static
+    # friction at high slip. Kept as a modelling choice; the catalogue's eq_N8_1
+    # states the textbook form.
     stribeck_ratio = slip_speed / (s["slip_transition_speed"] + epsilon)
     effective_mu = (s["mu_kinetic"]
                     + (s["mu_static"] - s["mu_kinetic"])

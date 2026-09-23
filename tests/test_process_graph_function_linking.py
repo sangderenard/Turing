@@ -736,18 +736,18 @@ def test_dead_generated_entry_formal_needs_no_external_operand():
 
 def test_declared_span_storage_survives_distinct_call_frame_occurrences():
     first = SSARecordFieldDescriptor(
-        "pub_tau", SSARecordFieldStorage.SPAN,
-        storage_identity="Metrics.pub_tau", value_ids=(101,),
+        "pub_exchange_time", SSARecordFieldStorage.SPAN,
+        storage_identity="Metrics.pub_exchange_time", value_ids=(101,),
         dtype="float64",
     )
     second = SSARecordFieldDescriptor(
-        "pub_tau", SSARecordFieldStorage.SPAN,
-        storage_identity="Metrics.pub_tau", value_ids=(202,),
+        "pub_exchange_time", SSARecordFieldStorage.SPAN,
+        storage_identity="Metrics.pub_exchange_time", value_ids=(202,),
         dtype="float64",
     )
     scalar_version = SSARecordFieldDescriptor(
-        "pub_tau", SSARecordFieldStorage.SCALAR,
-        storage_identity="Metrics.pub_tau", value_ids=(202,),
+        "pub_exchange_time", SSARecordFieldStorage.SCALAR,
+        storage_identity="Metrics.pub_exchange_time", value_ids=(202,),
         dtype="float64",
     )
 
@@ -3277,7 +3277,7 @@ def test_declared_span_shape_folds_through_record_return_class():
         "Metrics": {
             "identity": "example.Metrics",
             "fields": {
-                "pub_tau": {
+                "pub_exchange_time": {
                     "storage": "span", "dtype": "float64", "shape": [2],
                 },
             },
@@ -3290,13 +3290,13 @@ def test_declared_span_shape_folds_through_record_return_class():
     )
     process.add_node(
         2, type="GetAttr", op="GetAttr",
-        attributes={"attribute": "pub_tau"}, parents=((1, "value"),),
-        expr_obj=ast.parse("metrics.pub_tau", mode="eval").body,
+        attributes={"attribute": "pub_exchange_time"}, parents=((1, "value"),),
+        expr_obj=ast.parse("metrics.pub_exchange_time", mode="eval").body,
     )
     process.add_node(
         3, type="GetAttr", op="GetAttr",
         attributes={"attribute": "shape"}, parents=((2, "value"),),
-        expr_obj=ast.parse("metrics.pub_tau.shape", mode="eval").body,
+        expr_obj=ast.parse("metrics.pub_exchange_time.shape", mode="eval").body,
     )
     process.add_node(
         4, type="Constant", op="const", constant=0,
@@ -3305,7 +3305,7 @@ def test_declared_span_shape_folds_through_record_return_class():
     process.add_node(
         5, type="Indexed", op="indexed",
         attributes={}, parents=((3, "base"), (4, "index")),
-        expr_obj=ast.parse("metrics.pub_tau.shape[0]", mode="eval").body,
+        expr_obj=ast.parse("metrics.pub_exchange_time.shape[0]", mode="eval").body,
     )
     process.add_edges_from(((1, 2), (2, 3), (3, 5), (4, 5)))
     graph = SimpleNamespace(G=process, roots=[5])

@@ -95,8 +95,8 @@ program_abi:
         error_present: {storage: span, dtype: float64, rank: 1, shape: [15], mutable: true, default: 0.0}
         control_values: {storage: span, dtype: float64, rank: 1, shape: [10], mutable: true, default: 0.0}
         control_present: {storage: span, dtype: float64, rank: 1, shape: [10], mutable: true, default: 0.0}
-        pub_tau: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
-        pub_tau_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
+        pub_exchange_time: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
+        pub_exchange_time_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
         pub_contract: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
         pub_dt_limit: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
         pub_dt_limit_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true, default: 0.0}
@@ -115,8 +115,8 @@ program_abi:
     StepSpans:
       identity: src.common.dt_system.participants.StepSpans
       fields:
-        pub_tau: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
-        pub_tau_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
+        pub_exchange_time: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
+        pub_exchange_time_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
         pub_contract: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
         pub_dt_limit: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}
         pub_dt_limit_present: {storage: span, dtype: float64, rank: 1, shape: [0], mutable: true}

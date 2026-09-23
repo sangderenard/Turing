@@ -1,4 +1,4 @@
-"""Per-participant time contracts: tau, and how it negotiates.
+"""Per-participant time contracts: exchange_time, and how it negotiates.
 
 These pin the behaviour that lets several coupled simulations step at
 different cadences without the most constrained one imposing itself on
@@ -46,13 +46,13 @@ def test_ids_are_monotonic_and_stable():
 def test_silence_is_hold_with_no_tau_not_a_zero_tau():
     """The distinction the dense-dict representation could not carry.
 
-    A participant that published nothing is not claiming tau = 0; a zero
-    tau would pin dt to zero and stop the simulation."""
+    A participant that published nothing is not claiming exchange_time = 0; a zero
+    exchange_time would pin dt to zero and stop the simulation."""
 
     registry = _registry("air", "pool")
     contracts = StepContracts.of(registry, {"air": (0.01, BIND)})
 
-    assert [bool(x) for x in contracts.tau_present.tolist()] == [True, False]
+    assert [bool(x) for x in contracts.exchange_time_present.tolist()] == [True, False]
     assert [int(x) for x in contracts.contract.tolist()] == [BIND, HOLD]
     assert [bool(x) for x in binding_mask(contracts).tolist()] == [True, False]
 
@@ -60,12 +60,12 @@ def test_silence_is_hold_with_no_tau_not_a_zero_tau():
 @pytest.mark.dt
 @pytest.mark.fast
 def test_binding_tau_pins_the_step():
-    """dt <= fraction * tau -- the same law as the energy/power pin, but
+    """dt <= fraction * exchange_time -- the same law as the energy/power pin, but
     per participant."""
 
     registry = _registry("air")
     contracts = StepContracts.of(registry, {"air": (0.01, BIND)})
-    # fraction 0.1, tau 0.01 -> 1 ms, below the 5 ms proposed.
+    # fraction 0.1, exchange_time 0.01 -> 1 ms, below the 5 ms proposed.
     assert bound_dt(contracts, 0.1, 5.0e-3) == pytest.approx(1.0e-3)
 
 
@@ -93,7 +93,7 @@ def test_dilating_participant_does_not_pin_anyone():
         registry,
         {
             "solver": (0.01, BIND),
-            # A far stiffer tau -- but dilating, so it must not bound.
+            # A far stiffer exchange_time -- but dilating, so it must not bound.
             "waiting_reactor": (1.0e-9, DILATE),
         },
     )
@@ -140,11 +140,11 @@ def test_no_binding_participant_leaves_the_step_alone():
 @pytest.mark.dt
 @pytest.mark.fast
 def test_dilated_state_is_well_relaxation():
-    """tau is the well's relaxation time -- the same quantity BIND uses to
+    """exchange_time is the well's relaxation time -- the same quantity BIND uses to
     bound, used here to evaluate."""
 
-    # One tau of relaxation closes 1 - 1/e of the gap to equilibrium.
-    assert dilated_state(x0=1.0, x_eq=0.0, tau_s=2.0, elapsed_s=2.0) == pytest.approx(
+    # One exchange_time of relaxation closes 1 - 1/e of the gap to equilibrium.
+    assert dilated_state(x0=1.0, x_eq=0.0, exchange_time_s=2.0, elapsed_s=2.0) == pytest.approx(
         math.exp(-1.0)
     )
     # Arbitrarily long elapsed intervals are evaluated, never replayed:
@@ -160,8 +160,8 @@ def test_crossing_time_answers_when_a_condition_is_met():
     can ask WHEN its barrier is reached instead of stepping finely enough
     not to miss it."""
 
-    # Relaxing 1 -> 0 with tau = 2; half way is at t = 2 ln 2.
-    t = crossing_time(x0=1.0, x_eq=0.0, tau_s=2.0, barrier=0.5)
+    # Relaxing 1 -> 0 with exchange_time = 2; half way is at t = 2 ln 2.
+    t = crossing_time(x0=1.0, x_eq=0.0, exchange_time_s=2.0, barrier=0.5)
     assert t == pytest.approx(2.0 * math.log(2.0))
     # And the closed form agrees with itself at that instant.
     assert dilated_state(1.0, 0.0, 2.0, t) == pytest.approx(0.5)
@@ -186,15 +186,15 @@ def test_reproduces_the_existing_energy_power_law():
 
     That test publishes energy 10 J and power 1000 W with
     ``energy_exchange_fraction = 0.1`` and requires
-    ``dt_next <= 0.1 * 10 / 1000``.  tau IS energy/power, so the same
+    ``dt_next <= 0.1 * 10 / 1000``.  exchange_time IS energy/power, so the same
     numbers through the contract give the same bound -- the law is
-    unchanged, only where tau comes from and who it applies to."""
+    unchanged, only where exchange_time comes from and who it applies to."""
 
     energy_j, power_w, fraction = 10.0, 1000.0, 0.1
-    tau = energy_j / power_w
+    exchange_time = energy_j / power_w
 
     registry = _registry("core")
-    contracts = StepContracts.of(registry, {"core": (tau, BIND)})
+    contracts = StepContracts.of(registry, {"core": (exchange_time, BIND)})
     assert bound_dt(contracts, fraction, 5.0e-3) <= fraction * energy_j / power_w + 1e-15
 
 
@@ -225,7 +225,7 @@ def test_concerns_and_contracts_compose_into_the_coordinator_decision():
         registry, {"solver": (0.01, BIND), "reactor": (1.0e-9, DILATE)}
     )
 
-    # The reactor's tau is a thousand times stiffer, and pins nothing.
+    # The reactor's exchange_time is a thousand times stiffer, and pins nothing.
     assert bound_dt(contracts, 0.1, 5.0e-3) == pytest.approx(1.0e-3)
 
     quiet = {n: [0.0] for n in union.names}

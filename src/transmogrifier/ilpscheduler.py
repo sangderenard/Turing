@@ -23,6 +23,12 @@ class ILPScheduler:
             case _:
                 return_value = self.compute_alap_levels()  # Default to ALAP if unknown method
 
+        # KNOWN UNFINISHED (original transmogrifier import, ca25e132, 2025-08-05):
+        # ``order`` is never applied -- this early return always yields
+        # dependency-order levels, so the ``match order:`` below is unreachable.
+        # Load-bearing as-is: ProcessGraph.compute_levels defaults to
+        # order='processing', so removing this return would flip level
+        # numbering for every caller that relies on that default.
         return return_value
         match order:
             case 'dependency':

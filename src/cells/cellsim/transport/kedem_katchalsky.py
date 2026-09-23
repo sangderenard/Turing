@@ -65,6 +65,10 @@ def fluxes(
     Jv = Lp * A * (Jv_pressure_term - osm)
     dV_L = -Jv
 
-    Js = P_arr * A * (C_L_arr - C_R_arr) + (1.0 - sigma_arr) * C_L_arr * Jv
+    # Solvent drag carries the MEAN membrane concentration (Kedem & Katchalsky
+    # 1958: J_s = omega RT dC + (1 - sigma) C_bar J_v), not the left side's --
+    # the left value is only the upwind one when J_v > 0.
+    C_bar = 0.5 * (C_L_arr + C_R_arr)
+    Js = P_arr * A * (C_L_arr - C_R_arr) + (1.0 - sigma_arr) * C_bar * Jv
     dS_L = {sp: -Js[i] for i, sp in enumerate(species)}
     return dV_L, dS_L

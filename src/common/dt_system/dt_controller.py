@@ -116,9 +116,9 @@ def _no_exchange_observed(metrics: Metrics, targets: "Targets") -> bool:
 def _participant_bound(spans, dt_proposed, dt_current, fraction):
     """Apply the existing per-participant time law to declared spans."""
 
-    from .participants import tau_bound
+    from .participants import exchange_time_bound
 
-    return tau_bound(spans, float(fraction), float(dt_proposed),
+    return exchange_time_bound(spans, float(fraction), float(dt_proposed),
                      None if dt_current is None else float(dt_current))
 
 
@@ -129,9 +129,9 @@ def _apply_energy_sidechain(dt_next, dt_tensor, metrics: Metrics, targets: "Targ
     """
 
     # Per participant first, when the state publishes that way: each binding
-    # tau applies as itself, a dilating or subcycling participant pins nobody,
+    # exchange_time applies as itself, a dilating or subcycling participant pins nobody,
     # and a HOLD prevents growth beyond the current step without shrinking it.
-    if int(metrics.pub_tau.shape[0]) > 0:
+    if int(metrics.pub_exchange_time.shape[0]) > 0:
         fraction = getattr(targets, "energy_exchange_fraction", None)
         if fraction is not None:
             bound = _participant_bound(
@@ -298,7 +298,7 @@ def step_with_dt_control_used(state,
         metrics = coerce_metrics(metrics)
         # Advance fills the attempt's declared publication buffers.
         spans = metrics
-        has_participants = int(metrics.pub_tau.shape[0]) > 0
+        has_participants = int(metrics.pub_exchange_time.shape[0]) > 0
         rollback_scale = float(rollback_threshold_multiplier)
         # A value between its ordinary limit and rollback_scale * limit is kept.
         # It still contributes its full ratio to the PI penalty below, so the next

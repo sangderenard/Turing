@@ -25,7 +25,7 @@ from src.common.dt_system.participants import (
     penalties,
     stability_gates,
     system_totals,
-    tau_bound,
+    exchange_time_bound,
     trip_report,
     tripped,
 )
@@ -180,11 +180,11 @@ def test_only_binding_taus_bound_the_step():
     _channels()
     spans = StepSpans.of(
         _registry("solver", "reactor"),
-        {"solver": Publication(tau_s=1e-2, contract=BIND),
-         "reactor": Publication(tau_s=1e-9, contract=DILATE)},
+        {"solver": Publication(exchange_time_s=1e-2, contract=BIND),
+         "reactor": Publication(exchange_time_s=1e-9, contract=DILATE)},
     )
-    # 0.1 * 1e-2 from the solver; the reactor's far stiffer tau is excluded
-    assert float(tau_bound(spans, 0.1, 5e-3).item()) == pytest.approx(1e-3)
+    # 0.1 * 1e-2 from the solver; the reactor's far stiffer exchange_time is excluded
+    assert float(exchange_time_bound(spans, 0.1, 5e-3).item()) == pytest.approx(1e-3)
 
 
 @pytest.mark.dt
@@ -193,9 +193,9 @@ def test_subcycling_does_not_bound_either():
     _channels()
     spans = StepSpans.of(
         _registry("interior"),
-        {"interior": Publication(tau_s=1e-9, contract=SUBCYCLE)},
+        {"interior": Publication(exchange_time_s=1e-9, contract=SUBCYCLE)},
     )
-    assert float(tau_bound(spans, 0.1, 5e-3).item()) == pytest.approx(5e-3)
+    assert float(exchange_time_bound(spans, 0.1, 5e-3).item()) == pytest.approx(5e-3)
 
 
 @pytest.mark.dt
@@ -204,9 +204,9 @@ def test_hold_prevents_growth_without_shrinking():
     _channels()
     spans = StepSpans.of(_registry("watcher"),
                          {"watcher": Publication(contract=HOLD)})
-    assert float(tau_bound(spans, 0.1, 5e-3, 2e-3).item()) == pytest.approx(2e-3)
+    assert float(exchange_time_bound(spans, 0.1, 5e-3, 2e-3).item()) == pytest.approx(2e-3)
     # with no current step to hold to, it shrinks nothing
-    assert float(tau_bound(spans, 0.1, 5e-3).item()) == pytest.approx(5e-3)
+    assert float(exchange_time_bound(spans, 0.1, 5e-3).item()) == pytest.approx(5e-3)
 
 
 @pytest.mark.dt
@@ -220,7 +220,7 @@ def test_silence_is_not_a_published_zero():
     # the absent participant has a row, and every presence bit in it is False
     assert [bool(x) for x in spans.pub_present.reshape((spans.participants, -1)).tolist()[1]] == [False] * 3
     assert bool(spans.pub_dt_limit_present.tolist()[1]) is False
-    assert bool(spans.pub_tau_present.tolist()[1]) is False
+    assert bool(spans.pub_exchange_time_present.tolist()[1]) is False
     totals, _ = system_totals(spans)
     assert _column(totals, energy) == pytest.approx(3.0)
 
@@ -258,11 +258,11 @@ def test_the_rows_do_not_record_who_filled_them():
     _channels()
     published = {
         "air": Publication(channels={"energy_j": 10.0, "mass_err": 1e-6},
-                           dt_limit=5e-4, tau_s=1e-3, contract=BIND),
+                           dt_limit=5e-4, exchange_time_s=1e-3, contract=BIND),
         "species": Publication(channels={"energy_j": 4.0, "mass_err": 2e-3},
-                               dt_limit=2e-3, tau_s=1e-2, contract=BIND),
+                               dt_limit=2e-3, exchange_time_s=1e-2, contract=BIND),
         "pool": Publication(channels={"energy_j": 1.0, "mass_err": 1e-9},
-                            dt_limit=1e-2, tau_s=1e-9, contract=DILATE),
+                            dt_limit=1e-2, exchange_time_s=1e-9, contract=DILATE),
     }
     registry = _registry("air", "species", "pool")
 
@@ -277,4 +277,4 @@ def test_the_rows_do_not_record_who_filled_them():
     assert system_totals(a)[0].tolist() == system_totals(b)[0].tolist()
     assert tripped(a).tolist() == tripped(b).tolist()
     assert stability_gates(a)[0].tolist() == stability_gates(b)[0].tolist()
-    assert float(tau_bound(a, 0.5, 5e-3).item()) == float(tau_bound(b, 0.5, 5e-3).item())
+    assert float(exchange_time_bound(a, 0.5, 5e-3).item()) == float(exchange_time_bound(b, 0.5, 5e-3).item())

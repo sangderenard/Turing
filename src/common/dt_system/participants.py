@@ -26,8 +26,8 @@ operation over the whole array.  Concretely:
 
 * a participant id indexes the participant axis, a channel id indexes the
   channel axis.  Ids ARE indices, so nothing on this path resolves a name.
-* absence is always its own span, never a sentinel value.  "Published no tau"
-  and "published tau = 0" are different claims and the step behaves differently
+* absence is always its own span, never a sentinel value.  "Published no exchange_time"
+  and "published exchange_time = 0" are different claims and the step behaves differently
   between them, so a dense span that let absence read as zero would silently
   move dt.
 * names appear at the reporting boundary only -- a log line, a refusal, an
@@ -99,7 +99,7 @@ class Publication:
 
     channels: Mapping[str, float] = field(default_factory=dict)
     dt_limit: float | None = None
-    tau_s: float | None = None
+    exchange_time_s: float | None = None
     contract: int = HOLD
     #: limits applied to THIS participant instead of the defaults
     limits: Mapping[str, float] | None = None
@@ -111,8 +111,8 @@ class StepSpans:
 
     Per participant, shape ``(P,)``::
 
-        pub_tau                its own time constant
-        pub_tau_present        whether it published one at all
+        pub_exchange_time                its own time constant
+        pub_exchange_time_present        whether it published one at all
         pub_contract           HOLD / BIND / DILATE / SUBCYCLE
         pub_dt_limit           its own stability floor
         pub_dt_limit_present   whether it published one at all
@@ -126,8 +126,8 @@ class StepSpans:
     compiled dt uses DT_CHANNEL_NAMES, independent of the process registry.
     """
 
-    pub_tau: Any
-    pub_tau_present: Any
+    pub_exchange_time: Any
+    pub_exchange_time_present: Any
     pub_contract: Any
     pub_dt_limit: Any
     pub_dt_limit_present: Any
@@ -151,7 +151,7 @@ class StepSpans:
 
         Participants come out in the registry's declaration order, which is the
         causal order.  A declared participant absent from ``published`` is
-        silence: ``HOLD``, no tau, no measures, no limit -- not a row of zeros.
+        silence: ``HOLD``, no exchange_time, no measures, no limit -- not a row of zeros.
         """
         from ...common.tensors import AbstractTensor
 
@@ -159,8 +159,8 @@ class StepSpans:
         channels = channels or ("",)
         default_limits = default_limits or {}
 
-        tau_s: list[float] = []
-        tau_present: list[bool] = []
+        exchange_time_s: list[float] = []
+        exchange_time_present: list[bool] = []
         contract: list[int] = []
         dt_limit: list[float] = []
         dt_limit_present: list[bool] = []
@@ -171,9 +171,9 @@ class StepSpans:
 
         for name in registry.declared():
             entry = published.get(name)
-            tau = None if entry is None else entry.tau_s
-            tau_s.append(0.0 if tau is None else float(tau))
-            tau_present.append(tau is not None)
+            exchange_time = None if entry is None else entry.exchange_time_s
+            exchange_time_s.append(0.0 if exchange_time is None else float(exchange_time))
+            exchange_time_present.append(exchange_time is not None)
             contract.append(HOLD if entry is None else int(entry.contract))
 
             floor = None if entry is None else entry.dt_limit
@@ -190,15 +190,15 @@ class StepSpans:
             limits.append([float(declared.get(c, 0.0)) for c in channels])
             limits_present.append([c in declared for c in channels])
 
-        if not tau_s:   # no participants declared at all
-            tau_s, tau_present, contract = [0.0], [False], [HOLD]
+        if not exchange_time_s:   # no participants declared at all
+            exchange_time_s, exchange_time_present, contract = [0.0], [False], [HOLD]
             dt_limit, dt_limit_present = [0.0], [False]
             values, present = [[0.0] * len(channels)], [[False] * len(channels)]
             limits, limits_present = [[0.0] * len(channels)], [[False] * len(channels)]
 
         tensor = AbstractTensor.tensor
         return cls(
-            pub_tau=tensor(tau_s), pub_tau_present=tensor(tau_present),
+            pub_exchange_time=tensor(exchange_time_s), pub_exchange_time_present=tensor(exchange_time_present),
             pub_contract=tensor(contract),
             pub_dt_limit=tensor(dt_limit), pub_dt_limit_present=tensor(dt_limit_present),
             pub_values=tensor(values).reshape((-1,)), pub_present=tensor(present).reshape((-1,)),
@@ -208,7 +208,7 @@ class StepSpans:
 
     @property
     def participants(self) -> int:
-        return int(self.pub_tau.shape[0])
+        return int(self.pub_exchange_time.shape[0])
 
 
 # --------------------------------------------------------------------- summed
@@ -228,12 +228,12 @@ def system_totals(spans: StepSpans, *, limbs: int = EXACT_LIMBS):
     from ...common.tensors import AbstractTensor
     from ...common.tensors.extended_precision import add_expansions
 
-    values = spans.pub_values.reshape((int(spans.pub_tau.shape[0]), -1))
-    present = spans.pub_present.reshape((int(spans.pub_tau.shape[0]), -1))
+    values = spans.pub_values.reshape((int(spans.pub_exchange_time.shape[0]), -1))
+    present = spans.pub_present.reshape((int(spans.pub_exchange_time.shape[0]), -1))
     contributed = AbstractTensor.where(present, values, AbstractTensor.zeros_like(values))
     accumulator = [AbstractTensor.zeros_like(contributed[0])
                    for _ in range(max(1, int(limbs)))]
-    for index in range(int(spans.pub_tau.shape[0])):
+    for index in range(int(spans.pub_exchange_time.shape[0])):
         accumulator = add_expansions(accumulator, [contributed[index]], limbs)
     reported = present.sum(dim=0) > 0.0
     return accumulator[0], reported
@@ -273,7 +273,7 @@ def tripped(spans: StepSpans):
 
 def any_tripped(spans: StepSpans):
     """Whether each participant tripped anything: ``(P,)`` of bool."""
-    return tripped(spans).reshape((int(spans.pub_tau.shape[0]), -1)).sum(dim=1) > 0.0
+    return tripped(spans).reshape((int(spans.pub_exchange_time.shape[0]), -1)).sum(dim=1) > 0.0
 
 
 def worst_penalty(spans: StepSpans, floor: float = 1.0):
@@ -304,13 +304,13 @@ def worst_penalty(spans: StepSpans, floor: float = 1.0):
 # ------------------------------------------------------------------ the step
 
 
-def tau_bound(spans: StepSpans, fraction: float, dt_proposed, dt_current=None):
-    """The step after every BINDing participant's tau is applied.
+def exchange_time_bound(spans: StepSpans, fraction: float, dt_proposed, dt_current=None):
+    """The step after every BINDing participant's exchange_time is applied.
 
-    ``dt <= fraction * tau`` per binding participant, as a masked minimum over
+    ``dt <= fraction * exchange_time`` per binding participant, as a masked minimum over
     them -- the same law the blended energy/power pin applied, per participant
     instead of over a total, so the stiff one is visible rather than averaged
-    away.  A tau only pins when its owner said ``BIND`` and actually published
+    away.  An exchange time only pins when its owner said ``BIND`` and actually published
     one; every other contract is deliberately excluded, and that exclusion is
     what lets a dilating participant keep its own cadence without imposing it.
 
@@ -320,14 +320,14 @@ def tau_bound(spans: StepSpans, fraction: float, dt_proposed, dt_current=None):
     """
     from ...common.tensors import AbstractTensor
 
-    binding = (spans.pub_contract == BIND) * spans.pub_tau_present
+    binding = (spans.pub_contract == BIND) * spans.pub_exchange_time_present
     limit = AbstractTensor.tensor(float(dt_proposed))
     if bool(binding.any().item()):
         # non-binding rows are lifted to the proposal so they cannot win the
         # minimum: a masked reduction, not a filtered list
         pinned = AbstractTensor.where(
-            binding, spans.pub_tau * float(fraction),
-            AbstractTensor.ones_like(spans.pub_tau) * float(dt_proposed),
+            binding, spans.pub_exchange_time * float(fraction),
+            AbstractTensor.ones_like(spans.pub_exchange_time) * float(dt_proposed),
         )
         limit = AbstractTensor.minimum(limit, pinned.min())
     if dt_current is not None and bool((spans.pub_contract == HOLD).any().item()):
@@ -363,7 +363,7 @@ def trip_report(
     boundary rather than carrying strings through the step.
     """
     names = list(channel_names) if channel_names is not None else list(spans.channel_names)
-    ratios = penalties(spans).reshape((int(spans.pub_tau.shape[0]), -1)).tolist()
+    ratios = penalties(spans).reshape((int(spans.pub_exchange_time.shape[0]), -1)).tolist()
     opened: list[tuple[str, str, float]] = []
     for index, row in enumerate(ratios):
         who = (participant_names[index] if index < len(participant_names)

@@ -50,8 +50,8 @@ class Metrics:
     control_values: AbstractTensor = field(default_factory=empty_control)
     control_present: AbstractTensor = field(default_factory=empty_control)
     # Participant rows forwarded from the producer's declared storage.
-    pub_tau: AbstractTensor = field(default_factory=empty_publication)
-    pub_tau_present: AbstractTensor = field(default_factory=empty_publication)
+    pub_exchange_time: AbstractTensor = field(default_factory=empty_publication)
+    pub_exchange_time_present: AbstractTensor = field(default_factory=empty_publication)
     pub_contract: AbstractTensor = field(default_factory=empty_publication)
     pub_dt_limit: AbstractTensor = field(default_factory=empty_publication)
     pub_dt_limit_present: AbstractTensor = field(default_factory=empty_publication)

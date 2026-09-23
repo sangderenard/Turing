@@ -346,7 +346,7 @@ def merge_metrics(rows: Sequence[Metrics], frame: int) -> Metrics:
     power_slot = DT_CHANNEL_NAMES.index("power_w")
     energy = float(channels[energy_slot].item())
     power = float(channels[power_slot].item())
-    tau_present = bool(present[energy_slot].item()) and bool(
+    exchange_time_present = bool(present[energy_slot].item()) and bool(
         present[power_slot].item()) and power > 0.0
     dt_limit = min(limits) if limits else None
     # The chamber is one top-level simulation.  Its surfaces, pools, air,
@@ -358,9 +358,9 @@ def merge_metrics(rows: Sequence[Metrics], frame: int) -> Metrics:
         dt_limit=dt_limit,
         error_channels=channels,
         error_present=present,
-        pub_tau=AbstractTensor.tensor([energy / power if tau_present else 0.0]),
-        pub_tau_present=AbstractTensor.tensor([float(tau_present)]),
-        pub_contract=AbstractTensor.tensor([BIND if tau_present else HOLD]),
+        pub_exchange_time=AbstractTensor.tensor([energy / power if exchange_time_present else 0.0]),
+        pub_exchange_time_present=AbstractTensor.tensor([float(exchange_time_present)]),
+        pub_contract=AbstractTensor.tensor([BIND if exchange_time_present else HOLD]),
         pub_dt_limit=AbstractTensor.tensor([0.0 if dt_limit is None else dt_limit]),
         pub_dt_limit_present=AbstractTensor.tensor([float(dt_limit is not None)]),
         pub_values=channels.copy(),

@@ -190,6 +190,34 @@ def error_scale(value, source):
     return smooth_abs(source * slope) / (smooth_abs(value) + EPS)
 
 
+def exchangeable_energy(stored, exchanged, state):
+    """Energy the law's own exchange can move before it runs its course.
+
+    ``stored`` is the law's stored energy (the ``energy_j`` it publishes),
+    ``exchanged`` the net energy it exchanges this step, ``state`` the
+    quantity that exchange drives.  Linearising the exchange about the
+    current state puts equilibrium at ``state - exchanged / (d exchanged /
+    d state)``, so the energy between here and there is
+
+        |d stored / d state| * |exchanged| / |d exchanged / d state|
+
+    measured from where the exchange is going, not from absolute zero.  The
+    state itself stays absolute; only this metric is relative.  Over the
+    published ``power_w = |exchanged| / dt`` it is ``C / |d rate / d state|``,
+    the law's true relaxation time, independent of the temperature (or
+    amount) it happens to sit at.  An exchange with no restoring slope (a
+    pure source) has no equilibrium to run toward and no energy bound: the
+    EPS floor makes that an effectively infinite exchange time, and the law's
+    own ``dt_limit`` governs.  Same symbolic derivative and Heaviside
+    respelling as ``euler_bound``.
+    """
+    def slope(expr):
+        return sp.diff(expr, state).replace(
+            sp.Heaviside, lambda *args: smooth_step(args[0], sp.Float(1e-9)))
+
+    return smooth_abs(slope(stored)) * smooth_abs(exchanged) / (smooth_abs(slope(exchanged)) + EPS)
+
+
 def relax(dt, tau):
     """Fraction of a gap closed in ``dt`` by first-order relaxation.
 
@@ -281,6 +309,7 @@ VOXEL_AIR_STEP = [
     named("mass_err", smooth_abs(m_a_n - (m_a + dm_a_flow))
           / (smooth_abs(m_a_n) + smooth_abs(m_a) + smooth_abs(dm_a_flow) + TINY)),
     named("energy_j", C_cell * T),
+    named("exchangeable_energy_j", exchangeable_energy(C_cell * T, dQ_flow + dQ_cond + Q_ext, T)),
     named("power_w", smooth_abs(dQ_flow + dQ_cond + Q_ext) / dt),
 ]
 
@@ -411,6 +440,7 @@ VOXEL_SPECIES_STEP = [
           / (smooth_abs(m_v_n) + smooth_abs(m_l_n) + smooth_abs(m_i_n) + smooth_abs(m_r_n)
              + smooth_abs(total_water) + smooth_abs(expected_change) + TINY)),
     named("energy_j", C_species * T + L_v * m_v),
+    named("exchangeable_energy_j", exchangeable_energy(C_species * T + L_v * m_v, Q_lat, m_v)),
     named("power_w", smooth_abs(Q_lat) / dt),
 ]
 
@@ -542,8 +572,10 @@ r_T = relax(dt, tau_T)
 T_p_next = T + (T_p - T) * (1 - r_T) + (L_v * dm_w / C_p) * (tau_T / dt) * r_T
 
 rho_p = m_p / (sp.Rational(4, 3) * pi * r3 + TINY)
-v_stokes = 2 * rho_p * g * r**2 / (9 * mu_air)
-v_newton = sp.sqrt(8 * rho_p * g * r / (3 * Cd * rho_air))
+# Buoyancy-corrected (rho_p - rho_air): the drop falls on its weight less the
+# air it displaces (Pruppacher & Klett); ~0.1% for water in air, not zero.
+v_stokes = 2 * (rho_p - rho_air) * g * r**2 / (9 * mu_air)
+v_newton = sp.sqrt(8 * (rho_p - rho_air) * g * r / (3 * Cd * rho_air))
 v_t = v_stokes * v_newton / sp.sqrt(v_stokes**2 + v_newton**2 + TINY)
 tau_v = v_t / g
 w_next = v_t + (w - v_t) * sp.exp(-dt / (tau_v + TINY))
@@ -584,6 +616,8 @@ DROPLET_STEP = [
     named("mass_err", smooth_abs(r_next**2 - r2_next)
           / (smooth_abs(r_next**2) + smooth_abs(r2_next) + TINY)),
     named("energy_j", C_p * T_p),
+    named("exchangeable_energy_j", exchangeable_energy(
+        C_p * T_p, h_c * 4 * pi * r**2 * (T - T_p) * dt + L_v * dm_w, T_p)),
     named("power_w", smooth_abs(L_v * dm_w) / dt + h_c * 4 * pi * r**2 * smooth_abs(T - T_p)),
 ]
 
@@ -649,6 +683,7 @@ SALT_SOLUTION_STEP = [
     named("mass_err", smooth_abs(n_c_n - (n_c + dn_c))
           / (smooth_abs(n_c_n) + smooth_abs(n_c) + smooth_abs(dn_c) + TINY)),
     named("energy_j", C_sol * T_sol),
+    named("exchangeable_energy_j", exchangeable_energy(C_sol * T_sol, Q_reaction, T_sol)),
     named("power_w", smooth_abs(Q_reaction) / dt),
 ]
 
@@ -742,6 +777,7 @@ SURFACE_STEP = [
              + smooth_abs(phi_drop * dt) + smooth_abs(runoff)
              + smooth_abs(m_frost_n) + smooth_abs(m_frost) + smooth_abs(dm_ice) + TINY)),
     named("energy_j", C_tot * T_s),
+    named("exchangeable_energy_j", exchangeable_energy(C_tot * T_s, Q_lat + Q_conv_s + Q_plate, T_s)),
     named("power_w", smooth_abs(Q_lat + Q_conv_s + Q_plate) / dt),
 ]
 
@@ -800,6 +836,8 @@ POOL_STEP = [
           / (smooth_abs(m_p_n) + smooth_abs(m_p) + smooth_abs(phi_in * dt)
              + smooth_abs(dm_evap) + smooth_abs(overflow) + TINY)),
     named("energy_j", C_l * T_l),
+    named("exchangeable_energy_j", exchangeable_energy(
+        C_l * T_l, Q_lat_pool + Q_conv_pool + Q_floor + Q_in, T_l)),
     named("power_w", smooth_abs(Q_lat_pool + Q_conv_pool + Q_floor + Q_in) / dt),
 ]
 

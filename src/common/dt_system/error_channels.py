@@ -17,7 +17,7 @@ all three under one name and their needs conflict:
   That is what this module carries, and it is the only genuinely dynamic,
   plug-and-play part: a new simulator declares a channel, publishes it, and
   consumers that never heard of it are unaffected.
-* A **physical observable** feeding a named law (``tau``, ``shadow_growth``)
+* A **physical observable** feeding a named law (``exchange_time_s``, ``shadow_growth``)
   is fixed at build time and belongs in ``time_contracts``; it was never an
   error and nothing compares it to a limit.
 * A **controller diagnostic** (``dt_unresolved``, ``superstep_*``) is written

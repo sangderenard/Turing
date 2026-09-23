@@ -223,13 +223,13 @@ ADVANCE_METRICS = '''    position = material.tire_state[0, :, :, 0:3]
     material.telemetry[8] = exchange_power
     channel_values = AbstractTensor.tensor([stored_energy, exchange_power, 0.0, 0.0, 0.0, 0.0, 0.0, displacement, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     channel_present = AbstractTensor.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    tau_present = exchange_power > 0.0
+    exchange_time_present = exchange_power > 0.0
     return physical, Metrics(max_vel=maximum_velocity, max_flux=maximum_velocity,
         div_inf=0.0, mass_err=0.0, error_channels=channel_values,
         error_present=channel_present, advanced_dt=dt,
-        pub_tau=AbstractTensor.tensor([stored_energy / exchange_power if tau_present else 0.0]),
-        pub_tau_present=AbstractTensor.tensor([float(tau_present)]),
-        pub_contract=AbstractTensor.tensor([1.0 if tau_present else 0.0]),
+        pub_exchange_time=AbstractTensor.tensor([stored_energy / exchange_power if exchange_time_present else 0.0]),
+        pub_exchange_time_present=AbstractTensor.tensor([float(exchange_time_present)]),
+        pub_contract=AbstractTensor.tensor([1.0 if exchange_time_present else 0.0]),
         pub_dt_limit=AbstractTensor.tensor([0.0]),
         pub_dt_limit_present=AbstractTensor.tensor([0.0]),
         pub_values=channel_values, pub_present=channel_present,
