@@ -9,9 +9,39 @@ from src.common.tensors.accelerator_backends.aot_compile import (
     compile_ast_aot,
     project_public_numerical_program,
 )
-from src.common.tensors.fused_ir import ordered_feed_ids
+from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep, ordered_feed_ids
 from src.compiler.fused_program_wasm_backend import emit_wasm_module
 from src.compiler.wasm_fidelity import verify_wasm_module, verify_wasm_source
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_batched_matmul_uses_concordance_shapes_for_exact_addressing(tmp_path):
+    left_id, right_id, result_id = 1, 2, 3
+    program = FusedProgram(
+        version=1,
+        feeds={left_id, right_id},
+        steps=[OpStep(
+            step_id=0, op_name="matmul", input_ids=[left_id, right_id],
+            attrs={}, result_id=result_id,
+        )],
+        outputs={"result": result_id},
+        meta={
+            left_id: Meta(shape=(2, 2, 3), dtype="float64"),
+            right_id: Meta(shape=(2, 3, 2), dtype="float64"),
+            result_id: Meta(shape=(2, 2, 2), dtype="float64"),
+        },
+    )
+    feeds = {
+        left_id: np.arange(12, dtype=np.float64).reshape(2, 2, 3),
+        right_id: np.arange(12, dtype=np.float64).reshape(2, 3, 2) / 3.0,
+    }
+    module = emit_wasm_module(program, name="batched_matmul", dtype="float64")
+
+    assert module.complete, module.shortfall_report()
+    proof = verify_wasm_module(
+        module, program, feeds, tmp_path, entrypoint="batched_matmul",
+    )
+    assert proof["passed"] is True
 
 
 # A trailing-axis reduction (N*K -> N): the flat run(count, ...) model cannot

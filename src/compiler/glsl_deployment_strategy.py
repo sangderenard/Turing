@@ -2003,6 +2003,34 @@ def _atomic_region_node_order(
     )
 
 
+def _shader_fusible_node_ids(
+    graph: Any, node_ids: Iterable[int],
+) -> tuple[int, ...]:
+    """Elementwise nodes that may share one generated shader body.
+
+    Shape/layout changes, reductions, contractions, constructors and other
+    native kernels remain executable, but each is a reserved dispatch region.
+    The captured backend already has dedicated lowerings for those regions;
+    admitting them to elementwise fixed-point fusion merely hides their
+    ordering boundary and hands ``program_snippet`` an impossible mixed body.
+    """
+
+    fusible = []
+    for node_id in node_ids:
+        data = graph.G.nodes[int(node_id)]
+        operation = str(
+            (data.get("attributes") or {}).get("tensor")
+            or (data.get("attributes") or {}).get("tensor_operation")
+            or data.get("op") or data.get("type") or data.get("label")
+        )
+        try:
+            canonical_elementwise_op(operation)
+        except KeyError:
+            continue
+        fusible.append(int(node_id))
+    return tuple(fusible)
+
+
 def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
     """Freeze call/region ownership before backend source composition."""
 
@@ -5640,7 +5668,9 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                 for value_id in all_ids
             }
             captured_regions[global_region] = (
-                _remap_captured_all_ids(captured, id_map)
+                _remap_captured_all_ids(
+                    captured, id_map, source_closure_id=closure_id,
+                )
             )
         # Nested callsite shells are logical compartments of this artifact,
         # not separately finalized shaders.  Carry their typed specialization
@@ -6906,7 +6936,17 @@ def _subgraph_reduction_digest(subgraph: Any) -> str:
 
     from joblib.externals import cloudpickle
 
-    return hashlib.sha256(cloudpickle.dumps(subgraph)).hexdigest()
+    graph_digest = hashlib.sha256(cloudpickle.dumps(subgraph)).hexdigest()
+    # Region artifacts depend on the transcription contract as well as graph
+    # topology.  Version that contract so a provenance/lowering fix cannot
+    # keep resurrecting an older region program from the reduction cache.
+    return hashlib.sha256(
+        (
+            "structural-region-v7-source-value-receipts|" + graph_digest
+        ).encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 def _structural_region_program_from_subgraph(
@@ -6933,6 +6973,24 @@ def _structural_region_program_from_subgraph(
         ),
         0.0,
     )
+    # This is the handoff from the compiler's provenance backbone into the
+    # backend-neutral numeric IR.  Several descriptors are proven recursively
+    # by the concordance and therefore do not live in the source node's
+    # shallow ``tensor`` snapshot.  Materialize those proven facts onto the
+    # dispatch subgraph before transcription; otherwise a later region seam
+    # forgets the shape even though the concordance still knows it.
+    for value_id in (*region.input_ids, *region.node_ids):
+        descriptor = _tensor_descriptor(subgraph, int(value_id))
+        if descriptor is None:
+            continue
+        node = subgraph.G.nodes[int(value_id)]
+        tensor = dict(node.get("tensor") or {})
+        tensor.update({
+            key: copy.deepcopy(descriptor[key])
+            for key in ("shape", "dtype", "device", "rank")
+            if descriptor.get(key) is not None
+        })
+        node["tensor"] = tensor
     program = dispatch_region_to_fused_program(subgraph, region)
     # Region-local integers are useful execution slots, but they are not the
     # identity a diagnostic or later compiler pass should have to remember.
@@ -6942,6 +7000,14 @@ def _structural_region_program_from_subgraph(
     exposed_values = {
         *map(int, program.feeds),
         *map(int, program.outputs.values()),
+    }
+    program.extras = {
+        **dict(program.extras or {}),
+        "source_function": str(graph_data.get("function_name") or ""),
+        "source_value_ids": {
+            int(value_id): int(value_id)
+            for value_id in sorted(exposed_values)
+        },
     }
     exposed_identity_tokens = {
         int(value_id): tuple(map(str, identity_tokens[value_id]))
@@ -7120,6 +7186,21 @@ def _dispatch_subgraph(
     }
     for node_id in boundary:
         data = subgraph.G.nodes[node_id]
+        # Ask the concordance while the source graph still owns this value's
+        # complete causal parents.  Turning a boundary into an Input below is
+        # intentionally lossy compartmentalization; without materializing the
+        # proven descriptor first, a chained layout operation (for example
+        # ``literal.unsqueeze(1).unsqueeze(2)``) loses the first view's shape
+        # exactly at the region seam.
+        descriptor = _tensor_descriptor(graph, int(node_id))
+        if descriptor_states_a_shape(descriptor):
+            tensor = dict(data.get("tensor") or {})
+            tensor.update({
+                key: copy.deepcopy(descriptor[key])
+                for key in ("shape", "dtype", "device", "rank")
+                if descriptor.get(key) is not None
+            })
+            data["tensor"] = tensor
         if str(data.get("type")) in {"Const", "const", "Constant"} and node_id not in carried_initials:
             continue
         data["type"] = "Input"
@@ -9438,6 +9519,8 @@ def _remap_captured_program(
 def _remap_captured_all_ids(
     captured: CapturedFusedProgram,
     id_map: Mapping[int, int],
+    *,
+    source_closure_id: int | None = None,
 ) -> CapturedFusedProgram:
     """Namespace every captured IR identity for hierarchical composition."""
 
@@ -9445,6 +9528,47 @@ def _remap_captured_all_ids(
         remap = lambda value_id: int(
             id_map.get(int(value_id), int(value_id))
         )
+        extras = copy.deepcopy(dict(source.extras or {}))
+        if source_closure_id is not None:
+            extras["source_closure_id"] = int(source_closure_id)
+        for table_name in (
+            "ssa_identity_tokens",
+            "capture_feed_origins",
+            "descriptor_derivations",
+        ):
+            table = extras.get(table_name)
+            if not isinstance(table, Mapping):
+                continue
+            extras[table_name] = {
+                remap(value_id): value
+                for value_id, value in table.items()
+            }
+        source_value_ids = extras.get("source_value_ids")
+        if isinstance(source_value_ids, Mapping):
+            extras["source_value_ids"] = {
+                remap(value_id): int(source_id)
+                for value_id, source_id in source_value_ids.items()
+            }
+        derivations = extras.get("descriptor_derivations")
+        if isinstance(derivations, Mapping):
+            extras["descriptor_derivations"] = {
+                int(value_id): {
+                    **dict(receipt),
+                    **(
+                        {"source_id": remap(receipt["source_id"])}
+                        if isinstance(receipt, Mapping)
+                        and receipt.get("source_id") is not None else {}
+                    ),
+                    **(
+                        {"input_ids": tuple(
+                            remap(item) for item in receipt["input_ids"]
+                        )}
+                        if isinstance(receipt, Mapping)
+                        and receipt.get("input_ids") is not None else {}
+                    ),
+                }
+                for value_id, receipt in derivations.items()
+            }
         target = FusedProgram(
             version=source.version,
             feeds={remap(value_id) for value_id in source.feeds},
@@ -9470,10 +9594,22 @@ def _remap_captured_all_ids(
                 else {remap(value_id) for value_id in source.state_in}
             ),
             meta={
-                remap(value_id): meta
+                remap(value_id): replace(
+                    meta,
+                    source_id=(
+                        None if meta.source_id is None
+                        else remap(meta.source_id)
+                    ),
+                    shape_source_ids=(
+                        None if meta.shape_source_ids is None else tuple(
+                            None if item is None else remap(item)
+                            for item in meta.shape_source_ids
+                        )
+                    ),
+                )
                 for value_id, meta in (source.meta or {}).items()
             },
-            extras=source.extras,
+            extras=extras,
         )
         if hasattr(source, "glsl_linear_output_shape"):
             target.glsl_linear_output_shape = tuple(
@@ -16695,6 +16831,42 @@ def propagate_bound_planner_specializations(
     entry = function_table.entry(reference.address).graph
     if entry is None:
         return
+
+    # Mutable public tensors are values, not planner literals, but their
+    # extents and element type are still the fixed Program-ABI contract for
+    # this compilation.  Previously the mutable filter below discarded both
+    # facts together.  The root web shell consequently entered hierarchy
+    # planning without descriptors, specialized every helper as rank zero,
+    # and only rediscovered the real shapes after its regions had already
+    # been cut.  Attach the non-value boundary facts to the exact formal
+    # identities and publish them through the same concordance used by
+    # callsite specialization.  No payload value is retained or folded.
+    mutable_descriptors: dict[str, dict[str, Any]] = {}
+    for name in mutable:
+        value = bindings.get(name)
+        shape = getattr(value, "shape", None)
+        dtype = getattr(value, "dtype", None)
+        if shape is None or callable(shape) or dtype is None:
+            continue
+        try:
+            extents = tuple(map(int, shape))
+        except (TypeError, ValueError):
+            continue
+        descriptor = {
+            "shape": extents,
+            "dtype": str(dtype),
+            "rank": len(extents),
+        }
+        mutable_descriptors[name] = descriptor
+        _publish_formal_shape(
+            str(entry.G.graph.get("function_name") or entrypoint),
+            name,
+            descriptor,
+            "program-abi",
+        )
+    if mutable_descriptors:
+        _apply_callsite_tensor_descriptors(entry, mutable_descriptors)
+
     queue: list[tuple[Any, dict[str, Any]]] = [(
         entry,
         {
@@ -16986,7 +17158,7 @@ def _tensor_descriptor(
         specialized_operator = bool(
             graph.G.graph.get("planner_tensor_descriptors")
             and descriptor_operation in {
-                "matmul", "sum", "prod", "min", "max", "any", "all",
+                "matmul", "sum", "mean", "prod", "min", "max", "any", "all",
             }
         )
         binding_name = str(
@@ -17091,6 +17263,67 @@ def _tensor_descriptor_rule(
     seen.add(int(node_id))
     data = graph.G.nodes[int(node_id)]
     tensor = dict(data.get("tensor") or {})
+    literal_operation = str(
+        (data.get("attributes") or {}).get("tensor")
+        or (data.get("attributes") or {}).get("tensor_candidate")
+        or data.get("op")
+        or data.get("type")
+        or ""
+    ).casefold()
+    if "shape" not in tensor and (
+        str(data.get("type")) in {"Constant", "Const", "const"}
+        or literal_operation == "tensor_from_list"
+    ):
+        literal = data.get("constant")
+        if literal is None:
+            literal_attributes = data.get("attributes") or {}
+            literal = literal_attributes.get(
+                "values", literal_attributes.get("value")
+            )
+        literal_shape = getattr(literal, "shape", None)
+        literal_dtype = getattr(literal, "dtype", None)
+        if (
+            literal_shape is not None
+            and not callable(literal_shape)
+            and literal_dtype is not None
+            and not isinstance(literal, np.dtype)
+        ):
+            # Capture-time feed arrays can become Constant nodes after their
+            # values are structurally bound, but their shape/dtype remain
+            # physical boundary facts.  Publish those facts through the
+            # descriptor query so a mutable tensor combined with a pointer
+            # lane keeps its rank in the web hierarchy.  This reads no array
+            # element and does not make the payload a planner literal.
+            try:
+                literal_shape = tuple(map(int, literal_shape))
+            except (TypeError, ValueError):
+                pass
+            else:
+                tensor = {
+                    "shape": literal_shape,
+                    "dtype": str(literal_dtype),
+                    "rank": len(literal_shape),
+                }
+        elif isinstance(literal, (list, tuple)) and literal:
+            # A source-authored nested numeric literal is the payload of a
+            # ``tensor_from_list`` once it enters tensor dataflow.  Its
+            # rectangular extents and numeric dtype are compile-time facts,
+            # just like a captured NumPy constant's ``shape``/``dtype`` above.
+            # Publishing them here lets rank-changing views and the following
+            # matmul inherit one concordance descriptor instead of collapsing
+            # the literal to an untyped structural aggregate.
+            literal_array = np.asarray(literal)
+            if (
+                literal_array.size
+                and literal_array.dtype.kind in {"b", "i", "u", "f", "c"}
+                and literal_array.dtype.kind != "O"
+            ):
+                literal_shape = tuple(map(int, literal_array.shape))
+                tensor = {
+                    "shape": literal_shape,
+                    "dtype": str(literal_array.dtype),
+                    "rank": len(literal_shape),
+                }
     # A generic tensor annotation publishes flat native span storage before a
     # caller is known, so its graph node deliberately starts with dynamic
     # metadata and an empty static shape.  Whole-program planning later puts
@@ -17115,14 +17348,23 @@ def _tensor_descriptor_rule(
             "rank": len(linked_shape),
         }
         tensor.pop("metadata_state", None)
+    # A source-level tensor builtin remains a syntactic ``Call`` node while
+    # its compiler-resolved numerical identity is recorded on the node.  The
+    # descriptor law must follow that concordance identity: dispatching on
+    # the word ``Call`` loses shape at perfectly ordinary views such as
+    # ``abs(pixel_x)`` even though the tensor operand is already proven.
     descriptor_operation = str(
-        data.get("op") or data.get("type") or ""
+        (data.get("attributes") or {}).get("tensor")
+        or (data.get("attributes") or {}).get("tensor_candidate")
+        or data.get("op")
+        or data.get("type")
+        or ""
     ).casefold()
     provisional_tensor = None
     if (
         graph.G.graph.get("planner_tensor_descriptors")
         and descriptor_operation in {
-            "matmul", "sum", "prod", "min", "max", "any", "all",
+            "matmul", "sum", "mean", "prod", "min", "max", "any", "all",
         }
         and "shape" in tensor
     ):
@@ -17246,7 +17488,7 @@ def _tensor_descriptor_rule(
             if boundary.get("python_type"):
                 tensor["python_type"] = str(boundary["python_type"])
     if "shape" not in tensor:
-        operation = str(data.get("op") or data.get("type") or "").casefold()
+        operation = descriptor_operation
         if operation in {
             "identity", "loopresult", "loopexit", "loopstateport",
         }:
@@ -17462,6 +17704,24 @@ def _tensor_descriptor_rule(
                         continue
                     node = graph.G.nodes[operand]
                     attributes = node.get("attributes") or {}
+                    semantic_operand = str(
+                        attributes.get("tensor")
+                        or attributes.get("tensor_candidate")
+                        or node.get("op")
+                        or node.get("type")
+                        or ""
+                    ).casefold()
+                    if (
+                        int(side.get("rank", 0)) == 0
+                        and semantic_operand in {
+                            "sum", "mean", "prod", "min", "max", "any", "all",
+                        }
+                    ):
+                        # An all-axis reduction has an exact rank-zero result.
+                        # It is not the empty placeholder returned by an
+                        # unsettled tensor call, so retain the reduction law's
+                        # descriptor when it enters later elementwise work.
+                        continue
                     if (
                         node.get("tensor")
                         or attributes.get("tensor_candidate")
@@ -17497,11 +17757,21 @@ def _tensor_descriptor_rule(
                             compatible = False
                             break
                     if compatible:
-                        dtype = next((
-                            str(side.get("dtype"))
-                            for side in sides
-                            if str(side.get("dtype") or "unknown") != "unknown"
-                        ), "float64")
+                        dtype = (
+                            "bool"
+                            if operation in {
+                                "equal", "not_equal", "less", "less_equal",
+                                "greater", "greater_equal", "eq", "ne", "lt",
+                                "le", "gt", "ge", "logical_and", "logical_or",
+                                "logical_xor",
+                            }
+                            else next((
+                                str(side.get("dtype"))
+                                for side in sides
+                                if str(side.get("dtype") or "unknown")
+                                != "unknown"
+                            ), "float64")
+                        )
                         return {
                             "shape": tuple(broadcast),
                             "dtype": dtype,
@@ -17562,7 +17832,9 @@ def _tensor_descriptor_rule(
                                     "dtype": dtype,
                                     "rank": len(result),
                                 }
-        if operation in {"sum", "prod", "min", "max", "any", "all"}:
+        if operation in {
+            "sum", "mean", "prod", "min", "max", "any", "all",
+        }:
             operand_roles = {
                 "operand", "value", "base", "input", "self", "receiver",
             }
@@ -17591,7 +17863,19 @@ def _tensor_descriptor_rule(
                         if isinstance(axis, (tuple, list))
                         else (axis,)
                     )
-                    if all(
+                    if not source_shape:
+                        # An explicit reduction axis cannot be normalized
+                        # against rank zero.  During callsite specialization
+                        # this combination means the local operand descriptor
+                        # and the authored reduction disagree; it is not a
+                        # proof that the authored result is scalar.  Leave the
+                        # result unsettled so the exact value identity falls
+                        # through to its tracked provisional descriptor (and
+                        # can be revised when the operand's concordance fact
+                        # arrives) instead of dividing by zero or cementing a
+                        # false shape.
+                        reduced = None
+                    elif all(
                         isinstance(item, int) and not isinstance(item, bool)
                         for item in axes
                     ):
@@ -24939,6 +25223,9 @@ def strategize_shell_deployment(
         max_nodes_per_region=max_nodes_per_dispatch,
         partition_keys=partition_keys,
         extra_dependency_edges=closure_edges,
+        fusible_node_ids=_shader_fusible_node_ids(
+            graph, executable_nodes,
+        ),
         control_node_ids=recursion_control_nodes,
     )
     executable_dispatch_nodes = tuple(

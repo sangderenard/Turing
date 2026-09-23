@@ -23,6 +23,7 @@ from src.common.tensors.accelerator_backends.aot_compile import (
     compile_ast_aot,
     _walk_planned_shells,
 )
+from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.glsl_deployment_strategy import (
     _structural_region_program_from_subgraph,
 )
@@ -82,6 +83,25 @@ def test_graph_only_reshape_builds_region_and_emits_wasm():
     assert {"bitand", "shr", "shl", "bitor"} <= set(op_names)
     # The backend lowers the reshape (a view) to a complete module.
     module = emit_wasm_module(program, name="decode_block_r0", dtype="int64")
+    assert module.complete, module.shortfall_report()
+
+
+@pytest.mark.parametrize("operation", ("unsqueeze", "squeeze"))
+def test_graph_only_rank_view_emits_as_linear_identity(operation):
+    program = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[
+            OpStep(0, "tensor_from_list", [], {"values": 2}, 2),
+            OpStep(1, operation, [1, 2], {}, 3),
+        ],
+        outputs={"result": 3},
+    )
+
+    module = emit_wasm_module(
+        program, name=f"rank_view_{operation}", dtype="float64",
+    )
+
     assert module.complete, module.shortfall_report()
 
 

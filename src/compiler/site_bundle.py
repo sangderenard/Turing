@@ -1510,6 +1510,691 @@ _SHADER_SURFACE_LANGUAGES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def _aot_output_identity_history(aot: Any, output_name: str) -> tuple[int, ...]:
+    """Return output identities in the executable hierarchy namespace.
+
+    ``identity_table`` is the complete source-local mutation history. Once
+    hierarchy composition namespaces and reduces that graph, its authoritative
+    public terminal lives in ``public_output_value_ids``. Keep the source
+    history for diagnostics/fallback, but put the concordance-owned terminal
+    last so consumers select the identity actually produced by retained
+    regions.
+    """
+
+    source_history = tuple(
+        int(value_id)
+        for value_id in aot.identity_table.get(output_name, ())
+    )
+    hierarchical_terminal = aot.public_output_value_ids.get(output_name)
+    if hierarchical_terminal is None:
+        return source_history
+    return tuple(dict.fromkeys((
+        *source_history,
+        int(hierarchical_terminal),
+    )))
+
+
+def _concord_region_value_metadata(
+    region_programs: Mapping[int, Any],
+    *,
+    feed_values: Mapping[int, Any] | None = None,
+    constant_values: Mapping[str, Any] | None = None,
+    source_graphs: Sequence[Any] = (),
+    hierarchy_plans: Sequence[Any] = (),
+) -> None:
+    """Carry one SSA identity's proven descriptor across every region seam.
+
+    Region partitioning copies metadata, so a producer can retain a descriptor
+    while a consumer's older boundary snapshot has none.  Structural identity
+    tokens correlate values while source graph identity is available.  After
+    transcription, the control concordance's declared output/feed seam is the
+    authoritative correlation: arbitrary region-local ids must never be
+    compared because reducers are free to reuse them.  Gather non-conflicting
+    facts from both identity layers, then fill only missing fields on every
+    correlated copy.  Conflicting facts are a compiler error; this never picks
+    a convenient shape.
+    """
+
+    facts: dict[tuple[str, ...], dict[str, Any]] = {}
+    seam_facts: dict[tuple[tuple[str, int | None], int], dict[str, Any]] = {}
+
+    def program_owner(program: Any) -> tuple[str, int | None]:
+        extras = dict(program.extras or {})
+        closure_id = extras.get("source_closure_id")
+        return (
+            str(extras.get("source_function") or ""),
+            int(closure_id) if closure_id is not None else None,
+        )
+
+    for captured in region_programs.values():
+        program = getattr(captured, "program", captured)
+        identity_tokens = {
+            int(value_id): tuple(map(str, tokens))
+            for value_id, tokens in dict(
+                (program.extras or {}).get("ssa_identity_tokens", {})
+            ).items()
+        }
+        for value_id, meta in (program.meta or {}).items():
+            identity = identity_tokens.get(int(value_id))
+            if identity is None:
+                continue
+            row = facts.setdefault(identity, {})
+            for field in ("shape", "dtype", "device"):
+                value = getattr(meta, field, None)
+                if value is None:
+                    continue
+                value = tuple(value) if field == "shape" else value
+                previous = row.get(field)
+                if previous is not None and previous != value:
+                    raise RuntimeError(
+                        f"concordance identity {identity!r} has conflicting "
+                        f"region {field}: {previous!r} != {value!r}"
+                    )
+                row[field] = value
+    import numpy as np
+    from ..common.tensors.fused_ir import Meta
+
+    elementwise = {
+        "add", "sub", "mul", "truediv", "floordiv", "mod", "pow",
+        "minimum", "maximum", "neg", "abs", "sin", "cos", "tan",
+        "exp", "log", "sqrt", "tanh", "logical_and", "logical_or",
+        "logical_not", "less", "less_equal", "greater", "greater_equal",
+        "equal", "not_equal", "isfinite", "isinf", "isnan", "where",
+    }
+    boolean_results = {
+        "logical_and", "logical_or", "logical_not", "less", "less_equal",
+        "greater", "greater_equal", "equal", "not_equal", "isfinite",
+        "isinf", "isnan",
+    }
+    replay_ops = elementwise | {
+        "unsqueeze", "squeeze", "matmul", "sum", "mean",
+        "prod", "min", "max",
+    }
+
+    def descriptor_operand_ids(step: Any) -> tuple[int, ...]:
+        """Return operands whose descriptors determine this result.
+
+        Layout transforms and reductions retain their axis as an auxiliary
+        SSA input for execution as well as in their concordance attributes.
+        That scalar control input is not tensor data and need not itself have
+        shape/dtype metadata before the tensor result can be proven.
+        """
+
+        inputs = tuple(map(int, step.input_ids))
+        if step.op_name in {
+            "unsqueeze", "squeeze", "sum", "mean", "prod", "min", "max",
+        }:
+            return inputs[:1]
+        return inputs
+
+    def scalar_constants(program: Any) -> dict[int, Any]:
+        constants: dict[int, Any] = {}
+        for step in program.steps:
+            if step.op_name != "tensor_from_list" or "values" not in step.attrs:
+                continue
+            try:
+                value = np.asarray(step.attrs["values"])
+            except (TypeError, ValueError):
+                continue
+            if value.size == 1:
+                constants[int(step.result_id)] = value.reshape(-1)[0].item()
+        return constants
+
+    programs = [
+        getattr(captured, "program", captured)
+        for captured in region_programs.values()
+    ]
+    source_call_binding_edges: list[
+        tuple[
+            tuple[tuple[str, int | None], int],
+            tuple[tuple[str, int | None], int],
+        ]
+    ] = []
+
+    def collect_call_bindings(
+        closure: Any,
+        logical_owner: tuple[str, int | None] | None = None,
+    ) -> None:
+        closure_name = str(getattr(closure, "name", "") or "")
+        closure_id = getattr(closure, "closure_id", None)
+        closure_scope = (
+            closure_name,
+            int(closure_id) if closure_id is not None else None,
+        )
+        caller = logical_owner or closure_scope
+        for item in tuple(getattr(closure, "items", ()) or ()):
+            callee = getattr(item, "callee", None)
+            if callee is None:
+                if getattr(item, "items", None) is not None:
+                    collect_call_bindings(item, caller)
+                continue
+            callee_name = str(getattr(callee, "name", "") or "")
+            callee_closure_id = getattr(callee, "closure_id", None)
+            callee_scope = (
+                callee_name,
+                int(callee_closure_id)
+                if callee_closure_id is not None else None,
+            )
+            source_call_binding_edges.extend(
+                ((caller, int(actual)), (callee_scope, int(formal)))
+                for actual, formal in tuple(
+                    getattr(item, "argument_bindings", ()) or ()
+                )
+            )
+            source_call_binding_edges.extend(
+                ((callee_scope, int(result)), (caller, int(receiving)))
+                for result, receiving in tuple(
+                    getattr(item, "result_bindings", ()) or ()
+                )
+            )
+            collect_call_bindings(callee)
+
+    for hierarchy_plan in hierarchy_plans:
+        if hierarchy_plan is not None:
+            collect_call_bindings(hierarchy_plan)
+    source_call_binding_edges = list(dict.fromkeys(
+        source_call_binding_edges
+    ))
+    source_instances: dict[
+        tuple[tuple[str, int | None], int], set[int]
+    ] = {}
+    for program in programs:
+        owner = program_owner(program)
+        for value_id, source_id in dict(
+            (program.extras or {}).get("source_value_ids", {})
+        ).items():
+            source_instances.setdefault(
+                (owner, int(source_id)), set()
+            ).add(int(value_id))
+    call_binding_edges = list(dict.fromkeys(
+        ((source_owner, source_value), (target_owner, target_value))
+        for (source_owner, source_id), (target_owner, target_id)
+        in source_call_binding_edges
+        for source_value in source_instances.get(
+            (source_owner, int(source_id)), (int(source_id),)
+        )
+        for target_value in source_instances.get(
+            (target_owner, int(target_id)), (int(target_id),)
+        )
+    ))
+    incoming_bound_values = {
+        target for _source, target in call_binding_edges
+    }
+    producer_outputs = {
+        (program_owner(program), int(value_id))
+        for program in programs
+        for value_id in program.outputs.values()
+    }
+    captured_feeds = {
+        int(value_id): value
+        for value_id, value in dict(feed_values or {}).items()
+    }
+    configured_constants = dict(constant_values or {})
+    for program in programs:
+        consumed = {
+            int(value_id)
+            for step in program.steps
+            for value_id in step.input_ids
+        } | set(map(int, program.outputs.values()))
+        program.feeds.intersection_update(consumed)
+        source_function = str(
+            (program.extras or {}).get("source_function") or ""
+        )
+        source_value_ids = {
+            int(value_id): int(source_id)
+            for value_id, source_id in dict(
+                (program.extras or {}).get("source_value_ids", {})
+            ).items()
+        }
+        if source_function and source_value_ids:
+            try:
+                from .identity_concordance import (
+                    current_identity_book,
+                    proven_shape_of,
+                )
+                proven_page = current_identity_book().page("proven_shape")
+            except Exception:
+                proven_page = None
+                proven_shape_of = None
+            if proven_shape_of is not None:
+                for value_id, source_id in source_value_ids.items():
+                    shape = proven_shape_of(source_function, source_id)
+                    descriptor = None
+                    shape_is_proven = bool(shape)
+                    if not shape_is_proven and source_graphs:
+                        descriptor_is_shaped = lambda _value: False
+                        try:
+                            from .glsl_deployment_strategy import (
+                                _tensor_descriptor,
+                                descriptor_states_a_shape,
+                            )
+                            descriptor_is_shaped = descriptor_states_a_shape
+                            owner_graph = next((
+                                graph
+                                for graph in source_graphs
+                                if source_id in graph.G
+                                and str(graph.G.graph.get("function_name") or "")
+                                == source_function
+                            ), None)
+                            if owner_graph is not None:
+                                descriptor = _tensor_descriptor(
+                                    owner_graph, source_id
+                                )
+                        except Exception:
+                            descriptor = None
+                        if descriptor_is_shaped(descriptor):
+                            shape = tuple(descriptor.get("shape") or ())
+                            # Rank zero is an exact shape.  Its empty tuple is
+                            # false in Python, which is why the old truthiness
+                            # test discarded scalar reduction facts precisely
+                            # at this concordance handoff.
+                            shape_is_proven = True
+                    if not shape_is_proven:
+                        continue
+                    row = (source_function, source_id)
+                    history = (
+                        tuple(proven_page.history(row))
+                        if proven_page is not None else ()
+                    )
+                    fact = max(
+                        history, key=lambda entry: int(entry[0])
+                    )[1] if history else None
+                    current = (program.meta or {}).get(value_id) or Meta()
+                    program.meta[value_id] = replace(
+                        current,
+                        shape=(
+                            current.shape
+                            if current.shape is not None else tuple(shape)
+                        ),
+                        dtype=(
+                            current.dtype
+                            if current.dtype is not None else (
+                                str(fact[2])
+                                if isinstance(fact, tuple) and len(fact) > 2
+                                else (
+                                    str(descriptor.get("dtype"))
+                                    if descriptor is not None
+                                    and descriptor.get("dtype") is not None
+                                    else None
+                                )
+                            )
+                        ),
+                    )
+        for value_id in program.feeds:
+            sample_value = captured_feeds.get(int(value_id))
+            if sample_value is None:
+                tokens = dict(
+                    (program.extras or {}).get("ssa_identity_tokens", {})
+                ).get(int(value_id), ())
+                binding_name = next((
+                    str(token)[len("value:"):]
+                    for token in tokens
+                    if str(token).startswith("value:")
+                    and str(token)[len("value:"):] in configured_constants
+                ), None)
+                if binding_name is not None:
+                    sample_value = configured_constants[binding_name]
+            if sample_value is None:
+                continue
+            try:
+                sample = np.asarray(sample_value)
+            except (TypeError, ValueError):
+                continue
+            if sample.dtype.kind not in "biufc":
+                continue
+            current = (program.meta or {}).get(int(value_id)) or Meta()
+            program.meta[int(value_id)] = replace(
+                current,
+                shape=(
+                    current.shape
+                    if current.shape is not None else tuple(map(int, sample.shape))
+                ),
+                dtype=(
+                    current.dtype
+                    if current.dtype is not None else str(sample.dtype)
+                ),
+            )
+
+    # A consumer's copied boundary metadata predates the producer's local
+    # descriptor derivation.  Source/feed seeding above may also have filled
+    # that copy, so clear it only now, immediately before settlement.  For a
+    # declared output/feed seam the producer is authoritative.
+    for program in programs:
+        owner = program_owner(program)
+        for value_id in map(int, program.feeds):
+            if (
+                (owner, value_id) not in producer_outputs
+                and (owner, value_id) not in incoming_bound_values
+            ):
+                continue
+            current = (program.meta or {}).get(value_id)
+            if current is not None:
+                program.meta[value_id] = replace(
+                    current, shape=None, dtype=None, device=None,
+                )
+
+    # A descriptor may cross a seam, unlock a layout transform, then become
+    # the descriptor crossing the next seam.  Settle that chain exactly like
+    # the source concordance settles callsite/formal facts; a single sweep is
+    # insufficient for a partitioned tensor expression.
+    # Replaying an operation is not enough to make its descriptor a fact: its
+    # operands may themselves still be stale boundary snapshots.  Authority
+    # therefore propagates transitively from non-seam inputs/constants and
+    # from producer facts received across a declared seam.  Only a replay
+    # whose every operand is authoritative may publish its result onward.
+    authoritative_values: set[tuple[int, int]] = set()
+    for program in programs:
+        owner = program_owner(program)
+        produced_by = {
+            int(step.result_id): step for step in program.steps
+        }
+        for value_id, meta in (program.meta or {}).items():
+            value_id = int(value_id)
+            producer = produced_by.get(value_id)
+            is_bound_feed = (
+                value_id in program.feeds
+                and (
+                    (owner, value_id) in producer_outputs
+                    or (owner, value_id) in incoming_bound_values
+                )
+            )
+            if (
+                not is_bound_feed
+                and (producer is None or producer.op_name not in replay_ops)
+                and meta is not None
+                and meta.shape is not None
+                and meta.dtype is not None
+            ):
+                authoritative_values.add((id(program), value_id))
+    for _pass in range(1 + sum(len(program.steps) for program in programs)):
+        changed = False
+        for program in programs:
+            owner = program_owner(program)
+            produced_by = {
+                int(step.result_id): step for step in program.steps
+            }
+            for value_id in map(int, (program.meta or {}).keys()):
+                seam_identity = (owner, value_id)
+                if (id(program), value_id) not in authoritative_values:
+                    continue
+                meta = (program.meta or {}).get(value_id)
+                if meta is None:
+                    continue
+                row = seam_facts.setdefault(seam_identity, {})
+                for field in ("shape", "dtype", "device"):
+                    value = getattr(meta, field, None)
+                    if value is None:
+                        continue
+                    value = tuple(value) if field == "shape" else value
+                    previous = row.get(field)
+                    if previous is not None and previous != value:
+                        raise RuntimeError(
+                            f"concordance seam value {value_id} has conflicting "
+                            f"region {field}: {previous!r} != {value!r}; "
+                            f"owner={owner!r}, producer="
+                            f"{getattr(produced_by.get(value_id), 'op_name', None)!r}, "
+                            f"is_feed={value_id in program.feeds}"
+                        )
+                    if previous is None:
+                        row[field] = value
+                        changed = True
+
+        for source, target in call_binding_edges:
+            source_row = seam_facts.get(source)
+            if not source_row:
+                continue
+            target_row = seam_facts.setdefault(target, {})
+            for field, value in source_row.items():
+                previous = target_row.get(field)
+                if previous is not None and previous != value:
+                    raise RuntimeError(
+                        f"concordance call binding {source!r} -> {target!r} "
+                        f"has conflicting {field}: {previous!r} != {value!r}"
+                    )
+                if previous is None:
+                    target_row[field] = value
+                    changed = True
+
+        for program in programs:
+            owner = program_owner(program)
+            identity_tokens = {
+                int(value_id): tuple(map(str, tokens))
+                for value_id, tokens in dict(
+                    (program.extras or {}).get("ssa_identity_tokens", {})
+                ).items()
+            }
+            for value_id, meta in tuple((program.meta or {}).items()):
+                identity = identity_tokens.get(int(value_id))
+                row = facts.get(identity, {}) if identity is not None else {}
+                seam_row = None
+                if int(value_id) in program.feeds:
+                    seam_row = seam_facts.get((owner, int(value_id)))
+                    if seam_row is not None:
+                        row = seam_row
+                updated = replace(
+                    meta,
+                    shape=(
+                        row.get("shape", meta.shape)
+                        if seam_row is not None else (
+                            meta.shape if meta.shape is not None
+                            else row.get("shape")
+                        )
+                    ),
+                    dtype=(
+                        row.get("dtype", meta.dtype)
+                        if seam_row is not None else (
+                            meta.dtype if meta.dtype is not None
+                            else row.get("dtype")
+                        )
+                    ),
+                    device=(
+                        row.get("device", meta.device)
+                        if seam_row is not None else (
+                            meta.device if meta.device is not None
+                            else row.get("device")
+                        )
+                    ),
+                )
+                if updated != meta:
+                    program.meta[int(value_id)] = updated
+                    changed = True
+                if (
+                    int(value_id) in program.feeds
+                    and (owner, int(value_id)) in seam_facts
+                    and updated.shape is not None
+                    and updated.dtype is not None
+                ):
+                    authoritative_values.add((id(program), int(value_id)))
+
+            constants = scalar_constants(program)
+            derivations = dict(
+                (program.extras or {}).get("descriptor_derivations", {})
+            )
+            for step in program.steps:
+                result_id = int(step.result_id)
+                if (
+                    step.op_name in replay_ops
+                    and not all(
+                        (id(program), int(value_id)) in authoritative_values
+                        for value_id in descriptor_operand_ids(step)
+                    )
+                ):
+                    continue
+                current = (program.meta or {}).get(result_id)
+                parent_meta = [
+                    program.meta.get(int(value_id))
+                    for value_id in step.input_ids
+                ]
+                inferred_shape = None
+                inferred_dtype = None
+                source_id = None
+                exact_derivation = False
+                exact_dtype_derivation = False
+                if step.op_name in {"unsqueeze", "squeeze"} and parent_meta:
+                    source = parent_meta[0]
+                    axis = step.attrs.get("axis", step.attrs.get("dim"))
+                    if axis is None and len(step.input_ids) > 1:
+                        axis = constants.get(int(step.input_ids[1]))
+                    if source is not None and source.shape is not None:
+                        shape = list(map(int, source.shape))
+                        if step.op_name == "unsqueeze" and axis is not None:
+                            position = int(axis)
+                            position = (
+                                position if position >= 0
+                                else position + len(shape) + 1
+                            )
+                            if 0 <= position <= len(shape):
+                                shape.insert(position, 1)
+                                inferred_shape = tuple(shape)
+                        elif step.op_name == "squeeze":
+                            if axis is None:
+                                inferred_shape = tuple(
+                                    extent for extent in shape if extent != 1
+                                )
+                            else:
+                                position = int(axis) % len(shape) if shape else 0
+                                if shape and shape[position] == 1:
+                                    del shape[position]
+                                    inferred_shape = tuple(shape)
+                        if inferred_shape is not None:
+                            inferred_dtype = source.dtype
+                            source_id = int(step.input_ids[0])
+                            exact_derivation = True
+                            exact_dtype_derivation = True
+                elif step.op_name in elementwise:
+                    shaped = [
+                        tuple(meta.shape)
+                        for meta in parent_meta
+                        if meta is not None and meta.shape is not None
+                    ]
+                    if shaped and len(shaped) == len(parent_meta):
+                        try:
+                            inferred_shape = tuple(np.broadcast_shapes(*shaped))
+                        except ValueError:
+                            inferred_shape = None
+                        else:
+                            exact_derivation = True
+                    inferred_dtype = (
+                        "bool" if step.op_name in boolean_results else next((
+                            meta.dtype for meta in parent_meta
+                            if meta is not None and meta.dtype is not None
+                        ), None)
+                    )
+                    exact_dtype_derivation = step.op_name in boolean_results
+                elif step.op_name == "matmul" and len(parent_meta) == 2:
+                    left_meta, right_meta = parent_meta
+                    if (
+                        left_meta is not None
+                        and right_meta is not None
+                        and left_meta.shape is not None
+                        and right_meta.shape is not None
+                    ):
+                        left = tuple(map(int, left_meta.shape))
+                        right = tuple(map(int, right_meta.shape))
+                        if left and right:
+                            left_vector = len(left) == 1
+                            right_vector = len(right) == 1
+                            matrix_left = (1, *left) if left_vector else left
+                            matrix_right = (*right, 1) if right_vector else right
+                            if matrix_left[-1] == matrix_right[-2]:
+                                try:
+                                    batch = tuple(np.broadcast_shapes(
+                                        matrix_left[:-2], matrix_right[:-2]
+                                    ))
+                                except ValueError:
+                                    pass
+                                else:
+                                    result = (
+                                        *batch,
+                                        matrix_left[-2],
+                                        matrix_right[-1],
+                                    )
+                                    if left_vector:
+                                        result = result[:-2] + result[-1:]
+                                    if right_vector:
+                                        result = result[:-1]
+                                    inferred_shape = tuple(result)
+                                    exact_derivation = True
+                                    inferred_dtype = next((
+                                        meta.dtype
+                                        for meta in parent_meta
+                                        if meta is not None
+                                        and meta.dtype is not None
+                                    ), None)
+                elif step.op_name in {"sum", "mean", "prod", "min", "max"}:
+                    source = parent_meta[0] if parent_meta else None
+                    axis = step.attrs.get("axis", step.attrs.get("dim"))
+                    if source is not None and source.shape is not None:
+                        shape = tuple(map(int, source.shape))
+                        keepdim = bool(step.attrs.get(
+                            "keepdim", step.attrs.get("keepdims", False)
+                        ))
+                        if axis is None:
+                            inferred_shape = (
+                                (1,) * len(shape) if keepdim else ()
+                            )
+                            exact_derivation = True
+                        else:
+                            raw_axes = (
+                                tuple(axis)
+                                if isinstance(axis, (tuple, list))
+                                else (int(axis),)
+                            )
+                            axes = tuple(sorted({
+                                int(item) % len(shape) for item in raw_axes
+                            })) if shape else ()
+                            inferred_shape = tuple(
+                                1 if keepdim and index in axes else extent
+                                for index, extent in enumerate(shape)
+                                if keepdim or index not in axes
+                            )
+                            exact_derivation = True
+                        inferred_dtype = source.dtype
+                if inferred_shape is None and inferred_dtype is None:
+                    continue
+                if exact_derivation:
+                    authoritative_values.add((id(program), result_id))
+                updated = replace(
+                    current or Meta(),
+                    shape=(
+                        inferred_shape if exact_derivation else (
+                            current.shape
+                            if current is not None and current.shape is not None
+                            else inferred_shape
+                        )
+                    ),
+                    dtype=(
+                        inferred_dtype if exact_dtype_derivation else (
+                            current.dtype
+                            if current is not None and current.dtype is not None
+                            else inferred_dtype
+                        )
+                    ),
+                    source_id=(
+                        source_id if source_id is not None
+                        else (current.source_id if current is not None else None)
+                    ),
+                )
+                if updated != current:
+                    program.meta[result_id] = updated
+                    derivations[result_id] = {
+                        "operation": step.op_name,
+                        "input_ids": tuple(map(int, step.input_ids)),
+                        "shape": (
+                            tuple(updated.shape)
+                            if updated.shape is not None else None
+                        ),
+                        "dtype": updated.dtype,
+                    }
+                    changed = True
+            if derivations:
+                program.extras = {
+                    **dict(program.extras or {}),
+                    "descriptor_derivations": derivations,
+                }
+        if not changed:
+            break
+
 def _shader_execution_descriptor(
     published_sources: list[dict[str, Any]],
     shell_io: Mapping[str, Any] | None = None,
@@ -2704,6 +3389,37 @@ def build_program_bundle(
             index: _fold_strings(program)
             for index, program in aot.region_programs.items()
         }
+        _concord_region_value_metadata(
+            effective_region_programs,
+            feed_values=aot.region_feed_values,
+            constant_values=contract.constant_map,
+            source_graphs=tuple(dict.fromkeys(
+                graph
+                for graph in (
+                    getattr(aot.deployment, "process_graph", None),
+                    *(
+                        getattr(shell, "process_graph", None)
+                        for shell in dict(getattr(
+                            aot.deployment, "function_shells", {}
+                        ) or {}).values()
+                    ),
+                )
+                if graph is not None
+            )),
+            hierarchy_plans=tuple(
+                plan for plan in (
+                    getattr(aot, "hierarchy_plan", None),
+                    getattr(getattr(aot, "shell", None), "hierarchy_plan", None),
+                    *(
+                        getattr(function_shell, "hierarchy_plan", None)
+                        for function_shell in dict(getattr(
+                            aot.deployment, "function_shells", {}
+                        ) or {}).values()
+                    ),
+                )
+                if plan is not None
+            ),
+        )
         _string_table.save()
         thread_topology = None
         if (
@@ -2757,7 +3473,9 @@ def build_program_bundle(
                 for output_name in contract.state_feedback.values()
                 if not any(
                     int(value_id) in region_output_ids
-                    for value_id in aot.identity_table.get(output_name, ())
+                    for value_id in _aot_output_identity_history(
+                        aot, output_name
+                    )
                 )
             ]
             if missing_feedback_outputs:
@@ -2886,7 +3604,7 @@ def build_program_bundle(
             )
             state_input_value_names: dict[int, str] = {}
             for input_name, output_name in contract.state_feedback.items():
-                for value_id in aot.identity_table.get(output_name, ()):
+                for value_id in _aot_output_identity_history(aot, output_name):
                     value_id = int(value_id)
                     previous = state_input_value_names.get(value_id)
                     if previous is not None and previous != input_name:
@@ -2941,7 +3659,7 @@ def build_program_bundle(
             }
             logical_outputs = {}
             for output_name in aot.function_outputs:
-                identities = tuple(aot.identity_table.get(output_name, ()))
+                identities = _aot_output_identity_history(aot, output_name)
                 binding = next(
                     (
                         producer[int(value_id)]

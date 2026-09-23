@@ -7,6 +7,8 @@ import inspect
 import textwrap
 from dataclasses import replace
 
+import numpy as np
+
 from src.common.tensors.accelerator_backends.glsl_backend import (
     emit_native_for_loop,
 )
@@ -318,6 +320,39 @@ def test_mutable_public_parameter_is_not_a_planner_specialization():
     assert "source" not in child.G.graph.get(
         "planner_specializations", {}
     )
+
+
+def test_mutable_public_tensor_publishes_shape_without_freezing_value():
+    module = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.build_from_ast(ast.parse(
+            "def tick(state):\n"
+            "    return state + 1.0\n"
+        ))
+    reduce_abstract_tensor_topology(module)
+
+    propagate_bound_planner_specializations(
+        module,
+        "tick",
+        {"state": np.zeros((3, 4), dtype=np.float64)},
+        mutable_parameters=("state",),
+    )
+
+    entry = module.function_table.entry("tick").graph
+    assert "state" not in entry.G.graph.get(
+        "planner_specializations", {}
+    )
+    assert entry.G.graph["planner_tensor_descriptors"]["state"] == {
+        "shape": (3, 4), "dtype": "float64", "rank": 2,
+    }
+    state = next(
+        data for _node_id, data in entry.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "state"
+    )
+    assert state["tensor"] == {
+        "shape": (3, 4), "dtype": "float64", "rank": 2,
+    }
 
 
 def test_structural_fold_does_not_specialize_a_public_parameter_default():

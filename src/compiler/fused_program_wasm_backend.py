@@ -398,7 +398,8 @@ def supported_tensor_operations(dtype: str | None = None) -> frozenset[str]:
     )
     structural = frozenset({
         "tensor_from_list", "where", "gather", "reshape", "view", "clone",
-        "tobytes", "sum", "mean", "prod", "min", "max",
+        "unsqueeze", "squeeze", "tobytes", "sum", "mean", "prod", "min",
+        "max",
     })
     if dtype is None:
         operations = floating | integral | structural | frozenset(
@@ -493,7 +494,9 @@ def program_feed_order(program: FusedProgram) -> tuple[int, ...]:
 #     kernel computation.
 #
 # Each backend owns the lowering of its own tensor ops; this is WebAssembly's.
-_VIEW_OPS = frozenset({"reshape", "view", "clone", "tobytes"})
+_VIEW_OPS = frozenset({
+    "reshape", "view", "clone", "tobytes", "unsqueeze", "squeeze",
+})
 
 
 def _lower_view_ops(steps: Sequence[OpStep]) -> list[OpStep]:
@@ -596,6 +599,161 @@ def _shape_product(shape: Any) -> int | None:
     return total
 
 
+def _pure_matmul_descriptor(program: FusedProgram, live: Sequence[OpStep]):
+    """Return the exact row-major contract for an isolated batched matmul.
+
+    Process-graph partitioning deliberately places a matmul at its own region
+    seam.  Its dimensions therefore belong to the concordance-carried ``Meta``
+    descriptors, not to a discovery payload or to the coordinator's unrelated
+    public ``count``.  Keep this recognizer strict: an unknown/symbolic shape or
+    a batch broadcast more complicated than the equal-or-singleton case stays
+    a named backend shortfall rather than acquiring guessed address arithmetic.
+    """
+
+    if len(live) != 1 or live[0].op_name != "matmul":
+        return None
+    step = live[0]
+    if len(step.input_ids) != 2:
+        return None
+    meta = program.meta or {}
+    left_meta = meta.get(int(step.input_ids[0]))
+    right_meta = meta.get(int(step.input_ids[1]))
+    output_meta = meta.get(int(step.result_id))
+    if not left_meta or not right_meta or not output_meta:
+        return None
+    left = tuple(map(int, left_meta.shape or ()))
+    right = tuple(map(int, right_meta.shape or ()))
+    output = tuple(map(int, output_meta.shape or ()))
+    if len(left) < 2 or len(right) < 2 or len(output) < 2:
+        return None
+    rows, inner = left[-2:]
+    right_inner, columns = right[-2:]
+    left_batch = _shape_product(left[:-2]) or 1
+    right_batch = _shape_product(right[:-2]) or 1
+    output_batch = _shape_product(output[:-2]) or 1
+    if (
+        inner != right_inner
+        or output[-2:] != (rows, columns)
+        or left_batch not in (1, output_batch)
+        or right_batch not in (1, output_batch)
+        or _shape_product(output) != output_batch * rows * columns
+    ):
+        return None
+    return step, rows, inner, columns, left_batch, right_batch, output_batch
+
+
+def _emit_pure_matmul_module(
+    program: FusedProgram,
+    descriptor,
+    *,
+    name: str,
+    function_name: str,
+    value_type: str,
+    element_bytes: int,
+    imports: Sequence[object],
+    static_data_offset: int,
+) -> "WasmModule":
+    """Emit one exact batched matrix product from concordance descriptors."""
+
+    from .wasm_binary import CodeBuilder, build_module
+
+    step, rows, inner, columns, left_batch, right_batch, _ = descriptor
+    feed_ids = list(program_feed_order(program))
+    output_ids = list(program.outputs.values())
+    parameter_feed_ids: list[int] = []
+    for feed_id in feed_ids:
+        source_id = resolve_view_source(program.meta, feed_id)
+        if source_id not in parameter_feed_ids:
+            parameter_feed_ids.append(source_id)
+    labels = feed_names(program, parameter_feed_ids)
+    parameter_count = 1 + len(parameter_feed_ids) + len(output_ids)
+    builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
+    i = builder.declare_local("i32")
+    row = builder.declare_local("i32")
+    column = builder.declare_local("i32")
+    batch = builder.declare_local("i32")
+    k = builder.declare_local("i32")
+    accumulator = builder.declare_local(value_type)
+
+    def parameter_for(value_id: int) -> int:
+        source_id = resolve_view_source(program.meta, int(value_id))
+        return 1 + parameter_feed_ids.index(source_id)
+
+    def load_matrix(value_id: int, batch_extent: int, row_stride: int,
+                    row_local: int, column_local: int) -> None:
+        builder.local_get(parameter_for(value_id))
+        if batch_extent > 1:
+            builder.local_get(batch).i32_const(row_stride * rows).raw(0x6C)
+        else:
+            builder.i32_const(0)
+        builder.local_get(row_local).i32_const(row_stride).raw(0x6C).raw(0x6A)
+        builder.local_get(column_local).raw(0x6A)
+        builder.i32_const(element_bytes).raw(0x6C).raw(0x6A).load()
+
+    builder.i32_const(0).local_set(i).block().loop()
+    builder.local_get(i).local_get(0).raw(0x4F).br_if(1)  # i32.ge_u
+    builder.local_get(i).i32_const(columns).raw(0x70).local_set(column)
+    builder.local_get(i).i32_const(columns).raw(0x6E)
+    builder.i32_const(rows).raw(0x70).local_set(row)
+    builder.local_get(i).i32_const(rows * columns).raw(0x6E).local_set(batch)
+    builder.value_const(0.0).local_set(accumulator)
+    builder.i32_const(0).local_set(k).block().loop()
+    builder.local_get(k).i32_const(inner).raw(0x4F).br_if(1)
+    load_matrix(step.input_ids[0], left_batch, inner, row, k)
+    # Right matrix index is batch*K*N + k*N + column.  ``rows`` in the
+    # helper's batch-stride expression is M, so spell this address directly.
+    builder.local_get(parameter_for(step.input_ids[1]))
+    if right_batch > 1:
+        builder.local_get(batch).i32_const(inner * columns).raw(0x6C)
+    else:
+        builder.i32_const(0)
+    builder.local_get(k).i32_const(columns).raw(0x6C).raw(0x6A)
+    builder.local_get(column).raw(0x6A)
+    builder.i32_const(element_bytes).raw(0x6C).raw(0x6A).load()
+    builder.op("mul").local_get(accumulator).op("add").local_set(accumulator)
+    builder.local_get(k).i32_const(1).raw(0x6A).local_set(k).br(0).end().end()
+    output_parameter = 1 + len(parameter_feed_ids)
+    builder.local_get(output_parameter).local_get(i)
+    builder.i32_const(element_bytes).raw(0x6C).raw(0x6A)
+    builder.local_get(accumulator).store()
+    builder.local_get(i).i32_const(1).raw(0x6A).local_set(i).br(0).end().end()
+
+    binary = build_module(
+        function_name=function_name,
+        parameter_types=["i32"] * parameter_count,
+        body=builder,
+        imports=imports,
+    )
+    memory_import = next(
+        (entry for entry in imports if getattr(entry, "kind", None) == "memory"),
+        None,
+    )
+    api = _describe(
+        name, function_name, parameter_feed_ids, output_ids,
+        value_type, element_bytes, 0, static_data_offset=static_data_offset,
+        shared_memory_import=(
+            {"module": memory_import.module, "field": memory_import.field}
+            if memory_import is not None else None
+        ),
+        input_names=labels, output_names=list(program.outputs.keys()),
+    )
+    parameters = tuple(
+        ["$count"] + [f"${label}" for label in labels]
+        + [f"$out{i}" for i in range(len(output_ids))]
+    )
+    source = (
+        f"(module ;; {name} -- exact batched matmul M={rows} K={inner} N={columns}\n"
+        f"  ;; dimensions are concordance-carried compile-time descriptors.\n"
+        f"  (func (export \"{function_name}\")"
+        + "".join(f" (param {parameter} i32)" for parameter in parameters)
+        + ")\n)\n"
+    )
+    return WasmModule(
+        name=name, source=source, shortfalls=(), parameters=parameters,
+        value_type=value_type, api=api, binary=binary,
+    )
+
+
 @dataclass(frozen=True)
 class _AxisReductionPlan:
     """How to iterate a program whose outputs survive a trailing-axis reduce.
@@ -666,6 +824,8 @@ def _plan_axis_reductions(
 
     extents_n: set[int] = set()
     extents_k: set[int] = set()
+    reduction_input_shapes: set[tuple[int, ...]] = set()
+    reduction_result_shapes: set[tuple[int, ...]] = set()
     reduce_op: dict[int, str] = {}
     for step in reductions:
         if not step.input_ids:
@@ -687,6 +847,10 @@ def _plan_axis_reductions(
             )
         k = int(shape[-1])
         total = _shape_product(shape) or 0
+        reduction_input_shapes.add(shape)
+        result_entry = meta.get(step.result_id)
+        if result_entry is not None and result_entry.shape is not None:
+            reduction_result_shapes.add(tuple(result_entry.shape))
         op = str(step.attrs.get("reduce_op") or step.op_name)
         if op not in _REDUCE_FOLD:
             return fail(
@@ -705,31 +869,58 @@ def _plan_axis_reductions(
         )
     outer_n = next(iter(extents_n))
     axis_k = next(iter(extents_k))
-    if outer_n == axis_k:
+    if len(reduction_input_shapes) != 1:
         return fail(
             reductions[0].step_id, "reduce",
-            f"ambiguous reduction where N == K == {outer_n}; broadcasting "
-            "cannot be classified by extent alone",
+            f"mixed reduction input shapes {sorted(reduction_input_shapes)!r} "
+            "are not lowered in one program",
         )
+    grid_shape = next(iter(reduction_input_shapes))
+    row_shape = tuple(grid_shape[:-1])
 
     def classify(value_id: int) -> str:
         entry = meta.get(value_id)
-        product = _shape_product(entry.shape) if entry is not None else None
+        shape = (
+            tuple(entry.shape)
+            if entry is not None and entry.shape is not None else None
+        )
+        product = _shape_product(shape) if shape is not None else None
         if product is None:
             return "unknown"
-        if product == outer_n * axis_k:
+        if shape == grid_shape:
             return "grid"
-        if product == outer_n:
+        # Exact rank/orientation is the descriptor fact that disambiguates
+        # square N == K reductions.  A surviving row has the input shape with
+        # its tracked trailing axis removed; a K-axis value is right-aligned
+        # against that axis.  Extent equality alone cannot tell them apart.
+        if shape == row_shape or shape in reduction_result_shapes:
             return "row"
-        if product == axis_k:
+        padded = (1,) * (len(grid_shape) - len(shape)) + shape
+        if (
+            len(shape) <= len(grid_shape)
+            and padded[-1:] == (axis_k,)
+            and all(extent == 1 for extent in padded[:-1])
+        ):
             return "kaxis"
         if product == 1:
             return "scalar"
+        if product == outer_n:
+            return "row"
+        if product == outer_n * axis_k:
+            return "grid"
         return "other"
 
     value_class: dict[int, str] = {}
+    auxiliary_control_values = {
+        int(value_id)
+        for step in reductions
+        for value_id in step.input_ids[1:]
+    }
     for value_id in feed_ids:
-        value_class[value_id] = classify(value_id)
+        value_class[value_id] = (
+            "scalar" if value_id in auxiliary_control_values
+            else classify(value_id)
+        )
     for step in live:
         value_class[step.result_id] = classify(step.result_id)
 
@@ -754,12 +945,6 @@ def _plan_axis_reductions(
     feed_class: dict[int, str] = {}
     for value_id in feed_ids:
         klass = value_class.get(value_id, "unknown")
-        if klass == "grid":
-            return fail(
-                -1, "feed",
-                f"feed {value_id} is grid-shaped (N*K); the count-based ABI "
-                "cannot size it yet",
-            )
         if klass in ("other", "unknown"):
             return fail(
                 -1, "feed",
@@ -977,7 +1162,7 @@ def _emit_reduction_body_wat(
         body.append("          i32.ge_s")
         body.append(f"          br_if $rdone_{region_index}")
         for feed_id in feed_ids:
-            if plan.feed_class[feed_id] == "kaxis":
+            if plan.feed_class[feed_id] in ("grid", "kaxis"):
                 emit_feed(feed_id)
         for step in plan.inner_dependencies[reduction.result_id]:
             emit_step(step)
@@ -1027,7 +1212,7 @@ def _emit_reduction_body_wat(
         body.append("          i32.ge_s")
         body.append("          br_if $gdone")
         for feed_id in feed_ids:
-            if plan.feed_class[feed_id] == "kaxis":
+            if plan.feed_class[feed_id] in ("grid", "kaxis"):
                 emit_feed(feed_id)
         for step in plan.grid_output_steps:
             emit_step(step)
@@ -1463,6 +1648,18 @@ def emit_wasm_module(
     value_type, element_bytes, load, store = _value_type(program, dtype)
     shortfalls: list[WasmShortfall] = []
     live = required_steps(program)
+
+    # Matmul is a collective region, not an elementwise spelling.  Its exact
+    # M/K/N contract has already been proven and recorded by the concordance;
+    # consume that descriptor here instead of trying to smuggle it through the
+    # scalar operation table or rediscovering it from runtime payloads.
+    matmul = _pure_matmul_descriptor(program, live)
+    if matmul is not None:
+        return _emit_pure_matmul_module(
+            program, matmul, name=name, function_name=function_name,
+            value_type=value_type, element_bytes=element_bytes,
+            imports=imports, static_data_offset=static_data_offset,
+        )
 
     # A pure shapeless container store (dict/list target keyed by unbounded
     # RVAs/addresses or string names) does not fit the per-cell array walk and
@@ -3001,7 +3198,7 @@ def _assemble(
             builder.raw(0x4E)  # i32.ge_s
             builder.br_if(1)
             for feed_id in feed_ids:
-                if plan.feed_class[feed_id] == "kaxis":
+                if plan.feed_class[feed_id] in ("grid", "kaxis"):
                     load_feed_class(feed_id)
             for step in plan.inner_dependencies[reduction.result_id]:
                 emit_reduction_step(step)
@@ -3041,7 +3238,7 @@ def _assemble(
             builder.raw(0x4E)  # i32.ge_s
             builder.br_if(1)
             for feed_id in feed_ids:
-                if plan.feed_class[feed_id] == "kaxis":
+                if plan.feed_class[feed_id] in ("grid", "kaxis"):
                     load_feed_class(feed_id)
             for step in plan.grid_output_steps:
                 emit_reduction_step(step)

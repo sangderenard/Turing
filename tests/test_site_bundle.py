@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from src.compiler.site_bundle import (
     TURING_REPOSITORY_ROOT,
     _compile_feed_values,
     _content_version,
+    _aot_output_identity_history,
     _shader_execution_descriptor,
     _write_program_origin,
     build_program_bundle,
@@ -163,6 +165,26 @@ def test_named_rgb_outputs_can_force_wasm_canvas_presentation():
     assert descriptor["url"] is None
     assert [item["language"] for item in descriptor["candidates"]] == ["canvas2d"]
     assert descriptor["configuration"]["channels"] == ["red", "green", "blue"]
+
+
+def test_hierarchical_output_terminal_extends_source_identity_history():
+    aot = SimpleNamespace(
+        identity_table={"next_position": (41, 52)},
+        public_output_value_ids={"next_position": 904},
+    )
+
+    assert _aot_output_identity_history(aot, "next_position") == (
+        41, 52, 904,
+    )
+
+
+def test_hierarchical_output_terminal_is_not_duplicated():
+    aot = SimpleNamespace(
+        identity_table={"result": (7, 19)},
+        public_output_value_ids={"result": 19},
+    )
+
+    assert _aot_output_identity_history(aot, "result") == (7, 19)
 
 
 def test_gallery_refuses_to_publish_into_the_turing_source_repository():

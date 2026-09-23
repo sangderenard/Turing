@@ -49,7 +49,8 @@ from .vehicle_native_graph_program import (
 FIXTURE_CORNERS = ("front_left", "front_right", "rear_left", "rear_right")
 
 
-def symbolic_abstract_tensor_source(compilation: Any, function_name: str) -> str:
+def symbolic_abstract_tensor_source(compilation: Any, function_name: str,
+                                    precision_policy: Any = None) -> str:
     """The AbstractTensor stage of one sympy-authored law, as Python source.
 
     One program, three stages: the law is ingested by the compiler into the
@@ -59,6 +60,13 @@ def symbolic_abstract_tensor_source(compilation: Any, function_name: str) -> str
     (``ssa_python_materializer``), taking and returning batch columns.  It is
     the very program the native product is lowered from, so executing it
     eagerly is running the program.  No sympy printer is involved.
+
+    ``precision_policy`` (optional, ``precision_policy.PrecisionPolicy``):
+    the compiler measures the law once on the policy's samples and emits its
+    precision sections -- ``Precision`` where a value's error passes the
+    policy's standard, collapsed (rounded once) where base-width code or the
+    return consumes it.  The plan's receipt is recorded on the function's
+    metadata under ``precision_plan``.
     """
 
     import ast
@@ -67,9 +75,23 @@ def symbolic_abstract_tensor_source(compilation: Any, function_name: str) -> str
 
     metadata = compilation.function.metadata
     argument_names = tuple(metadata["argument_names"])
-    statements, uses_math = materialize_function_body(
-        compilation.function, parameter_names=argument_names, tensor_vocabulary=True,
-    )
+    plan = None
+    if precision_policy is not None:
+        from .precision_policy import plan_precision
+
+        plan = plan_precision(compilation.function, precision_policy, argument_names)
+        metadata["precision_plan"] = plan.receipt()
+    sections: list = []
+    if plan is not None and plan.wide_ids:
+        from .ssa_python_materializer import materialize_precision_sections
+
+        sections, statements, uses_math = materialize_precision_sections(
+            compilation.function, parameter_names=argument_names, precision_plan=plan,
+            section_name=f"{function_name}__precision_section")
+    else:
+        statements, uses_math = materialize_function_body(
+            compilation.function, parameter_names=argument_names, tensor_vocabulary=True,
+        )
     function = ast.FunctionDef(
         name=function_name,
         args=ast.arguments(
@@ -81,6 +103,10 @@ def symbolic_abstract_tensor_source(compilation: Any, function_name: str) -> str
     body: list[ast.stmt] = []
     if uses_math:
         body.append(ast.Import(names=[ast.alias(name="math")]))
+    if sections:
+        body.append(ast.ImportFrom(module="src.common.tensors.extended_precision",
+                                   names=[ast.alias(name="Precision")], level=0))
+        body.extend(sections)
     body.append(function)
     module = ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
     return ast.unparse(module) + chr(10)

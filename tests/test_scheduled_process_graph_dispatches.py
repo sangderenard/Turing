@@ -364,6 +364,23 @@ def test_shader_region_reducer_leaves_an_unfusible_operation_alone():
     ]
 
 
+def test_shader_fusibility_reserves_shape_and_reduction_regions():
+    from src.compiler.glsl_deployment_strategy import (
+        _shader_fusible_node_ids,
+    )
+
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "reshape", (1,))
+    _add(graph, 3, "Mul", (2,))
+    _add(graph, 4, "sum", (3,))
+    _add(graph, 5, "Call", (3,))
+    graph.G.nodes[5]["attributes"] = {"tensor": "abs"}
+
+    assert _shader_fusible_node_ids(graph, (1, 2, 3, 4, 5)) == (1, 3, 5)
+
+
 def test_shader_region_reducer_keeps_multiple_published_values_fused():
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 0, "Input")

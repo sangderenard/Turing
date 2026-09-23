@@ -1313,16 +1313,19 @@ function wasmTileWorkerSource() {
     const elementBytes = Number(manifest.modules[0].element_bytes || 8);
     const View = typedArrayForDtype(manifest.modules[0].value_type);
     const fieldCount = (inventory.field_slots || []).length;
+    const fieldExtents = (inventory.field_slots || []).map(
+      field => Number(field.extent || count)
+    );
     let cursor = Math.ceil(Number(manifest.shared_static_bytes || 0) / 4) * 4;
     const inventoryOffset = cursor;
     cursor += fieldCount * 4;
     cursor = Math.ceil(cursor / elementBytes) * elementBytes;
-    const offsets = Array.from({length: fieldCount}, () => {
-      const offset = cursor; cursor += count * elementBytes; return offset;
+    const offsets = Array.from({length: fieldCount}, (_, index) => {
+      const offset = cursor; cursor += fieldExtents[index] * elementBytes; return offset;
     });
     const memory = new WebAssembly.Memory({initial: Math.max(1, Math.ceil(cursor / 65536))});
     new Int32Array(memory.buffer, inventoryOffset, fieldCount).set(offsets);
-    const context = {memory, offsets, View, instances: new Map()};
+    const context = {memory, offsets, fieldExtents, View, instances: new Map()};
     contexts.set(count, context);
     return context;
   }
@@ -1344,10 +1347,10 @@ function wasmTileWorkerSource() {
       const specs = new Map(manifest.modules.map(spec => [spec.name, spec]));
       const cards = new Map((inventory.methods || []).map(card => [card.index, card]));
       const context = await contextFor(count);
-      const {memory, offsets, View, instances} = context;
+      const {memory, offsets, fieldExtents, View, instances} = context;
       for (const [indexText, values] of Object.entries(fields)) {
         const index = Number(indexText);
-        new View(memory.buffer, offsets[index], count).set(values);
+        new View(memory.buffer, offsets[index], fieldExtents[index]).set(values);
       }
       for (const methodId of methodIds) {
         const card = cards.get(methodId);
@@ -1370,7 +1373,9 @@ function wasmTileWorkerSource() {
       const outputs = {};
       const transfer = [];
       for (const slot of resultSlots) {
-        const values = new View(memory.buffer, offsets[slot], count).slice();
+        const values = new View(
+          memory.buffer, offsets[slot], fieldExtents[slot]
+        ).slice();
         outputs[slot] = values;
         transfer.push(values.buffer);
       }
@@ -1396,6 +1401,9 @@ class ClassGraphRunner {
     this.fieldOffsets = [];
     this.fieldIndex = new Map(
       (manifest.class_inventory.field_slots || []).map(field => [field.key, field.index])
+    );
+    this.fieldExtentByIndex = (manifest.class_inventory.field_slots || []).map(
+      field => Number(field.extent || 0)
     );
     for (const redirect of manifest.class_inventory.storage_redirects || []) {
       const storageIndex = this.fieldIndex.get(redirect.storage);
@@ -1811,7 +1819,8 @@ class ClassGraphRunner {
         cursor = Math.ceil((base + mapBlockBytes) / elementBytes) * elementBytes;
         return base;
       }
-      const offset = cursor; cursor += count * elementBytes; return offset;
+      const extent = Number(field.extent || count);
+      const offset = cursor; cursor += extent * elementBytes; return offset;
     });
     if (cursor > this.memory.buffer.byteLength) {
       this.memory.grow(Math.ceil((cursor - this.memory.buffer.byteLength) / 65536));
@@ -1838,6 +1847,12 @@ class ClassGraphRunner {
     const index = this.fieldIndex.get(key);
     if (index === undefined) throw new Error("unknown shared-memory slot / class field " + key);
     return this.fieldOffsets[index];
+  }
+
+  extentForKey(key, fallback) {
+    const index = this.fieldIndex.get(key);
+    if (index === undefined) throw new Error("unknown shared-memory slot / class field " + key);
+    return Number(this.fieldExtentByIndex[index] || fallback);
   }
 
   rebindCardAliases(method) {
@@ -1924,11 +1939,12 @@ class ClassGraphRunner {
         continue;
       }
       const offset = this.offsetForKey(identity);
-      const target = new View(this.memory.buffer, offset, count);
+      const inputExtent = this.extentForKey(identity, count);
+      const target = new View(this.memory.buffer, offset, inputExtent);
       if (ArrayBuffer.isView(source) || Array.isArray(source)) {
         if (source.length === 1) target.fill(Number(source[0]));
-        else if (source.length >= count) target.set(source.subarray ? source.subarray(0, count) : source.slice(0, count));
-        else throw new Error(logicalName + " has " + source.length + " values for extent " + count);
+        else if (source.length >= inputExtent) target.set(source.subarray ? source.subarray(0, inputExtent) : source.slice(0, inputExtent));
+        else throw new Error(logicalName + " has " + source.length + " values for extent " + inputExtent);
       } else {
         target.fill(Number(source));
       }
@@ -1991,9 +2007,10 @@ class ClassGraphRunner {
       const binding = this.manifest.logical_outputs[parameter.name];
       if (!binding) throw new Error("logical output " + parameter.name + " has no deployment binding");
       const identity = "out::" + binding[0] + "::" + binding[1];
-      if (residentOutputs) return this.storageReference(identity, count);
+      const outputExtent = this.extentForKey(identity, count);
+      if (residentOutputs) return this.storageReference(identity, outputExtent);
       const offset = this.offsetForKey(identity);
-      return new View(this.memory.buffer, offset, count).slice();
+      return new View(this.memory.buffer, offset, outputExtent).slice();
     });
   }
 }

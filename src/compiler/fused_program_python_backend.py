@@ -237,6 +237,19 @@ def _step_expression(dialect: Dialect, step: OpStep, names: dict[int, str]) -> s
             f"{op} has no {dialect.name} spelling registered"
         )
     a = names[step.input_ids[0]]
+    if op == "matmul":
+        if len(step.input_ids) != 2:
+            raise PythonLoweringShortfall("matmul requires two operands")
+        b = names[step.input_ids[1]]
+        if dialect is NUMPY:
+            return f"np.matmul({a}, {b})"
+        if dialect is TORCH:
+            return f"torch.matmul({a}, {b})"
+        if dialect is ABSTRACT_TENSOR:
+            return f"{a}.matmul({b})"
+        raise PythonLoweringShortfall(
+            f"matmul has no {dialect.name} spelling registered"
+        )
     reduce_numpy = _REDUCE_NUMPY.get(op)
     if reduce_numpy is not None:
         axis = step.attrs.get("axis")

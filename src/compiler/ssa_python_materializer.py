@@ -246,8 +246,13 @@ class _BodyMaterializer:
         *,
         argument_names: Mapping[int, str],
         tensor_vocabulary: bool = False,
+        precision_plan: Any = None,
     ):
         self.function = function
+        # A precision plan is honoured by materialize_precision_sections,
+        # which emits the wide values as their own section function; the
+        # body materializer itself is width-agnostic.
+        self.precision_plan = precision_plan
         self.names: dict[int, str] = dict(argument_names)
         self.statements: list[ast.stmt] = []
         self.uses_math = False
@@ -914,8 +919,14 @@ def materialize_function_body(
     *,
     parameter_names: Sequence[str] | None = None,
     tensor_vocabulary: bool = False,
+    precision_plan: Any = None,
 ) -> tuple[list[ast.stmt], bool]:
     """One SSA function's body as statements, plus whether it needs ``math``.
+
+    ``precision_plan`` (optional, see precision_policy.plan_precision) names
+    the values to compute wide: the emitted body then uses ``Precision`` for
+    that section and collapses it, rounding once, where base-width code or
+    the return consumes it.
 
     ``tensor_vocabulary`` emits the AbstractTensor form of the elementwise
     unary operations (``x.log()``) instead of the scalar one
@@ -949,8 +960,14 @@ def materialize_function_body(
 
     materializer = _BodyMaterializer(
         function, argument_names=names, tensor_vocabulary=tensor_vocabulary,
+        precision_plan=precision_plan,
     )
     block_count = len(getattr(function, "blocks", {}) or {})
+    if precision_plan is not None and precision_plan.wide_ids:
+        raise MaterializationError(
+            f"{function.name}: a precision plan is emitted by "
+            "materialize_precision_sections, which also returns the section "
+            "function the body calls")
     if block_count == 4:
         statements = _materialize_conditional_diamond(function, materializer)
         return (statements or [ast.Pass()]), materializer.uses_math
@@ -1520,3 +1537,108 @@ __all__ = [
     "materialize_module",
     "to_source",
 ]
+
+
+def _returned_values(function) -> tuple:
+    block = _single_block(function)
+    for instruction in block.instrs:
+        if str(instruction.op) in {"Ret", "ret", "Return", "return"}:
+            return tuple(instruction.args)
+    return ()
+
+
+def materialize_precision_sections(
+    function: Any,
+    *,
+    parameter_names: Sequence[str],
+    precision_plan: Any,
+    section_name: str = "__precision_section",
+    tensor_vocabulary: bool = True,
+) -> tuple[list[ast.FunctionDef], list[ast.stmt], bool]:
+    """A single-block body with its planned wide values as a section function.
+
+    Returns ``(section_functions, body_statements, uses_math)``.  The block is
+    partitioned: narrow instructions the section does not depend on come
+    first; the section function computes every planned wide value, taking its
+    inputs as ``Precision.of(x, limbs)`` and returning each value the rest of
+    the body (or the return) reads as ``.collapse()`` -- rounded once; the
+    remaining narrow instructions follow the call.  Eagerly that is ordinary
+    ``Precision`` code; compiled, ``lower_python_precision`` reads the same
+    spellings as width declarations and ``apply_precision_pipeline`` lowers
+    the section, collapsing where it returns.
+    """
+
+    wide_ids = set(int(i) for i in precision_plan.wide_ids)
+    limbs = int(precision_plan.limbs)
+    formals = tuple(getattr(function, "args", ()))
+    if len(parameter_names) != len(formals):
+        raise MaterializationError(f"{function.name}: parameter names do not match formals")
+    names = {int(f.id): str(n) for f, n in zip(formals, parameter_names)}
+    block = _single_block(function)
+    body_instructions = [i for i in block.instrs
+                         if str(i.op) not in {"Ret", "ret", "Return", "return"}]
+    returned = _returned_values(function)
+
+    depends_on_wide: set[int] = set()
+    for instruction in body_instructions:
+        result = instruction.res
+        if result is None:
+            continue
+        if int(result.id) in wide_ids or any(
+                int(a.id) in depends_on_wide or int(a.id) in wide_ids for a in instruction.args):
+            depends_on_wide.add(int(result.id))
+    wide = [i for i in body_instructions if i.res is not None and int(i.res.id) in wide_ids]
+    before = [i for i in body_instructions
+              if i.res is None or int(i.res.id) not in depends_on_wide]
+    after = [i for i in body_instructions
+             if i.res is not None and int(i.res.id) in depends_on_wide
+             and int(i.res.id) not in wide_ids]
+    produced_after = {int(i.res.id) for i in after}
+    for instruction in wide:
+        for argument in instruction.args:
+            if int(argument.id) in produced_after:
+                raise MaterializationError(
+                    f"{function.name}: the precision section reads a value computed "
+                    "from its own results; split sections are not supported")
+
+    main = _BodyMaterializer(function, argument_names=names, tensor_vocabulary=tensor_vocabulary)
+    for instruction in before:
+        main.step(instruction)
+
+    inputs: list[int] = []
+    for instruction in wide:
+        for argument in instruction.args:
+            value_id = int(argument.id)
+            if value_id not in wide_ids and value_id not in inputs:
+                inputs.append(value_id)
+    input_names = [main.names[i] for i in inputs]
+    section = _BodyMaterializer(function, argument_names={i: main.names[i] for i in inputs},
+                                tensor_vocabulary=tensor_vocabulary)
+    section.constant_ids = {i for i in inputs if i in main.constant_ids}
+    promote = [ast.parse(f"{n} = Precision.of({n}, {limbs})").body[0]
+               for i, n in zip(inputs, input_names) if i not in main.constant_ids]
+    for instruction in wide:
+        section.step(instruction)
+    read_later = {int(a.id) for i in after for a in i.args} | {int(v.id) for v in returned}
+    outputs = [int(i.res.id) for i in wide if int(i.res.id) in read_later]
+    output_names = [section.names[i] for i in outputs]
+    collapsed = ", ".join(f"{n}.collapse()" for n in output_names)
+    section_body = [*promote, *section.statements,
+                    ast.parse(f"return {collapsed}" if len(outputs) != 1
+                              else f"return {output_names[0]}.collapse()").body[0]]
+    section_function = ast.FunctionDef(
+        name=section_name,
+        args=ast.arguments(posonlyargs=[], args=[ast.arg(arg=n) for n in input_names],
+                           vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
+        body=section_body, decorator_list=[], returns=None)
+
+    targets = ", ".join(output_names)
+    main.statements.append(ast.parse(
+        f"{targets} = {section_name}({', '.join(input_names)})").body[0])
+    for value_id, name in zip(outputs, output_names):
+        main.names[value_id] = name
+    for instruction in after:
+        main.step(instruction)
+    main.finish(returned)
+    return [section_function], main.statements or [ast.Pass()], (main.uses_math or section.uses_math)
+

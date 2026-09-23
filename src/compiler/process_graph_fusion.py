@@ -17,9 +17,12 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 import networkx as nx
+import numpy as np
 
 from ..common.tensors.fused_ir import (
     AXIS_REDUCTION_FOLDS,
+    ELEMENTWISE_BINARY,
+    ELEMENTWISE_UNARY,
     FusedProgram,
     Meta,
     OpStep,
@@ -895,7 +898,10 @@ def _node_payload(
     tensor = {}
     if meta is not None:
         tensor = {
-            "shape": tuple(meta.shape or ()),
+            # ``None`` is unknown; ``()`` is a proven scalar.  Collapsing the
+            # former into the latter makes every later backend broadcast a
+            # genuinely tensor-valued feed from lane zero.
+            "shape": tuple(meta.shape) if meta.shape is not None else None,
             "dtype": meta.dtype,
             "device": meta.device,
         }
@@ -1092,7 +1098,19 @@ def fused_program_to_process_graph(program: FusedProgram) -> ProcessGraph:
 
 def _operation(graph: ProcessGraph, node_id: int) -> str:
     data = graph.G.nodes[node_id]
-    raw = str(data.get("op") or data.get("type") or data.get("label"))
+    attributes = data.get("attributes") or {}
+    # Tensor resolution is a ProcessGraph provenance receipt.  The syntactic
+    # node can still be a generic ``Call`` after resolution, while the receipt
+    # states the exact numerical operator (for example builtins ``abs`` over a
+    # tensor).  Transcribing the syntax instead discards that settled identity
+    # and hands backends a fictitious opaque call.
+    raw = str(
+        attributes.get("tensor")
+        or attributes.get("tensor_operation")
+        or data.get("op")
+        or data.get("type")
+        or data.get("label")
+    )
     # A ProcessGraph built from a SymPy expression carries SSA-Handler-style
     # capitalized spellings ("Add", "Mul", "Pow", ...; see
     # symbolic_process_graph.py's _SYMPY_TO_CANONICAL) rather than this
@@ -1234,13 +1252,15 @@ def dispatch_region_to_fused_program(
     metadata: dict[int, Meta] = {}
     for value_id in (*region.input_ids, *region.node_ids):
         tensor = graph.G.nodes[value_id].get("tensor") or {}
+        shape = tensor.get("shape")
         metadata[value_id] = Meta(
-            shape=tuple(tensor.get("shape") or ()),
+            shape=tuple(shape) if shape is not None else None,
             dtype=tensor.get("dtype"),
             device=tensor.get("device"),
         )
 
     emitted_tensor_constants: set[int] = set()
+    descriptor_derivations: dict[int, dict[str, Any]] = {}
 
     def append_tensor_constant(
         parent_id: int,
@@ -1249,17 +1269,35 @@ def dispatch_region_to_fused_program(
         if parent_id in emitted_tensor_constants:
             return
         tensor = parent_data.get("tensor") or {}
-        metadata[parent_id] = Meta(
-            shape=tuple(tensor.get("shape") or ()),
-            dtype=tensor.get("dtype"),
-            device=tensor.get("device"),
-        )
+        shape = tensor.get("shape")
         attrs = {
             key: copy.deepcopy(value)
             for key, value in (parent_data.get("attributes") or {}).items()
             if key != "creation_op"
         }
-        attrs["values"] = copy.deepcopy(parent_data.get("constant"))
+        constant = parent_data.get("constant")
+        # Structural constants can retain their payload in the provenance
+        # attributes while the syntax-level ``constant`` slot is merely the
+        # placeholder ``None`` from the authored AST.  Do not erase a known
+        # payload during ProcessGraph -> FusedProgram transcription.
+        if constant is not None or "values" not in attrs:
+            attrs["values"] = copy.deepcopy(constant)
+        if shape is None and attrs.get("shape") is not None:
+            shape = tuple(attrs["shape"])
+        dtype = tensor.get("dtype")
+        if shape is None and attrs.get("values") is not None:
+            try:
+                literal = np.asarray(attrs["values"])
+            except (TypeError, ValueError):
+                literal = None
+            if literal is not None and literal.dtype.kind in "biufc":
+                shape = tuple(map(int, literal.shape))
+                dtype = dtype or str(literal.dtype)
+        metadata[parent_id] = Meta(
+            shape=tuple(shape) if shape is not None else None,
+            dtype=dtype,
+            device=tensor.get("device"),
+        )
         steps.append(
             OpStep(
                 step_id=len(steps),
@@ -1274,14 +1312,38 @@ def dispatch_region_to_fused_program(
     for node_id in region.node_ids:
         data = graph.G.nodes[node_id]
         raw_op = _operation(graph, node_id)
-        parents = list(data.get("parents") or ())
+        parents = [
+            (int(parent_id), role)
+            for parent_id, role in (data.get("parents") or ())
+            if str(role).casefold() not in {
+                "callee", "func", "function", "definition", "operator",
+                "operator_reference",
+            }
+        ]
         # ``max``/``min`` name both Python's binary scalar operations and
         # tensor axis reductions.  Arity disambiguates them at this semantic
         # boundary: a reduction consumes one tensor; a two-parent node is the
         # ordinary elementwise binary operation and may legitimately carry a
         # scalar constant operand (for example ``max(speed, 1e-30)`` in the
         # managed-dt controller).
-        reduction = raw_op in AXIS_REDUCTION_FOLDS and len(parents) == 1
+        node_attributes = dict(data.get("attributes") or {})
+        reduction = raw_op in AXIS_REDUCTION_FOLDS and (
+            len(parents) == 1
+            or "axis" in node_attributes
+            or "dim" in node_attributes
+        )
+        if reduction and len(parents) > 1:
+            tensor_parents = [
+                parent
+                for parent in parents
+                if _operation(graph, parent[0]) != "const"
+            ]
+            if len(tensor_parents) == 1:
+                # The dimension/keepdim literals remain in the ProcessGraph
+                # provenance, while the numeric reduction consumes only its
+                # tensor receiver.  Their values are already recorded in the
+                # operation attributes by the concordance.
+                parents = tensor_parents
         # The builder is a faithful transcriber, not a translator: an op that is
         # neither a fused-elementwise op nor an axis reduction (a reshape/view/
         # cast/native kernel) is emitted under its own name with its operands
@@ -1302,6 +1364,23 @@ def dispatch_region_to_fused_program(
             except KeyError:
                 op = raw_op
                 elementwise = False
+        if elementwise:
+            expected_arity = 1 if op in ELEMENTWISE_UNARY else 2
+            # A resolved Python call keeps its callable/name parent in the
+            # ProcessGraph for provenance.  Some graph normalizations label
+            # that edge ``operand`` rather than ``callee``; numeric IR arity is
+            # the reliable semantic boundary.  Remove only surplus Load/Name
+            # references, never an Input or computed value.
+            while len(parents) > expected_arity:
+                callable_position = next((
+                    index
+                    for index, (parent_id, _role) in enumerate(parents)
+                    if str(_operation(graph, parent_id)).casefold()
+                    in {"load", "name"}
+                ), None)
+                if callable_position is None:
+                    break
+                parents.pop(callable_position)
         structural = not reduction and not elementwise
         value_parents: list[int] = []
         scalar_parent: tuple[int, Any] | None = None
@@ -1338,6 +1417,8 @@ def dispatch_region_to_fused_program(
             copy.deepcopy(dict(data.get("attributes") or {}))
             if reduction or structural else {}
         )
+        if reduction and "axis" not in attrs and "dim" in attrs:
+            attrs["axis"] = attrs["dim"]
         if scalar_parent is not None:
             if reduction:
                 raise ValueError(f"{op} cannot consume a scalar constant operand")
@@ -1365,13 +1446,119 @@ def dispatch_region_to_fused_program(
                 result_id=node_id,
             )
         )
+        current = metadata.get(node_id)
+        exact_shape = None
+        exact_dtype = None
+        exact_source = None
+        if op in {"unsqueeze", "squeeze"} and value_parents:
+            source_id = int(value_parents[0])
+            source_meta = metadata.get(source_id)
+            if source_meta is not None and source_meta.shape is not None:
+                axis = None
+                if len(value_parents) > 1:
+                    axis_data = graph.G.nodes[value_parents[1]]
+                    axis_value = axis_data.get("constant")
+                    if axis_value is None:
+                        axis_value = (
+                            axis_data.get("attributes") or {}
+                        ).get("values")
+                    uniform_axis = uniform_tensor_constant(axis_value)
+                    if uniform_axis is not None and float(uniform_axis).is_integer():
+                        axis = int(uniform_axis)
+                source_shape = list(map(int, source_meta.shape))
+                if op == "unsqueeze" and axis is not None:
+                    normalized = axis if axis >= 0 else axis + len(source_shape) + 1
+                    if 0 <= normalized <= len(source_shape):
+                        source_shape.insert(normalized, 1)
+                        exact_shape = tuple(source_shape)
+                elif op == "squeeze":
+                    if axis is None:
+                        exact_shape = tuple(dim for dim in source_shape if dim != 1)
+                    else:
+                        normalized = axis if axis >= 0 else axis + len(source_shape)
+                        if (
+                            0 <= normalized < len(source_shape)
+                            and source_shape[normalized] == 1
+                        ):
+                            del source_shape[normalized]
+                            exact_shape = tuple(source_shape)
+                if exact_shape is not None:
+                    exact_dtype = source_meta.dtype
+                    exact_source = source_id
+                    descriptor_derivations[int(node_id)] = {
+                        "operation": op,
+                        "source_id": source_id,
+                        "shape": exact_shape,
+                        "dtype": exact_dtype,
+                    }
+        if (
+            exact_shape is not None
+            or current is None
+            or current.shape is None
+            or current.dtype is None
+        ):
+            known = [
+                metadata[parent_id]
+                for parent_id in value_parents
+                if parent_id in metadata
+                and metadata[parent_id].shape is not None
+            ]
+            inferred_shape = None
+            if known and elementwise:
+                try:
+                    inferred_shape = tuple(np.broadcast_shapes(*(
+                        tuple(item.shape) for item in known
+                    )))
+                except ValueError:
+                    inferred_shape = None
+            inferred_dtype = next(
+                (item.dtype for item in known if item.dtype is not None), None
+            )
+            if exact_shape is not None:
+                inferred_shape = exact_shape
+                inferred_dtype = exact_dtype
+            if op in {
+                "less", "less_equal", "greater", "greater_equal", "equal",
+                "not_equal", "logical_and", "logical_or", "logical_not",
+                "isfinite", "isinf", "isnan",
+            }:
+                inferred_dtype = "bool"
+            if inferred_shape is not None or inferred_dtype is not None:
+                metadata[node_id] = Meta(
+                    shape=(
+                        inferred_shape
+                        if inferred_shape is not None
+                        else (current.shape if current is not None else None)
+                    ),
+                    dtype=(
+                        inferred_dtype
+                        if inferred_dtype is not None
+                        else (current.dtype if current is not None else None)
+                    ),
+                    device=(current.device if current is not None else None),
+                    source_id=exact_source,
+                )
 
+    produced_ids = {int(step.result_id) for step in steps}
+    consumed_ids = {
+        int(value_id) for step in steps for value_id in step.input_ids
+    }
+    live_feeds = (
+        consumed_ids | set(map(int, dict(region.outputs).values()))
+    ) & set(map(int, region.input_ids)) - produced_ids
     return FusedProgram(
         version=1,
-        feeds=set(region.input_ids),
+        # Callable/name references removed from numeric op arity must not
+        # survive as phantom buffer parameters merely because the structural
+        # deployment boundary listed them before transcription.
+        feeds=live_feeds,
         steps=steps,
         outputs=dict(region.outputs),
         meta=metadata,
+        extras=(
+            {"descriptor_derivations": descriptor_derivations}
+            if descriptor_derivations else {}
+        ),
     )
 
 

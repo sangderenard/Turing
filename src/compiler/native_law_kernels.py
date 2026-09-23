@@ -206,7 +206,8 @@ class LLVMPiece:
         )
 
 
-def _lower_law(compilation: Any, law: str, batch: int, backend: str) -> LawKernel:
+def _lower_law(compilation: Any, law: str, batch: int, backend: str,
+               precision_policy: Any = None) -> LawKernel:
     from src.common.tensors import AbstractTensor
     from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
         c_backend_repository_ssa_reference)
@@ -216,10 +217,16 @@ def _lower_law(compilation: Any, law: str, batch: int, backend: str) -> LawKerne
     metadata = compilation.function.metadata
     argument_names = tuple(metadata["argument_names"])
     output_names = tuple(metadata["output_names"])
-    source = symbolic_abstract_tensor_source(compilation, "tick")
+    # ``precision_policy`` (optional): the AbstractTensor stage is produced
+    # with its measured precision sections written in (precision_policy.py),
+    # and those Precision sections lower through apply_precision_pipeline
+    # like any authored Precision code.
+    source = symbolic_abstract_tensor_source(compilation, "tick", precision_policy)
+    from src.common.tensors.extended_precision import Precision
+
     lowered = lower_ast_source_to_ssa(
         source, "tick",
-        python_bindings={"AbstractTensor": AbstractTensor},
+        python_bindings={"AbstractTensor": AbstractTensor, "Precision": Precision},
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         name=f"{law}_batched", runtime_closure_only=True,
         extraction_contract=batch_contract("tick", argument_names, batch),

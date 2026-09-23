@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import networkx as nx
+import numpy as np
 
 from src.compiler.glsl_deployment_strategy import (
     _invalidate_tensor_descriptor_dependents,
@@ -21,6 +22,79 @@ from src.compiler.identity_concordance import (
 )
 from src.transmogrifier.ssa import SSAValue
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
+
+
+def test_constant_array_descriptor_enters_the_value_concordance():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.graph["function_name"] = "pointer_lane"
+    graph.G.add_node(
+        3, type="Constant", op="const", value_id=3,
+        constant=np.zeros(96, dtype=np.float64),
+        attributes={"structural_specialization": True},
+        parents=[], children=[],
+    )
+
+    _book, token = begin_identity_book()
+    try:
+        assert _tensor_descriptor(graph, 3) == {
+            "shape": (96,), "dtype": "float64", "rank": 1,
+        }
+        assert proven_shape_of("pointer_lane", 3) == (96,)
+    finally:
+        end_identity_book(token)
+
+
+def test_numeric_literal_views_carry_shape_into_matmul_concordance():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.graph["function_name"] = "literal_projection"
+    graph.G.add_node(
+        1, type="Constant", op="const", value_id=1,
+        constant=[float(index) for index in range(8)],
+        attributes={"value": [float(index) for index in range(8)]},
+        parents=[],
+    )
+    for node_id, value in ((2, 0), (4, 2), (6, 0), (8, 1)):
+        graph.G.add_node(
+            node_id, type="Constant", op="const", value_id=node_id,
+            constant=value, attributes={"value": value}, parents=[],
+        )
+    graph.G.add_node(
+        3, type="unsqueeze", op="unsqueeze", value_id=3,
+        attributes={"tensor_candidate": "unsqueeze"},
+        parents=[(1, "operand"), (2, "arg:0")],
+    )
+    graph.G.add_node(
+        5, type="unsqueeze", op="unsqueeze", value_id=5,
+        attributes={"tensor_candidate": "unsqueeze"},
+        parents=[(3, "operand"), (4, "arg:0")],
+    )
+    graph.G.add_node(
+        7, type="unsqueeze", op="unsqueeze", value_id=7,
+        attributes={"tensor_candidate": "unsqueeze"},
+        parents=[(1, "operand"), (6, "arg:0")],
+    )
+    graph.G.add_node(
+        9, type="unsqueeze", op="unsqueeze", value_id=9,
+        attributes={"tensor_candidate": "unsqueeze"},
+        parents=[(7, "operand"), (8, "arg:0")],
+    )
+    graph.G.add_node(
+        10, type="matmul", op="matmul", value_id=10,
+        attributes={}, parents=[(5, "lhs"), (9, "rhs")],
+    )
+    graph.G.add_edges_from((
+        (1, 3), (2, 3), (3, 5), (4, 5),
+        (1, 7), (6, 7), (7, 9), (8, 9), (5, 10), (9, 10),
+    ))
+
+    _book, token = begin_identity_book()
+    try:
+        assert _tensor_descriptor(graph, 10) == {
+            "shape": (1, 8, 8), "dtype": "float64", "rank": 3,
+        }
+        assert proven_shape_of("literal_projection", 10) == (1, 8, 8)
+    finally:
+        end_identity_book(token)
 
 
 def test_specialized_graph_reads_authored_formal_shape_row():
@@ -195,6 +269,40 @@ def test_polymorphic_specialization_rederives_intermediate_shape_locally():
             ("_row", 2)
         )
         assert history[-1][1][0] == "conflicting"
+    finally:
+        end_identity_book(token)
+
+
+def test_axis_reduction_keeps_tracked_result_when_operand_rank_is_unsettled():
+    """A transient scalar operand fact cannot erase a reduction descriptor."""
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.graph.update({
+        "function_name": "reduce_rows",
+        "planner_tensor_descriptors": {"value": {
+            "shape": (), "dtype": "float64",
+        }},
+    })
+    graph.G.add_node(
+        0, type="Input", op="input", value_id=0,
+        tensor={"shape": (), "dtype": "float64"},
+        attributes={"binding_name": "value"}, parents=[], children=[
+            (1, "operand"),
+        ],
+    )
+    graph.G.add_node(
+        1, type="sum", op="sum", value_id=1,
+        tensor={"shape": (8,), "dtype": "float64"},
+        parents=[(0, "operand")], children=[],
+        attributes={"tensor_candidate": "sum", "dim": 2},
+    )
+    graph.G.add_edge(0, 1)
+
+    _book, token = begin_identity_book()
+    try:
+        assert _tensor_descriptor(graph, 1) == {
+            "shape": (8,), "dtype": "float64", "rank": 1,
+        }
     finally:
         end_identity_book(token)
 

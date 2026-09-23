@@ -64,6 +64,7 @@ from .process_graph_fusion import (
 # silently evaluating them once per tile changes one world into many worlds.
 COLLECTIVE_FUSED_OPERATIONS = frozenset({
     "sum", "mean", "prod", "min", "max", "any", "all", "argmin", "argmax",
+    "matmul",
 })
 
 
@@ -78,6 +79,41 @@ def fused_program_extent_effect(program: FusedProgram) -> str:
         ):
             return "collective"
     return "pointwise"
+
+
+def _exact_value_extent(program: FusedProgram, value_id: int) -> int | None:
+    """Read an exact element extent from the concordance-transcribed metadata."""
+
+    meta = (program.meta or {}).get(int(value_id))
+    if meta is None or meta.shape is None:
+        return None
+    if meta.shape_source_ids and any(
+        source_id is not None for source_id in meta.shape_source_ids
+    ):
+        return None
+    total = 1
+    try:
+        for dimension in meta.shape:
+            total *= int(dimension)
+    except (TypeError, ValueError):
+        return None
+    return total
+
+
+def fused_program_invocation_extent(program: FusedProgram) -> int | None:
+    """Return the one exact lane count shared by a region's public outputs."""
+
+    extents = {
+        extent
+        for value_id in program.outputs.values()
+        if (extent := _exact_value_extent(program, int(value_id))) is not None
+    }
+    if len(extents) != 1 or len(extents) != len({
+        _exact_value_extent(program, int(value_id))
+        for value_id in program.outputs.values()
+    }):
+        return None
+    return next(iter(extents))
 
 
 def _diagnose_region(program, region, module_name) -> str:
@@ -586,6 +622,14 @@ def emit_control_region_modules(
             ),
             "operation_count": len(program.steps),
             "extent_effect": fused_program_extent_effect(program),
+            "invocation_extent": fused_program_invocation_extent(program),
+            "input_extents": [
+                _exact_value_extent(program, value_id) for value_id in feed_ids
+            ],
+            "output_extents": [
+                _exact_value_extent(program, int(value_id))
+                for value_id in program.outputs.values()
+            ],
             "node_ids": [int(step.result_id) for step in program.steps],
             "is_root": False,
             "region_index": region,

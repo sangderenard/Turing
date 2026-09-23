@@ -260,6 +260,49 @@ def test_a_multi_element_tensor_from_list_survives_process_graph_round_trip():
     assert lowered.steps[1].input_ids == [1, 2]
 
 
+def test_resolved_tensor_call_receipt_names_the_transcribed_operation():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.add_node(0, op="Load", type="Load")
+    graph.G.add_node(1, op="input", type="input")
+    graph.G.add_node(
+        2,
+        op="Call",
+        type="Call",
+        parents=((0, "callee"), (1, "arg:0")),
+        attributes={"tensor": "abs", "static_python_reference": "abs"},
+    )
+
+    lowered = dispatch_region_to_fused_program(
+        graph,
+        DispatchRegion((2,), (1,), (("result", 2),), 0.0),
+    )
+
+    assert lowered.steps[0].op_name == "abs"
+    assert lowered.steps[0].input_ids == [1]
+
+
+def test_structural_constant_payload_is_not_replaced_by_ast_placeholder():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.add_node(
+        1,
+        op="const",
+        type="const",
+        constant=None,
+        attributes={"values": (1.0, 2.0), "value": None},
+    )
+    graph.G.add_node(
+        2, op="abs", type="abs", parents=((1, "arg:0"),),
+    )
+
+    lowered = dispatch_region_to_fused_program(
+        graph,
+        DispatchRegion((2,), (), (("result", 2),), 0.0),
+    )
+
+    assert lowered.steps[0].op_name == "tensor_from_list"
+    assert lowered.steps[0].attrs["values"] == (1.0, 2.0)
+
+
 def test_two_uniform_constants_remain_a_valid_graph_operation():
     program = FusedProgram(
         version=1,

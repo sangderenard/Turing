@@ -228,6 +228,7 @@ class ClassFieldSlot:
 
     index: int
     key: str
+    extent: int | None = None
 
 
 @dataclass(frozen=True)
@@ -256,6 +257,7 @@ class ClassMethodCard:
     input_slots: tuple[int, ...]
     output_slots: tuple[int, ...]
     kernel: str = ""
+    invocation_extent: int | None = None
 
     @property
     def parameter_count(self) -> int:
@@ -281,7 +283,11 @@ class ClassInventory:
         return {
             "abi": "turing.class-memory-inventory.v1",
             "field_slots": [
-                {"index": field.index, "key": field.key}
+                {
+                    "index": field.index,
+                    "key": field.key,
+                    **({"extent": field.extent} if field.extent is not None else {}),
+                }
                 for field in self.fields
             ],
             "container_fields": list(self.container_fields),
@@ -298,6 +304,10 @@ class ClassInventory:
                     "input_slots": list(method.input_slots),
                     "output_slots": list(method.output_slots),
                     "parameter_count": method.parameter_count,
+                    **(
+                        {"invocation_extent": method.invocation_extent}
+                        if method.invocation_extent is not None else {}
+                    ),
                 }
                 for method in self.methods
             ],
@@ -369,6 +379,28 @@ def build_class_inventory(manifest: Mapping[str, object]) -> ClassInventory:
     field_index = {
         key: canonical_index[canonical(key)] for key in keys
     }
+    extent_by_key: dict[str, int] = {}
+    for module in modules:
+        for input_name, extent in zip(
+            module.get("inputs", ()), module.get("input_extents", ()),
+        ):
+            binding = source_of.get(f"{module['name']}::{input_name}")
+            if binding is not None and extent is not None:
+                extent_by_key[binding] = max(
+                    extent_by_key.get(binding, 0), int(extent),
+                )
+        for output_name, extent in zip(
+            module.get("outputs", ()), module.get("output_extents", ()),
+        ):
+            if extent is not None:
+                key = f"out::{module['name']}::{output_name}"
+                extent_by_key[key] = max(extent_by_key.get(key, 0), int(extent))
+    canonical_extents: dict[str, int] = {}
+    for key, extent in extent_by_key.items():
+        storage = canonical(key)
+        canonical_extents[storage] = max(
+            canonical_extents.get(storage, 0), int(extent),
+        )
 
     methods = []
     for index, module in enumerate(modules):
@@ -391,6 +423,10 @@ def build_class_inventory(manifest: Mapping[str, object]) -> ClassInventory:
             input_slots=tuple(inputs),
             output_slots=outputs,
             kernel=str(module.get("kernel", module["name"])),
+            invocation_extent=(
+                int(module["invocation_extent"])
+                if module.get("invocation_extent") is not None else None
+            ),
         ))
     container_fields = tuple(sorted({
         canonical_index[canonical(str(key))]
@@ -399,7 +435,8 @@ def build_class_inventory(manifest: Mapping[str, object]) -> ClassInventory:
     }))
     return ClassInventory(
         fields=tuple(
-            ClassFieldSlot(index, key) for index, key in enumerate(canonical_keys)
+            ClassFieldSlot(index, key, canonical_extents.get(key))
+            for index, key in enumerate(canonical_keys)
         ),
         methods=tuple(methods),
         storage_redirects=tuple(
@@ -562,7 +599,10 @@ def emit_wasm_class_coordinator(
         body.local_get(2).i32_const(method.index).raw(OP_I32_LE_S)
         body.i32_const(method.index).local_get(3).raw(OP_I32_LT_S)
         body.raw(OP_I32_AND).if_()
-        body.local_get(0)
+        if method.invocation_extent is None:
+            body.local_get(0)
+        else:
+            body.i32_const(method.invocation_extent)
         for slot in (*method.input_slots, *method.output_slots):
             body.local_get(1).i32_load(offset=slot * 4)
         body.call(kernel_import_index[method.import_module]).end()
@@ -630,7 +670,10 @@ def emit_wasm_control_coordinator(
                 f"control region {region_index} has no WebAssembly method"
             )
         method = methods[method_index]
-        body.local_get(0)
+        if method.invocation_extent is None:
+            body.local_get(0)
+        else:
+            body.i32_const(method.invocation_extent)
         for slot in (*method.input_slots, *method.output_slots):
             body.local_get(1).i32_load(offset=int(slot) * 4)
         body.call(int(method.index))
