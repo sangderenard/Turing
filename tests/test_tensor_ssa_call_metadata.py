@@ -962,6 +962,53 @@ def test_aggregate_output_views_share_the_callee_resident_value():
     assert call.attributes["callee_output_ids"] == (10, 10)
 
 
+def test_aggregate_projection_inherits_exact_view_descriptor():
+    resident = SSAValue(11, "float64", (2,))
+    callee = Function("planned", [], {
+        "entry": BasicBlock("entry", [Instr("Ret", [resident, resident], None)]),
+    })
+    table = SSATensorTable()
+    table.register(SSATensorDescriptor(
+        tensor_id=11, data_value_id=11, shape=(2,), storage="output",
+    ))
+    table.register(SSATensorDescriptor(
+        tensor_id=30,
+        data_value_id=11,
+        shape=(2, 1),
+        storage="view",
+        owns_allocation=False,
+        allocation_owner=11,
+        alias_of=11,
+    ))
+    aggregate = SSAValue(100, "ssa.aggregate")
+    call = Instr(
+        "Call", [], aggregate,
+        attributes={
+            "callee": callee.name,
+            "result_convention": "ssa.aggregate",
+            "output_ids": (11, 30),
+        },
+    )
+    flat = SSAValue(11, "float64", (2,))
+    column = SSAValue(30, "float64")
+    caller = Function("caller", [], {
+        "entry": BasicBlock("entry", [
+            call,
+            *_aggregate_projection(aggregate, 0, 200, flat),
+            *_aggregate_projection(aggregate, 1, 210, column),
+        ]),
+    })
+    module = IRModule(
+        {callee.name: callee, caller.name: caller},
+        tensor_tables={callee.name: table},
+    )
+
+    assert propagate_repository_ssa_call_metadata(
+        module, authoritative_returns=True,
+    )
+    assert column.shape == (2, 1)
+
+
 def test_aggregate_output_view_of_formal_rebinds_to_caller_actual():
     formal = SSAValue(10, "float64", (8,))
     callee = Function("planned", [formal], {

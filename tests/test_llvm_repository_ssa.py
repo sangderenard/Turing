@@ -40,6 +40,7 @@ from src.compiler.ssa_features import (
     XOROSHIRO128SS_FILL,
     link_required_ssa_features,
 )
+from src.compiler.identity_concordance import identity_book
 from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
 from src.transmogrifier.ssa_registry import Handler
 
@@ -214,6 +215,48 @@ def test_left_integer_literal_uses_double_scalar_tensor_abi():
     assert not any(
         instruction.attributes.get("callee") == "broadcast_double"
         for instruction in instructions
+    )
+
+
+def test_integer_scalar_broadcast_gets_concordant_double_value_conversion():
+    source = SSAValue(1200, dtype="float64", shape=(2,))
+    index = SSAValue(1201, dtype="int64", shape=())
+    result = SSAValue(1202, dtype="bool", shape=(2,))
+    caller = Function(
+        "scalar_broadcast_conversion",
+        [source, index],
+        {"entry": BasicBlock("entry", [
+            Instr(Handler.Eq.value, [source, index], result),
+            Instr(Handler.Ret.value, [result], None),
+        ])},
+    )
+    module = IRModule({caller.name: caller})
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference(),
+    ) == ()
+
+    instructions = caller.blocks["entry"].instrs
+    conversion = next(
+        instruction for instruction in instructions
+        if instruction.op == "Cast"
+        and instruction.attributes.get(
+            "concordant_kernel_input_conversion"
+        )
+    )
+    broadcast = next(
+        instruction for instruction in instructions
+        if instruction.attributes.get("callee") == "broadcast_double"
+    )
+    assert conversion.args == [index]
+    assert conversion.res.dtype == "float64"
+    assert broadcast.args[0] is conversion.res
+    assert broadcast.res.dtype == "float64"
+    page = identity_book(module).page("kernel_input_conversion")
+    row = (caller.name, "entry", result.id, 1)
+    assert page.latest(row) == (
+        index.id, conversion.res.id, "int64", "float64",
+        "broadcast_double",
     )
 
 

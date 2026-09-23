@@ -816,8 +816,23 @@ class SSAReferenceEvaluator:
             # about an emission detail, which is the kind this tree keeps
             # being wrong about. Ret is the fallback, for a callee that
             # declares nothing.
+            # The linker can publish only a projection of a callee's Ret.
+            # In that case it writes the exact callee-side identities beside
+            # the caller-side identities.  This is the concordance-backed
+            # mapping; neither Ret position nor a coincident numeric id can
+            # recover a projected member once the other members are omitted.
+            callee_output_ids = tuple(map(
+                int, instruction.attributes.get("callee_output_ids", ()),
+            ))
             declared = tuple(callee.metadata.get("named_outputs") or ())
-            if declared and len(declared) == len(output_ids):
+            if (
+                callee_output_ids
+                and len(callee_output_ids) == len(output_ids)
+            ):
+                published = [
+                    inner.get(value_id) for value_id in callee_output_ids
+                ]
+            elif declared and len(declared) == len(output_ids):
                 published = [
                     inner.get(int(value_id)) for _name, value_id in declared
                 ]

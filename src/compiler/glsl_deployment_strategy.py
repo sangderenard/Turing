@@ -1696,7 +1696,10 @@ def _record_aggregate_ledger_lookup(
     record exists to show, without guessing at it.
     """
     try:
-        from .identity_concordance import current_identity_book
+        from .identity_concordance import (
+            authored_function_name,
+            current_identity_book,
+        )
 
         owner = (
             graph.G.graph.get("function_name")
@@ -15516,26 +15519,32 @@ def _publish_formal_literal(
 
 def _publish_formal_shape(
     function: str, parameter: str, descriptor: Any, caller: str,
-) -> None:
+) -> bool:
     """Record that a callsite proved one shape for one formal."""
 
     try:
-        from .identity_concordance import current_identity_book
+        from .identity_concordance import (
+            authored_function_name,
+            current_identity_book,
+        )
 
         extents = tuple(int(e) for e in (descriptor.get("shape") or ()))
         dtype = str(descriptor.get("dtype") or "float64")
         page = current_identity_book().page("formal_shape")
-        row = (str(function), str(parameter))
+        row = (authored_function_name(function), str(parameter))
         previous = page.latest(row)
         if previous is None:
             page.set(row, 0, ("proven", extents, dtype, caller))
+            return True
         elif previous[0] == "proven" and tuple(previous[1]) != extents:
             page.set(
                 row, len(page.history(row)),
                 ("conflicting", extents, dtype, caller),
             )
+            return True
     except Exception:
-        pass
+        return False
+    return False
 
 
 def _proven_formal_shape(graph: Any, name: Any) -> Any:
@@ -15544,10 +15553,16 @@ def _proven_formal_shape(graph: Any, name: Any) -> Any:
     if not name:
         return None
     try:
-        from .identity_concordance import current_identity_book
+        from .identity_concordance import (
+            authored_function_name,
+            current_identity_book,
+        )
 
         page = current_identity_book().page("formal_shape")
-        row = (str(graph.G.graph.get("function_name")), str(name))
+        row = (
+            authored_function_name(graph.G.graph.get("function_name")),
+            str(name),
+        )
         proven = page.latest(row)
     except Exception:
         return None
@@ -15975,6 +15990,162 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
     return changed
 
 
+def _callsite_descriptor_receipt(descriptor: Any) -> Any:
+    """Stable concordance spelling for one structured return descriptor."""
+
+    if isinstance(descriptor, Mapping):
+        return (
+            tuple(descriptor.get("shape") or ()),
+            str(descriptor.get("dtype") or "unknown"),
+        )
+    if isinstance(descriptor, tuple):
+        return tuple(_callsite_descriptor_receipt(item) for item in descriptor)
+    return None
+
+
+def _invalidate_tensor_descriptor_dependents(
+    graph: Any, source_ids: Any, reason: str,
+) -> None:
+    """Invalidate every cached descriptor derived from changed exact values."""
+
+    sources = {int(source_id) for source_id in source_ids}
+    affected = set(sources)
+    changed = True
+    while changed:
+        changed = False
+        for node_id, data in graph.G.nodes(data=True):
+            node_id = int(node_id)
+            if node_id in affected:
+                continue
+            parents = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) not in {"callee", "func", "definition"}
+            )
+            causes = tuple(parent for parent in parents if parent in affected)
+            if not causes:
+                continue
+            affected.add(node_id)
+            data.pop("tensor", None)
+            try:
+                from .identity_concordance import invalidate_proven_shape
+
+                invalidate_proven_shape(
+                    graph.G.graph.get("function_name"),
+                    int(data.get("value_id", node_id)),
+                    int(causes[0]),
+                    str(reason),
+                )
+            except Exception:
+                pass
+            changed = True
+
+
+def _publish_callsite_return_members(
+    caller: Any, node_id: int, descriptors: Any, kind: str,
+) -> bool:
+    """Materialize or enrich the exact projections of one aggregate call.
+
+    Projection ids are stable identities.  Their descriptors are fixed-point
+    facts and may become more precise after those ids are first materialized.
+    Existing ids therefore receive the newer fact in place; node existence is
+    not evidence that their metadata has settled.
+    """
+
+    node_id = int(node_id)
+    data = caller.G.nodes[node_id]
+    attributes = dict(data.get("attributes") or {})
+    descriptors = tuple(copy.deepcopy(tuple(descriptors)))
+    incumbent_leaves = tuple(map(
+        int, attributes.get("aggregate_leaf_value_ids") or (),
+    ))
+
+    from .identity_concordance import current_identity_book
+
+    page = current_identity_book().page("callsite_projection_specialization")
+    caller_name = str(caller.G.graph.get("function_name") or "")
+
+    def record(index: int, leaf_id: int, action: str, descriptor: Any) -> None:
+        row = (caller_name, node_id, int(index), int(leaf_id))
+        fact = (str(action), _callsite_descriptor_receipt(descriptor))
+        if page.latest(row) != fact:
+            page.set(row, len(page.history(row)), fact)
+
+    if (
+        len(incumbent_leaves) == len(descriptors)
+        and incumbent_leaves
+        and all(leaf_id in caller.G for leaf_id in incumbent_leaves)
+    ):
+        changed = False
+        for index, (leaf_id, descriptor) in enumerate(zip(
+            incumbent_leaves, descriptors,
+        )):
+            if not isinstance(descriptor, Mapping):
+                continue
+            replacement = copy.deepcopy(dict(descriptor))
+            leaf = caller.G.nodes[leaf_id]
+            if dict(leaf.get("tensor") or {}) == replacement:
+                continue
+            leaf["tensor"] = replacement
+            record(index, leaf_id, "enriched", descriptor)
+            _invalidate_tensor_descriptor_dependents(
+                caller, (leaf_id,), "aggregate-return-projection-enriched",
+            )
+            changed = True
+        if tuple(attributes.get("tensor_output_descriptors") or ()) != descriptors:
+            attributes["tensor_output_descriptors"] = descriptors
+            data["attributes"] = attributes
+            changed = True
+        return changed
+
+    stale_leaves = tuple(
+        leaf_id for leaf_id in incumbent_leaves if leaf_id not in caller.G
+    )
+    # Materialize exact member projections of the authored return. These are
+    # call results, never extra caller inputs or copies of the payload.
+    leaves = []
+    for index, descriptor in enumerate(descriptors):
+        index_id = next_process_value_id(caller)
+        caller.G.add_node(index_id, type="Constant", op="const",
+                          value_id=index_id, constant=index,
+                          attributes={"value": index}, parents=[], children=[])
+        member_id = next_process_value_id(caller)
+        caller.G.add_node(
+            member_id, type="Indexed", op="Indexed", value_id=member_id,
+            parents=[(node_id, "base"), (index_id, "index")], children=[],
+            attributes={"authored_call_result_projection": True},
+            # A member that is itself an aggregate has no tensor fact of its
+            # own; its structure stays in the ordered output descriptors,
+            # where the nested projection path reads it.
+            tensor=(
+                {} if descriptor is None or isinstance(descriptor, tuple)
+                else copy.deepcopy(dict(descriptor))
+            ),
+        )
+        caller.G.add_edge(node_id, member_id, role="base")
+        caller.G.add_edge(index_id, member_id, role="index")
+        data.setdefault("children", []).append((member_id, "base"))
+        caller.G.nodes[index_id]["children"].append((member_id, "index"))
+        leaves.append(member_id)
+        record(index, member_id, "materialized", descriptor)
+    attributes.update({
+        "authored_return_container": kind,
+        "producer_kind": "aggregate", "aggregate_kind": kind,
+        "aggregate_leaf_value_ids": tuple(leaves),
+        "tensor_output_descriptors": descriptors,
+    })
+    if stale_leaves:
+        attributes["aggregate_leaf_republication"] = {
+            "replaced_missing_value_ids": stale_leaves,
+            "replacement_value_ids": tuple(map(int, leaves)),
+            "rule": "exact-stored-output-descriptors",
+            "tie_policy": "incumbent",
+        }
+    data["attributes"] = attributes
+    data.pop("tensor", None)
+    return True
+
+
 def _propagate_callsite_tensor_specializations(graph: Any) -> None:
     """Carry consistent tensor descriptors through the function table.
 
@@ -15992,63 +16163,6 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
     graphs.extend(
         entry.graph for entry in function_table if entry.graph is not None
     )
-
-    def publish_return_members(caller, node_id, descriptors, kind):
-        data = caller.G.nodes[node_id]
-        attributes = dict(data.get("attributes") or {})
-        incumbent_leaves = tuple(map(
-            int, attributes.get("aggregate_leaf_value_ids") or (),
-        ))
-        if incumbent_leaves and all(
-            leaf_id in caller.G for leaf_id in incumbent_leaves
-        ):
-            return False
-        stale_leaves = tuple(
-            leaf_id for leaf_id in incumbent_leaves
-            if leaf_id not in caller.G
-        )
-        # Materialize exact member projections of the authored return. These
-        # are call results, never extra caller inputs or copies of the payload.
-        leaves = []
-        for index, descriptor in enumerate(descriptors):
-            index_id = next_process_value_id(caller)
-            caller.G.add_node(index_id, type="Constant", op="const",
-                              value_id=index_id, constant=index,
-                              attributes={"value": index}, parents=[], children=[])
-            member_id = next_process_value_id(caller)
-            caller.G.add_node(
-                member_id, type="Indexed", op="Indexed", value_id=member_id,
-                parents=[(node_id, "base"), (index_id, "index")], children=[],
-                attributes={"authored_call_result_projection": True},
-                # A member that is itself an aggregate has no tensor fact of
-                # its own; its structure stays in the ordered output
-                # descriptors, where the nested projection path reads it.
-                tensor=(
-                    {} if descriptor is None or isinstance(descriptor, tuple)
-                    else copy.deepcopy(dict(descriptor))
-                ),
-            )
-            caller.G.add_edge(node_id, member_id, role="base")
-            caller.G.add_edge(index_id, member_id, role="index")
-            data.setdefault("children", []).append((member_id, "base"))
-            caller.G.nodes[index_id]["children"].append((member_id, "index"))
-            leaves.append(member_id)
-        attributes.update({
-            "authored_return_container": kind,
-            "producer_kind": "aggregate", "aggregate_kind": kind,
-            "aggregate_leaf_value_ids": tuple(leaves),
-            "tensor_output_descriptors": tuple(copy.deepcopy(descriptors)),
-        })
-        if stale_leaves:
-            attributes["aggregate_leaf_republication"] = {
-                "replaced_missing_value_ids": stale_leaves,
-                "replacement_value_ids": tuple(map(int, leaves)),
-                "rule": "exact-stored-output-descriptors",
-                "tie_policy": "incumbent",
-            }
-        data["attributes"] = attributes
-        data.pop("tensor", None)
-        return True
 
     def call_result_descriptor(
         caller: Any,
@@ -16147,9 +16261,7 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                 descriptor = _structured_output_descriptor(
                     specialized, value_id,
                 )
-                if isinstance(descriptor, Mapping) and not (
-                    descriptor_states_a_shape(descriptor)
-                ):
+                if not descriptor_states_a_shape(descriptor):
                     # The identity table lists every value that IS this
                     # binding; they are one storage by construction.  The last
                     # resident one is what the return names, but a store or a
@@ -16229,10 +16341,16 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                     continue
                 if callee is None:
                     continue
-                if _tensor_descriptor(caller, int(_node_id)) is None:
-                    result_descriptors = call_result_descriptor(
-                        caller, int(_node_id), callee
-                    )
+                # A call node can carry an early catalogue descriptor that is
+                # no longer exact after its operands are specialized.  Calls
+                # are equality edges, so recompute their return contract on
+                # every fixed-point round and replace only when the exact
+                # callee result differs.  The decision itself is recorded by
+                # ``call_result_descriptor`` in the concordance.
+                result_descriptors = call_result_descriptor(
+                    caller, int(_node_id), callee
+                )
+                if result_descriptors:
                     return_kinds = set((callee.G.graph.get("return_container_kinds") or {}).values())
                     if (
                         len(return_kinds) == 1
@@ -16248,7 +16366,7 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                                 or isinstance(item, (Mapping, tuple))
                                 for item in result_descriptors)
                     ):
-                        changed |= publish_return_members(
+                        changed |= _publish_callsite_return_members(
                             caller, int(_node_id), result_descriptors,
                             next(iter(return_kinds)),
                         )
@@ -16259,8 +16377,34 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                         # descriptor tree. Only a tensor leaf belongs in
                         # the node's tensor slot; preserve aggregate returns
                         # in the structured output ledger below.
-                        data["tensor"] = result_descriptors[0]
-                        changed = True
+                        replacement = copy.deepcopy(dict(
+                            result_descriptors[0]
+                        ))
+                        if dict(data.get("tensor") or {}) != replacement:
+                            previous = copy.deepcopy(data.get("tensor"))
+                            data["tensor"] = replacement
+                            _invalidate_tensor_descriptor_dependents(
+                                caller, (int(_node_id),),
+                                "call-result-specialization-changed",
+                            )
+                            from .identity_concordance import current_identity_book
+
+                            mutation_page = current_identity_book().page(
+                                "callsite_tensor_result_specialization"
+                            )
+                            mutation_row = (
+                                str(caller.G.graph.get("function_name")),
+                                int(_node_id),
+                            )
+                            mutation_page.set(
+                                mutation_row,
+                                len(mutation_page.history(mutation_row)),
+                                (
+                                    _callsite_descriptor_receipt(previous),
+                                    _callsite_descriptor_receipt(replacement),
+                                ),
+                            )
+                            changed = True
                     elif result_descriptors:
                         attributes = dict(data.get("attributes") or {})
                         if attributes.get(
@@ -16284,6 +16428,22 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                     )
                     descriptor = _tensor_descriptor(caller, int(parent))
                     if parameter is not None and descriptor is not None:
+                        # This fixed point is the first stage that knows the
+                        # exact caller value and the callee formal together.
+                        # Publish that agreement now, under the authored
+                        # identity, so recursive return specialization can
+                        # recover the formal shape from every clean or hashed
+                        # graph copy on its next round.  Keeping the fact only
+                        # in ``planner_tensor_descriptors`` made it local to
+                        # one catalogue graph; a fresh specialization then
+                        # reverted the same formal to an unknown scalar.
+                        if tuple(descriptor.get("shape") or ()):
+                            changed |= _publish_formal_shape(
+                                str(callee.G.graph.get("function_name")),
+                                str(parameter),
+                                descriptor,
+                                str(caller.G.graph.get("function_name")),
+                            )
                         candidates.setdefault(
                             (int(reference), str(parameter)), []
                         ).append(copy.deepcopy(dict(descriptor)))
@@ -16806,7 +16966,10 @@ def _tensor_descriptor(
     row = None
     page = None
     try:
-        from .identity_concordance import current_identity_book
+        from .identity_concordance import (
+            authored_function_name,
+            current_identity_book,
+        )
 
         data = graph.G.nodes[int(node_id)] if int(node_id) in graph.G else {}
         page = current_identity_book().page("proven_shape")
@@ -16817,7 +16980,69 @@ def _tensor_descriptor(
         from .identity_concordance import proven_shape_of
 
         settled = proven_shape_of(row[0], row[1])
-        if settled:
+        descriptor_operation = str(
+            data.get("op") or data.get("type") or ""
+        ).casefold()
+        specialized_operator = bool(
+            graph.G.graph.get("planner_tensor_descriptors")
+            and descriptor_operation in {
+                "matmul", "sum", "prod", "min", "max", "any", "all",
+            }
+        )
+        binding_name = str(
+            (data.get("attributes") or {}).get("binding_name") or ""
+        )
+        localized_formal = bool(
+            str(data.get("type") or "") == "Input"
+            and binding_name
+            and binding_name in (
+                graph.G.graph.get("planner_tensor_descriptors") or {}
+            )
+        )
+        authored_owner = authored_function_name(
+            graph.G.graph.get("function_name")
+        )
+        formal_conflict = False
+        if str(data.get("type") or "") == "Input" and binding_name:
+            formal_page = current_identity_book().page("formal_shape")
+            formal_fact = formal_page.latest((
+                authored_function_name(
+                    graph.G.graph.get("function_name")
+                ),
+                binding_name,
+            ))
+            formal_conflict = bool(
+                isinstance(formal_fact, tuple)
+                and formal_fact
+                and formal_fact[0] == "conflicting"
+            )
+        # Once two exact call edges disagree on any formal, this authored
+        # function has no single descriptor graph.  Every intermediate in a
+        # callsite-specialized copy must then be derived from that copy's
+        # exact operands.  Reusing a previously proven authored-row result for
+        # an elementwise intermediate is precisely how `_row((2, 1), ...)`
+        # inherited the `(2, 2)` lane's multiply and consequently returned
+        # `(2,)` instead of `(1,)`.
+        formal_page = current_identity_book().page("formal_shape")
+        polymorphic_specialization = bool(
+            graph.G.graph.get("planner_tensor_descriptors")
+            and any(
+                isinstance(formal_row, tuple)
+                and len(formal_row) >= 2
+                and authored_function_name(formal_row[0]) == authored_owner
+                and isinstance(formal_page.latest(formal_row), tuple)
+                and formal_page.latest(formal_row)
+                and formal_page.latest(formal_row)[0] == "conflicting"
+                for formal_row in formal_page.rows()
+            )
+        )
+        if (
+            settled
+            and not formal_conflict
+            and not localized_formal
+            and not specialized_operator
+            and not polymorphic_specialization
+        ):
             # Already proven.  Answering from the concordance is what makes
             # the query a function of the value rather than of the moment.
             return {
@@ -16894,7 +17119,21 @@ def _tensor_descriptor_rule(
         data.get("op") or data.get("type") or ""
     ).casefold()
     provisional_tensor = None
-    if tensor.get("metadata_state") == "dynamic" or (
+    if (
+        graph.G.graph.get("planner_tensor_descriptors")
+        and descriptor_operation in {
+            "matmul", "sum", "prod", "min", "max", "any", "all",
+        }
+        and "shape" in tensor
+    ):
+        # A catalogue node's result descriptor predates this exact callsite's
+        # operand bindings.  Re-evaluate shape-changing operator laws from
+        # those local operands, retaining the catalogue descriptor only as a
+        # fallback when the law cannot prove a result.  The query records the
+        # resulting exact shape in the concordance below.
+        provisional_tensor = dict(tensor)
+        tensor = {}
+    elif tensor.get("metadata_state") == "dynamic" or (
         descriptor_operation in {
             "identity", "loopresult", "loopexit", "loopstateport",
         }
@@ -17268,6 +17507,113 @@ def _tensor_descriptor_rule(
                             "dtype": dtype,
                             "rank": len(broadcast),
                         }
+        if operation == "matmul":
+            operands = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role).casefold() in {
+                    "lhs", "rhs", "left", "right", "operand", "value",
+                    "other", "self", "receiver",
+                }
+                and int(parent) in graph.G
+            )
+            if len(operands) == 2:
+                sides = tuple(
+                    _tensor_descriptor(graph, operand, seen)
+                    for operand in operands
+                )
+                if all(
+                    side is not None and descriptor_states_a_shape(side)
+                    for side in sides
+                ):
+                    left = tuple(map(int, sides[0].get("shape") or ()))
+                    right = tuple(map(int, sides[1].get("shape") or ()))
+                    if left and right:
+                        left_vector = len(left) == 1
+                        right_vector = len(right) == 1
+                        matrix_left = (1, *left) if left_vector else left
+                        matrix_right = (*right, 1) if right_vector else right
+                        if matrix_left[-1] == matrix_right[-2]:
+                            try:
+                                batch = tuple(np.broadcast_shapes(
+                                    matrix_left[:-2], matrix_right[:-2]
+                                ))
+                            except ValueError:
+                                pass
+                            else:
+                                result = (
+                                    *batch,
+                                    matrix_left[-2],
+                                    matrix_right[-1],
+                                )
+                                if left_vector:
+                                    result = result[:-2] + result[-1:]
+                                if right_vector:
+                                    result = result[:-1]
+                                dtype = next((
+                                    str(side.get("dtype"))
+                                    for side in sides
+                                    if str(
+                                        side.get("dtype") or "unknown"
+                                    ) != "unknown"
+                                ), "float64")
+                                return {
+                                    "shape": tuple(result),
+                                    "dtype": dtype,
+                                    "rank": len(result),
+                                }
+        if operation in {"sum", "prod", "min", "max", "any", "all"}:
+            operand_roles = {
+                "operand", "value", "base", "input", "self", "receiver",
+            }
+            source_id = next((
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role).casefold() in operand_roles
+                and int(parent) in graph.G
+            ), None)
+            source = (
+                None if source_id is None
+                else _tensor_descriptor(graph, source_id, seen)
+            )
+            if source is not None and descriptor_states_a_shape(source):
+                source_shape = tuple(map(int, source.get("shape") or ()))
+                attributes = data.get("attributes") or {}
+                axis = attributes.get("axis", attributes.get("dim"))
+                keepdim = bool(attributes.get(
+                    "keepdim", attributes.get("keepdims", False)
+                ))
+                if axis is None:
+                    reduced = (1,) * len(source_shape) if keepdim else ()
+                else:
+                    axes = (
+                        tuple(axis)
+                        if isinstance(axis, (tuple, list))
+                        else (axis,)
+                    )
+                    if all(
+                        isinstance(item, int) and not isinstance(item, bool)
+                        for item in axes
+                    ):
+                        normalized = tuple(sorted({
+                            int(item) % len(source_shape) for item in axes
+                        }))
+                        reduced = tuple(
+                            1 if keepdim and index in normalized else extent
+                            for index, extent in enumerate(source_shape)
+                            if keepdim or index not in normalized
+                        )
+                    else:
+                        reduced = None
+                if reduced is not None:
+                    dtype = str(source.get("dtype") or "float64")
+                    if operation in {"any", "all"}:
+                        dtype = "bool"
+                    return {
+                        "shape": tuple(reduced),
+                        "dtype": dtype,
+                        "rank": len(reduced),
+                    }
         if operation in {
             "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
             "tanh", "clone", "copy", "identity", "real", "imag", "conj",
@@ -17278,9 +17624,16 @@ def _tensor_descriptor_rule(
             # no elements at all.
             "cumsum", "cumprod",
         }:
-            parents = tuple(
+            operand_roles = {"operand", "value", "base", "self", "receiver"}
+            by_role = tuple(
                 int(parent) for parent, role in data.get("parents") or ()
-                if str(role) != "callee"
+                if str(role).casefold() in operand_roles
+                and int(parent) in graph.G
+            )
+            parents = by_role or tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) not in {"callee", "func", "definition"}
+                and int(parent) in graph.G
             )
             if len(parents) == 1:
                 return _tensor_descriptor(graph, parents[0], seen)
@@ -19468,15 +19821,39 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                     "program_abi_dtype": str(value.dtype or "unknown"),
                 })
                 data["attributes"] = attributes
-                data["tensor"] = {
-                    "shape": tuple(value.shape or ()),
-                    "dtype": str(value.dtype or "unknown"),
-                    "rank": int(rank),
-                    **(
-                        {"metadata_state": "dynamic"}
-                        if value.shape is None else {}
-                    ),
-                }
+                binding_name = str(attributes.get("binding_name") or "")
+                callsite_descriptor = (
+                    graph.G.graph.get("planner_tensor_descriptors") or {}
+                ).get(binding_name)
+                if isinstance(callsite_descriptor, Mapping) and (
+                    callsite_descriptor.get("shape") is not None
+                ):
+                    # The rank-only ProgramABI fact is the fallback boundary;
+                    # it cannot overwrite the exact descriptor already bound
+                    # by this callsite.  Doing so changed ``mask: (2,)`` back
+                    # into a dynamic empty shape while leaving the planner
+                    # ledger itself correct, splitting one formal identity
+                    # into two incompatible facts.
+                    data["tensor"] = copy.deepcopy(dict(callsite_descriptor))
+                    from .identity_concordance import record_proven_shape
+
+                    record_proven_shape(
+                        graph.G.graph.get("function_name"),
+                        int(data.get("value_id", node_id)),
+                        tuple(callsite_descriptor.get("shape") or ()),
+                        callsite_descriptor.get("dtype"),
+                        int(_dependency_levels(graph).get(int(node_id), 0)),
+                    )
+                else:
+                    data["tensor"] = {
+                        "shape": tuple(value.shape or ()),
+                        "dtype": str(value.dtype or "unknown"),
+                        "rank": int(rank),
+                        **(
+                            {"metadata_state": "dynamic"}
+                            if value.shape is None else {}
+                        ),
+                    }
             if (
                 node_id in loop_carried_initial_ids
                 and not isinstance(value, _ProgramABIValueFact)
@@ -19936,20 +20313,11 @@ def _apply_callsite_tensor_descriptors(
             data["tensor"] = copy.deepcopy(dict(descriptor))
 
     # Cached intermediate shapes were derived before these exact argument
-    # descriptors arrived. Invalidate their dependency closure so structural
-    # folding recomputes them; stale padded scalar shapes are not evidence.
-    affected = set(changed_inputs)
-    changed = True
-    while changed:
-        changed = False
-        for node_id, data in graph.G.nodes(data=True):
-            if int(node_id) in affected:
-                continue
-            if any(int(parent) in affected for parent, role in data.get("parents") or ()
-                   if str(role) not in {"callee", "func", "definition"}):
-                affected.add(int(node_id))
-                data.pop("tensor", None)
-                changed = True
+    # descriptors arrived. Invalidate their dependency closure, including the
+    # concordance proof that would otherwise immediately repopulate the cache.
+    _invalidate_tensor_descriptor_dependents(
+        graph, changed_inputs, "callsite-input-specialization-changed",
+    )
 
 
 def _follow_declared_value_source(
@@ -20490,8 +20858,46 @@ def _callsite_specialized_shell_type(
         )),
         int(max_nodes_per_dispatch),
     )
+    def publish_call_result_shape(specialized_graph: Any) -> None:
+        """Join an exact specialized return to its caller value identity."""
+
+        outputs = tuple(
+            specialized_graph.G.graph.get("function_outputs") or ()
+        )
+        if len(outputs) != 1:
+            return
+        identities = specialized_graph.G.graph.get("identity_table") or {}
+        output_ids = tuple(identities.get(str(outputs[0]), ()))
+        descriptor = None
+        for candidate in reversed(output_ids):
+            if int(candidate) not in specialized_graph.G:
+                continue
+            inferred = _structured_output_descriptor(
+                specialized_graph, int(candidate),
+            )
+            if isinstance(inferred, Mapping) and (
+                descriptor_states_a_shape(inferred)
+            ):
+                descriptor = inferred
+                break
+        if descriptor is None:
+            return
+        extents = tuple(descriptor.get("shape") or ())
+        if not extents:
+            return
+        from .identity_concordance import record_proven_shape
+
+        record_proven_shape(
+            str(caller.G.graph.get("function_name")),
+            int(data.get("value_id", node_id)),
+            extents,
+            descriptor.get("dtype"),
+            int(_dependency_levels(caller).get(int(node_id), 0)),
+        )
+
     cached = _CALLSITE_SHELL_TYPE_CACHE.get(key)
     if cached is not None:
+        publish_call_result_shape(cached.process_graph)
         return cached
     specialized = extract_clean_process_subgraph(
         original,
@@ -20524,6 +20930,13 @@ def _callsite_specialized_shell_type(
         max_nodes_per_dispatch=int(max_nodes_per_dispatch),
         _function_table_stack=(id(function_table),),
     )
+    # Recursive planning above specializes the callee's own calls first.  At
+    # this point its return descriptor is therefore the exact callsite
+    # contract, including facts that did not exist during the earlier global
+    # catalogue fixed point.  Publish it to the caller's authored value row;
+    # every later graph copy and SSA object asks that row instead of relying
+    # on mutation of this one specialized graph.
+    publish_call_result_shape(specialized)
     _CALLSITE_SHELL_TYPE_CACHE[key] = planned
     return planned
 

@@ -1,4 +1,5 @@
 from src.compiler.ssa_call_input_adapters import adapt_physical_call_inputs, physical_call_input_conflicts
+from src.compiler.identity_concordance import begin_identity_book, end_identity_book
 from src.transmogrifier.ssa import SSAValue, Instr, Function, BasicBlock
 
 
@@ -38,6 +39,73 @@ def test_authored_callee_contract_is_not_a_generated_region_adapter():
     functions['region'].metadata.clear()
     assert adapt_physical_call_inputs(functions) == 0
     assert call.args[0] is field
+
+
+def test_generated_scalar_call_input_gets_concordant_numeric_conversion():
+    index = SSAValue(3, 'int64')
+    formal = SSAValue(10, 'float64')
+    result = SSAValue(4, 'float64')
+    helper = Function('helper', [formal], {
+        'entry': BasicBlock('entry', [Instr('Ret', [formal], None)]),
+    })
+    call = Instr('Call', [index], result, attributes={'callee': 'helper'})
+    caller = Function('caller', [], {
+        'entry': BasicBlock('entry', [call, Instr('Ret', [result], None)]),
+    })
+    functions = {'caller': caller, 'helper': helper}
+    book, token = begin_identity_book()
+    try:
+        assert adapt_physical_call_inputs(functions) == 1
+        cast, rewritten_call, _ret = caller.blocks['entry'].instrs
+        assert cast.op == 'Cast'
+        assert cast.args == [index]
+        assert cast.res is rewritten_call.args[0]
+        assert cast.res.dtype == 'float64'
+        assert cast.attributes == {
+            'target_dtype': 'float64',
+            'source_dtype': 'int64',
+            'concordant_call_input_conversion': True,
+        }
+        row = ('caller', 3, 'helper', 10)
+        converted_id, source, target, kind = book.page(
+            'call_input_conversion'
+        ).latest(row)
+        assert converted_id == int(cast.res.id)
+        assert (source, target, kind) == (
+            'int64', 'float64', 'read_only_scalar_numeric',
+        )
+        assert adapt_physical_call_inputs(functions) == 0
+    finally:
+        end_identity_book(token)
+
+
+def test_settled_integer_scalar_is_adapted_to_broadcast_double_abi():
+    index = SSAValue(3, 'int64')
+    output = SSAValue(4, 'float64', (2,))
+    shape = SSAValue(5, 'int32', (1,))
+    rank = SSAValue(6, 'int32')
+    call = Instr(
+        'Call', [index, output, shape, rank, shape, rank], output,
+        attributes={'callee': 'broadcast_double', 'ssa_output_argument': 1},
+    )
+    caller = Function('caller', [index], {
+        'entry': BasicBlock('entry', [call, Instr('Ret', [output], None)]),
+    })
+    book, token = begin_identity_book()
+    try:
+        assert adapt_physical_call_inputs({'caller': caller}) == 1
+        cast, rewritten_call, _ret = caller.blocks['entry'].instrs
+        assert cast.op == 'Cast'
+        assert cast.args == [index]
+        assert cast.res is rewritten_call.args[0]
+        assert cast.res.dtype == 'float64'
+        row = ('caller', 'entry', output.id, 0)
+        assert book.page('kernel_input_conversion').latest(row) == (
+            index.id, cast.res.id, 'int64', 'float64', 'broadcast_double',
+        )
+        assert adapt_physical_call_inputs({'caller': caller}) == 0
+    finally:
+        end_identity_book(token)
 
 
 def test_stale_same_id_region_capture_uses_incumbent_formal_type():

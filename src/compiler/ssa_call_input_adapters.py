@@ -5,6 +5,7 @@ from itertools import chain
 from math import prod
 
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
+from .identity_concordance import current_identity_book
 from ..transmogrifier.ssa import Instr, SSAValue
 
 
@@ -206,10 +207,88 @@ def adapt_physical_call_inputs(functions) -> int:
     count = 0
     for caller in functions.values():
         caller_formals = {int(value.id): value for value in caller.args}
-        for block in caller.blocks.values():
+        for block_name, block in caller.blocks.items():
             rewritten = []
             for instruction in block.instrs:
-                callee = functions.get(str(instruction.attributes.get('callee', '')))
+                callee_name = str(instruction.attributes.get('callee', ''))
+                callee = functions.get(callee_name)
+                if (
+                    instruction.op in {'Call', 'call'}
+                    and callee_name == 'broadcast_double'
+                    and instruction.args
+                ):
+                    source = instruction.args[0]
+                    source_dtype = (
+                        (source.accounting or {}).get('physical_dtype')
+                        or source.dtype
+                    )
+                    if (
+                        not tuple(source.shape or ())
+                        and str(source_dtype).casefold() in {
+                            'bool', 'i1', 'int', 'int32', 'int64', 'long',
+                            'float32',
+                        }
+                    ):
+                        # Opaque pointers do not carry the authored kernel's
+                        # pointee type. `broadcast_double` position zero is a
+                        # double buffer, so a scalar integer actual requires
+                        # a value conversion after whole-program type
+                        # settlement; passing its pointer directly is byte
+                        # reinterpretation (integer 1 becomes 5e-324).
+                        converted = SSAValue(
+                            GLOBAL_MONOTONIC_IDS.mint(),
+                            dtype='float64', shape=(), device=source.device,
+                            accounting={
+                                'physical_dtype': 'float64',
+                                'kernel_input_conversion': (
+                                    caller.name, int(source.id),
+                                    'broadcast_double', 0,
+                                ),
+                            },
+                        )
+                        rewritten.append(Instr(
+                            'Cast', [source], converted,
+                            attributes={
+                                'source_dtype': str(source_dtype),
+                                'target_dtype': 'float64',
+                                'concordant_kernel_input_conversion': True,
+                            },
+                        ))
+                        instruction.args[0] = converted
+                        conversion = {
+                            'source_id': int(source.id),
+                            'converted_id': int(converted.id),
+                            'source_dtype': str(source_dtype),
+                            'target_dtype': 'float64',
+                            'callee': 'broadcast_double',
+                            'operand_position': 0,
+                            'block': str(block_name),
+                            'consumer_id': (
+                                None if instruction.res is None
+                                else int(instruction.res.id)
+                            ),
+                        }
+                        caller.metadata['kernel_input_conversions'] = (
+                            *tuple(caller.metadata.get(
+                                'kernel_input_conversions', (),
+                            )),
+                            conversion,
+                        )
+                        page = current_identity_book().page(
+                            'kernel_input_conversion'
+                        )
+                        row = (
+                            str(caller.name), str(block_name),
+                            conversion['consumer_id'], 0,
+                        )
+                        history = page.history(row)
+                        column = history[-1][0] + 1 if history else 0
+                        page.set(row, column, (
+                            int(source.id), int(converted.id),
+                            str(source_dtype), 'float64',
+                            'broadcast_double',
+                        ))
+                        count += 1
                 if (instruction.op in {'Call', 'call'} and callee is not None
                         and len(instruction.args) == len(callee.args)):
                     outputs = set(map(int, instruction.attributes.get('output_ids', ())))
@@ -219,33 +298,101 @@ def adapt_physical_call_inputs(functions) -> int:
                         scalar_region = bool(callee.metadata.get('source_region_integral') and not formal.shape and formal.dtype != 'ptr')
                         source_dtype = accounting.get('physical_dtype') or actual.dtype
                         target_dtype = formal.dtype if scalar_region else (formal.accounting or {}).get('physical_dtype')
-                        if (not (accounting.get('program_abi_storage') or accounting.get('physical_dtype')
-                                or int(actual.id) in caller_formals)
-                                or source_dtype == target_dtype
-                                or (not scalar_region and formal.dtype != 'ptr' and actual.dtype != formal.dtype)
-                                or (scalar_region and actual.shape)
-                                or (not actual.shape and (accounting.get('program_abi_storage') == 'span'
-                                    or int(accounting.get('program_abi_rank') or 0) > 0))
-                                or int(actual.id) in outputs
-                                or not _read_only_feed(callee, formal.id, functions)):
+                        numeric = {'bool', 'int32', 'int64', 'float32', 'float64'}
+                        # A generated scalar (most importantly a loop-carried
+                        # induction value) may feed an authored tensor helper
+                        # whose scalar formal is consumed in the tensor's
+                        # numerical dtype.  The call edge is then a VALUE
+                        # conversion, not permission to reinterpret the
+                        # integer's bytes as a double.  Physical/program ABI
+                        # storage remains immutable and follows the stricter
+                        # region rule below.
+                        logical_scalar_conversion = bool(
+                            not actual.shape
+                            and not formal.shape
+                            and formal.dtype != 'ptr'
+                            and not accounting.get('program_abi_storage')
+                            and not accounting.get('physical_dtype')
+                            and source_dtype in numeric
+                            and formal.dtype in numeric
+                            and source_dtype != formal.dtype
+                            and int(actual.id) not in outputs
+                            and _read_only_feed(callee, formal.id, functions)
+                        )
+                        physical_conversion = not (
+                            not (accounting.get('program_abi_storage') or accounting.get('physical_dtype')
+                                 or int(actual.id) in caller_formals)
+                            or source_dtype == target_dtype
+                            or (not scalar_region and formal.dtype != 'ptr' and actual.dtype != formal.dtype)
+                            or (scalar_region and actual.shape)
+                            or (not actual.shape and (accounting.get('program_abi_storage') == 'span'
+                                or int(accounting.get('program_abi_rank') or 0) > 0))
+                            or int(actual.id) in outputs
+                            or not _read_only_feed(callee, formal.id, functions)
+                        )
+                        if not logical_scalar_conversion and not physical_conversion:
                             continue
                         # Only numerical scalar representation changes belong
                         # here. Records, references and string tokens are not
                         # interchangeable numerical values.
-                        numeric = {'bool', 'int32', 'int64', 'float32', 'float64'}
+                        if logical_scalar_conversion:
+                            target_dtype = formal.dtype
                         if source_dtype not in numeric or target_dtype not in numeric:
                             continue
                         # Shape is retained; a span conversion is elementwise.
                         converted = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=target_dtype, shape=actual.shape, device=actual.device,
                             accounting={'physical_dtype': target_dtype,
-                                'call_input_conversion': (caller.name, int(actual.id), callee.name, int(formal.id))})
-                        rewritten.append(Instr('Cast', [actual], converted,
-                            attributes={'target_dtype': target_dtype, 'source_dtype': source_dtype,
-                                'physical_region_input_conversion': True}))
+                                'call_input_conversion': (caller.name, int(actual.id), callee.name, int(formal.id)),
+                                'call_input_conversion_kind': (
+                                    'read_only_scalar_numeric'
+                                    if logical_scalar_conversion
+                                    else 'physical_region'
+                                )})
+                        conversion_attributes = {
+                            'target_dtype': target_dtype,
+                            'source_dtype': source_dtype,
+                        }
+                        if logical_scalar_conversion:
+                            conversion_attributes['concordant_call_input_conversion'] = True
+                        else:
+                            conversion_attributes['physical_region_input_conversion'] = True
+                        rewritten.append(Instr(
+                            'Cast', [actual], converted,
+                            attributes=conversion_attributes,
+                        ))
                         instruction.args[index] = converted
                         formal.accounting = {**dict(formal.accounting or {}),
                             'source_physical_dtype': source_dtype,
                             'physical_dtype': target_dtype}
+                        conversion = {
+                            'caller': str(caller.name),
+                            'actual_id': int(actual.id),
+                            'callee': str(callee.name),
+                            'formal_id': int(formal.id),
+                            'converted_id': int(converted.id),
+                            'source_dtype': str(source_dtype),
+                            'target_dtype': str(target_dtype),
+                            'kind': (
+                                'read_only_scalar_numeric'
+                                if logical_scalar_conversion
+                                else 'physical_region'
+                            ),
+                        }
+                        caller.metadata['call_input_conversions'] = (
+                            *tuple(caller.metadata.get('call_input_conversions', ())),
+                            conversion,
+                        )
+                        page = current_identity_book().page('call_input_conversion')
+                        row = (
+                            str(caller.name), int(actual.id),
+                            str(callee.name), int(formal.id),
+                        )
+                        history = page.history(row)
+                        column = history[-1][0] + 1 if history else 0
+                        page.set(row, column, (
+                            int(converted.id), str(source_dtype),
+                            str(target_dtype), conversion['kind'],
+                        ))
                         count += 1
                 publication = None
                 output_position = instruction.attributes.get('ssa_output_argument')

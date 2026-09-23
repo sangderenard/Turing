@@ -621,6 +621,18 @@ class CorrelationTable:
                     (row[0], row[1]) if isinstance(row, tuple) and len(row) >= 2
                     else (str(row), -1)
                 )
+                resolution = book.page(
+                    "argument_binding_resolution"
+                ).latest((str(function_name), int(value_id), int(source)))
+                if (
+                    isinstance(resolution, tuple)
+                    and resolution
+                    and str(resolution[0]) in by_kind
+                ):
+                    # The raw history remains intact, but the shared
+                    # concordance has selected the one kind capable of
+                    # materializing this exact source slot.
+                    continue
                 found.append(Finding(
                     "binding-kind-disagreement",
                     str(function_name),
@@ -1591,6 +1603,32 @@ def declare_loop_scope(
         page.set(row, INNER + 1, ("graph", int(graph_outer), int(graph_inner)))
 
 
+def rebind_loop_scope_inner(
+    function: Any,
+    loop_node_id: Any,
+    declared_inner: int,
+    resident_inner: int,
+    reason: Any,
+) -> None:
+    """Register a transformation of the value crossing a loop backedge.
+
+    The scope declaration preserves the authored outer/carried/inner
+    generations.  Outlining or aggregate projection can subsequently mint a
+    resident SSA value for that same inner generation.  Record that transition
+    separately so the original declaration remains historical evidence while
+    every later consumer sees the resident identity.
+    """
+
+    page = current_identity_book().page("loop_scope_inner_transition")
+    row = (
+        authored_function_name(function), int(loop_node_id),
+        int(declared_inner),
+    )
+    history = page.history(row)
+    column = history[-1][0] + 1 if history else 0
+    page.set(row, column, (int(resident_inner), str(reason)))
+
+
 def loop_scope_declarations(book: Any, function: Any) -> list[dict]:
     """Every loop scope declared for one authored function."""
 
@@ -1620,12 +1658,193 @@ def loop_scope_declarations(book: Any, function: Any) -> list[dict]:
             and CARRIED in generations
             and INNER in generations
         ):
+            declared_inner = int(generations[INNER])
+            transition = book.page("loop_scope_inner_transition").latest((
+                wanted, int(loop_node_id), declared_inner,
+            ))
+            resident_inner = (
+                int(transition[0])
+                if isinstance(transition, tuple) and transition
+                else declared_inner
+            )
             record["rebinds"].append({
                 "outer": int(generations[OUTER]),
                 "carried": int(generations[CARRIED]),
-                "inner": int(generations[INNER]),
+                "inner": resident_inner,
+                "declared_inner": declared_inner,
             })
     return [record for record in scopes.values() if record["boundary"]]
+
+
+def concord_loop_scope_latch_residents(module: Any) -> tuple[dict, ...]:
+    """Publish the final resident identity on every transformed backedge.
+
+    Aggregate legalization and linked-call projection happen after control
+    lowering declared the authored inner generation.  At the completed-module
+    seam the loop Phi is the exact authority on what now crosses the latch.
+    Reconcile that resident into the concordance so the declaration tracks the
+    transformation instead of leaving a locally recorded but globally unknown
+    rename.
+    """
+
+    book = identity_book(module)
+    receipts: list[dict] = []
+    for function_name, function in getattr(module, "functions", {}).items():
+        for declaration in loop_scope_declarations(book, function_name):
+            header, latch, _exit = declaration["boundary"]
+            loop_node_id = int(declaration["loop_node_id"])
+            for rebind in declaration["rebinds"]:
+                carried = int(rebind["carried"])
+                declared_inner = int(rebind.get(
+                    "declared_inner", rebind["inner"]
+                ))
+                phi = _carried_phi(function, str(header), carried)
+                if phi is None:
+                    continue
+                incoming = tuple(phi.attributes.get("incoming_blocks") or ())
+                resident = next((
+                    int(argument.id)
+                    for predecessor, argument in zip(incoming, phi.args)
+                    if str(predecessor) == str(latch)
+                    and getattr(argument, "id", None) is not None
+                ), None)
+                if resident is None or resident == int(rebind["inner"]):
+                    continue
+                rebind_loop_scope_inner(
+                    function_name,
+                    loop_node_id,
+                    declared_inner,
+                    resident,
+                    "completed_module_latch_projection",
+                )
+                receipt = {
+                    "function": str(function_name),
+                    "loop_node_id": loop_node_id,
+                    "carried": carried,
+                    "declared_inner": declared_inner,
+                    "resident_inner": resident,
+                    "reason": "completed_module_latch_projection",
+                }
+                receipts.append(receipt)
+                argument = next((
+                    argument
+                    for predecessor, argument in zip(incoming, phi.args)
+                    if str(predecessor) == str(latch)
+                    and int(argument.id) == resident
+                ), None)
+                if argument is not None:
+                    argument.accounting = {
+                        **dict(argument.accounting or {}),
+                        "loop_scope_inner_transition": (
+                            declared_inner, resident,
+                            "completed_module_latch_projection",
+                        ),
+                    }
+    if receipts:
+        metadata = getattr(module, "metadata", None)
+        if metadata is not None:
+            metadata["loop_scope_inner_reconciliations"] = tuple(receipts)
+    return tuple(receipts)
+
+
+def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
+    """Account for hidden formals proved to be compiler-owned at every call.
+
+    A structural value such as a tensor dtype can survive specialization as a
+    scalar formal even when it is not an authored parameter.  If every exact
+    incoming call position supplies linked frame storage, the concordance can
+    classify that formal without guessing from its numerical dtype or use.
+    """
+
+    functions = getattr(module, "functions", {}) or {}
+    incoming: dict[tuple[str, int], list[tuple[str, Any]]] = defaultdict(list)
+    for caller_name, caller in functions.items():
+        for block in caller.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op not in {"Call", "call"}:
+                    continue
+                callee_name = str(instruction.attributes.get("callee") or "")
+                callee = functions.get(callee_name)
+                if callee is None or len(instruction.args) != len(callee.args):
+                    continue
+                for formal, actual in zip(callee.args, instruction.args):
+                    incoming[(callee_name, int(formal.id))].append((
+                        str(caller_name), actual,
+                    ))
+
+    receipts: list[dict] = []
+    book = identity_book(module)
+    for function_name, function in functions.items():
+        metadata = function.metadata
+        named = {
+            int(value_id)
+            for _name, value_id in metadata.get("parameter_names", ())
+        }
+        recorded = {
+            int(item["value_id"])
+            for key in ("storage_formals", "closure_formals", "member_formals")
+            for item in (metadata.get(key, ()) or ())
+            if isinstance(item, Mapping) and item.get("value_id") is not None
+        }
+        for formal in function.args:
+            formal_id = int(formal.id)
+            accounting = dict(formal.accounting or {})
+            if (
+                formal_id in named
+                or formal_id in recorded
+                or any(accounting.get(key) not in {None, ""} for key in (
+                    "program_abi_storage", "program_abi_parameter",
+                    "program_abi_field", "linked_call_frame_storage",
+                    "compiler_frame_storage", "returned_record_storage",
+                ))
+            ):
+                continue
+            sources = incoming.get((str(function_name), formal_id), ())
+            if not sources or not all(
+                (actual.accounting or {}).get("linked_call_frame_storage")
+                or (actual.accounting or {}).get("compiler_frame_storage")
+                for _caller, actual in sources
+            ):
+                continue
+            source_receipts = tuple(
+                (caller, int(actual.id)) for caller, actual in sources
+            )
+            formal.accounting = {
+                **accounting,
+                "compiler_frame_storage": str(function_name),
+                "compiler_frame_sources": source_receipts,
+            }
+            storage_entry = {
+                "value_id": formal_id,
+                "dtype": str(formal.dtype or "unknown"),
+                "shape": tuple(formal.shape or ()),
+                "kind": "compiler_frame_storage",
+                "sources": source_receipts,
+            }
+            prior = tuple(metadata.get("storage_formals", ()) or ())
+            metadata["storage_formals"] = (
+                *prior,
+                *( () if storage_entry in prior else (storage_entry,) ),
+            )
+            receipt = {
+                "function": str(function_name),
+                "formal_id": formal_id,
+                "sources": source_receipts,
+                "kind": "compiler_frame_storage",
+            }
+            receipts.append(receipt)
+            page = book.page("formal_storage_resolution")
+            row = (str(function_name), formal_id)
+            history = page.history(row)
+            column = history[-1][0] + 1 if history else 0
+            page.set(row, column, (
+                "compiler_frame_storage", source_receipts,
+            ))
+    if receipts:
+        getattr(module, "metadata", {})[
+            "compiler_frame_formal_reconciliations"
+        ] = tuple(receipts)
+    return tuple(receipts)
 
 
 def materializing_binding_kind(
@@ -1658,12 +1877,23 @@ def materializing_binding_kind(
         if int(recorded_source) != int(source_id):
             continue
         if str(recorded_kind) == "caller_storage":
+            resolution_page = book.page("argument_binding_resolution")
+            resolution_row = (
+                str(callee_symbol), int(formal_id), int(source_id),
+            )
+            history = resolution_page.history(resolution_row)
+            column = history[-1][0] + 1 if history else 0
+            resolution_page.set(resolution_row, column, (
+                "caller_storage", str(kind),
+                "materializing_binding_kind",
+            ))
             return "caller_storage"
     return str(kind)
 
 
 def record_proven_shape(
-    function: Any, value_id: int, extents: Any, dtype: Any, level: int = 0,
+    function: Any, value_id: int, extents: Any, dtype: Any,
+    level: int | None = 0,
 ) -> None:
     """Record extents proven for one value identity at one causal level.
 
@@ -1682,14 +1912,49 @@ def record_proven_shape(
     row = (authored_function_name(function), int(value_id))
     recorded = page.history(row)
     fact = ("proven", extents, str(dtype or "float64"))
+    target_level = (
+        max((int(column) for column, _fact in recorded), default=0)
+        if level is None else int(level)
+    )
     if not recorded:
-        page.set(row, int(level), fact)
+        page.set(row, target_level, fact)
         return
     deepest = max(recorded, key=lambda entry: int(entry[0]))
-    if tuple(deepest[1][1]) == extents or int(level) > int(deepest[0]):
-        page.set(row, int(level), fact)
+    if isinstance(deepest[1], tuple) and deepest[1] and (
+        deepest[1][0] == "invalidated"
+    ):
+        # An upstream identity changed after this proof was derived.  The next
+        # descriptor query is a new proof generation, not a disagreement with
+        # the invalidated fact.  Keep both events in causal order.
+        page.set(row, int(deepest[0]) + 1, fact)
         return
-    page.set(row, int(level), ("conflicting", extents, str(dtype or "")))
+    if (
+        tuple(deepest[1][1]) == extents
+        or target_level > int(deepest[0])
+    ):
+        page.set(row, target_level, fact)
+        return
+    page.set(
+        row, target_level,
+        ("conflicting", extents, str(dtype or "")),
+    )
+
+
+def invalidate_proven_shape(
+    function: Any, value_id: int, source_id: int, reason: Any,
+) -> None:
+    """Withdraw a derived shape after one of its exact dependencies changes."""
+
+    page = current_identity_book().page("proven_shape")
+    row = (authored_function_name(function), int(value_id))
+    recorded = page.history(row)
+    column = max(
+        (int(existing) for existing, _fact in recorded), default=-1,
+    ) + 1
+    page.set(
+        row, column,
+        ("invalidated", int(source_id), str(reason)),
+    )
 
 
 def proven_shape_of(function: Any, value_id: int) -> tuple[int, ...] | None:

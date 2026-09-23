@@ -3451,7 +3451,7 @@ class _ControlSSABuilder:
             if edge.name in incoming_blocks
         }
         for index, (
-            updated_id, initial_id, _initial, _reserved, incumbent
+            updated_id, initial_id, _initial, reserved, incumbent
         ) in enumerate(carried):
             candidate = carried_updates[int(updated_id)]
             incoming_values = tuple(
@@ -3503,6 +3503,29 @@ class _ControlSSABuilder:
             carried_phis[int(updated_id)].args[1] = completed
             carried_updates[int(updated_id)] = completed
             self.external_values[int(updated_id)] = completed
+            source_loop_node_id = carried_phis[int(updated_id)].attributes.get(
+                "source_loop_node_id"
+            )
+            if (
+                source_loop_node_id is not None
+                and int(completed.id) != int(reserved.id)
+            ):
+                from .identity_concordance import rebind_loop_scope_inner
+
+                rebind_loop_scope_inner(
+                    self.function_name,
+                    source_loop_node_id,
+                    int(reserved.id),
+                    int(completed.id),
+                    "complete_loop_latch_carried",
+                )
+                completed.accounting = {
+                    **dict(completed.accounting or {}),
+                    "loop_scope_inner_transition": (
+                        int(reserved.id), int(completed.id),
+                        "complete_loop_latch_carried",
+                    ),
+                }
 
     def emit(
         self,

@@ -14197,7 +14197,8 @@ def _class_surface_ssa_program(
     # history is the order in which this phase learned about it.
     from .identity_concordance import current_identity_book as _shape_book
 
-    shape_page = _shape_book().page("value_shape")
+    shape_identity_book = _shape_book()
+    shape_page = shape_identity_book.page("value_shape")
 
     def note_shape(owner: Any, value_id: int, fact: Any) -> None:
         row = (str(owner.graph.get("function_name")), int(value_id))
@@ -14205,8 +14206,14 @@ def _class_surface_ssa_program(
         # A fact is the shape, not who said it.  Two callsites agreeing is one
         # fact recorded once; otherwise every additional caller reads as a
         # change and a round trip between equal shapes reads as oscillation.
-        if previous is not None and tuple(previous[1:]) == tuple(fact[1:]):
-            return
+        if previous is not None:
+            same_payload = tuple(previous[1:]) == tuple(fact[1:])
+            state_transition = (
+                str(previous[0]) == "polymorphic"
+                or str(fact[0]) == "polymorphic"
+            ) and str(previous[0]) != str(fact[0])
+            if same_payload and not state_transition:
+                return
         shape_page.set(row, len(shape_page.history(row)), fact)
     planned_graphs_by_shell: dict[int, Any] = {}
     for planned_shell in planned_shells:
@@ -14590,9 +14597,12 @@ def _class_surface_ssa_program(
                     # program whose callees are about to be specialized
                     # anyway.  Everything the two callsites DO agree on
                     # (dtype, storage, rank when equal) is kept.
-                    from .identity_concordance import current_identity_book
-
-                    page = current_identity_book().page(
+                    # Use the book captured by this whole-program settlement.
+                    # Nested shell planning can temporarily install its own
+                    # context book; publishing through that ambient context
+                    # made the polymorphism receipt disappear before SSA
+                    # lowering could consult it.
+                    page = shape_identity_book.page(
                         "linked_value_abi_polymorphism"
                     )
                     row = (
@@ -18676,7 +18686,59 @@ def _class_surface_ssa_program(
                     "less", "less_equal", "greater", "greater_equal",
                 } else arguments[0].dtype
             )
-            result = SSAValue(value_id, dtype=dtype)
+            # Every operator this branch handles (add/sub/mul/div, the
+            # comparisons, logical_not) is an elementwise, broadcasting
+            # operator -- reductions were shape=() by construction in an
+            # earlier branch, and this one is never reached for them.
+            # ``SSAValue(value_id, dtype=dtype)`` alone defaults to
+            # shape=(), regardless of what the operands actually carried --
+            # that is what let a comparison over a length-n index vector
+            # publish itself as a scalar, which downstream broadcast
+            # kernels then read past the end of the real 1-element buffer
+            # for. The identity concordance is the one place this fact
+            # belongs.  The exact operands remain the authority at a
+            # shape-polymorphic callsite: two `_row` specializations reuse
+            # authored value ids while carrying `(n,n)` and `(n,1)` storage.
+            # Compare their local broadcast with the shared fact and record
+            # disagreement as a concordance conflict; never borrow the first
+            # specialization's extent for the second one's result.
+            from .identity_concordance import (
+                proven_shape_of,
+                record_proven_shape,
+            )
+
+            operand_shapes = [
+                tuple(argument.shape or ()) for argument in arguments
+            ]
+            computed_shape = operand_shapes[0]
+            for shape in operand_shapes[1:]:
+                rank = max(len(computed_shape), len(shape))
+                left = (1,) * (rank - len(computed_shape)) + computed_shape
+                right = (1,) * (rank - len(shape)) + shape
+                merged: list[int] = []
+                incompatible = False
+                for left_extent, right_extent in zip(left, right):
+                    if left_extent == right_extent or right_extent == 1:
+                        merged.append(left_extent)
+                    elif left_extent == 1:
+                        merged.append(right_extent)
+                    else:
+                        incompatible = True
+                        break
+                if incompatible:
+                    # Disagreeing declared shapes prove nothing reliably
+                    # here; retain the ranked operand without asserting a
+                    # broadcast neither operand supports.
+                    computed_shape = shape if shape else computed_shape
+                    continue
+                computed_shape = tuple(merged)
+            shared_shape = proven_shape_of(symbol, value_id)
+            if computed_shape:
+                record_proven_shape(
+                    symbol, value_id, computed_shape, dtype, None,
+                )
+            result_shape = computed_shape or shared_shape or ()
+            result = SSAValue(value_id, dtype=dtype, shape=result_shape)
             insertions.append(Instr(
                 row.handler.value,
                 arguments,
@@ -27912,6 +27974,10 @@ def _class_surface_ssa_program(
                     callee_values = {
                         int(argument.id): argument for argument in callee.args
                     }
+                    exact_argument_bindings = {
+                        int(callee_id): int(caller_id)
+                        for caller_id, callee_id in record.argument_bindings
+                    }
                     storage_identity_by_value = {}
                     if callee_record_table is not None:
                         for descriptor in callee_record_table.records.values():
@@ -27926,6 +27992,40 @@ def _class_surface_ssa_program(
                             distinct_bindings.append((callee_id, kind, source))
                             continue
                         source_id = int(source)
+                        exact_caller_id = exact_argument_bindings.get(
+                            int(callee_id)
+                        )
+                        if exact_caller_id is not None:
+                            # This slot is an authored call argument, not
+                            # anonymous frame storage. Two helper formals that
+                            # consume the same authored value prove sharing;
+                            # their callee-local owner names do not prove a
+                            # split. Register that stronger identity fact in
+                            # the mutation ledger so retaining the alias is a
+                            # concordance decision, not an untracked bypass.
+                            identity = (
+                                str(caller_symbol), int(record.callsite_id),
+                                str(record.callee_symbol), int(callee_id),
+                            )
+                            retained = frame_ledger.propose(
+                                identity,
+                                "exact_argument_binding",
+                                (int(exact_caller_id), int(callee_id)),
+                                before=source_id,
+                                after=source_id,
+                            )
+                            if not retained:
+                                source_id = int(
+                                    frame_ledger.incumbent_target(identity)
+                                )
+                            distinct_bindings.append((
+                                int(callee_id), str(kind), source_id,
+                            ))
+                            owner_by_slot.setdefault(
+                                source_id,
+                                ("authored_argument", int(exact_caller_id)),
+                            )
+                            continue
                         storage_identity = storage_identity_by_value.get(
                             int(callee_id)
                         )
@@ -31888,7 +31988,6 @@ def _class_surface_ssa_program(
                             ]
                         ),
                     }
-
     # Linking a callee's own calls can expand its physical argument frame
     # after an incoming native Call was materialized in an earlier fixed-point
     # round. Refresh those already-emitted call operands from the final call
@@ -37795,6 +37894,15 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
                     ),
                     *receipts,
                 ))
+        from .identity_concordance import (
+            concord_compiler_frame_formals,
+            concord_loop_scope_latch_residents,
+        )
+
+        _loop_scope_reconciliations = concord_loop_scope_latch_residents(
+            module
+        )
+        _frame_formal_reconciliations = concord_compiler_frame_formals(module)
         _progress = kwargs.get("progress")
         # Ask the concordance's own detector the same question here, so a
         # disagreement between the two walks is reported where it happens
@@ -37813,7 +37921,10 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
         if _progress is not None:
             _progress(
                 "ssa-program: loop-result uses reconciled at the module "
-f"boundary: {reconciled}; detector still reports "
+f"boundary: {reconciled}; loop-scope latch residents concorded: "
+                f"{len(_loop_scope_reconciliations)}; compiler-frame formals "
+                f"concorded: {len(_frame_formal_reconciliations)}; detector "
+                "still reports "
                 f"{len(_unresolved)}: "
                 + "; ".join(
                     f"{getattr(f, 'function', '?')} value "

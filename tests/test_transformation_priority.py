@@ -61,6 +61,22 @@ def test_same_proof_cannot_replace_incumbent_by_allocating_again():
     assert len(ledger.events) == 2
 
 
+def test_exact_argument_binding_prevents_anonymous_owner_split():
+    ledger = frame_transformation_ledger()
+    identity = ("caller", 80, "column", 0)
+    assert ledger.propose(
+        identity, "distinct_owner", ("value", ("row", 0)),
+        before=3, after=101,
+    )
+    assert ledger.propose(
+        identity, "exact_argument_binding", (114, 0),
+        before=101, after=3,
+    )
+    assert ledger.incumbent_target(identity) == 3
+    assert ledger.events[-1]["rule"] == "exact_argument_binding"
+    assert ledger.events[-1]["accepted"] is True
+
+
 def test_increasing_but_undeclared_transition_rejected():
     ledger = TransformationLedger((TransformationRule("a", 1), TransformationRule("b", 2)), {})
     ledger.propose(1, "a", "proof")

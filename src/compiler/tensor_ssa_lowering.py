@@ -308,6 +308,54 @@ _SHAPED_SSA_OPERATIONS = {
 }
 
 
+def _shape_polymorphic_function(function_name: str) -> bool:
+    """Whether call-edge settlement proved multiple shapes for this helper."""
+
+    try:
+        from .identity_concordance import (
+            authored_function_name,
+            current_identity_book,
+        )
+        authored_name = authored_function_name(function_name)
+        page = current_identity_book().page(
+            "linked_value_abi_polymorphism"
+        )
+        if any(
+            isinstance(row, tuple)
+            and len(row) >= 2
+            and authored_function_name(row[0]) == authored_name
+            for row in page.rows()
+        ):
+            return True
+        # The whole-program ABI fixed point owns the durable shape ledger.
+        # Its polymorphic marker must survive even when the two callsites'
+        # last concrete payload equals the marker's payload.
+        page = current_identity_book().page("value_shape")
+        return any(
+            isinstance(row, tuple)
+            and len(row) >= 2
+            and authored_function_name(row[0]) == authored_name
+            and (
+                any(
+                    isinstance(fact, tuple)
+                    and fact
+                    and str(fact[0]) == "polymorphic"
+                    for _column, fact in page.history(row)
+                )
+                or len({
+                    tuple(fact[1])
+                    for _column, fact in page.history(row)
+                    if isinstance(fact, tuple)
+                    and len(fact) > 1
+                    and tuple(fact[1] or ())
+                }) > 1
+            )
+            for row in page.rows()
+        )
+    except Exception:
+        return False
+
+
 def _settle_operand_shapes(function_name: str, values: Any) -> None:
     """Read each operand's shape from the concordance before dispatching.
 
@@ -323,6 +371,7 @@ def _settle_operand_shapes(function_name: str, values: Any) -> None:
         from .identity_concordance import proven_shape_of
     except Exception:
         return
+    shape_polymorphic = _shape_polymorphic_function(function_name)
     for value in values or ():
         # A shaped view shares its storage owner's value id and nothing else.
         # The resolver is keyed by that id, so asking it here answers with the
@@ -339,7 +388,153 @@ def _settle_operand_shapes(function_name: str, values: Any) -> None:
         except Exception:
             continue
         if settled and tuple(value.shape or ()) != settled:
+            # The call-edge concordance has already proved that this helper
+            # has no single formal shape.  A nonempty shape on its exact
+            # specialized SSA occurrence is therefore more specific than an
+            # authored-row proof left by a peer specialization.  Preserve
+            # that local fact; the shape.ssa page records what this consumer
+            # actually reads.  Missing extents still receive the shared fact.
+            if shape_polymorphic and tuple(value.shape or ()):
+                continue
             value.shape = settled
+
+
+def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
+    tuple[str, int], list[tuple[tuple[int, ...], str]]
+]:
+    """Publish current exact actual/formal contracts after metadata settles."""
+
+    from .identity_concordance import record_proven_shape
+
+    page = identity_book(module).page("ssa_call_shape")
+    contracts: dict[
+        tuple[str, int], list[tuple[tuple[int, ...], str]]
+    ] = {}
+    for caller_name, caller in module.functions.items():
+        native_result_shapes: dict[int, tuple[tuple[int, ...], str]] = {}
+        for caller_block in caller.blocks.values():
+            for producer in caller_block.instrs:
+                native_contract = tuple(
+                    producer.attributes.get("native_result_contract", ())
+                )
+                if (
+                    producer.op in {"Call", "call"}
+                    and producer.res is not None
+                    and len(native_contract) == 1
+                    and tuple(native_contract[0][2] or ())
+                ):
+                    native_result_shapes[int(producer.res.id)] = (
+                        tuple(native_contract[0][2]),
+                        str(native_contract[0][1] or "float64"),
+                    )
+        for block in caller.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op not in {"Call", "call"}:
+                    continue
+                callee_name = str(instruction.attributes.get("callee") or "")
+                callee = module.functions.get(callee_name)
+                if callee is None or len(instruction.args) != len(callee.args):
+                    continue
+                for actual, formal in zip(instruction.args, callee.args):
+                    native_result = native_result_shapes.get(int(actual.id))
+                    descriptor = getattr(module, "tensor_tables", {}).get(
+                        str(caller_name), SSATensorTable()
+                    ).by_id(int(actual.id))
+                    explicit_view = (actual.accounting or {}).get(
+                        "ssa_storage_view"
+                    )
+                    extents = tuple(
+                        native_result[0]
+                        if native_result is not None and not explicit_view
+                        else actual.shape or ()
+                        if explicit_view
+                        else (
+                            tuple(descriptor.shape or ())
+                            if descriptor is not None
+                            and descriptor.metadata_state == "static"
+                            and tuple(descriptor.shape or ())
+                            else tuple(actual.shape or ())
+                        )
+                    )
+                    if not extents:
+                        continue
+                    fact = (extents, str(
+                        (None if native_result is None else native_result[1])
+                        or actual.dtype
+                        or (None if descriptor is None else descriptor.dtype)
+                        or "float64"
+                    ))
+                    row = (
+                        callee_name, int(formal.id),
+                        str(caller_name), int(actual.id),
+                    )
+                    if page.latest(row) != fact:
+                        page.set(row, len(page.history(row)), fact)
+                    evidence_page = identity_book(module).page(
+                        "ssa_call_shape_evidence"
+                    )
+                    evidence = (
+                        "native_result_contract"
+                        if native_result is not None and not explicit_view
+                        else "explicit_storage_view"
+                        if explicit_view
+                        else "resident_descriptor"
+                        if descriptor is not None
+                        and descriptor.metadata_state == "static"
+                        and tuple(descriptor.shape or ())
+                        else "ssa_occurrence"
+                    )
+                    if evidence_page.latest(row) != evidence:
+                        evidence_page.set(
+                            row, len(evidence_page.history(row)), evidence
+                        )
+                    record_proven_shape(
+                        callee_name, int(formal.id), extents, actual.dtype,
+                    )
+                    contracts.setdefault(
+                        (callee_name, int(formal.id)), []
+                    ).append(fact)
+    return contracts
+
+
+def _settle_exact_ssa_call_shapes(
+    module: IRModule,
+    contracts: Mapping[
+        tuple[str, int], list[tuple[tuple[int, ...], str]]
+    ],
+) -> None:
+    """Apply only unanimous exact call-edge facts, retaining their receipt."""
+
+    for (callee_name, formal_id), candidates in contracts.items():
+        exact = set(candidates)
+        if len(exact) != 1:
+            continue
+        extents, dtype = next(iter(exact))
+        callee = module.functions[callee_name]
+        occurrences = [*callee.args]
+        for block in callee.blocks.values():
+            for instruction in block.instrs:
+                occurrences.extend(instruction.args)
+                if instruction.res is not None:
+                    occurrences.append(instruction.res)
+        for occurrence in occurrences:
+            if (
+                int(occurrence.id) != int(formal_id)
+                or (occurrence.accounting or {}).get("ssa_storage_view")
+            ):
+                continue
+            occurrence.shape = tuple(extents)
+            if occurrence.dtype is None:
+                occurrence.dtype = dtype
+            occurrence.accounting = {
+                **dict(occurrence.accounting or {}),
+                "shape_settlement_provenance": (
+                    "unanimous_exact_ssa_call_edges",
+                    callee_name,
+                    int(formal_id),
+                ),
+                "shape_settlement_tie_policy": "exact-call-edge",
+            }
 
 
 def _record_ssa_shape(function_name: str, value: Any) -> None:
@@ -1221,7 +1416,42 @@ def propagate_repository_ssa_call_metadata(
                                 == int(output_id)
                                 else None
                             )
-                            if material_descriptor is not None:
+                            view_descriptor = (
+                                descriptor
+                                if descriptor is not None
+                                and descriptor.storage == "view"
+                                and bool(tuple(descriptor.shape))
+                                and int(descriptor.tensor_id)
+                                == int(callee_value_id)
+                                else None
+                            )
+                            if view_descriptor is not None:
+                                # A planned region may return the same storage
+                                # more than once through different shaped
+                                # views. Ret therefore contains the resident
+                                # id repeatedly and cannot carry the semantic
+                                # extents by id alone. The tensor table is the
+                                # exact concordance from the authored output
+                                # identity to that resident storage; retain
+                                # its view shape instead of replacing it with
+                                # the allocation owner's shape.
+                                callee_value = SSAValue(
+                                    callee_value_id,
+                                    dtype=str(view_descriptor.dtype),
+                                    shape=tuple(view_descriptor.shape),
+                                    accounting={
+                                        "ssa_storage_view": {
+                                            "storage_value_id": int(
+                                                view_descriptor.data_value_id
+                                            ),
+                                            "view_shape": tuple(
+                                                view_descriptor.shape
+                                            ),
+                                            "operation": "tensor_descriptor",
+                                        },
+                                    },
+                                )
+                            elif material_descriptor is not None:
                                 # The tensor table is the allocation contract
                                 # for a lowered region output.  One canonical
                                 # source id can also name earlier singleton
@@ -1253,6 +1483,7 @@ def propagate_repository_ssa_call_metadata(
                                 function, int(caller_value.id), callee_value,
                                 authoritative=(
                                     settle_exact_returns
+                                    or view_descriptor is not None
                                     or material_descriptor is not None
                                 ),
                             )
@@ -1428,6 +1659,15 @@ def lower_tensor_calls_to_repository_ssa(
     # transfer that exact contract onto every occurrence before tensor
     # recognition.  This is identity transport, not shape inference.
     shape_page = identity_book(module).pages.get("tensor_shape_concordance")
+
+    # Seed formals from the call graph so the metadata fixed point can lower
+    # operations whose callee-local occurrences began empty.  These are
+    # explicitly provisional concordance entries: source-linked result
+    # contracts can become more precise during the fixed point below, and the
+    # same edge rows are republished afterwards before lowering consumes them.
+    provisional_call_shapes = _publish_exact_ssa_call_shapes(module)
+    _settle_exact_ssa_call_shapes(module, provisional_call_shapes)
+
     if shape_page is not None:
         contract_keys = (
             "program_abi_storage",
@@ -1574,6 +1814,15 @@ def lower_tensor_calls_to_repository_ssa(
     if settle_canonical_value_metadata(module):
         propagate_repository_ssa_call_metadata(module)
 
+    # Publish call-edge shapes only after source-linked results and canonical
+    # metadata have reached their fixed point.  Recording them earlier stores
+    # the placeholder a call happened to carry while its real result contract
+    # was still in flight.  The callee-qualified concordance rows retain every
+    # transition and avoid collapsing a planned-region formal into the
+    # authored helper's (potentially polymorphic) value-id namespace.
+    exact_call_shapes = _publish_exact_ssa_call_shapes(module)
+    _settle_exact_ssa_call_shapes(module, exact_call_shapes)
+
     linked_roots: set[str] = set()
     shortfalls: list[TensorSSALoweringShortfall] = []
 
@@ -1641,6 +1890,19 @@ def lower_tensor_calls_to_repository_ssa(
         tensor_table = module.tensor_tables.setdefault(
             function_name, SSATensorTable()
         )
+        shape_polymorphic_function = _shape_polymorphic_function(
+            function_name
+        )
+        # A function's own formals are the same split-identity hazard as
+        # any operand: a planned region carved out of this function, or a
+        # caller-side linking pass, may have already proven this identity's
+        # true shape onto a DIFFERENT SSAValue object sharing the same id
+        # under this function's authored name. Settle every formal from
+        # the concordance before anything below reads its .shape to decide
+        # a static count -- the exact read that baked a wrong element
+        # count from a formal whose true rank was already proven
+        # elsewhere, just not onto this particular object.
+        _settle_operand_shapes(function_name, function.args)
         function_argument_ids = {int(value.id) for value in function.args}
         unresolved_argument_ids = {
             int(value.id)
@@ -2712,15 +2974,27 @@ def lower_tensor_calls_to_repository_ssa(
                 # was captured before shape settlement.  Use that resident
                 # descriptor only to fill a missing occurrence shape.  An
                 # already shaped occurrence remains the incumbent, including
-                # an equal-priority view spelling.
+                # an equal-priority view spelling.  The exception is a helper
+                # the call-edge concordance proved shape-polymorphic: there,
+                # the descriptor produced earlier in THIS specialized
+                # function outranks a stale occurrence stamped from another
+                # specialization's authored-row proof.
                 for operand in data_args:
-                    if tuple(operand.shape or ()):
-                        continue
                     incumbent = tensor_table.by_id(int(operand.id))
                     if (
                         incumbent is None
                         or incumbent.metadata_state != "static"
                         or not tuple(incumbent.shape or ())
+                    ):
+                        continue
+                    operand_shape = tuple(operand.shape or ())
+                    incumbent_shape = tuple(incumbent.shape or ())
+                    if operand_shape and not (
+                        shape_polymorphic_function
+                        and operand_shape != incumbent_shape
+                        and not (operand.accounting or {}).get(
+                            "ssa_storage_view"
+                        )
                     ):
                         continue
                     operand.shape = tuple(incumbent.shape)
@@ -3822,10 +4096,101 @@ def lower_tensor_calls_to_repository_ssa(
                                     ))
                                 else:
                                     conformed_args = []
-                                    for operand in data_args:
+                                    for operand_position, operand in enumerate(data_args):
                                         if tuple(operand.shape) == tuple(result.shape):
                                             conformed_args.append(operand)
                                             continue
+                                        broadcast_source = operand
+                                        if (
+                                            not tuple(operand.shape or ())
+                                            and str(operand.dtype or "").casefold()
+                                            in {
+                                                "bool", "i1", "int", "int32",
+                                                "int64", "long", "float32",
+                                            }
+                                        ):
+                                            # `broadcast_double` consumes a
+                                            # DOUBLE buffer.  A scalar loop
+                                            # index is a numerical value, not
+                                            # a pointer whose integer bytes
+                                            # may be reinterpreted as a
+                                            # double.  Materialize the exact
+                                            # promotion at this repository
+                                            # boundary and publish that
+                                            # transformation to the shared
+                                            # concordance.
+                                            broadcast_source = fresh(
+                                                shape=(), dtype="float64",
+                                            )
+                                            broadcast_source.accounting = {
+                                                **dict(
+                                                    broadcast_source.accounting
+                                                    or {}
+                                                ),
+                                                "kernel_input_conversion": (
+                                                    function_name,
+                                                    int(operand.id),
+                                                    "broadcast_double",
+                                                    int(operand_position),
+                                                ),
+                                            }
+                                            prefix.append(Instr(
+                                                "Cast", [operand],
+                                                broadcast_source,
+                                                attributes={
+                                                    "source_dtype": str(
+                                                        operand.dtype
+                                                    ),
+                                                    "target_dtype": "float64",
+                                                    "concordant_kernel_input_conversion": True,
+                                                },
+                                            ))
+                                            conversion = {
+                                                "source_id": int(operand.id),
+                                                "converted_id": int(
+                                                    broadcast_source.id
+                                                ),
+                                                "source_dtype": str(
+                                                    operand.dtype
+                                                ),
+                                                "target_dtype": "float64",
+                                                "callee": "broadcast_double",
+                                                "operand_position": int(
+                                                    operand_position
+                                                ),
+                                                "block": str(block_name),
+                                                "consumer_id": int(result.id),
+                                            }
+                                            function.metadata[
+                                                "kernel_input_conversions"
+                                            ] = (
+                                                *tuple(function.metadata.get(
+                                                    "kernel_input_conversions",
+                                                    (),
+                                                )),
+                                                conversion,
+                                            )
+                                            page = identity_book(module).page(
+                                                "kernel_input_conversion"
+                                            )
+                                            row = (
+                                                str(function_name),
+                                                str(block_name),
+                                                int(result.id),
+                                                int(operand_position),
+                                            )
+                                            history = page.history(row)
+                                            column = (
+                                                history[-1][0] + 1
+                                                if history else 0
+                                            )
+                                            page.set(row, column, (
+                                                int(operand.id),
+                                                int(broadcast_source.id),
+                                                str(operand.dtype),
+                                                "float64",
+                                                "broadcast_double",
+                                            ))
                                         if shape_unknown(operand) or shape_unknown(result):
                                             # Shapes unknown statically: conforming
                                             # is a runtime decision, so route the
@@ -3836,12 +4201,12 @@ def lower_tensor_calls_to_repository_ssa(
                                             result_extents = ensure_dynamic(prefix, result)
                                             broadcasted = fresh(
                                                 shape=result.shape,
-                                                dtype=operand.dtype or "float64",
+                                                dtype="float64",
                                             )
                                             emitted.append(call(
                                                 "broadcast_double",
                                                 [
-                                                    operand,
+                                                    broadcast_source,
                                                     broadcasted,
                                                     operand_extents["shape"],
                                                     operand_extents["rank"],
@@ -3861,7 +4226,7 @@ def lower_tensor_calls_to_repository_ssa(
                                             continue
                                         broadcasted = fresh(
                                             shape=result.shape,
-                                            dtype=operand.dtype or "float64",
+                                            dtype="float64",
                                         )
                                         input_shape, input_shape_def = int_vector(
                                             operand.shape
@@ -3884,7 +4249,7 @@ def lower_tensor_calls_to_repository_ssa(
                                         emitted.append(call(
                                             "broadcast_double",
                                             [
-                                                operand,
+                                                broadcast_source,
                                                 broadcasted,
                                                 input_shape,
                                                 input_rank,

@@ -81,8 +81,12 @@ def frame_transformation_ledger() -> TransformationLedger:
     return TransformationLedger((
         TransformationRule("receiver_field", 1),
         TransformationRule("distinct_owner", 2),
-        TransformationRule("distinct_result", 3),
+        TransformationRule("exact_argument_binding", 3),
+        TransformationRule("distinct_result", 4),
     ), {
-        "receiver_field": ("distinct_owner", "distinct_result"),
-        "distinct_owner": ("distinct_result",),
+        "receiver_field": (
+            "distinct_owner", "exact_argument_binding", "distinct_result",
+        ),
+        "distinct_owner": ("exact_argument_binding", "distinct_result"),
+        "exact_argument_binding": ("distinct_result",),
     })

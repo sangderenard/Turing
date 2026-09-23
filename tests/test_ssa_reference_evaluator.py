@@ -492,6 +492,53 @@ def test_linked_call_publishes_through_ret_positionally():
     )
 
 
+def test_linked_call_projection_uses_exact_callee_output_identity():
+    """A projected call result follows its linker-recorded identity.
+
+    A call may consume one member of a multi-value Ret.  Positional binding
+    cannot describe that projection, and caller ids belong to a different
+    namespace.  ``callee_output_ids`` is the exact linker concordance between
+    those spaces and must therefore be authoritative.
+    """
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    callee = Function(
+        "callee",
+        [],
+        {"entry": BasicBlock("entry", [
+            Instr("Const", [], SSAValue(20, dtype="float64"),
+                  attributes={"value": -111.0}),
+            Instr("Const", [], SSAValue(79, dtype="float64"),
+                  attributes={"value": 4.0}),
+            Instr("Const", [], SSAValue(76, dtype="float64"),
+                  attributes={"value": 99.0}),
+            Instr("Ret", [SSAValue(79), SSAValue(76)], None),
+        ])},
+    )
+    caller = Function(
+        "caller",
+        [],
+        {"entry": BasicBlock("entry", [
+            Instr(
+                "Call", [], SSAValue(90, dtype="float64"),
+                attributes={
+                    "callee": "callee",
+                    "output_ids": (20,),
+                    "callee_output_ids": (79,),
+                    "output_positions": (0,),
+                },
+            ),
+            Instr("Ret", [SSAValue(20)], None),
+        ])},
+    )
+
+    class _Module:
+        functions = {"caller": caller, "callee": callee}
+
+    result = SSAReferenceEvaluator(_Module()).run("caller", {})
+    assert float(np.asarray(result.returned[0]).reshape(-1)[0]) == 4.0
+
+
 def test_declared_outputs_agree_with_ret_order(lowered_advance):
     """The callee's declared output contract must match what Ret lists.
 

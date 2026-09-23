@@ -3832,7 +3832,10 @@ def _emit_repository_call_module(
         if not (
             is_compiler_owned_storage(value)
             and storage_requirements.get(int(value.id)) is not None
-            and storage_requirements[int(value.id)].element_count is not None
+            and (
+                storage_requirements[int(value.id)].element_count is not None
+                or not storage_requirements[int(value.id)].dynamic
+            )
         )
     )
     root_internal_storage = tuple(
@@ -3840,7 +3843,10 @@ def _emit_repository_call_module(
         if (
             is_compiler_owned_storage(value)
             and storage_requirements.get(int(value.id)) is not None
-            and storage_requirements[int(value.id)].element_count is not None
+            and (
+                storage_requirements[int(value.id)].element_count is not None
+                or not storage_requirements[int(value.id)].dynamic
+            )
         )
     )
     public_values = [*root_public_args, *root_outputs]
