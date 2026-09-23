@@ -421,6 +421,7 @@ def reduce_scheduled_shader_regions(
     partition_keys: Mapping[int, Any] | None = None,
     extra_dependency_edges: Iterable[tuple[int, int]] = (),
     fusible_node_ids: Iterable[int] | None = None,
+    indivisible_node_groups: Iterable[Iterable[int]] = (),
     control_node_ids: Iterable[int] = (),
     schedule: str = "asap",
 ) -> ScheduledProcessGraphDispatchPlan:
@@ -444,6 +445,13 @@ def reduce_scheduled_shader_regions(
     inside one shader body.  An operation outside that set is a real dispatch
     boundary rather than a planning preference, so it stays alone in its own
     region; the default admits every executable node.
+
+    ``indivisible_node_groups`` are compiler-owned regions whose membership
+    was settled before ordinary fusion. They enter the quotient as one vertex
+    and are never split or enlarged by the opportunistic shader rewrites
+    below. This is the region reducer's reservation mechanism for a semantic
+    section whose interior operations are meaningful only when lowered
+    together.
 
     ``control_node_ids`` are cached recursion/loop-IR nodes.  Fusion removes
     only edges incident to those nodes from its scheduling projection.  The
@@ -582,14 +590,47 @@ def reduce_scheduled_shader_regions(
                 batch_count=1,
             ))
 
+    reserved_groups = []
+    reserved_members: set[int] = set()
+    for supplied_group in indivisible_node_groups:
+        group = {
+            int(node_id) for node_id in supplied_group
+            if int(node_id) in executable
+        }
+        if len(group) < 2:
+            continue
+        overlap = group.intersection(reserved_members)
+        if overlap:
+            raise ValueError(
+                "indivisible dispatch regions overlap: "
+                f"members={tuple(sorted(overlap))!r}"
+            )
+        member_keys = {keys.get(node_id) for node_id in group}
+        if len(member_keys) > 1:
+            raise ValueError(
+                "indivisible dispatch region crosses a control partition: "
+                f"members={tuple(sorted(group))!r}"
+            )
+        reserved_groups.append(group)
+        reserved_members.update(group)
+
+    initial_groups = [
+        *reserved_groups,
+        *(
+            {node_id} for node_id in topological
+            if node_id in executable and node_id not in reserved_members
+        ),
+    ]
     regions: dict[int, set[int]] = {
-        index: {node_id}
-        for index, node_id in enumerate(
-            node_id for node_id in topological if node_id in executable
-        )
+        index: set(group) for index, group in enumerate(initial_groups)
     }
+    reserved_region_ids = set(range(len(reserved_groups)))
     histories: dict[int, list[str]] = {
-        region_id: [] for region_id in regions
+        region_id: (
+            ["indivisible-reservation"]
+            if region_id in reserved_region_ids else []
+        )
+        for region_id in regions
     }
     next_region_id = len(regions)
 
@@ -642,6 +683,8 @@ def reduce_scheduled_shader_regions(
     def can_merge(region_ids, quotient_graph=None):
         region_ids = tuple(dict.fromkeys(region_ids))
         if len(region_ids) < 2:
+            return False
+        if any(region_id in reserved_region_ids for region_id in region_ids):
             return False
         members = set().union(*(regions[item] for item in region_ids))
         if len(members) > cap:

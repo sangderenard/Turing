@@ -310,7 +310,7 @@ def _lower_law(compilation: Any, law: str, batch: int, backend: str,
             f"declares {len(argument_names)} arguments")
     if backend != "llvm":
         raise RuntimeError(f"{law}: backend {backend!r} stand-in not wired yet")
-    from .ssa_llvm_backend import emit_ssa_function_to_llvm
+    from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
 
     artifact = emit_ssa_function_to_llvm(module, entry)
     if not artifact.complete:
@@ -321,6 +321,7 @@ def _lower_law(compilation: Any, law: str, batch: int, backend: str,
     missing = [name for name, value_id in output_ids.items() if value_id not in exposed]
     if missing:
         raise RuntimeError(f"{law}: outputs not exposed by the kernel ABI: {missing[:5]}")
+    artifact = compile_artifact(artifact)
     return LawKernel(
         law=law, batch=batch, backend=backend, artifact=artifact,
         argument_names=argument_names, argument_ids=argument_ids,

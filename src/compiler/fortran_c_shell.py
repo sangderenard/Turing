@@ -18309,6 +18309,44 @@ def _class_surface_ssa_program(
                 data.get("op") or data.get("type") or ""
             ).casefold()
             attributes = dict(data.get("attributes") or {})
+            precision_boundary = attributes.get(
+                "python_precision_boundary"
+            )
+            if precision_boundary is None:
+                from .identity_concordance import current_identity_book
+
+                scope = str(
+                    graph.graph.get("function_name")
+                    or graph.graph.get("qualified_name")
+                    or symbol
+                )
+                boundary_page = current_identity_book().page(
+                    "source_precision_boundary_concordance"
+                )
+                boundary_fact = boundary_page.latest((scope, value_id))
+                if boundary_fact is None:
+                    parent_ids = {
+                        int(parent)
+                        for parent, _role in data.get("parents") or ()
+                    }
+                    candidates = tuple(dict.fromkeys(
+                        tuple(candidate)
+                        for row in boundary_page.rows()
+                        for candidate in (boundary_page.latest(row),)
+                        if isinstance(row, tuple)
+                        and len(row) == 2
+                        and int(row[1]) == value_id
+                        and isinstance(candidate, tuple)
+                        and len(candidate) == 3
+                        and int(candidate[1]) in parent_ids
+                    ))
+                    if len(candidates) == 1:
+                        boundary_fact = candidates[0]
+                if (
+                    isinstance(boundary_fact, tuple)
+                    and len(boundary_fact) == 3
+                ):
+                    precision_boundary = str(boundary_fact[0])
             compare_op_canonical = None
             if (
                 operation in {"call", "plancall"}
@@ -18498,6 +18536,47 @@ def _class_surface_ssa_program(
                     value_id, operation, "carried-value"
                 ))
                 return None
+            if (
+                operation == "cast"
+                and precision_boundary
+            ):
+                operand_id = next((
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) in {"operand", "value"}
+                ), None)
+                if operand_id is None:
+                    structural_shortfalls.append((
+                        value_id, operation, "precision-boundary-operand"
+                    ))
+                    return None
+                operand = ensure_structural_value(operand_id)
+                if operand is None:
+                    structural_shortfalls.append((
+                        value_id, operation,
+                        f"precision-boundary-operand:{operand_id}",
+                    ))
+                    return None
+                values[value_id] = operand
+                prior_receipts = tuple(function.metadata.get(
+                    "control_identity_receipts", ()
+                ))
+                receipt = (
+                    value_id,
+                    int(operand.id),
+                    "python_precision_"
+                    + str(precision_boundary),
+                )
+                if receipt not in prior_receipts:
+                    function.metadata["control_identity_receipts"] = (
+                        *prior_receipts, receipt,
+                    )
+                if value_id != int(operand.id):
+                    _publish_concordant_function_aliases(
+                        function,
+                        {value_id: int(operand.id)},
+                    )
+                return operand
             if operation == "item":
                 operand_id = next((
                     int(parent)
@@ -35271,6 +35350,81 @@ def _class_surface_ssa_program(
     if return_edge_repairs:
         lowered_module.metadata["return_edge_recomputations"] = int(
             return_edge_repairs
+        )
+    # The whole-program ABI fixed point records source-call result shapes on
+    # ``value_shape`` before function-local SSA exists. Aggregate/call
+    # legalization can then mint the final SSA occurrence of that exact value
+    # after the ordinary metadata propagation pass has run. Materialize the
+    # concorded fact onto every final occurrence here, at the completed-module
+    # seam, so native backends see the same rank the call linker proved.
+    from .identity_concordance import (
+        authored_function_name as _authored_shape_owner,
+        current_identity_book as _current_shape_book,
+    )
+
+    _shape_book_instance = _current_shape_book()
+    _value_shape_page = _shape_book_instance.page("value_shape")
+    _ssa_shape_page = _shape_book_instance.page(
+        "ssa_shape_materialization"
+    )
+    _shape_materializations = []
+    for _function_name, _function in lowered_module.functions.items():
+        _owner = _authored_shape_owner(_function_name)
+        _occurrences: dict[int, list[Any]] = {}
+        for _value in (
+            *_function.args,
+            *(
+                value
+                for _block in _function.blocks.values()
+                for _instruction in _block.instrs
+                for value in (*_instruction.args, _instruction.res)
+                if value is not None
+            ),
+        ):
+            _occurrences.setdefault(int(_value.id), []).append(_value)
+        for _value_id, _values in _occurrences.items():
+            _fact = _value_shape_page.latest((_owner, int(_value_id)))
+            if not (
+                isinstance(_fact, tuple)
+                and len(_fact) >= 4
+                and str(_fact[0]) != "polymorphic"
+                and tuple(_fact[1] or ())
+            ):
+                continue
+            _shape = tuple(map(int, _fact[1]))
+            _dtype = str(_fact[2] or "")
+            _storage = str(_fact[3] or "")
+            for _value in {id(value): value for value in _values}.values():
+                _existing = tuple(_value.shape or ())
+                if _existing and _existing != _shape:
+                    raise ValueError(
+                        "concorded source/SSA shape disagreement for "
+                        f"{(_function_name, _value_id)!r}: "
+                        f"ssa={_existing!r}, concordance={_shape!r}"
+                    )
+                _value.shape = _shape
+                if _value.dtype is None and _dtype:
+                    _value.dtype = _dtype
+                _value.accounting.update({
+                    "program_abi_rank": len(_shape),
+                    "program_abi_storage": _storage or "span",
+                    "shape_materialized_from_concordance": True,
+                })
+            _row = (str(_function_name), int(_value_id))
+            _proposed = (_shape, _dtype, _storage, _owner)
+            _incumbent = _ssa_shape_page.latest(_row)
+            if _incumbent is not None and tuple(_incumbent) != _proposed:
+                raise ValueError(
+                    "SSA shape materialization concordance disagreement for "
+                    f"{_row!r}: recorded={_incumbent!r}, "
+                    f"proposed={_proposed!r}"
+                )
+            if _incumbent is None:
+                _ssa_shape_page.set(_row, 0, _proposed)
+            _shape_materializations.append(_row)
+    if _shape_materializations:
+        lowered_module.metadata["ssa_shape_materializations"] = tuple(
+            _shape_materializations
         )
     # Precision is one vertical compiler feature: the frontend names widened
     # arithmetic, the repository SSA proves exact reductions and materialises

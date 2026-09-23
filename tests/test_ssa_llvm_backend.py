@@ -359,6 +359,38 @@ def test_integer_scalar_domain_is_not_widened_through_double(tmp_path):
         )
 
 
+def test_multiblock_span_constants_fill_and_mixed_scalars_convert(tmp_path):
+    """Span fills and scalar broadcasts retain their physical dtypes."""
+
+    source = SSAValue(0, "float64", (4,))
+    negative_one = SSAValue(1, "int64")
+    zero_fill = SSAValue(2, "float64", (4,))
+    product = SSAValue(3, "float64", (4,))
+    function = Function("mixed_span_constants", [source], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], negative_one, attributes={"constant": -1}),
+            Instr("Const", [], zero_fill, attributes={"constant": 0.0}),
+            Instr("Br", [], None, attributes={"target": "work"}),
+        ], ["work"]),
+        "work": BasicBlock("work", [
+            Instr("Mul", [negative_one, source], product),
+            Instr("Ret", [zero_fill, product], None),
+        ]),
+    })
+
+    artifact = emit_ssa_function_to_llvm(
+        IRModule({function.name: function}), function.name,
+    )
+    assert artifact.shortfalls == ()
+    native = compile_artifact(artifact, directory=tmp_path / "mixed_span")
+    values = np.asarray([1.0e8, 3.0e5, 20.0, 7.0])
+    execution = prepare_artifact_execution(native, {source.id: values})
+    execution.run()
+
+    np.testing.assert_array_equal(execution.buffers[zero_fill.id], 0.0)
+    np.testing.assert_array_equal(execution.buffers[product.id], -values)
+
+
 def test_multi_axis_address_is_exact_or_named(tmp_path):
     """A 2-D span address is linearised from its extents, or refused.
 

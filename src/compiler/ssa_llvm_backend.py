@@ -1686,8 +1686,28 @@ def _emit_repository_call_module(
     # travels on -- then measure that buffer's axis once through the artifact's
     # existing extents vector. Nothing is inferred from names or positions.
     span_origin: dict[tuple[str, int], tuple[str, int]] = {}
+    precision_extent_origin: dict[
+        tuple[str, int], tuple[str, int]
+    ] = {}
     internal_callers: dict[str, set[str]] = {}
     for caller_name in reachable:
+        caller_function = module.functions[caller_name]
+        for value in (
+            *tuple(caller_function.args),
+            *tuple(
+                instruction.res
+                for block in caller_function.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+            ),
+        ):
+            source_id = (value.accounting or {}).get(
+                "precision_extent_source_id"
+            )
+            if source_id is not None:
+                precision_extent_origin[(
+                    str(caller_name), int(value.id)
+                )] = (str(caller_name), int(source_id))
         for block in module.functions[caller_name].blocks.values():
             for instruction in block.instrs:
                 if instruction.op != "Call":
@@ -1713,7 +1733,9 @@ def _emit_repository_call_module(
             if current in seen:
                 return None
             seen.add(current)
-            origin = span_origin.get(current)
+            origin = precision_extent_origin.get(current)
+            if origin is None:
+                origin = span_origin.get(current)
             if origin is None:
                 return None
             current = origin
@@ -1904,6 +1926,40 @@ def _emit_repository_call_module(
         register_cache: dict[str, tuple[str, str]] = {}
         _CACHEABLE_SLOT = ("%value.", "%out.", "%arg.")
 
+        def convert_loaded(
+            loaded: str, source_type: str, wanted: str, tag: str,
+        ) -> str:
+            """Convert an already-loaded scalar by the module's ABI rules."""
+
+            if source_type == wanted:
+                return loaded
+            converted = f"%convert.{tag}"
+            if wanted == "double" and source_type in {"i1", "i32", "i64"}:
+                opcode = "uitofp" if source_type == "i1" else "sitofp"
+                body.append(
+                    f"  {converted} = {opcode} {source_type} {loaded} to double"
+                )
+                return converted
+            if wanted in {"i32", "i64"} and source_type == "double":
+                body.append(
+                    f"  {converted} = fptosi double {loaded} to {wanted}"
+                )
+                return converted
+            if wanted == "i64" and source_type == "i32":
+                body.append(f"  {converted} = sext i32 {loaded} to i64")
+                return converted
+            if wanted == "i32" and source_type == "i64":
+                body.append(f"  {converted} = trunc i64 {loaded} to i32")
+                return converted
+            if wanted == "i1":
+                zero = "0.0" if source_type == "double" else "0"
+                comparison = "fcmp one" if source_type == "double" else "icmp ne"
+                body.append(
+                    f"  {converted} = {comparison} {source_type} {loaded}, {zero}"
+                )
+                return converted
+            return loaded
+
         def load_as(value: _Any, wanted: str, tag: str) -> str:
             slot_home = pointer(value)
             cached = (
@@ -1920,37 +1976,7 @@ def _emit_repository_call_module(
                 )
                 if _reuse_registers and slot_home.startswith(_CACHEABLE_SLOT):
                     register_cache[slot_home] = (loaded, source_type)
-            if source_type == wanted:
-                return loaded
-            converted = f"%convert.{tag}"
-            if wanted == "double" and source_type in {"i1", "i32", "i64"}:
-                opcode = "uitofp" if source_type == "i1" else "sitofp"
-                body.append(
-                    f"  {converted} = {opcode} {source_type} {loaded} to double"
-                )
-                return converted
-            if wanted in {"i32", "i64"} and source_type == "double":
-                body.append(
-                    f"  {converted} = fptosi double {loaded} to {wanted}"
-                )
-                return converted
-            # Integer width coercion.  An i32 induction against an int64 ABI
-            # cell (a keyed mapping's length slot) previously emitted a mixed
-            # icmp the LLVM verifier rejects.
-            if wanted == "i64" and source_type == "i32":
-                body.append(f"  {converted} = sext i32 {loaded} to i64")
-                return converted
-            if wanted == "i32" and source_type == "i64":
-                body.append(f"  {converted} = trunc i64 {loaded} to i32")
-                return converted
-            if wanted == "i1":
-                zero = "0.0" if source_type == "double" else "0"
-                comparison = "fcmp one" if source_type == "double" else "icmp ne"
-                body.append(
-                    f"  {converted} = {comparison} {source_type} {loaded}, {zero}"
-                )
-                return converted
-            return loaded
+            return convert_loaded(loaded, source_type, wanted, tag)
 
         scheduled_instructions = [
             (block_name, instruction)
@@ -2371,6 +2397,63 @@ def _emit_repository_call_module(
                             f"  {slot} = getelementptr i32, ptr {target}, i64 {index}"
                         )
                         body.append(f"  store i32 {int(item)}, ptr {slot}, align 4")
+                elif _declared_span_rank(result) > 0:
+                    # A scalar payload with a span result is a fill, not a
+                    # one-cell constant. Precision ABI expansion exposes the
+                    # sharpest form of this contract: an appended low limb is
+                    # ``+0`` at every lane. Initialising only lane zero leaves
+                    # the remaining limb values undefined and poisons the
+                    # exact section as soon as they are consumed. Measure the
+                    # span through the same concorded public-origin path used
+                    # by elementwise operations and materialise every cell.
+                    total = _span_element_count(
+                        name, result, tag, body,
+                        public_span_value, module_extent_slot,
+                    )
+                    if total is None:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation,
+                            f"span constant %t{result_id} needs its extents; "
+                            "refusing to initialise only one element",
+                        ))
+                        continue
+                    llvm_type = _value_llvm_type(result)
+                    entry_label = block_exit_label.get(
+                        active_block or "", active_block or "entry",
+                    )
+                    head = f"const.head.{tag}"
+                    loop_body = f"const.body.{tag}"
+                    done = f"const.done.{tag}"
+                    index = f"%const.i.{tag}"
+                    nxt = f"%const.next.{tag}"
+                    body.append(f"  br label %{head}")
+                    body.append(f"{head}:")
+                    body.append(
+                        f"  {index} = phi i32 [ 0, %{entry_label} ], "
+                        f"[ {nxt}, %{loop_body} ]"
+                    )
+                    body.append(
+                        f"  %const.more.{tag} = icmp slt i32 {index}, {total}"
+                    )
+                    body.append(
+                        f"  br i1 %const.more.{tag}, label %{loop_body}, "
+                        f"label %{done}"
+                    )
+                    body.append(f"{loop_body}:")
+                    body.append(
+                        f"  %const.dst.{tag} = getelementptr {llvm_type}, "
+                        f"ptr {target}, i32 {index}"
+                    )
+                    body.append(
+                        f"  store {llvm_type} {literal(payload, llvm_type)}, "
+                        f"ptr %const.dst.{tag}, align {_align(llvm_type)}"
+                    )
+                    body.append(f"  {nxt} = add i32 {index}, 1")
+                    body.append(f"  br label %{head}")
+                    body.append(f"{done}:")
+                    if active_block is not None:
+                        block_exit_label[active_block] = done
+                    register_cache.clear()
                 else:
                     llvm_type = _value_llvm_type(result)
                     body.append(
@@ -3588,23 +3671,29 @@ def _emit_repository_call_module(
                 operands = []
                 for position, argument in enumerate(instruction.args):
                     slot = f"%ew.op.{tag}.{position}"
+                    source_type = _value_llvm_type(argument)
                     if _declared_span_rank(argument) > 0:
                         body.append(
-                            f"  {slot}.addr = getelementptr {element_type}, "
+                            f"  {slot}.addr = getelementptr {source_type}, "
                             f"ptr {pointer(argument)}, i32 {index}"
                         )
                         body.append(
-                            f"  {slot} = load {element_type}, "
-                            f"ptr {slot}.addr, align 8"
+                            f"  {slot} = load {source_type}, "
+                            f"ptr {slot}.addr, align {_align(source_type)}"
                         )
                     else:
                         # A rank-0 operand broadcasts, which is what `+ 0.0`
-                        # over an array means.
+                        # over an array means. Load its own physical type;
+                        # interpreting an i64 literal's bits as a double makes
+                        # ``-1 * span`` a NaN before arithmetic even begins.
                         body.append(
-                            f"  {slot} = load {element_type}, "
-                            f"ptr {pointer(argument)}, align 8"
+                            f"  {slot} = load {source_type}, "
+                            f"ptr {pointer(argument)}, align {_align(source_type)}"
                         )
-                    operands.append(slot)
+                    operands.append(convert_loaded(
+                        slot, source_type, element_type,
+                        f"ew.{tag}.{position}",
+                    ))
                 computed = f"%ew.val.{tag}"
                 for rendered_line in template.format(
                     *operands, out=computed
@@ -5837,14 +5926,31 @@ def compile_artifact(
     library = build_dir / f"{artifact.name}.dll"
     # Same LLVM toolchain resolution the C backend uses: the ziglang package
     # bundles clang, invoked through the interpreter, no PATH assumptions.
+    import importlib.util as _importlib_util
     import sys as _sys
     optimization = str(optimization)
     if optimization not in {"O0", "O1", "O2", "O3", "Os", "Oz"}:
         raise ValueError(f"unsupported LLVM optimization level {optimization!r}")
     optimization_flag = f"-{optimization}"
-    command = [_sys.executable, "-m", "ziglang", "cc", "-shared",
-               optimization_flag,
-               "-o", str(library), str(source)]
+    ziglang_spec = _importlib_util.find_spec("ziglang")
+    zig_binary = None
+    if ziglang_spec is not None and ziglang_spec.submodule_search_locations:
+        package_root = _Path(next(iter(
+            ziglang_spec.submodule_search_locations
+        )))
+        candidate = package_root / (
+            "zig.exe" if _sys.platform == "win32" else "zig"
+        )
+        if candidate.is_file():
+            zig_binary = candidate
+    command = (
+        [str(zig_binary)]
+        if zig_binary is not None
+        else [_sys.executable, "-m", "ziglang"]
+    ) + [
+        "cc", "-shared", optimization_flag,
+        "-o", str(library), str(source),
+    ]
     if _fma_contract_enabled():
         # The module names no target, so contraction permission alone reaches
         # no FMA unit; name the host. Same switch as the `contract` flag.

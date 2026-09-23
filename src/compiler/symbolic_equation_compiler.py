@@ -19,7 +19,10 @@ import sympy
 from .hierarchical_plan import PREDICATE_OPERATIONS
 from .ir_identities import reduce_constant_exponent_pow
 from .ssa_builder import process_graph_to_ssa_instrs
-from .symbolic_process_graph import ingest_sympy_expressions
+from .symbolic_process_graph import (
+    ingest_sympy_expression,
+    ingest_sympy_expressions,
+)
 from .sympy_dual_ir_cache import SympyDualIRCache
 from ..common.tensors.accelerator_backends.aot_checkpoint import callable_digest
 from ..common.tensors.accelerator_backends.artifact_cache import implementation_digest
@@ -376,6 +379,7 @@ def _pipeline_implementation() -> str:
 
     return callable_digest(
         _compile_sympy_equations_uncached,
+        ingest_sympy_expression,
         ingest_sympy_expressions,
         process_graph_to_ssa_instrs,
         reduce_constant_exponent_pow,

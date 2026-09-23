@@ -2031,6 +2031,124 @@ def _shader_fusible_node_ids(
     return tuple(fusible)
 
 
+def _precision_indivisible_node_groups(
+    graph: Any,
+    executable_node_ids: Iterable[int],
+) -> tuple[tuple[int, ...], ...]:
+    """Reserve each concorded Precision interval as one compiler region.
+
+    Precision limbs are not independent region values. The source
+    concordance is the authority for both boundaries and every
+    precision-bearing interior value. Connected components of those facts
+    are therefore the exact non-separable units supplied to the ordinary
+    region reducer; source ranges and backend operator lists are irrelevant.
+    """
+
+    from .identity_concordance import current_identity_book
+
+    executable = {
+        int(node_id) for node_id in executable_node_ids
+        if int(node_id) in graph.G
+    }
+    if not executable:
+        return ()
+    scope = str(
+        graph.G.graph.get("function_name")
+        or graph.G.graph.get("qualified_name")
+        or "<module>"
+    )
+    book = current_identity_book()
+    class_page = book.page("source_value_class_concordance")
+    boundary_page = book.page("source_precision_boundary_concordance")
+    precision_values = {
+        int(row[1])
+        for row in class_page.rows()
+        for fact in (class_page.latest(row),)
+        if (
+            isinstance(row, tuple)
+            and len(row) == 2
+            and str(row[0]) == scope
+            and int(row[1]) in executable
+            and isinstance(fact, tuple)
+            and len(fact) >= 2
+            and str(fact[0]).rsplit(".", 1)[-1] == "Precision"
+        )
+    }
+    boundaries = {
+        int(row[1]): (str(fact[0]), int(fact[1]), int(fact[2]))
+        for row in boundary_page.rows()
+        for fact in (boundary_page.latest(row),)
+        if (
+            isinstance(row, tuple)
+            and len(row) == 2
+            and str(row[0]) == scope
+            and int(row[1]) in graph.G
+            and isinstance(fact, tuple)
+            and len(fact) == 3
+        )
+    }
+    members = precision_values | set(boundaries)
+    if len(members) < 2:
+        return ()
+
+    semantic = nx.Graph()
+    semantic.add_nodes_from(members)
+    for node_id in members:
+        for parent, _role in graph.G.nodes[node_id].get("parents", ()):
+            parent = int(parent)
+            if parent in members:
+                semantic.add_edge(parent, node_id)
+        for parent in graph.G.predecessors(node_id):
+            if int(parent) in members:
+                semantic.add_edge(int(parent), node_id)
+
+    region_page = book.page("source_precision_region_concordance")
+    groups = []
+    order = {
+        int(node_id): index
+        for index, node_id in enumerate(_dependency_order(graph))
+    }
+    for component in nx.connected_components(semantic):
+        component_boundaries = {
+            node_id: boundaries[node_id]
+            for node_id in component if node_id in boundaries
+        }
+        promotes = tuple(sorted(
+            node_id for node_id, fact in component_boundaries.items()
+            if fact[0] == "promote"
+        ))
+        collapses = tuple(sorted(
+            node_id for node_id, fact in component_boundaries.items()
+            if fact[0] == "collapse"
+        ))
+        if not promotes or not collapses:
+            continue
+        ordered = tuple(sorted(
+            component.intersection(executable), key=order.__getitem__,
+        ))
+        if len(ordered) < 2:
+            continue
+        widths = tuple(sorted({
+            int(fact[2]) for fact in component_boundaries.values()
+        }))
+        row = (scope, collapses[-1])
+        proposed = (ordered, promotes, collapses, widths)
+        incumbent = region_page.latest(row)
+        if incumbent is not None and tuple(incumbent) != proposed:
+            raise ValueError(
+                "source precision region concordance disagreement for "
+                f"{row!r}: recorded={incumbent!r}, proposed={proposed!r}"
+            )
+        if incumbent is None:
+            region_page.set(row, 0, proposed)
+        for node_id in ordered:
+            graph.G.nodes[node_id].setdefault("attributes", {})[
+                "source_precision_region"
+            ] = row
+        groups.append(ordered)
+    return tuple(groups)
+
+
 def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
     """Freeze call/region ownership before backend source composition."""
 
@@ -6563,6 +6681,19 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
 
 def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
     data = graph.G.nodes[node_id]
+    precision_operator = (data.get("attributes") or {}).get(
+        "python_precision_operator"
+    )
+    if precision_operator is True:
+        # The authored syntax is a method call, but the concorded rewrite has
+        # already made this a repository precision operator. It is numerical
+        # region work, not a coordinator call. Its detached Attribute node is
+        # separately marked ``*-selector`` and remains metadata.
+        return False
+    if isinstance(precision_operator, str) and precision_operator.endswith(
+        "-selector"
+    ):
+        return True
     if (data.get("attributes") or {}).get("authored_call_result_projection"):
         # Specialization publishes typed leaves of a callee's tuple return.
         # Their tensor descriptors describe the payload, not a tensor gather
@@ -16747,6 +16878,8 @@ def _resolve_bound_function_references(graph: Any) -> None:
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}
         if (
+            attributes.get("python_precision_boundary")
+            or
             attributes.get("callee_ref") is not None
             or attributes.get("method_ref") is not None
         ):
@@ -17360,6 +17493,15 @@ def _tensor_descriptor_rule(
         or data.get("type")
         or ""
     ).casefold()
+    if descriptor_operation.startswith("precision_"):
+        precision_operation = descriptor_operation.removeprefix(
+            "precision_"
+        )
+        if precision_operation in (
+            _ELEMENTWISE_BINARY_OPERATIONS
+            | {"neg", "abs"}
+        ):
+            descriptor_operation = precision_operation
     provisional_tensor = None
     if (
         graph.G.graph.get("planner_tensor_descriptors")
@@ -21242,6 +21384,32 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         graph.G.graph.get("parameter_record_abi") or {}
     )
 
+    def source_expression_identity(expression: ast.AST) -> tuple[Any, ...]:
+        """Identify one authored expression across copied AST instances."""
+
+        return (
+            type(expression).__name__,
+            getattr(expression, "lineno", None),
+            getattr(expression, "col_offset", None),
+            getattr(expression, "end_lineno", None),
+            getattr(expression, "end_col_offset", None),
+            ast.dump(expression, include_attributes=False),
+        )
+
+    precision_boundary_selectors = {
+        source_expression_identity(expression.func)
+        for _node_id, data in graph.G.nodes(data=True)
+        for expression in (data.get("expr_obj"),)
+        if (
+            (data.get("attributes") or {}).get("python_precision_boundary")
+            or (data.get("attributes") or {}).get(
+                "python_precision_operator"
+            )
+        )
+        and isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+    }
+
     def declared_parameter_class(binding_name: str | None) -> str | None:
         """Resolve a receiver from its explicit program-ABI record identity."""
 
@@ -21350,7 +21518,18 @@ def _resolve_grounded_method_references(graph: Any) -> None:
 
     bound_selectors = {}
     for node_id, data in graph.G.nodes(data=True):
+        attributes = data.get("attributes") or {}
         expression = data.get("expr_obj")
+        if (
+            attributes.get("python_precision_boundary")
+            or attributes.get("python_precision_operator")
+            or isinstance(expression, ast.Attribute)
+            and source_expression_identity(expression)
+            in precision_boundary_selectors
+        ):
+            for key in ("bound_method_ref", "method_ref", "callee_ref"):
+                attributes.pop(key, None)
+            continue
         roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
         receiver_id, method_name, receiver_expression = None, None, None
         if isinstance(expression, ast.Attribute):
@@ -21423,7 +21602,9 @@ def _resolve_grounded_method_references(graph: Any) -> None:
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}
         if (
-            attributes.get("callee_ref") is not None
+            attributes.get("python_precision_boundary")
+            or attributes.get("python_precision_operator")
+            or attributes.get("callee_ref") is not None
             or attributes.get("method_ref") is not None
         ):
             continue
@@ -25224,6 +25405,9 @@ def strategize_shell_deployment(
         partition_keys=partition_keys,
         extra_dependency_edges=closure_edges,
         fusible_node_ids=_shader_fusible_node_ids(
+            graph, executable_nodes,
+        ),
+        indivisible_node_groups=_precision_indivisible_node_groups(
             graph, executable_nodes,
         ),
         control_node_ids=recursion_control_nodes,

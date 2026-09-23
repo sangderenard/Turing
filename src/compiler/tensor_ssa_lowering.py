@@ -1658,7 +1658,38 @@ def lower_tensor_calls_to_repository_ssa(
     # identities to the shared concordance after the region was first built;
     # transfer that exact contract onto every occurrence before tensor
     # recognition.  This is identity transport, not shape inference.
-    shape_page = identity_book(module).pages.get("tensor_shape_concordance")
+    book = identity_book(module)
+    shape_page = book.pages.get("tensor_shape_concordance")
+    precision_region_page = book.pages.get(
+        "source_precision_region_concordance"
+    )
+
+    def is_concorded_precision_operator(instruction: Instr) -> bool:
+        """Whether this operation belongs to an indivisible Precision region.
+
+        Precision arithmetic is expanded by ``apply_precision_pipeline`` after
+        repository tensor lowering. Treating one of its shaped operations as
+        an ordinary tensor opcode here severs the region: for example,
+        ``precision_sqrt`` becomes ``unary_double`` and can no longer consume
+        or produce the region's limb representation. The source concordance,
+        rather than an opcode allow-list, owns the exception.
+        """
+
+        if (
+            not instruction.attributes.get("python_precision_operator")
+            or instruction.res is None
+            or precision_region_page is None
+        ):
+            return False
+        raw_row = instruction.attributes.get("source_precision_region")
+        if not isinstance(raw_row, (tuple, list)) or len(raw_row) != 2:
+            return False
+        row = (str(raw_row[0]), int(raw_row[1]))
+        fact = precision_region_page.latest(row)
+        if not isinstance(fact, tuple) or len(fact) != 4:
+            return False
+        members = tuple(map(int, fact[0]))
+        return int(instruction.res.id) in members
 
     # Seed formals from the call graph so the metadata fixed point can lower
     # operations whose callee-local occurrences began empty.  These are
@@ -2135,6 +2166,12 @@ def lower_tensor_calls_to_repository_ssa(
                 instruction = dataclasses.replace(
                     original, args=[resolve(argument) for argument in original.args]
                 )
+                # A shaped operation inside a concorded Precision region is
+                # not independently lowerable. Preserve it for the compiler's
+                # limb pipeline, which expands the entire region later.
+                if is_concorded_precision_operator(instruction):
+                    rewritten.append(instruction)
+                    continue
                 if (
                     instruction.op in {"Call", "call"}
                     and instruction.attributes.get("call_role_set") == "blas"

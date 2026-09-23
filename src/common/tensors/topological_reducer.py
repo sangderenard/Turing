@@ -52,6 +52,81 @@ from ...transmogrifier.graph.node_special_cases import tensor_annotation_identit
 logger = logging.getLogger(__name__)
 
 
+def _concord_source_value_class(
+    scope: str,
+    value_id: int,
+    class_identity: str,
+    *,
+    precision_limbs: int = 1,
+    source: str,
+) -> tuple[str, int]:
+    """Commit the class and precision width carried by a source value."""
+
+    page = current_identity_book().page("source_value_class_concordance")
+    row = (str(scope), int(value_id))
+    proposed = (str(class_identity), max(int(precision_limbs or 1), 1))
+    incumbent = page.latest(row)
+    if incumbent is not None:
+        recorded = (str(incumbent[0]), int(incumbent[1]))
+        if recorded != proposed:
+            raise ValueError(
+                "source value class concordance disagreement for "
+                f"{scope!r} value {value_id}: recorded={recorded!r}, "
+                f"{source} says {proposed!r}"
+            )
+        return recorded
+    page.set(row, 0, (*proposed, str(source)))
+    return proposed
+
+
+def _resolved_source_value_class(
+    graph: Any,
+    value_id: Any,
+) -> tuple[str | None, int]:
+    target = getattr(graph, "G", graph)
+    if not isinstance(value_id, int) or value_id not in target:
+        return None, 1
+    attributes = target.nodes[value_id].get("attributes") or {}
+    class_identity = attributes.get(
+        "result_class_ref", attributes.get("class_ref")
+    )
+    limbs = max(int(attributes.get("precision_limbs") or 1), 1)
+    return (
+        None if class_identity is None else str(class_identity),
+        limbs,
+    )
+
+
+def _concord_source_precision_boundary(
+    scope: str,
+    value_id: int,
+    boundary: str,
+    operand_id: int,
+    *,
+    precision_limbs: int,
+) -> tuple[str, int, int]:
+    """Commit one authored Precision boundary independently of graph copies."""
+
+    page = current_identity_book().page(
+        "source_precision_boundary_concordance"
+    )
+    row = (str(scope), int(value_id))
+    proposed = (
+        str(boundary),
+        int(operand_id),
+        max(int(precision_limbs or 1), 1),
+    )
+    incumbent = page.latest(row)
+    if incumbent is not None and tuple(incumbent) != proposed:
+        raise ValueError(
+            "source precision boundary concordance disagreement for "
+            f"{row!r}: recorded={incumbent!r}, proposed={proposed!r}"
+        )
+    if incumbent is None:
+        page.set(row, 0, proposed)
+    return proposed
+
+
 def _concorded_static_parameter_bindings(
     definition: Any,
     parameter_names: tuple[str, ...],
@@ -524,8 +599,9 @@ PRECISION_TYPE_ALIASES = {"double": "float64", "float": "float32",
                           "f64": "float64", "f32": "float32", "f16": "float16"}
 
 #: Operations closed over the limb representation. A sum, difference,
-#: product, quotient or negation of limbed values IS a limbed value, so each
-#: has a wider counterpart meaning the same thing. Nothing else belongs: there
+#: product, quotient, square root or negation of limbed values IS a limbed
+#: value, so each has a wider counterpart meaning the same thing. Nothing else
+#: belongs: there
 #: is no wider form of a reduction or a reshape that would be right, so those
 #: keep their ordinary name and a destination refuses the operand rather than
 #: reading its limbs as channels.
@@ -533,7 +609,9 @@ PRECISION_TYPE_ALIASES = {"double": "float64", "float": "float32",
 #: uniform -- four are capitalised and ``neg`` is not, and there is no
 #: ``truediv`` at this layer, only ``Div``. Keying on a tidied-up spelling
 #: silently misses and falls through to the ordinary operation.
-PRECISION_CLOSED_OPERATIONS = ("Add", "Sub", "Mul", "Div", "neg")
+PRECISION_CLOSED_OPERATIONS = (
+    "Add", "Sub", "Mul", "Div", "Sqrt", "neg",
+)
 
 #: The greatest width a generated name is provided for.
 PRECISION_LIMB_LIMIT = 8
@@ -1187,6 +1265,10 @@ def _normalize_lexical_values(
     attribute_value_nodes: dict[tuple[int, str], int] = {}
     parameter_names = set(function_parameter_names(statement))
     static_parameter_bindings = dict(static_parameter_bindings or {})
+    value_class_scope = str(
+        graph.G.graph.get("function_name")
+        or getattr(statement, "name", "<function>")
+    )
     # A parameter annotated with a locally-defined class name gives a
     # receiver a real, known class identity at ingestion -- enough to
     # resolve ``receiver.attr`` through the class's own navigation table
@@ -2970,6 +3052,37 @@ def _normalize_lexical_values(
                             closure_value, f"closure:{closure_name}",
                         ))
                 _replace_inputs(graph, node_id, tuple(resolved_inputs))
+                result_class = call_attributes.get(
+                    "result_class_ref", call_attributes.get("class_ref")
+                )
+                if result_class is not None:
+                    precision_limbs = int(
+                        call_attributes.get("precision_limbs") or 1
+                    )
+                    if (
+                        str(result_class).rsplit(".", 1)[-1]
+                        in {"Precision", "ComplexPrecision"}
+                        and isinstance(expression.func, ast.Attribute)
+                        and expression.func.attr == "of"
+                    ):
+                        precision_limbs = 2
+                        if len(expression.args) >= 2:
+                            try:
+                                precision_limbs = int(ast.literal_eval(
+                                    expression.args[1]
+                                ))
+                            except (ValueError, TypeError):
+                                pass
+                        call_attributes["precision_limbs"] = max(
+                            precision_limbs, 1
+                        )
+                    _concord_source_value_class(
+                        value_class_scope,
+                        node_id,
+                        str(result_class),
+                        precision_limbs=precision_limbs,
+                        source="resolved call result",
+                    )
                 if (
                     isinstance(expression.func, ast.Attribute)
                     and expression.func.attr == "setdefault"
@@ -6626,12 +6739,20 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         known_record_classes = {
             str(owner) for owner, _field in class_field_aggregate_kinds
         }
-        declared_class = (
+        declared_spelling = (
             definition.returns.id
             if isinstance(definition.returns, ast.Name)
+            else definition.returns.value
+            if isinstance(definition.returns, ast.Constant)
+            and isinstance(definition.returns.value, str)
+            else None
+        )
+        declared_class = (
+            str(declared_spelling)
+            if declared_spelling is not None
             and (
-                definition.returns.id in graph.G.graph["class_table"]
-                or definition.returns.id in known_record_classes
+                str(declared_spelling) in graph.G.graph["class_table"]
+                or str(declared_spelling) in known_record_classes
             )
             else None
         )
@@ -6673,6 +6794,8 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             if not isinstance(expression, ast.Call):
                 continue
             attributes = call_data.setdefault("attributes", {})
+            if attributes.get("python_precision_boundary"):
+                continue
             # Method calls can already have their exact source reference even
             # when the later generic call-correlation pass has not mirrored
             # it into ``callee_ref`` yet.  Both fields name the same function
@@ -6694,6 +6817,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             if (
                 not isinstance(expression, ast.Call)
                 or not isinstance(expression.func, ast.Attribute)
+                or attributes.get("python_precision_boundary")
                 or attributes.get("method_ref") is not None
             ):
                 continue
@@ -6726,10 +6850,437 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             if accessor_id in target_graph:
                 target_graph.nodes[accessor_id].setdefault(
                     "attributes", {}
-                ).update({
-                    "accessor_kind": "method",
+                    ).update({
+                        "accessor_kind": "method",
+                        "method_ref": method_reference,
+                    })
+
+    binary_special_methods = {
+        ast.Add: ("__add__", "__radd__"),
+        ast.Sub: ("__sub__", "__rsub__"),
+        ast.Mult: ("__mul__", "__rmul__"),
+        ast.Div: ("__truediv__", "__rtruediv__"),
+        ast.FloorDiv: ("__floordiv__", "__rfloordiv__"),
+        ast.Mod: ("__mod__", "__rmod__"),
+        ast.Pow: ("__pow__", "__rpow__"),
+        ast.MatMult: ("__matmul__", "__rmatmul__"),
+        ast.BitAnd: ("__and__", "__rand__"),
+        ast.BitOr: ("__or__", "__ror__"),
+        ast.BitXor: ("__xor__", "__rxor__"),
+        ast.LShift: ("__lshift__", "__rlshift__"),
+        ast.RShift: ("__rshift__", "__rrshift__"),
+    }
+    unary_special_methods = {
+        ast.USub: "__neg__",
+        ast.UAdd: "__pos__",
+        ast.Invert: "__invert__",
+    }
+
+    def lower_class_operator_calls(target_wrapper: Any) -> None:
+        """Bind authored operators through the receiver's class table.
+
+        Lexical normalization has already replaced every Name occurrence by
+        its exact producer at this seam.  Consequently the receiver edge, not
+        a source spelling or an operand position guessed later, determines
+        whether Python's class dispatch applies.  The concordance row commits
+        that decision once for all later call planning and storage binding.
+        """
+
+        target_graph = target_wrapper.G
+        scope = str(target_graph.graph.get("function_name") or "<module>")
+        class_table = graph.G.graph.get("class_table", {})
+        page = current_identity_book().page(
+            "source_operator_dispatch_concordance"
+        )
+
+        def descriptor(value_id: Any) -> tuple[str | None, int]:
+            return _resolved_source_value_class(target_graph, value_id)
+
+        def commit(
+            node_id: int,
+            receiver_id: int,
+            class_identity: str,
+            method_name: str,
+            method_reference: int,
+            reflected: bool,
+        ) -> None:
+            fact = (
+                int(receiver_id), str(class_identity), str(method_name),
+                int(method_reference), bool(reflected),
+            )
+            row = (scope, int(node_id))
+            incumbent = page.latest(row)
+            if incumbent is not None and tuple(incumbent) != fact:
+                raise ValueError(
+                    "source operator dispatch concordance disagreement for "
+                    f"{row!r}: recorded={incumbent!r}, proposed={fact!r}"
+                )
+            if incumbent is None:
+                page.set(row, 0, fact)
+
+        changed = True
+        while changed:
+            changed = False
+            for node_id, data in tuple(target_graph.nodes(data=True)):
+                expression = data.get("expr_obj")
+                attributes = data.setdefault("attributes", {})
+                if (
+                    attributes.get("class_operator_dispatch")
+                    or attributes.get("python_precision_operator")
+                ):
+                    continue
+                parents = {
+                    str(role): int(parent)
+                    for parent, role in data.get("parents", ())
+                    if int(parent) in target_graph
+                }
+                receiver_id = other_id = None
+                class_identity = method_name = None
+                reflected = False
+                if isinstance(expression, ast.BinOp):
+                    methods = binary_special_methods.get(type(expression.op))
+                    left_id = parents.get("lhs")
+                    right_id = parents.get("rhs")
+                    if methods is None or left_id is None or right_id is None:
+                        continue
+                    left_class, _left_limbs = descriptor(left_id)
+                    right_class, _right_limbs = descriptor(right_id)
+                    candidates = (
+                        (left_id, right_id, left_class, methods[0], False),
+                        (right_id, left_id, right_class, methods[1], True),
+                    )
+                    selected = next((
+                        candidate for candidate in candidates
+                        if candidate[2] is not None
+                        and class_table.get(str(candidate[2]), {})
+                        .get("methods", {}).get(candidate[3]) is not None
+                    ), None)
+                    if selected is None:
+                        continue
+                    (
+                        receiver_id, other_id, class_identity,
+                        method_name, reflected,
+                    ) = selected
+                elif isinstance(expression, ast.UnaryOp):
+                    method_name = unary_special_methods.get(type(expression.op))
+                    receiver_id = parents.get("operand")
+                    if method_name is None or receiver_id is None:
+                        continue
+                    class_identity, _limbs = descriptor(receiver_id)
+                    if (
+                        class_identity is None
+                        or class_table.get(str(class_identity), {})
+                        .get("methods", {}).get(method_name) is None
+                    ):
+                        continue
+                else:
+                    continue
+                method_reference = int(
+                    class_table[str(class_identity)]["methods"][method_name]
+                )
+                returned_class = returned_class_by_reference.get(
+                    method_reference
+                )
+                attributes.update({
+                    "source_type": type(expression).__name__,
+                    "class_operator_dispatch": True,
+                    "operator_receiver_class": str(class_identity),
+                    "operator_method": str(method_name),
+                    "operator_reflected": bool(reflected),
                     "method_ref": method_reference,
+                    "callee_ref": method_reference,
                 })
+                if returned_class is not None:
+                    attributes["result_class_ref"] = str(returned_class)
+                    _concord_source_value_class(
+                        scope,
+                        int(node_id),
+                        str(returned_class),
+                        precision_limbs=max(
+                            descriptor(receiver_id)[1],
+                            descriptor(other_id)[1]
+                            if other_id is not None else 1,
+                        ),
+                        source=f"operator method {method_name}",
+                    )
+                data["type"] = "Call"
+                data["op"] = "call"
+                call_inputs = [(int(receiver_id), "operand")]
+                if other_id is not None:
+                    call_inputs.append((int(other_id), "arg:0"))
+                _replace_inputs(
+                    target_wrapper, int(node_id), tuple(call_inputs)
+                )
+                commit(
+                    int(node_id), int(receiver_id), str(class_identity),
+                    str(method_name), method_reference, bool(reflected),
+                )
+                changed = True
+
+    def lower_python_precision(target_wrapper: Any) -> None:
+        """Lower the authored Precision surface to its repository operators.
+
+        ``Precision.of`` and ``collapse`` are boundary declarations, not
+        runtime calls into the eager Python implementation.  The former
+        commits the class/width descriptor carried by that source occurrence;
+        the latter consumes it.  Arithmetic between those boundaries is the
+        existing ``precision_*`` vocabulary consumed by
+        ``apply_precision_pipeline``.  This pass runs only after lexical
+        normalization, so every descriptor follows the exact producer edge.
+        """
+
+        target_graph = target_wrapper.G
+        scope = str(target_graph.graph.get("function_name") or "<module>")
+
+        def is_real_precision(identity: Any) -> bool:
+            return (
+                identity is not None
+                and str(identity).rsplit(".", 1)[-1] == "Precision"
+            )
+
+        for node_id, data in tuple(target_graph.nodes(data=True)):
+            expression = data.get("expr_obj")
+            if not (
+                isinstance(expression, ast.Call)
+                and isinstance(expression.func, ast.Attribute)
+            ):
+                continue
+            attributes = data.setdefault("attributes", {})
+            parents = tuple(data.get("parents", ()))
+            if (
+                expression.func.attr == "of"
+                and is_real_precision(attributes.get(
+                    "result_class_ref", attributes.get("class_ref")
+                ))
+            ):
+                value_id = next((
+                    int(parent) for parent, role in parents
+                    if str(role) in {"arg:0", "arg0"}
+                ), None)
+                if value_id is None:
+                    continue
+                limbs = 2
+                if len(expression.args) >= 2:
+                    try:
+                        limbs = max(int(ast.literal_eval(expression.args[1])), 1)
+                    except (TypeError, ValueError, SyntaxError):
+                        continue
+                class_identity = str(attributes.get(
+                    "result_class_ref", attributes.get("class_ref")
+                ))
+                attributes.update({
+                    "precision_limbs": limbs,
+                    "result_class_ref": class_identity,
+                    "python_precision_boundary": "promote",
+                })
+                for field in (
+                    "callee_ref", "method_ref", "constructor_ref", "class_ref",
+                ):
+                    attributes.pop(field, None)
+                accessor_id = id(expression.func)
+                if accessor_id in target_graph:
+                    accessor_attributes = target_graph.nodes[
+                        accessor_id
+                    ].setdefault("attributes", {})
+                    for field in (
+                        "callee_ref", "method_ref", "bound_method_ref",
+                    ):
+                        accessor_attributes.pop(field, None)
+                    accessor_attributes[
+                        "python_precision_boundary"
+                    ] = "promote-selector"
+                data["type"] = "Cast"
+                data["op"] = "Cast"
+                _replace_inputs(
+                    target_wrapper, int(node_id), ((value_id, "operand"),)
+                )
+                _concord_source_value_class(
+                    scope, int(node_id), class_identity,
+                    precision_limbs=limbs,
+                    source="Precision.of boundary",
+                )
+                _concord_source_precision_boundary(
+                    scope,
+                    int(node_id),
+                    "promote",
+                    int(value_id),
+                    precision_limbs=limbs,
+                )
+
+        changed = True
+        while changed:
+            changed = False
+            for node_id, data in tuple(target_graph.nodes(data=True)):
+                expression = data.get("expr_obj")
+                if not isinstance(expression, (ast.BinOp, ast.UnaryOp)):
+                    continue
+                attributes = data.setdefault("attributes", {})
+                if attributes.get("python_precision_operator"):
+                    continue
+                parents = {
+                    str(role): int(parent)
+                    for parent, role in data.get("parents", ())
+                    if int(parent) in target_graph
+                }
+                if isinstance(expression, ast.BinOp):
+                    operand_ids = (
+                        parents.get("lhs"), parents.get("rhs")
+                    )
+                    if None in operand_ids:
+                        continue
+                    descriptors = tuple(
+                        _resolved_source_value_class(target_graph, value_id)
+                        for value_id in operand_ids
+                    )
+                    precision = tuple(
+                        item for item in descriptors
+                        if is_real_precision(item[0])
+                    )
+                    if not precision:
+                        continue
+                    limbs = max(item[1] for item in precision)
+                    operation = _qualified_handler(
+                        "binop", expression.op, limbs=limbs
+                    )
+                else:
+                    operand_id = parents.get("operand")
+                    if operand_id is None:
+                        continue
+                    class_identity, limbs = _resolved_source_value_class(
+                        target_graph, operand_id
+                    )
+                    if not is_real_precision(class_identity):
+                        continue
+                    operation = _qualified_handler(
+                        "unaryop", expression.op, limbs=limbs
+                    )
+                class_identity = str(precision[0][0]) if isinstance(
+                    expression, ast.BinOp
+                ) else str(class_identity)
+                data["type"] = operation
+                data["op"] = operation
+                attributes.update({
+                    "python_precision_operator": True,
+                    "precision_limbs": int(limbs),
+                    "result_class_ref": class_identity,
+                })
+                _concord_source_value_class(
+                    scope, int(node_id), class_identity,
+                    precision_limbs=int(limbs),
+                    source=f"Precision {type(expression).__name__}",
+                )
+                changed = True
+
+        for node_id, data in tuple(target_graph.nodes(data=True)):
+            expression = data.get("expr_obj")
+            if not (
+                isinstance(expression, ast.Call)
+                and isinstance(expression.func, ast.Attribute)
+                and expression.func.attr == "sqrt"
+            ):
+                continue
+            receiver_id = next((
+                int(parent) for parent, role in data.get("parents", ())
+                if str(role) in {"operand", "receiver", "value"}
+            ), None)
+            if receiver_id is None:
+                continue
+            receiver_class, receiver_limbs = (
+                _resolved_source_value_class(target_graph, receiver_id)
+            )
+            if not is_real_precision(receiver_class):
+                continue
+            operation = PRECISION_SINGULAR_NAMES["Sqrt"]
+            attributes = data.setdefault("attributes", {})
+            attributes.update({
+                "python_precision_operator": True,
+                "precision_limbs": int(receiver_limbs),
+                "result_class_ref": str(receiver_class),
+                "precision_source_operation": "Sqrt",
+            })
+            for field in (
+                "callee_ref", "method_ref", "constructor_ref", "class_ref",
+            ):
+                attributes.pop(field, None)
+            accessor_id = id(expression.func)
+            if accessor_id in target_graph:
+                accessor_attributes = target_graph.nodes[
+                    accessor_id
+                ].setdefault("attributes", {})
+                for field in (
+                    "callee_ref", "method_ref", "bound_method_ref",
+                ):
+                    accessor_attributes.pop(field, None)
+                accessor_attributes["python_precision_operator"] = (
+                    "sqrt-selector"
+                )
+            data["type"] = operation
+            data["op"] = operation
+            _replace_inputs(
+                target_wrapper,
+                int(node_id),
+                ((int(receiver_id), "operand"),),
+            )
+            _concord_source_value_class(
+                scope, int(node_id), str(receiver_class),
+                precision_limbs=int(receiver_limbs),
+                source="Precision sqrt",
+            )
+
+        for node_id, data in tuple(target_graph.nodes(data=True)):
+            expression = data.get("expr_obj")
+            if not (
+                isinstance(expression, ast.Call)
+                and isinstance(expression.func, ast.Attribute)
+                and expression.func.attr == "collapse"
+            ):
+                continue
+            receiver_id = next((
+                int(parent) for parent, role in data.get("parents", ())
+                if str(role) == "operand"
+            ), None)
+            if receiver_id is None:
+                continue
+            receiver_class, receiver_limbs = (
+                _resolved_source_value_class(target_graph, receiver_id)
+            )
+            if not is_real_precision(receiver_class):
+                continue
+            data.setdefault("attributes", {}).update({
+                "python_precision_boundary": "collapse",
+                "precision_limbs": int(receiver_limbs),
+            })
+            attributes = data["attributes"]
+            for field in (
+                "callee_ref", "method_ref", "constructor_ref", "class_ref",
+            ):
+                attributes.pop(field, None)
+            accessor_id = id(expression.func)
+            if accessor_id in target_graph:
+                accessor_attributes = target_graph.nodes[
+                    accessor_id
+                ].setdefault("attributes", {})
+                for field in (
+                    "callee_ref", "method_ref", "bound_method_ref",
+                ):
+                    accessor_attributes.pop(field, None)
+                accessor_attributes[
+                    "python_precision_boundary"
+                ] = "collapse-selector"
+            data["type"] = "Cast"
+            data["op"] = "Cast"
+            _replace_inputs(
+                target_wrapper,
+                int(node_id),
+                ((int(receiver_id), "operand"),),
+            )
+            _concord_source_precision_boundary(
+                scope,
+                int(node_id),
+                "collapse",
+                int(receiver_id),
+                precision_limbs=int(receiver_limbs),
+            )
 
     propagated_graphs = {id(graph.G)}
     propagate_returned_receiver_types(graph.G)
@@ -8137,6 +8688,12 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             # only after lexical normalization. Canonicalize its attribute
             # read at this post-extraction seam as well as on the root graph.
             normalize_python_attribute_special_cases(entry_wrapper)
+            propagate_returned_receiver_types(entry_graph)
+            lower_python_precision(entry_wrapper)
+            lower_class_operator_calls(entry_wrapper)
+            # Operator calls can themselves return class instances.  Resolve
+            # a following method (for example ``wide_product.collapse()``)
+            # from the just-concorded result identity before call planning.
             propagate_returned_receiver_types(entry_graph)
     # External call references and static Python bindings are two views of the
     # same compile-time environment.  Join them once after every call has been

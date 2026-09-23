@@ -1888,13 +1888,40 @@ def lower_precision_operations(
     sub_name = PRECISION_SINGULAR_NAMES["Sub"]
     mul_name = PRECISION_SINGULAR_NAMES["Mul"]
     div_name = PRECISION_SINGULAR_NAMES["Div"]
+    sqrt_name = PRECISION_SINGULAR_NAMES["Sqrt"]
     neg_name = PRECISION_SINGULAR_NAMES["neg"]
-    expandable = {add_name, sub_name, mul_name, div_name, neg_name}
+    expandable = {
+        add_name, sub_name, mul_name, div_name, sqrt_name, neg_name,
+    }
 
     counts = {name: 0 for name in expandable}
     original_formals = {
         str(name): tuple(function.args) for name, function in functions.items()
     }
+    from .identity_concordance import current_identity_book
+
+    promotion_page = current_identity_book().page(
+        "source_precision_boundary_concordance"
+    )
+    promoted_scalar_formals: dict[str, set[int]] = {}
+    for name, function in functions.items():
+        metadata = dict(getattr(function, "metadata", {}) or {})
+        scopes = {
+            str(name),
+            str(metadata.get("source_qualified_name") or ""),
+        }
+        promoted_scalar_formals[str(name)] = {
+            int(value_id)
+            for row in promotion_page.rows()
+            for fact in (promotion_page.latest(row),)
+            if isinstance(row, tuple)
+            and len(row) == 2
+            and str(row[0]) in scopes
+            and isinstance(fact, tuple)
+            and len(fact) == 3
+            and str(fact[0]) == "promote"
+            for value_id in (row[1], fact[1])
+        }
 
     # -- the boundary, brought into line with the interior ----------------
     #
@@ -1997,7 +2024,13 @@ def lower_precision_operations(
                     int(instruction.attributes.get("precision_limbs") or 1), 1
                 )
                 for argument in instruction.args:
-                    if int(argument.id) in formal_ids and width > 1:
+                    if (
+                        int(argument.id) in formal_ids
+                        and int(argument.id) not in promoted_scalar_formals[
+                            str(name)
+                        ]
+                        and width > 1
+                    ):
                         widths[int(argument.id)] = max(
                             widths.get(int(argument.id), 1), width
                         )
@@ -2031,7 +2064,13 @@ def lower_precision_operations(
                         if width <= 1 or position >= len(instruction.args):
                             continue
                         actual = int(instruction.args[position].id)
-                        if actual in caller_formals and here.get(actual, 1) < width:
+                        if (
+                            actual in caller_formals
+                            and actual not in promoted_scalar_formals[
+                                str(name)
+                            ]
+                            and here.get(actual, 1) < width
+                        ):
                             here[actual] = width
                             changed = True
 
@@ -2041,21 +2080,46 @@ def lower_precision_operations(
         if not widths:
             continue
         rows: list[list] = []
+        parameter_name_by_id = {
+            int(value_id): str(label)
+            for label, value_id in (
+                function.metadata.get("parameter_names", ()) or ()
+            )
+        }
+        member_receipts = list(
+            function.metadata.get("parameter_member_formals", ()) or ()
+        )
         for formal in list(function.args):
             width = widths.get(int(formal.id), 1)
             if width <= 1:
                 continue
             row = [formal]
-            for _index in range(1, width):
+            for limb_index in range(1, width):
                 extra = SSAValue(
                     GLOBAL_MONOTONIC_IDS.mint(),
                     dtype=formal.dtype,
-                    shape=(),
+                    shape=tuple(formal.shape or ()),
                     device=formal.device,
+                    accounting={
+                        "precision_formal_source_id": int(formal.id),
+                        "precision_limb_index": int(limb_index),
+                        "precision_extent_source_id": int(formal.id),
+                    },
                 )
                 function.args.append(extra)
                 row.append(extra)
+                parameter_name = parameter_name_by_id.get(int(formal.id))
+                if parameter_name is not None:
+                    member_receipts.append({
+                        "value_id": int(extra.id),
+                        "parameter": parameter_name,
+                        "path": (int(limb_index),),
+                    })
             rows.append(row)
+        if member_receipts:
+            function.metadata["parameter_member_formals"] = tuple(
+                member_receipts
+            )
         seeded[str(name)] = rows
 
     for function_name, function in functions.items():
@@ -2071,6 +2135,17 @@ def lower_precision_operations(
 
         for block in function.blocks.values():
             emitted: list = []
+            known_scalar_ids = {
+                int(instruction.res.id)
+                for candidate_block in function.blocks.values()
+                for instruction in candidate_block.instrs
+                if instruction.op == "Const"
+                and instruction.res is not None
+                and not tuple(instruction.res.shape or ())
+                and not int((instruction.res.accounting or {}).get(
+                    "program_abi_rank", 0
+                ) or 0)
+            }
 
             # The element the section being expanded declared, when it is
             # narrower than the value it is expanding. An expansion mints
@@ -2085,22 +2160,77 @@ def lower_precision_operations(
             # residual is quietly wrong rather than loudly absent.
             section_element: list = [None]
 
-            def fresh(like):
+            def fresh(like, extent_like=None):
                 declared = section_element[0]
+                extent_like = like if extent_like is None else extent_like
+                like_dtype = str(like.dtype or "")
+                extent_dtype = str(extent_like.dtype or "")
                 dtype = (
                     declared if declared in _NARROW_LIMB_ELEMENTS
+                    else extent_like.dtype
+                    if (
+                        extent_dtype.casefold() in {
+                            "float", "float16", "float32", "float64",
+                            "double", "f16", "f32", "f64",
+                        }
+                        and like_dtype.casefold() not in {
+                            "float", "float16", "float32", "float64",
+                            "double", "f16", "f32", "f64",
+                        }
+                    )
                     else like.dtype
                 )
+                logical_shape = tuple(extent_like.shape or ())
+                carried_width = max(int(
+                    (extent_like.accounting or {}).get(
+                        "precision_limbs"
+                    ) or 1
+                ), 1)
+                if (
+                    carried_width > 1
+                    and logical_shape
+                    and logical_shape[-1] == carried_width
+                ):
+                    logical_shape = logical_shape[:-1]
                 value = SSAValue(
                     GLOBAL_MONOTONIC_IDS.mint(),
                     dtype=dtype,
-                    shape=(),
+                    shape=logical_shape,
                     device=like.device,
+                    accounting={
+                        "precision_extent_source_id": int(extent_like.id),
+                    },
                 )
                 return value
 
             def put(op, args, like):
-                result = fresh(like)
+                def extent_strength(value):
+                    accounting = value.accounting or {}
+                    shape = tuple(value.shape or ())
+                    carried_width = max(int(
+                        accounting.get("precision_limbs") or 1
+                    ), 1)
+                    logical_rank = len(shape) - int(
+                        carried_width > 1
+                        and bool(shape)
+                        and shape[-1] == carried_width
+                    )
+                    declared_rank = max(
+                        logical_rank,
+                        int(accounting.get("program_abi_rank", 0) or 0),
+                        int(accounting.get("ssa_call_rank", 0) or 0),
+                    )
+                    return (
+                        declared_rank,
+                        int(value.id) not in known_scalar_ids,
+                        bool(shape),
+                    )
+
+                extent_like = max(
+                    tuple(args) or (like,),
+                    key=extent_strength,
+                )
+                result = fresh(like, extent_like)
                 emitted.append(Instr(op, list(args), result, attributes={
                     PRECISION_SECTION_ATTRIBUTE: True,
                     "lowered_from": "precision",
@@ -2125,6 +2255,22 @@ def lower_precision_operations(
                     PRECISION_SECTION_ATTRIBUTE: True,
                     "lowered_from": "precision.scalar_promotion",
                 }))
+                known_scalar_ids.add(int(result.id))
+                return result
+
+            def scalar_constant(number, like):
+                result = SSAValue(
+                    GLOBAL_MONOTONIC_IDS.mint(),
+                    dtype=like.dtype,
+                    shape=(),
+                    device=like.device,
+                )
+                emitted.append(Instr("Const", [], result, attributes={
+                    "constant": float(number),
+                    PRECISION_SECTION_ATTRIBUTE: True,
+                    "lowered_from": "precision.scalar_constant",
+                }))
+                known_scalar_ids.add(int(result.id))
                 return result
 
             def two_sum(a, b):
@@ -2276,6 +2422,9 @@ def lower_precision_operations(
                         "lowered_from": "precision.collapse",
                     },
                 ))
+                original.accounting[
+                    "precision_extent_source_id"
+                ] = int(parts_of[0].id)
                 # The limb channel the carry pass put on this value is now
                 # STALE and actively harmful. It described a value whose
                 # limbs lived on a trailing axis; lowering has just made
@@ -2338,6 +2487,10 @@ def lower_precision_operations(
                         by_head = {int(row[0].id): row for row in rows}
                         original_actuals = list(instruction.args)
                         additions = []
+                        declared_inputs = instruction.attributes.get(
+                            "callee_input_ids"
+                        )
+                        added_formal_ids = []
                         for position, formal in enumerate(target_formals):
                             row = by_head.get(int(formal.id))
                             if row is None or position >= len(original_actuals):
@@ -2350,11 +2503,27 @@ def lower_precision_operations(
                                     if index < len(supplied)
                                     else zero(actual)
                                 )
+                                added_formal_ids.append(int(row[index].id))
                         instruction.args.extend(additions)
+                        if declared_inputs is not None:
+                            declared = tuple(map(int, declared_inputs))
+                            if len(declared) != len(original_actuals):
+                                raise ValueError(
+                                    "precision call input concordance starts "
+                                    "from a receipt that does not cover its "
+                                    f"actuals: {callee!r} receipt={declared!r}, "
+                                    f"actuals={len(original_actuals)}"
+                                )
+                            instruction.attributes["callee_input_ids"] = (
+                                *declared, *added_formal_ids,
+                            )
                         instruction.attributes["precision_actuals_bound"] = True
                         instruction.attributes[
                             "precision_actual_count"
                         ] = len(additions)
+                        instruction.attributes[
+                            "precision_actual_formal_ids"
+                        ] = tuple(added_formal_ids)
                     emitted.append(instruction)
                     continue
 
@@ -2438,6 +2607,33 @@ def lower_precision_operations(
                         int(value.id) for value in negated
                     )
                     collapse(negated, instruction.res)
+                    counts[operation] += 1
+                    continue
+
+                if operation == sqrt_name:
+                    width = max(int(
+                        instruction.attributes.get("precision_limbs") or 2
+                    ), 2)
+                    source = expanded(instruction.args[0], width)
+                    collapsed = source[0]
+                    for term in source[1:]:
+                        collapsed = put("Add", (collapsed, term), collapsed)
+                    seed = put("Sqrt", (collapsed,), collapsed)
+                    root = expanded(seed, width)
+                    half = scalar_constant(0.5, seed)
+                    steps = max(1, (int(width) - 1).bit_length()) + 1
+                    for _step in range(steps):
+                        quotient = divide_expansions(source, root, width)
+                        root = add_expansions(root, quotient, width)
+                        root = [
+                            put("Mul", (term, half), term)
+                            for term in root
+                        ]
+                    limbs[int(instruction.res.id)] = root
+                    lowered_limb_records[int(instruction.res.id)] = tuple(
+                        int(value.id) for value in root
+                    )
+                    collapse(root, instruction.res)
                     counts[operation] += 1
                     continue
 

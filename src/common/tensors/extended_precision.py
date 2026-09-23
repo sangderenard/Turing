@@ -814,7 +814,8 @@ class Precision:
 
     @classmethod
     def dispatch(cls, op: str, left: Any, right: Any, *, limbs: int = 1,
-                 accumulator: Any = None, accumulate_output: bool = False):
+                 accumulator: Any = None,
+                 accumulate_output: bool = False) -> "Precision":
         """One operator at a stated width, on operands of any width."""
 
         if op not in _HANDLED:
@@ -879,15 +880,15 @@ class Precision:
         # flatten and used to make scalar AOT parameters fail here.
         return cls(pieces, width)
 
-    def __add__(self, other): return Precision.dispatch("add", self, other)
-    def __radd__(self, other): return Precision.dispatch("add", other, self)
-    def __sub__(self, other): return Precision.dispatch("sub", self, other)
-    def __rsub__(self, other): return Precision.dispatch("rsub", self, other)
-    def __mul__(self, other): return Precision.dispatch("mul", self, other)
-    def __rmul__(self, other): return Precision.dispatch("mul", other, self)
-    def __truediv__(self, other): return Precision.dispatch("truediv", self, other)
-    def __rtruediv__(self, other): return Precision.dispatch("rtruediv", self, other)
-    def __neg__(self): return Precision.dispatch("neg", self, None)
+    def __add__(self, other) -> "Precision": return Precision.dispatch("add", self, other)
+    def __radd__(self, other) -> "Precision": return Precision.dispatch("add", other, self)
+    def __sub__(self, other) -> "Precision": return Precision.dispatch("sub", self, other)
+    def __rsub__(self, other) -> "Precision": return Precision.dispatch("rsub", self, other)
+    def __mul__(self, other) -> "Precision": return Precision.dispatch("mul", self, other)
+    def __rmul__(self, other) -> "Precision": return Precision.dispatch("mul", other, self)
+    def __truediv__(self, other) -> "Precision": return Precision.dispatch("truediv", self, other)
+    def __rtruediv__(self, other) -> "Precision": return Precision.dispatch("rtruediv", self, other)
+    def __neg__(self) -> "Precision": return Precision.dispatch("neg", self, None)
 
     # -- the rest of the basic surface, limb-correct ---------------------
     #
@@ -1321,46 +1322,46 @@ class ComplexPrecision:
     def _pair(self, other: Any) -> "ComplexPrecision":
         return type(self).of(other, self.limbs)
 
-    def __add__(self, other):
+    def __add__(self, other) -> "ComplexPrecision":
         other = self._pair(other)
         return type(self)(
             self.real + other.real, self.imag + other.imag,
             max(self.limbs, other.limbs),
         )
 
-    def __radd__(self, other):
+    def __radd__(self, other) -> "ComplexPrecision":
         return self + other
 
-    def __sub__(self, other):
+    def __sub__(self, other) -> "ComplexPrecision":
         other = self._pair(other)
         return type(self)(
             self.real - other.real, self.imag - other.imag,
             max(self.limbs, other.limbs),
         )
 
-    def __rsub__(self, other):
+    def __rsub__(self, other) -> "ComplexPrecision":
         return self._pair(other) - self
 
-    def __neg__(self):
+    def __neg__(self) -> "ComplexPrecision":
         return type(self)(-self.real, -self.imag, self.limbs)
 
-    def __mul__(self, other):
+    def __mul__(self, other) -> "ComplexPrecision":
         other = self._pair(other)
         real = self.real * other.real - self.imag * other.imag
         imag = self.real * other.imag + self.imag * other.real
         return type(self)(real, imag, max(self.limbs, other.limbs))
 
-    def __rmul__(self, other):
+    def __rmul__(self, other) -> "ComplexPrecision":
         return self * other
 
-    def __truediv__(self, other):
+    def __truediv__(self, other) -> "ComplexPrecision":
         other = self._pair(other)
         denominator = other.real * other.real + other.imag * other.imag
         real = (self.real * other.real + self.imag * other.imag) / denominator
         imag = (self.imag * other.real - self.real * other.imag) / denominator
         return type(self)(real, imag, max(self.limbs, other.limbs))
 
-    def __rtruediv__(self, other):
+    def __rtruediv__(self, other) -> "ComplexPrecision":
         return self._pair(other) / self
 
     def sum(self) -> "ComplexPrecision":

@@ -861,6 +861,18 @@ def ingest_sympy_expression(
             fallbacks.append(fallback_name)
             rule = SympyProcessGraphRule(fallback_name)
 
+        # SymPy's canonical representation of ``sqrt(x)`` is
+        # ``Pow(x, Rational(1, 2))``.  That is not an optimization of a
+        # general real power: it is the source operation's exact identity.
+        # Preserve it before the generic Pow translation so precision
+        # planning and every backend receive Sqrt rather than having to infer
+        # the authored operation later from a floating exponent.
+        if (
+            isinstance(value, sympy.Pow)
+            and value.exp == sympy.Rational(1, 2)
+        ):
+            rule = SympyProcessGraphRule("Sqrt", ("operand",))
+
         if isinstance(value, sympy.Piecewise):
             # Lower N arms into nested three-input Select nodes. The final
             # implicit value is NaN, matching SymPy Piecewise semantics when
@@ -887,7 +899,11 @@ def ingest_sympy_expression(
             memo[value] = selected_id
             return selected_id
 
-        arguments = tuple(value.args)
+        arguments = (
+            (value.base,)
+            if rule.operation == "Sqrt" and isinstance(value, sympy.Pow)
+            else tuple(value.args)
+        )
         # SymPy represents associative arithmetic as variadic nodes, while
         # repository SSA and every scalar backend give Add/Mul/Min/Max an
         # exact binary arity.  Preserve the authored expression as a stable

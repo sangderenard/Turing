@@ -54,6 +54,9 @@ Findings (each is one concrete disagreement, with the two claims):
     it moves from first-class function syntax through a callable record field.
 ``source-parameter-identity-disagreement``
     one discovered static parameter identity changes between source stages.
+``source-precision-boundary-disagreement``
+    one authored Precision boundary changes kind, operand, or limb width
+    between source reduction and structural output recovery.
 """
 
 from __future__ import annotations
@@ -285,6 +288,8 @@ class CorrelationTable:
         found.extend(self._binding_kind_findings(module))
         found.extend(self._source_field_identity_findings(module))
         found.extend(self._source_parameter_identity_findings(module))
+        found.extend(self._source_precision_boundary_findings(module))
+        found.extend(self._source_precision_region_findings(module))
         found.extend(self._callable_identity_findings(module))
         return found
 
@@ -615,6 +620,78 @@ class CorrelationTable:
                 None,
                 f"parameter {parameter!r} changed identity across source "
                 f"stages: {distinct!r}",
+            ))
+        return found
+
+    @staticmethod
+    def _source_precision_boundary_findings(module: Any) -> list[Finding]:
+        """Report a Precision boundary whose exact source fact changed."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "source_precision_boundary_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            history = page.history(row)
+            distinct = tuple(dict.fromkeys(
+                repr(fact) for _column, fact in history
+            ))
+            if len(distinct) <= 1:
+                continue
+            scope, value_id = (
+                row if isinstance(row, tuple) and len(row) == 2
+                else (row, None)
+            )
+            found.append(Finding(
+                "source-precision-boundary-disagreement",
+                str(scope),
+                None if value_id is None else int(value_id),
+                "Precision boundary changed kind, operand, or limb width "
+                f"across source stages: {distinct!r}",
+            ))
+        return found
+
+    @staticmethod
+    def _source_precision_region_findings(module: Any) -> list[Finding]:
+        """Report an indivisible Precision region whose membership changed."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "source_precision_region_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            history = page.history(row)
+            distinct = tuple(dict.fromkeys(
+                repr(fact) for _column, fact in history
+            ))
+            if len(distinct) <= 1:
+                continue
+            scope, collapse_id = (
+                row if isinstance(row, tuple) and len(row) == 2
+                else (row, None)
+            )
+            found.append(Finding(
+                "source-precision-region-disagreement",
+                str(scope),
+                None if collapse_id is None else int(collapse_id),
+                "Precision region changed members, boundaries, or limb "
+                f"width across compilation stages: {distinct!r}",
             ))
         return found
 
