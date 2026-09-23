@@ -806,8 +806,15 @@ def ingest_sympy_expression(
                         "antiderivative variable) needs a declared Domain: "
                         f"{value!r}")
             # SymPy first: a closed-form antiderivative ingests like any
-            # other expression.
-            integrated = value.doit()
+            # other expression.  SymPy may also RAISE instead of returning
+            # the Integral unevaluated (piecewise/inequality reduction on
+            # |.| integrands does); that is the same answer -- it could not
+            # integrate it -- so it falls through to quadrature.
+            try:
+                integrated = value.doit()
+            except (NotImplementedError, TypeError, ValueError, ArithmeticError,
+                    sympy.PolynomialError):
+                integrated = value
             if not integrated.has(sympy.Integral):
                 result_id = add_node(integrated)
                 memo[value] = result_id

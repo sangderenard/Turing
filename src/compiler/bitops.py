@@ -446,6 +446,9 @@ Tensor.SYMPY_MEANING = ("cross", "transpose", "tr", "det", "outer", "Matrix", "M
 MANIFOLD_OPERATORS = {
     "grad": "d0", "curl": "d1", "div": "-delta1",
     "laplacian_0": "laplace0", "laplacian_1": "laplace1",
+    # not DEC complex operators: u . grad (advection of a vector field) and
+    # the metric connection's covariant derivative (spacetime/curved domain)
+    "advective": "u.d0", "covariant": "connection",
 }
 #: Boundary kinds, by name (the ``Boundary`` flag attributes above are bare
 #: ``auto()`` objects on a non-Enum class and carry no usable value).
@@ -515,6 +518,127 @@ def _domain_of(sympy_limits):
     return domain
 
 
+
+class ParametricDomain(Domain):
+    """A Domain over symbolically defined geometry: parameters, their Limits,
+    and a parametric map x(u) into the embedding space.
+
+    Everything geometric is DERIVED from the map, exactly and on demand --
+    nothing is sampled, so nothing is lost:
+
+    * ``jacobian``  J_ai = d x_a / d u_i
+    * ``metric``    g = J^T J (the induced metric)
+    * ``measure``   sqrt(det g): the area/volume element in parameter space
+    * ``integral``  the integral of a field over the domain, written as a
+                    parameter-space Integral with the measure folded in, so it
+                    goes through the ingestion's SymPy-first / quadrature path
+    * ``grad`` / ``div`` / ``laplacian``  in the domain's own coordinates
+                    (contravariant gradient, divergence and Laplace-Beltrami)
+    * ``singular_set``  where det g = 0 (sphere poles, cone apex): declared,
+                    never clamped away
+
+    ``periodic`` names the parameters whose Limit wraps (their extent is the
+    exact period, not a sum of steps).
+
+    ``orientation`` is DECLARED, never guessed: ``+1`` states the map is
+    regular and positively oriented on the interior (the singular set aside),
+    so sqrt(det g) is taken as its positive branch.  Left as ``None`` the
+    measure keeps its exact |.| -- correct everywhere, but piecewise under
+    differentiation and harder for SymPy to integrate.
+    """
+
+    def __init__(self, parameters, limits, transform, periodic=(), boundaries=None,
+                 orientation=None):
+        import sympy
+
+        parameters = tuple(parameters)
+        if len(parameters) != len(limits):
+            raise ValueError("one (lower, upper) limit per parameter")
+        built = [lim if isinstance(lim, Limit) else _limit_of(sympy.sympify(lim[0]), sympy.sympify(lim[1]))
+                 for lim in limits]
+        super().__init__(built, boundaries)
+        self.parameters = parameters
+        self.axes = parameters
+        self.bounds = tuple((lim.integer_pieces[1], lim.integer_pieces[2]) for lim in built)
+        self.transform = tuple(sympy.sympify(component) for component in transform)
+        self.periodic = tuple(periodic)
+        if orientation not in (None, 1):
+            raise ValueError("orientation is None (undeclared) or +1 (declared positive)")
+        self.orientation = orientation
+        unknown = set(self.periodic) - set(parameters)
+        if unknown:
+            raise ValueError(f"periodic names unknown parameters {unknown}")
+
+    # -- geometry, exact ------------------------------------------------
+    def jacobian(self):
+        import sympy
+
+        return sympy.Matrix([[sympy.diff(x_a, u) for u in self.parameters] for x_a in self.transform])
+
+    def metric(self):
+        import sympy
+
+        J = self.jacobian()
+        return sympy.simplify(J.T * J)
+
+    def measure(self):
+        """sqrt(det g), simplified with the parameters' own ranges in mind."""
+        import sympy
+
+        det = sympy.factor(sympy.simplify(self.metric().det()))
+        root = sympy.simplify(sympy.sqrt(det))
+        if self.orientation == 1:
+            root = root.replace(sympy.Abs, lambda arg: arg)
+        return root
+
+    def period(self, parameter):
+        index = self.parameters.index(parameter)
+        lower, upper = self.bounds[index]
+        return upper - lower
+
+    def singular_set(self):
+        """Parameter values where the map degenerates (det g = 0)."""
+        import sympy
+
+        det = sympy.factor(sympy.simplify(self.metric().det()))
+        out = {}
+        for u, (lower, upper) in zip(self.parameters, self.bounds):
+            roots = sympy.solveset(det, u, domain=sympy.Interval(lower, upper))
+            if roots is not sympy.S.EmptySet:
+                out[u] = roots
+        return out
+
+    # -- calculus on the domain ----------------------------------------
+    def integral(self, field):
+        """The integral of ``field`` (a function of the parameters) over the
+        domain, measure included, as a parameter-space sympy.Integral."""
+        import sympy
+
+        limits = [(u, lower, upper) for u, (lower, upper) in zip(self.parameters, self.bounds)]
+        return sympy.Integral(field * self.measure(), *limits)
+
+    def grad(self, field):
+        """Contravariant gradient components g^ij d_j f."""
+        import sympy
+
+        g_inv = self.metric().inv()
+        partials = sympy.Matrix([sympy.diff(field, u) for u in self.parameters])
+        return sympy.simplify(g_inv * partials)
+
+    def div(self, components):
+        """Divergence of a vector field given by contravariant components V^i:
+        (1/sqrt g) d_i (sqrt g V^i)."""
+        import sympy
+
+        root = self.measure()
+        return sympy.simplify(sum(sympy.diff(root * v_i, u)
+                                  for v_i, u in zip(components, self.parameters)) / root)
+
+    def laplacian(self, field):
+        """Laplace-Beltrami: (1/sqrt g) d_i (sqrt g g^ij d_j f)."""
+        return self.div(tuple(self.grad(field)))
+
+
 def declare(expr, bindings=None):
     """The declaration of what a surviving SymPy node means, or None if the
     node is not one of the constructs above.
@@ -529,6 +653,12 @@ def declare(expr, bindings=None):
 
     bindings = dict(bindings or {})
     if isinstance(expr, sympy.Integral):
+        declared = [bindings.get(str(entry[0])) for entry in expr.limits if len(entry) == 1]
+        if declared and all(isinstance(d, ParametricDomain) for d in declared) and len(declared) == 1:
+            geometry = declared[0]
+            return Declaration(Integral, expr, geometry,
+                               {"integrand": expr.function,
+                                "parametric": geometry.integral(expr.function)})
         domain = _domain_of(expr.limits)
         missing = tuple(f"bounds of {axis}" for axis, lim in zip(domain.axes, domain.limits)
                         if lim is None and axis not in expr.function.free_symbols)
