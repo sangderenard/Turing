@@ -10,11 +10,26 @@ import sys
 import networkx as nx
 
 from src.common.tensors.topological_reducer import (
+    _concorded_static_parameter_bindings,
     reduce_abstract_tensor_topology,
 )
+from src.common.tensors.extended_precision import ComplexPrecision
 from src.common.tensors.abstract_nn.token_encoder import decode_identity_tokens
 from src.common.tensors.abstract_nn.token_lexicon import CompilerTokenLexicon
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
+from src.compiler.identity_concordance import (
+    begin_identity_book,
+    end_identity_book,
+)
+
+
+class _StaticClassMethodFactory:
+    def __init__(self, value):
+        self.value = value
+
+    @classmethod
+    def make(cls, value):
+        return cls(value)
 
 
 def test_python_named_integer_becomes_plain_constant_with_origin_metadata():
@@ -420,6 +435,96 @@ def test_annotated_receiver_discovers_authored_method_without_instance():
         if (data.get("attributes") or {}).get("callee_ref") is not None
     )
     assert call["attributes"]["callee_ref"] == scale.address
+
+
+def test_classmethod_receiver_uses_concorded_static_class_identity():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {
+        "_StaticClassMethodFactory": _StaticClassMethodFactory,
+    }
+    book, token = begin_identity_book()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(
+                "def kernel(value):\n"
+                "    return _StaticClassMethodFactory.make(value)\n",
+                resolve_unresolved_parents=True,
+                pursuit_roots=("kernel",),
+            )
+        reduce_abstract_tensor_topology(graph)
+
+        make = graph.function_table.entry(
+            graph.function_table.reference("make")
+        )
+        executable = make.graph.G
+        assert executable.graph["static_parameter_bindings"] == ((
+            "cls",
+            "static_class",
+            __name__,
+            "_StaticClassMethodFactory",
+        ),)
+        assert not any(
+            data.get("type") == "Input"
+            and (data.get("attributes") or {}).get("binding_name") == "cls"
+            for _node_id, data in executable.nodes(data=True)
+        )
+        construction = next(
+            data
+            for _node_id, data in executable.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.Call)
+            and (data.get("attributes") or {}).get("class_ref")
+            == "_StaticClassMethodFactory"
+        )
+        assert construction["attributes"]["class_ref"] == (
+            "_StaticClassMethodFactory"
+        )
+        page = book.page("source_parameter_identity_concordance")
+        assert any(
+            fact == (
+                "static_class", __name__, "_StaticClassMethodFactory"
+            )
+            for row in page.rows()
+            for _column, fact in page.history(row)
+            if row[1] == "cls"
+        )
+    finally:
+        end_identity_book(token)
+
+
+def test_complex_precision_classmethod_receiver_uses_same_concordance_rule():
+    definition = ast.parse(
+        "@classmethod\n"
+        "def of(cls, value, limbs=2):\n"
+        "    return cls(value, limbs)\n"
+    ).body[0]
+    definition._python_bindings = {"cls": ComplexPrecision}
+    definition._python_source_identity = (
+        ComplexPrecision.__module__,
+        f"{ComplexPrecision.__qualname__}.of",
+    )
+    book, token = begin_identity_book()
+    try:
+        resolved = _concorded_static_parameter_bindings(
+            definition,
+            ("cls", "value", "limbs"),
+        )
+        assert resolved == {"cls": ComplexPrecision}
+        row = (
+            (
+                ComplexPrecision.__module__,
+                f"{ComplexPrecision.__qualname__}.of",
+            ),
+            "cls",
+        )
+        assert book.page(
+            "source_parameter_identity_concordance"
+        ).latest(row) == (
+            "static_class",
+            ComplexPrecision.__module__,
+            ComplexPrecision.__qualname__,
+        )
+    finally:
+        end_identity_book(token)
 
 
 def test_descendant_loop_targets_are_not_enclosing_loop_carried_state():

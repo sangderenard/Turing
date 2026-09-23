@@ -22,7 +22,9 @@ from src.compiler.fortran_c_shell import (
 from src.compiler.identity_concordance import (
     IdentityPage,
     begin_identity_book,
+    concord_sequence_row_dtypes,
     commit_sequence_contract,
+    committed_sequence_row_dtypes,
     committed_sequence_contract,
     end_identity_book,
     resolved_concordant_alias_bindings,
@@ -67,6 +69,40 @@ def test_sequence_contract_concordance_refuses_width_redefinition():
             commit_sequence_contract(
                 "kernel", 3, "duplicates", 1, False,
                 source="runtime tuple view",
+            )
+    finally:
+        end_identity_book(token)
+
+
+def test_sequence_row_dtype_concordance_refines_equivalent_unknown_arena():
+    book, token = begin_identity_book()
+    try:
+        assert concord_sequence_row_dtypes(
+            "kernel", {29: ("float64",)}, source="declaration"
+        ) == ("float64",)
+        assert concord_sequence_row_dtypes(
+            "kernel",
+            {29: ("float64",), 33: ("unknown",)},
+            source="conditional replace",
+        ) == ("float64",)
+        assert committed_sequence_row_dtypes(
+            "kernel", 33
+        ) == ("float64",)
+        assert len(book.page(
+            "sequence_row_dtype_concordance"
+        ).history(("kernel", 33))) == 1
+    finally:
+        end_identity_book(token)
+
+
+def test_sequence_row_dtype_concordance_refuses_known_disagreement():
+    _book, token = begin_identity_book()
+    try:
+        with pytest.raises(ValueError, match="column 0"):
+            concord_sequence_row_dtypes(
+                "kernel",
+                {29: ("float64",), 33: ("complex128",)},
+                source="conditional replace",
             )
     finally:
         end_identity_book(token)

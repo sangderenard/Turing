@@ -52,11 +52,71 @@ from ...transmogrifier.graph.node_special_cases import tensor_annotation_identit
 logger = logging.getLogger(__name__)
 
 
+def _concorded_static_parameter_bindings(
+    definition: Any,
+    parameter_names: tuple[str, ...],
+) -> dict[str, Any]:
+    """Return parameters whose discovered identity is compile-time static.
+
+    Source pursuit has already bound a classmethod receiver to the class that
+    Python supplies for that call.  That binding is the identity fact.  The
+    reducer used to ignore it because the spelling also appeared in the
+    authored parameter list, then separately interpreted the same class as a
+    runtime RECORD contract.  Commit the discovered identity once so lexical
+    resolution and storage classification consume the same decision.
+    """
+
+    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return {}
+    if not any(
+        isinstance(decorator, ast.Name) and decorator.id == "classmethod"
+        for decorator in definition.decorator_list
+    ):
+        return {}
+    positional = (*definition.args.posonlyargs, *definition.args.args)
+    if not positional:
+        return {}
+    receiver_name = str(positional[0].arg)
+    if receiver_name not in parameter_names:
+        return {}
+    value = dict(getattr(definition, "_python_bindings", {}) or {}).get(
+        receiver_name
+    )
+    if not inspect.isclass(value):
+        return {}
+    source_identity = getattr(definition, "_python_source_identity", None)
+    scope = (
+        tuple(map(str, source_identity))
+        if isinstance(source_identity, tuple)
+        else (str(getattr(definition, "name", "<function>")),)
+    )
+    descriptor = (
+        "static_class",
+        str(getattr(value, "__module__", "")),
+        str(getattr(value, "__qualname__", getattr(value, "__name__", ""))),
+    )
+    page = current_identity_book().page(
+        "source_parameter_identity_concordance"
+    )
+    row = (scope, receiver_name)
+    incumbent = page.latest(row)
+    if incumbent is not None and incumbent != descriptor:
+        raise ValueError(
+            "source parameter identity concordance disagreement for "
+            f"{scope!r}.{receiver_name}: recorded={incumbent!r}, "
+            f"resolved={descriptor!r}"
+        )
+    if incumbent is None:
+        page.set(row, 0, descriptor)
+    return {receiver_name: value}
+
+
 def _known_parameter_memory_contracts(
     definition: Any,
     parameter_names: tuple[str, ...],
     *,
     method_owner: str | None,
+    static_parameter_names: frozenset[str] = frozenset(),
 ) -> tuple[ParameterContract, ...]:
     """Describe parameter storage only when source pursuit proved its kind.
 
@@ -69,6 +129,8 @@ def _known_parameter_memory_contracts(
     bindings = dict(getattr(definition, "_python_bindings", {}) or {})
     storage_by_name: dict[str, ParameterStorage] = {}
     for index, name in enumerate(parameter_names):
+        if name in static_parameter_names:
+            continue
         value = bindings.get(name)
         if any(value is kind for kind in (list, set, dict, tuple)):
             storage_by_name[name] = ParameterStorage.TABLE
@@ -1091,6 +1153,7 @@ def _normalize_lexical_values(
         tuple[str, str], tuple[str, ...]
     ] | None = None,
     class_field_classes: Mapping[tuple[str, str], str] | None = None,
+    static_parameter_bindings: Mapping[str, Any] | None = None,
 ) -> None:
     """Resolve unique lexical occurrences into a monotonic value DAG.
 
@@ -1123,6 +1186,7 @@ def _normalize_lexical_values(
     # only supplies exact incoming values when source control joins a write.
     attribute_value_nodes: dict[tuple[int, str], int] = {}
     parameter_names = set(function_parameter_names(statement))
+    static_parameter_bindings = dict(static_parameter_bindings or {})
     # A parameter annotated with a locally-defined class name gives a
     # receiver a real, known class identity at ingestion -- enough to
     # resolve ``receiver.attr`` through the class's own navigation table
@@ -2064,6 +2128,12 @@ def _normalize_lexical_values(
         if isinstance(expression, ast.Name):
             node_id = id(expression)
             if isinstance(expression.ctx, ast.Load):
+                if expression.id in static_parameter_bindings:
+                    _remove_node(graph, node_id)
+                    return _StaticPythonReference(
+                        static_parameter_bindings[expression.id],
+                        expression.id,
+                    )
                 static_reference = static_environment.get(expression.id)
                 if static_reference is not None:
                     _remove_node(graph, node_id)
@@ -7793,6 +7863,23 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             *keyword_only_parameters,
             *variadic_parameters,
         )
+        static_parameter_bindings = _concorded_static_parameter_bindings(
+            statement,
+            parameter_names,
+        )
+        static_parameter_receipts = tuple(
+            (
+                name,
+                "static_class",
+                str(getattr(value, "__module__", "")),
+                str(getattr(
+                    value,
+                    "__qualname__",
+                    getattr(value, "__name__", ""),
+                )),
+            )
+            for name, value in static_parameter_bindings.items()
+        )
         parameter_defaults = {}
         if isinstance(
             statement,
@@ -7884,6 +7971,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 )
             ),
             function_parameters=parameter_names,
+            static_parameter_bindings=static_parameter_receipts,
             positional_parameters=positional_parameters,
             keyword_only_parameters=keyword_only_parameters,
             parameter_defaults=parameter_defaults,
@@ -7917,6 +8005,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             statement,
             parameter_names,
             method_owner=method_owners.get(node_id),
+            static_parameter_names=frozenset(static_parameter_bindings),
         )
         if parameter_contracts:
             function_table.set_parameter_contracts(
@@ -8003,6 +8092,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             class_field_mapping_contracts=local_mapping_contracts,
             class_field_sequence_dtypes=class_field_sequence_dtypes,
             class_field_classes=class_field_classes,
+            static_parameter_bindings=static_parameter_bindings,
         )
         generator_yields = tuple(
             node_id

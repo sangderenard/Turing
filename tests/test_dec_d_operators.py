@@ -520,3 +520,54 @@ def test_calculate_geometry_publishes_a_complete_dec_package() -> None:
     assert dec["hodge_stars"]["availability"] == {
         "hodge_0": True, "hodge_1": True, "hodge_2": True}
     assert float(AT.linalg.norm(d1 @ d0)) < 1e-9
+
+
+def test_full_hodge_star_uses_the_complete_polygon_face_area() -> None:
+    """A quadrilateral 2-cell is not silently reduced to its first triangle."""
+    from src.common.tensors.abstract_convolution.laplace_nd import HodgeStarBuilder
+
+    vertices = AT.get_tensor([
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [2.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ])
+    edges = AT.get_tensor([
+        [0, 1], [1, 2], [2, 3], [3, 0],
+    ]).astype(AT.long_dtype_)
+
+    hodge = HodgeStarBuilder().build_full_hodge_star(
+        vertices, edges, {0: (0, 1, 2, 3)})
+
+    h0 = _np(hodge["hodge_0"])
+    h1 = _np(hodge["hodge_1"])
+    h2 = _np(hodge["hodge_2"])
+    assert np.diag(h0) == pytest.approx([0.5] * 4)
+    assert np.diag(h1) == pytest.approx([0.5] * 4)
+    assert h2[0, 0] == pytest.approx(2.0)
+
+
+def test_hodge_cache_identity_includes_embedded_vertex_geometry() -> None:
+    """Equal connectivity at a different scale has a different Hodge metric."""
+    from src.common.tensors.abstract_convolution.laplace_nd import HodgeStarBuilder
+
+    unit = AT.get_tensor([
+        [0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0], [0.0, 1.0, 0.0],
+    ])
+    stretched = AT.get_tensor([
+        [0.0, 0.0, 0.0], [2.0, 0.0, 0.0],
+        [2.0, 1.0, 0.0], [0.0, 1.0, 0.0],
+    ])
+    edges = AT.get_tensor([
+        [0, 1], [1, 2], [2, 3], [3, 0],
+    ]).astype(AT.long_dtype_)
+    faces = {0: (0, 1, 2, 3)}
+    builder = HodgeStarBuilder()
+
+    unit_hodge = builder.build_full_hodge_star(unit, edges, faces)
+    stretched_hodge = builder.build_full_hodge_star(stretched, edges, faces)
+
+    assert _np(unit_hodge["hodge_2"])[0, 0] == pytest.approx(1.0)
+    assert _np(stretched_hodge["hodge_2"])[0, 0] == pytest.approx(2.0)
+    assert len(builder.hodge_cache) == 2

@@ -314,6 +314,33 @@ def test_whole_module_tensor_recipes_expand_views_transpose_reduction_cast_and_c
     assert emitted.complete, [item.format() for item in emitted.shortfalls]
 
 
+def test_rank_zero_any_reduction_uses_concorded_scalar_identity():
+    source = SSAValue(2040, dtype="bool", shape=())
+    result = SSAValue(2041, dtype="bool", shape=())
+    function = Function("scalar_any", [source], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                Handler.Call.value,
+                [source],
+                result,
+                attributes={"tensor_operation": "any"},
+            ),
+            Instr(Handler.Ret.value, [result], None),
+        ])
+    })
+    module = IRModule({function.name: function})
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference()
+    ) == ()
+    lowered = function.blocks["entry"].instrs[0]
+    assert lowered.op == "clone"
+    assert lowered.attributes == {
+        "lowered_from": "any",
+        "scalar_reduction_identity": True,
+    }
+
+
 def test_linked_llvm_accepts_explicit_cast_output_and_count_operands():
     source = SSAValue(2050, dtype="float64", shape=(4,))
     result = SSAValue(2051, dtype="float64", shape=(4,))

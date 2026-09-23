@@ -1058,16 +1058,10 @@ import matplotlib.pyplot as plt
 def _corner_normal(v0, v1, v2):
     """``(v1 - v0) x (v2 - v0)`` for three single vertices.
 
-    ``AbstractTensor.cross`` takes its component axis with
-    ``_take_along_dim``, which collapses a bare ``(3,)`` vector to a
-    scalar and then has nothing to stack -- so the obvious spelling
-    raises ``AttributeError`` on exactly the one-vector-at-a-time case
-    every caller here has.  Presenting the vectors as ``(1, 3)`` keeps
-    the component axis alive and takes the documented path.
+    The shared cross primitive owns bare-vector handling, so geometry uses
+    the same spelling as every other mesh, torque, and field caller.
     """
-    normal = AbstractTensor.cross(
-        (v1 - v0).reshape(1, 3), (v2 - v0).reshape(1, 3))
-    return normal.reshape(3)
+    return AbstractTensor.cross(v1 - v0, v2 - v0)
 
 
 def ring_key(ring):
@@ -1455,7 +1449,13 @@ class HodgeStarBuilder:
             face_list.sort(key=lambda x: x[0])
             faces_data = str(face_list).encode()
 
-        topology_data = (vertices.shape, edges.tobytes(), faces_data)
+        # Hodge stars are metric objects.  Connectivity alone is not their
+        # identity: stretching a mesh while retaining the same vertex/edge/
+        # face indices changes every primal and dual measure.  The former key
+        # used only ``vertices.shape`` and could return one object's geometry
+        # for another equally sized mesh.
+        vertex_data = np.asarray(vertices.tolist()).tobytes()
+        topology_data = (vertices.shape, vertex_data, edges.tobytes(), faces_data)
         return hashlib.sha256(b''.join([str(t).encode() for t in topology_data])).hexdigest()
 
     def build_basic_hodge_star(self, vertices, edges):
@@ -1504,55 +1504,50 @@ class HodgeStarBuilder:
         Build full hodge star including faces. With face information, we can
         properly compute areas and thus refine the Hodge star operators.
         """
-        dtype = vertices.long_dtype_
         hash_key = self._hash_topology(vertices, edges, faces)
         if hash_key in self.hodge_cache:
             return self.hodge_cache[hash_key]
 
+        # Compute every polygon's complete area once.  FaceMapGenerator
+        # returns oriented rings, not necessarily triangles.  Using only the
+        # first three vertices silently assigned a quadrilateral half of its
+        # physical area, which then corrupted all three Hodge measures seen by
+        # a mesh-domain law.  A fan over the declared ring preserves triangles
+        # exactly and accounts for every part of a general planar face.
+        face_geometry = []
+        for face in faces.values():
+            ring = tuple(int(vertex) for vertex in face)
+            if len(ring) < 3:
+                raise ValueError("a DEC face needs at least three vertices")
+            anchor = vertices[ring[0]]
+            area = 0.0
+            for index in range(1, len(ring) - 1):
+                area += 0.5 * AbstractTensor.norm(_corner_normal(
+                    anchor, vertices[ring[index]], vertices[ring[index + 1]]))
+            face_geometry.append((ring, area))
+
         # Compute vertex volumes (0-forms)
         vertex_volumes = AbstractTensor.zeros(vertices.shape[0], device=self.device)
-        face_tensors = []
-        for f_idx, face in faces.items():
-            face_tensor = AbstractTensor.tensor(face, device=self.device)
-            face_tensors.append(face_tensor)
-            v0, v1, v2 = vertices[face_tensor[0]], vertices[face_tensor[1]], vertices[face_tensor[2]]
-            area = 0.5 * AbstractTensor.norm(_corner_normal(v0, v1, v2))
+        for face, area in face_geometry:
             # Distribute area equally among vertices for volume approximation
             for vert in face:
-                vertex_volumes[vert] += area/3.0
+                vertex_volumes[vert] += area / len(face)
 
         # Compute edge dual areas (1-forms)
         # Each edge belongs to some faces; sum area contributions
         edge_dual_areas = AbstractTensor.zeros(edges.shape[0], device=self.device)
-        if face_tensors:
-            face_tensor = AbstractTensor.stack(face_tensors)
-        else:
-            # No faces were detected; fall back to an empty tensor so downstream
-            # operations become no-ops instead of crashing with a stack error.
-            face_tensor = AbstractTensor.empty(
-                (0, 3), dtype=dtype, device=self.device
-            )
         for i, edge in enumerate(edges):
-            # Find faces containing this edge
-            mask = (face_tensor == edge[0]).any(dim=1) & (face_tensor == edge[1]).any(dim=1)
-            mask = mask.to_dtype(mask.bool_dtype_)
-
-            shared_faces = face_tensor[mask]
             dual_area = 0.0
-            for f in shared_faces:
-                v0, v1, v2 = vertices[f[0]], vertices[f[1]], vertices[f[2]]
-                area = 0.5 * AbstractTensor.norm(_corner_normal(v0, v1, v2))
-                dual_area += area/3.0
+            edge_vertices = (int(edge[0]), int(edge[1]))
+            for face, area in face_geometry:
+                if edge_vertices[0] in face and edge_vertices[1] in face:
+                    dual_area += area / len(face)
             edge_dual_areas[i] = dual_area if dual_area > 0 else 1.0  # fallback
 
         # Compute face areas (2-forms)
-        face_areas = []
-        for f in faces.values():
-            f_tensor = AbstractTensor.tensor(f, device=self.device)
-            v0, v1, v2 = vertices[f_tensor[0]], vertices[f_tensor[1]], vertices[f_tensor[2]]
-            area = 0.5 * AbstractTensor.norm(_corner_normal(v0, v1, v2))
-            face_areas.append(area)
-        face_areas = AbstractTensor.tensor(face_areas, device=self.device)
+        face_areas = (AbstractTensor.stack([area for _face, area in face_geometry])
+                      if face_geometry else
+                      AbstractTensor.empty((0,), device=self.device))
         has_faces = face_areas.numel() > 0
 
         hodge_0 = AbstractTensor.diag(vertex_volumes)

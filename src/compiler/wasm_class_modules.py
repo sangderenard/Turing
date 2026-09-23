@@ -438,6 +438,10 @@ def emit_control_region_modules(
     dtype: str = "float64",
     logical_input_names: Mapping[int, str] | None = None,
     feedback_input_names: Sequence[str] = (),
+    concordance_value_aliases: Mapping[
+        tuple[tuple[str, int | None], int],
+        Sequence[tuple[tuple[str, int | None], int]],
+    ] | None = None,
     reduction_cache=None,
     progress=None,
 ) -> tuple[dict[int, object], dict]:
@@ -497,15 +501,27 @@ def emit_control_region_modules(
         for value_id, name in dict(logical_input_names or {}).items()
     }
     feedback_names = frozenset(map(str, feedback_input_names))
-    producer: dict[int, tuple[str, str]] = {}
+    def program_owner(program) -> tuple[str, int | None]:
+        extras = dict(program.extras or {})
+        closure_id = extras.get("source_closure_id")
+        return (
+            str(extras.get("source_function") or ""),
+            int(closure_id) if closure_id is not None else None,
+        )
+
+    concordance_aliases = dict(concordance_value_aliases or {})
+    producer: dict[
+        tuple[tuple[str, int | None], int], list[tuple[str, str]]
+    ] = {}
     module_names = {
         region: f"{owner_name}_region_{region}" for region in ordered_regions
     }
     for region, program in programs.items():
+        owner = program_owner(program)
         for output_name, value_id in program.outputs.items():
-            producer[int(value_id)] = (
+            producer.setdefault((owner, int(value_id)), []).append((
                 module_names[region], str(output_name)
-            )
+            ))
 
     modules = {}
     entries = []
@@ -519,10 +535,10 @@ def emit_control_region_modules(
     edges = []
     logical_inputs: dict[str, list[tuple[str, str]]] = {}
     logical_input_value_ids: dict[str, list[int]] = {}
-    value_bindings: dict[int, str] = {
-        value_id: f"out::{module_name}::{output_name}"
-        for value_id, (module_name, output_name) in producer.items()
-    }
+    value_bindings: dict[int, str] = {}
+    for (_owner, value_id), bindings in producer.items():
+        module_name, output_name = bindings[-1]
+        value_bindings[int(value_id)] = f"out::{module_name}::{output_name}"
     # Reserve the heap-control bytes at the start of linear memory so the fixed
     # HEAP_CURSOR_ADDR the container kernels bake never collides with static
     # data. Region static data (and everything else) starts past it.
@@ -530,6 +546,7 @@ def emit_control_region_modules(
     for region in ordered_regions:
         program = programs[region]
         module_name = module_names[region]
+        owner = program_owner(program)
 
         def _lower_region(program=program, module_name=module_name,
                           static_offset=static_offset):
@@ -599,11 +616,24 @@ def emit_control_region_modules(
             feedback_name = (
                 str(origin_name) if origin_name in feedback_names else None
             )
-            source = (
-                None
-                if logical_override is not None or feedback_name is not None
-                else producer.get(value_id)
-            )
+            source = None
+            if logical_override is None and feedback_name is None:
+                identity = (owner, int(value_id))
+                candidate_identities = concordance_aliases.get(
+                    identity, (identity,)
+                )
+                candidates = list(dict.fromkeys(
+                    binding
+                    for candidate in candidate_identities
+                    for binding in producer.get(candidate, ())
+                    if binding[0] != module_name
+                ))
+                if len(candidates) > 1:
+                    raise ValueError(
+                        "concordance maps region feed "
+                        f"{identity!r} to multiple producers: {candidates!r}"
+                    )
+                source = candidates[0] if candidates else None
             if source is not None:
                 edges.append({
                     "from": {
@@ -613,6 +643,10 @@ def emit_control_region_modules(
                         "module": module_name, "input": input_name
                     },
                 })
+                value_bindings.setdefault(
+                    int(value_id),
+                    f"out::{source[0]}::{source[1]}",
+                )
                 continue
             logical_name = str(
                 logical_override

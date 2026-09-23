@@ -1562,7 +1562,10 @@ def _concord_region_value_metadata(
     constant_values: Mapping[str, Any] | None = None,
     source_graphs: Sequence[Any] = (),
     hierarchy_plans: Sequence[Any] = (),
-) -> None:
+) -> dict[
+    tuple[tuple[str, int | None], int],
+    tuple[tuple[tuple[str, int | None], int], ...],
+]:
     """Carry one SSA identity's proven descriptor across every region seam.
 
     Region partitioning copies metadata, so a producer can retain a descriptor
@@ -1738,6 +1741,39 @@ def _concord_region_value_metadata(
             (target_owner, int(target_id)), (int(target_id),)
         )
     ))
+    # Region transcription gives one source value several composed SSA
+    # occurrences, and a PlanCall gives the caller occurrence and callee
+    # formal/result different source owners. Those are not merely descriptor
+    # hints: they are the concordance-owned equality relation used later to
+    # wire region producers to consumers. Keep it scoped by function/closure;
+    # bare integer ids are deliberately insufficient because reducers may
+    # reuse them in different call instances.
+    parent: dict[
+        tuple[tuple[str, int | None], int],
+        tuple[tuple[str, int | None], int],
+    ] = {}
+
+    def find(identity):
+        parent.setdefault(identity, identity)
+        while parent[identity] != identity:
+            parent[identity] = parent[parent[identity]]
+            identity = parent[identity]
+        return identity
+
+    def union(left, right) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for (owner, _source_id), occurrences in source_instances.items():
+        scoped = [(owner, int(value_id)) for value_id in occurrences]
+        for identity in scoped:
+            find(identity)
+        for identity in scoped[1:]:
+            union(scoped[0], identity)
+    for source, target in call_binding_edges:
+        union(source, target)
     incoming_bound_values = {
         target for _source, target in call_binding_edges
     }
@@ -2215,6 +2251,17 @@ def _concord_region_value_metadata(
                 }
         if not changed:
             break
+
+    equivalence_classes: dict[
+        tuple[tuple[str, int | None], int],
+        list[tuple[tuple[str, int | None], int]],
+    ] = {}
+    for identity in parent:
+        equivalence_classes.setdefault(find(identity), []).append(identity)
+    return {
+        identity: tuple(equivalence_classes[find(identity)])
+        for identity in parent
+    }
 
 def _shader_execution_descriptor(
     published_sources: list[dict[str, Any]],
@@ -3423,7 +3470,7 @@ def build_program_bundle(
             )
             if graph is not None
         ))
-        _concord_region_value_metadata(
+        concordance_value_aliases = _concord_region_value_metadata(
             effective_region_programs,
             feed_values=aot.region_feed_values,
             constant_values=contract.constant_map,
@@ -3652,6 +3699,7 @@ def build_program_bundle(
                 dtype="float64",
                 logical_input_names=state_input_value_names,
                 feedback_input_names=tuple(contract.state_feedback),
+                concordance_value_aliases=concordance_value_aliases,
                 reduction_cache=None,
                 progress=lambda region, cached: channel.log(
                     f"region {region} reduction lowered",

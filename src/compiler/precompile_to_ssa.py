@@ -15,7 +15,10 @@ import networkx as nx
 
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from .id_space import serial_of as _id_serial_of
-from .identity_concordance import IdentityPage
+from .identity_concordance import (
+    IdentityPage,
+    concord_sequence_row_dtypes,
+)
 from .control_source import (
     CallBlock,
     ConditionalBlock,
@@ -4642,6 +4645,32 @@ class _ControlSSABuilder:
             tuple(range(max(1, int(column_count) - 1)))
             if policy == "unique" else ()
         )
+        def _canonicalize_column(raw_dtype: str | None, column: int) -> str | None:
+            canonical = _canonical_sequence_dtype(raw_dtype)
+            if canonical != raw_dtype and _LOG.isEnabledFor(logging.DEBUG):
+                _LOG.debug(
+                    "sequence %d column %d at %s: widened dtype %r -> %r "
+                    "(this array is shared across every function that "
+                    "touches the sequence, so its element width must be "
+                    "one fact, not whatever the first function to see it "
+                    "happened to infer)",
+                    value_id, column, location, raw_dtype, canonical,
+                )
+            return canonical
+
+        first_dtype = _canonicalize_column(element_dtype or (
+            column_dtypes[0] if column_dtypes else None
+        ), 0)
+        proposed_column_dtypes = tuple(
+            _canonicalize_column(
+                first_dtype if column == 0 else (
+                    column_dtypes[column]
+                    if column < len(column_dtypes) else None
+                ),
+                column,
+            ) or "unknown"
+            for column in range(int(column_count))
+        )
         if existing is not None:
             if existing.key_columns != key_columns:
                 self.shortfalls.append(SSALoweringShortfall(
@@ -4667,23 +4696,32 @@ class _ControlSSABuilder:
                     "after storage was declared without live flags",
                 ))
                 return None
-            return existing
-        def _canonicalize_column(raw_dtype: str | None, column: int) -> str | None:
-            canonical = _canonical_sequence_dtype(raw_dtype)
-            if canonical != raw_dtype and _LOG.isEnabledFor(logging.DEBUG):
-                _LOG.debug(
-                    "sequence %d column %d at %s: widened dtype %r -> %r "
-                    "(this array is shared across every function that "
-                    "touches the sequence, so its element width must be "
-                    "one fact, not whatever the first function to see it "
-                    "happened to infer)",
-                    value_id, column, location, raw_dtype, canonical,
+            concorded_column_dtypes = concord_sequence_row_dtypes(
+                self.function_name,
+                {value_id: proposed_column_dtypes},
+                source=f"{location}: descriptor reuse",
+            )
+            if tuple(existing.column_dtypes) != concorded_column_dtypes:
+                existing = replace(
+                    existing, column_dtypes=concorded_column_dtypes
                 )
-            return canonical
-
-        first_dtype = _canonicalize_column(element_dtype or (
-            column_dtypes[0] if column_dtypes else None
-        ), 0)
+                self.sequence_descriptors[value_id] = existing
+                for value, dtype in zip(
+                    self.sequence_storage_values[value_id],
+                    concorded_column_dtypes,
+                ):
+                    if str(value.dtype or "unknown") in {
+                        "", "None", "unknown",
+                    }:
+                        value.dtype = str(dtype)
+            return existing
+        concorded_column_dtypes = concord_sequence_row_dtypes(
+            self.function_name,
+            {value_id: proposed_column_dtypes},
+            source=f"{location}: descriptor construction",
+        )
+        if concorded_column_dtypes:
+            first_dtype = concorded_column_dtypes[0]
         data = self.external_value(value_id, dtype=first_dtype)
         # Claim the physical arena at its creation boundary.  Waiting for the
         # final storage-declaration sweep is too late: call/result identity
@@ -4711,12 +4749,7 @@ class _ControlSSABuilder:
                 (
                     "int64"
                     if nested_table and index == int(column_count) - 2
-                    else str(
-                        column_dtypes[index + 1]
-                        if index + 1 < len(column_dtypes)
-                        and column_dtypes[index + 1] is not None
-                        else data.dtype or "unknown"
-                    )
+                    else concorded_column_dtypes[index + 1]
                 ),
                 index + 1,
             ))
@@ -5841,6 +5874,35 @@ class _ControlSSABuilder:
             )
             if source is None:
                 return
+            concorded_dtypes = concord_sequence_row_dtypes(
+                self.function_name,
+                {
+                    int(destination.sequence_id): destination.column_dtypes,
+                    int(source.sequence_id): source.column_dtypes,
+                },
+                source=f"{location}: {operation} equivalence",
+            )
+            if tuple(destination.column_dtypes) != concorded_dtypes:
+                destination = replace(
+                    destination, column_dtypes=concorded_dtypes
+                )
+                self.sequence_descriptors[
+                    int(destination.sequence_id)
+                ] = destination
+            if tuple(source.column_dtypes) != concorded_dtypes:
+                source = replace(source, column_dtypes=concorded_dtypes)
+                self.sequence_descriptors[int(source.sequence_id)] = source
+            for descriptor in (destination, source):
+                for value, dtype in zip(
+                    self.sequence_storage_values[
+                        int(descriptor.sequence_id)
+                    ],
+                    concorded_dtypes,
+                ):
+                    if str(value.dtype or "unknown") in {
+                        "", "None", "unknown",
+                    }:
+                        value.dtype = str(dtype)
             function_name = (
                 f"ssa_sequence_{destination.sequence_id}_{operation}_"
                 f"{source.sequence_id}"

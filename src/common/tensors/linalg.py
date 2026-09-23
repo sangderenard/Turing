@@ -96,7 +96,21 @@ def cross(a: AbstractTensor, b: AbstractTensor, dim: int = -1) -> AbstractTensor
     cy = az * bx - ax * bz
     cz = ax * by - ay * bx
 
-    return ax.stack([cx, cy, cz], dim=da)
+    # ``_take_along_dim`` legitimately produces scalar tensor values for a
+    # bare ``(3,)`` vector.  Stack is an AbstractTensor constructor, not an
+    # operation that requires one component to retain a non-scalar instance
+    # method surface.  Calling it through ``ax`` made the most ordinary cross
+    # product fail while batched vectors happened to work.
+    result = AbstractTensor.stack([cx, cy, cz], dim=da)
+    component_shape = list(AbstractTensor.get_tensor(cx).get_shape())
+    component_shape.insert(da, 3)
+    target_shape = tuple(component_shape)
+    # Some backends represent a stack of rank-zero values as ``(N, 1)``.
+    # Cross has a stronger public shape contract: replacing one component
+    # axis of length three must return that same axis, with no new singleton.
+    if tuple(result.get_shape()) != target_shape:
+        result = result.reshape(target_shape)
+    return result
 
 
 def trace(A: AbstractTensor) -> AbstractTensor:

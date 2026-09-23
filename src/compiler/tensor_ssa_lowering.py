@@ -3513,7 +3513,32 @@ def lower_tensor_calls_to_repository_ssa(
                     axis_sequence = _as_sequence(axis)
                     if axis_sequence is not None and len(axis_sequence) == 1:
                         axis = axis_sequence[0]
-                    if axis is None and operation in {"sum", "mean"}:
+                    if (
+                        axis is None
+                        and not shape_unknown(source)
+                        and not tuple(source.shape or ())
+                    ):
+                        # Rank zero is already the reduction of its sole
+                        # element.  This is especially important for Python
+                        # ``any``/``all`` lowered from generator predicates:
+                        # concordance proves the carried predicate scalar,
+                        # so asking for tensor extents here would discard a
+                        # valid descriptor merely because ``()`` is falsey.
+                        result.shape = ()
+                        emitted.append(Instr(
+                            (
+                                "clone"
+                                if str(source.dtype) == str(result.dtype)
+                                else "Cast"
+                            ),
+                            [source], result,
+                            attributes={
+                                "lowered_from": operation,
+                                "scalar_reduction_identity": True,
+                            },
+                            source_span=instruction.source_span,
+                        ))
+                    elif axis is None and operation in {"sum", "mean"}:
                         count = need_count(source, source_count)
                         if count is not None and operation == "sum":
                             emitted.append(call("sum_double", [source, count], result, instruction))

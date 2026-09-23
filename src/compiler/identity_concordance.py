@@ -52,6 +52,8 @@ Findings (each is one concrete disagreement, with the two claims):
 ``callable-identity-disagreement``
     one exact source value is assigned different function-table addresses as
     it moves from first-class function syntax through a callable record field.
+``source-parameter-identity-disagreement``
+    one discovered static parameter identity changes between source stages.
 """
 
 from __future__ import annotations
@@ -282,6 +284,7 @@ class CorrelationTable:
         found.extend(self._sequence_descriptor_findings(module))
         found.extend(self._binding_kind_findings(module))
         found.extend(self._source_field_identity_findings(module))
+        found.extend(self._source_parameter_identity_findings(module))
         found.extend(self._callable_identity_findings(module))
         return found
 
@@ -578,6 +581,40 @@ class CorrelationTable:
                 None,
                 f"field {field!r} changed identity across source stages: "
                 f"{distinct!r}",
+            ))
+        return found
+
+    @staticmethod
+    def _source_parameter_identity_findings(module: Any) -> list[Finding]:
+        """Report a static parameter whose discovered identity changed."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "source_parameter_identity_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            history = page.history(row)
+            distinct = tuple(dict.fromkeys(
+                repr(fact) for _column, fact in history
+            ))
+            if len(distinct) <= 1:
+                continue
+            scope, parameter = (
+                row if isinstance(row, tuple) and len(row) == 2
+                else (row, "?")
+            )
+            found.append(Finding(
+                "source-parameter-identity-disagreement",
+                str(scope),
+                None,
+                f"parameter {parameter!r} changed identity across source "
+                f"stages: {distinct!r}",
             ))
         return found
 
@@ -1282,6 +1319,108 @@ class SequenceContract:
     policy: str
     column_count: int
     writable: bool
+
+
+def _canonical_sequence_row_dtype(dtype: Any) -> str:
+    spelling = "unknown" if dtype is None else str(dtype)
+    return "unknown" if spelling in {"", "None", "unknown"} else spelling
+
+
+def committed_sequence_row_dtypes(
+    scope: Any,
+    sequence_id: int,
+    *,
+    page: IdentityPage | None = None,
+) -> tuple[str, ...] | None:
+    """Read the row dtype contract for one resident sequence identity."""
+
+    if page is None:
+        page = current_identity_book().page(
+            "sequence_row_dtype_concordance"
+        )
+    fact = page.latest((scope, int(sequence_id)))
+    if fact is None:
+        return None
+    return tuple(map(str, fact[0]))
+
+
+def concord_sequence_row_dtypes(
+    scope: Any,
+    claims: Mapping[int, Iterable[Any]],
+    *,
+    source: str,
+    page: IdentityPage | None = None,
+) -> tuple[str, ...]:
+    """Resolve one row layout across sequence identities proven equivalent.
+
+    ``unknown`` is absence of a claim, not a competing dtype.  A replace or
+    carried-state edge proves its two arenas have the same physical row, so a
+    known column on either side refines the other.  Two different known
+    dtypes are a real disagreement and compilation stops here.
+    """
+
+    if page is None:
+        page = current_identity_book().page(
+            "sequence_row_dtype_concordance"
+        )
+    normalized: dict[int, tuple[str, ...]] = {}
+    for sequence_id, raw_dtypes in claims.items():
+        sid = int(sequence_id)
+        proposed = tuple(
+            _canonical_sequence_row_dtype(dtype) for dtype in raw_dtypes
+        )
+        incumbent = committed_sequence_row_dtypes(
+            scope, sid, page=page
+        )
+        if incumbent is not None and len(incumbent) != len(proposed):
+            raise ValueError(
+                "sequence row dtype concordance width disagreement for "
+                f"{scope!r} value {sid}: recorded={incumbent!r}, "
+                f"{source} says {proposed!r}"
+            )
+        normalized[sid] = proposed if incumbent is None else tuple(
+            recorded if proposed_dtype == "unknown" else proposed_dtype
+            if recorded == "unknown" else recorded
+            for recorded, proposed_dtype in zip(incumbent, proposed)
+        )
+        if incumbent is not None:
+            for recorded, proposed_dtype in zip(incumbent, proposed):
+                if (
+                    recorded != "unknown"
+                    and proposed_dtype != "unknown"
+                    and recorded != proposed_dtype
+                ):
+                    raise ValueError(
+                        "sequence row dtype concordance disagreement for "
+                        f"{scope!r} value {sid}: recorded={incumbent!r}, "
+                        f"{source} says {proposed!r}"
+                    )
+    widths = {len(dtypes) for dtypes in normalized.values()}
+    if len(widths) > 1:
+        raise ValueError(
+            "sequence row dtype concordance cannot equate different row "
+            f"widths for {scope!r} at {source}: {normalized!r}"
+        )
+    width = next(iter(widths), 0)
+    resolved: list[str] = []
+    for column in range(width):
+        known = {
+            dtypes[column] for dtypes in normalized.values()
+            if dtypes[column] != "unknown"
+        }
+        if len(known) > 1:
+            raise ValueError(
+                "sequence row dtype concordance disagreement for "
+                f"{scope!r} column {column} at {source}: {normalized!r}"
+            )
+        resolved.append(next(iter(known), "unknown"))
+    result = tuple(resolved)
+    for sequence_id in normalized:
+        row = (scope, int(sequence_id))
+        history = page.history(row)
+        column = history[-1][0] + 1 if history else 0
+        page.set(row, column, (result, str(source)))
+    return result
 
 
 def committed_sequence_contract(
