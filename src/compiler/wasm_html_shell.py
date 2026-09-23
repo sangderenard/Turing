@@ -2184,6 +2184,10 @@ async function computeViaSelectedRunner(feeds, count) {
   const manifest = activeExecutionMode === "staged" ? activeStagedManifest() : CLASS_GRAPH;
   if (!manifest) throw new Error("choose an execution shape before running");
   for (const logicalName of Object.keys(manifest.logical_inputs || {})) {
+    if (Object.prototype.hasOwnProperty.call(manifest.fixed_inputs || {}, logicalName)) {
+      logicalInputs[logicalName] = manifest.fixed_inputs[logicalName];
+      continue;
+    }
     const paramIndex = inputs.findIndex(p => p.name === logicalName);
     if (paramIndex >= 0) {
       logicalInputs[logicalName] = feeds[paramIndex];
@@ -4531,6 +4535,7 @@ def _input_rows(
     feed_expressions: Mapping[str, str] | None = None,
     network_routes: Mapping[str, Mapping[str, Any]] | None = None,
     shell_io: Mapping[str, Any] | None = None,
+    initial_values: Mapping[str, Any] | None = None,
 ) -> str:
     """One row per feed, each able to be literal values or an expression.
 
@@ -4542,6 +4547,7 @@ def _input_rows(
 
     expressions = dict(feed_expressions or {})
     routes = dict(network_routes or {})
+    initial = dict(initial_values or {})
     requirements = dict((shell_io or {}).get("requirements") or {})
     system_parameters = {
         str(field.get("parameter"))
@@ -4558,6 +4564,21 @@ def _input_rows(
         expression = expressions.get(name, "i")
         route = routes.get(name, {})
         default_mode = "network" if route else ("expression" if name in expressions else "values")
+        value = initial.get(name)
+        if value is None:
+            value_text = "1, 2, 3, 4"
+        else:
+            if hasattr(value, "tolist"):
+                value = value.tolist()
+            flattened = []
+            pending = [value]
+            while pending:
+                item = pending.pop(0)
+                if isinstance(item, (list, tuple)):
+                    pending[0:0] = item
+                else:
+                    flattened.append(item)
+            value_text = ", ".join(map(str, flattened))
         rows.append(
             '<div class="row">'
             f'<div class="name">{_escape(name)}</div>'
@@ -4569,7 +4590,7 @@ def _input_rows(
             "</select>"
             '<div class="grow">'
             f'<div id="row_values_{_escape(name)}">'
-            f'<input type="text" id="in_{_escape(name)}" value="1, 2, 3, 4" '
+            f'<input type="text" id="in_{_escape(name)}" value="{_escape(value_text)}" '
             'placeholder="comma or space separated numbers"></div>'
             f'<div id="row_expr_{_escape(name)}" hidden>'
             f'<input type="text" id="expr_{_escape(name)}" '
@@ -5125,6 +5146,7 @@ def emit_html_shell(
     process_graph: Any = None,
     origin_source: str = "",
     feed_expressions: Mapping[str, str] | None = None,
+    initial_feed_values: Mapping[str, Any] | None = None,
     build_parameters: Mapping[str, Any] | None = None,
     default_width: int = 64,
     default_height: int = 40,
@@ -5509,7 +5531,7 @@ def emit_html_shell(
     <div class="panel-title">Inputs</div>
     {picker}
     {_system_port_rows(shell_io_mapping)}
-    {_input_rows(parameters, feed_expressions, network_routes, shell_io_mapping)}
+    {_input_rows(parameters, feed_expressions, network_routes, shell_io_mapping, initial_feed_values)}
     <div id="stats" class="stat"></div>
     <div class="row">
       <button id="run"{disabled}>Run {_escape(str(entry["name"]))}</button>

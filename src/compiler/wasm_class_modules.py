@@ -437,6 +437,7 @@ def emit_control_region_modules(
     module_dir: str,
     dtype: str = "float64",
     logical_input_names: Mapping[int, str] | None = None,
+    feedback_input_names: Sequence[str] = (),
     reduction_cache=None,
     progress=None,
 ) -> tuple[dict[int, object], dict]:
@@ -448,9 +449,11 @@ def emit_control_region_modules(
     to the planner-owned loop/state-machine structure.
 
     ``logical_input_names`` names external region values whose identity comes
-    from a caller-owned contract rather than capture provenance. State-carried
-    values are the motivating case: a region sees the previous ``next_phase``
-    value, while the public input through which it returns is named ``phase``.
+    from a caller-owned contract rather than capture provenance.
+    ``feedback_input_names`` marks capture-provenance names that remain public
+    initial inputs even though another region later produces their resident
+    storage. The name is resolved from the feed's concordance receipt, not by
+    comparing unrelated source-local and composed value-ID namespaces.
 
     ``reduction_cache`` (a ``ReductionArtifactStore``), when given, persists each
     lowered region under its content key so an interrupted or repeated bake
@@ -493,6 +496,7 @@ def emit_control_region_modules(
         int(value_id): str(name)
         for value_id, name in dict(logical_input_names or {}).items()
     }
+    feedback_names = frozenset(map(str, feedback_input_names))
     producer: dict[int, tuple[str, str]] = {}
     module_names = {
         region: f"{owner_name}_region_{region}" for region in ordered_regions
@@ -514,6 +518,7 @@ def emit_control_region_modules(
     kernel_files: dict[str, str] = {}
     edges = []
     logical_inputs: dict[str, list[tuple[str, str]]] = {}
+    logical_input_value_ids: dict[str, list[int]] = {}
     value_bindings: dict[int, str] = {
         value_id: f"out::{module_name}::{output_name}"
         for value_id, (module_name, output_name) in producer.items()
@@ -582,7 +587,23 @@ def emit_control_region_modules(
             )
         origins = dict((program.extras or {}).get("capture_feed_origins", {}))
         for value_id, input_name in zip(feed_ids, inputs):
-            source = producer.get(value_id)
+            origin = origins.get(value_id, origins.get(str(value_id), {}))
+            origin_name = origin.get("binding_name")
+            # A state-feedback identity is both an initial public input and a
+            # later region output.  The explicit concordance name owns the
+            # initial feed; assembly subsequently redirects that field to the
+            # declared output.  Letting the global producer table win here
+            # turns the initial state into a backwards internal edge and
+            # erases its public ABI name.
+            logical_override = contract_input_names.get(value_id)
+            feedback_name = (
+                str(origin_name) if origin_name in feedback_names else None
+            )
+            source = (
+                None
+                if logical_override is not None or feedback_name is not None
+                else producer.get(value_id)
+            )
             if source is not None:
                 edges.append({
                     "from": {
@@ -593,15 +614,16 @@ def emit_control_region_modules(
                     },
                 })
                 continue
-            origin = origins.get(value_id, origins.get(str(value_id), {}))
             logical_name = str(
-                origin.get("binding_name")
-                or contract_input_names.get(value_id)
+                logical_override
+                or feedback_name
+                or origin_name
                 or f"input_{value_id}"
             )
             logical_inputs.setdefault(logical_name, []).append(
                 (module_name, input_name)
             )
+            logical_input_value_ids.setdefault(logical_name, []).append(value_id)
             value_bindings.setdefault(value_id, f"in::{logical_name}")
         entries.append({
             "name": module_name,
@@ -676,6 +698,7 @@ def emit_control_region_modules(
         "modules": entries,
         "edges": edges,
         "logical_inputs": logical_inputs,
+        "logical_input_value_ids": logical_input_value_ids,
         "shared_memory": True,
         "shared_static_bytes": static_offset,
         "control_regions": list(ordered_regions),

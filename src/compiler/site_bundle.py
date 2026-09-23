@@ -1534,6 +1534,27 @@ def _aot_output_identity_history(aot: Any, output_name: str) -> tuple[int, ...]:
     )))
 
 
+def _aot_equivalent_value_ids(
+    aot: Any, value_ids: Sequence[int]
+) -> tuple[int, ...]:
+    """Expand composed hierarchy aliases for concordant value identities."""
+
+    neighbors: dict[int, set[int]] = {}
+    for left, right in dict(aot.hierarchical_value_aliases or {}).items():
+        left, right = int(left), int(right)
+        neighbors.setdefault(left, set()).add(right)
+        neighbors.setdefault(right, set()).add(left)
+    ordered = list(dict.fromkeys(map(int, value_ids)))
+    seen = set(ordered)
+    for value_id in ordered:
+        for equivalent in sorted(neighbors.get(value_id, ())):
+            if equivalent in seen:
+                continue
+            seen.add(equivalent)
+            ordered.append(equivalent)
+    return tuple(ordered)
+
+
 def _concord_region_value_metadata(
     region_programs: Mapping[int, Any],
     *,
@@ -3389,23 +3410,24 @@ def build_program_bundle(
             index: _fold_strings(program)
             for index, program in aot.region_programs.items()
         }
+        concord_source_graphs = tuple(dict.fromkeys(
+            graph
+            for graph in (
+                getattr(aot.deployment, "process_graph", None),
+                *(
+                    getattr(shell, "process_graph", None)
+                    for shell in dict(getattr(
+                        aot.deployment, "function_shells", {}
+                    ) or {}).values()
+                ),
+            )
+            if graph is not None
+        ))
         _concord_region_value_metadata(
             effective_region_programs,
             feed_values=aot.region_feed_values,
             constant_values=contract.constant_map,
-            source_graphs=tuple(dict.fromkeys(
-                graph
-                for graph in (
-                    getattr(aot.deployment, "process_graph", None),
-                    *(
-                        getattr(shell, "process_graph", None)
-                        for shell in dict(getattr(
-                            aot.deployment, "function_shells", {}
-                        ) or {}).values()
-                    ),
-                )
-                if graph is not None
-            )),
+            source_graphs=concord_source_graphs,
             hierarchy_plans=tuple(
                 plan for plan in (
                     getattr(aot, "hierarchy_plan", None),
@@ -3604,7 +3626,10 @@ def build_program_bundle(
             )
             state_input_value_names: dict[int, str] = {}
             for input_name, output_name in contract.state_feedback.items():
-                for value_id in _aot_output_identity_history(aot, output_name):
+                identities = list(_aot_equivalent_value_ids(
+                    aot, _aot_output_identity_history(aot, output_name)
+                ))
+                for value_id in dict.fromkeys(identities):
                     value_id = int(value_id)
                     previous = state_input_value_names.get(value_id)
                     if previous is not None and previous != input_name:
@@ -3626,6 +3651,7 @@ def build_program_bundle(
                 module_dir=card_directory.as_posix(),
                 dtype="float64",
                 logical_input_names=state_input_value_names,
+                feedback_input_names=tuple(contract.state_feedback),
                 reduction_cache=None,
                 progress=lambda region, cached: channel.log(
                     f"region {region} reduction lowered",
@@ -3682,10 +3708,18 @@ def build_program_bundle(
             )
             for input_name, output_name in contract.state_feedback.items():
                 if input_name not in card_manifest.get("logical_inputs", {}):
-                    raise ValueError(
-                        f"state feedback names unknown logical input "
-                        f"{input_name!r}"
-                    )
+                    # An in-place state value can have no direct first-frame
+                    # region consumer: its public input is copied straight
+                    # into the producer's resident output slot.  Retain that
+                    # contract identity with an empty target list; the storage
+                    # redirect below is the concordance edge that gives it a
+                    # concrete class-memory field.
+                    card_manifest.setdefault("logical_inputs", {})[
+                        str(input_name)
+                    ] = []
+                    card_manifest.setdefault("logical_input_value_ids", {})[
+                        str(input_name)
+                    ] = []
                 producer_binding = logical_outputs.get(output_name)
                 if producer_binding is None:
                     raise ValueError(
@@ -3696,6 +3730,90 @@ def build_program_bundle(
                     f"out::{producer_binding[0]}::{producer_binding[1]}"
                 )
             card_manifest["storage_redirects"] = storage_redirects
+            # Captured configured values still occupy ordinary class-memory
+            # input fields, but they are not public controls.  Preserve the
+            # emitter's value-id receipt and initialize those fields from the
+            # AOT capture instead of exposing anonymous ``input_<id>`` rows.
+            # This keeps the web ABI on authored names while the concordance
+            # remains the join between each captured value and its field.
+            import numpy as np
+
+            public_input_names = (
+                set(parameter_names) - set(contract.constant_map)
+            ) | set(contract.state_feedback)
+            captured_feed_values = {
+                int(value_id): value
+                for value_id, value in dict(aot.region_feed_values).items()
+            }
+            constant_name_by_value_id: dict[int, str] = {}
+            for region_program in effective_region_programs.values():
+                program_value = getattr(
+                    region_program, "program", region_program
+                )
+                source_function = str(
+                    (program_value.extras or {}).get("source_function") or ""
+                )
+                source_ids = {
+                    int(value_id): int(source_id)
+                    for value_id, source_id in dict(
+                        (program_value.extras or {}).get(
+                            "source_value_ids", {}
+                        )
+                    ).items()
+                }
+                owner_graph = next((
+                    graph for graph in concord_source_graphs
+                    if str(graph.G.graph.get("function_name") or "")
+                    == source_function
+                ), None)
+                if owner_graph is None:
+                    continue
+                identity_table = dict(
+                    owner_graph.G.graph.get("identity_table") or {}
+                )
+                for value_id in program_value.feeds:
+                    source_id = source_ids.get(int(value_id))
+                    if source_id is None:
+                        continue
+                    constant_name = next((
+                        str(name)
+                        for name, history in identity_table.items()
+                        if str(name) in contract.constant_map
+                        and source_id in tuple(map(int, history))
+                    ), None)
+                    if constant_name is not None:
+                        constant_name_by_value_id[int(value_id)] = constant_name
+            fixed_inputs: dict[str, list[Any]] = {}
+            for logical_name, value_ids in dict(
+                card_manifest.get("logical_input_value_ids", {}) or {}
+            ).items():
+                if str(logical_name) in public_input_names:
+                    continue
+                captured = next((
+                    captured_feed_values[int(value_id)]
+                    for value_id in value_ids
+                    if int(value_id) in captured_feed_values
+                ), None)
+                source_name = next((
+                    constant_name_by_value_id[int(value_id)]
+                    for value_id in value_ids
+                    if int(value_id) in constant_name_by_value_id
+                ), None)
+                if captured is None and source_name is not None:
+                    captured = contract.constant_map[source_name]
+                if captured is None and logical_name in contract.constant_map:
+                    captured = contract.constant_map[logical_name]
+                if captured is None:
+                    continue
+                array = np.asarray(captured)
+                if array.dtype.kind not in "biufc":
+                    continue
+                fixed_inputs[str(logical_name)] = array.reshape(-1).tolist()
+            card_manifest["fixed_inputs"] = fixed_inputs
+            card_manifest["public_inputs"] = [
+                name for name in card_manifest.get("logical_inputs", {})
+                if name not in fixed_inputs
+            ]
             channel.log("building class inventory", path="regions")
             inventory = build_class_inventory(card_manifest)
             channel.log("class inventory built", path="regions", methods=len(inventory.methods))
@@ -3827,7 +3945,7 @@ def build_program_bundle(
                 attach_shell_io,
             )
 
-            logical_inputs = tuple(card_manifest.get("logical_inputs", {}))
+            logical_inputs = tuple(card_manifest.get("public_inputs", ()))
             logical_outputs = tuple(card_manifest.get("logical_outputs", {}))
             coordinator_parameters = (
                 Parameter(
@@ -4211,6 +4329,11 @@ def build_program_bundle(
             process_graph=summarize_process_graph(graph),
             origin_source="",
             feed_expressions=contract.feed_expressions,
+            initial_feed_values={
+                name: feeds[name]
+                for name in card_manifest.get("public_inputs", ())
+                if name in feeds
+            },
             build_parameters={
                 "bundle schema": BUNDLE_SCHEMA,
                 "content version": version,
