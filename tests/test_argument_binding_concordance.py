@@ -34,3 +34,24 @@ def test_materializing_binding_resolution_preserves_history_and_settles_audit():
         assert CorrelationTable._binding_kind_findings(module) == []
     finally:
         end_identity_book(token)
+
+
+def test_precision_operator_concordance_reports_changed_source_identity():
+    book, token = begin_identity_book()
+    try:
+        page = book.page("source_precision_operator_concordance")
+        row = (("law", "section"), 27)
+        page.set(row, 0, ("Exp", 19, "Precision", 2))
+        page.set(row, 1, ("Log", 19, "Precision", 2))
+        module = type("Module", (), {
+            "metadata": {"identity_book": book},
+        })()
+
+        findings = CorrelationTable._source_precision_operator_findings(module)
+
+        assert len(findings) == 1
+        assert findings[0].kind == "source-precision-operator-disagreement"
+        assert findings[0].function == str(("law", "section"))
+        assert findings[0].value_id == 27
+    finally:
+        end_identity_book(token)

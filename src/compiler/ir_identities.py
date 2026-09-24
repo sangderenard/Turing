@@ -1728,6 +1728,12 @@ def precision_section_contracts(
     precision_fma_ops = {
         PRECISION_SINGULAR_NAMES["Mul"],
         PRECISION_SINGULAR_NAMES["Div"],
+        # The symbolic Exp/Log cores are Horner chains over wide
+        # multiplication. Their source operation therefore carries the same
+        # exact-product obligation as an explicit wide multiply, before the
+        # core is materialised into individual SSA operations below.
+        PRECISION_SINGULAR_NAMES["Exp"],
+        PRECISION_SINGULAR_NAMES["Log"],
     } if two_product_flavor == "fma" else set()
     contracts: list[PrecisionSectionContract] = []
 
@@ -1889,9 +1895,12 @@ def lower_precision_operations(
     mul_name = PRECISION_SINGULAR_NAMES["Mul"]
     div_name = PRECISION_SINGULAR_NAMES["Div"]
     sqrt_name = PRECISION_SINGULAR_NAMES["Sqrt"]
+    exp_name = PRECISION_SINGULAR_NAMES["Exp"]
+    log_name = PRECISION_SINGULAR_NAMES["Log"]
     neg_name = PRECISION_SINGULAR_NAMES["neg"]
     expandable = {
-        add_name, sub_name, mul_name, div_name, sqrt_name, neg_name,
+        add_name, sub_name, mul_name, div_name, sqrt_name, exp_name,
+        log_name, neg_name,
     }
 
     counts = {name: 0 for name in expandable}
@@ -2397,6 +2406,161 @@ def lower_precision_operations(
                     )
                 return renormalise(quotient, width)
 
+            def sum_expansion(source):
+                """The ordinary value used only for a range/seed decision."""
+
+                total = source[0]
+                for term in source[1:]:
+                    total = put("Add", (total, term), total)
+                return total
+
+            def constant_expansion(parts_, like):
+                return [scalar_constant(part, like) for part in parts_]
+
+            def sqrt_expansion(source, width: int):
+                """The eager Precision Newton law over repository limbs."""
+
+                collapsed = sum_expansion(source)
+                seed = put("Sqrt", (collapsed,), collapsed)
+                root = expanded(seed, width)
+                half = scalar_constant(0.5, seed)
+                steps = max(1, (int(width) - 1).bit_length()) + 1
+                for _step in range(steps):
+                    quotient = divide_expansions(source, root, width)
+                    root = add_expansions(root, quotient, width)
+                    root = [put("Mul", (term, half), term) for term in root]
+                return root
+
+            def proof_core(name: str, argument, width: int):
+                """Materialise the registered symbolic proof as wide SSA.
+
+                The identity, interval-derived order, exact rational
+                coefficients, and structural parity all come from
+                signal_symbolic. This pass only spells that already-authored
+                program with the expansion arithmetic above.
+                """
+
+                from ..common.tensors import signal_symbolic as proof
+
+                count = proof.order_for(
+                    name, proof.CORE_RADII[name], digits=16 * int(width),
+                )
+                degree = proof.order_to_degree(name, count)
+                coefficients = proof.structured_coefficients(name, degree)
+                element = section_element[0]
+                coefficient_values = [
+                    constant_expansion(
+                        proof.limb_decomposition(
+                            coefficient, width, element=element,
+                        ),
+                        argument[0],
+                    )
+                    for coefficient in coefficients
+                ]
+                structure = proof.TRANSCENDENTALS[name]["structure"]
+                base = (
+                    multiply_expansions(argument, argument, width)
+                    if structure in ("odd", "even") else list(argument)
+                )
+                result = coefficient_values[-1]
+                for coefficient in reversed(coefficient_values[:-1]):
+                    result = add_expansions(
+                        coefficient,
+                        multiply_expansions(base, result, width),
+                        width,
+                    )
+                if structure in ("odd", "factored"):
+                    result = multiply_expansions(argument, result, width)
+                return result
+
+            def exp_expansion(source, width: int):
+                """Precision.exp's ln(2) reduction plus the proof core."""
+
+                import math
+
+                from ..common.tensors.signal_symbolic import constant_limbs
+
+                collapsed = sum_expansion(source)
+                ln2_parts = constant_expansion(
+                    constant_limbs(
+                        "ln2", width, element=section_element[0],
+                    ),
+                    source[0],
+                )
+                ln2_head = scalar_constant(float(math.log(2.0)), source[0])
+                binade = put(
+                    "Round", (put("Div", (collapsed, ln2_head), collapsed),),
+                    collapsed,
+                )
+                remainder = add_expansions(
+                    source,
+                    [
+                        put("Neg", (term,), term)
+                        for term in multiply_expansions(
+                            ln2_parts, [binade], width,
+                        )
+                    ],
+                    width,
+                )
+                core = proof_core("exp", remainder, width)
+                scale = put(
+                    "Pow",
+                    (scalar_constant(2.0, collapsed), binade),
+                    collapsed,
+                )
+                return multiply_expansions(core, [scale], width)
+
+            def log_expansion(source, width: int):
+                """Precision.log's binade law plus the log1p proof core."""
+
+                import math
+
+                from ..common.tensors.signal_symbolic import constant_limbs
+
+                collapsed = sum_expansion(source)
+                ln2_head = scalar_constant(float(math.log(2.0)), source[0])
+                binade = put(
+                    "Floor",
+                    (put(
+                        "Div",
+                        (put("Log", (collapsed,), collapsed), ln2_head),
+                        collapsed,
+                    ),),
+                    collapsed,
+                )
+                scale = put(
+                    "Pow",
+                    (
+                        scalar_constant(2.0, collapsed),
+                        put("Neg", (binade,), binade),
+                    ),
+                    collapsed,
+                )
+                mantissa = multiply_expansions(source, [scale], width)
+                reduced = sqrt_expansion(
+                    sqrt_expansion(mantissa, width), width,
+                )
+                one = constant_expansion(
+                    (1.0, *((0.0,) * (int(width) - 1))), source[0],
+                )
+                offset = add_expansions(
+                    reduced, [put("Neg", (term,), term) for term in one],
+                    width,
+                )
+                core = proof_core("log1p", offset, width)
+                four = scalar_constant(4.0, source[0])
+                core = [put("Mul", (term, four), term) for term in core]
+                ln2_parts = constant_expansion(
+                    constant_limbs(
+                        "ln2", width, element=section_element[0],
+                    ),
+                    source[0],
+                )
+                restored = multiply_expansions(
+                    ln2_parts, [binade], width,
+                )
+                return add_expansions(core, restored, width)
+
             def collapse(parts_of, original):
                 """Define the ORIGINAL value as the sum of its limbs.
 
@@ -2615,25 +2779,30 @@ def lower_precision_operations(
                         instruction.attributes.get("precision_limbs") or 2
                     ), 2)
                     source = expanded(instruction.args[0], width)
-                    collapsed = source[0]
-                    for term in source[1:]:
-                        collapsed = put("Add", (collapsed, term), collapsed)
-                    seed = put("Sqrt", (collapsed,), collapsed)
-                    root = expanded(seed, width)
-                    half = scalar_constant(0.5, seed)
-                    steps = max(1, (int(width) - 1).bit_length()) + 1
-                    for _step in range(steps):
-                        quotient = divide_expansions(source, root, width)
-                        root = add_expansions(root, quotient, width)
-                        root = [
-                            put("Mul", (term, half), term)
-                            for term in root
-                        ]
+                    root = sqrt_expansion(source, width)
                     limbs[int(instruction.res.id)] = root
                     lowered_limb_records[int(instruction.res.id)] = tuple(
                         int(value.id) for value in root
                     )
                     collapse(root, instruction.res)
+                    counts[operation] += 1
+                    continue
+
+                if operation in {exp_name, log_name}:
+                    width = max(int(
+                        instruction.attributes.get("precision_limbs") or 2
+                    ), 2)
+                    source = expanded(instruction.args[0], width)
+                    result_limbs = (
+                        exp_expansion(source, width)
+                        if operation == exp_name
+                        else log_expansion(source, width)
+                    )
+                    limbs[int(instruction.res.id)] = result_limbs
+                    lowered_limb_records[int(instruction.res.id)] = tuple(
+                        int(value.id) for value in result_limbs
+                    )
+                    collapse(result_limbs, instruction.res)
                     counts[operation] += 1
                     continue
 

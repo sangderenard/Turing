@@ -57,6 +57,9 @@ Findings (each is one concrete disagreement, with the two claims):
 ``source-precision-boundary-disagreement``
     one authored Precision boundary changes kind, operand, or limb width
     between source reduction and structural output recovery.
+``source-precision-operator-disagreement``
+    one authored Precision operator changes operation, receiver, class, or
+    limb width between source stages.
 """
 
 from __future__ import annotations
@@ -289,6 +292,7 @@ class CorrelationTable:
         found.extend(self._source_field_identity_findings(module))
         found.extend(self._source_parameter_identity_findings(module))
         found.extend(self._source_precision_boundary_findings(module))
+        found.extend(self._source_precision_operator_findings(module))
         found.extend(self._source_precision_region_findings(module))
         found.extend(self._callable_identity_findings(module))
         return found
@@ -692,6 +696,42 @@ class CorrelationTable:
                 None if collapse_id is None else int(collapse_id),
                 "Precision region changed members, boundaries, or limb "
                 f"width across compilation stages: {distinct!r}",
+            ))
+        return found
+
+    @staticmethod
+    def _source_precision_operator_findings(module: Any) -> list[Finding]:
+        """Report a wide operator whose source identity changed."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "source_precision_operator_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            history = page.history(row)
+            distinct = tuple(dict.fromkeys(
+                repr(fact) for _column, fact in history
+            ))
+            if len(distinct) <= 1:
+                continue
+            scope, value_id = (
+                row if isinstance(row, tuple) and len(row) == 2
+                else (row, None)
+            )
+            found.append(Finding(
+                "source-precision-operator-disagreement",
+                str(scope),
+                None if value_id is None else int(value_id),
+                "Precision operator changed operation, receiver, class, or "
+                f"limb width across source stages: {distinct!r}",
             ))
         return found
 

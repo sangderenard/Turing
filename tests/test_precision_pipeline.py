@@ -1,4 +1,5 @@
 from fractions import Fraction
+import math
 import typing
 
 import pytest
@@ -62,6 +63,20 @@ def _evaluate_scalar_block(function, arguments):
             result = operands[0] / operands[1]
         elif operation == "Neg":
             result = -operands[0]
+        elif operation == "Pow":
+            result = operands[0] ** operands[1]
+        elif operation == "Sqrt":
+            result = math.sqrt(operands[0])
+        elif operation == "Exp":
+            result = math.exp(operands[0])
+        elif operation == "Log":
+            result = math.log(operands[0])
+        elif operation == "Floor":
+            result = math.floor(operands[0])
+        elif operation == "Round":
+            result = math.copysign(
+                math.floor(abs(operands[0]) + 0.5), operands[0]
+            )
         elif operation == "Fma":
             result = float(
                 Fraction.from_float(operands[0])
@@ -72,6 +87,134 @@ def _evaluate_scalar_block(function, arguments):
             raise AssertionError(f"unexpected scalar operation {operation!r}")
         environment[int(instruction.res.id)] = result
     return environment
+
+
+@pytest.mark.parametrize(
+    ("operation", "argument", "reference"),
+    (
+        ("Exp", 1.0e-8, math.expm1(1.0e-8)),
+        ("Log", 1.0e-8, math.log1p(1.0e-8)),
+    ),
+)
+def test_precision_transcendentals_lower_registered_proof_cores(
+    operation, argument, reference,
+):
+    """Exp/Log consume symbolic cores inside the indivisible wide section."""
+
+    from src.common.tensors.abstraction import AbstractTensor
+
+    eager_argument = Precision.of(
+        AbstractTensor.get_tensor([argument]), 2,
+    )
+    eager = (
+        eager_argument.exp() - 1.0
+        if operation == "Exp"
+        else (eager_argument + 1.0).log()
+    ).collapse().tolist()[0]
+
+    x, one, shifted, transcendental, result = (
+        value(1), value(2), value(3), value(4), value(5)
+    )
+    instructions = [Instr(
+        "Const", [], one, attributes={"constant": 1.0},
+    )]
+    if operation == "Exp":
+        instructions.extend((
+            Instr(
+                PRECISION_SINGULAR_NAMES["Exp"], [x], transcendental,
+                attributes={"precision_limbs": 2},
+            ),
+            Instr(
+                PRECISION_SINGULAR_NAMES["Sub"], [transcendental, one],
+                result, attributes={"precision_limbs": 2},
+            ),
+        ))
+    else:
+        instructions.extend((
+            Instr(
+                PRECISION_SINGULAR_NAMES["Add"], [x, one], shifted,
+                attributes={"precision_limbs": 2},
+            ),
+            Instr(
+                PRECISION_SINGULAR_NAMES["Log"], [shifted], result,
+                attributes={"precision_limbs": 2},
+            ),
+        ))
+    function = Function(
+        "f", [x], {"entry": BasicBlock("entry", instructions)},
+    )
+    module = IRModule({"f": function})
+
+    receipt = apply_precision_pipeline(module)
+    environment = _evaluate_scalar_block(function, [argument, 0.0])
+
+    assert receipt["status"] == "lowered"
+    assert receipt["lowered_operations"][
+        PRECISION_SINGULAR_NAMES[operation]
+    ] == 1
+    assert not {
+        str(instruction.op)
+        for instruction in function.blocks["entry"].instrs
+    }.intersection(PRECISION_SINGULAR_NAMES.values())
+    assert environment[result.id] == eager
+    assert abs(environment[result.id] - reference) <= math.ulp(reference)
+
+
+@pytest.mark.parametrize("operation", ("Exp", "Log"))
+def test_symbolic_law_compiler_concords_precision_transcendental(operation):
+    """The public source compiler keeps the planned wide region indivisible."""
+
+    import sympy as sp
+
+    from src.common.tensors import AbstractTensor
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.identity_concordance import CorrelationTable
+    from src.compiler.native_law_kernels import batch_contract
+    from src.compiler.precision_policy import PrecisionPolicy
+    from src.compiler.symbolic_equation_compiler import compile_sympy_equations
+    from src.compiler.vehicle_python_compilation import (
+        symbolic_abstract_tensor_source,
+    )
+
+    x, y = sp.symbols("x y")
+    expression = sp.exp(x) - 1 if operation == "Exp" else sp.log(1 + x)
+    compilation = compile_sympy_equations(
+        [sp.Eq(y, expression, evaluate=False)],
+        name=f"{operation.lower()}_precision_concordance",
+    )
+    samples = [1.0e-8, 1.0e-5, 0.1, -0.1]
+    policy = PrecisionPolicy(samples={"x": samples}, ulps=1.0)
+    source = symbolic_abstract_tensor_source(compilation, "tick", policy)
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source,
+        "tick",
+        python_bindings={
+            "AbstractTensor": AbstractTensor,
+            "Precision": Precision,
+        },
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        name=f"{operation.lower()}_precision_concordance_batched",
+        runtime_closure_only=True,
+        extraction_contract=batch_contract("tick", ("x",), len(samples)),
+    )
+
+    receipt = module.metadata[PRECISION_PIPELINE_METADATA]
+    assert receipt["status"] == "lowered"
+    assert receipt["lowered_operations"][
+        PRECISION_SINGULAR_NAMES[operation]
+    ] == 1
+    book = module.metadata["identity_book"]
+    page = book.page("source_precision_operator_concordance")
+    facts = {
+        tuple(fact)
+        for row in page.rows()
+        for _column, fact in page.history(row)
+    }
+    assert any(fact[0] == operation and fact[3] == 2 for fact in facts)
+    assert CorrelationTable._source_precision_operator_findings(module) == []
 
 
 def test_precision_width_annotation_is_a_runtime_generic_alias():

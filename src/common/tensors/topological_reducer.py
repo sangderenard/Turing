@@ -599,7 +599,7 @@ PRECISION_TYPE_ALIASES = {"double": "float64", "float": "float32",
                           "f64": "float64", "f32": "float32", "f16": "float16"}
 
 #: Operations closed over the limb representation. A sum, difference,
-#: product, quotient, square root or negation of limbed values IS a limbed
+#: product, quotient, square root, exponential, logarithm or negation of limbed
 #: value, so each has a wider counterpart meaning the same thing. Nothing else
 #: belongs: there
 #: is no wider form of a reduction or a reshape that would be right, so those
@@ -610,7 +610,7 @@ PRECISION_TYPE_ALIASES = {"double": "float64", "float": "float32",
 #: ``truediv`` at this layer, only ``Div``. Keying on a tidied-up spelling
 #: silently misses and falls through to the ordinary operation.
 PRECISION_CLOSED_OPERATIONS = (
-    "Add", "Sub", "Mul", "Div", "Sqrt", "neg",
+    "Add", "Sub", "Mul", "Div", "Sqrt", "Exp", "Log", "neg",
 )
 
 #: The greatest width a generated name is provided for.
@@ -7038,6 +7038,32 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 and str(identity).rsplit(".", 1)[-1] == "Precision"
             )
 
+        def concord_operator(
+            node_id: int,
+            operation: str,
+            receiver_id: int,
+            class_identity: str,
+            limbs: int,
+        ) -> None:
+            """Commit the exact source operation carried by a wide value."""
+
+            page = current_identity_book().page(
+                "source_precision_operator_concordance"
+            )
+            row = (scope, int(node_id))
+            proposed = (
+                str(operation), int(receiver_id), str(class_identity),
+                max(int(limbs or 1), 1),
+            )
+            incumbent = page.latest(row)
+            if incumbent is not None and tuple(incumbent) != proposed:
+                raise ValueError(
+                    "source precision operator concordance disagreement for "
+                    f"{row!r}: recorded={incumbent!r}, proposed={proposed!r}"
+                )
+            if incumbent is None:
+                page.set(row, 0, proposed)
+
         for node_id, data in tuple(target_graph.nodes(data=True)):
             expression = data.get("expr_obj")
             if not (
@@ -7107,6 +7133,15 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     precision_limbs=limbs,
                 )
 
+        precision_methods = {
+            "sqrt": "Sqrt",
+            "exp": "Exp",
+            "log": "Log",
+        }
+        # A method can feed an operator and an operator can feed a method.
+        # Settle both from the same producer-edge identities to a fixed point;
+        # ordering these as two one-shot loops lost `(wide.exp() - 1)` between
+        # the two and left the following collapse without a class descriptor.
         changed = True
         while changed:
             changed = False
@@ -7169,63 +7204,78 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     precision_limbs=int(limbs),
                     source=f"Precision {type(expression).__name__}",
                 )
-                changed = True
-
-        for node_id, data in tuple(target_graph.nodes(data=True)):
-            expression = data.get("expr_obj")
-            if not (
-                isinstance(expression, ast.Call)
-                and isinstance(expression.func, ast.Attribute)
-                and expression.func.attr == "sqrt"
-            ):
-                continue
-            receiver_id = next((
-                int(parent) for parent, role in data.get("parents", ())
-                if str(role) in {"operand", "receiver", "value"}
-            ), None)
-            if receiver_id is None:
-                continue
-            receiver_class, receiver_limbs = (
-                _resolved_source_value_class(target_graph, receiver_id)
-            )
-            if not is_real_precision(receiver_class):
-                continue
-            operation = PRECISION_SINGULAR_NAMES["Sqrt"]
-            attributes = data.setdefault("attributes", {})
-            attributes.update({
-                "python_precision_operator": True,
-                "precision_limbs": int(receiver_limbs),
-                "result_class_ref": str(receiver_class),
-                "precision_source_operation": "Sqrt",
-            })
-            for field in (
-                "callee_ref", "method_ref", "constructor_ref", "class_ref",
-            ):
-                attributes.pop(field, None)
-            accessor_id = id(expression.func)
-            if accessor_id in target_graph:
-                accessor_attributes = target_graph.nodes[
-                    accessor_id
-                ].setdefault("attributes", {})
-                for field in (
-                    "callee_ref", "method_ref", "bound_method_ref",
-                ):
-                    accessor_attributes.pop(field, None)
-                accessor_attributes["python_precision_operator"] = (
-                    "sqrt-selector"
+                receiver_id = (
+                    int(operand_ids[0]) if isinstance(expression, ast.BinOp)
+                    else int(operand_id)
                 )
-            data["type"] = operation
-            data["op"] = operation
-            _replace_inputs(
-                target_wrapper,
-                int(node_id),
-                ((int(receiver_id), "operand"),),
-            )
-            _concord_source_value_class(
-                scope, int(node_id), str(receiver_class),
-                precision_limbs=int(receiver_limbs),
-                source="Precision sqrt",
-            )
+                concord_operator(
+                    int(node_id), str(operation), receiver_id,
+                    class_identity, int(limbs),
+                )
+                changed = True
+            for node_id, data in tuple(target_graph.nodes(data=True)):
+                expression = data.get("expr_obj")
+                attributes = data.setdefault("attributes", {})
+                if (
+                    attributes.get("python_precision_operator")
+                    or not isinstance(expression, ast.Call)
+                    or not isinstance(expression.func, ast.Attribute)
+                    or expression.func.attr not in precision_methods
+                ):
+                    continue
+                receiver_id = next((
+                    int(parent) for parent, role in data.get("parents", ())
+                    if str(role) in {"operand", "receiver", "value"}
+                ), None)
+                if receiver_id is None:
+                    continue
+                receiver_class, receiver_limbs = (
+                    _resolved_source_value_class(target_graph, receiver_id)
+                )
+                if not is_real_precision(receiver_class):
+                    continue
+                source_operation = precision_methods[expression.func.attr]
+                operation = PRECISION_SINGULAR_NAMES[source_operation]
+                attributes.update({
+                    "python_precision_operator": True,
+                    "precision_limbs": int(receiver_limbs),
+                    "result_class_ref": str(receiver_class),
+                    "precision_source_operation": source_operation,
+                })
+                for field in (
+                    "callee_ref", "method_ref", "constructor_ref",
+                    "class_ref",
+                ):
+                    attributes.pop(field, None)
+                accessor_id = id(expression.func)
+                if accessor_id in target_graph:
+                    accessor_attributes = target_graph.nodes[
+                        accessor_id
+                    ].setdefault("attributes", {})
+                    for field in (
+                        "callee_ref", "method_ref", "bound_method_ref",
+                    ):
+                        accessor_attributes.pop(field, None)
+                    accessor_attributes["python_precision_operator"] = (
+                        f"{expression.func.attr}-selector"
+                    )
+                data["type"] = operation
+                data["op"] = operation
+                _replace_inputs(
+                    target_wrapper,
+                    int(node_id),
+                    ((int(receiver_id), "operand"),),
+                )
+                _concord_source_value_class(
+                    scope, int(node_id), str(receiver_class),
+                    precision_limbs=int(receiver_limbs),
+                    source=f"Precision {expression.func.attr}",
+                )
+                concord_operator(
+                    int(node_id), source_operation, int(receiver_id),
+                    str(receiver_class), int(receiver_limbs),
+                )
+                changed = True
 
         for node_id, data in tuple(target_graph.nodes(data=True)):
             expression = data.get("expr_obj")
