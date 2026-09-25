@@ -85,8 +85,8 @@ was written.
 | Start time | `2026-08-12 19:42:12 -05:00` |
 | Command | `python -u scripts/extract_compile_host_library.py` |
 | Root | native CPython `compile()` |
-| stdout | `build/compile-host-library-v3.stdout.log` |
-| stderr | `build/compile-host-library-v3.stderr.log` |
+| stdout | `artifacts/compiler_evidence/compile-host-library-v3.stdout.log` |
+| stderr | `artifacts/compiler_evidence/compile-host-library-v3.stderr.log` |
 | Last observed elapsed | about 51 minutes |
 | Last observed CPU | about 2,872 seconds |
 | Last observed working set | about 17.38 GiB |
@@ -117,8 +117,8 @@ if ($null -eq $process) {
     "PRIVATE_GB=$([math]::Round($process.PrivateMemorySize64 / 1GB, 2))"
     "RESPONDING=$($process.Responding)"
 }
-Get-Content build/compile-host-library-v3.stdout.log -Tail 12
-Get-Content build/compile-host-library-v3.stderr.log -Tail 12
+Get-Content artifacts/compiler_evidence/compile-host-library-v3.stdout.log -Tail 12
+Get-Content artifacts/compiler_evidence/compile-host-library-v3.stderr.log -Tail 12
 ```
 
 Do not attach a second Python profiler and do not launch another recursive

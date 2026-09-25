@@ -992,7 +992,19 @@ def dt_system_contract(entry, columns, batch, participants=1):
                ("pub_values", "pub_present", "pub_limits", "pub_limits_present")},
         },
     }
-    records["Metrics"]["fields"].update(records["StepSpans"]["fields"])
+    # StepSpans refines the physical extents of Metrics' publication fields,
+    # but it does not replace their Python constructor semantics.  In
+    # particular, Metrics supplies these fields through default factories.
+    # Replacing the field mappings wholesale used to erase ``default`` and
+    # made an ordinary ``Metrics(...)`` construction publish a shorter record
+    # than a Metrics returned by an engine.  Preserve the incumbent semantic
+    # contract while applying StepSpans' storage/shape refinement.
+    metrics_fields = records["Metrics"]["fields"]
+    for field_name, span_field in records["StepSpans"]["fields"].items():
+        metrics_fields[field_name] = {
+            **metrics_fields[field_name],
+            **span_field,
+        }
     bindings.append({"function": "*", "parameter": "spans", "record": "StepSpans"})
     bindings.append({"function": "*", "parameter": "state", "record": "PieceState"})
     values = [

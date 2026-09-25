@@ -4,9 +4,11 @@ __pycache__
 *.zip
 pytest_run_times.log
 .turing-cache/
+/.cache/
 .vs
 env
-/build/
+/build/*
+!/build/README.md
 
 # Generated diagnostics and render captures are local artifacts. Reference
 # images intentionally kept under src/rendering/ascii_diff remain tracked.
@@ -61,7 +63,8 @@ tools/_precision_benchmark/
 # 2026-09-18, of which .piece is 94 MB and .pdb symbols are 26 MB. The
 # pieces are live inputs to examples/llvm_dt_system.py, so this directory
 # is kept locally and rebuilt -- it is ignored, not deleted.
-/artifacts/
+/artifacts/*
+!/artifacts/README.md
 
 # Symbolic law construction cache, rebuilt on demand.
 __lawcache__/

@@ -88,6 +88,15 @@ _UNARY: dict[str, str] = {
     "Ceil": "{out} = call double @llvm.ceil.f64(double {0})",
     "Trunc": "{out} = call double @llvm.trunc.f64(double {0})",
     "Round": "{out} = call double @llvm.round.f64(double {0})",
+    "IsFinite": (
+        "{out}.abs = call double @llvm.fabs.f64(double {0})\n"
+        "{out} = fcmp one double {out}.abs, 0x7FF0000000000000"
+    ),
+    "IsNaN": "{out} = fcmp uno double {0}, {0}",
+    "IsInf": (
+        "{out}.abs = call double @llvm.fabs.f64(double {0})\n"
+        "{out} = fcmp oeq double {out}.abs, 0x7FF0000000000000"
+    ),
     "Not": "{out} = xor i1 {0}, true",
     "LNot": "{out} = xor i1 {0}, true",
     "Invert": "{out} = xor i64 {0}, -1",
@@ -750,6 +759,19 @@ def integer_scalar_lines(
             f"{register} = add {operand_type} {register}.rem, "
             f"{register}.adjust",
         ], operand_type)
+    if operation in {"LAnd", "LOr"} and len(operands) >= 2:
+        opcode = _INTEGER_BINARY[operation]
+        lines = []
+        prior = operands[0]
+        for position, operand in enumerate(operands[1:], 1):
+            target = register if position == len(operands) - 1 else (
+                f"{register}.{position}"
+            )
+            lines.append(
+                f"{target} = {opcode} {operand_type} {prior}, {operand}"
+            )
+            prior = target
+        return lines, operand_type
     if operation in _INTEGER_BINARY and len(operands) == 2:
         return ([
             f"{register} = {_INTEGER_BINARY[operation]} "
@@ -1162,7 +1184,9 @@ def _piece_module_parts(llvm_ir: str) -> tuple[dict[str, str], dict[str, str]]:
     return declarations, definitions
 
 
-from .hierarchical_plan import PREDICATE_OPERATIONS  # noqa: E402
+from .hierarchical_plan import (  # noqa: E402
+    is_predicate_operation,
+)
 
 
 def _emit_repository_call_module(
@@ -1762,7 +1786,7 @@ def _emit_repository_call_module(
         if instruction.res is not None
         and _declared_span_rank(instruction.res) > 0
         and scalar_likeness(str(instruction.op)) is not None
-        and str(instruction.op) not in PREDICATE_OPERATIONS
+        and not is_predicate_operation(instruction.op)
     )
     growing = True
     while growing:
@@ -2861,7 +2885,22 @@ def _emit_repository_call_module(
                     continue
 
             if operation in {"Load", "load"} and result is not None and instruction.args:
-                addressed = span_addresses.get(int(instruction.args[0].id))
+                address_argument = instruction.args[0]
+                address_accounting = dict(address_argument.accounting or {})
+                addressed = span_addresses.get(int(address_argument.id))
+                if (
+                    addressed is None
+                    and address_accounting.get("compiler_frame_sequence_id")
+                    is not None
+                    and address_accounting.get("compiler_frame_member")
+                    is not None
+                ):
+                    # A resident sequence member is already a physical
+                    # caller-owned address.  The concordance stamps its
+                    # sequence/member identity on the formal; requiring a
+                    # preceding GEP would discard that proven address and
+                    # leave direct length/status loads unrenderable.
+                    addressed = pointer(address_argument)
                 if addressed is not None:
                     loaded_type = _value_llvm_type(result)
                     if loaded_type in {"double", "i32", "i1"}:
@@ -2917,6 +2956,18 @@ def _emit_repository_call_module(
                     )
                     pointers[result_id] = loaded_pointer
                     continue
+                address = instruction.args[0]
+                shortfalls.append(LLVMEmissionShortfall(
+                    name,
+                    operation,
+                    f"address value {int(address.id)} for result "
+                    f"{result_id} has no concorded span, aggregate member, "
+                    "or aggregate slot; address dtype="
+                    f"{str(address.dtype)!r}, accounting="
+                    f"{dict(address.accounting or {})!r}, instruction "
+                    f"attributes={dict(instruction.attributes or {})!r}",
+                ))
+                continue
 
             if operation in {"Store", "store"} and len(instruction.args) == 2:
                 source, address = instruction.args
@@ -3334,12 +3385,29 @@ def _emit_repository_call_module(
                             ))
                             continue
                     if len(semantic_arguments) != expected_argument_count:
+                        callee_formals = module.functions[symbol].args
+                        row_receipts = {
+                            key: instruction.attributes.get(key)
+                            for key in (
+                                "ssa_deferred_record_row",
+                                "ssa_deferred_record_slots",
+                                "ssa_record_row_expanded_from",
+                                "ssa_record_slots_expanded",
+                                "ssa_record_row_identity",
+                                "sequence_id",
+                            )
+                            if key in instruction.attributes
+                        }
                         shortfalls.append(LLVMEmissionShortfall(
                             name,
                             symbol,
                             "repository call argument count does not match "
                             f"callee ABI: actual={len(semantic_arguments)}, "
-                            f"expected={expected_argument_count}",
+                            f"expected={expected_argument_count}; actual ids="
+                            f"{tuple(int(value.id) for value in semantic_arguments)!r}; "
+                            f"formal ids={tuple(int(value.id) for value in callee_formals)!r}; "
+                            f"row receipts={row_receipts!r}; unresolved rows="
+                            f"{tuple(function.metadata.get('unresolved_record_sequence_rows', ()))!r}",
                         ))
                         continue
                     required_positions = callee_aggregate_parameter_positions.get(
@@ -3568,6 +3636,77 @@ def _emit_repository_call_module(
                                 pointers[result_id] = aggregate
                     continue
 
+            if (
+                operation in {"Cast", "CastLike", "cast_like"}
+                and result is not None
+                and instruction.args
+                and _declared_span_rank(result) > 0
+            ):
+                result_type = _value_llvm_type(result)
+                source = instruction.args[0]
+                source_type = _value_llvm_type(source)
+                total = _span_element_count(
+                    name, result, tag, body,
+                    public_span_value, module_extent_slot,
+                )
+                if total is None:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"elementwise {operation} over span %t{result_id} "
+                        "needs its extents, and no public origin declares "
+                        "them; refusing to emit a one-element stand-in",
+                    ))
+                    continue
+                entry_label = block_exit_label.get(
+                    active_block or "", active_block or "entry",
+                )
+                head = f"cast.head.{tag}"
+                loop_body = f"cast.body.{tag}"
+                done = f"cast.done.{tag}"
+                index = f"%cast.i.{tag}"
+                nxt = f"%cast.next.{tag}"
+                body.extend((
+                    f"  br label %{head}",
+                    f"{head}:",
+                    f"  {index} = phi i32 [ 0, %{entry_label} ], "
+                    f"[ {nxt}, %{loop_body} ]",
+                    f"  %cast.more.{tag} = icmp slt i32 {index}, {total}",
+                    f"  br i1 %cast.more.{tag}, label %{loop_body}, "
+                    f"label %{done}",
+                    f"{loop_body}:",
+                ))
+                loaded = f"%cast.source.{tag}"
+                if _declared_span_rank(source) > 0:
+                    body.append(
+                        f"  {loaded}.addr = getelementptr {source_type}, "
+                        f"ptr {pointer(source)}, i32 {index}"
+                    )
+                    body.append(
+                        f"  {loaded} = load {source_type}, "
+                        f"ptr {loaded}.addr, align {_align(source_type)}"
+                    )
+                else:
+                    body.append(
+                        f"  {loaded} = load {source_type}, "
+                        f"ptr {pointer(source)}, align {_align(source_type)}"
+                    )
+                converted = convert_loaded(
+                    loaded, source_type, result_type, f"cast.{tag}",
+                )
+                body.extend((
+                    f"  %cast.dst.{tag} = getelementptr {result_type}, "
+                    f"ptr {pointer(result)}, i32 {index}",
+                    f"  store {result_type} {converted}, "
+                    f"ptr %cast.dst.{tag}, align {_align(result_type)}",
+                    f"  {nxt} = add i32 {index}, 1",
+                    f"  br label %{head}",
+                    f"{done}:",
+                ))
+                if active_block is not None:
+                    block_exit_label[active_block] = done
+                register_cache.clear()
+                continue
+
             if operation in {"Cast", "CastLike", "cast_like"} and result is not None and instruction.args:
                 result_type = _value_llvm_type(result)
                 rendered = load_as(
@@ -3621,7 +3760,7 @@ def _emit_repository_call_module(
                 template is not None
                 and result is not None
                 and _declared_span_rank(result) > 0
-                and operation not in PREDICATE_OPERATIONS
+                and not is_predicate_operation(operation)
             ):
                 # An elementwise operation whose RESULT is a span is an array
                 # operation, and rendering it as one scalar load/op/store
@@ -3806,7 +3945,7 @@ def _emit_repository_call_module(
                     # example, ``store i32 %double_register`` when an integer
                     # compiler index was gated by a floating predicate.
                     result_type = (
-                        "i1" if operation in PREDICATE_OPERATIONS
+                        "i1" if is_predicate_operation(operation)
                         else operand_type
                     )
                 # The cell was alloca'd with the value's DECLARED type; a
@@ -5170,6 +5309,12 @@ def emit_ssa_function_to_llvm(
     for argument in function.args:
         argument_pointer = buffer(int(argument.id))
         if tuple(argument.shape or ()):
+            accounting = dict(argument.accounting or {})
+            if (
+                accounting.get("compiler_frame_sequence_id") is not None
+                and accounting.get("compiler_frame_member") is not None
+            ):
+                scalars[int(argument.id)] = (argument_pointer, "ptr")
             continue
         llvm_type = _value_llvm_type(argument)
         register = f"%argument.{int(argument.id)}"
@@ -5760,7 +5905,7 @@ def emit_ssa_function_to_llvm(
                 # consumer of it emitted `fcmp one double` against an i1 --
                 # rejected by the verifier. Nothing consumed a comparison in
                 # this path until Piecewise did, so it sat unnoticed.
-                if str(operation) in PREDICATE_OPERATIONS:
+                if is_predicate_operation(operation):
                     for rendered in template.format(
                         *operands, out=register
                     ).splitlines():
@@ -5915,7 +6060,10 @@ def compile_artifact(
     if not artifact.complete:
         raise ValueError(
             "artifact has shortfalls: "
-            + "; ".join(s.reason for s in artifact.shortfalls[:5])
+            + "; ".join(
+                f"{s.function}: {s.operation}: {s.reason}"
+                for s in artifact.shortfalls[:5]
+            )
         )
     build_dir = _Path(directory) if directory is not None else _Path(
         _tempfile.mkdtemp(prefix=f"ssa_llvm_{artifact.name}_")

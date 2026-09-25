@@ -43,7 +43,7 @@ C ABI shim. The fixture uses append and does not call the replacement path.
 The assertion was not weakened and no baseline checkout/stash was used.
 This is a measured remaining failure, not a claimed clean broad gate.
 
-Fresh source diagnostic `build/keyed_replace_full_formals_20260907.log`
+Fresh source diagnostic `artifacts/compiler_evidence/keyed_replace_full_formals_20260907.log`
 completed with exit1 at the strict gate: **19 formals, zero undefined operands,
 zero unresolved calls, zero unmaterialized boundaries**, no optional merge or
 non-native findings. The authoritative full_formal_diagnostic artifacts have

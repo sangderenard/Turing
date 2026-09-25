@@ -325,6 +325,24 @@ def test_clean_subgraph_drops_obligations_to_excluded_parents():
     assert graph.G.nodes[2]["parents"] == [(1, "arg0")]
 
 
+def test_clean_subgraph_preserves_cyclic_metadata_identity_without_aliasing_source():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "input")
+    shared = {"label": "shared"}
+    shared["backedge"] = shared
+    graph.G.graph["cyclic_metadata"] = shared
+    graph.G.nodes[1]["attributes"]["shared_metadata"] = shared
+
+    extracted = extract_clean_process_subgraph(graph, (1,))
+    copied = extracted.G.graph["cyclic_metadata"]
+
+    assert copied is not shared
+    assert copied["backedge"] is copied
+    assert extracted.G.nodes[1]["attributes"]["shared_metadata"] is copied
+    copied["label"] = "isolated"
+    assert shared["label"] == "shared"
+
+
 def test_shader_reducer_consumes_existing_process_graph_schedule():
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 0, "Input")

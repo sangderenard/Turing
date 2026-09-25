@@ -113,6 +113,47 @@ def test_loop_composer_unrolls_small_static_range():
     assert plan.loop.body_nodes
 
 
+def test_static_unroll_clones_authored_calls_with_exact_argument_edges():
+    graph = _function_graph(
+        "def selected(parts, index):\n"
+        "    return parts[index]\n"
+        "\n"
+        "def kernel(left, right):\n"
+        "    parts = (left, right)\n"
+        "    result = selected(parts, 0)\n"
+        "    for index in range(1, 2):\n"
+        "        result = result + selected(parts, index)\n"
+        "    return result\n",
+        "kernel",
+    )
+    composer = _glsl_composer()
+    plans = composer.discover(graph)
+    original_call = next(
+        node_id
+        for node_id in plans[0].loop.body_nodes
+        if graph.G.nodes[node_id]["type"] == "Call"
+    )
+    original_callee = graph.G.nodes[original_call]["attributes"]["callee_ref"]
+
+    evaporated = evaporate_unrolled_loops(graph, plans)
+
+    assert evaporated == plans
+    cloned_call = next(
+        (node_id, data)
+        for node_id, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("unrolled_from") == original_call
+    )
+    cloned_id, cloned = cloned_call
+    assert cloned_id != original_call
+    assert cloned["attributes"]["callee_ref"] == original_callee
+    index_id = next(
+        parent
+        for parent, role in cloned["parents"]
+        if role == "arg:1"
+    )
+    assert graph.G.nodes[index_id]["constant"] == 1
+
+
 def test_unroll_does_not_evaporate_explicit_sequence_mutation():
     graph = _function_graph(
         "def kernel(x):\n"

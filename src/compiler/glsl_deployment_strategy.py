@@ -282,6 +282,32 @@ def _lower_python_scalar_intrinsics(graph: Any) -> None:
         })
 
 
+def _refresh_specialized_python_precision(graph: Any) -> None:
+    """Apply exact numeric identity after planner specialization is known."""
+
+    from ..common.tensors.topological_reducer import (
+        specialize_python_precision_widths,
+    )
+
+    function_table = getattr(graph, "function_table", None)
+    if function_table is not None:
+        # Shared catalogue facts are installed only when every callsite
+        # agrees.  Settle those callees first so the caller can read their
+        # exact specialized return identity in this same planning phase.
+        for entry in function_table:
+            callee = getattr(entry, "graph", None)
+            if (
+                callee is not None
+                and callee is not graph
+                and (
+                    callee.G.graph.get("planner_specializations")
+                    or callee.G.graph.get("planner_parameter_classes")
+                )
+            ):
+                specialize_python_precision_widths(callee)
+    specialize_python_precision_widths(graph)
+
+
 def _topological_region_order(shell: Any, candidate_regions: Any) -> tuple[int, ...]:
     return _topological_region_schedule(shell, candidate_regions)[0]
 
@@ -1784,6 +1810,30 @@ def _authored_aggregate_leaves(graph: Any, value_id: int) -> tuple[int, ...]:
     ))
 
 
+def _authored_aggregate_descriptor_tree(graph: Any, value_id: int) -> Any:
+    """Return the exact nested descriptor tree of an authored aggregate.
+
+    Aggregate identity is recursive: a tuple member may itself be a tuple.
+    Flattening the outer ledger to one descriptor per member discarded the
+    coefficient-limb rows in ``((c00, c01), ..., (c30, c31))``.  Preserve the
+    authored tree; leaves remain ordinary tensor descriptors (or ``None``
+    when no shape has yet been proved).
+    """
+
+    value_id = int(value_id)
+    leaves = _authored_aggregate_leaves(graph, value_id)
+    if leaves:
+        return tuple(
+            _authored_aggregate_descriptor_tree(graph, int(leaf))
+            for leaf in leaves
+        )
+    descriptor = _tensor_descriptor(graph, value_id)
+    return (
+        None if descriptor is None
+        else copy.deepcopy(dict(descriptor))
+    )
+
+
 def _expanded_callsite_argument_edges(
     graph: Any, node_id: int,
 ) -> tuple[tuple[int, str], ...]:
@@ -2053,7 +2103,8 @@ def _precision_indivisible_node_groups(
     if not executable:
         return ()
     scope = str(
-        graph.G.graph.get("function_name")
+        graph.G.graph.get("source_numeric_scope")
+        or graph.G.graph.get("function_name")
         or graph.G.graph.get("qualified_name")
         or "<module>"
     )
@@ -2115,13 +2166,19 @@ def _precision_indivisible_node_groups(
         }
         promotes = tuple(sorted(
             node_id for node_id, fact in component_boundaries.items()
-            if fact[0] == "promote"
+            if fact[0] in {"promote", "pack"}
         ))
         collapses = tuple(sorted(
             node_id for node_id, fact in component_boundaries.items()
             if fact[0] == "collapse"
         ))
-        if not promotes or not collapses:
+        # A helper may return Precision directly.  Its authored interval is
+        # open at the function boundary rather than closed by ``collapse``;
+        # the promotion and every concorded Precision result are still one
+        # non-separable numerical region.  Requiring a collapse stranded the
+        # promoted high limbs as anonymous frame formals in precisely these
+        # helpers, so native execution read uninitialized storage.
+        if not promotes:
             continue
         ordered = tuple(sorted(
             component.intersection(executable), key=order.__getitem__,
@@ -2131,7 +2188,7 @@ def _precision_indivisible_node_groups(
         widths = tuple(sorted({
             int(fact[2]) for fact in component_boundaries.values()
         }))
-        row = (scope, collapses[-1])
+        row = (scope, collapses[-1] if collapses else ordered[-1])
         proposed = (ordered, promotes, collapses, widths)
         incumbent = region_page.latest(row)
         if incumbent is not None and tuple(incumbent) != proposed:
@@ -2149,8 +2206,16 @@ def _precision_indivisible_node_groups(
     return tuple(groups)
 
 
-def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
+def _build_shell_hierarchy_plan(
+    shell: Any,
+    _memo: dict[int, PlanClosure] | None = None,
+) -> PlanClosure:
     """Freeze call/region ownership before backend source composition."""
+
+    memo = {} if _memo is None else _memo
+    incumbent_plan = memo.get(id(shell))
+    if incumbent_plan is not None:
+        return incumbent_plan
 
     graph = shell.process_graph
     # The plan freezes tensor descriptors into ``PlanClosure.value_shapes``.
@@ -2453,12 +2518,15 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     graph, int(parent),
                 )
                 # Member formals materialized for an aggregate parameter
-                # carry their exact member index.  They outlive the
+                # carry their exact member path.  They outlive the
                 # shapeless aggregate formal, which is dropped once every
                 # authored projection reads its member directly, so the
                 # member binding must not depend on that formal's identity.
                 member_inputs = {
-                    int(member_attributes["aggregate_index"]): int(member_id)
+                    tuple(map(int, member_attributes.get(
+                        "aggregate_path",
+                        (member_attributes["aggregate_index"],),
+                    ))): int(member_id)
                     for member_id, member_data in child_graph.nodes(data=True)
                     if member_data.get("type") == "Input"
                     and str(
@@ -2472,17 +2540,37 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     if member_attributes.get("aggregate_index") is not None
                 }
                 if member_inputs:
-                    if not caller_leaves or max(member_inputs) >= len(
-                        caller_leaves
-                    ):
+                    caller_member_ids: dict[tuple[int, ...], int] = {}
+
+                    def record_caller_members(
+                        value_id: int, path: tuple[int, ...] = (),
+                    ) -> None:
+                        member_leaves = _authored_aggregate_leaves(
+                            graph, int(value_id),
+                        )
+                        if not member_leaves:
+                            if path:
+                                caller_member_ids[path] = int(value_id)
+                            return
+                        for member_index, member_id in enumerate(member_leaves):
+                            record_caller_members(
+                                int(member_id), (*path, int(member_index)),
+                            )
+
+                    record_caller_members(int(parent))
+                    missing_paths = tuple(
+                        path for path in member_inputs
+                        if path not in caller_member_ids
+                    )
+                    if missing_paths:
                         raise ValueError(
                             f"aggregate call binding for {name!r} names "
-                            f"member {max(member_inputs)} but the caller "
-                            f"aggregate has {len(caller_leaves)} leaves"
+                            f"paths {missing_paths!r} absent from caller "
+                            f"paths {tuple(caller_member_ids)!r}"
                         )
-                    for index in sorted(member_inputs):
+                    for path in sorted(member_inputs):
                         argument_bindings.append((
-                            int(caller_leaves[index]), member_inputs[index],
+                            int(caller_member_ids[path]), member_inputs[path],
                         ))
                 if identities and not member_inputs:
                     # With member formals bound above, the aggregate itself
@@ -2661,7 +2749,7 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             child_outputs = tuple(child_output_paths.values())
             items.append(PlanCall(
                 int(node_id),
-                _build_shell_hierarchy_plan(child),
+                _build_shell_hierarchy_plan(child, memo),
                 parents,
                 tuple(caller for _callee, caller in result_bindings),
                 tuple(argument_bindings),
@@ -3393,7 +3481,7 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         getattr(shell, "shell_control_program", None)
     ))
 
-    return PlanClosure(
+    planned = PlanClosure(
         name=str(
             graph.G.graph.get("function_name")
             or type(shell).__name__
@@ -3409,6 +3497,8 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         ))),
         items=tuple(items),
     )
+    memo[id(shell)] = planned
+    return planned
 
 
 def _loop_induction_name(loop_node_id: int) -> str:
@@ -16202,7 +16292,9 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
                     facts = fallthrough_facts.get(int(consumer), frozenset())
                 if required not in facts:
                     raise ValueError(
-                        f"optional tuple {node_id} consumer {consumer} has no proven presence guard"
+                        f"optional tuple {node_id} consumer {consumer} has no "
+                        "proven presence guard in function "
+                        f"{graph.G.graph.get('function_name')!r}"
                     )
                 guarded.append(int(consumer))
             if not consumers or any(node_id in values for values in
@@ -16368,10 +16460,68 @@ def _publish_callsite_return_members(
     stale_leaves = tuple(
         leaf_id for leaf_id in incumbent_leaves if leaf_id not in caller.G
     )
+
+    def resident_direct_projection(index: int) -> int | None:
+        """Return the one authored ``call[index]`` value, when exact.
+
+        Lexical tuple unpacking creates these projections before callsite
+        return descriptors settle.  Reusing that identity is essential:
+        loop/effect metadata already names it, so minting a parallel leaf
+        makes the call publish one value while the effect consumes another.
+        """
+
+        candidates = []
+        for successor in caller.G.successors(node_id):
+            projection = caller.G.nodes[int(successor)]
+            if str(
+                projection.get("op") or projection.get("type") or ""
+            ).casefold() != "indexed":
+                continue
+            if not any(
+                int(parent) == node_id
+                and str(role) in {"base", "value", "operand", "object"}
+                for parent, role in projection.get("parents") or ()
+            ):
+                continue
+            indices = tuple(
+                int(parent)
+                for parent, role in projection.get("parents") or ()
+                if str(role) == "index" and int(parent) in caller.G
+            )
+            if len(indices) != 1:
+                continue
+            try:
+                projected_index = _constant_value(
+                    caller.G.nodes[indices[0]]
+                )
+            except KeyError:
+                continue
+            if (
+                isinstance(projected_index, int)
+                and not isinstance(projected_index, bool)
+                and int(projected_index) == int(index)
+            ):
+                candidates.append(int(successor))
+        unique = tuple(dict.fromkeys(candidates))
+        return unique[0] if len(unique) == 1 else None
+
     # Materialize exact member projections of the authored return. These are
     # call results, never extra caller inputs or copies of the payload.
     leaves = []
     for index, descriptor in enumerate(descriptors):
+        resident_projection = resident_direct_projection(index)
+        if resident_projection is not None:
+            member = caller.G.nodes[int(resident_projection)]
+            member.setdefault("attributes", {})[
+                "authored_call_result_projection"
+            ] = True
+            member["tensor"] = (
+                {} if descriptor is None or isinstance(descriptor, tuple)
+                else copy.deepcopy(dict(descriptor))
+            )
+            leaves.append(int(resident_projection))
+            record(index, int(resident_projection), "reused", descriptor)
+            continue
         index_id = next_process_value_id(caller)
         caller.G.add_node(index_id, type="Constant", op="const",
                           value_id=index_id, constant=index,
@@ -16402,6 +16552,51 @@ def _publish_callsite_return_members(
         "tensor_output_descriptors": descriptors,
     })
     if stale_leaves:
+        # The old leaf ids are not merely descriptor cache entries.  Source
+        # control can name them from cached loop/effect receipts even after a
+        # specialized call republishes the same return slots under fresh
+        # resident ids.  Concord the exact slot transition, then move every
+        # cached occurrence through that recorded identity before exposing
+        # the replacement ledger.  Otherwise ``append(result_record)`` can
+        # retain the dead pre-specialization projection while the call itself
+        # publishes the new one.
+        projection_identity = current_identity_book().page(
+            "callsite_projection_identity_concordance"
+        )
+        projection_scope = (
+            caller_name,
+            int(node_id),
+            id(caller.G),
+        )
+        for index, (stale_id, replacement_id) in enumerate(zip(
+            incumbent_leaves, leaves,
+        )):
+            if int(stale_id) == int(replacement_id):
+                continue
+            row = (projection_scope, int(index), int(stale_id))
+            fact = int(replacement_id)
+            incumbent = projection_identity.latest(row)
+            if incumbent is not None and int(incumbent) != fact:
+                raise ValueError(
+                    "callsite projection identity concordance disagreement "
+                    f"for {row!r}: recorded={incumbent!r}, "
+                    f"replacement={fact!r}"
+                )
+            if incumbent is None:
+                projection_identity.set(row, 0, fact)
+            _retarget_all_cached_value_ids(
+                caller, int(stale_id),
+                int(projection_identity.latest(row)),
+            )
+            if os.environ.get("TURING_DEBUG_SEQUENCE_EFFECT_IDENTITY"):
+                print(
+                    "DEBUG-CALLSITE-PROJECTION-IDENTITY "
+                    f"function={caller_name!r} callsite={int(node_id)} "
+                    f"slot={int(index)} stale={int(stale_id)} "
+                    f"resident={int(replacement_id)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         attributes["aggregate_leaf_republication"] = {
             "replaced_missing_value_ids": stale_leaves,
             "replacement_value_ids": tuple(map(int, leaves)),
@@ -16413,7 +16608,12 @@ def _publish_callsite_return_members(
     return True
 
 
-def _propagate_callsite_tensor_specializations(graph: Any) -> None:
+def _propagate_callsite_tensor_specializations(
+    graph: Any,
+    *,
+    runtime_references: frozenset[int] | None = None,
+    _progress: Any = None,
+) -> None:
     """Carry consistent tensor descriptors through the function table.
 
     This is the descriptor analogue of literal planner specialization.  It
@@ -16426,9 +16626,22 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
     function_table = getattr(graph, "function_table", None)
     if function_table is None:
         return
-    graphs = [graph]
+    # A source-catalogue graph owns the table but is not itself an executable
+    # caller.  Its per-definition graphs contain the actual parameter ABI,
+    # call edges, and numerical dependencies.  Including the catalogue here
+    # both duplicates all callsites and lets tuple/return publication rewrite
+    # a map container which the structural-fold stage explicitly excludes.
+    graphs = (
+        [graph] if graph.G.graph.get("function_name") else []
+    )
     graphs.extend(
-        entry.graph for entry in function_table if entry.graph is not None
+        entry.graph
+        for entry in function_table
+        if entry.graph is not None
+        and (
+            runtime_references is None
+            or int(entry.reference.address) in runtime_references
+        )
     )
 
     def call_result_descriptor(
@@ -16440,9 +16653,7 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
 
         _receiver, positional, _all = _method_parameter_layout(callee.G)
         descriptors: dict[str, dict[str, Any]] = {}
-        aggregate_descriptors: dict[
-            str, tuple[dict[str, Any] | None, ...]
-        ] = {}
+        aggregate_descriptors: dict[str, tuple[Any, ...]] = {}
         specializations: dict[str, Any] = {}
         bound_parameters: set[str] = set()
         for parent, role_value in _expanded_callsite_argument_edges(
@@ -16472,11 +16683,8 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                 # (``previous_hub, ... = history``), so the propagation copy
                 # must see those members bound, not an opaque formal.
                 aggregate_descriptors[parameter] = tuple(
-                    None if item is None else copy.deepcopy(dict(item))
-                    for item in (
-                        _tensor_descriptor(caller, int(leaf))
-                        for leaf in leaves
-                    )
+                    _authored_aggregate_descriptor_tree(caller, int(leaf))
+                    for leaf in leaves
                 )
             if static_argument:
                 try:
@@ -16580,8 +16788,48 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
             else ()
         )
 
+    round_index = 0
+    seen_round_states: dict[str, int] = {}
+
+    def specialization_state() -> tuple[str, int]:
+        facts = []
+        tensor_fact_count = 0
+        for item in graphs:
+            function_name = str(item.G.graph.get("function_name") or "")
+            planner = item.G.graph.get("planner_tensor_descriptors") or {}
+            facts.append((function_name, "planner", repr(planner)))
+            for value_id, node in item.G.nodes(data=True):
+                tensor = node.get("tensor")
+                if tensor:
+                    tensor_fact_count += 1
+                    facts.append((
+                        function_name,
+                        int(value_id),
+                        repr(_callsite_descriptor_receipt(tensor)),
+                    ))
+        digest = hashlib.sha256(repr(tuple(facts)).encode("utf-8")).hexdigest()
+        return digest[:16], tensor_fact_count
+
     changed = True
     while changed:
+        round_index += 1
+        round_started = time.monotonic()
+        callsites = 0
+        mutation_counts = {
+            "conditional_members": 0,
+            "return_members": 0,
+            "single_returns": 0,
+            "structured_returns": 0,
+            "formal_shapes": 0,
+            "callee_descriptors": 0,
+        }
+        if _progress is not None:
+            _progress({
+                "specialization_state": "round-begin",
+                "round": round_index,
+                "graphs": len(graphs),
+                "graph_nodes": sum(item.G.number_of_nodes() for item in graphs),
+            })
         changed = False
         # The outer catalogue graph owns the function table, but its entry
         # graphs own the parameter ABI and numerical dependencies.  Settle
@@ -16589,12 +16837,47 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
         # shaped ``material_state[:, :, 3]`` still looks scalar here and only
         # a later backend happens to rediscover its extent after the call ABI
         # has already been frozen.
-        for caller in graphs:
+        for caller_index, caller in enumerate(graphs):
             if caller.G.graph.get("function_name"):
-                _fold_callsite_structural_values(caller)
+                fold_started = time.monotonic()
+                if _progress is not None:
+                    _progress({
+                        "specialization_state": "prefold-begin",
+                        "round": round_index,
+                        "caller_index": int(caller_index),
+                        "caller": str(caller.G.graph.get("function_name")),
+                        "caller_nodes": caller.G.number_of_nodes(),
+                    })
+                _fold_callsite_structural_values(
+                    caller,
+                    _progress=(
+                        None if _progress is None else
+                        lambda facts, caller=caller: _progress({
+                            "specialization_state": "prefold-fixed-point",
+                            "round": round_index,
+                            "caller": str(
+                                caller.G.graph.get("function_name") or ""
+                            ),
+                            **facts,
+                        })
+                    ),
+                )
+                if _progress is not None:
+                    _progress({
+                        "specialization_state": "prefold-end",
+                        "round": round_index,
+                        "caller_index": int(caller_index),
+                        "caller": str(caller.G.graph.get("function_name")),
+                        "caller_nodes": caller.G.number_of_nodes(),
+                        "duration_seconds": round(
+                            time.monotonic() - fold_started, 6
+                        ),
+                    })
         candidates: dict[tuple[int, str], list[dict[str, Any]]] = {}
         for caller in graphs:
-            changed |= _publish_conditional_tuple_members(caller)
+            conditional_changed = _publish_conditional_tuple_members(caller)
+            changed |= conditional_changed
+            mutation_counts["conditional_members"] += int(conditional_changed)
             for _node_id, data in tuple(caller.G.nodes(data=True)):
                 attributes = data.get("attributes") or {}
                 reference = attributes.get("callee_ref")
@@ -16608,6 +16891,24 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                     continue
                 if callee is None:
                     continue
+                callsites += 1
+                if _progress is not None and (
+                    callsites == 1 or callsites % 16 == 0
+                ):
+                    _progress({
+                        "specialization_state": "callsite-progress",
+                        "round": round_index,
+                        "callsites": callsites,
+                        "caller": str(
+                            caller.G.graph.get("function_name") or ""
+                        ),
+                        "callee": str(
+                            callee.G.graph.get("function_name") or reference
+                        ),
+                        "round_elapsed_seconds": round(
+                            time.monotonic() - round_started, 6
+                        ),
+                    })
                 # A call node can carry an early catalogue descriptor that is
                 # no longer exact after its operands are specialized.  Calls
                 # are equality edges, so recompute their return contract on
@@ -16633,9 +16934,13 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                                 or isinstance(item, (Mapping, tuple))
                                 for item in result_descriptors)
                     ):
-                        changed |= _publish_callsite_return_members(
+                        return_members_changed = _publish_callsite_return_members(
                             caller, int(_node_id), result_descriptors,
                             next(iter(return_kinds)),
+                        )
+                        changed |= return_members_changed
+                        mutation_counts["return_members"] += int(
+                            return_members_changed
                         )
                     elif len(result_descriptors) == 1 and isinstance(
                         result_descriptors[0], Mapping
@@ -16672,6 +16977,7 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                                 ),
                             )
                             changed = True
+                            mutation_counts["single_returns"] += 1
                     elif result_descriptors:
                         attributes = dict(data.get("attributes") or {})
                         if attributes.get(
@@ -16682,6 +16988,7 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                             )
                             data["attributes"] = attributes
                             changed = True
+                            mutation_counts["structured_returns"] += 1
                 _receiver, positional, _all = _method_parameter_layout(callee.G)
                 for parent, role_value in _expanded_callsite_argument_edges(
                     caller, int(_node_id),
@@ -16705,11 +17012,15 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                         # one catalogue graph; a fresh specialization then
                         # reverted the same formal to an unknown scalar.
                         if tuple(descriptor.get("shape") or ()):
-                            changed |= _publish_formal_shape(
+                            formal_shape_changed = _publish_formal_shape(
                                 str(callee.G.graph.get("function_name")),
                                 str(parameter),
                                 descriptor,
                                 str(caller.G.graph.get("function_name")),
+                            )
+                            changed |= formal_shape_changed
+                            mutation_counts["formal_shapes"] += int(
+                                formal_shape_changed
                             )
                         candidates.setdefault(
                             (int(reference), str(parameter)), []
@@ -16793,6 +17104,32 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
             # folded below by ``_callsite_specialized_shell_type`` after both
             # descriptor and literal arguments have been collected.
             changed = True
+            mutation_counts["callee_descriptors"] += len(additions)
+
+        state_digest, tensor_fact_count = specialization_state()
+        repeated_round = seen_round_states.get(state_digest)
+        seen_round_states.setdefault(state_digest, round_index)
+        from .identity_concordance import current_identity_book
+
+        return_page = current_identity_book().page(
+            "callsite_return_specialization"
+        )
+        oscillating_rows = return_page.oscillating_rows()
+        if _progress is not None:
+            _progress({
+                "specialization_state": "round-end",
+                "round": round_index,
+                "duration_seconds": round(
+                    time.monotonic() - round_started, 6
+                ),
+                "changed": bool(changed),
+                "callsites": callsites,
+                "tensor_facts": tensor_fact_count,
+                "state_digest": state_digest,
+                "repeats_round": repeated_round,
+                "oscillating_rows": len(oscillating_rows),
+                **mutation_counts,
+            })
 
 
 def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
@@ -16854,6 +17191,54 @@ def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
             replacements.append(member_id)
             replaced.append((int(leaf_id), int(member_id)))
             repaired += 1
+        if replaced:
+            from .identity_concordance import current_identity_book
+
+            projection_identity = current_identity_book().page(
+                "callsite_projection_identity_concordance"
+            )
+            projection_scope = (
+                str(graph.G.graph.get("function_name") or ""),
+                int(node_id),
+                id(graph.G),
+            )
+            replacement_by_stale = dict(replaced)
+            for index, stale_id in enumerate(leaves):
+                replacement_id = replacement_by_stale.get(int(stale_id))
+                if replacement_id is None:
+                    continue
+                row = (projection_scope, int(index), int(stale_id))
+                incumbent = projection_identity.latest(row)
+                if (
+                    incumbent is not None
+                    and int(incumbent) != int(replacement_id)
+                ):
+                    raise ValueError(
+                        "callsite projection identity concordance "
+                        f"disagreement for {row!r}: "
+                        f"recorded={incumbent!r}, "
+                        f"replacement={replacement_id!r}"
+                    )
+                if incumbent is None:
+                    projection_identity.set(
+                        row, 0, int(replacement_id)
+                    )
+                _retarget_all_cached_value_ids(
+                    graph, int(stale_id),
+                    int(projection_identity.latest(row)),
+                )
+                if os.environ.get(
+                    "TURING_DEBUG_SEQUENCE_EFFECT_IDENTITY"
+                ):
+                    print(
+                        "DEBUG-CALLSITE-PROJECTION-IDENTITY "
+                        f"function={projection_scope[0]!r} "
+                        f"callsite={int(node_id)} slot={int(index)} "
+                        f"stale={int(stale_id)} "
+                        f"resident={int(replacement_id)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
         attributes["aggregate_leaf_value_ids"] = tuple(replacements)
         attributes["aggregate_leaf_republication"] = {
             "replacements": tuple(replaced),
@@ -17290,9 +17675,13 @@ def _tensor_descriptor(
         ).casefold()
         specialized_operator = bool(
             graph.G.graph.get("planner_tensor_descriptors")
-            and descriptor_operation in {
-                "matmul", "sum", "mean", "prod", "min", "max", "any", "all",
-            }
+            and descriptor_operation in (
+                {
+                    "matmul", "sum", "mean", "prod", "min", "max",
+                    "any", "all",
+                }
+                | _ELEMENTWISE_BINARY_OPERATIONS
+            )
         )
         binding_name = str(
             (data.get("attributes") or {}).get("binding_name") or ""
@@ -17505,9 +17894,13 @@ def _tensor_descriptor_rule(
     provisional_tensor = None
     if (
         graph.G.graph.get("planner_tensor_descriptors")
-        and descriptor_operation in {
-            "matmul", "sum", "mean", "prod", "min", "max", "any", "all",
-        }
+        and descriptor_operation in (
+            {
+                "matmul", "sum", "mean", "prod", "min", "max",
+                "any", "all",
+            }
+            | _ELEMENTWISE_BINARY_OPERATIONS
+        )
         and "shape" in tensor
     ):
         # A catalogue node's result descriptor predates this exact callsite's
@@ -17907,12 +18300,12 @@ def _tensor_descriptor_rule(
                                 "le", "gt", "ge", "logical_and", "logical_or",
                                 "logical_xor",
                             }
-                            else next((
-                                str(side.get("dtype"))
+                            else str(np.result_type(*(
+                                np.dtype(str(side.get("dtype")))
                                 for side in sides
                                 if str(side.get("dtype") or "unknown")
                                 != "unknown"
-                            ), "float64")
+                            )))
                         )
                         return {
                             "shape": tuple(broadcast),
@@ -18148,6 +18541,24 @@ def _tensor_descriptor_rule(
                     graph.G.nodes[indices[0]].get("attributes") or {}
                 )
                 index = index_attributes.get("value")
+                if index is None:
+                    index = graph.G.nodes[indices[0]].get("constant")
+                if isinstance(index, slice):
+                    base_descriptor = _tensor_descriptor(graph, base, seen)
+                    base_shape = tuple(
+                        (base_descriptor or {}).get("shape") or ()
+                    )
+                    if base_shape:
+                        start, stop, step = index.indices(int(base_shape[0]))
+                        sliced = len(range(start, stop, step))
+                        return {
+                            "shape": (int(sliced), *base_shape[1:]),
+                            "dtype": str(
+                                (base_descriptor or {}).get("dtype")
+                                or "float64"
+                            ),
+                            "rank": len(base_shape),
+                        }
                 output_descriptors = base_attributes.get(
                     "tensor_output_descriptors"
                 ) or ()
@@ -18262,7 +18673,9 @@ def _tensor_descriptor_rule(
     }
 
 
-def _fold_callsite_structural_values(graph: Any) -> None:
+def _fold_callsite_structural_values(
+    graph: Any, *, _progress: Any = None,
+) -> None:
     """Fold only whitelisted structural Python identities from graph facts.
 
     This pass is deliberately smaller than Python evaluation.  It consumes
@@ -19637,13 +20050,20 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 return _constant_value(index)
         return basic_index(expression.slice)
 
+    fixed_point_iteration = 0
+    seen_fixed_point_states: dict[str, int] = {}
     changed = True
     while changed:
+        fixed_point_iteration += 1
+        iteration_mutations: list[Any] = []
+        tensor_state_before = {
+            int(node_id): copy.deepcopy(data.get("tensor"))
+            for node_id, data in graph.G.nodes(data=True)
+        }
         changed = False
         for node_id in _dependency_order(graph):
             node_id = int(node_id)
             data = graph.G.nodes[node_id]
-            previous_tensor = copy.deepcopy(data.get("tensor"))
             operation = str(data.get("op") or data.get("type") or "").casefold()
             # ``history[0]`` over an authored aggregate with an exact leaf
             # ledger IS that leaf.  Keeping the projection as a separate
@@ -19687,6 +20107,10 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                             node_id, leaves[index_value % len(leaves)]
                         )
                         known.pop(node_id, None)
+                        iteration_mutations.append((
+                            "aggregate-alias", int(node_id),
+                            int(leaves[index_value % len(leaves)]),
+                        ))
                         changed = True
                         break
             inherited_descriptor = _tensor_descriptor(graph, node_id)
@@ -20120,19 +20544,41 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 source_descriptor = next((
                     _tensor_descriptor(graph, int(parent))
                     for parent, role in (data.get("parents") or ())
-                    if str(role) in {"operand", "arg:0", "value"}
+                    if str(role) in {"operand", "value"}
                     and _tensor_descriptor(graph, int(parent)) is not None
                 ), None)
-                shape_parent = next((
-                    int(parent)
+                shape_arguments = sorted(
+                    (
+                        int(position),
+                        known.get(int(parent), unresolved),
+                    )
                     for parent, role in (data.get("parents") or ())
-                    if str(role) in {"shape", "new_shape", "arg:1", "arg:0"}
-                    and str(role) not in {"operand", "value"}
+                    for position in (_positional_argument_index(str(role)),)
+                    if position is not None
                     and known.get(int(parent), unresolved) is not unresolved
-                ), None)
-                if source_descriptor is not None and shape_parent is not None:
-                    result_shape = known[int(shape_parent)]
-                    if isinstance(result_shape, (tuple, list)):
+                )
+                named_shape = next((
+                    known.get(int(parent), unresolved)
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"shape", "new_shape"}
+                    and known.get(int(parent), unresolved) is not unresolved
+                ), unresolved)
+                result_shape = (
+                    named_shape
+                    if named_shape is not unresolved
+                    else tuple(value for _position, value in shape_arguments)
+                )
+                if (
+                    isinstance(result_shape, tuple)
+                    and len(result_shape) == 1
+                    and isinstance(result_shape[0], (tuple, list))
+                ):
+                    result_shape = result_shape[0]
+                if source_descriptor is not None:
+                    if isinstance(result_shape, (tuple, list)) and all(
+                        isinstance(extent, int) and not isinstance(extent, bool)
+                        for extent in result_shape
+                    ):
                         resolved_shape = [int(extent) for extent in result_shape]
                         inferred = [
                             index for index, extent in enumerate(resolved_shape)
@@ -20164,23 +20610,34 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                     "sum", "mean", "prod", "min", "max", "any", "all"
                 }
             ):
+                method_style = any(
+                    str(role) in {"operand", "value", "self", "receiver"}
+                    for _parent, role in (data.get("parents") or ())
+                )
                 source_descriptor = next((
                     _tensor_descriptor(graph, int(parent))
                     for parent, role in (data.get("parents") or ())
-                    if str(role) in {"operand", "arg:0", "value"}
+                    if str(role) in (
+                        {"operand", "value", "self", "receiver"}
+                        if method_style else {"arg:0"}
+                    )
                     and _tensor_descriptor(graph, int(parent)) is not None
                 ), None)
                 axis = structural_call_argument(
                     data,
                     roles={
-                        "dim", "axis", "kw:dim", "kw:axis", "arg:1",
+                        "dim", "axis", "kw:dim", "kw:axis",
+                        "arg:0" if method_style else "arg:1",
                     },
                     keywords={"dim", "axis"},
                     default=unresolved,
                 )
                 keepdim = structural_call_argument(
                     data,
-                    roles={"keepdim", "kw:keepdim", "arg:2"},
+                    roles={
+                        "keepdim", "kw:keepdim",
+                        "arg:1" if method_style else "arg:2",
+                    },
                     keywords={"keepdim"},
                     default=False,
                 )
@@ -20211,13 +20668,6 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                     attributes.setdefault("dim", axis)
                     attributes.setdefault("keepdim", bool(keepdim))
                     data["attributes"] = attributes
-            if data.get("tensor") != previous_tensor:
-                # Descriptor propagation and structural folding are one
-                # fixed-point problem: a newly specialized reduction shape
-                # can make a downstream ``value.shape[index]`` constant on
-                # the following pass.  Descriptor-only progress must keep
-                # the loop alive even when no literal was learned this pass.
-                changed = True
             if str(data.get("type")) in {"Constant", "Const", "const"}:
                 value = constant(data)
             else:
@@ -20309,6 +20759,9 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             if isinstance(value, _StructuralValueAlias):
                 replace_alias(node_id, value.source_id)
                 known.pop(node_id, None)
+                iteration_mutations.append((
+                    "structural-alias", int(node_id), int(value.source_id),
+                ))
                 changed = True
                 break
             if (
@@ -20316,6 +20769,9 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 or not same_structural_value(known[node_id], value)
             ):
                 known[node_id] = value
+                iteration_mutations.append((
+                    "known", int(node_id), str(operation), repr(value)[:160],
+                ))
                 changed = True
             # ABI facts prove source type and physical presence; they are not
             # runtime literals.  Keep the authored SSA producer intact so a
@@ -20333,6 +20789,87 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 continue
             if str(data.get("type")) not in {"Constant", "Const", "const"}:
                 replace(node_id, value)
+
+        # Descriptor propagation and structural folding are one fixed-point
+        # problem, but progress is a fact about a COMPLETED round.  An indexed
+        # Program-ABI span can acquire a provisional tensor descriptor above
+        # and then be restored to its authoritative callsite/ABI descriptor
+        # later in the same node visit.  Treating that transient intermediate
+        # value as progress made an otherwise settled graph repeat forever.
+        # Compare the round boundaries, and record only the net descriptor
+        # transitions in both the trace and concordance.
+        net_tensor_mutations = []
+        for changed_node_id, changed_data in graph.G.nodes(data=True):
+            changed_node_id = int(changed_node_id)
+            before = tensor_state_before.get(changed_node_id)
+            after = changed_data.get("tensor")
+            if before == after:
+                continue
+            net_tensor_mutations.append((
+                "tensor", changed_node_id,
+                str(changed_data.get("op") or changed_data.get("type") or ""),
+                _callsite_descriptor_receipt(before),
+                _callsite_descriptor_receipt(after),
+            ))
+        if net_tensor_mutations:
+            iteration_mutations.extend(net_tensor_mutations)
+            changed = True
+
+        fixed_point_facts = tuple(
+            (
+                int(node_id),
+                str(data.get("type") or ""),
+                repr(_callsite_descriptor_receipt(data.get("tensor"))),
+                repr(known.get(int(node_id), unresolved))[:240],
+            )
+            for node_id, data in sorted(graph.G.nodes(data=True))
+        )
+        fixed_point_digest = hashlib.sha256(
+            repr(fixed_point_facts).encode("utf-8")
+        ).hexdigest()[:16]
+        repeated_iteration = seen_fixed_point_states.get(fixed_point_digest)
+        seen_fixed_point_states.setdefault(
+            fixed_point_digest, fixed_point_iteration
+        )
+        from .identity_concordance import current_identity_book
+
+        fixed_point_page = current_identity_book().page(
+            "structural_specialization_fixed_point"
+        )
+        fixed_point_row = str(graph.G.graph.get("function_name") or "")
+        fixed_point_page.set(
+            fixed_point_row,
+            len(fixed_point_page.history(fixed_point_row)),
+            (
+                fixed_point_digest,
+                bool(changed),
+                tuple(net_tensor_mutations),
+            ),
+        )
+        if _progress is not None and (
+            fixed_point_iteration <= 3
+            or repeated_iteration is not None
+            or not changed
+        ):
+            _progress({
+                "fold_state": "fixed-point-iteration",
+                "fold_iteration": fixed_point_iteration,
+                "changed": bool(changed),
+                "state_digest": fixed_point_digest,
+                "repeats_iteration": repeated_iteration,
+                "mutation_count": len(iteration_mutations),
+                "mutations": tuple(iteration_mutations[:8]),
+            })
+        if changed and repeated_iteration is not None:
+            raise RuntimeError(
+                "structural specialization fixed point repeated a prior "
+                "state while still claiming progress: "
+                f"function={graph.G.graph.get('function_name')!r}, "
+                f"iteration={fixed_point_iteration}, "
+                f"repeats_iteration={repeated_iteration}, "
+                f"digest={fixed_point_digest}, "
+                f"mutations={tuple(iteration_mutations[:8])!r}"
+            )
 
     # A callsite specialization may make source control decidable even when
     # the selected value remains runtime numerical data.  Remove only the
@@ -20885,12 +21422,12 @@ def _alias_projection_to_member(
 
 def _apply_callsite_aggregate_descriptors(
     graph: Any,
-    descriptors: Mapping[str, tuple[Mapping[str, Any] | None, ...]],
+    descriptors: Mapping[str, tuple[Any, ...]],
 ) -> None:
     """Bind an aggregate formal to its exact authored projection identities."""
 
     identities = graph.G.graph.get("identity_table") or {}
-    for name, members in descriptors.items():
+    for name, root_members in descriptors.items():
         inputs = tuple(dict.fromkeys((
             *tuple(identities.get(str(name), ())),
             *(
@@ -20910,92 +21447,119 @@ def _apply_callsite_aggregate_descriptors(
                 f"aggregate parameter {name!r} does not have one input identity: "
                 f"{inputs!r}"
             )
-        input_id = inputs[0]
-        projections: dict[int, list[int]] = {}
-        for node_id, data in graph.G.nodes(data=True):
-            if str(data.get("op") or data.get("type") or "").casefold() not in {
-                "indexed", "getitem", "subscript",
-            }:
-                continue
-            base = tuple(
-                int(parent)
-                for parent, role in data.get("parents") or ()
-                if str(role) in {"base", "value", "object"}
+        def materialize(
+            input_id: int,
+            binding_path: str,
+            members: tuple[Any, ...],
+            *,
+            root_binding: str,
+            aggregate_path: tuple[int, ...] = (),
+        ) -> None:
+            """Materialize one level, retaining nested member ledgers."""
+
+            projections: dict[int, list[int]] = {}
+            for node_id, data in tuple(graph.G.nodes(data=True)):
+                if str(
+                    data.get("op") or data.get("type") or ""
+                ).casefold() not in {"indexed", "getitem", "subscript"}:
+                    continue
+                base = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) in {"base", "value", "object"}
+                )
+                if base != (int(input_id),):
+                    continue
+                index_ids = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) in {"index", "slice", "subscript"}
+                )
+                if len(index_ids) != 1 or index_ids[0] not in graph.G:
+                    continue
+                index_data = graph.G.nodes[index_ids[0]]
+                index = index_data.get("constant")
+                if index is None:
+                    index = (index_data.get("attributes") or {}).get("value")
+                if (
+                    not isinstance(index, int) or isinstance(index, bool)
+                    or not members
+                ):
+                    continue
+                normalized = int(index) % len(members)
+                projections.setdefault(normalized, []).append(int(node_id))
+
+            leaves = []
+            nested = []
+            for index, descriptor in enumerate(members):
+                leaf_id = next_process_value_id(graph)
+                member_path = f"{binding_path}[{index}]"
+                full_path = (*aggregate_path, int(index))
+                is_nested = isinstance(descriptor, tuple)
+                graph.G.add_node(
+                    leaf_id,
+                    type="Input", op="input", label=member_path,
+                    expr_obj=None, value_id=leaf_id,
+                    parents=[], children=[],
+                    attributes={
+                        "binding_name": member_path,
+                        "binding_kind": "parameter",
+                        "aggregate_parent_binding": str(root_binding),
+                        "aggregate_path": tuple(full_path),
+                        "aggregate_index": int(index),
+                    },
+                    tensor=(
+                        copy.deepcopy(dict(descriptor))
+                        if isinstance(descriptor, Mapping) else {}
+                    ),
+                )
+                leaves.append(leaf_id)
+                for projection in projections.get(index, ()):
+                    _alias_projection_to_member(graph, projection, leaf_id)
+                if is_nested:
+                    nested.append((
+                        leaf_id, member_path, tuple(descriptor), full_path,
+                    ))
+
+            leaves = tuple(leaves)
+            input_attributes = dict(
+                graph.G.nodes[input_id].get("attributes") or {}
             )
-            if base != (input_id,):
-                continue
-            index_ids = tuple(
-                int(parent)
-                for parent, role in data.get("parents") or ()
-                if str(role) in {"index", "slice", "subscript"}
-            )
-            if len(index_ids) != 1 or index_ids[0] not in graph.G:
-                continue
-            index_data = graph.G.nodes[index_ids[0]]
-            index = index_data.get("constant")
-            if index is None:
-                index = (index_data.get("attributes") or {}).get("value")
-            if not isinstance(index, int) or isinstance(index, bool):
-                continue
-            # ``rest = constants[0]`` and a later ``f(constants[0])`` are two
-            # authored projections of one member; both read the same formal.
-            normalized = int(index) % len(members)
-            projections.setdefault(normalized, []).append(int(node_id))
-        leaves = []
-        for index, descriptor in enumerate(members):
-            leaf_id = next_process_value_id(graph)
-            graph.G.add_node(
-                leaf_id,
-                type="Input", op="input",
-                label=f"{name}[{index}]",
-                expr_obj=None, value_id=leaf_id,
-                parents=[], children=[],
-                attributes={
-                    "binding_name": f"{name}[{index}]",
-                    "binding_kind": "parameter",
-                    "aggregate_parent_binding": str(name),
-                    "aggregate_index": int(index),
-                },
-                tensor=(
-                    {} if descriptor is None
-                    else copy.deepcopy(dict(descriptor))
-                ),
-            )
-            leaves.append(leaf_id)
-            # A member input is a formal of this specialization.  Give the
-            # authored projection ``name[index]`` that exact identity: every
-            # consumer of the projection reads the member formal directly,
-            # the same physical ABI a starred positional expansion produces.
-            # An unconsumed member is dropped with the other unused formals.
-            for projection in projections.get(index, ()):
-                _alias_projection_to_member(graph, projection, leaf_id)
-        leaves = tuple(leaves)
-        # The aggregate formal IS the tuple of its member formals.  Make that
-        # structure explicit: the formal becomes an authored-style Tuple whose
-        # elements are the member inputs.  A whole-aggregate consumer such as
-        # ``f(*constants)`` then keeps every member alive through ordinary
-        # dataflow, an unconsumed formal is dropped like any dead tuple, and
-        # ``_authored_aggregate_leaves`` reads one ledger for both.
-        input_attributes = dict(graph.G.nodes[input_id].get("attributes") or {})
-        input_attributes.update({
-            "producer_kind": "aggregate",
-            "aggregate_kind": "tuple",
-            "aggregate_leaf_value_ids": leaves,
-            "tensor_output_descriptors": copy.deepcopy(tuple(members)),
-            "sequence_key_columns": (),
-            "sequence_column_count": 1,
-            "sequence_writable": False,
-        })
-        formal = graph.G.nodes[input_id]
-        formal["attributes"] = input_attributes
-        formal["type"] = "Tuple"
-        formal["op"] = None
-        formal["parents"] = [(int(leaf), "elts") for leaf in leaves]
-        for leaf in leaves:
-            graph.G.add_edge(int(leaf), int(input_id), role="elts")
-            graph.G.nodes[int(leaf)].setdefault("children", []).append(
-                (int(input_id), "elts")
-            )
+            input_attributes.update({
+                "producer_kind": "aggregate",
+                "aggregate_kind": "tuple",
+                "aggregate_leaf_value_ids": leaves,
+                "tensor_output_descriptors": copy.deepcopy(tuple(members)),
+                "sequence_key_columns": (),
+                "sequence_column_count": 1,
+                "sequence_writable": False,
+            })
+            formal = graph.G.nodes[input_id]
+            formal["attributes"] = input_attributes
+            formal["type"] = "Tuple"
+            formal["op"] = None
+            formal["tensor"] = {}
+            formal["parents"] = [(int(leaf), "elts") for leaf in leaves]
+            for leaf in leaves:
+                graph.G.add_edge(int(leaf), int(input_id), role="elts")
+                graph.G.nodes[int(leaf)].setdefault("children", []).append(
+                    (int(input_id), "elts")
+                )
+            for leaf_id, member_path, nested_members, nested_path in nested:
+                materialize(
+                    leaf_id,
+                    member_path,
+                    nested_members,
+                    root_binding=root_binding,
+                    aggregate_path=tuple(nested_path),
+                )
+
+        materialize(
+            int(inputs[0]),
+            str(name),
+            tuple(root_members),
+            root_binding=str(name),
+        )
 
 
 def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
@@ -21113,10 +21677,18 @@ def _callsite_specialized_shell_type(
     _receiver, positional, _all = _method_parameter_layout(original.G)
     specializations = {}
     tensor_descriptors: dict[str, dict[str, Any]] = {}
-    aggregate_descriptors: dict[
-        str, tuple[dict[str, Any], ...]
-    ] = {}
+    aggregate_descriptors: dict[str, tuple[Any, ...]] = {}
     record_descriptors: dict[str, dict[str, Any]] = {}
+    # What each argument is, as the caller's concordance states it.  The
+    # specialization's parameters are exactly these values.
+    parameter_classes: dict[str, tuple[str, int]] = {}
+    from ..common.tensors.topological_reducer import _source_numeric_scope
+    from .identity_concordance import current_identity_book
+
+    caller_scope = _source_numeric_scope(caller.G)
+    caller_class_page = current_identity_book().page(
+        "source_value_class_concordance"
+    )
     bound_parameters: set[str] = set()
     data = caller.G.nodes[int(node_id)]
     caller_record_abi = dict(
@@ -21160,6 +21732,11 @@ def _callsite_specialized_shell_type(
             continue
         parameter = str(parameter)
         bound_parameters.add(parameter)
+        class_fact = caller_class_page.latest((caller_scope, int(parent)))
+        if isinstance(class_fact, tuple) and len(class_fact) >= 2:
+            parameter_classes[parameter] = (
+                str(class_fact[0]), max(int(class_fact[1]), 1),
+            )
         declared_record_abi = dict(
             original.G.graph.get("parameter_record_abi") or {}
         ).get(parameter)
@@ -21196,10 +21773,8 @@ def _callsite_specialized_shell_type(
                     f"{caller.G.graph.get('function_name')!r}"
                 )
             aggregate_descriptors[parameter] = tuple(
-                None if item is None else copy.deepcopy(dict(item))
-                for item in (
-                    _tensor_descriptor(caller, int(leaf)) for leaf in leaves
-                )
+                _authored_aggregate_descriptor_tree(caller, int(leaf))
+                for leaf in leaves
             )
         if static_argument:
             try:
@@ -21225,6 +21800,43 @@ def _callsite_specialized_shell_type(
                 proven_descriptor,
                 str(caller.G.graph.get("function_name")),
             )
+
+    # Nested functions receive enclosing values through closure identities,
+    # not through the Call node's positional edges.  They are nevertheless
+    # exact callsite inputs and must carry the same recursive aggregate
+    # ledger.  Without this, ``selected`` saw ``left_limbs`` as an opaque
+    # zero-member input even though its caller had two concorded limb leaves.
+    for _capture_id, capture in original.G.nodes(data=True):
+        capture_attributes = capture.get("attributes") or {}
+        if str(capture.get("type") or "") != "Input" or str(
+            capture_attributes.get("binding_kind") or ""
+        ) not in {"closure", "external"}:
+            continue
+        capture_name = str(capture_attributes.get("binding_name") or "")
+        if not capture_name or capture_name in bound_parameters:
+            continue
+        capture_values = tuple(dict.fromkeys(
+            int(value_id)
+            for value_id in caller_identities.get(capture_name, ())
+            if int(value_id) in caller.G
+        ))
+        if len(capture_values) != 1:
+            continue
+        capture_value = int(capture_values[0])
+        capture_leaves = _authored_aggregate_leaves(
+            caller, capture_value,
+        )
+        if capture_leaves:
+            aggregate_descriptors[capture_name] = tuple(
+                _authored_aggregate_descriptor_tree(caller, int(leaf))
+                for leaf in capture_leaves
+            )
+            bound_parameters.add(capture_name)
+            continue
+        capture_descriptor = _tensor_descriptor(caller, capture_value)
+        if capture_descriptor is not None:
+            tensor_descriptors[capture_name] = capture_descriptor
+            bound_parameters.add(capture_name)
     for parameter, default in (
         original.G.graph.get("parameter_defaults") or {}
     ).items():
@@ -21282,6 +21894,7 @@ def _callsite_specialized_shell_type(
             (name, stable(value))
             for name, value in record_descriptors.items()
         )),
+        tuple(sorted(parameter_classes.items())),
         int(max_nodes_per_dispatch),
     )
     def publish_call_result_shape(specialized_graph: Any) -> None:
@@ -21295,17 +21908,30 @@ def _callsite_specialized_shell_type(
         identities = specialized_graph.G.graph.get("identity_table") or {}
         output_ids = tuple(identities.get(str(outputs[0]), ()))
         descriptor = None
+        inspected = []
         for candidate in reversed(output_ids):
             if int(candidate) not in specialized_graph.G:
                 continue
             inferred = _structured_output_descriptor(
                 specialized_graph, int(candidate),
             )
+            inspected.append((int(candidate), copy.deepcopy(inferred)))
             if isinstance(inferred, Mapping) and (
                 descriptor_states_a_shape(inferred)
             ):
                 descriptor = inferred
                 break
+        if os.environ.get("TURING_DEBUG_CALL_RESULT_SHAPE"):
+            print(
+                "CALL-RESULT-SHAPE "
+                f"caller={caller.G.graph.get('function_name')!r} "
+                f"callee={specialized_graph.G.graph.get('function_name')!r} "
+                f"outputs={outputs!r} output_ids={output_ids!r} "
+                "planner="
+                f"{specialized_graph.G.graph.get('planner_tensor_descriptors')!r} "
+                f"inspected={inspected!r}",
+                file=sys.stderr, flush=True,
+            )
         if descriptor is None:
             return
         extents = tuple(descriptor.get("shape") or ())
@@ -21320,6 +21946,16 @@ def _callsite_specialized_shell_type(
             descriptor.get("dtype"),
             int(_dependency_levels(caller).get(int(node_id), 0)),
         )
+        # A Precision operation may have been identified before this callee's
+        # exact return extents existed.  The concordance publication above is
+        # the causal event that makes its tensor identity complete; refresh
+        # the caller from that fact now, so the later SSA copy does not retain
+        # the provisional rank-zero descriptor.
+        from ..common.tensors.topological_reducer import (
+            specialize_python_precision_widths,
+        )
+
+        specialize_python_precision_widths(caller)
 
     cached = _CALLSITE_SHELL_TYPE_CACHE.get(key)
     if cached is not None:
@@ -21335,6 +21971,9 @@ def _callsite_specialized_shell_type(
     # to survive into a later tensor-valued occurrence of the same parameter.
     specialized.G.graph["planner_specializations"] = copy.deepcopy(
         specializations
+    )
+    specialized.G.graph["planner_parameter_classes"] = dict(
+        parameter_classes
     )
     specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
         tensor_descriptors
@@ -21798,6 +22437,7 @@ class ProcessGraphGLSLDeployment:
     dispatch_count = None
     deployment_batches = None
     max_nodes_per_dispatch = None
+    selection_progress = None
 
     def __init__(
         self,
@@ -21809,6 +22449,7 @@ class ProcessGraphGLSLDeployment:
         output_slots=64,
         legacy_fused_network=False,
         shell_language="glsl",
+        _defer_callsite_planning=False,
         **tuning,
     ):
         tuning = dict(tuning)
@@ -21853,15 +22494,72 @@ class ProcessGraphGLSLDeployment:
         # growing registry on this deployment, not on its cached class.
         self.function_shell_types = dict(self.function_shell_types)
         self.specialized_dependency_extensions = []
-        self.function_shells = {
-            reference: shell_type(**tuning)
-            for reference, shell_type in self.function_shell_types.items()
-        }
+        self._callsite_planning_deferred = bool(
+            _defer_callsite_planning
+        )
+        # Only the outer deployment owns and instantiates the function
+        # catalogue.  Catalogue members and literal-callsite shells are
+        # constructed shallowly, attached to that one shared catalogue, and
+        # then traversed by ``plan_callsites`` with its active reference
+        # chain intact.  Eagerly constructing a catalogue from one of those
+        # children re-entered this constructor before the chain could be
+        # passed down, making recursive call topologies expand forever.
+        self.function_shells = (
+            {}
+            if self._callsite_planning_deferred
+            else {
+                reference: shell_type(
+                    **tuning,
+                    _defer_callsite_planning=True,
+                )
+                for reference, shell_type in self.function_shell_types.items()
+            }
+        )
         self._owns_function_shells = bool(self.function_shells)
         for function_shell in self.function_shells.values():
             function_shell.function_shells = self.function_shells
             function_shell._owns_function_shells = False
+        compilation_unit_receipt = dict(
+            self.process_graph.G.graph.get("compilation_unit_plan") or {}
+        )
+        callsite_unit_by_reference = {
+            int(reference): int(unit_index)
+            for reference, unit_index in (
+                compilation_unit_receipt.get("reference_to_unit") or {}
+            ).items()
+        }
+        recursive_callsite_units = {
+            int(unit_index)
+            for unit_index, unit in enumerate(
+                compilation_unit_receipt.get("units") or ()
+            )
+            if bool(unit.get("recursive"))
+        }
+        callsite_planning_started = time.monotonic()
+        callsite_planning_visits: dict[
+            tuple[str, int, int], int
+        ] = {}
+        planned_callsite_shells: dict[
+            tuple[type, int, int, type], Any
+        ] = {}
+        callsite_planning_total = 0
+
+        def recursive_unit_backedge(owner, reference):
+            owner_reference = owner.process_graph.G.graph.get("function_ref")
+            if owner_reference is None:
+                return None
+            owner_unit = callsite_unit_by_reference.get(int(owner_reference))
+            callee_unit = callsite_unit_by_reference.get(int(reference))
+            if (
+                owner_unit is None
+                or owner_unit != callee_unit
+                or owner_unit not in recursive_callsite_units
+            ):
+                return None
+            return int(owner_unit)
+
         def plan_callsites(owner, active_references=()):
+            nonlocal callsite_planning_total
             owner.callsite_function_shells = {}
             for node_id, data in owner.process_graph.G.nodes(data=True):
                 attributes = data.get("attributes") or {}
@@ -21883,6 +22581,80 @@ class ProcessGraphGLSLDeployment:
                 if reference is None:
                     continue
                 reference = int(reference)
+                recursive_unit = recursive_unit_backedge(owner, reference)
+                activation_mode = (
+                    "recursive_scc_backedge"
+                    if recursive_unit is not None else "callsite_shell"
+                )
+                from .identity_concordance import current_identity_book
+
+                callsite_identity = current_identity_book().page(
+                    "source_callsite_activation_concordance"
+                )
+                caller_metadata = owner.process_graph.G.graph
+                caller_name = str(
+                    caller_metadata.get("function_name") or "<module>"
+                )
+                method_owner = caller_metadata.get("method_owner")
+                caller_identity = str(
+                    caller_metadata.get("qualified_name")
+                    or (
+                        f"{method_owner}.{caller_name}"
+                        if method_owner else caller_name
+                    )
+                )
+                planning_key = (
+                    caller_identity, int(node_id), reference,
+                )
+                planning_visit = int(
+                    callsite_planning_visits.get(planning_key, 0)
+                ) + 1
+                callsite_planning_visits[planning_key] = planning_visit
+                callsite_planning_total += 1
+                if (
+                    self.selection_progress is not None
+                    and (
+                        callsite_planning_total <= 16
+                        or callsite_planning_total % 64 == 0
+                    )
+                ):
+                    self.selection_progress(
+                        "callsite-plan: "
+                        f"total={callsite_planning_total} "
+                        f"elapsed_seconds={round(time.monotonic() - callsite_planning_started, 6)} "
+                        f"depth={len(active_references)} "
+                        f"owner={caller_identity} node={int(node_id)} "
+                        f"callee_ref={reference} visit={planning_visit} "
+                        f"owner_ref={owner.process_graph.G.graph.get('function_ref')} "
+                        f"unit={recursive_unit} mode={activation_mode}"
+                    )
+                identity_row = (caller_identity, int(node_id))
+                activation_fact = (
+                    reference,
+                    activation_mode,
+                    recursive_unit,
+                )
+                incumbent_reference = callsite_identity.latest(identity_row)
+                if (
+                    incumbent_reference is not None
+                    and tuple(incumbent_reference) != activation_fact
+                ):
+                    raise ValueError(
+                        "source callsite activation concordance "
+                        f"disagreement for {identity_row!r}: "
+                        f"recorded={incumbent_reference!r}, "
+                        f"resolved={activation_fact!r}"
+                    )
+                if incumbent_reference is None:
+                    callsite_identity.set(identity_row, 0, activation_fact)
+                if recursive_unit is not None:
+                    # The compilation-unit planner has already proven this
+                    # edge belongs to one recursive SCC.  Its call remains in
+                    # the owner's ProcessGraph and function-reference table;
+                    # expanding it into another shell would enumerate every
+                    # simple path around the SCC instead of representing the
+                    # one authored backedge.
+                    continue
                 shell_type = self.function_shell_types.get(reference)
                 if shell_type is None and self._owns_function_shells:
                     # A receiver class can first become known at this exact
@@ -21902,7 +22674,10 @@ class ProcessGraphGLSLDeployment:
                             _function_table_stack=(id(table),),
                         )
                         self.function_shell_types[reference] = shell_type
-                        shared = shell_type(**tuning)
+                        shared = shell_type(
+                            **tuning,
+                            _defer_callsite_planning=True,
+                        )
                         shared.function_shells = self.function_shells
                         shared._owns_function_shells = False
                         self.function_shells[reference] = shared
@@ -21924,9 +22699,28 @@ class ProcessGraphGLSLDeployment:
                     shell_type,
                     self.max_nodes_per_dispatch,
                 )
-                planned = shell_type(**tuning)
+                planned_identity = (
+                    type(owner), int(node_id), reference, shell_type,
+                )
+                incumbent_planned = planned_callsite_shells.get(
+                    planned_identity
+                )
+                if incumbent_planned is not None:
+                    owner.callsite_function_shells[node_id] = (
+                        incumbent_planned
+                    )
+                    continue
+                planned = shell_type(
+                    **tuning,
+                    _defer_callsite_planning=True,
+                )
                 planned.function_shells = self.function_shells
                 planned._owns_function_shells = False
+                # Publish before descending.  The active-reference rule owns
+                # recursive backedges, while this table turns repeated
+                # arrivals at one exact specialized callsite into a DAG node
+                # instead of unfolding the same subtree once per path.
+                planned_callsite_shells[planned_identity] = planned
                 owner.callsite_function_shells[node_id] = planned
                 plan_callsites(
                     planned,
@@ -21941,14 +22735,20 @@ class ProcessGraphGLSLDeployment:
             function_shell = self.function_shells.get(int(reference))
             if function_shell is None:
                 continue
-            plan_callsites(function_shell)
+            # Seed the active chain with the activation root itself.  A
+            # direct recursive call is therefore a backedge, not one more
+            # shell instance; mutual recursion terminates on the first
+            # already-active function identity for the same reason.
+            plan_callsites(function_shell, (int(reference),))
             (
                 function_shell.hierarchy_plan,
                 function_shell.hierarchy_value_table,
             ) = assign_hierarchy_ids(
                 _build_shell_hierarchy_plan(function_shell)
             )
-        if self.runtime_closure_only:
+        if self._callsite_planning_deferred:
+            self.callsite_function_shells = {}
+        elif self.runtime_closure_only:
             # The module shell owns the definition catalogue, not another
             # execution of every function body in the source file.  Submitted
             # target shells above are the activation roots in this mode.
@@ -21983,7 +22783,39 @@ class ProcessGraphGLSLDeployment:
         self.forward_region_planned_capture_ids = ()
         self.forward_region_planned_input_ids = ()
         self.forward_planned_collection_materializations = {}
-        self.compiled_process_graph_aliases = {}
+        # ``Precision.of(tensor, n)`` introduces no independent high-limb
+        # storage: its high limb is exactly the authored tensor and the
+        # precision pass supplies the remaining zero limbs.  Source
+        # specialization records that identity on the concordance.  Install
+        # it in the ordinary capture alias table so a region feed is wired to
+        # the authored producer instead of escaping as compiler-owned frame
+        # storage.
+        from .identity_concordance import current_identity_book
+
+        numeric_scope = str(
+            self.process_graph.G.graph.get("source_numeric_scope")
+            or self.process_graph.G.graph.get("function_name")
+            or self.process_graph.G.graph.get("qualified_name")
+            or "<module>"
+        )
+        boundary_page = current_identity_book().page(
+            "source_precision_boundary_concordance"
+        )
+        self.compiled_process_graph_aliases = {
+            int(row[1]): int(fact[1])
+            for row in boundary_page.rows()
+            for fact in (boundary_page.latest(row),)
+            if (
+                isinstance(row, tuple)
+                and len(row) == 2
+                and str(row[0]) == numeric_scope
+                and int(row[1]) in self.process_graph.G
+                and isinstance(fact, tuple)
+                and len(fact) == 3
+                and str(fact[0]) == "promote"
+                and int(fact[1]) in self.process_graph.G
+            )
+        }
         self.compiled_tapes = ()
         self.compiled_shell_program = None
         self.compiled_region_indices = ()
@@ -22247,7 +23079,15 @@ class ProcessGraphGLSLDeployment:
             if progress is not None:
                 progress(message)
 
+        hierarchy_started = time.perf_counter()
+        _note(
+            "aot: refreshing root hierarchy before structural precompile"
+        )
         self.refresh_hierarchy_plan()
+        _note(
+            "aot: refreshed root hierarchy before structural precompile "
+            f"in {time.perf_counter() - hierarchy_started:.3f}s"
+        )
         if not self.whole_program_compiled:
             self.compile_process_graph(device=device)
         # A selected-entrypoint compile prepares only its proven activation
@@ -22257,12 +23097,24 @@ class ProcessGraphGLSLDeployment:
         # the executable contents of that one class record.  Do not infer this
         # from ``runtime_closure_only``: older selected-entrypoint adapters also
         # use broad planning but still have one executable activation tree.
-        for target in _walk_planned_shells(
+        planned_shells = tuple(_walk_planned_shells(
             self,
             include_function_registry=bool(getattr(
                 self, "prepare_complete_catalogue", False
             )),
-        ):
+        ))
+        _note(
+            f"aot: preparing {len(planned_shells)} planned shell(s)"
+        )
+        for shell_index, target in enumerate(planned_shells, 1):
+            shell_started = time.perf_counter()
+            shell_name = str(
+                target.process_graph.G.graph.get("function_name") or "?"
+            )
+            _note(
+                f"aot: shell {shell_index}/{len(planned_shells)} "
+                f"{shell_name} structural preparation begin"
+            )
             # A callsite-specialized shell (below, in
             # ``_specialized_shell_type``) already gets this fold; a
             # top-level planned shell like the one this loop walks never
@@ -22280,6 +23132,11 @@ class ProcessGraphGLSLDeployment:
             if target.process_graph.G.graph.get("function_name"):
                 _fold_callsite_structural_values(target.process_graph)
             target.refresh_hierarchy_plan()
+            _note(
+                f"aot: shell {shell_index}/{len(planned_shells)} "
+                f"{shell_name} hierarchy ready in "
+                f"{time.perf_counter() - shell_started:.3f}s"
+            )
             complete_regions, region_dependencies = _topological_region_schedule(
                 target, range(len(target.dispatch_subgraphs))
             )
@@ -22604,11 +23461,9 @@ class ProcessGraphGLSLDeployment:
             # bespoke plan transcription. Layout/cast ops ride through under
             # their own names for each backend to lower.
             subgraphs = tuple(enumerate(target.dispatch_subgraphs))
-            fn_name = str(
-                target.process_graph.G.graph.get("function_name") or "?"
-            )
             _note(
-                f"aot: lowering {len(subgraphs)} region(s) for shell {fn_name}"
+                f"aot: lowering {len(subgraphs)} region(s) for shell "
+                f"{shell_name}"
             )
             # NOTE: regions are NOT deduplicated by sharing program objects
             # here. Structurally-identical regions are distinct *invocations*
@@ -22636,6 +23491,11 @@ class ProcessGraphGLSLDeployment:
                     {},
                     (),
                 )
+            )
+            _note(
+                f"aot: shell {shell_index}/{len(planned_shells)} "
+                f"{shell_name} structural preparation end in "
+                f"{time.perf_counter() - shell_started:.3f}s"
             )
         (
             self.hierarchy_plan,
@@ -25159,6 +26019,8 @@ def strategize_shell_deployment(
     schedule_preference: str | None = None,
     runtime_closure_only: bool = False,
     _function_table_stack: tuple[int, ...] = (),
+    _selection_progress: Any = None,
+    _selection_trace: dict[str, Any] | None = None,
 ) -> type:
     """Build a stateful shell around the graph's flat dispatch schedule.
 
@@ -25185,14 +26047,110 @@ def strategize_shell_deployment(
     dropping iterations.
     """
 
-    _lower_python_scalar_intrinsics(graph)
+    if _selection_trace is None:
+        _selection_trace = {
+            "started_at": time.monotonic(),
+            "sequence": 0,
+            "dropped_events": 0,
+            "visits": {},
+            "events": [],
+        }
+    trace = _selection_trace
+    graph_metadata = graph.G.graph
+    function_identity = str(
+        graph_metadata.get("qualified_name")
+        or graph_metadata.get("function_name")
+        or graph_metadata.get("function_ref")
+        or "<source-catalogue>"
+    )
+    visit_key = "|".join((
+        function_identity,
+        str(graph.G.number_of_nodes()),
+        str(graph.G.number_of_edges()),
+    ))
+    visits = trace.setdefault("visits", {})
+    visits[visit_key] = int(visits.get(visit_key, 0)) + 1
+
+    def selection_event(stage: str, state: str, **facts: Any) -> None:
+        trace["sequence"] = int(trace.get("sequence", 0)) + 1
+        event = {
+            "sequence": int(trace["sequence"]),
+            "elapsed_seconds": round(
+                time.monotonic() - float(trace["started_at"]), 6
+            ),
+            "function": function_identity,
+            "function_depth": len(_function_table_stack),
+            "visit": int(visits[visit_key]),
+            "stage": str(stage),
+            "state": str(state),
+            "nodes": int(graph.G.number_of_nodes()),
+            "edges": int(graph.G.number_of_edges()),
+            **facts,
+        }
+        events = trace.setdefault("events", [])
+        events.append(event)
+        if len(events) > 512:
+            del events[: len(events) - 512]
+            trace["dropped_events"] = int(
+                trace.get("dropped_events", 0)
+            ) + 1
+        # Keep the evidence on every graph which participates in selection.
+        # The shared object means the root and extracted function graphs expose
+        # one ordered account rather than unrelated print-only diagnostics.
+        graph_metadata["deployment_selection_trace"] = trace
+        if _selection_progress is not None:
+            detail = " ".join(
+                f"{name}={value}"
+                for name, value in facts.items()
+            )
+            _selection_progress(
+                "deployment-select: "
+                f"function={function_identity} "
+                f"depth={len(_function_table_stack)} "
+                f"visit={visits[visit_key]} "
+                f"stage={stage} state={state} "
+                f"nodes={event['nodes']} edges={event['edges']}"
+                + (f" {detail}" if detail else "")
+            )
+
+    def selection_phase(name: str, action: Any) -> Any:
+        phase_started = time.monotonic()
+        selection_event(name, "begin")
+        try:
+            result = action()
+        except BaseException as exc:
+            selection_event(
+                name,
+                "failed",
+                duration_seconds=round(time.monotonic() - phase_started, 6),
+                exception=type(exc).__name__,
+            )
+            raise
+        selection_event(
+            name,
+            "end",
+            duration_seconds=round(time.monotonic() - phase_started, 6),
+        )
+        return result
+
+    selection_event("deployment", "begin", repeated_visit=visits[visit_key] > 1)
+    selection_phase(
+        "lower-python-scalar-intrinsics",
+        lambda: _lower_python_scalar_intrinsics(graph),
+    )
 
     # Region planning may legitimately erase structural AST nodes after their
     # dataflow has been reduced.  Capture authored branch/guard identity before
     # any such planning so every extracted function shell retains the control
     # catalogue needed for later SSA overlay.
-    _retain_source_control_records(graph.G)
-    _retain_source_sequence_mutation_records(graph.G)
+    selection_phase(
+        "retain-source-control-records",
+        lambda: _retain_source_control_records(graph.G),
+    )
+    selection_phase(
+        "retain-source-sequence-mutation-records",
+        lambda: _retain_source_sequence_mutation_records(graph.G),
+    )
 
     # Inherit whatever the compilation asked for, then record it so the
     # function shells planned from subgraphs of this one see the same thing.
@@ -25228,9 +26186,28 @@ def strategize_shell_deployment(
         "schedule_preference": schedule_preference,
     }
     graph.G.graph["deployment_schedule_preference"] = schedule_preference
+    runtime_catalogue = bool(
+        runtime_closure_only
+        and not graph.G.graph.get("function_name")
+    )
+    specialization_dependency_regions = (
+        (graph.G.graph.get("map_ir") or {}).get("dependency_regions") or {}
+    )
+    runtime_specialization_references = (
+        frozenset(map(int, specialization_dependency_regions["runtime"]))
+        if runtime_closure_only
+        and "runtime" in specialization_dependency_regions
+        else None
+    )
 
-    _resolve_bound_function_references(graph)
-    _propagate_callsite_planner_specializations(graph)
+    selection_phase(
+        "resolve-bound-function-references",
+        lambda: _resolve_bound_function_references(graph),
+    )
+    selection_phase(
+        "propagate-callsite-planner-specializations",
+        lambda: _propagate_callsite_planner_specializations(graph),
+    )
     # A concrete function graph always has literal structural facts that can
     # remove or alias nodes even when there is no callsite-specific scalar
     # specialization. Perform that fixed point before its dispatch regions are
@@ -25240,21 +26217,56 @@ def strategize_shell_deployment(
     # applied. ``prepare_graph_precompile`` repeats the fold defensively after
     # callsite shells are attached; by then it must be idempotent.
     if graph.G.graph.get("function_name"):
-        _fold_callsite_structural_values(graph)
-    _propagate_callsite_tensor_specializations(graph)
+        selection_phase(
+            "fold-callsite-structural-values-before-tensors",
+            lambda: _fold_callsite_structural_values(graph),
+        )
+    if not _function_table_stack:
+        selection_phase(
+            "propagate-callsite-tensor-specializations",
+            lambda: _propagate_callsite_tensor_specializations(
+                graph,
+                runtime_references=runtime_specialization_references,
+                _progress=lambda facts: selection_event(
+                    "callsite-tensor-specialization",
+                    "progress",
+                    **facts,
+                ),
+            ),
+        )
+    else:
+        # The root pass settled the entire proven runtime closure directly on
+        # the shared function-table entries before any clean function graph is
+        # extracted. Re-running that whole-table fixed point from every child
+        # shell is redundant and can let one child mutate sibling catalogue
+        # graphs after their shells have already been planned.
+        selection_event(
+            "propagate-callsite-tensor-specializations",
+            "inherited",
+        )
     if graph.G.graph.get("function_name"):
         # Tensor descriptors learned across call edges can make another local
         # shape-only expression decidable.  The structural fixed point is
         # idempotent and still executes no numerical source code.
-        _fold_callsite_structural_values(graph)
+        selection_phase(
+            "fold-callsite-structural-values-after-tensors",
+            lambda: _fold_callsite_structural_values(graph),
+        )
         # Branch folding can remove synthesized call-result projections while
         # retaining the aggregate producer selected by the surviving arm.
         # The fold itself now repairs that ledger invariant before returning,
         # including for recursive callsite specializations.
+        selection_phase(
+            "refresh-specialized-python-precision",
+            lambda: _refresh_specialized_python_precision(graph),
+        )
     # Loop discovery snapshots state effects into immutable descriptors. Link
     # methods before that snapshot so an authored record mutation is owned by
     # its compiled callee instead of remaining a second opaque callsite effect.
-    _resolve_grounded_method_references(graph)
+    selection_phase(
+        "resolve-grounded-method-references-before-loops",
+        lambda: _resolve_grounded_method_references(graph),
+    )
     canonical_value_ids = bool(
         graph.G.graph.get("canonical_value_ids")
     )
@@ -25268,25 +26280,38 @@ def strategize_shell_deployment(
             unroll_limit=int(unroll_limit),
         )
     )
-    discovered_loop_plans = (
-        loop_composer.discover(graph)
-        if canonical_value_ids
-        else ()
+    discovered_loop_plans = selection_phase(
+        "discover-loops",
+        lambda: (
+            loop_composer.discover(graph)
+            if canonical_value_ids and not runtime_catalogue
+            else ()
+        ),
     )
-    evaporated_loop_plans = (
-        evaporate_unrolled_loops(graph, discovered_loop_plans)
-        if discovered_loop_plans
-        else ()
+    evaporated_loop_plans = selection_phase(
+        "evaporate-unrolled-loops",
+        lambda: (
+            evaporate_unrolled_loops(graph, discovered_loop_plans)
+            if discovered_loop_plans else ()
+        ),
     )
     if evaporated_loop_plans and (
         graph.G.graph.get("planner_specializations")
         or graph.G.graph.get("planner_tensor_descriptors")
     ):
         # Unrolling turns each induction/tuple component into a literal node.
-        # Re-run the same structural fixed point so predicates inside the
-        # cloned body select aliases to their real carried producer instead of
-        # escaping as invented function arguments.
-        _fold_callsite_structural_values(graph)
+        # Re-run callsite specialization before the local structural fixed
+        # point. A cloned call consumes the fresh literal induction value and
+        # owns a fresh callsite id; retaining the pre-unroll dynamic callee
+        # would replace an exact aggregate member with private frame storage.
+        selection_phase(
+            "propagate-callsite-planner-specializations-after-unroll",
+            lambda: _propagate_callsite_planner_specializations(graph),
+        )
+        selection_phase(
+            "fold-callsite-structural-values-after-unroll",
+            lambda: _fold_callsite_structural_values(graph),
+        )
     evaporated_loop_ids = {
         int(plan.loop.node_id) for plan in evaporated_loop_plans
     }
@@ -25322,18 +26347,22 @@ def strategize_shell_deployment(
         if int(plan.loop.node_id) not in evaporated_loop_ids
         and int(plan.loop.node_id) in graph.G
     )
-    semantic_loop_plans = (
-        loop_composer.materialize_semantic_ir(
-            graph,
-            retained_loop_plans,
-        )
-        if retained_loop_plans
-        else ()
+    semantic_loop_plans = selection_phase(
+        "materialize-loop-semantic-ir",
+        lambda: (
+            loop_composer.materialize_semantic_ir(
+                graph,
+                retained_loop_plans,
+            )
+            if retained_loop_plans else ()
+        ),
     )
-    loop_plans = (
-        materialize_retained_loop_ports(graph, semantic_loop_plans)
-        if semantic_loop_plans
-        else ()
+    loop_plans = selection_phase(
+        "materialize-retained-loop-ports",
+        lambda: (
+            materialize_retained_loop_ports(graph, semantic_loop_plans)
+            if semantic_loop_plans else ()
+        ),
     )
     function_entry = None
     function_reference = graph.G.graph.get("function_ref")
@@ -25348,28 +26377,63 @@ def strategize_shell_deployment(
     python_callable = (
         None if function_entry is None else function_entry.python_callable
     )
-    _resolve_grounded_method_references(graph)
-    _resolve_grounded_tensor_operations(graph)
-    reference_tables = build_shell_reference_tables(graph)
-    ordered_executable_nodes = _dependency_order(graph)
+    selection_phase(
+        "resolve-grounded-method-references-after-loops",
+        lambda: _resolve_grounded_method_references(graph),
+    )
+    selection_phase(
+        "resolve-grounded-tensor-operations",
+        lambda: _resolve_grounded_tensor_operations(graph),
+    )
+    reference_tables = selection_phase(
+        "build-shell-reference-tables",
+        lambda: build_shell_reference_tables(graph),
+    )
+    ordered_executable_nodes = selection_phase(
+        "dependency-order",
+        lambda: _dependency_order(graph),
+    )
     is_dispatch_metadata = _dispatch_metadata_node_classifier(graph)
     executable_nodes = tuple(
         node_id
         for node_id in ordered_executable_nodes
         if not is_dispatch_metadata(node_id)
     )
+    if runtime_catalogue:
+        # The runtime root is the source catalogue and map owner. Execution
+        # starts at ``activation_root_references`` in its function shells;
+        # _compile_whole_process_graph already treats this shell as a catalogue
+        # rather than a second execution of the module. Keep the same boundary
+        # here during region selection: planning catalogue syntax as numerical
+        # work created hundreds of dispatch subgraphs which no runtime could
+        # ever execute.
+        selection_event(
+            "runtime-catalogue-boundary",
+            "applied",
+            excluded_executable_nodes=len(executable_nodes),
+        )
+        executable_nodes = ()
     # Control membership is a semantic partition: numerical work may be
     # reduced freely inside one planner-owned loop body or conditional branch,
     # but never fused across that control boundary.  All other dispatch
     # boundaries are produced by the fixed-point shader-region identities
     # rather than inherited from schedule levels or operator spelling.
-    partition_keys = _control_partition_keys(
-        graph,
-        loop_plans,
-        executable_nodes,
+    partition_keys = selection_phase(
+        "control-partition-keys",
+        lambda: _control_partition_keys(
+            graph,
+            loop_plans,
+            executable_nodes,
+        ),
     )
-    inert_nodes = _inert_routing_nodes(graph)
-    closure_edges, closure_outputs = _closure_routing_dependencies(graph)
+    inert_nodes = selection_phase(
+        "inert-routing-nodes",
+        lambda: _inert_routing_nodes(graph),
+    )
+    closure_edges, closure_outputs = selection_phase(
+        "closure-routing-dependencies",
+        lambda: _closure_routing_dependencies(graph),
+    )
     # A method may ``return`` a compile-time reference (a type or module, e.g.
     # ``return torch.float32``). That resolves to a _StaticPythonReference, not a
     # runtime value node id -- it is a compile-time constant, not a runtime
@@ -25398,19 +26462,27 @@ def strategize_shell_deployment(
         if record.get("control_ir", True)
         for node_id in record.get("control_members", ())
     )
-    dispatch_plan = reduce_scheduled_shader_regions(
-        graph,
-        executable_nodes,
-        max_nodes_per_region=max_nodes_per_dispatch,
-        partition_keys=partition_keys,
-        extra_dependency_edges=closure_edges,
-        fusible_node_ids=_shader_fusible_node_ids(
-            graph, executable_nodes,
+    dispatch_plan = selection_phase(
+        "reduce-scheduled-shader-regions",
+        lambda: reduce_scheduled_shader_regions(
+            graph,
+            executable_nodes,
+            max_nodes_per_region=max_nodes_per_dispatch,
+            partition_keys=partition_keys,
+            extra_dependency_edges=closure_edges,
+            fusible_node_ids=_shader_fusible_node_ids(
+                graph, executable_nodes,
+            ),
+            indivisible_node_groups=_precision_indivisible_node_groups(
+                graph, executable_nodes,
+            ),
+            control_node_ids=recursion_control_nodes,
+            _progress=lambda facts: selection_event(
+                "shader-region-fixed-point",
+                "progress",
+                **facts,
+            ),
         ),
-        indivisible_node_groups=_precision_indivisible_node_groups(
-            graph, executable_nodes,
-        ),
-        control_node_ids=recursion_control_nodes,
     )
     executable_dispatch_nodes = tuple(
         dispatch.node_ids
@@ -25433,18 +26505,21 @@ def strategize_shell_deployment(
                         f"preferences: region={region_index}, "
                         f"preferences={(previous, deployment.schedule_preference)!r}"
                     )
-    dispatch_subgraphs = tuple(
-        _dispatch_subgraph(
-            graph,
-            node_ids,
-            required_outputs=frozenset((*closure_outputs, *return_outputs)),
-            inert_nodes=inert_nodes,
-            schedule_preference=deployment_region_preferences.get(
-                region_index, "asap"
-            ),
-        )
-        for region_index, node_ids in enumerate(executable_dispatch_nodes)
-        if node_ids
+    dispatch_subgraphs = selection_phase(
+        "extract-dispatch-subgraphs",
+        lambda: tuple(
+            _dispatch_subgraph(
+                graph,
+                node_ids,
+                required_outputs=frozenset((*closure_outputs, *return_outputs)),
+                inert_nodes=inert_nodes,
+                schedule_preference=deployment_region_preferences.get(
+                    region_index, "asap"
+                ),
+            )
+            for region_index, node_ids in enumerate(executable_dispatch_nodes)
+            if node_ids
+        ),
     )
     for subgraph, dispatch in zip(
         dispatch_subgraphs,
@@ -25461,10 +26536,13 @@ def strategize_shell_deployment(
         )
         for plan in loop_plans
     }
-    loop_shader_reductions = analyze_shader_loop_reductions(
-        graph,
-        loop_plans,
-        executable_dispatch_nodes,
+    loop_shader_reductions = selection_phase(
+        "analyze-shader-loop-reductions",
+        lambda: analyze_shader_loop_reductions(
+            graph,
+            loop_plans,
+            executable_dispatch_nodes,
+        ),
     )
     deep_compilers = tuple(
         GraphDeepCompiler(
@@ -25530,6 +26608,10 @@ def strategize_shell_deployment(
             ),
             "dispatch_count": len(dispatch_subgraphs),
             "max_nodes_per_dispatch": int(max_nodes_per_dispatch),
+            "selection_progress": (
+                None if _selection_progress is None
+                else staticmethod(_selection_progress)
+            ),
             "deployment_batches": node_locations,
         },
     )
@@ -25549,7 +26631,7 @@ def strategize_shell_deployment(
         and table_identity not in _function_table_stack
     ):
         nested_stack = (*_function_table_stack, table_identity)
-        for entry in function_table:
+        for function_index, entry in enumerate(function_table):
             if entry.graph is None:
                 continue
             reference = int(entry.reference.address)
@@ -25566,9 +26648,25 @@ def strategize_shell_deployment(
                 # 103 function types and thousands of callsite activations,
                 # lowering unrelated class methods as though they ran.
                 continue
-            function_graph = extract_clean_process_subgraph(
-                entry.graph,
-                entry.graph.G,
+            child_identity = str(
+                getattr(entry, "qualified_name", None)
+                or getattr(entry, "name", None)
+                or reference
+            )
+            function_started = time.monotonic()
+            selection_event(
+                "function-shell",
+                "begin",
+                child_function=child_identity,
+                child_reference=reference,
+                function_index=int(function_index),
+            )
+            function_graph = selection_phase(
+                "extract-function-subgraph",
+                lambda entry=entry: extract_clean_process_subgraph(
+                    entry.graph,
+                    entry.graph.G,
+                ),
             )
             # A function's graph is built independently, not carved out of
             # the caller's, so it does not inherit the compilation's loop
@@ -25585,7 +26683,19 @@ def strategize_shell_deployment(
                     function_graph,
                     max_nodes_per_dispatch=max_nodes_per_dispatch,
                     _function_table_stack=nested_stack,
+                    _selection_progress=_selection_progress,
+                    _selection_trace=trace,
                 )
+            )
+            selection_event(
+                "function-shell",
+                "end",
+                child_function=child_identity,
+                child_reference=reference,
+                function_index=int(function_index),
+                duration_seconds=round(
+                    time.monotonic() - function_started, 6
+                ),
             )
     activation_root_references = []
     if runtime_closure_only and function_table is not None:
@@ -25621,6 +26731,12 @@ def strategize_shell_deployment(
         set(deployment_class.catalogued_function_references)
         - set(deployment_class.planned_function_references)
     ))
+    selection_event(
+        "deployment",
+        "end",
+        dispatches=len(dispatch_subgraphs),
+        planned_functions=len(function_shell_types),
+    )
     return deployment_class
 
 

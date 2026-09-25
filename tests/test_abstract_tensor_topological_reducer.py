@@ -14,9 +14,16 @@ from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )
 from src.common.tensors.extended_precision import ComplexPrecision
+from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.abstract_nn.token_encoder import decode_identity_tokens
 from src.common.tensors.abstract_nn.token_lexicon import CompilerTokenLexicon
-from src.transmogrifier.graph.graph_express2 import ProcessGraph
+from src.transmogrifier.graph.graph_express2 import (
+    ProcessGraph,
+    _class_field_reference,
+)
+from src.compiler.extraction_contract import (
+    ExtractionContract,
+)
 from src.compiler.identity_concordance import (
     begin_identity_book,
     end_identity_book,
@@ -437,6 +444,53 @@ def test_annotated_receiver_discovers_authored_method_without_instance():
     assert call["attributes"]["callee_ref"] == scale.address
 
 
+def test_static_identity_concordance_drives_schema_normalization_without_receipts():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"AbstractTensor": AbstractTensor}
+    book, token = begin_identity_book()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(
+                "def kernel(x):\n"
+                "    return x if isinstance(x, AbstractTensor) "
+                "else AbstractTensor.tensor(x)\n"
+            ))
+        reduce_abstract_tensor_topology(graph)
+
+        executable = graph.function_table.entry("kernel").graph.G
+        assert not any(
+            isinstance(data.get("expr_obj"), ast.IfExp)
+            for _node_id, data in executable.nodes(data=True)
+        )
+        normalized = next(
+            data for _node_id, data in executable.nodes(data=True)
+            if (data.get("attributes") or {}).get(
+                "source_type_normalization"
+            )
+        )
+        assert normalized["op"] == "tensor"
+        assert tuple(
+            book.page("source_type_normalization_concordance").rows()
+        )
+        identities = tuple(
+            fact
+            for row in book.page(
+                "source_python_identity_concordance"
+            ).rows()
+            for _column, fact in book.page(
+                "source_python_identity_concordance"
+            ).history(row)
+        )
+        assert any(fact[0] == "builtins.isinstance" for fact in identities)
+        assert any(
+            fact[0]
+            == "src.common.tensors.abstraction.AbstractTensor.tensor"
+            for fact in identities
+        )
+    finally:
+        end_identity_book(token)
+
+
 def test_classmethod_receiver_uses_concorded_static_class_identity():
     graph = ProcessGraph(materialize_memory=False)
     graph.python_bindings = {
@@ -523,6 +577,24 @@ def test_complex_precision_classmethod_receiver_uses_same_concordance_rule():
             ComplexPrecision.__module__,
             ComplexPrecision.__qualname__,
         )
+    finally:
+        end_identity_book(token)
+
+
+def test_constructor_field_resolution_carries_its_cycle_guard():
+    """Nested local discovery must not forget the field already being read."""
+
+    book, token = begin_identity_book()
+    try:
+        resolved = _class_field_reference(
+            ExtractionContract, "program_abi", frozenset(),
+        )
+
+        assert resolved is None
+        assert book.page("source_field_identity_concordance").latest((
+            "src.compiler.extraction_contract.ExtractionContract",
+            "program_abi",
+        )) is None
     finally:
         end_identity_book(token)
 

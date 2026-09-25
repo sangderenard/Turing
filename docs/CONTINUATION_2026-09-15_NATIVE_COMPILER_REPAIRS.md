@@ -223,7 +223,7 @@ The balloon-tire validator simulation is the target: its program includes
 python -u tools/build_vehicle_validator_simulation.py --output build/validator_frontier_20260915_v12 --lanes 8
 ```
 
-Log: `build/validator_frontier_20260915_v12.log`. A fresh build is required
+Log: `artifacts/compiler_evidence/validator_frontier_20260915_v12.log`. A fresh build is required
 rather than a checkpoint replay because repairs 3 and 4 act before SSA, so a
 saved pre-frame checkpoint cannot exercise them.
 

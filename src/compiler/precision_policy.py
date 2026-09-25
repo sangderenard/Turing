@@ -30,8 +30,10 @@ from typing import Any, Mapping
 
 import numpy as np
 
-#: The widest section binary64 limbs are proven for (apply_precision_pipeline
-#: refuses wider); planning escalates up to it and no further.
+#: The default automatic-search ceiling.  This is a cost policy, not an ABI
+#: or arithmetic limit: authored Precision[n] sections may use any positive
+#: width, and callers may explicitly ask the planner to search beyond this
+#: conservative default.
 MAX_LIMBS = 4
 
 #: SSA operations a wide section may contain.  Native and eager are the same
@@ -70,8 +72,8 @@ class PrecisionPolicy:
             raise ValueError("a wide section needs at least two limbs")
         if self.target not in WIDE_OPERATIONS_BY_TARGET:
             raise ValueError(f"target is one of {sorted(WIDE_OPERATIONS_BY_TARGET)}")
-        if not int(self.limbs) <= int(self.max_limbs) <= MAX_LIMBS:
-            raise ValueError(f"limbs <= max_limbs <= {MAX_LIMBS} (the binary64 ceiling)")
+        if int(self.max_limbs) < int(self.limbs):
+            raise ValueError("max_limbs must be greater than or equal to limbs")
 
 
 #: Standards of error acceptability, in ulps of binary64, strictest first.
@@ -104,7 +106,7 @@ class PrecisionPlan:
     ledger: tuple = ()                                   # (operation, max ulps, culprit count)
     output_ulps: float = 0.0     # the planned program's worst output error vs the reference
     met: bool = True             # output_ulps within the standard
-    at_ceiling: bool = False     # the plan used MAX_LIMBS, the widest reference there is
+    at_ceiling: bool = False     # the plan used the caller's max_limbs policy bound
     tried: tuple = ()            # (limbs, output ulps) for every width tried
 
     def receipt(self) -> dict:

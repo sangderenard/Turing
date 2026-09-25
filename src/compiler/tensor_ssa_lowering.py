@@ -356,7 +356,9 @@ def _shape_polymorphic_function(function_name: str) -> bool:
         return False
 
 
-def _settle_operand_shapes(function_name: str, values: Any) -> None:
+def _settle_operand_shapes(
+    function_name: str, values: Any, numeric_scope: str | None = None,
+) -> None:
     """Read each operand's shape from the concordance before dispatching.
 
     An SSAValue's shape is a field somebody filled in at construction, and
@@ -383,10 +385,16 @@ def _settle_operand_shapes(function_name: str, values: Any) -> None:
         # that it speaks for itself.
         if (value.accounting or {}).get("ssa_storage_view"):
             continue
-        try:
-            settled = proven_shape_of(function_name, int(value.id))
-        except Exception:
-            continue
+        settled = None
+        for scope in (numeric_scope, function_name):
+            if scope is None:
+                continue
+            try:
+                settled = proven_shape_of(scope, int(value.id))
+            except Exception:
+                continue
+            if settled:
+                break
         if settled and tuple(value.shape or ()) != settled:
             # The call-edge concordance has already proved that this helper
             # has no single formal shape.  A nonempty shape on its exact
@@ -1933,7 +1941,8 @@ def lower_tensor_calls_to_repository_ssa(
         # a static count -- the exact read that baked a wrong element
         # count from a formal whose true rank was already proven
         # elsewhere, just not onto this particular object.
-        _settle_operand_shapes(function_name, function.args)
+        numeric_scope = (function.metadata or {}).get("source_numeric_scope")
+        _settle_operand_shapes(function_name, function.args, numeric_scope)
         function_argument_ids = {int(value.id) for value in function.args}
         unresolved_argument_ids = {
             int(value.id)
@@ -2301,9 +2310,13 @@ def lower_tensor_calls_to_repository_ssa(
                 # the opcode falls through to the scalar emitter, which writes
                 # element zero and leaves the rest of the buffer untouched.
                 # Take the settled fact for the identity before deciding.
-                _settle_operand_shapes(function_name, instruction.args)
+                _settle_operand_shapes(
+                    function_name, instruction.args, numeric_scope,
+                )
                 if instruction.res is not None:
-                    _settle_operand_shapes(function_name, (instruction.res,))
+                    _settle_operand_shapes(
+                        function_name, (instruction.res,), numeric_scope,
+                    )
                 candidate_only = bool(
                     instruction.attributes.get("tensor_candidate") is not None
                     and instruction.attributes.get("tensor_operation") is None
@@ -2967,9 +2980,11 @@ def lower_tensor_calls_to_repository_ssa(
                 # structure (shape, axis, dtype, keepdim, ...).  Dropping a
                 # constant first operand made calls such as
                 # ``broadcast_to(1.0, (m, n))`` appear to have no source.
-                _settle_operand_shapes(function_name, args)
+                _settle_operand_shapes(function_name, args, numeric_scope)
                 if instruction.res is not None:
-                    _settle_operand_shapes(function_name, (instruction.res,))
+                    _settle_operand_shapes(
+                        function_name, (instruction.res,), numeric_scope,
+                    )
                 data_positions = (
                     frozenset({0, 1, 2})
                     if operation == "where" else frozenset({0})
@@ -3589,6 +3604,72 @@ def lower_tensor_calls_to_repository_ssa(
                                 attributes={"lowered_from": "mean"},
                                 source_span=instruction.source_span,
                             ))
+                    elif (
+                        axis is None
+                        and operation in _REDUCTION_CODES
+                        and source_count is not None
+                    ):
+                        # The repository reduction kernel is axis-based.  The
+                        # eager C backend already implements an all-axis
+                        # reduction by viewing the same storage as one flat
+                        # dimension; publish that exact view here instead of
+                        # leaving max/any/all/prod/min without call operands.
+                        # This changes only the reduction domain, never the
+                        # source tensor's storage identity or descriptor.
+                        flat_shape, flat_shape_def = int_vector((
+                            int(source_count),
+                        ))
+                        flat_rank, flat_rank_def = constant(1, "int32")
+                        flat_axis, flat_axis_def = constant(0, "int32")
+                        code, code_def = constant(
+                            _REDUCTION_CODES[operation], "int32"
+                        )
+                        domain_fact = (
+                            int(source.id), str(operation),
+                            tuple(map(int, source.shape)),
+                            int(source_count),
+                        )
+                        domain_page = identity_book(module).page(
+                            "tensor_reduction_domain_concordance"
+                        )
+                        domain_row = (str(function_name), int(result.id))
+                        incumbent = domain_page.latest(domain_row)
+                        if incumbent is not None and incumbent != domain_fact:
+                            raise ValueError(
+                                "tensor reduction domain concordance "
+                                f"disagreement for {domain_row!r}: "
+                                f"{incumbent!r} != {domain_fact!r}"
+                            )
+                        if incumbent is None:
+                            domain_page.set(domain_row, 0, domain_fact)
+                        result.shape = ()
+                        if str(result.dtype or "").casefold() in {"bool", "i1"}:
+                            result.accounting = {
+                                **dict(result.accounting or {}),
+                                "physical_dtype": "float64",
+                            }
+                        prefix.extend((
+                            flat_shape_def, flat_rank_def, flat_axis_def,
+                            code_def,
+                        ))
+                        reduction_instruction = dataclasses.replace(
+                            instruction,
+                            attributes={
+                                **dict(instruction.attributes or {}),
+                                "tensor_reduction_domain_concordance": (
+                                    domain_fact
+                                ),
+                            },
+                        )
+                        emitted.append(call(
+                            "reduce_dim_double",
+                            [
+                                source, result, flat_shape, flat_rank,
+                                flat_axis, code,
+                            ],
+                            result, reduction_instruction,
+                            output_argument=1,
+                        ))
                     elif axis is not None and shape_unknown(source) and operation in _REDUCTION_CODES:
                         # Symbolic source: shape and rank ride as runtime
                         # extents; the kernel already takes them as operands.

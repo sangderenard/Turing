@@ -28,7 +28,7 @@ experimental field ledger and is not the same input as the saved 23-finding
 artifact; the two counts must not be conflated. The new groups are
 run_superstep 6, step 10, and the three singleton helpers. The authoritative
 diagnostic files were regenerated; the review's old numerical ids are stale.
-Log: `build/reachability_full_formals_20260906.log`.
+Log: `artifacts/compiler_evidence/reachability_full_formals_20260906.log`.
 
 The five non-native regression cases, seven formal-provenance cases, and the
 existing caller/callee pruning regression passed: **13 passed in 4.62s**.

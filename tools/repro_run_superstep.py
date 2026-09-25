@@ -88,19 +88,23 @@ def main() -> int:
     # the STController class needed to source-link its bound methods.
     source = advance_source + "\n\n" + root_source
     base = _base_records()
-    contract_abi = {
-        "records": {
+    records = {
             "Metrics": base["records"]["Metrics"],
             "Targets": base["records"]["Targets"],
             "STController": base["records"]["STController"],
             "BalloonTireManagedState": base["records"][
                 "BalloonTireManagedState"
             ],
-        },
+    }
+    contract_abi = {
+        "records": records,
         "bindings": [
             # Preserve the managed contract's function-scoped bindings too:
             # coerce_metrics calls its Metrics receiver ``value``.
-            *base["bindings"],
+            *(
+                binding for binding in base["bindings"]
+                if binding["record"] in records
+            ),
             {
                 "function": "*", "parameter": "state",
                 "record": "BalloonTireManagedState",

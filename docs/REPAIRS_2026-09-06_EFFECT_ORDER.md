@@ -5,7 +5,7 @@
 Fresh whole-program lowering completed at **FORMAL-DIAGNOSTIC 19**, with
 **zero undefined operands, unresolved calls, and unmaterialized boundaries**.
 It exited 1 at the strict provenance gate. Log:
-`build/effect_order_full_formals_20260906.log`. The authoritative files in
+`artifacts/compiler_evidence/effect_order_full_formals_20260906.log`. The authoritative files in
 `build/full_formal_diagnostic/` now contain this post-repair linked SSA.
 
 The linked step confirms that the hard-failure bool region reads **1378**,

@@ -148,7 +148,7 @@ def test_function_alias_publication_commits_transitive_terminal_resident():
 
         assert _concordant_function_aliases(function) == {64: 58, 69: 58}
         published = _publish_concordant_function_aliases(
-            function, {71: 86},
+            function, {71: 86}, provenance="test_new_alias",
         )
 
         assert published == {64: 58, 69: 58, 71: 86}
@@ -175,6 +175,7 @@ def test_output_settlement_keeps_frame_arena_as_physical_resident():
         published = _publish_concordant_function_aliases(
             function,
             {value_id: 2 for value_id in range(50, 61) if value_id != 2},
+            provenance="test_frame_arena",
         )
         assert published[60] == 2
         assert page.latest(("get_state", 60)) == 2
@@ -212,6 +213,42 @@ def kernel(values: Mapping[str, float]):
         assert (
             parameter_id, "unique", 2, False
         ) in declarations
+    finally:
+        end_identity_book(token)
+
+
+def test_annotated_list_slice_iteration_does_not_become_a_keyed_table():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse("""
+from typing import Any
+
+def product(factors: list[Any]):
+    held = factors[0]
+    for factor in factors[1:]:
+        held = factor
+    return held
+"""))
+    reduce_abstract_tensor_topology(graph)
+    executable = graph.function_table.entry("product").graph.G
+    parameter_id = int(executable.graph["identity_table"]["factors"][0])
+
+    _book, token = begin_identity_book()
+    try:
+        declarations = _field_slot_ops(
+            executable, contract_scope="product"
+        )[8]
+        parameter_declarations = tuple(
+            declaration
+            for declaration in declarations
+            if int(declaration[0]) == parameter_id
+        )
+        assert parameter_declarations
+        assert {
+            (policy, int(columns))
+            for _sequence_id, policy, columns, _writable
+            in parameter_declarations
+        } == {("duplicates", 1)}
     finally:
         end_identity_book(token)
 

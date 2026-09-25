@@ -135,7 +135,7 @@ seen from two ends.
 
 `examples/symbolic_fluid_live.py`. Defaults, with only `--audio FILE` given:
 sample-rate substepping, voice coil, and an AVI at
-`build/symbolic-fluid-live/pool.avi`.
+`artifacts/compiler_evidence/symbolic-fluid-live/pool.avi`.
 
 Timing arrangement (this was got backwards once -- do not re-invert it):
 

@@ -1144,6 +1144,122 @@ def repair_non_dominating_return_phi_inputs(function):
     return tuple(receipts)
 
 
+def repair_non_dominating_record_phi_uses(function):
+    """Use a record-field Phi's authored initial field before its merge.
+
+    Fieldwise record lowering records ``initial_value_id`` on every physical
+    Phi. Late record/call reconciliation can correlate an earlier use with the
+    eventual Phi result, but that result is unavailable before the merge. The
+    recorded initial field is the exact predecessor identity; substitute it
+    only where ordinary CFG dominance proves it available.
+    """
+    from .identity_concordance import current_identity_book
+
+    block_names = tuple(function.blocks)
+    if not block_names:
+        return ()
+    entry = "entry" if "entry" in function.blocks else block_names[0]
+    cfg = nx.DiGraph()
+    cfg.add_nodes_from(block_names)
+    for name, block in function.blocks.items():
+        cfg.add_edges_from(
+            (str(name), str(successor))
+            for successor in block.successors
+            if successor in function.blocks
+        )
+    reachable = set(nx.descendants(cfg, entry)) | {entry}
+    immediate = nx.immediate_dominators(cfg.subgraph(reachable), entry)
+    immediate[entry] = entry
+
+    def block_dominates(owner, target):
+        current = str(target)
+        while current in immediate:
+            if current == str(owner):
+                return True
+            parent = immediate[current]
+            if parent == current:
+                break
+            current = parent
+        return False
+
+    formals = {int(value.id): value for value in function.args}
+    definitions = {}
+    values = dict(formals)
+    fallbacks = {}
+    for block_name, block in function.blocks.items():
+        for index, instruction in enumerate(block.instrs):
+            if instruction.res is None:
+                continue
+            value_id = int(instruction.res.id)
+            definitions.setdefault(value_id, []).append((
+                str(block_name), int(index), instruction,
+            ))
+            values.setdefault(value_id, instruction.res)
+            attrs = instruction.attributes or {}
+            initial = attrs.get("initial_value_id")
+            if (
+                instruction.op == "Phi"
+                and attrs.get("record_field_phi")
+                and initial is not None
+            ):
+                fallbacks[value_id] = int(initial)
+
+    def dominates(value_id, target, use_index, phi_edge):
+        value_id = int(value_id)
+        if value_id in formals:
+            return True
+        locations = definitions.get(value_id, ())
+        if len(locations) != 1:
+            return False
+        owner, index, _instruction = locations[0]
+        return block_dominates(owner, target) and (
+            owner != target or phi_edge or index < use_index
+        )
+
+    page = current_identity_book().page(
+        "record_phi_temporal_fallback_concordance"
+    )
+    receipts = []
+    for block_name, block in function.blocks.items():
+        for use_index, instruction in enumerate(block.instrs):
+            incoming = tuple((instruction.attributes or {}).get(
+                "incoming_blocks", ()
+            )) if instruction.op == "Phi" else ()
+            arguments = list(instruction.args)
+            for position, argument in enumerate(tuple(arguments)):
+                result_id = int(argument.id)
+                fallback_id = fallbacks.get(result_id)
+                fallback = values.get(fallback_id) if fallback_id is not None else None
+                if fallback is None:
+                    continue
+                target = (
+                    str(incoming[position])
+                    if position < len(incoming) else str(block_name)
+                )
+                phi_edge = position < len(incoming)
+                if dominates(result_id, target, int(use_index), phi_edge):
+                    continue
+                if not dominates(fallback_id, target, int(use_index), phi_edge):
+                    continue
+                row = (
+                    str(function.name), result_id, str(block_name),
+                    int(use_index), int(position),
+                )
+                fact = (fallback_id, target, "initial_record_field_version")
+                prior = page.latest(row)
+                if prior is not None and tuple(prior) != fact:
+                    raise ValueError(
+                        "record Phi temporal fallback disagreement: "
+                        f"row={row!r}, prior={prior!r}, new={fact!r}"
+                    )
+                if prior is None:
+                    page.set(row, max(page.columns, default=-1) + 1, fact)
+                arguments[position] = fallback
+                receipts.append((result_id, fallback_id, block_name, use_index, position))
+            instruction.args = arguments
+    return tuple(receipts)
+
+
 def publish_scalar_record_return_fields(module):
     """Publish checked return versions after call signatures and CFG settle.
 

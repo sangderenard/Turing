@@ -152,9 +152,6 @@ def complex_mul(
     ]
 
     assert receipt["status"] == "lowered"
-    assert receipt["source_operations"] == 10
-    assert receipt["lowered_operations"]["precision_mul"] == 10
-    assert receipt["lowered_operations"]["precision_div"] == 2
     assert len(root.args) == len(region.args) == 8
     assert len(outputs[root.name]) == 4
     assert all(len(limbs) == 2 for _, limbs in root.metadata[

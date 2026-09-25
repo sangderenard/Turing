@@ -98,6 +98,7 @@ TENSOR_OPERATION_SCALAR_SPELLING: dict[str, str] = {
     "bitand": "BitAnd", "bitor": "BitOr", "bitxor": "BitXor",
     "shl": "Shl", "shr": "Shr", "invert": "Invert",
     "sqrt": "Sqrt", "exp": "Exp", "log": "Log",
+    "isfinite": "IsFinite", "isnan": "IsNaN", "isinf": "IsInf",
 }
 
 #: Operations whose result is a truth value rather than a number.
@@ -111,8 +112,17 @@ TENSOR_OPERATION_SCALAR_SPELLING: dict[str, str] = {
 #: that consumes it. Fortran and SPIR-V have the same exposure.
 PREDICATE_OPERATIONS: frozenset[str] = frozenset({
     "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "ULt", "ULe",
-    "LAnd", "LOr", "LNot", "LXor",
+    "LAnd", "LOr", "LNot", "LXor", "IsFinite", "IsNaN", "IsInf",
 })
+_PREDICATE_OPERATION_SPELLINGS = frozenset(
+    operation.casefold() for operation in PREDICATE_OPERATIONS
+)
+
+
+def is_predicate_operation(operation: Any) -> bool:
+    """Whether an SSA spelling produces truth, independent of casing."""
+
+    return str(operation).casefold() in _PREDICATE_OPERATION_SPELLINGS
 
 
 def plan_value_id_watermark(plan: PlanClosure) -> int:
@@ -139,6 +149,7 @@ def plan_value_id_watermark(plan: PlanClosure) -> int:
 
 def expand_plan_regions(
     plan: PlanClosure, *, first_free_value_id: int = 0,
+    function_scope: str = "<plan>",
 ) -> dict[tuple[str, int], tuple[Instr, ...]]:
     """Lower every top-level ``region_*`` closure of ``plan`` exactly once.
 
@@ -165,7 +176,9 @@ def expand_plan_regions(
         ):
             continue
         instructions = plan_region_to_ssa_instrs(
-            item, first_free_value_id=watermark,
+            item,
+            first_free_value_id=watermark,
+            function_scope=function_scope,
         )
         for instruction in instructions:
             for value in (
@@ -202,6 +215,7 @@ def copy_region_instructions(
 
 def plan_region_to_ssa_instrs(
     region: PlanClosure, *, first_free_value_id: int = 0,
+    function_scope: str = "<plan>",
 ) -> tuple[Instr, ...]:
     """Lower one planner-owned flat region to repository SSA instructions.
 
@@ -231,7 +245,7 @@ def plan_region_to_ssa_instrs(
         "less_equal", "gt", "greater", "ge", "greater_equal",
         "land", "logical_and", "lor", "logical_or", "lnot",
         "logical_not", "is", "is_not", "contains", "not_contains",
-    }
+    } | _PREDICATE_OPERATION_SPELLINGS
     integer_result_ops = {
         "len", "length", "extent", "bitlength", "bit_length",
     }
@@ -243,6 +257,35 @@ def plan_region_to_ssa_instrs(
         "int": "int64",
         "bool": "bool",
     }
+
+    # The operation owns its result domain. Commit that fact at the point
+    # repository SSA values are born so later region copies and target
+    # emitters consume one shared decision instead of re-inferring truth
+    # types from whichever spelling (``IsFinite`` or ``isfinite``) survived.
+    from .identity_concordance import current_identity_book
+    predicate_type_page = current_identity_book().page(
+        "operator_result_type_concordance"
+    )
+    for item in region.items:
+        if not (
+            isinstance(item, PlanLine)
+            and item.outputs
+            and str(item.opcode).casefold() in predicate_ops
+        ):
+            continue
+        row = (
+            str(function_scope), int(region.closure_id), str(region.name),
+            int(item.outputs[0]),
+        )
+        claim = (str(item.opcode).casefold(), "bool")
+        incumbent = predicate_type_page.latest(row)
+        if incumbent is None:
+            predicate_type_page.set(row, 0, claim)
+        elif incumbent != claim:
+            raise ValueError(
+                "operator result-type concordance disagreement: "
+                f"row={row!r}, incumbent={incumbent!r}, candidate={claim!r}"
+            )
 
     def semantic_input_ids(item: PlanLine) -> tuple[int, ...]:
         if len(item.input_roles) != len(item.inputs):

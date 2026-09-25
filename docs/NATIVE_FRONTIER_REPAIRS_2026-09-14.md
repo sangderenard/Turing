@@ -29,9 +29,9 @@ both moment banks, not just loss reduction.
 
 Evidence before the subsequent shape/optional changes:
 
-- `build/perforated_frontier_regressions.log`: six native network/recurrent tests.
-- `build/native_adjoint_final.log`: three native adjoint/reference tests passed.
-- `build/native_frontier_metadata_regressions.log`: 31 metadata/control tests passed.
+- `artifacts/compiler_evidence/perforated_frontier_regressions.log`: six native network/recurrent tests.
+- `artifacts/compiler_evidence/native_adjoint_final.log`: three native adjoint/reference tests passed.
+- `artifacts/compiler_evidence/native_frontier_metadata_regressions.log`: 31 metadata/control tests passed.
 
 The real-engine pressure run uses 64 transitions, two training experiences, one
 validation experience, hidden width four, and two epochs:
@@ -58,7 +58,7 @@ the central issuer's initial ID. The heuristic now checks trillion-scale values;
 it is a diagnostic, not an allocator or proof of identity ownership.
 
 The v7 replay completed eight frame rounds and three result-type rounds. Its
-audit (`build/validator_frontier_20260914_v7_audit.log`) has 13 formal-parity groups,
+audit (`artifacts/compiler_evidence/validator_frontier_20260914_v7_audit.log`) has 13 formal-parity groups,
 three definition-dominance findings, and the same optional result conflict.
 This is repository SSA, not an executable validator DLL.
 
@@ -77,13 +77,13 @@ Additional general repairs made while replaying:
   existing Python annotations/defaults. This changes representation, not physics
   or adaptive-controller tolerances.
 
-`build/native_optional_record_constructor_v2.log` records three native DLL tests
+`artifacts/compiler_evidence/native_optional_record_constructor_v2.log` records three native DLL tests
 distinguishing absent, present-zero, and present-nonzero values. The linked record
 row group passes four tests in
-`build/optional_record_constructor_regressions_v2.log`. Late source recovery and
+`artifacts/compiler_evidence/optional_record_constructor_regressions_v2.log`. Late source recovery and
 the central-ID heuristic group passes ten tests in
-`build/late_source_recovery_regressions.log`. Three shape regressions pass in
-`build/call_edge_shape_regressions_v2.log`.
+`artifacts/compiler_evidence/late_source_recovery_regressions.log`. Three shape regressions pass in
+`artifacts/compiler_evidence/call_edge_shape_regressions_v2.log`.
 
 A fresh source build is required to incorporate the optional ABI declarations;
 the old pickle stores the earlier declarations:
@@ -92,15 +92,15 @@ the old pickle stores the earlier declarations:
 python -u tools/build_vehicle_validator_simulation.py --output build/validator_frontier_20260914_v8 --lanes 8
 ```
 
-The v8 log is `build/validator_frontier_20260914_v8.log`. Recheck its result before
+The v8 log is `artifacts/compiler_evidence/validator_frontier_20260914_v8.log`. Recheck its result before
 starting another build. No full-suite gate was used.
 
 After the shape and optional-constructor changes, the cross-frontier group
 (`test_native_scalar_loss_adjoint`, `test_recurrent_native_history_reference`,
 `test_ssa_optional_values`, `test_managed_native_output_contract`) passes 17 tests
-in 117.35 seconds (`build/native_frontier_cross_regressions.log`). The optional
+in 117.35 seconds (`artifacts/compiler_evidence/native_frontier_cross_regressions.log`). The optional
 record/scalar group subsequently passes seven tests in 19.07 seconds
-(`build/optional_record_native_final.log`), including a native zero/absence test
+(`artifacts/compiler_evidence/optional_record_native_final.log`), including a native zero/absence test
 that resolves presence from the local record descriptor rather than stale
 callee accounting IDs.
 
@@ -141,7 +141,7 @@ python -u ../speaktome/AGENTS/tools/replay_turing_resolved_frontier.py build/val
 ```
 
 It retains `pre-frame-link.pkl` as well as final repository SSA and audit output.
-Its log is `build/validator_frontier_20260914_v9.log`. It began before the latest
+Its log is `artifacts/compiler_evidence/validator_frontier_20260914_v9.log`. It began before the latest
 lexical-return anchor/call-order edits; use its concrete audit to choose the next
 checkpoint replay. No full native validator artifact is claimed by these tests.
 
@@ -149,7 +149,7 @@ The v9 replay reached pre-frame lowering but its diagnostic serializer rejected
 the deployment's dynamically created class. The helper now uses the already
 installed `joblib.externals.cloudpickle` for that checkpoint, as the older
 working pre-frame helpers do. The corrected replay is **v10**, with log
-`build/validator_frontier_20260914_v10.log`; v9 has no usable pre-frame checkpoint.
+`artifacts/compiler_evidence/validator_frontier_20260914_v10.log`; v9 has no usable pre-frame checkpoint.
 
 The strengthened native loop now verifies all 3/5 iterations, zero iterations,
 and an early return after exactly one mutation. Its initial shaped zero needed

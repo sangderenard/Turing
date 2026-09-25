@@ -16,7 +16,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import sympy
 
-from .hierarchical_plan import PREDICATE_OPERATIONS
+from .hierarchical_plan import is_predicate_operation
 from .ir_identities import reduce_constant_exponent_pow
 from .ssa_builder import process_graph_to_ssa_instrs
 from .symbolic_process_graph import (
@@ -135,7 +135,7 @@ def _compile_sympy_equations_uncached(
         # verification. Declaring it here fixes every target at once.
         spelling = str(data.get("op") or data.get("type") or "")
         data["tensor"] = {
-            "dtype": "bool" if spelling in PREDICATE_OPERATIONS else dtype,
+            "dtype": "bool" if is_predicate_operation(spelling) else dtype,
             "shape": (),
         }
         if str(data.get("type") or data.get("op") or "").casefold() in {

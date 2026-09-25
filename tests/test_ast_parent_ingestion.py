@@ -37,6 +37,14 @@ class _RegisteredMethodOwner:
         return _recursive_source_helper(4)
 
 
+class _RetainedMethodDependencyOwner:
+    def run(self, value):
+        return self.step(value)
+
+    def step(self, value):
+        return _source_helper(value)
+
+
 class _ConstructorDependencyOwner:
     def __init__(self):
         self.value = _dependency_middle(3)
@@ -102,6 +110,33 @@ def test_reachable_registered_method_pursues_body_without_new_bindings():
     assert "_source_helper" in discovered
     assert "_recursive_source_helper" not in discovered
     assert any(definition.name == "_source_helper" for definition, _call in links)
+
+
+def test_retained_source_method_pursues_its_method_body_dependencies():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            ast.parse(""),
+            resolve_unresolved_parents=True,
+            parent_include=_source_dependency_is_not_tensor_primitive,
+            pursuit_roots=("_RetainedMethodDependencyOwner.run",),
+            retain=(_RetainedMethodDependencyOwner,),
+        )
+
+    helper_id, _helper = _definitions(graph, "_source_helper")[0]
+    helper_call_id, helper_call = next(
+        (node_id, data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Name)
+        and data["expr_obj"].func.id == "_source_helper"
+    )
+    assert graph.G.has_edge(helper_id, helper_call_id)
+    assert helper_call["attributes"]["resolved_ast_parent"] == helper_id
+    assert not any(
+        call["name"] == "step"
+        for call in graph.G.graph["unresolved_ast_calls"]
+    )
 
 
 def test_lexical_pursuit_follows_nested_helpers_but_respects_parameter_shadowing():

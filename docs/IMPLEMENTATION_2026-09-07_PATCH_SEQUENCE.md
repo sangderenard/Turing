@@ -103,7 +103,7 @@ The second diagnostic was also terminated, at 600 seconds during repository
 SSA lowering. Neither attempt yielded a fresh formal count. The user explicitly
 instructed: “YOU CANNOT KEEP USING TIMEOUTS”. Subsequent runs have no execution
 time ceiling; tool yields are progress polling only. The fresh v3 diagnostic
-runs directly and logs to build/patch_sequence_diagnostic_v3.log. Test subprocess
+runs directly and logs to artifacts/compiler_evidence/patch_sequence_diagnostic_v3.log. Test subprocess
 time limits in the five native regression files expanded in this batch were
 removed as well. Do not repeat the timeout-based workflow.
 
@@ -211,7 +211,7 @@ reused for constant and runtime iterables, filters, empty results, duplicate key
 with different values, missing defaults and repeated invocations.
 
 Fresh full-controller lowering is now session43484, output
-`build/patch_sequence_fresh_v13`, log `build/patch_sequence_fresh_v13.log`.
+`build/patch_sequence_fresh_v13`, log `artifacts/compiler_evidence/patch_sequence_fresh_v13.log`.
 `tools/checkpoint_managed_ssa.py` saves source, pre-frame-link, and completed SSA
 checkpoints before the strict native gate. It does not compile C or impose an
 execution deadline. General generator reductions, alias-correct field rebinding,
@@ -232,7 +232,7 @@ output failures. Do not compare that post-pruning count directly with earlier
 pre-gate scans. No complete native controller was compiled or run.
 
 The next generator-reduction reproduction is recorded in
-`build/star_max_diagnostic.log`: `max(initial, *(value * 2 for value in values),
+`artifacts/compiler_evidence/star_max_diagnostic.log`: `max(initial, *(value * 2 for value in values),
 suffix)` leaves the Starred wrapper as an unaccounted formal. No generator-max
 fix is claimed. The query/reduction lowering must preserve prefix/generator/suffix
 order and incumbent behavior for equal values and NaNs.
@@ -250,7 +250,7 @@ complete and filtered generators, empty filtered input, multiple values,
 suffix wins, signed zero, and NaNs in incumbent and candidate positions. The
 adjacent collection/control batch passed 8 tests in 28.95s; the final focused
 lowering/native batch passed 3 tests in 16.24s, both without execution deadlines.
-Saved checkpoint replay `build/patch_sequence_replay_v15.log` completed without
+Saved checkpoint replay `artifacts/compiler_evidence/patch_sequence_replay_v15.log` completed without
 source extraction or native compilation. The real `_propose_dt_pen` formal
 parity finding is absent and the pre-gate structural scan moved from 45 to 44.
 The remaining controller findings are unchanged families and no full native

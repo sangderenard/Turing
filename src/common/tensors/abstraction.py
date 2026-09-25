@@ -267,9 +267,23 @@ def _defers_to_reflected(other: Any) -> bool:
     it.
     """
 
-    from .extended_precision import ComplexPrecision, Precision
+    from .extended_precision import (
+        ComplexPrecision,
+        ComplexRational,
+        ComplexRationalPrecision,
+        Precision,
+        Rational,
+        RationalPrecision,
+    )
 
-    return isinstance(other, (Precision, ComplexPrecision))
+    return isinstance(other, (
+        Precision,
+        ComplexPrecision,
+        Rational,
+        RationalPrecision,
+        ComplexRational,
+        ComplexRationalPrecision,
+    ))
 
 
 class AbstractTensor:
@@ -283,6 +297,11 @@ class AbstractTensor:
     inf: float = float('inf')
     ninf: float = float('-inf')
     nan: float = float('nan')
+    # Power-of-two scale: a handle denotes ``data * 2**scale_exponent``.  The
+    # class defaults mean an ordinary handle carries none and pays nothing;
+    # see ``power_scale`` for the handles that do.
+    scale_exponent: int = 0
+    track_scale: bool = False
 
     @staticmethod
     def nan_to_num(x, nan: float = 0.0, posinf: float = inf, neginf: float = ninf) -> "AbstractTensor":
@@ -1047,15 +1066,13 @@ class AbstractTensor:
             except Exception:
                 pass
 
-        # "nodus" first: when the arena is connected this routes canonical
-        # elementwise ops through it instead of NumPy; when it is not,
-        # NodusTensorOperations falls back to the inherited NumPy behaviour
-        # per-op, so preferring it here costs nothing when nodus is absent.
-        # ABSTRACT_TENSOR_BACKEND names the backend to try first, process
-        # wide, without touching code: e.g. "numpy" to keep an eager run on
-        # plain NumPy while the nodus arena is connected.
+        # NumPy is the canonical default. Accelerator backends remain explicit
+        # choices so connecting an arena cannot silently change tensor
+        # semantics or make an unsupported dtype fail on an otherwise ordinary
+        # AbstractTensor expression. ABSTRACT_TENSOR_BACKEND can still name a
+        # different backend to try first, process wide, without touching code.
         requested = os.environ.get("ABSTRACT_TENSOR_BACKEND", "").strip().lower()
-        order = ("nodus", "numpy", "torch", "pure_python")
+        order = ("numpy", "nodus", "torch", "pure_python")
         if requested:
             order = (requested,) + tuple(name for name in order if name != requested)
         for backend_name in order:
@@ -2531,6 +2548,16 @@ class AbstractTensor:
         - for true division            -> cast bool to float
         Promotion happens BEFORE unwrap; backends never see bool arithmetic.
         """
+        # A scaled operand (power_scale) takes the scale-aware seam; an
+        # ordinary handle bypasses it on one class-dictionary check.
+        if (type(left).__dict__.get("_is_scaled_class", False)
+                or type(right).__dict__.get("_is_scaled_class", False)):
+            from .power_scale import scaled_apply_operator
+
+            return scaled_apply_operator(
+                self, op, left, right, limbs=limbs, accumulator=accumulator,
+                accumulate_output=accumulate_output,
+            )
         # Coerce list-like operands into tensors so that operator logic remains
         # backend-agnostic. This ensures raw Python lists interoperate with
         # tensors without requiring callers to explicitly convert them.
@@ -3935,3 +3962,6 @@ AbstractTensor._v3_valuewise  = _v3_valuewise
 from .mathematical_library import install_abstract_tensor_mathematical_library
 
 install_abstract_tensor_mathematical_library(AbstractTensor)
+
+# The power-of-two scale surface (with_scale, rebalance, materialize, ...).
+from . import power_scale as _power_scale  # noqa: E402,F401

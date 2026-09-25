@@ -831,9 +831,11 @@ def evaporate_unrolled_loops(
             continue
         selected_plans = group or (plan,)
         loop = selected_plans[0].loop
-        # Cloning value producers does not clone authored calls or terminal
-        # edges. Keep their iterative owner until an unroller can publish
-        # both the call occurrences and the guarded break/continue edges.
+        # Guarded terminal edges still need their iterative owner. Authored
+        # calls do not: ``add_clone`` gives every unrolled occurrence a fresh
+        # ProcessGraph value/callsite id while retaining its exact callee and
+        # argument edges, so ordinary post-unroll callsite specialization can
+        # publish each occurrence independently.
         blocked_by_control = any(
             member.loop.control_sites for member in selected_plans
         )
@@ -854,7 +856,7 @@ def evaporate_unrolled_loops(
                 f"iterable_constant={type(loop.iterable_constant).__name__}",
                 file=sys.stderr, flush=True,
             )
-        if blocked_by_control or blocked_by_call:
+        if blocked_by_control:
             continue
         # Collection mutations are resident memory effects, not values that can
         # be replaced by cloning the loop body's numerical producer cone. The

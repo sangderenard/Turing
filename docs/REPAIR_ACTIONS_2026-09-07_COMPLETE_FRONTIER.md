@@ -8,7 +8,7 @@ managed input can enter the native adapter, all required operations and returns
 survive lowering, the strict gates pass, and native results/state match Python.
 Zero fabricated formals alone is not completion.
 
-Baseline: `build/keyed_replace_full_formals_20260907.log` and
+Baseline: `artifacts/compiler_evidence/keyed_replace_full_formals_20260907.log` and
 `build/full_formal_diagnostic/{formals.json,repository-ssa.pkl,resolved-process-graph.pkl}`.
 That completed run has19 formals, zero undefined operands/unresolved calls.
 IDs below refer to that baseline, not an anticipated new lowering.

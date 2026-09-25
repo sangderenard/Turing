@@ -61,7 +61,7 @@ session's precompile_to_ssa.py edits, each a separate hunk:
 5. loop_composer: post-order return values, return placement waiting for
    slots, specialized dead-arm handling.
 
-Disable one at a time (in memory, the way `build/check_scheduler_baseline.py`
+Disable one at a time (in memory, the way `tools/compiler_probes/check_scheduler_baseline.py`
 does) until the repro passes, then fix that hunk at its identity source: a
 control expression must never define an id a region publishes. Keep the
 hunk's intent; do not just delete it.

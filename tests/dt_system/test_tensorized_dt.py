@@ -164,6 +164,28 @@ def test_native_publication_uses_declared_participant_channel_extent(tmp_path):
             assert np.count_nonzero(values) == 1
 
 
+def test_participant_extent_refinement_preserves_metrics_constructor_defaults():
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples"))
+    from llvm_dt_system import PUBLICATION_FIELDS, dt_system_contract
+
+    fields = dt_system_contract("root", (), 1, 2).program_abi.receipt()[
+        "records"
+    ]["Metrics"]["fields"]
+    for field_name in (
+        *PUBLICATION_FIELDS,
+        "pub_values", "pub_present", "pub_limits", "pub_limits_present",
+    ):
+        assert fields[field_name]["default"] == 0.0
+    for field_name in PUBLICATION_FIELDS:
+        assert fields[field_name]["shape"] == [2]
+    for field_name in (
+        "pub_values", "pub_present", "pub_limits", "pub_limits_present",
+    ):
+        assert fields[field_name]["shape"] == [2 * len(DT_CHANNEL_NAMES)]
+
+
 def test_coerced_metrics_uses_declared_publication_extent():
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples"))

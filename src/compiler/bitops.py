@@ -174,6 +174,14 @@ class Limit(BitStruct):
         self.rinc = rinc
         self.fromtheleft = fromtheleft
 
+    @property
+    def lower(self):
+        return self.integer_pieces[1]
+
+    @property
+    def upper(self):
+        return self.integer_pieces[2]
+
 class Tensor(Domain):
     CONTINUOUS = auto()
     SPARSE = auto()

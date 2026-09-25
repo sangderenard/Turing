@@ -27,6 +27,7 @@ from src.compiler.precompile_to_ssa import lower_precompile_and_control_to_ssa
 from src.compiler.ssa_llvm_backend import (
     compile_artifact,
     emit_ssa_function_to_llvm,
+    integer_scalar_lines,
     prepare_artifact_execution,
     with_native_sgd_loop,
 )
@@ -109,6 +110,39 @@ def test_pointer_array_materializes_repository_pointer_table():
     assert artifact.shortfalls == ()
     assert "%aggregate.pointer_array." in artifact.llvm_ir
     assert "store ptr" in artifact.llvm_ir
+
+
+def test_concorded_sequence_frame_member_is_a_direct_load_address(tmp_path):
+    length_address = SSAValue(
+        0,
+        "int64",
+        (1,),
+        accounting={
+            "compiler_frame_storage": "sequence_truth",
+            "compiler_frame_sequence_id": 63,
+            "compiler_frame_member": 1,
+        },
+    )
+    length = SSAValue(1, "int64")
+    function = Function("sequence_truth", [length_address], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Load", [length_address], length,
+                attributes={"binding": "ssa_sequence_truth"},
+            ),
+            Instr("Ret", [length], None),
+        ]),
+    })
+
+    artifact = emit_ssa_function_to_llvm(
+        IRModule({function.name: function}), function.name,
+    )
+
+    assert artifact.shortfalls == ()
+    native = compile_artifact(artifact, directory=tmp_path / "sequence_truth")
+    execution = prepare_artifact_execution(native, {length_address.id: [7]})
+    execution.run()
+    assert int(execution.buffers[length.id]) == 7
 
 
 def test_multiblock_conditional_phi_executes_natively(tmp_path):
@@ -311,6 +345,53 @@ def test_referenced_target_intrinsics_are_declared_and_compile(tmp_path):
     assert float(execution.buffers[result.id]) == pytest.approx(
         np.exp(2.0) + 2.0
     )
+
+
+def test_float_classification_predicates_compile_and_execute(tmp_path):
+    value = SSAValue(0, "float64")
+    finite = SSAValue(1, "bool")
+    nan = SSAValue(2, "bool")
+    infinite = SSAValue(3, "bool")
+    function = Function("classify_float", [value], {
+        "entry": BasicBlock("entry", [
+            Instr("IsFinite", [value], finite),
+            Instr("IsNaN", [value], nan),
+            Instr("IsInf", [value], infinite),
+            Instr("Ret", [finite, nan, infinite], None),
+        ]),
+    })
+
+    artifact = emit_ssa_function_to_llvm(
+        IRModule({function.name: function}), function.name,
+    )
+
+    assert artifact.shortfalls == ()
+    native = compile_artifact(artifact, directory=tmp_path / "classify_float")
+    for sample, expected in (
+        (1.5, (True, False, False)),
+        (float("inf"), (False, False, True)),
+        (float("-inf"), (False, False, True)),
+        (float("nan"), (False, True, False)),
+    ):
+        execution = prepare_artifact_execution(native, {value.id: sample})
+        execution.run()
+        observed = tuple(
+            bool(execution.buffers[result.id])
+            for result in (finite, nan, infinite)
+        )
+        assert observed == expected
+
+
+def test_variadic_logical_integer_emission_folds_all_operands():
+    lines, result_type = integer_scalar_lines(
+        "LAnd", "i1", ["%a", "%b", "%c"], "%all",
+    )
+
+    assert result_type == "i1"
+    assert lines == [
+        "%all.1 = and i1 %a, %b",
+        "%all = and i1 %all.1, %c",
+    ]
 
 
 def test_integer_scalar_domain_is_not_widened_through_double(tmp_path):

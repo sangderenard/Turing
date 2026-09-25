@@ -55,3 +55,35 @@ def test_precision_operator_concordance_reports_changed_source_identity():
         assert findings[0].value_id == 27
     finally:
         end_identity_book(token)
+
+
+def test_audit_reads_post_ssa_numeric_concordance_pages():
+    book, token = begin_identity_book()
+    try:
+        feed = book.page("exact_region_feed_dtype")
+        feed.set(("feed", "root", 37), 0, ("bool",))
+        feed.set(("feed", "root", 37), 1, ("float64",))
+        channel = book.page("precision_channel_shape_concordance")
+        channel.set(("wide", 4), 0, ((2,), (2, 2), 2))
+        channel.set(("wide", 4), 1, ((), (2,), 2))
+        phi = book.page("single_input_phi_descriptor_concordance")
+        phi.set(("wide", 9), 0, (4, "float64", (2,)))
+        phi.set(("wide", 9), 1, (5, "float64", ()))
+        module = type("Module", (), {
+            "metadata": {"identity_book": book},
+        })()
+
+        findings = CorrelationTable._post_ssa_numeric_identity_findings(
+            module
+        )
+
+        assert {finding.kind for finding in findings} == {
+            "exact-region-feed-dtype-disagreement",
+            "precision-channel-shape-disagreement",
+            "single-input-phi-descriptor-disagreement",
+        }
+        assert {(finding.function, finding.value_id) for finding in findings} == {
+            ("root", 37), ("wide", 4), ("wide", 9),
+        }
+    finally:
+        end_identity_book(token)

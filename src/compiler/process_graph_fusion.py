@@ -118,22 +118,54 @@ def extract_clean_process_subgraph(
 ) -> ProcessGraph:
     """Copy an induced subgraph without obligations to excluded nodes."""
 
-    def isolate_metadata(value):
-        """Copy mutable metadata containers without cloning semantic objects."""
+    metadata_memo: dict[int, object] = {}
 
+    def isolate_metadata(value):
+        """Copy metadata containers while preserving their identity graph.
+
+        ProcessGraph metadata can intentionally share containers and can
+        contain backreferences.  This copier keeps semantic leaf objects in
+        place, but it must treat container identity exactly as ``deepcopy``
+        does: one source container becomes one isolated container and a
+        backedge remains a backedge.  Recursing without that identity memo
+        made callsite specialization nonterminating on cyclic metadata.
+        """
+
+        identity = id(value)
+        if identity in metadata_memo:
+            return metadata_memo[identity]
         if isinstance(value, dict):
-            return {
-                isolate_metadata(key): isolate_metadata(item)
+            isolated = {}
+            metadata_memo[identity] = isolated
+            isolated.update(
+                (isolate_metadata(key), isolate_metadata(item))
                 for key, item in value.items()
-            }
+            )
+            return isolated
         if isinstance(value, list):
-            return [isolate_metadata(item) for item in value]
+            isolated = []
+            metadata_memo[identity] = isolated
+            isolated.extend(isolate_metadata(item) for item in value)
+            return isolated
         if isinstance(value, tuple):
-            return tuple(isolate_metadata(item) for item in value)
+            isolated = tuple(isolate_metadata(item) for item in value)
+            # Immutable containers cannot directly contain themselves.  A
+            # cycle through a mutable container is broken by that container's
+            # memo entry before control returns here.
+            incumbent = metadata_memo.get(identity)
+            if incumbent is not None:
+                return incumbent
+            metadata_memo[identity] = isolated
+            return isolated
         if isinstance(value, set):
-            return {isolate_metadata(item) for item in value}
+            isolated = set()
+            metadata_memo[identity] = isolated
+            isolated.update(isolate_metadata(item) for item in value)
+            return isolated
         if isinstance(value, frozenset):
-            return frozenset(isolate_metadata(item) for item in value)
+            isolated = frozenset(isolate_metadata(item) for item in value)
+            metadata_memo[identity] = isolated
+            return isolated
         return value
 
     included = {
@@ -424,6 +456,7 @@ def reduce_scheduled_shader_regions(
     indivisible_node_groups: Iterable[Iterable[int]] = (),
     control_node_ids: Iterable[int] = (),
     schedule: str = "asap",
+    _progress: Any = None,
 ) -> ScheduledProcessGraphDispatchPlan:
     """Reduce executable nodes to maximal shader regions by fixed point.
 
@@ -633,6 +666,18 @@ def reduce_scheduled_shader_regions(
         for region_id in regions
     }
     next_region_id = len(regions)
+    merge_count = 0
+    fixed_point_iteration = 0
+
+    def report_reduction(state: str, **facts: Any) -> None:
+        if _progress is not None:
+            _progress({
+                "reduction_state": str(state),
+                "iteration": int(fixed_point_iteration),
+                "merges": int(merge_count),
+                "regions": len(regions),
+                **facts,
+            })
 
     def region_key(members):
         member_keys = {keys.get(node_id) for node_id in members}
@@ -742,7 +787,7 @@ def reduce_scheduled_shader_regions(
         return True
 
     def merge(region_ids, identity):
-        nonlocal next_region_id
+        nonlocal next_region_id, merge_count
         region_ids = tuple(dict.fromkeys(region_ids))
         members = set().union(*(regions.pop(item) for item in region_ids))
         history = [
@@ -755,10 +800,16 @@ def reduce_scheduled_shader_regions(
         next_region_id += 1
         regions[merged_id] = members
         histories[merged_id] = history
+        merge_count += 1
+        if merge_count == 1 or merge_count % 128 == 0:
+            report_reduction("merge-progress", identity=str(identity))
         return merged_id
 
     changed = True
+    report_reduction("fixed-point-begin")
     while changed:
+        fixed_point_iteration += 1
+        regions_before_iteration = len(regions)
         changed = False
 
         # Identity 1: same-level calls of the same operator and execution
@@ -861,6 +912,15 @@ def reduce_scheduled_shader_regions(
                 merged = merge(group, "horizontal-shader-pack")
                 candidates[:len(group)] = [merged]
                 changed = True
+
+        report_reduction(
+            "fixed-point-iteration",
+            regions_before=int(regions_before_iteration),
+            regions_after=len(regions),
+            changed=bool(changed),
+        )
+
+    report_reduction("fixed-point-end")
 
     # Regions execute in the order they are listed, so that order must respect
     # the quotient graph, not the position of each region's earliest member.

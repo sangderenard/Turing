@@ -17,6 +17,7 @@ from src.compiler.hierarchical_plan import (
     reduce_hierarchy_identities,
     render_plan_ascii,
 )
+from src.compiler.identity_concordance import current_identity_book
 from src.compiler.glsl_deployment_strategy import (
     PlannedOperatorImplementation,
     _build_planned_operator_implementations,
@@ -1304,6 +1305,30 @@ def test_python_integer_chain_is_int64_before_backend_lowering():
         3: "int64", 4: "int64", 5: "int64", 6: "int64",
         7: "int64", 8: "int64",
     }
+
+
+def test_lowercase_finiteness_predicate_is_boolean_before_backend_lowering():
+    region = PlanClosure(
+        "region_isfinite_predicate",
+        captures=(1,),
+        items=(PlanLine.create(
+            "isfinite", inputs=(1,), outputs=(2,),
+            input_roles=("arg:0",),
+        ),),
+        closure_id=991,
+        value_shapes=((1, (), "float64"), (2, (), "float64")),
+    )
+
+    instructions = plan_region_to_ssa_instrs(region)
+
+    assert len(instructions) == 1
+    assert instructions[0].res.dtype == "bool"
+    assert instructions[0].op == "IsFinite"
+    assert current_identity_book().page(
+        "operator_result_type_concordance"
+    ).latest(("<plan>", 991, "region_isfinite_predicate", 2)) == (
+        "isfinite", "bool",
+    )
 
 
 def test_scalar_tensor_tagged_extrema_become_primitive_ssa_in_plan_lowering():
