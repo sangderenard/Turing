@@ -60,6 +60,12 @@ Findings (each is one concrete disagreement, with the two claims):
 ``source-precision-operator-disagreement``
     one authored Precision operator changes operation, receiver, class, or
     limb width between source stages.
+``operator-result-type-disagreement``
+    one planned operation assigns more than one result dtype to the same
+    region value identity.
+``planning-alias-transition-disagreement``
+    a recorded planning refinement does not begin at the resident established
+    by the preceding refinement for that exact value.
 """
 
 from __future__ import annotations
@@ -291,10 +297,230 @@ class CorrelationTable:
         found.extend(self._binding_kind_findings(module))
         found.extend(self._source_field_identity_findings(module))
         found.extend(self._source_parameter_identity_findings(module))
+        found.extend(self._source_numeric_component_findings(module))
+        found.extend(self._source_numeric_intrinsic_findings(module))
+        found.extend(self._source_numeric_type_dependency_findings(module))
+        found.extend(self._source_numeric_operator_specialization_findings(module))
+        found.extend(self._source_sequence_mutation_findings(module))
+        found.extend(self._source_callsite_activation_findings(module))
         found.extend(self._source_precision_boundary_findings(module))
         found.extend(self._source_precision_operator_findings(module))
         found.extend(self._source_precision_region_findings(module))
+        found.extend(self._operator_result_type_findings(module))
+        found.extend(self._planning_alias_transition_findings(module))
+        found.extend(self._tensor_reduction_domain_findings(module))
         found.extend(self._callable_identity_findings(module))
+        found.extend(self._post_ssa_numeric_identity_findings(module))
+        return found
+
+    @staticmethod
+    def _post_ssa_numeric_identity_findings(module: Any) -> list[Finding]:
+        """Report disagreement in the numeric facts consumed after SSA.
+
+        These pages are deliberately distinct because they govern distinct
+        transformations: exact region feeds, the physical limb channel, and
+        the descriptor forwarded by a structural one-input Phi.  The audit
+        reads all three so a later pass cannot silently publish a second fact
+        for the same semantic value.
+        """
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        if book is None:
+            return []
+        specifications = (
+            (
+                "exact_region_feed_dtype",
+                "exact-region-feed-dtype-disagreement",
+                "exact region feed changed dtype",
+            ),
+            (
+                "precision_channel_shape_concordance",
+                "precision-channel-shape-disagreement",
+                "Precision value changed logical shape, channel shape, or width",
+            ),
+            (
+                "single_input_phi_descriptor_concordance",
+                "single-input-phi-descriptor-disagreement",
+                "single-input Phi changed source, dtype, or shape",
+            ),
+        )
+        found: list[Finding] = []
+        pages = getattr(book, "pages", {}) or {}
+        for page_name, kind, detail in specifications:
+            page = pages.get(page_name)
+            if page is None:
+                continue
+            for row in page.rows():
+                distinct = tuple(dict.fromkeys(
+                    repr(fact) for _column, fact in page.history(row)
+                ))
+                if len(distinct) <= 1:
+                    continue
+                if (
+                    page_name == "exact_region_feed_dtype"
+                    and isinstance(row, tuple)
+                    and len(row) == 3
+                ):
+                    function, value_id = str(row[1]), int(row[2])
+                elif isinstance(row, tuple) and len(row) >= 2:
+                    function, value_id = str(row[0]), int(row[1])
+                else:
+                    function, value_id = str(row), None
+                found.append(Finding(
+                    kind,
+                    function,
+                    value_id,
+                    f"{detail}: {distinct!r}",
+                ))
+        return found
+
+    @staticmethod
+    def _source_callsite_activation_findings(module: Any) -> list[Finding]:
+        """Report a source callsite resolved to multiple function identities."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "source_callsite_activation_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found: list[Finding] = []
+        for row in page.rows():
+            distinct = tuple(dict.fromkeys(
+                repr(fact) for _column, fact in page.history(row)
+            ))
+            if len(distinct) <= 1:
+                continue
+            function_name, value_id = (
+                row if isinstance(row, tuple) and len(row) == 2
+                else (str(row), None)
+            )
+            found.append(Finding(
+                "source-callsite-activation-disagreement",
+                str(function_name),
+                None if value_id is None else int(value_id),
+                "source callsite changed function-table identity across "
+                f"planning stages: {distinct!r}",
+            ))
+        return found
+
+    @staticmethod
+    def _planning_alias_transition_findings(module: Any) -> list[Finding]:
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "planning_alias_transition_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found: list[Finding] = []
+        for row in page.rows():
+            history = tuple(fact for _column, fact in page.history(row))
+            for prior, current in zip(history, history[1:]):
+                if int(tuple(prior)[1]) == int(tuple(current)[0]):
+                    continue
+                function_name, value_id = row
+                found.append(Finding(
+                    "planning-alias-transition-disagreement",
+                    str(function_name), int(value_id),
+                    "planning refinement history is discontinuous: "
+                    f"prior={prior!r}, current={current!r}",
+                ))
+        return found
+
+    @staticmethod
+    def _operator_result_type_findings(module: Any) -> list[Finding]:
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "operator_result_type_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found: list[Finding] = []
+        for row in page.rows():
+            facts = tuple(dict.fromkeys(
+                fact for _column, fact in page.history(row)
+            ))
+            if len(facts) <= 1:
+                continue
+            if len(row) == 4:
+                function_name, _closure_id, region_name, value_id = row
+            else:
+                _closure_id, region_name, value_id = row
+                function_name = region_name
+            found.append(Finding(
+                "operator-result-type-disagreement",
+                str(function_name), int(value_id),
+                f"planned value acquired multiple operator result types: "
+                f"region={region_name!r}, facts={facts!r}",
+            ))
+        return found
+
+    @staticmethod
+    def _tensor_reduction_domain_findings(module: Any) -> list[Finding]:
+        """Check all-axis reduction views against their emitted kernel call."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "tensor_reduction_domain_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found: list[Finding] = []
+        for row in page.rows():
+            function_name, result_id = row
+            history = page.history(row)
+            facts = tuple(dict.fromkeys(
+                fact for _column, fact in history
+            ))
+            if len(facts) != 1:
+                found.append(Finding(
+                    "tensor-reduction-domain-disagreement",
+                    str(function_name), int(result_id),
+                    f"all-axis reduction acquired multiple domains: {facts!r}",
+                ))
+                continue
+            function = module.functions.get(str(function_name))
+            receipts = () if function is None else tuple(
+                instruction.attributes.get(
+                    "tensor_reduction_domain_concordance"
+                )
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+                and int(instruction.res.id) == int(result_id)
+                and instruction.attributes.get(
+                    "tensor_reduction_domain_concordance"
+                ) is not None
+            )
+            if receipts != facts:
+                found.append(Finding(
+                    "tensor-reduction-domain-unpublished",
+                    str(function_name), int(result_id),
+                    f"concordance records {facts!r}, emitted call records "
+                    f"{receipts!r}",
+                ))
         return found
 
     @staticmethod
@@ -624,6 +850,184 @@ class CorrelationTable:
                 None,
                 f"parameter {parameter!r} changed identity across source "
                 f"stages: {distinct!r}",
+            ))
+        return found
+
+    @staticmethod
+    def _source_numeric_component_findings(module: Any) -> list[Finding]:
+        """Report a composite coefficient projection that changed identity."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "source_numeric_component_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            history = page.history(row)
+            distinct = tuple(dict.fromkeys(
+                repr(fact) for _column, fact in history
+            ))
+            if len(distinct) <= 1:
+                continue
+            scope, value_id = (
+                row if isinstance(row, tuple) and len(row) == 2
+                else (row, None)
+            )
+            found.append(Finding(
+                "source-numeric-component-disagreement",
+                str(scope),
+                None if value_id is None else int(value_id),
+                "numeric coefficient projection changed receiver, path, or "
+                f"descriptor across source stages: {distinct!r}",
+            ))
+        return found
+
+    @staticmethod
+    def _source_numeric_intrinsic_findings(module: Any) -> list[Finding]:
+        """Report a numeric intrinsic whose structural results changed."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "source_numeric_intrinsic_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            distinct = tuple(dict.fromkeys(
+                repr(fact) for _column, fact in page.history(row)
+            ))
+            if len(distinct) <= 1:
+                continue
+            scope, value_id = (
+                row if isinstance(row, tuple) and len(row) == 2
+                else (row, None)
+            )
+            found.append(Finding(
+                "source-numeric-intrinsic-disagreement",
+                str(scope),
+                None if value_id is None else int(value_id),
+                "numeric intrinsic changed receiver or ordered component "
+                f"results across source stages: {distinct!r}",
+            ))
+        return found
+
+    @staticmethod
+    def _source_numeric_type_dependency_findings(module: Any) -> list[Finding]:
+        """Report an authored wrapper whose coefficient closure changed."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "source_numeric_type_dependency_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            distinct = tuple(dict.fromkeys(
+                repr(fact) for _column, fact in page.history(row)
+            ))
+            if len(distinct) <= 1:
+                continue
+            type_name, limbs = (
+                row if isinstance(row, tuple) and len(row) == 2
+                else (row, None)
+            )
+            found.append(Finding(
+                "source-numeric-type-dependency-disagreement",
+                str(type_name),
+                None,
+                f"numeric type at width {limbs!r} acquired multiple "
+                f"coefficient dependency closures: {distinct!r}",
+            ))
+        return found
+
+    @staticmethod
+    def _source_numeric_operator_specialization_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """Report a same-type wrapper dunder that changed its exact target."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "source_numeric_operator_specialization_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            distinct = tuple(dict.fromkeys(
+                repr(fact) for _column, fact in page.history(row)
+            ))
+            if len(distinct) <= 1:
+                continue
+            scope, value_id = (
+                row if isinstance(row, tuple) and len(row) == 2
+                else (row, None)
+            )
+            found.append(Finding(
+                "source-numeric-operator-specialization-disagreement",
+                str(scope),
+                None if value_id is None else int(value_id),
+                "same-type numeric operator changed receiver, argument, "
+                f"descriptor, or authored target: {distinct!r}",
+            ))
+        return found
+
+    @staticmethod
+    def _source_sequence_mutation_findings(module: Any) -> list[Finding]:
+        """Report a source mutation whose resident sequence fact changed."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "source_sequence_mutation_concordance"
+            )
+        )
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            distinct = tuple(dict.fromkeys(
+                repr(fact) for _column, fact in page.history(row)
+            ))
+            if len(distinct) <= 1:
+                continue
+            scope, value_id = (
+                row if isinstance(row, tuple) and len(row) == 2
+                else (row, None)
+            )
+            found.append(Finding(
+                "source-sequence-mutation-disagreement",
+                str(scope),
+                None if value_id is None else int(value_id),
+                "source mutation changed resident sequence, operator, "
+                f"arguments, policy, or mutation kind: {distinct!r}",
             ))
         return found
 
@@ -1035,35 +1439,47 @@ class CorrelationTable:
                 "planning_value_concordance"
             )
         )
+        output_page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                "output_identity_concordance"
+            )
+        )
         if book is not None:
-            durable_aliases: list[tuple[str, int, int]] = []
+            durable_aliases: list[tuple[str, Any, int, int]] = []
             local_aliases = metadata.get("value_aliases", ()) or ()
             local_pairs = (
                 local_aliases.items()
                 if isinstance(local_aliases, Mapping) else local_aliases
             )
             durable_aliases.extend(
-                ("metadata.value_aliases", int(alias), int(target))
+                (
+                    "metadata.value_aliases", page,
+                    int(alias), int(target),
+                )
                 for alias, target in local_pairs
             )
             durable_aliases.extend(
                 (
                     "metadata.output_identity_aliases",
+                    output_page,
                     int(alias), int(target),
                 )
                 for alias, target in (
                     metadata.get("output_identity_aliases", ()) or ()
                 )
             )
-            for source, alias, target in durable_aliases:
+            for source, authority, alias, target in durable_aliases:
                 concorded = (
-                    None if page is None else page.latest((name, alias))
+                    None if authority is None
+                    else authority.latest((name, alias))
                 )
                 if concorded is not None and int(concorded) == target:
                     continue
                 found.append(Finding(
                     "alias-not-concorded", name, alias,
-                    f"{source} says {target}, planning_value_concordance "
+                    f"{source} says {target}, "
+                    f"{('output_identity_concordance' if source.endswith('output_identity_aliases') else 'planning_value_concordance')} "
                     f"says {concorded!r}",
                 ))
         return found
@@ -1302,6 +1718,24 @@ class IdentityPage:
         entries = self.history(row)
         return entries[-1][1] if entries else default
 
+    def concord(self, row: Any, fact: Any) -> Any:
+        """Commit ``fact`` for ``row`` and return the committed fact.
+
+        The first statement owns the row; a later stage may repeat it but may
+        not replace it, so a different proposal is a disagreement, never a
+        silent overwrite.  Callers use the returned fact as the decision.
+        """
+        incumbent = self.latest(row)
+        if incumbent is None:
+            self.set(row, 0, fact)
+            return fact
+        if incumbent != fact:
+            raise ValueError(
+                f"{self.name} disagreement for {row!r}: "
+                f"recorded={incumbent!r}, proposed={fact!r}"
+            )
+        return incumbent
+
     def bind_alias(self, scope: Any, alias: int, resident: int) -> None:
         """Concord one planning value occurrence with its resident identity.
 
@@ -1405,8 +1839,12 @@ class IdentityBook:
     """Every stage's page, so one identity's claim can be read across all
     of them -- the comparison none of them makes on its own."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, detached: bool = False) -> None:
         self.pages: dict[str, IdentityPage] = {}
+        #: Created by ``current_identity_book`` because nothing had begun a
+        #: compile.  A standalone transaction owns its own book instead of
+        #: joining one of these, whose facts belong to no single program.
+        self.detached = bool(detached)
 
     def page(self, name: str) -> IdentityPage:
         return self.pages.setdefault(name, IdentityPage(name))
@@ -1657,7 +2095,7 @@ def current_identity_book() -> IdentityBook:
     ``begin_identity_book`` -- it simply has nowhere to be dumped later)."""
     book = _ACTIVE_IDENTITY_BOOK.get()
     if book is None:
-        book = IdentityBook()
+        book = IdentityBook(detached=True)
         _ACTIVE_IDENTITY_BOOK.set(book)
     return book
 

@@ -1,6 +1,7 @@
 import ast
 import contextlib
 import io
+import inspect
 import _pickle
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ import pytest
 import sympy
 
 from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
-from src.common.dt_system.dt_scaler import Metrics, coerce_metrics
+from src.common.dt_system.dt_scaler import Metrics, coerce_metrics, _scalar
 from src.compiler.process_graph_function_linking import link_process_graph_functions
 from src.compiler.fortran_c_shell import (
     _dispatch_region_completion_positions,
@@ -20,11 +21,13 @@ from src.compiler.fortran_c_shell import (
     _linked_sequence_propagation_kind,
     _linked_frame_physical_shape,
     _same_declared_span_storage,
-    _publish_concordant_function_aliases,
     _linked_frame_storage_role,
     _linked_frame_storage_owner,
     _monotonic_ssa_ids,
     _preferred_linked_field_candidates,
+    _publish_concorded_output_identities,
+    _concord_record_return_phi_inputs,
+    _apply_concorded_function_aliases,
     _prune_dead_entry_field_aliases,
     _prune_unused_callee_formals,
     _rebind_linked_storage_alias,
@@ -32,10 +35,14 @@ from src.compiler.fortran_c_shell import (
     _resolve_repeated_aggregate_output_positions,
     _retained_parameter_identity,
     _static_mapping_capacity_bounds,
+    _undefined_repository_ssa_operands,
     lower_ast_source_to_ssa,
 )
 from src.compiler.symbolic_equation_compiler import compile_sympy_equations
 from src.compiler.ssa_reference_evaluator import SSAReferenceEvaluator
+from src.compiler.ssa_record_return_state import (
+    repair_non_dominating_record_phi_uses,
+)
 from src.compiler.ssa_aggregate_abi import is_storage_view
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 from src.transmogrifier.ssa import (
@@ -629,7 +636,7 @@ def test_identity_audit_reads_callable_identity_history():
     assert "changed function-table address" in report
 
 
-def test_output_alias_publication_advances_durable_snapshot_with_concordance():
+def test_output_alias_publication_uses_distinct_concordance_from_storage():
     from src.compiler.identity_concordance import (
         begin_identity_book,
         current_identity_book,
@@ -645,15 +652,186 @@ def test_output_alias_publication_advances_durable_snapshot_with_concordance():
         page = current_identity_book().page("planning_value_concordance")
         page.bind_alias("step", 376, 375)
 
-        aliases = _publish_concordant_function_aliases(
+        aliases = _publish_concorded_output_identities(
             function, {376: 2305843010213698294},
         )
 
         assert aliases[376] == 2305843010213698294
-        assert function.metadata["value_aliases"][376] == 2305843010213698294
-        assert page.latest(("step", 376)) == 2305843010213698294
+        assert function.metadata["value_aliases"][376] == 375
+        assert page.latest(("step", 376)) == 375
+        assert current_identity_book().page(
+            "output_identity_concordance"
+        ).latest(("step", 376)) == 2305843010213698294
     finally:
         end_identity_book(token)
+
+
+def test_planning_alias_refinement_records_concorded_transition():
+    from src.compiler.fortran_c_shell import (
+        _publish_concordant_function_aliases,
+    )
+    from src.compiler.identity_concordance import (
+        begin_identity_book,
+        current_identity_book,
+        end_identity_book,
+    )
+
+    function = Function(
+        "step", [], {"entry": BasicBlock("entry", [])},
+        metadata={"value_aliases": {272: 100}},
+    )
+    _book, token = begin_identity_book()
+    try:
+        planning = current_identity_book().page(
+            "planning_value_concordance"
+        )
+        planning.bind_alias("step", 272, 100)
+
+        aliases = _publish_concordant_function_aliases(
+            function, {272: 200},
+            provenance="linked_call_record_projection",
+        )
+
+        assert aliases[272] == 200
+        assert function.metadata["value_aliases"][272] == 200
+        assert planning.latest(("step", 272)) == 200
+        assert current_identity_book().page(
+            "planning_alias_transition_concordance"
+        ).latest(("step", 272)) == (
+            100, 200, "linked_call_record_projection",
+        )
+    finally:
+        end_identity_book(token)
+
+
+def test_record_return_phi_revisit_rejects_merged_self_candidate():
+    from src.compiler.identity_concordance import (
+        begin_identity_book,
+        current_identity_book,
+        end_identity_book,
+    )
+
+    incoming = SSAValue(10, dtype="float64")
+    result = SSAValue(20, dtype="float64")
+    phi = Instr(
+        "Phi", [incoming], result,
+        attributes={
+            "binding": "return_merge",
+            "record_return_scalar": True,
+            "record_field": "limits",
+            "incoming_blocks": ("return_edge",),
+        },
+    )
+    _book, token = begin_identity_book()
+    try:
+        selected = _concord_record_return_phi_inputs(
+            "step", phi, [result],
+        )
+
+        assert selected == [incoming]
+        assert current_identity_book().page(
+            "record_return_phi_input_concordance"
+        ).latest(("step", 20, "limits", 0, "return_edge")) == (
+            20, 10, "merged_descriptor_self_candidate_rejected",
+        )
+    finally:
+        end_identity_book(token)
+
+
+def test_alias_application_retains_value_when_resident_is_future_return_phi():
+    from src.compiler.identity_concordance import (
+        begin_identity_book,
+        current_identity_book,
+        end_identity_book,
+    )
+
+    source = SSAValue(10, dtype="float64")
+    condition = SSAValue(11, dtype="bool")
+    merged = SSAValue(20, dtype="float64")
+    use = Instr("Call", [source], None, attributes={"callee": "consume"})
+    branch = Instr(
+        "Br", [], None, attributes={"target": "function_exit"},
+    )
+    phi = Instr(
+        "Phi", [source], merged,
+        attributes={
+            "binding": "return_merge",
+            "incoming_blocks": ("body",),
+        },
+    )
+    function = Function(
+        "step", [source, condition],
+        {
+            "entry": BasicBlock(
+                "entry", [Instr(
+                    "Br", [], None, attributes={"target": "body"},
+                )], successors=["body"],
+            ),
+            "body": BasicBlock(
+                "body", [use, branch], successors=["function_exit"],
+            ),
+            "function_exit": BasicBlock(
+                "function_exit", [phi, Instr("Ret", [merged], None)],
+            ),
+        },
+    )
+    _book, token = begin_identity_book()
+    try:
+        receipts = _apply_concorded_function_aliases(
+            function, {10: 20},
+        )
+
+        assert use.args == [source]
+        assert phi.args == [source]
+        facts = current_identity_book().page(
+            "alias_application_concordance"
+        )
+        assert facts.latest(("step", "body", 0, 0))[3] == (
+            "resident_not_available_at_use"
+        )
+        assert facts.latest(("step", "function_exit", 0, 0))[3] == (
+            "resident_not_available_at_use"
+        )
+        assert len(receipts) == 2
+    finally:
+        end_identity_book(token)
+
+
+def test_record_phi_temporal_fallback_repairs_earlier_use_and_self_edge():
+    initial = SSAValue(10, dtype="float64")
+    result = SSAValue(20, dtype="float64")
+    use = Instr("Call", [result], None, attributes={"callee": "consume"})
+    phi = Instr(
+        "Phi", [result], result,
+        attributes={
+            "record_field_phi": True,
+            "initial_value_id": 10,
+            "incoming_blocks": ("body",),
+        },
+    )
+    function = Function(
+        "step", [initial],
+        {
+            "entry": BasicBlock(
+                "entry", [Instr("Br", [], None, attributes={"target": "body"})],
+                successors=["body"],
+            ),
+            "body": BasicBlock(
+                "body", [use, Instr(
+                    "Br", [], None, attributes={"target": "function_exit"},
+                )], successors=["function_exit"],
+            ),
+            "function_exit": BasicBlock(
+                "function_exit", [phi, Instr("Ret", [result], None)],
+            ),
+        },
+    )
+
+    receipts = repair_non_dominating_record_phi_uses(function)
+
+    assert use.args == [initial]
+    assert phi.args == [initial]
+    assert len(receipts) == 2
 
 
 def test_public_source_compiler_reports_progress_by_default(monkeypatch, capsys):
@@ -1769,6 +1947,54 @@ def test_linked_record_result_expands_as_typed_sequence_row():
     assert destination.child_table_pool.handle_column == 16
     assert "ssa_deferred_record_row" not in append.attributes
     assert append.attributes["ssa_record_row_identity"] == "Metrics"
+
+
+def test_looped_multi_result_record_append_reuses_authored_call_projection():
+    source = "\n\n".join((
+        "from src.common.tensors import AbstractTensor",
+        inspect.getsource(_scalar),
+        inspect.getsource(coerce_metrics),
+        "def pair(metrics, value):\n"
+        "    metrics = coerce_metrics(metrics)\n"
+        "    return metrics, value + 1.0, value + 2.0\n",
+        "def root(metrics, value, attempts):\n"
+        "    rows: list[Metrics] = []\n"
+        "    count = 0\n"
+        "    total = 0.0\n"
+        "    while count < attempts:\n"
+        "        metrics, next_value, used_value = pair(metrics, value)\n"
+        "        if metrics.max_vel > 0.0:\n"
+        "            rows.append(metrics)\n"
+        "        total = total + used_value\n"
+        "        count = count + 1\n"
+        "    return total\n",
+    ))
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source,
+        "root",
+        name="looped_multi_result_record_append",
+        python_bindings={"Metrics": Metrics},
+        extraction_contract=KEYED_CONTRACT,
+    )
+
+    root = module.functions["looped_multi_result_record_append__root"]
+    assert "unresolved_record_sequence_rows" not in root.metadata
+    assert _undefined_repository_ssa_operands(module) == ()
+    call = next(
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("callee")
+        == "looped_multi_result_record_append__pair"
+    )
+    call_record = next(
+        record for record in module.call_table[root.name]
+        if record.callee_symbol == "looped_multi_result_record_append__pair"
+    )
+    record_result_id = int(call_record.result_bindings[0][1])
+    assert record_result_id in module.record_tables[root.name].records
+    assert call.attributes["output_ids"]
 
 
 def test_linked_returned_record_mapping_keeps_authored_capacity():

@@ -341,6 +341,60 @@ def test_rank_zero_any_reduction_uses_concorded_scalar_identity():
     }
 
 
+@pytest.mark.parametrize(("operation", "code", "dtype"), (
+    ("max", 3, "float64"),
+    ("any", 4, "bool"),
+))
+def test_all_axis_reduction_publishes_flat_domain_to_concordance(
+    operation, code, dtype,
+):
+    source = SSAValue(2042, dtype="float64", shape=(3, 5))
+    result = SSAValue(2043, dtype=dtype, shape=())
+    function = Function(f"all_axis_{operation}", [source], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                Handler.Call.value,
+                [source],
+                result,
+                attributes={"tensor_operation": operation},
+            ),
+            Instr(Handler.Ret.value, [result], None),
+        ])
+    })
+    module = IRModule({function.name: function})
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference()
+    ) == ()
+    reduction = next(
+        instruction
+        for instruction in function.blocks["entry"].instrs
+        if instruction.op == Handler.Call.value
+        and instruction.attributes.get("callee") == "reduce_dim_double"
+    )
+    fact = (source.id, operation, source.shape, 15)
+    assert reduction.attributes[
+        "tensor_reduction_domain_concordance"
+    ] == fact
+    assert identity_book(module).page(
+        "tensor_reduction_domain_concordance"
+    ).latest((function.name, result.id)) == fact
+    constants = {
+        instruction.res.id: instruction.attributes.get(
+            "values", instruction.attributes.get("constant")
+        )
+        for instruction in function.blocks["entry"].instrs
+        if instruction.op == Handler.Const.value
+        and instruction.res is not None
+    }
+    assert constants[reduction.args[2].id] == (15,)
+    assert constants[reduction.args[3].id] == 1
+    assert constants[reduction.args[4].id] == 0
+    assert constants[reduction.args[5].id] == code
+    if operation == "any":
+        assert result.accounting["physical_dtype"] == "float64"
+
+
 def test_linked_llvm_accepts_explicit_cast_output_and_count_operands():
     source = SSAValue(2050, dtype="float64", shape=(4,))
     result = SSAValue(2051, dtype="float64", shape=(4,))

@@ -556,7 +556,7 @@ server rejects non-loopback bind addresses by construction.
 The HTML controller shows all 54 contiguous architectural/observation cells as
 named 64-bit hexadecimal values over the shader's occupancy colors. The lower
 half remains the program-owned terminal/framebuffer. A browser render of the
-real card run is retained at `build/reversible_chip_cmd_card_final.png`.
+real card run is retained at `artifacts/compiler_evidence/reversible_chip_cmd_card_final.png`.
 
 The interactive probe can also resume a segmented directory tape. The current
 long-lived interactive `cmd.exe` evidence contains 69,949 records in 278

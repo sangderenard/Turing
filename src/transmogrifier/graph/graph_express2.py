@@ -327,7 +327,9 @@ def _resolve_class_body_field(
         expression_bindings = (
             field_bindings
             if scope is None
-            else _ast_local_constructor_bindings(scope, field_bindings)
+            else _ast_local_constructor_bindings(
+                scope, field_bindings, seen=seen,
+            )
         )
         resolved = (
             _resolve_ast_parent_reference(expression, expression_bindings, seen)
@@ -411,19 +413,44 @@ def _source_class_field_reference(definition, attribute, bindings, seen):
     source is pursued.  Without this step the receiver of every
     ``self.<field>.<method>()`` in a source-defined class was ``None``, the
     call was reported ``dynamic_or_primitive``, and the field's class never
-    entered the class table.  A method name resolves to nothing here: the
-    reducer links methods of source classes through the class table.
+    entered the class table.  A method name returns its exact source
+    definition so pursuit can visit that body's dependencies.  It is not
+    installed as the call's callee: runtime method dispatch still belongs to
+    the reducer's class table.
     """
 
     key = (definition, attribute)
     if key in seen:
         return None
-    if any(
-        isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and member.name == attribute
+    method = next((
+        member
         for member in definition.body
-    ):
-        return None
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and member.name == attribute
+    ), None)
+    if method is not None:
+        from ...compiler.identity_concordance import current_identity_book
+
+        source_identity = getattr(definition, "_python_source_identity", None)
+        owner_key = (
+            tuple(map(str, source_identity))
+            if isinstance(source_identity, tuple)
+            else (str(definition.name),)
+        )
+        row = (*owner_key, str(attribute))
+        page = current_identity_book().page(
+            "source_method_identity_concordance"
+        )
+        incumbent = page.latest(row)
+        if incumbent is None:
+            page.set(row, 0, method)
+            return method
+        if not _same_ast_reference(incumbent, method):
+            raise ValueError(
+                "source method identity concordance disagreement for "
+                f"{row!r}: recorded={incumbent!r}, resolved={method!r}"
+            )
+        return incumbent
     field_bindings = dict(
         getattr(definition, "_python_bindings", None) or bindings or {}
     )
@@ -1168,7 +1195,9 @@ def _ast_call_argument_bindings(
     return resolved
 
 
-def _ast_local_constructor_bindings(definition, bindings):
+def _ast_local_constructor_bindings(
+    definition, bindings, seen=frozenset(),
+):
     """Recover local storage kinds from annotations, constructors and literals.
 
     A parameter annotation naming a class is a source-level receiver schema.
@@ -1204,7 +1233,9 @@ def _ast_local_constructor_bindings(definition, bindings):
             annotation = getattr(parameter, "annotation", None)
             if annotation is None or parameter.arg in resolved:
                 continue
-            reference = _resolve_ast_parent_reference(annotation, resolved)
+            reference = _resolve_ast_parent_reference(
+                annotation, resolved, seen,
+            )
             if inspect.isclass(reference):
                 resolved[str(parameter.arg)] = reference
     changed = True
@@ -1224,7 +1255,9 @@ def _ast_local_constructor_bindings(definition, bindings):
             elif isinstance(value, ast.Tuple):
                 reference = tuple
             elif value is not None:
-                reference = _resolve_ast_value_reference(value, resolved)
+                reference = _resolve_ast_value_reference(
+                    value, resolved, seen,
+                )
             if reference is None:
                 continue
             if isinstance(statement, ast.Assign):
@@ -1502,6 +1535,32 @@ def _lower_consumed_generator_loops(tree):
     return lowered
 
 
+def _mark_source_pursuit_active(definition):
+    """Commit that ``definition`` is part of the program being compiled."""
+
+    from ...compiler.identity_concordance import current_identity_book
+
+    source_identity = getattr(definition, "_python_source_identity", None)
+    identity = (
+        tuple(map(str, source_identity))
+        if isinstance(source_identity, tuple)
+        else (str(getattr(definition, "name", "<definition>")),)
+    )
+    row = (*identity, id(definition))
+    page = current_identity_book().page(
+        "source_pursuit_activation_concordance"
+    )
+    incumbent = page.latest(row)
+    if incumbent is not None and incumbent is not True:
+        raise ValueError(
+            "source pursuit activation concordance disagreement for "
+            f"{row!r}: recorded={incumbent!r}, proposed=True"
+        )
+    if incumbent is None:
+        page.set(row, 0, True)
+    definition._source_pursuit_active = True
+
+
 def _expand_unresolved_ast_parents(
     tree,
     bindings,
@@ -1671,10 +1730,16 @@ def _expand_unresolved_ast_parents(
     }
     definitions_by_name = {}
     for definition in definitions:
-        seed = root_bindings
+        seed = dict(
+            getattr(definition, "_python_bindings", None)
+            or root_bindings
+        )
         owner_class = source_class_of_method.get(id(definition))
         if owner_class is not None:
-            seed = dict(root_bindings)
+            # Keep a retained external class's defining-module bindings. The
+            # owner adds self/cls context; it must not replace the lexical
+            # globals already obtained from that class's source module.
+            seed = dict(seed)
             seed.setdefault("self", owner_class)
             seed.setdefault("cls", owner_class)
         definition_bindings = _ast_local_constructor_bindings(
@@ -1759,6 +1824,8 @@ def _expand_unresolved_ast_parents(
             ]
         return candidates[0] if len(candidates) == 1 else None
 
+    mark_source_pursuit_active = _mark_source_pursuit_active
+
     roots = tuple(dict.fromkeys(map(str, pursuit_roots or ())))
     if roots:
         root_definitions = tuple(root_definition(root) for root in roots)
@@ -1776,10 +1843,14 @@ def _expand_unresolved_ast_parents(
             for definition in root_definitions
             for call in lexical_calls(definition)
         )
+        active_seed_definitions = root_definitions
     else:
         pending_calls = deque(
             node for node in ast.walk(module) if isinstance(node, ast.Call)
         )
+        active_seed_definitions = tuple(definitions)
+    for definition in active_seed_definitions:
+        mark_source_pursuit_active(definition)
     all_calls = list(pending_calls)
     call_owners = {}
     for definition in definitions:
@@ -1874,6 +1945,7 @@ def _expand_unresolved_ast_parents(
 
     def requeue_definition(definition):
         definition_id = id(definition)
+        mark_source_pursuit_active(definition)
         activated_definitions.add(definition_id)
         binding_revisions[definition_id] = (
             binding_revisions.get(definition_id, 0) + 1
@@ -1972,6 +2044,14 @@ def _expand_unresolved_ast_parents(
         call_bindings = node_bindings.get(id(node), root_bindings)
         target = call_target(node, call_bindings)
         identity_target = target.__func__ if inspect.ismethod(target) else target
+        if isinstance(identity_target, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A source-class method call remains dynamically dispatched, but
+            # its named method body is still a reachable dependency seed.
+            # Visit it now; the reducer later selects the exact class-table
+            # callee from the concorded receiver identity.
+            if id(identity_target) not in activated_definitions:
+                requeue_definition(identity_target)
+            continue
         if not callable(identity_target):
             definition = lexical_definition(node, owner_definition)
             if definition is not None and id(definition) not in activated_definitions:
@@ -2409,6 +2489,10 @@ def _expand_unresolved_ast_parents(
         target = call_target(call, call_bindings)
         if inspect.ismethod(target):
             target = target.__func__
+        if isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Its body was pursued above.  Do not freeze ``self.method`` to
+            # this definition: class-table dispatch remains authoritative.
+            continue
         target_identity = ".".join(filter(None, (
             str(getattr(target, "__module__", "")),
             str(getattr(
@@ -3448,6 +3532,7 @@ class ProcessGraph:
         pursuit_roots=None,
         tensor_code_references=None,
         source_ast_normalizers=(),
+        retained_ast_normalizers=(),
         retain=(),
         profile_verbose=False,
         progress=None,
@@ -3582,6 +3667,28 @@ class ProcessGraph:
                     "source is unavailable"
                 )
             definition = _attach_external_methods(retained_class, definition)
+            if retained_ast_normalizers:
+                retained_module = ast.Module(
+                    body=[definition], type_ignores=[]
+                )
+                for normalize in retained_ast_normalizers:
+                    normalize(retained_module)
+                ast.fix_missing_locations(retained_module)
+                definition = retained_module.body[0]
+            # A retained class is external source. Its method free names live
+            # in the defining module, not in the submitted program's globals.
+            # Preserve that exact lexical environment so source pursuit can
+            # follow method dependencies instead of leaving helper calls as
+            # unresolved tokens. No value is executed or instantiated here.
+            retained_bindings = _ast_definition_bindings(retained_class)
+            definition._python_bindings = _reducer_facing_bindings(
+                retained_bindings
+            )
+            for member in definition.body:
+                if isinstance(
+                    member, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    member._python_bindings = definition._python_bindings
             tree.body.append(definition)
             existing_classes.add(identity)
 
@@ -3600,6 +3707,15 @@ class ProcessGraph:
         )
         self._graph_progress = progress
         self._graph_build_counter = 0
+        if not resolve_unresolved_parents:
+            # No pursuit runs, so none marks what is being compiled.  With no
+            # roots, pursuit's own rule is that every authored definition is
+            # active; a build that does not pursue applies the same rule.
+            for definition in (
+                node for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ):
+                _mark_source_pursuit_active(definition)
         if resolve_unresolved_parents:
             bindings = dict(getattr(self, "python_bindings", {}) or {})
             bindings.update(parent_bindings or {})

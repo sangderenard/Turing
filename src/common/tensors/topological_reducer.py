@@ -11,6 +11,7 @@ import importlib
 import inspect
 import json
 import logging
+import os
 import re
 import symtable
 import textwrap
@@ -46,10 +47,274 @@ from ...transmogrifier.graph.python_special_cases import (
     interpret_python_special_case,
     interpret_python_static_value,
 )
+from ...transmogrifier.graph.python_identity_programs import (
+    resolve_python_identity,
+)
 from ...transmogrifier.graph.node_special_cases import tensor_annotation_identity
 
 
 logger = logging.getLogger(__name__)
+
+
+_NUMERIC_FEATURE_TYPES = {
+    frozenset({"precision"}): "Precision",
+    frozenset({"complex", "precision"}): "ComplexPrecision",
+    frozenset({"rational"}): "Rational",
+    frozenset({"rational", "precision"}): "RationalPrecision",
+    frozenset({"complex", "rational"}): "ComplexRational",
+    frozenset({"complex", "rational", "precision"}): (
+        "ComplexRationalPrecision"
+    ),
+}
+_NUMERIC_TYPE_FEATURES = {
+    name: features for features, name in _NUMERIC_FEATURE_TYPES.items()
+}
+
+
+@dataclass(frozen=True)
+class NumericFeatureDescriptor:
+    """One authored numeric wrapper contract, before repository SSA.
+
+    This is the source-facing description shared by boundary expansion,
+    operator selection, and method selection.  A composite annotation is not
+    a scalar with an interesting name: its feature set determines its owned
+    component paths, and Precision determines how many scalar limbs each leaf
+    owns.
+    """
+
+    type_name: str
+    features: frozenset[str]
+    limbs: int = 1
+    element_type: str | None = None
+
+    @property
+    def coefficient_paths(self) -> tuple[tuple[str, ...], ...]:
+        paths: tuple[tuple[str, ...], ...] = ((),)
+        if "complex" in self.features:
+            paths = (("real",), ("imag",))
+        if "rational" in self.features:
+            paths = tuple(
+                (*path, component)
+                for path in paths
+                for component in ("numerator", "denominator")
+            )
+        return paths
+
+    @property
+    def scalar_components(self) -> int:
+        width = self.limbs if "precision" in self.features else 1
+        return len(self.coefficient_paths) * width
+
+    @property
+    def operators(self) -> tuple[str, ...]:
+        operations = ["add", "sub", "mul", "truediv", "neg"]
+        if "rational" in self.features:
+            operations.append("pow_integer")
+        return tuple(operations)
+
+    @property
+    def methods(self) -> tuple[str, ...]:
+        methods = ["collapse"]
+        if self.features == frozenset({"precision"}):
+            methods.extend(("sqrt", "exp", "log"))
+        if "rational" in self.features:
+            methods.extend(("components", "reciprocal"))
+            if "complex" not in self.features:
+                methods.append("quotient")
+        if "complex" in self.features:
+            methods.extend(("collapse_components", "conjugate"))
+        return tuple(methods)
+
+    def receipt(self) -> dict[str, Any]:
+        return {
+            "type_name": self.type_name,
+            "features": tuple(sorted(self.features)),
+            "limbs": int(self.limbs),
+            "element_type": self.element_type,
+            "coefficient_paths": self.coefficient_paths,
+            "scalar_components": self.scalar_components,
+            "operators": self.operators,
+            "methods": self.methods,
+        }
+
+
+def numeric_feature_descriptor(
+    annotation: str | ast.AST | None,
+) -> NumericFeatureDescriptor | None:
+    """Normalize one supported numeric annotation into its complete shape."""
+
+    if annotation is None:
+        return None
+    try:
+        parsed = (
+            annotation
+            if isinstance(annotation, ast.AST)
+            else ast.parse(str(annotation), mode="eval").body
+        )
+    except SyntaxError:
+        return None
+    target = parsed.value if isinstance(parsed, ast.Subscript) else parsed
+    type_name = (
+        target.id if isinstance(target, ast.Name)
+        else target.attr if isinstance(target, ast.Attribute)
+        else None
+    )
+    features = _NUMERIC_TYPE_FEATURES.get(str(type_name))
+    if features is None:
+        return None
+
+    limbs, element_type = 1, None
+    if isinstance(parsed, ast.Subscript):
+        index = parsed.slice
+        parts = index.elts if isinstance(index, ast.Tuple) else (index,)
+        for part in parts:
+            if isinstance(part, ast.Constant) and isinstance(part.value, int):
+                limbs = max(int(part.value), 1)
+            elif isinstance(part, ast.Name):
+                element_type = part.id
+            elif isinstance(part, ast.Constant) and isinstance(part.value, str):
+                element_type = part.value
+    if "precision" not in features:
+        limbs = 1
+    return NumericFeatureDescriptor(
+        str(type_name), features, limbs, element_type,
+    )
+
+
+def join_numeric_feature_descriptors(
+    *descriptors: NumericFeatureDescriptor | None,
+) -> NumericFeatureDescriptor | None:
+    """Canonical feature union and widest Precision contract."""
+
+    present = tuple(descriptor for descriptor in descriptors if descriptor)
+    if not present:
+        return None
+    features = frozenset().union(*(item.features for item in present))
+    type_name = _NUMERIC_FEATURE_TYPES.get(features)
+    if type_name is None:
+        return None
+    limbs = max(item.limbs for item in present)
+    element_type = _widest_element(*(
+        item.element_type for item in present
+    ))
+    return NumericFeatureDescriptor(
+        type_name, features, limbs, element_type,
+    )
+
+
+def _numeric_feature_descriptor_from_receipt(
+    receipt: Mapping[str, Any] | None,
+) -> NumericFeatureDescriptor | None:
+    """Recover the normalized descriptor carried by a graph value."""
+
+    if not receipt:
+        return None
+    features = frozenset(map(str, receipt.get("features") or ()))
+    type_name = str(receipt.get("type_name") or "")
+    if not type_name or _NUMERIC_FEATURE_TYPES.get(features) != type_name:
+        return None
+    return NumericFeatureDescriptor(
+        type_name=type_name,
+        features=features,
+        limbs=max(int(receipt.get("limbs") or 1), 1),
+        element_type=(
+            None if receipt.get("element_type") is None
+            else str(receipt["element_type"])
+        ),
+    )
+
+
+def numeric_feature_field_projection(
+    descriptor: NumericFeatureDescriptor,
+    attribute: str,
+) -> NumericFeatureDescriptor | None:
+    """Return the exact wrapper held by one structural coefficient field.
+
+    Composite numeric wrappers are nested algebra, not packed anonymous
+    scalars. ``real``/``imag`` remove the complex layer and
+    ``numerator``/``denominator`` remove the rational layer. Precision width
+    is orthogonal to both and therefore survives every projection unchanged.
+    An empty feature set denotes an ordinary tensor coefficient and returns
+    ``None``.
+    """
+
+    features = set(descriptor.features)
+    attribute = str(attribute)
+    if attribute in {"real", "imag"} and "complex" in features:
+        features.remove("complex")
+    elif attribute in {"numerator", "denominator"} and "rational" in features:
+        features.remove("rational")
+    else:
+        return None
+    projected = frozenset(features)
+    if not projected:
+        return None
+    type_name = _NUMERIC_FEATURE_TYPES.get(projected)
+    if type_name is None:
+        return None
+    return NumericFeatureDescriptor(
+        type_name=type_name,
+        features=projected,
+        limbs=(descriptor.limbs if "precision" in projected else 1),
+        element_type=descriptor.element_type,
+    )
+
+
+def numeric_feature_method_components(
+    descriptor: NumericFeatureDescriptor,
+    method: str,
+) -> tuple[tuple[tuple[str, ...], NumericFeatureDescriptor | None], ...]:
+    """Describe the ordered structural results of a numeric intrinsic."""
+
+    if str(method) != "components":
+        return ()
+    if "complex" in descriptor.features:
+        fields = ("real", "imag")
+    elif "rational" in descriptor.features:
+        fields = ("numerator", "denominator")
+    else:
+        return ()
+    return tuple(
+        ((field,), numeric_feature_field_projection(descriptor, field))
+        for field in fields
+    )
+
+
+def _record_numeric_annotation_descriptors(graph: Any) -> dict[str, Any]:
+    """Publish normalized numeric contracts at topology-reducer entry.
+
+    Raw annotation spellings remain available for source archaeology. This
+    adjacent table is the executable meaning consumed by operators, methods,
+    calls, and ABI expansion, so none of those stages has to reinterpret an
+    annotation independently.
+    """
+
+    target = getattr(graph, "G", graph)
+    metadata = getattr(target, "graph", None)
+    if not isinstance(metadata, dict):
+        return {}
+    by_function = metadata.get("function_parameter_annotations") or {}
+    normalized: dict[str, dict[str, dict[str, Any]]] = {}
+    for function_name, parameters in by_function.items():
+        described = {}
+        for parameter, annotation in (parameters or {}).items():
+            descriptor = numeric_feature_descriptor(annotation)
+            if descriptor is not None:
+                described[str(parameter)] = descriptor.receipt()
+        if described:
+            normalized[str(function_name)] = described
+    metadata["function_parameter_numeric_descriptors"] = normalized
+
+    local = {}
+    for name, annotation in (metadata.get("type_annotations") or {}).items():
+        descriptor = numeric_feature_descriptor(annotation)
+        if descriptor is not None:
+            local[str(name)] = descriptor.receipt()
+    metadata["local_numeric_descriptors"] = local
+    return {
+        "parameters": normalized,
+        "locals": local,
+    }
 
 
 def _concord_source_value_class(
@@ -72,6 +337,7 @@ def _concord_source_value_class(
             raise ValueError(
                 "source value class concordance disagreement for "
                 f"{scope!r} value {value_id}: recorded={recorded!r}, "
+                f"recorded_source={tuple(incumbent[2:])!r}, "
                 f"{source} says {proposed!r}"
             )
         return recorded
@@ -79,22 +345,764 @@ def _concord_source_value_class(
     return proposed
 
 
+def _source_numeric_scope(graph: Any, fallback: str = "<module>") -> str:
+    """Return the class-qualified identity of one reduced source function."""
+
+    target = getattr(graph, "G", graph)
+    metadata = getattr(target, "graph", {}) or {}
+    specialized = metadata.get("source_numeric_scope")
+    if specialized is not None:
+        return str(specialized)
+    name = str(metadata.get("function_name") or fallback)
+    owner = metadata.get("method_owner")
+    return name if owner is None else f"{owner}.{name}"
+
+
+def specialize_python_precision_widths(graph: Any) -> bool:
+    """Refresh Precision identity after exact callsite specialization.
+
+    Source reduction necessarily sees a generic function before callsite
+    planning proves structural parameters such as ``limbs``.  A width chosen
+    there is therefore provisional.  This pass runs on the clean specialized
+    graph, gives that specialization its own concordance scope, and repeats
+    only the existing Precision identity decisions: call result width,
+    arithmetic spelling, and boundary width.  It does not merge, inline, or
+    execute specializations.
+    """
+
+    target_wrapper = graph
+    target = getattr(graph, "G", graph)
+    metadata = getattr(target, "graph", {})
+    specializations = dict(metadata.get("planner_specializations") or {})
+
+    def stable(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return tuple(sorted(
+                (str(key), stable(item)) for key, item in value.items()
+            ))
+        if isinstance(value, (tuple, list)):
+            return tuple(stable(item) for item in value)
+        if isinstance(value, (str, bytes, bool, int, float, type(None))):
+            return value
+        return repr(value)
+
+    authored_scope = str(
+        metadata.get("method_owner") or ""
+    )
+    function_name = str(metadata.get("function_name") or "<module>")
+    authored_scope = (
+        f"{authored_scope}.{function_name}"
+        if authored_scope else function_name
+    )
+    parameter_classes = dict(metadata.get("planner_parameter_classes") or {})
+    receipt = tuple(sorted(
+        (str(name), stable(value))
+        for name, value in specializations.items()
+    )) + tuple(
+        (f"class:{name}", stable(value))
+        for name, value in sorted(parameter_classes.items())
+    )
+    digest = hashlib.sha256(repr(receipt).encode("utf-8")).hexdigest()[:16]
+    scope = f"{authored_scope}#specialization:{digest}"
+    identity_page = current_identity_book().page(
+        "source_numeric_specialization_concordance"
+    )
+    identity_row = (authored_scope, digest)
+    identity_fact = (scope, receipt)
+    incumbent = identity_page.latest(identity_row)
+    if incumbent is not None and tuple(incumbent) != identity_fact:
+        raise ValueError(
+            "source numeric specialization concordance disagreement for "
+            f"{identity_row!r}: recorded={incumbent!r}, "
+            f"proposed={identity_fact!r}"
+        )
+    if incumbent is None:
+        identity_page.set(identity_row, 0, identity_fact)
+    metadata["source_numeric_scope"] = scope
+    metadata["source_numeric_specialization_receipt"] = receipt
+    # A specialization is its authored function with some inputs known: the
+    # authored function's committed facts hold in it (never a sibling
+    # specialization's, which were decided for other inputs).
+    class_page = current_identity_book().page(
+        "source_value_class_concordance"
+    )
+    if str(authored_scope) != scope:
+        for row in tuple(class_page.rows()):
+            if (
+                isinstance(row, tuple) and len(row) == 2
+                and row[0] == authored_scope
+                and row[1] in target
+                and class_page.latest((scope, row[1])) is None
+            ):
+                for column, fact in class_page.history(row):
+                    class_page.set((scope, row[1]), column, fact)
+    # The parameters are what the call passed: concord them in this scope.
+    for node_id, data in target.nodes(data=True):
+        if data.get("type") != "Input":
+            continue
+        name = (data.get("attributes") or {}).get("binding_name")
+        if name is None or str(name) not in parameter_classes:
+            continue
+        class_identity, limbs = parameter_classes[str(name)]
+        _concord_source_value_class(
+            scope, int(node_id), str(class_identity),
+            precision_limbs=int(limbs),
+            source=f"specialization call argument {name}",
+        )
+    # A Precision parameter is where this scope's Precision interval begins:
+    # the value enters here already assembled at its concorded width (its
+    # limbs are supplied by the caller), so it opens the interval as a pack.
+    for node_id, data in target.nodes(data=True):
+        if data.get("type") != "Input":
+            continue
+        fact = class_page.latest((scope, int(node_id)))
+        if (
+            isinstance(fact, tuple) and len(fact) >= 2
+            and str(fact[0]).rsplit(".", 1)[-1] == "Precision"
+        ):
+            _concord_source_precision_boundary(
+                scope, int(node_id), "pack", int(node_id),
+                precision_limbs=max(int(fact[1]), 1),
+            )
+
+    def static_int(expression: ast.AST) -> int | None:
+        try:
+            value = ast.literal_eval(expression)
+        except (TypeError, ValueError, SyntaxError):
+            if not isinstance(expression, ast.Name):
+                return None
+            value = specializations.get(expression.id)
+        if isinstance(value, bool):
+            return None
+        try:
+            return max(int(value), 1)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def is_precision(identity: Any) -> bool:
+        return (
+            identity is not None
+            and str(identity).rsplit(".", 1)[-1] == "Precision"
+        )
+
+    function_table = getattr(target_wrapper, "function_table", None)
+
+    def tensor_descriptor(value_id: int) -> dict[str, Any] | None:
+        if int(value_id) not in target:
+            return None
+        descriptor = target.nodes[int(value_id)].get("tensor")
+        if isinstance(descriptor, Mapping) and tuple(
+            descriptor.get("shape") or ()
+        ):
+            return copy.deepcopy(dict(descriptor))
+
+        # Exact callsite planning publishes return extents to the concordance
+        # because specialized graphs are disposable copies.  Numeric
+        # specialization runs on another such copy, so a private ``tensor``
+        # field is not an adequate hand-off.  Read the same authored value
+        # row used by ``publish_call_result_shape`` before concluding that a
+        # Precision promotion is scalar.
+        from ...compiler.identity_concordance import proven_shape_of
+
+        data = target.nodes[int(value_id)]
+        source_value_id = int(data.get("value_id", value_id))
+        for function in (
+            metadata.get("source_numeric_scope"),
+            metadata.get("function_name"),
+        ):
+            if function is None:
+                continue
+            extents = proven_shape_of(str(function), source_value_id)
+            if extents:
+                materialized = (
+                    copy.deepcopy(dict(descriptor))
+                    if isinstance(descriptor, Mapping) else {}
+                )
+                materialized["shape"] = tuple(extents)
+                materialized["rank"] = len(extents)
+                materialized.setdefault("dtype", "float64")
+                return materialized
+        return (
+            copy.deepcopy(dict(descriptor))
+            if isinstance(descriptor, Mapping) else None
+        )
+
+    def publish_tensor(value_id: int, descriptor: Any) -> None:
+        if not isinstance(descriptor, Mapping):
+            return
+        extents = tuple(descriptor.get("shape") or ())
+        if not extents:
+            return
+        materialized = copy.deepcopy(dict(descriptor))
+        materialized["shape"] = extents
+        materialized.setdefault("rank", len(extents))
+        target.nodes[int(value_id)]["tensor"] = materialized
+        from ...compiler.identity_concordance import record_proven_shape
+
+        record_proven_shape(
+            scope, int(value_id), extents,
+            materialized.get("dtype"), level=None,
+        )
+
+    def call_return_identity(
+        attributes: Mapping[str, Any], expression: ast.Call,
+    ) -> tuple[str | None, int | None, dict[str, Any] | None]:
+        """Read the authored return class and exact specialized limbs."""
+
+        class_identity = attributes.get(
+            "result_class_ref", attributes.get("class_ref")
+        )
+        reference = attributes.get(
+            "callee_ref", attributes.get("method_ref")
+        )
+        callee = None
+        return_tensor = None
+        if reference is not None and function_table is not None:
+            try:
+                callee = function_table.entry(int(reference)).graph
+            except (KeyError, TypeError, ValueError):
+                callee = None
+        if class_identity is None and callee is not None:
+            outputs = tuple(callee.G.graph.get("function_outputs") or ())
+            identities = callee.G.graph.get("identity_table") or {}
+            candidates = tuple(
+                int(value_id)
+                for output in outputs
+                for value_id in identities.get(str(output), ())
+                if int(value_id) in callee.G
+            )
+            for value_id in reversed(candidates):
+                candidate, _width = _resolved_source_value_class(
+                    callee.G, value_id
+                )
+                if candidate is not None:
+                    class_identity = candidate
+                    descriptor = callee.G.nodes[value_id].get("tensor")
+                    if isinstance(descriptor, Mapping):
+                        return_tensor = copy.deepcopy(dict(descriptor))
+                    break
+            if os.environ.get("TURING_DEBUG_PRECISION_SPECIALIZATION"):
+                logger.warning(
+                    "PRECISION-RETURN-IDENTITY caller=%s reference=%s "
+                    "outputs=%r candidates=%r descriptors=%r",
+                    authored_scope, reference, outputs, candidates,
+                    tuple(
+                        (value_id, _resolved_source_value_class(
+                            callee.G, value_id
+                        ))
+                        for value_id in candidates
+                    ),
+                )
+        width = None
+        if callee is not None:
+            positional = tuple(map(str,
+                callee.G.graph.get("positional_parameters")
+                or callee.G.graph.get("function_parameters")
+                or ()
+            ))
+            if "limbs" in positional:
+                position = positional.index("limbs")
+                if position < len(expression.args):
+                    width = static_int(expression.args[position])
+        return (
+            None if class_identity is None else str(class_identity),
+            width,
+            return_tensor,
+        )
+
+    changed = False
+    precision_flow_widths: dict[int, int] = {}
+    precision_flow_tensors: dict[int, dict[str, Any]] = {}
+    # The width argument is an authored part of both Precision constructors
+    # and Precision.of.  Calls returning Precision through a helper retain
+    # the same proof when that call passes this specialization's exact limbs
+    # parameter; the class identity was already established by source
+    # reduction and is not guessed here.
+    for node_id, data in tuple(target.nodes(data=True)):
+        expression = data.get("expr_obj")
+        attributes = data.setdefault("attributes", {})
+        if not isinstance(expression, ast.Call):
+            continue
+        class_identity, call_width, return_tensor = call_return_identity(
+            attributes, expression
+        )
+        if not is_precision(class_identity):
+            continue
+        width = None
+        if len(expression.args) >= 2 and (
+            isinstance(expression.func, ast.Name)
+            and expression.func.id == "Precision"
+            or isinstance(expression.func, ast.Attribute)
+            and expression.func.attr == "of"
+        ):
+            width = static_int(expression.args[1])
+        if width is None:
+            width = call_width
+        if width is None:
+            for argument in expression.args:
+                if (
+                    isinstance(argument, ast.Name)
+                    and argument.id in specializations
+                    and argument.id == "limbs"
+                ):
+                    width = static_int(argument)
+                    break
+        if width is None:
+            continue
+        prior = int(attributes.get("precision_limbs") or 1)
+        attributes["precision_limbs"] = int(width)
+        attributes["result_class_ref"] = str(class_identity)
+        if return_tensor is not None:
+            publish_tensor(int(node_id), return_tensor)
+        _concord_source_value_class(
+            scope, int(node_id), str(class_identity),
+            precision_limbs=int(width),
+            source="callsite-specialized Precision result",
+        )
+        value_id = next((
+            int(parent) for parent, role in data.get("parents", ())
+            if str(role) in {"arg:0", "arg0"}
+        ), None)
+        is_promotion = (
+            isinstance(expression.func, ast.Attribute)
+            and expression.func.attr == "of"
+        )
+        is_pack = (
+            isinstance(expression.func, ast.Name)
+            and expression.func.id == "Precision"
+        )
+        if value_id is not None and is_promotion:
+            attributes["python_precision_boundary"] = "promote"
+            for field in (
+                "callee_ref", "method_ref", "constructor_ref", "class_ref",
+            ):
+                attributes.pop(field, None)
+            accessor_id = id(expression.func)
+            if accessor_id in target:
+                accessor_attributes = target.nodes[accessor_id].setdefault(
+                    "attributes", {}
+                )
+                for field in (
+                    "callee_ref", "method_ref", "bound_method_ref",
+                ):
+                    accessor_attributes.pop(field, None)
+                accessor_attributes["python_precision_boundary"] = (
+                    "promote-selector"
+                )
+            data["type"] = "Cast"
+            data["op"] = "Cast"
+            _replace_inputs(
+                target_wrapper, int(node_id), ((int(value_id), "operand"),)
+            )
+            _concord_source_precision_boundary(
+                scope, int(node_id), "promote", int(value_id),
+                precision_limbs=int(width),
+            )
+            source_tensor = tensor_descriptor(int(value_id))
+            if source_tensor is not None:
+                publish_tensor(int(node_id), source_tensor)
+        elif value_id is not None and is_pack and value_id in target:
+            value_attributes = target.nodes[value_id].get("attributes") or {}
+            leaves = tuple(map(int,
+                value_attributes.get("aggregate_leaf_value_ids")
+                or value_attributes.get("materialized_value_ids")
+                or value_attributes.get("materialized_source_value_ids")
+                or ()
+            ))
+            if len(leaves) >= int(width) and all(
+                leaf in target for leaf in leaves[:int(width)]
+            ):
+                leaves = leaves[:int(width)]
+                attributes["python_precision_boundary"] = "pack"
+                attributes["precision_pack_source_id"] = int(value_id)
+                attributes["precision_pack_limb_ids"] = leaves
+                for field in (
+                    "callee_ref", "method_ref", "constructor_ref", "class_ref",
+                ):
+                    attributes.pop(field, None)
+                data["type"] = PRECISION_PACK_NAME
+                data["op"] = PRECISION_PACK_NAME
+                _replace_inputs(
+                    target_wrapper, int(node_id), tuple(
+                        (leaf, f"limb:{index}")
+                        for index, leaf in enumerate(leaves)
+                    )
+                )
+                pack_page = current_identity_book().page(
+                    "source_precision_pack_concordance"
+                )
+                pack_row = (scope, int(node_id))
+                pack_fact = (leaves, int(width), int(value_id))
+                incumbent_pack = pack_page.latest(pack_row)
+                if (
+                    incumbent_pack is not None
+                    and tuple(incumbent_pack) != pack_fact
+                ):
+                    raise ValueError(
+                        "source precision pack concordance disagreement for "
+                        f"{pack_row!r}: recorded={incumbent_pack!r}, "
+                        f"proposed={pack_fact!r}"
+                    )
+                if incumbent_pack is None:
+                    pack_page.set(pack_row, 0, pack_fact)
+                _concord_source_precision_boundary(
+                    scope, int(node_id), "pack", int(value_id),
+                    precision_limbs=int(width),
+                )
+                source_tensor = tensor_descriptor(int(leaves[0]))
+                if source_tensor is not None:
+                    publish_tensor(int(node_id), source_tensor)
+        precision_flow_widths[int(node_id)] = int(width)
+        seeded_tensor = tensor_descriptor(int(node_id))
+        if seeded_tensor is not None:
+            precision_flow_tensors[int(node_id)] = seeded_tensor
+        changed = changed or prior != int(width)
+
+    # Calls inside comprehensions return through LoopResult/tuple projection
+    # nodes before the named value reaches arithmetic.  Those nodes are
+    # structural carriers, not new numeric decisions.  Follow their exact
+    # producer edges and refresh only values source reduction already proved
+    # to be Precision; no unrelated value acquires a class here.
+    for node_id, data in tuple(target.nodes(data=True)):
+        identity, width = _resolved_source_value_class(target, int(node_id))
+        if is_precision(identity) and int(width) > 1:
+            precision_flow_widths[int(node_id)] = int(width)
+            seeded_tensor = tensor_descriptor(int(node_id))
+            if seeded_tensor is not None:
+                precision_flow_tensors[int(node_id)] = seeded_tensor
+    if os.environ.get("TURING_DEBUG_PRECISION_SPECIALIZATION"):
+        for node_id, data in tuple(target.nodes(data=True)):
+            if authored_scope not in {
+                "compile_interpolant", "_wide_from_columns", "_pick_columns",
+                "selected", "_locate_nearer_columns",
+            }:
+                break
+            attributes = data.get("attributes") or {}
+            expression = data.get("expr_obj")
+            if (
+                int(node_id) in precision_flow_widths
+                or is_precision(attributes.get(
+                    "result_class_ref", attributes.get("class_ref")
+                ))
+                or isinstance(expression, (ast.BinOp, ast.Call))
+                or authored_scope == "selected"
+                or authored_scope == "_locate_nearer_columns"
+                or authored_scope == "_wide_from_columns"
+                and int(node_id) in {51, 52, 58, 59, 60, 62, 66, 75}
+            ):
+                logger.warning(
+                    "PRECISION-SPECIALIZATION scope=%s node=%s type=%s "
+                    "class=%s width=%s flow=%s tensor=%r parents=%r "
+                    "aggregate=%r binding=%r",
+                    scope, node_id, data.get("type"),
+                    attributes.get(
+                        "result_class_ref", attributes.get("class_ref")
+                    ), attributes.get("precision_limbs"),
+                    precision_flow_widths.get(int(node_id)),
+                    data.get("tensor"),
+                    data.get("parents"),
+                    attributes.get("aggregate_leaf_value_ids"),
+                    attributes.get("binding_name"),
+                )
+                if (
+                    authored_scope == "_wide_from_columns"
+                    and int(node_id) in {
+                        50, 51, 52, 59, 60, 62, 66, 75, 76, 77, 78, 79,
+                        80, 81,
+                    }
+                    or authored_scope == "compile_interpolant"
+                    or authored_scope == "_locate_nearer_columns"
+                ):
+                    logger.warning(
+                        "PRECISION-SPECIALIZATION-DETAIL scope=%s node=%s "
+                        "attributes=%r parents=%r children=%r expression=%s",
+                        scope, node_id, attributes, data.get("parents"),
+                        data.get("children"),
+                        ast.dump(expression, include_attributes=False)
+                        if isinstance(expression, ast.AST) else None,
+                    )
+    propagated = True
+    while propagated:
+        propagated = False
+        for node_id, data in tuple(target.nodes(data=True)):
+            parent_widths = tuple(
+                precision_flow_widths[int(parent)]
+                for parent, _role in data.get("parents", ())
+                if int(parent) in precision_flow_widths
+            )
+            if not parent_widths:
+                continue
+            parent_tensors = tuple(
+                precision_flow_tensors[int(parent)]
+                for parent, _role in data.get("parents", ())
+                if int(parent) in precision_flow_tensors
+                and tuple(
+                    precision_flow_tensors[int(parent)].get("shape") or ()
+                )
+            )
+            width = max(parent_widths)
+            if precision_flow_widths.get(int(node_id), 1) < width:
+                precision_flow_widths[int(node_id)] = int(width)
+                propagated = True
+            if parent_tensors and int(node_id) not in precision_flow_tensors:
+                selected_tensor = max(
+                    parent_tensors,
+                    key=lambda item: len(tuple(item.get("shape") or ())),
+                )
+                precision_flow_tensors[int(node_id)] = copy.deepcopy(
+                    selected_tensor
+                )
+                propagated = True
+            attributes = data.setdefault("attributes", {})
+            class_identity = attributes.get(
+                "result_class_ref", attributes.get("class_ref")
+            )
+            if not is_precision(class_identity):
+                continue
+            prior = int(attributes.get("precision_limbs") or 1)
+            if prior == width:
+                continue
+            attributes["precision_limbs"] = int(width)
+            attributes["result_class_ref"] = str(class_identity)
+            if int(node_id) in precision_flow_tensors:
+                publish_tensor(
+                    int(node_id), precision_flow_tensors[int(node_id)]
+                )
+            _concord_source_value_class(
+                scope, int(node_id), str(class_identity),
+                precision_limbs=int(width),
+                source="callsite-specialized Precision producer flow",
+            )
+            changed = True
+
+    operator_page = current_identity_book().page(
+        "source_precision_operator_concordance"
+    )
+    settled = True
+    while settled:
+        settled = False
+        for node_id, data in tuple(target.nodes(data=True)):
+            expression = data.get("expr_obj")
+            if not isinstance(expression, (ast.BinOp, ast.UnaryOp)):
+                continue
+            parents = {
+                str(role): int(parent)
+                for parent, role in data.get("parents", ())
+                if int(parent) in target
+            }
+            operand_ids = (
+                (parents.get("lhs"), parents.get("rhs"))
+                if isinstance(expression, ast.BinOp)
+                else (parents.get("operand"),)
+            )
+            if any(value_id is None for value_id in operand_ids):
+                continue
+            descriptors = tuple(
+                (
+                    ("Precision", precision_flow_widths[int(value_id)])
+                    if int(value_id) in precision_flow_widths
+                    else _resolved_source_value_class(
+                        target, int(value_id)
+                    )
+                )
+                for value_id in operand_ids
+            )
+            precision = tuple(
+                descriptor for descriptor in descriptors
+                if is_precision(descriptor[0])
+            )
+            if not precision:
+                continue
+            width = max(descriptor[1] for descriptor in precision)
+            operation = _qualified_handler(
+                "binop" if isinstance(expression, ast.BinOp) else "unaryop",
+                expression.op,
+                limbs=width,
+            )
+            class_identity = str(precision[0][0])
+            attributes = data.setdefault("attributes", {})
+            prior = (
+                str(data.get("op") or data.get("type")),
+                int(attributes.get("precision_limbs") or 1),
+            )
+            data["type"] = operation
+            data["op"] = operation
+            attributes.update({
+                "python_precision_operator": True,
+                "precision_limbs": int(width),
+                "result_class_ref": class_identity,
+            })
+            operand_tensors = tuple(
+                precision_flow_tensors.get(int(value_id))
+                or tensor_descriptor(int(value_id))
+                for value_id in operand_ids
+            )
+            shaped_operands = tuple(
+                descriptor for descriptor in operand_tensors
+                if isinstance(descriptor, Mapping)
+                and tuple(descriptor.get("shape") or ())
+            )
+            if shaped_operands:
+                result_tensor = max(
+                    shaped_operands,
+                    key=lambda item: len(tuple(item.get("shape") or ())),
+                )
+                publish_tensor(int(node_id), result_tensor)
+                precision_flow_tensors[int(node_id)] = copy.deepcopy(
+                    result_tensor
+                )
+            _concord_source_value_class(
+                scope, int(node_id), class_identity,
+                precision_limbs=int(width),
+                source="callsite-specialized Precision operator",
+            )
+            precision_flow_widths[int(node_id)] = int(width)
+            row = (scope, int(node_id))
+            fact = (
+                str(operation), int(operand_ids[0]), class_identity,
+                int(width),
+            )
+            incumbent = operator_page.latest(row)
+            if incumbent is not None and tuple(incumbent) != fact:
+                raise ValueError(
+                    "source precision operator concordance disagreement for "
+                    f"{row!r}: recorded={incumbent!r}, proposed={fact!r}"
+                )
+            if incumbent is None:
+                operator_page.set(row, 0, fact)
+            now = (str(operation), int(width))
+            if prior != now:
+                settled = True
+                changed = True
+
+    for node_id, data in tuple(target.nodes(data=True)):
+        expression = data.get("expr_obj")
+        attributes = data.setdefault("attributes", {})
+        boundary = attributes.get("python_precision_boundary")
+        if (
+            boundary is None
+            and isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+            and expression.func.attr == "collapse"
+        ):
+            boundary = "collapse"
+        if not (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+            and boundary in {"promote", "collapse"}
+        ):
+            continue
+        operand_id = next((
+            int(parent) for parent, role in data.get("parents", ())
+            if str(role) == "operand"
+        ), None)
+        if operand_id is None:
+            continue
+        if boundary == "promote":
+            width = static_int(expression.args[1]) if (
+                len(expression.args) >= 2
+            ) else None
+        else:
+            _identity, width = _resolved_source_value_class(
+                target, operand_id
+            )
+            if not is_precision(_identity):
+                continue
+        if width is None:
+            continue
+        prior = int(attributes.get("precision_limbs") or 1)
+        attributes.update({
+            "python_precision_boundary": str(boundary),
+            "precision_limbs": int(width),
+        })
+        if boundary == "collapse":
+            for field in (
+                "callee_ref", "method_ref", "constructor_ref", "class_ref",
+            ):
+                attributes.pop(field, None)
+            accessor_id = id(expression.func)
+            if accessor_id in target:
+                accessor_attributes = target.nodes[accessor_id].setdefault(
+                    "attributes", {}
+                )
+                for field in (
+                    "callee_ref", "method_ref", "bound_method_ref",
+                ):
+                    accessor_attributes.pop(field, None)
+                accessor_attributes["python_precision_boundary"] = (
+                    "collapse-selector"
+                )
+            data["type"] = "Cast"
+            data["op"] = "Cast"
+            _replace_inputs(
+                target_wrapper, int(node_id), ((int(operand_id), "operand"),)
+            )
+        _concord_source_precision_boundary(
+            scope, int(node_id), str(boundary), int(operand_id),
+            precision_limbs=int(width),
+        )
+        changed = changed or prior != int(width)
+    return changed
+
+
 def _resolved_source_value_class(
     graph: Any,
     value_id: Any,
 ) -> tuple[str | None, int]:
+    """What this value is: its concorded class and width, or unknown."""
+
     target = getattr(graph, "G", graph)
     if not isinstance(value_id, int) or value_id not in target:
         return None, 1
-    attributes = target.nodes[value_id].get("attributes") or {}
-    class_identity = attributes.get(
-        "result_class_ref", attributes.get("class_ref")
+    fact = current_identity_book().page(
+        "source_value_class_concordance"
+    ).latest((_source_numeric_scope(target), int(value_id)))
+    if not isinstance(fact, tuple) or len(fact) < 2:
+        return None, 1
+    return str(fact[0]), max(int(fact[1]), 1)
+
+
+def _concorded_numeric_descriptor(
+    graph: Any, value_id: Any,
+) -> NumericFeatureDescriptor | None:
+    """What this numeral value is, from the concordance (or unknown)."""
+
+    class_identity, limbs = _resolved_source_value_class(graph, value_id)
+    if class_identity is None:
+        return None
+    return numeric_feature_descriptor(
+        class_identity.rsplit(".", 1)[-1]
+        + (f"[{int(limbs)}]" if int(limbs) > 1 else "")
     )
-    limbs = max(int(attributes.get("precision_limbs") or 1), 1)
-    return (
-        None if class_identity is None else str(class_identity),
-        limbs,
+
+
+def _concord_numeric_feature_projection(
+    scope: str,
+    result_id: int,
+    receiver_id: int,
+    attribute: str,
+    component_path: tuple[str, ...],
+    descriptor: NumericFeatureDescriptor | None,
+) -> tuple[Any, ...]:
+    """Commit one structural numeric field projection to the identity book."""
+
+    page = current_identity_book().page(
+        "source_numeric_component_concordance"
     )
+    row = (str(scope), int(result_id))
+    fact = (
+        int(receiver_id), str(attribute), tuple(map(str, component_path)),
+        None if descriptor is None else descriptor.receipt(),
+    )
+    incumbent = page.latest(row)
+    if incumbent is not None and tuple(incumbent) != fact:
+        raise ValueError(
+            "source numeric component concordance disagreement for "
+            f"{row!r}: recorded={incumbent!r}, proposed={fact!r}"
+        )
+    if incumbent is None:
+        page.set(row, 0, fact)
+    return fact
 
 
 def _concord_source_precision_boundary(
@@ -613,7 +1621,9 @@ PRECISION_CLOSED_OPERATIONS = (
     "Add", "Sub", "Mul", "Div", "Sqrt", "Exp", "Log", "neg",
 )
 
-#: The greatest width a generated name is provided for.
+#: The greatest width represented in the legacy inspectable qualified-name
+#: catalogue. Repository lowering consumes the singular operation plus its
+#: explicit ``precision_limbs`` attribute and is not bounded by this table.
 PRECISION_LIMB_LIMIT = 8
 
 
@@ -652,6 +1662,7 @@ PRECISION_SINGULAR_NAMES = {
     operation: f"precision_{operation.lower()}"
     for operation in PRECISION_CLOSED_OPERATIONS
 }
+PRECISION_PACK_NAME = "precision_pack"
 
 
 def _widest_element(*declared: Optional[str]) -> Optional[str]:
@@ -705,19 +1716,15 @@ def _parameter_declaration(graph: Any, name: str) -> Optional[str]:
     return declared.pop() if len(declared) == 1 else None
 
 
-def _operand_precision(graph: Any, node: ast.AST) -> tuple[int, Optional[str]]:
-    """An operand's declared width, read off the AST.
+def _operand_numeric_descriptor(
+    graph: Any, node: ast.AST,
+) -> NumericFeatureDescriptor | None:
+    """An operand's complete declared numeric feature contract.
 
     The declaration is what the source says the value IS -- captured by
-    ``annotate_types`` at ingestion and kept as ``type_annotations`` -- so a
-    limbed operand is recognised from the program rather than from a flag
-    something else was supposed to have set. Returns ``(1, None)`` for an
-    ordinary value.
-
-    ``Precision`` and ``Precision[n]`` are the spellings; the element type
-    comes from a second subscript when the declaration gives one, because the
-    width an operation is eventually emitted at is not derivable from the limb
-    count alone.
+    ``annotate_types`` at ingestion and kept as ``type_annotations``. Parameter
+    annotations use the exact spelling retained by ``build_from_ast``. The
+    result describes every wrapper axis before an operator is chosen.
 
     An INDEXED operand is read through to the name it indexes: ``a[i]`` where
     ``a`` is declared carries ``a``'s width. Limbs are a channel in the last
@@ -731,39 +1738,31 @@ def _operand_precision(graph: Any, node: ast.AST) -> tuple[int, Optional[str]]:
     while isinstance(node, ast.Subscript):
         node = node.value
     if not isinstance(node, ast.Name):
-        return 1, None
+        return None
     try:
         annotations = graph.G.graph.get("type_annotations") or {}
     except AttributeError:
-        return 1, None
+        return None
     declared = annotations.get(node.id) or _parameter_declaration(
         graph, node.id
     )
     if not declared:
-        return 1, None
-    try:
-        parsed = ast.parse(str(declared), mode="eval").body
-    except SyntaxError:
-        return 1, None
+        return None
+    descriptor = numeric_feature_descriptor(str(declared))
+    if descriptor is not None:
+        graph.G.graph.setdefault(
+            "numeric_annotation_descriptors", {}
+        )[str(declared)] = descriptor.receipt()
+    return descriptor
 
-    target = parsed.value if isinstance(parsed, ast.Subscript) else parsed
-    name = (target.id if isinstance(target, ast.Name)
-            else target.attr if isinstance(target, ast.Attribute) else None)
-    if name != "Precision":
-        return 1, None
 
-    limbs, dtype = 1, None
-    if isinstance(parsed, ast.Subscript):
-        index = parsed.slice
-        parts = index.elts if isinstance(index, ast.Tuple) else [index]
-        for part in parts:
-            if isinstance(part, ast.Constant) and isinstance(part.value, int):
-                limbs = max(int(part.value), 1)
-            elif isinstance(part, ast.Name):
-                dtype = part.id
-            elif isinstance(part, ast.Constant) and isinstance(part.value, str):
-                dtype = part.value
-    return limbs, dtype
+def _operand_precision(graph: Any, node: ast.AST) -> tuple[int, Optional[str]]:
+    """Compatibility view consumed by the established Precision pipeline."""
+
+    descriptor = _operand_numeric_descriptor(graph, node)
+    if descriptor is None or descriptor.features != frozenset({"precision"}):
+        return 1, None
+    return descriptor.limbs, descriptor.element_type
 
 
 def _qualified_handler(prefix: str, operator: ast.AST, *, limbs: int = 1,
@@ -1265,17 +2264,19 @@ def _normalize_lexical_values(
     attribute_value_nodes: dict[tuple[int, str], int] = {}
     parameter_names = set(function_parameter_names(statement))
     static_parameter_bindings = dict(static_parameter_bindings or {})
-    value_class_scope = str(
-        graph.G.graph.get("function_name")
-        or getattr(statement, "name", "<function>")
+    value_class_scope = _source_numeric_scope(
+        graph, getattr(statement, "name", "<function>")
     )
-    # A parameter annotated with a locally-defined class name gives a
+    # A parameter annotated with an ingested class name gives a
     # receiver a real, known class identity at ingestion -- enough to
     # resolve ``receiver.attr`` through the class's own navigation table
     # (below) instead of inventing a name for it.  Only a bare ``Name``
     # annotation naming a class this source itself defines counts; anything
-    # else (no annotation, an external/generic type) leaves the receiver's
-    # class unknown here, and attribute access on it is not slot-resolvable.
+    # else leaves the receiver's class unknown here, and attribute access on
+    # it is not slot-resolvable. Numeric wrapper annotations are allowed to be
+    # generic (``ComplexRationalPrecision[2]``): source admission has already
+    # made their class identity part of this same navigation table, and the
+    # normalized descriptor supplies the bare authoritative identity.
     #
     # ``build_class_navigation_table`` needs only ``map_ir`` (ingestion-time,
     # AST-derived) and ``function_table`` for method references; both are
@@ -1293,6 +2294,7 @@ def _normalize_lexical_values(
         navigation_table = build_class_navigation_table(graph)
         graph.G.graph["_class_navigation_table"] = navigation_table
     parameter_class_names: dict[str, str] = {}
+    parameter_numeric_descriptors: dict[str, NumericFeatureDescriptor] = {}
     parameter_aggregate_kinds: dict[str, str] = {}
     parameter_sequence_record_widths: dict[str, int] = {}
     known_class_identities = {
@@ -1322,11 +2324,21 @@ def _normalize_lexical_values(
         *statement.args.kwonlyargs,
     ):
         annotation = argument.annotation
+        numeric_descriptor = numeric_feature_descriptor(annotation)
+        declared_class_identity = (
+            numeric_descriptor.type_name
+            if numeric_descriptor is not None
+            else annotation.id if isinstance(annotation, ast.Name) else None
+        )
         if (
-            isinstance(annotation, ast.Name)
-            and annotation.id in known_class_identities
+            declared_class_identity is not None
+            and declared_class_identity in known_class_identities
         ):
-            parameter_class_names[argument.arg] = annotation.id
+            parameter_class_names[argument.arg] = declared_class_identity
+            if numeric_descriptor is not None:
+                parameter_numeric_descriptors[argument.arg] = (
+                    numeric_descriptor
+                )
         aggregate_kind = annotation_aggregate_kind(annotation)
         if aggregate_kind is not None:
             parameter_aggregate_kinds[argument.arg] = aggregate_kind
@@ -1571,6 +2583,23 @@ def _normalize_lexical_values(
             "binding_name": name,
             "binding_kind": binding_kind,
         }
+        class_identity = parameter_class_names.get(name)
+        numeric_descriptor = parameter_numeric_descriptors.get(name)
+        if class_identity is not None:
+            # A typed parameter already IS an instance of its declared class.
+            # ``class_ref`` has the narrower, executable meaning "this node
+            # constructs an instance" throughout deployment planning.  Giving
+            # it to an Input caused every numeric wrapper parameter to acquire
+            # a synthetic ``__init__`` call, after which the linker exported
+            # the constructor's private frame as thousands of root formals.
+            # The source-value class concordance below is authoritative for
+            # receiver identity; ``result_class_ref`` is its graph view.
+            attributes["result_class_ref"] = class_identity
+        if numeric_descriptor is not None:
+            attributes.update({
+                "numeric_feature_descriptor": numeric_descriptor.receipt(),
+                "precision_limbs": numeric_descriptor.limbs,
+            })
         if aggregate_kind is not None:
             attributes.update({
                 "producer_kind": "aggregate_parameter",
@@ -1592,6 +2621,17 @@ def _normalize_lexical_values(
         environment[name] = value
         identity_bindings.setdefault(name, []).append(value)
         ingestion_definitions.setdefault(name, []).append((value, {}))
+        if class_identity is not None:
+            _concord_source_value_class(
+                value_class_scope,
+                value,
+                class_identity,
+                precision_limbs=(
+                    numeric_descriptor.limbs
+                    if numeric_descriptor is not None else 1
+                ),
+                source=f"parameter annotation {name}",
+            )
         return value
 
     lexical_free_names_by_reference: dict[int, tuple[str, ...]] = {}
@@ -1859,7 +2899,7 @@ def _normalize_lexical_values(
         )
         current_identity_book().page("callable_identity_concordance").set(
             (
-                str(graph.G.graph.get("function_name") or "<module>"),
+                _source_numeric_scope(graph),
                 int(node_id),
             ),
             0,
@@ -2132,6 +3172,27 @@ def _normalize_lexical_values(
                         if str(role) == "arg:0"
                     ), None)
                     guarded_type = dotted_name(guard.args[1])
+                    if os.environ.get("TURING_DEBUG_TYPE_NORMALIZATION"):
+                        logger.warning(
+                            "type-normalization candidate line=%s "
+                            "test_program=%r subject=%r body=%r "
+                            "normalized=%r normalized_subject=%r "
+                            "ensured_type=%r guarded_type=%r "
+                            "guard_receipt=%r normalizer_receipt=%r "
+                            "test_attributes=%r normalized_attributes=%r",
+                            getattr(expression, "lineno", None),
+                            test_program,
+                            subject_id,
+                            body_value,
+                            normalized_id,
+                            normalized_subject,
+                            ensured_type,
+                            guarded_type,
+                            getattr(guard, "_extraction_contract", None),
+                            getattr(expression.orelse, "_extraction_contract", None),
+                            test_attributes,
+                            normalized_attributes,
+                        )
                     if (
                         test_program.get("object_type")
                         == "schema_type_guard"
@@ -2147,6 +3208,38 @@ def _normalize_lexical_values(
                             )
                         )
                     ):
+                        normalization_descriptor = (
+                            int(subject_id),
+                            int(normalized_id),
+                            str(ensured_type),
+                            str(guarded_type),
+                        )
+                        normalization_page = current_identity_book().page(
+                            "source_type_normalization_concordance"
+                        )
+                        normalization_row = (
+                            value_class_scope, int(node_id)
+                        )
+                        normalization_incumbent = normalization_page.latest(
+                            normalization_row
+                        )
+                        if (
+                            normalization_incumbent is not None
+                            and tuple(normalization_incumbent)
+                            != normalization_descriptor
+                        ):
+                            raise ValueError(
+                                "source type normalization concordance "
+                                f"disagreement for {normalization_row!r}: "
+                                f"recorded={normalization_incumbent!r}, "
+                                f"resolved={normalization_descriptor!r}"
+                            )
+                        if normalization_incumbent is None:
+                            normalization_page.set(
+                                normalization_row,
+                                0,
+                                normalization_descriptor,
+                            )
                         graph.G.nodes[normalized_id].setdefault(
                             "attributes", {}
                         )["source_type_normalization"] = {
@@ -2468,6 +3561,9 @@ def _normalize_lexical_values(
                 receiver_attributes = (
                     graph.G.nodes[receiver].get("attributes") or {}
                 )
+                receiver_fact = current_identity_book().page(
+                    "source_value_class_concordance"
+                ).latest((value_class_scope, int(receiver)))
                 receiver_class = (
                     str(method_owner)
                     if (
@@ -2475,11 +3571,74 @@ def _normalize_lexical_values(
                         and isinstance(expression.value, ast.Name)
                         and expression.value.id in {"self", "cls"}
                     )
-                    else receiver_attributes.get(
-                        "result_class_ref",
-                        receiver_attributes.get("class_ref"),
+                    else str(receiver_fact[0])
+                    if isinstance(receiver_fact, tuple) else None
+                )
+                receiver_numeric = (
+                    None if not isinstance(receiver_fact, tuple)
+                    else numeric_feature_descriptor(
+                        str(receiver_fact[0]).rsplit(".", 1)[-1]
+                        + (
+                            f"[{int(receiver_fact[1])}]"
+                            if int(receiver_fact[1]) > 1 else ""
+                        )
                     )
                 )
+                projected_numeric = (
+                    None if receiver_numeric is None
+                    else numeric_feature_field_projection(
+                        receiver_numeric, expression.attr
+                    )
+                )
+                if (
+                    receiver_numeric is not None
+                    and (
+                        (expression.attr in {"real", "imag"}
+                         and "complex" in receiver_numeric.features)
+                        or (expression.attr in {"numerator", "denominator"}
+                            and "rational" in receiver_numeric.features)
+                    )
+                ):
+                    projected_attributes = graph.G.nodes[
+                        attribute_id
+                    ].setdefault("attributes", {})
+                    component_path = (
+                        *tuple(receiver_attributes.get(
+                            "numeric_component_path", ()
+                        )),
+                        str(expression.attr),
+                    )
+                    projected_attributes.update({
+                        "numeric_component_path": component_path,
+                        "numeric_component_receiver_id": int(receiver),
+                        "numeric_component_attribute": str(expression.attr),
+                        "precision_limbs": (
+                            int(projected_numeric.limbs)
+                            if projected_numeric is not None else 1
+                        ),
+                    })
+                    if projected_numeric is not None:
+                        projected_attributes.update({
+                            "numeric_feature_descriptor": (
+                                projected_numeric.receipt()
+                            ),
+                            "result_class_ref": projected_numeric.type_name,
+                        })
+                        _concord_source_value_class(
+                            value_class_scope,
+                            int(attribute_id),
+                            projected_numeric.type_name,
+                            precision_limbs=projected_numeric.limbs,
+                            source="numeric-component-projection",
+                        )
+                    _concord_numeric_feature_projection(
+                        value_class_scope,
+                        int(attribute_id),
+                        int(receiver),
+                        str(expression.attr),
+                        component_path,
+                        projected_numeric,
+                    )
                 declared_callable_field = None
                 declared_receiver_field = None
                 if receiver_class is not None:
@@ -2697,6 +3856,55 @@ def _normalize_lexical_values(
                         (*receiver_inputs, *argument_inputs, *keyword_inputs),
                     )
             callee = resolve_expression(expression.func)
+            if isinstance(callee, _StaticPythonReference) and node_id in graph.G:
+                identity_target = (
+                    callee.value.__func__
+                    if inspect.ismethod(callee.value)
+                    else callee.value
+                )
+                identity = ".".join(filter(None, (
+                    str(getattr(identity_target, "__module__", "")),
+                    str(getattr(
+                        identity_target,
+                        "__qualname__",
+                        getattr(identity_target, "__name__", ""),
+                    )),
+                )))
+                identity_program = resolve_python_identity(identity)
+                if identity_program is not None:
+                    call_attributes = graph.G.nodes[node_id].setdefault(
+                        "attributes", {}
+                    )
+                    call_attributes.update({
+                        "python_identity_program": identity_program.mapping(),
+                        "python_replacement_kind": identity_program.kind,
+                        **identity_program.direct_attributes,
+                    })
+                    descriptor = (
+                        str(identity),
+                        str(identity_program.kind),
+                        identity_program.direct_operator,
+                        tuple(sorted(
+                            identity_program.direct_attributes.items()
+                        )),
+                    )
+                    identity_page = current_identity_book().page(
+                        "source_python_identity_concordance"
+                    )
+                    identity_row = (value_class_scope, int(node_id))
+                    identity_incumbent = identity_page.latest(identity_row)
+                    if (
+                        identity_incumbent is not None
+                        and tuple(identity_incumbent) != descriptor
+                    ):
+                        raise ValueError(
+                            "source Python identity concordance disagreement "
+                            f"for {identity_row!r}: "
+                            f"recorded={identity_incumbent!r}, "
+                            f"resolved={descriptor!r}"
+                        )
+                    if identity_incumbent is None:
+                        identity_page.set(identity_row, 0, descriptor)
             if (
                 isinstance(callee, _StaticPythonReference)
                 and any(
@@ -3056,8 +4264,16 @@ def _normalize_lexical_values(
                     "result_class_ref", call_attributes.get("class_ref")
                 )
                 if result_class is not None:
-                    precision_limbs = int(
-                        call_attributes.get("precision_limbs") or 1
+                    # A width is recorded only where the source states it;
+                    # a Precision-bearing result whose width is computed is
+                    # stated by its callsite specialization, not guessed here.
+                    carries_width = "precision" in (_NUMERIC_TYPE_FEATURES.get(
+                        str(result_class).rsplit(".", 1)[-1]
+                    ) or ())
+                    precision_limbs: int | None = (
+                        int(call_attributes["precision_limbs"])
+                        if call_attributes.get("precision_limbs")
+                        else None if carries_width else 1
                     )
                     if (
                         str(result_class).rsplit(".", 1)[-1]
@@ -3072,10 +4288,12 @@ def _normalize_lexical_values(
                                     expression.args[1]
                                 ))
                             except (ValueError, TypeError):
-                                pass
-                        call_attributes["precision_limbs"] = max(
-                            precision_limbs, 1
-                        )
+                                precision_limbs = None
+                        if precision_limbs is not None:
+                            call_attributes["precision_limbs"] = max(
+                                precision_limbs, 1
+                            )
+                if result_class is not None and precision_limbs is not None:
                     _concord_source_value_class(
                         value_class_scope,
                         node_id,
@@ -4099,12 +5317,12 @@ def _normalize_lexical_values(
                     if field_key in before_attribute_values:
                         continue
                     receiver_id, attribute_name = field_key
-                    receiver_attributes = (
-                        graph.G.nodes[int(receiver_id)].get("attributes") or {}
-                    )
-                    receiver_class = receiver_attributes.get(
-                        "result_class_ref",
-                        receiver_attributes.get("class_ref"),
+                    receiver_fact = current_identity_book().page(
+                        "source_value_class_concordance"
+                    ).latest((value_class_scope, int(receiver_id)))
+                    receiver_class = (
+                        str(receiver_fact[0])
+                        if isinstance(receiver_fact, tuple) else None
                     )
                     if receiver_class is None:
                         effect_classes = {
@@ -4903,6 +6121,29 @@ def _normalize_lexical_values(
                         and call.func.attr in _MAPPING_MUTATION_OPERATORS
                         and state_attributes.get("sequence_writable", True)
                     )
+                    if sequence_mutation or mapping_mutation:
+                        mutation_page = current_identity_book().page(
+                            "source_sequence_mutation_concordance"
+                        )
+                        mutation_row = (value_class_scope, int(call_id))
+                        mutation_fact = (
+                            int(initial), str(call.func.attr),
+                            str(sequence_policy), tuple(argument_ids),
+                            "mapping" if mapping_mutation else "sequence",
+                        )
+                        incumbent = mutation_page.latest(mutation_row)
+                        if (
+                            incumbent is not None
+                            and tuple(incumbent) != mutation_fact
+                        ):
+                            raise ValueError(
+                                "source sequence mutation concordance "
+                                f"disagreement for {mutation_row!r}: "
+                                f"recorded={incumbent!r}, "
+                                f"proposed={mutation_fact!r}"
+                            )
+                        if incumbent is None:
+                            mutation_page.set(mutation_row, 0, mutation_fact)
                     state_effects.append({
                         "state_name": name,
                         "operator": call.func.attr,
@@ -5250,6 +6491,22 @@ def _normalize_lexical_values(
         )
         for name, value_ids in identity_bindings.items()
     }
+    # Class facts this function committed while its values still had
+    # ingestion ids follow those values into the canonical id space, exactly
+    # as the identity table does; the concordance answers by canonical id.
+    class_page = current_identity_book().page(
+        "source_value_class_concordance"
+    )
+    for row in tuple(class_page.rows()):
+        if (
+            isinstance(row, tuple) and len(row) == 2
+            and row[0] == value_class_scope and row[1] in mapping
+            and mapping[row[1]] != row[1]
+        ):
+            for column, fact in class_page.history(row):
+                class_page.set(
+                    (value_class_scope, mapping[row[1]]), column, fact,
+                )
     # Per-return slot values are ids in the pre-canonical space too.
     graph.G.graph["return_slot_values"] = {
         span: tuple(
@@ -5502,6 +6759,7 @@ def normalize_python_attribute_special_cases(graph: Any) -> None:
 def reduce_abstract_tensor_topology(graph: Any) -> Any:
     """Apply existing ProcessGraph names to the three structural AST nodes."""
 
+    _record_numeric_annotation_descriptors(graph)
     function_table = getattr(graph, "function_table", None)
     if function_table is None:
         function_table = FunctionTable()
@@ -6696,6 +7954,45 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         }
         for class_name, definition in class_definitions.items()
     }
+    # Class navigation owns Python's inherited method surface as well as the
+    # methods written directly in each body. Retained numerical wrappers are
+    # intentionally thin (for example ComplexRationalPrecision inherits its
+    # arithmetic from _ComplexRationalBase), so omitting this relation loses
+    # the exact dunder dependency even though both class definitions and the
+    # base edge are already present in the graph. Copy only absent members;
+    # an override on the derived class remains authoritative.
+    inheritance_changed = True
+    while inheritance_changed:
+        inheritance_changed = False
+        for class_name, bases in class_bases.items():
+            descriptor = graph.G.graph["class_table"].get(class_name)
+            if descriptor is None:
+                continue
+            for base_name in bases:
+                base_descriptor = graph.G.graph["class_table"].get(base_name)
+                if base_descriptor is None:
+                    continue
+                for method_name, method_reference in dict(
+                    base_descriptor.get("methods") or {}
+                ).items():
+                    if method_name not in descriptor["methods"]:
+                        descriptor["methods"][method_name] = method_reference
+                        inheritance_changed = True
+                inherited_fields = tuple(dict.fromkeys((
+                    *tuple(base_descriptor.get("fields") or ()),
+                    *tuple(descriptor.get("fields") or ()),
+                )))
+                if inherited_fields != tuple(descriptor.get("fields") or ()):
+                    descriptor["fields"] = inherited_fields
+                    inheritance_changed = True
+                for metadata_name in ("field_defaults", "field_classes"):
+                    inherited = {
+                        **dict(base_descriptor.get(metadata_name) or {}),
+                        **dict(descriptor.get(metadata_name) or {}),
+                    }
+                    if inherited != dict(descriptor.get(metadata_name) or {}):
+                        descriptor[metadata_name] = inherited
+                        inheritance_changed = True
     for function_node_id, owner_name in method_owners.items():
         reference = function_nodes.get(function_node_id)
         if reference is None:
@@ -6826,13 +8123,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 for parent, role in call_data.get("parents", ())
                 if str(role) in {"operand", "value", "base", "object"}
             ), None)
-            receiver_attributes = (
-                {}
-                if receiver_id is None or receiver_id not in target_graph
-                else target_graph.nodes[receiver_id].get("attributes") or {}
-            )
-            receiver_class = receiver_attributes.get(
-                "result_class_ref", receiver_attributes.get("class_ref")
+            receiver_class = (
+                None if receiver_id is None
+                else _resolved_source_value_class(target_graph, receiver_id)[0]
             )
             method_reference = (
                 target_class_table.get(str(receiver_class), {})
@@ -6876,7 +8169,422 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         ast.Invert: "__invert__",
     }
 
-    def lower_class_operator_calls(target_wrapper: Any) -> None:
+    def specialize_concorded_same_type_numeric_operator(
+        target_wrapper: Any,
+    ) -> bool:
+        """Bind a generic wrapper dunder to its authored same-type body.
+
+        A retained dunder is normalized before call edges have specialized its
+        ``self`` and ``other`` formals.  The source-AST specialization can
+        therefore cover an annotated root expression but not an operator
+        reached later through another wrapper's component algebra.  Once both
+        formals carry the same concorded numeric descriptor, the generic
+        ``_composed_binary(op, left, right)`` promotion is provably redundant:
+        its own eager contract dispatches that exact case to ``_binary_same``.
+        Rebind the already-existing call and constant operation argument; do
+        not synthesize algebra or infer a type from the dunder spelling.
+        """
+
+        target_graph = target_wrapper.G
+        scope = _source_numeric_scope(target_graph)
+        method_name = str(target_graph.graph.get("function_name") or "")
+        if method_name not in {
+            "__add__", "__radd__", "__sub__", "__rsub__",
+            "__mul__", "__rmul__", "__truediv__", "__rtruediv__",
+        }:
+            return False
+        inputs = {
+            str(attributes.get("binding_name")): int(node_id)
+            for node_id, data in target_graph.nodes(data=True)
+            for attributes in (data.get("attributes") or {},)
+            if data.get("type") == "Input"
+            and attributes.get("binding_name") is not None
+        }
+        if not {"self", "other"} <= set(inputs):
+            return False
+        self_descriptor = _concorded_numeric_descriptor(
+            target_graph, inputs["self"]
+        )
+        other_descriptor = _concorded_numeric_descriptor(
+            target_graph, inputs["other"]
+        )
+        if self_descriptor is None or self_descriptor != other_descriptor:
+            return False
+        class_table = graph.G.graph.get("class_table", {})
+        method_reference = (
+            class_table.get(self_descriptor.type_name, {})
+            .get("methods", {})
+            .get("_binary_same")
+        )
+        if method_reference is None:
+            return False
+        changed = False
+        page = current_identity_book().page(
+            "source_numeric_operator_specialization_concordance"
+        )
+        for node_id, data in tuple(target_graph.nodes(data=True)):
+            attributes = data.setdefault("attributes", {})
+            if attributes.get("static_python_reference") != "_composed_binary":
+                continue
+            actuals = {
+                str(role): int(parent)
+                for parent, role in data.get("parents", ())
+                if int(parent) in target_graph
+            }
+            operation_id = actuals.get("arg:0")
+            receiver_id = actuals.get("arg:1")
+            other_id = actuals.get("arg:2")
+            if None in (operation_id, receiver_id, other_id):
+                continue
+            receiver_descriptor = _concorded_numeric_descriptor(
+                target_graph, receiver_id
+            )
+            argument_descriptor = _concorded_numeric_descriptor(
+                target_graph, other_id
+            )
+            if receiver_descriptor != self_descriptor or (
+                argument_descriptor != self_descriptor
+            ):
+                continue
+            fact = (
+                int(receiver_id), int(other_id), int(operation_id),
+                self_descriptor.receipt(), int(method_reference),
+            )
+            row = (scope, int(node_id))
+            incumbent = page.latest(row)
+            if incumbent is not None and tuple(incumbent) != fact:
+                raise ValueError(
+                    "source numeric operator specialization concordance "
+                    f"disagreement for {row!r}: recorded={incumbent!r}, "
+                    f"proposed={fact!r}"
+                )
+            if incumbent is None:
+                page.set(row, 0, fact)
+            for field in ("static_python_reference", "reference_kind"):
+                attributes.pop(field, None)
+            attributes.update({
+                "method_ref": int(method_reference),
+                "callee_ref": int(method_reference),
+                "numeric_same_type_specialization": True,
+                "numeric_feature_descriptor": self_descriptor.receipt(),
+                "result_class_ref": self_descriptor.type_name,
+                "precision_limbs": int(self_descriptor.limbs),
+            })
+            data["type"] = "Call"
+            data["op"] = "call"
+            _replace_inputs(target_wrapper, int(node_id), (
+                (int(receiver_id), "operand"),
+                (int(other_id), "arg:0"),
+                (int(operation_id), "arg:1"),
+            ))
+            _concord_source_value_class(
+                scope, int(node_id), self_descriptor.type_name,
+                precision_limbs=self_descriptor.limbs,
+                source="concorded same-type numeric operator specialization",
+            )
+            changed = True
+        return changed
+
+    def resolve_concorded_receiver_constructor(target_wrapper: Any) -> bool:
+        """Bind ``type(receiver)(...)`` to the receiver's concorded class.
+
+        ``type(self)`` names no class lexically; the receiver's class is the
+        source-value class concordance fact the call edges already committed
+        for ``self``.  Once that fact exists the call is an ordinary
+        constructor of that class: stamp ``class_ref`` (which call planning
+        resolves through the class table's ``__new__``/``__init__``), feed it
+        only its authored arguments, and commit the constructed value's class
+        at the receiver's width.  Nothing is inferred from a spelling.
+        """
+
+        target_graph = target_wrapper.G
+        scope = _source_numeric_scope(target_graph)
+        class_table = graph.G.graph.get("class_table", {})
+        class_page = current_identity_book().page(
+            "source_value_class_concordance"
+        )
+        page = current_identity_book().page(
+            "source_receiver_constructor_concordance"
+        )
+        changed = False
+        for node_id, data in tuple(target_graph.nodes(data=True)):
+            if str(data.get("type") or "") != "Call":
+                continue
+            attributes = data.setdefault("attributes", {})
+            if attributes.get("class_ref") is not None:
+                continue
+            roles = {
+                str(role): int(parent)
+                for parent, role in data.get("parents", ())
+                if int(parent) in target_graph
+            }
+            callee_id = roles.get("callee")
+            if callee_id is None:
+                continue
+            callee = target_graph.nodes[callee_id]
+            callee_roles = {
+                str(role): int(parent)
+                for parent, role in callee.get("parents", ())
+                if int(parent) in target_graph
+            }
+            if (
+                (callee.get("attributes") or {}).get(
+                    "static_python_reference"
+                ) != "type"
+                or set(callee_roles) != {"callee", "arg:0"}
+            ):
+                continue
+            receiver_id = callee_roles["arg:0"]
+            concorded = class_page.latest((scope, int(receiver_id)))
+            if not isinstance(concorded, tuple) or len(concorded) < 2:
+                continue
+            class_identity, limbs = str(concorded[0]), int(concorded[1])
+            if class_identity not in class_table:
+                continue
+            fact = (int(receiver_id), class_identity, limbs)
+            row = (scope, int(node_id))
+            incumbent = page.latest(row)
+            if incumbent is not None and tuple(incumbent) != fact:
+                raise ValueError(
+                    "source receiver constructor concordance disagreement "
+                    f"for {row!r}: recorded={incumbent!r}, proposed={fact!r}"
+                )
+            if incumbent is None:
+                page.set(row, 0, fact)
+            attributes.update({
+                "class_ref": class_identity,
+                "result_class_ref": class_identity,
+                "precision_limbs": limbs,
+            })
+            descriptor = numeric_feature_descriptor(
+                class_identity + (f"[{limbs}]" if limbs > 1 else "")
+            )
+            if descriptor is not None:
+                attributes["numeric_feature_descriptor"] = descriptor.receipt()
+            _replace_inputs(target_wrapper, int(node_id), tuple(
+                (parent, role)
+                for parent, role in data.get("parents", ())
+                if str(role) != "callee"
+            ))
+            _concord_source_value_class(
+                scope, int(node_id), class_identity,
+                precision_limbs=limbs,
+                source="concorded receiver constructor",
+            )
+            changed = True
+        return changed
+
+    def propagate_numeric_field_projections(target_wrapper: Any) -> bool:
+        """Carry exact composite coefficient types after call specialization.
+
+        Lexical normalization can run before an unannotated method formal has
+        received its caller's numeric descriptor. Revisit existing GetAttr
+        edges after that transfer so nested fields inherit the same arbitrary
+        Precision width. This is a monotone publication of the receiver-edge
+        fact, not a reconstruction from the field spelling alone.
+        """
+
+        target_graph = target_wrapper.G
+        scope = _source_numeric_scope(target_graph)
+        changed = False
+        settling = True
+        while settling:
+            settling = False
+            for node_id, data in tuple(target_graph.nodes(data=True)):
+                expression = data.get("expr_obj")
+                if not (
+                    isinstance(expression, ast.Call)
+                    and isinstance(expression.func, ast.Attribute)
+                ):
+                    continue
+                method = str(expression.func.attr)
+                receiver_id = next((
+                    int(parent)
+                    for parent, role in data.get("parents", ())
+                    if str(role) in {"operand", "value", "object", "receiver"}
+                    and int(parent) in target_graph
+                ), None)
+                if receiver_id is None:
+                    continue
+                receiver_attributes = (
+                    target_graph.nodes[receiver_id].get("attributes") or {}
+                )
+                receiver_descriptor = _concorded_numeric_descriptor(
+                    target_graph, receiver_id
+                )
+                if receiver_descriptor is None:
+                    continue
+                components = numeric_feature_method_components(
+                    receiver_descriptor, method
+                )
+                if not components:
+                    continue
+                results = tuple(
+                    {
+                        "path": (
+                            *tuple(receiver_attributes.get(
+                                "numeric_component_path", ()
+                            )),
+                            *path,
+                        ),
+                        "descriptor": (
+                            None if descriptor is None
+                            else descriptor.receipt()
+                        ),
+                    }
+                    for path, descriptor in components
+                )
+                attributes = data.setdefault("attributes", {})
+                page = current_identity_book().page(
+                    "source_numeric_intrinsic_concordance"
+                )
+                row = (scope, int(node_id))
+                fact = (int(receiver_id), method, results)
+                incumbent = page.latest(row)
+                if incumbent is not None and tuple(incumbent) != fact:
+                    raise ValueError(
+                        "source numeric intrinsic concordance disagreement "
+                        f"for {row!r}: recorded={incumbent!r}, "
+                        f"proposed={fact!r}"
+                    )
+                if incumbent is None:
+                    page.set(row, 0, fact)
+                if attributes.get("numeric_component_results") != results:
+                    attributes["numeric_component_results"] = results
+                    changed = settling = True
+
+            for node_id, data in tuple(target_graph.nodes(data=True)):
+                if str(data.get("type") or "") != "Indexed":
+                    continue
+                parents = {
+                    str(role): int(parent)
+                    for parent, role in data.get("parents", ())
+                    if int(parent) in target_graph
+                }
+                base_id, index_id = parents.get("base"), parents.get("index")
+                if base_id is None or index_id is None:
+                    continue
+                results = tuple(
+                    (target_graph.nodes[base_id].get("attributes") or {}).get(
+                        "numeric_component_results", ()
+                    )
+                )
+                index = (target_graph.nodes[index_id].get("attributes") or {}).get(
+                    "value"
+                )
+                if not isinstance(index, int) or not (0 <= index < len(results)):
+                    continue
+                selected = dict(results[index])
+                descriptor = _numeric_feature_descriptor_from_receipt(
+                    selected.get("descriptor")
+                )
+                path = tuple(map(str, selected.get("path") or ()))
+                attributes = data.setdefault("attributes", {})
+                proposed = {
+                    "numeric_component_path": path,
+                    "numeric_component_receiver_id": int(base_id),
+                    "numeric_component_attribute": f"result[{index}]",
+                    "precision_limbs": (
+                        int(descriptor.limbs) if descriptor is not None else 1
+                    ),
+                }
+                if descriptor is not None:
+                    proposed.update({
+                        "numeric_feature_descriptor": descriptor.receipt(),
+                        "result_class_ref": descriptor.type_name,
+                    })
+                    _concord_source_value_class(
+                        scope, int(node_id), descriptor.type_name,
+                        precision_limbs=descriptor.limbs,
+                        source="numeric-intrinsic-result-projection",
+                    )
+                _concord_numeric_feature_projection(
+                    scope, int(node_id), int(base_id), f"result[{index}]",
+                    path, descriptor,
+                )
+                if any(attributes.get(key) != value
+                       for key, value in proposed.items()):
+                    attributes.update(proposed)
+                    changed = settling = True
+
+            for node_id, data in tuple(target_graph.nodes(data=True)):
+                expression = data.get("expr_obj")
+                attributes = data.setdefault("attributes", {})
+                attribute = (
+                    expression.attr
+                    if isinstance(expression, ast.Attribute)
+                    else attributes.get("attribute")
+                    if str(data.get("type") or "") == "GetAttr"
+                    else None
+                )
+                if attribute not in {
+                    "real", "imag", "numerator", "denominator",
+                }:
+                    continue
+                receiver_id = next((
+                    int(parent)
+                    for parent, role in data.get("parents", ())
+                    if str(role) in {"value", "object", "base", "operand"}
+                    and int(parent) in target_graph
+                ), None)
+                if receiver_id is None:
+                    continue
+                receiver_attributes = (
+                    target_graph.nodes[receiver_id].get("attributes") or {}
+                )
+                receiver_descriptor = _concorded_numeric_descriptor(
+                    target_graph, receiver_id
+                )
+                if receiver_descriptor is None:
+                    continue
+                structural = (
+                    (attribute in {"real", "imag"}
+                     and "complex" in receiver_descriptor.features)
+                    or (attribute in {"numerator", "denominator"}
+                        and "rational" in receiver_descriptor.features)
+                )
+                if not structural:
+                    continue
+                projected = numeric_feature_field_projection(
+                    receiver_descriptor, str(attribute)
+                )
+                path = (
+                    *tuple(receiver_attributes.get(
+                        "numeric_component_path", ()
+                    )),
+                    str(attribute),
+                )
+                proposed = {
+                    "numeric_component_path": path,
+                    "numeric_component_receiver_id": int(receiver_id),
+                    "numeric_component_attribute": str(attribute),
+                    "precision_limbs": (
+                        int(projected.limbs) if projected is not None else 1
+                    ),
+                }
+                if projected is not None:
+                    proposed.update({
+                        "numeric_feature_descriptor": projected.receipt(),
+                        "result_class_ref": projected.type_name,
+                    })
+                    _concord_source_value_class(
+                        scope, int(node_id), projected.type_name,
+                        precision_limbs=projected.limbs,
+                        source="post-call numeric-component-projection",
+                    )
+                _concord_numeric_feature_projection(
+                    scope, int(node_id), int(receiver_id), str(attribute),
+                    path, projected,
+                )
+                if any(attributes.get(key) != value
+                       for key, value in proposed.items()):
+                    attributes.update(proposed)
+                    changed = settling = True
+        return changed
+
+    def lower_class_operator_calls(
+        target_wrapper: Any, *, settled: bool = False,
+    ) -> None:
         """Bind authored operators through the receiver's class table.
 
         Lexical normalization has already replaced every Name occurrence by
@@ -6887,7 +8595,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         """
 
         target_graph = target_wrapper.G
-        scope = str(target_graph.graph.get("function_name") or "<module>")
+        scope = _source_numeric_scope(target_graph)
         class_table = graph.G.graph.get("class_table", {})
         page = current_identity_book().page(
             "source_operator_dispatch_concordance"
@@ -6945,6 +8653,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         continue
                     left_class, _left_limbs = descriptor(left_id)
                     right_class, _right_limbs = descriptor(right_id)
+                    if left_class is None and not settled:
+                        # The left operand decides first; while its type is
+                        # still being settled, the reflected method is not
+                        # yet the answer.
+                        continue
                     candidates = (
                         (left_id, right_id, left_class, methods[0], False),
                         (right_id, left_id, right_class, methods[1], True),
@@ -6981,6 +8694,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 returned_class = returned_class_by_reference.get(
                     method_reference
                 )
+                numeric_descriptor = _concorded_numeric_descriptor(
+                    target_graph, node_id
+                )
+                if returned_class is None and numeric_descriptor is not None:
+                    returned_class = numeric_descriptor.type_name
                 attributes.update({
                     "source_type": type(expression).__name__,
                     "class_operator_dispatch": True,
@@ -6990,6 +8708,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     "method_ref": method_reference,
                     "callee_ref": method_reference,
                 })
+                attributes.pop("numeric_composite_pending", None)
                 if returned_class is not None:
                     attributes["result_class_ref"] = str(returned_class)
                     _concord_source_value_class(
@@ -7030,7 +8749,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         """
 
         target_graph = target_wrapper.G
-        scope = str(target_graph.graph.get("function_name") or "<module>")
+        scope = _source_numeric_scope(target_graph)
 
         def is_real_precision(identity: Any) -> bool:
             return (
@@ -7706,9 +9425,34 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 attributes["source_type"] = "BinOp"
                 attributes["constant_folded"] = "sequence-replication"
                 continue
-            left_limbs, left_type = _operand_precision(graph, expression.left)
-            right_limbs, right_type = _operand_precision(
-                graph, expression.right)
+            left_descriptor = _operand_numeric_descriptor(
+                graph, expression.left
+            )
+            right_descriptor = _operand_numeric_descriptor(
+                graph, expression.right
+            )
+            numeric_descriptor = join_numeric_feature_descriptors(
+                left_descriptor, right_descriptor,
+            )
+            attributes = data.setdefault("attributes", {})
+            if numeric_descriptor is not None:
+                attributes["numeric_feature_descriptor"] = (
+                    numeric_descriptor.receipt()
+                )
+                if numeric_descriptor.features != frozenset({"precision"}):
+                    attributes["numeric_composite_pending"] = True
+            left_limbs, left_type = (
+                (left_descriptor.limbs, left_descriptor.element_type)
+                if left_descriptor is not None
+                and left_descriptor.features == frozenset({"precision"})
+                else (1, None)
+            )
+            right_limbs, right_type = (
+                (right_descriptor.limbs, right_descriptor.element_type)
+                if right_descriptor is not None
+                and right_descriptor.features == frozenset({"precision"})
+                else (1, None)
+            )
             operand_limbs = max(left_limbs, right_limbs)
             operand_element = _widest_element(left_type, right_type)
             operation = _qualified_handler(
@@ -7717,7 +9461,6 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             )
             data["type"] = operation
             data["op"] = operation
-            attributes = data.setdefault("attributes", {})
             if operand_limbs > 1:
                 attributes["precision_limbs"] = operand_limbs
                 attributes["precision_element"] = operand_element
@@ -7772,15 +9515,28 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     id(expression.operand),
                 )
                 continue
-            operand_limbs, operand_type = _operand_precision(
-                graph, expression.operand)
+            numeric_descriptor = _operand_numeric_descriptor(
+                graph, expression.operand
+            )
+            attributes = data.setdefault("attributes", {})
+            if numeric_descriptor is not None:
+                attributes["numeric_feature_descriptor"] = (
+                    numeric_descriptor.receipt()
+                )
+                if numeric_descriptor.features != frozenset({"precision"}):
+                    attributes["numeric_composite_pending"] = True
+            operand_limbs, operand_type = (
+                (numeric_descriptor.limbs, numeric_descriptor.element_type)
+                if numeric_descriptor is not None
+                and numeric_descriptor.features == frozenset({"precision"})
+                else (1, None)
+            )
             operation = _qualified_handler(
                 "unaryop", expression.op, limbs=operand_limbs,
                 dtype=operand_type,
             )
             data["type"] = operation
             data["op"] = operation
-            attributes = data.setdefault("attributes", {})
             if operand_limbs > 1:
                 attributes["precision_limbs"] = operand_limbs
                 attributes["precision_element"] = _widest_element(operand_type)
@@ -8541,6 +10297,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         function_graph.G.graph.update(
             function_ref=reference.address,
             function_name=function_table.entry(reference).name,
+            source_pursuit_active=bool(
+                getattr(statement, "_source_pursuit_active", False)
+            ),
             method_owner=method_owners.get(node_id),
             method_binding=(
                 "class"
@@ -8730,6 +10489,266 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     # Function graphs are attached only after the earlier root-graph pass.
     # Reuse that exact provenance propagation now that every callee body is
     # available, so a call in a function body retains its returned class.
+    def propagate_call_formal_numeric_types() -> bool:
+        """Carry exact numeric class facts over authored call edges.
+
+        A retained base method deliberately does not hard-code the concrete
+        wrapper used at a callsite.  The call edge is the proof: its actual
+        has an already-concorded class/width, and the callee formal is the
+        same value.  Commit that identity through the concordance book before
+        publishing it on the formal node; copied AST annotations are not an
+        independent typing channel.
+        """
+
+        entries = {
+            int(entry.reference.address): entry
+            for entry in function_table
+            if getattr(entry, "graph", None) is not None
+        }
+
+        def ordered_actuals(call_data: Mapping[str, Any]) -> tuple[int, ...]:
+            ranked = []
+            for actual_id, role in call_data.get("parents", ()):
+                spelling = str(role)
+                if spelling in {"operand", "receiver"}:
+                    rank = -1
+                elif spelling.startswith("arg:"):
+                    try:
+                        rank = int(spelling.split(":", 1)[1])
+                    except ValueError:
+                        continue
+                elif spelling.startswith("arg"):
+                    try:
+                        rank = int(spelling[3:])
+                    except ValueError:
+                        continue
+                else:
+                    continue
+                ranked.append((rank, int(actual_id)))
+            return tuple(actual for _rank, actual in sorted(ranked))
+
+        changed = False
+        for caller_entry in entries.values():
+            caller = caller_entry.graph.G
+            if not caller.graph.get("source_pursuit_active"):
+                continue
+            caller_scope = _source_numeric_scope(caller, caller_entry.name)
+            for call_id, call_data in tuple(caller.nodes(data=True)):
+                call_attributes = call_data.get("attributes") or {}
+                callee_ref = call_attributes.get(
+                    "callee_ref", call_attributes.get("method_ref")
+                )
+                if callee_ref is None or int(callee_ref) not in entries:
+                    continue
+                callee_entry = entries[int(callee_ref)]
+                callee = callee_entry.graph.G
+                callee_scope = _source_numeric_scope(
+                    callee, callee_entry.name
+                )
+                reachability_page = current_identity_book().page(
+                    "source_function_reachability_concordance"
+                )
+                reachability_row = (
+                    caller_scope, int(call_id), callee_scope,
+                )
+                incumbent_reachability = reachability_page.latest(
+                    reachability_row
+                )
+                if incumbent_reachability is not None and (
+                    incumbent_reachability is not True
+                ):
+                    raise ValueError(
+                        "source function reachability concordance "
+                        f"disagreement for {reachability_row!r}: "
+                        f"recorded={incumbent_reachability!r}, proposed=True"
+                    )
+                if incumbent_reachability is None:
+                    reachability_page.set(reachability_row, 0, True)
+                if not callee.graph.get("source_pursuit_active"):
+                    callee.graph["source_pursuit_active"] = True
+                    changed = True
+                output_histories = dict(
+                    callee.graph.get("identity_table") or {}
+                )
+                returned_value_ids = tuple(
+                    int(history[-1])
+                    for output_name in tuple(
+                        callee.graph.get("function_outputs") or ()
+                    )
+                    for history in (tuple(
+                        output_histories.get(str(output_name)) or ()
+                    ),)
+                    if history and int(history[-1]) in callee
+                )
+                returned_facts = tuple(dict.fromkeys(
+                    _resolved_source_value_class(callee, value_id)
+                    for value_id in returned_value_ids
+                    if _resolved_source_value_class(
+                        callee, value_id
+                    )[0] is not None
+                ))
+                if len(returned_facts) == 1:
+                    returned_class, returned_limbs = returned_facts[0]
+                    result_page = current_identity_book().page(
+                        "source_call_result_identity_concordance"
+                    )
+                    result_row = (caller_scope, int(call_id))
+                    result_fact = (
+                        int(callee_ref), str(returned_class),
+                        int(returned_limbs),
+                    )
+                    incumbent_result = result_page.latest(result_row)
+                    if incumbent_result is not None and tuple(
+                        incumbent_result
+                    ) != result_fact:
+                        raise ValueError(
+                            "source call result identity concordance "
+                            f"disagreement for {result_row!r}: "
+                            f"recorded={incumbent_result!r}, "
+                            f"proposed={result_fact!r}"
+                        )
+                    if incumbent_result is None:
+                        result_page.set(result_row, 0, result_fact)
+                    call_result_attributes = caller.nodes[
+                        int(call_id)
+                    ].setdefault("attributes", {})
+                    prior_result = (
+                        call_result_attributes.get("result_class_ref"),
+                        int(call_result_attributes.get(
+                            "precision_limbs"
+                        ) or 1),
+                    )
+                    _concord_source_value_class(
+                        caller_scope,
+                        int(call_id),
+                        str(returned_class),
+                        precision_limbs=int(returned_limbs),
+                        source=f"call result {callee_scope}",
+                    )
+                    call_result_attributes.update({
+                        "result_class_ref": str(returned_class),
+                        "precision_limbs": int(returned_limbs),
+                        "numeric_identity_source": (
+                            f"call result {callee_scope}"
+                        ),
+                    })
+                    returned_descriptor = numeric_feature_descriptor(
+                        str(returned_class) + (
+                            f"[{int(returned_limbs)}]"
+                            if int(returned_limbs) > 1 else ""
+                        )
+                    )
+                    if returned_descriptor is not None:
+                        call_result_attributes[
+                            "numeric_feature_descriptor"
+                        ] = returned_descriptor.receipt()
+                    changed = changed or prior_result != (
+                        str(returned_class), int(returned_limbs),
+                    )
+                parameter_names = tuple(
+                    map(str, callee.graph.get("function_parameters") or ())
+                )
+                actuals = ordered_actuals(call_data)
+                if not parameter_names or not actuals:
+                    continue
+                formal_nodes = {
+                    str(attributes.get("binding_name")): int(node_id)
+                    for node_id, data in callee.nodes(data=True)
+                    for attributes in (data.get("attributes") or {},)
+                    if data.get("type") == "Input"
+                    and attributes.get("binding_name") is not None
+                }
+                for position, actual_id in enumerate(actuals):
+                    if position >= len(parameter_names):
+                        break
+                    class_page = current_identity_book().page(
+                        "source_value_class_concordance"
+                    )
+                    concorded = class_page.latest((
+                        caller_scope, int(actual_id),
+                    ))
+                    class_identity, limbs = (
+                        (str(concorded[0]), int(concorded[1]))
+                        if isinstance(concorded, tuple)
+                        and len(concorded) >= 2
+                        else _resolved_source_value_class(
+                            caller, int(actual_id)
+                        )
+                    )
+                    if class_identity is None:
+                        continue
+                    formal_id = formal_nodes.get(parameter_names[position])
+                    if formal_id is None:
+                        continue
+                    formal_attributes = callee.nodes[formal_id].setdefault(
+                        "attributes", {}
+                    )
+                    actual_attributes = (
+                        caller.nodes[int(actual_id)].get("attributes") or {}
+                    )
+                    transfer_source = (
+                        f"call actual {caller_scope}:{actual_id}"
+                        + (
+                            " via "
+                            + str(actual_attributes["numeric_identity_source"])
+                            if actual_attributes.get("numeric_identity_source")
+                            else ""
+                        )
+                    )
+                    prior = (
+                        formal_attributes.get("result_class_ref"),
+                        int(formal_attributes.get("precision_limbs") or 1),
+                    )
+                    _concord_source_value_class(
+                        callee_scope,
+                        formal_id,
+                        str(class_identity),
+                        precision_limbs=int(limbs),
+                        source=transfer_source,
+                    )
+                    # The actual-to-formal edge transfers the instance's
+                    # class identity; it does not turn the formal Input into
+                    # a constructor.  ``class_ref`` is consumed by deployment
+                    # as a request to call ``__init__``.  Stamping it here
+                    # recursively constructed every specialized ``self`` and
+                    # ``other`` parameter and exported the resulting private
+                    # frames all the way to the root ABI.
+                    formal_attributes.pop("class_ref", None)
+                    formal_attributes.update({
+                        "result_class_ref": str(class_identity),
+                        "precision_limbs": int(limbs),
+                        "numeric_identity_source": transfer_source,
+                    })
+                    descriptor = numeric_feature_descriptor(
+                        str(class_identity) + (
+                            f"[{int(limbs)}]" if int(limbs) > 1 else ""
+                        )
+                    )
+                    if descriptor is not None:
+                        formal_attributes["numeric_feature_descriptor"] = (
+                            descriptor.receipt()
+                        )
+                    changed = changed or prior != (
+                        str(class_identity), int(limbs),
+                    )
+        return changed
+
+    # Operators reveal new exact callees; those call edges reveal the
+    # concrete type of an unannotated ``self``/``other`` formal.  Settle the
+    # two facts together rather than relying on traversal order.
+    for _round in range(max(len(tuple(function_table)), 1) + 1):
+        for entry in function_table:
+            entry_wrapper = getattr(entry, "graph", None)
+            if entry_wrapper is not None:
+                propagate_returned_receiver_types(entry_wrapper.G)
+                propagate_numeric_field_projections(entry_wrapper)
+                lower_python_precision(entry_wrapper)
+                specialize_concorded_same_type_numeric_operator(entry_wrapper)
+                resolve_concorded_receiver_constructor(entry_wrapper)
+                lower_class_operator_calls(entry_wrapper)
+        if not propagate_call_formal_numeric_types():
+            break
+
     for entry in function_table:
         entry_wrapper = getattr(entry, "graph", None)
         entry_graph = getattr(entry_wrapper, "G", None)
@@ -8739,8 +10758,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             # read at this post-extraction seam as well as on the root graph.
             normalize_python_attribute_special_cases(entry_wrapper)
             propagate_returned_receiver_types(entry_graph)
+            propagate_numeric_field_projections(entry_wrapper)
             lower_python_precision(entry_wrapper)
-            lower_class_operator_calls(entry_wrapper)
+            specialize_concorded_same_type_numeric_operator(entry_wrapper)
+            lower_class_operator_calls(entry_wrapper, settled=True)
             # Operator calls can themselves return class instances.  Resolve
             # a following method (for example ``wide_product.collapse()``)
             # from the just-concorded result identity before call planning.
@@ -8774,4 +10795,5 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
 __all__ = [
     "normalize_python_attribute_special_cases",
     "reduce_abstract_tensor_topology",
+    "specialize_python_precision_widths",
 ]

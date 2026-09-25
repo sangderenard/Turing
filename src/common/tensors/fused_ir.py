@@ -276,7 +276,20 @@ def flatten_tensor_constant(values: Any) -> tuple[float, ...]:
                 visit(item)
             return
         if isinstance(value, Real):
-            flattened.append(float(value))
+            try:
+                flattened.append(float(value))
+            except OverflowError as error:
+                # Exact structural integers (for example rational range
+                # bounds beyond binary64) are numeric Python constants but
+                # are not tensor-constructor payloads in this float-valued
+                # IR.  Report that boundary as an ordinary non-tensor value;
+                # deployment classification can then keep it in coordinator
+                # structure instead of crashing while merely asking whether
+                # the constant is a tensor.
+                raise ValueError(
+                    "tensor_from_list numeric value is outside the finite "
+                    "binary64 payload range"
+                ) from error
             return
         raise TypeError(
             "tensor_from_list values must be nested numeric sequences; "

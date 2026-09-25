@@ -51,6 +51,7 @@ not in workarounds here.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Sequence
 
 #: Everything about a limb that depends on which float carries it, stated
@@ -64,8 +65,9 @@ from typing import Any, Sequence
 #:   product, it invalidates the theorem.
 #: * ``digits_per_limb`` is ``t * log10(2)``, used to size orders and the
 #:   exact-rational working precision.
-#: * ``max_limbs`` is what the repository lowering accepts; ``ladder`` is
-#:   the widths a lane actually offers. binary64 walks 2/3/4; binary32
+#: * ``max_limbs`` is the conservative automatic-planning default retained
+#:   for compatibility; it is not a repository-lowering limit. ``ladder`` is
+#:   the widths a lane recommends. binary64 walks 2/3/4; binary32
 #:   walks 2/4/6/8 -- even steps, because each rung is priced against the
 #:   binary64 rung it replaces (two f32 limbs per f64 limb) and odd rungs
 #:   would be tiers nothing on the other side corresponds to.
@@ -776,6 +778,16 @@ class Precision:
         # equation parameters retain operator dispatch just like vector limbs.
         return AbstractTensor.get_tensor(self._stack[int(index)])
 
+    def __getitem__(self, key) -> "Precision":
+        """Select elements, every limb with the same key.
+
+        The limbs are ordinary tensors of the declared shape, so indexing
+        each one alike selects whole expansions: no limb of an element is
+        separated from the others.
+        """
+
+        return Precision([term[key] for term in self.terms()], self.limbs)
+
     def terms(self, width: int | None = None) -> list:
         width = self.limbs if width is None else int(width)
         if width == self.limbs:
@@ -880,14 +892,14 @@ class Precision:
         # flatten and used to make scalar AOT parameters fail here.
         return cls(pieces, width)
 
-    def __add__(self, other) -> "Precision": return Precision.dispatch("add", self, other)
-    def __radd__(self, other) -> "Precision": return Precision.dispatch("add", other, self)
-    def __sub__(self, other) -> "Precision": return Precision.dispatch("sub", self, other)
-    def __rsub__(self, other) -> "Precision": return Precision.dispatch("rsub", self, other)
-    def __mul__(self, other) -> "Precision": return Precision.dispatch("mul", self, other)
-    def __rmul__(self, other) -> "Precision": return Precision.dispatch("mul", other, self)
-    def __truediv__(self, other) -> "Precision": return Precision.dispatch("truediv", self, other)
-    def __rtruediv__(self, other) -> "Precision": return Precision.dispatch("rtruediv", self, other)
+    def __add__(self, other): return _composed_binary("add", self, other)
+    def __radd__(self, other): return _composed_binary("add", other, self)
+    def __sub__(self, other): return _composed_binary("sub", self, other)
+    def __rsub__(self, other): return _composed_binary("sub", other, self)
+    def __mul__(self, other): return _composed_binary("mul", self, other)
+    def __rmul__(self, other): return _composed_binary("mul", other, self)
+    def __truediv__(self, other): return _composed_binary("truediv", self, other)
+    def __rtruediv__(self, other): return _composed_binary("truediv", other, self)
     def __neg__(self) -> "Precision": return Precision.dispatch("neg", self, None)
 
     # -- the rest of the basic surface, limb-correct ---------------------
@@ -1322,47 +1334,32 @@ class ComplexPrecision:
     def _pair(self, other: Any) -> "ComplexPrecision":
         return type(self).of(other, self.limbs)
 
-    def __add__(self, other) -> "ComplexPrecision":
-        other = self._pair(other)
-        return type(self)(
-            self.real + other.real, self.imag + other.imag,
-            max(self.limbs, other.limbs),
-        )
+    def __add__(self, other):
+        return _composed_binary("add", self, other)
 
     def __radd__(self, other) -> "ComplexPrecision":
-        return self + other
+        return _composed_binary("add", other, self)
 
-    def __sub__(self, other) -> "ComplexPrecision":
-        other = self._pair(other)
-        return type(self)(
-            self.real - other.real, self.imag - other.imag,
-            max(self.limbs, other.limbs),
-        )
+    def __sub__(self, other):
+        return _composed_binary("sub", self, other)
 
     def __rsub__(self, other) -> "ComplexPrecision":
-        return self._pair(other) - self
+        return _composed_binary("sub", other, self)
 
     def __neg__(self) -> "ComplexPrecision":
         return type(self)(-self.real, -self.imag, self.limbs)
 
-    def __mul__(self, other) -> "ComplexPrecision":
-        other = self._pair(other)
-        real = self.real * other.real - self.imag * other.imag
-        imag = self.real * other.imag + self.imag * other.real
-        return type(self)(real, imag, max(self.limbs, other.limbs))
+    def __mul__(self, other):
+        return _composed_binary("mul", self, other)
 
     def __rmul__(self, other) -> "ComplexPrecision":
-        return self * other
+        return _composed_binary("mul", other, self)
 
-    def __truediv__(self, other) -> "ComplexPrecision":
-        other = self._pair(other)
-        denominator = other.real * other.real + other.imag * other.imag
-        real = (self.real * other.real + self.imag * other.imag) / denominator
-        imag = (self.imag * other.real - self.real * other.imag) / denominator
-        return type(self)(real, imag, max(self.limbs, other.limbs))
+    def __truediv__(self, other):
+        return _composed_binary("truediv", self, other)
 
     def __rtruediv__(self, other) -> "ComplexPrecision":
-        return self._pair(other) / self
+        return _composed_binary("truediv", other, self)
 
     def sum(self) -> "ComplexPrecision":
         return type(self)(self.real.sum(), self.imag.sum(), self.limbs)
@@ -1372,4 +1369,649 @@ class ComplexPrecision:
 
     def __repr__(self) -> str:
         return f"ComplexPrecision(limbs={self.limbs}, shape={self.shape!r})"
+
+
+# --------------------------------------------------------------------------
+# Structural rationals and canonical numerical composition
+
+
+def _component_zero(like: Any):
+    return like * 0
+
+
+def _component_one(like: Any):
+    return _component_zero(like) + 1
+
+
+def _broadcast_shape(left: Any, right: Any) -> tuple[int, ...]:
+    from .abstraction_methods.elementwise import _broadcast_result_shape
+
+    return tuple(_broadcast_result_shape("rational", left.shape, right.shape))
+
+
+#: A rational result whose denominator's leading limb leaves [2**-400, 2**400]
+#: is rebalanced at once.  Its low limbs sit about 53 * (limbs - 1) bits below
+#: the leading one, so inside this band every limb stays a normal float64;
+#: outside it, products overflow or tails fall into subnormals and lose bits.
+#: Measured: a 21-knot spline solve drove the rhs components to 2**-857 with
+#: tails at 2**-1043, and the solved values lost everything past 1e-16.
+_REBALANCE_BAND = 2.0 ** 400
+
+
+def _rebalanced(numerator: Any, denominator: Any, *, band: float | None = None):
+    """Scale numerator and denominator together by an exact power of two,
+    element by element, so each denominator's leading limb sits in [1, 2).
+
+    The quotient is unchanged exactly: both components are multiplied by the
+    same power of two, and a power-of-two multiply is exact while normal.
+    With ``band``, only elements whose denominator has left the band move.
+    """
+
+    from .abstraction import AbstractTensor
+    from .power_scale import _log2_floor, _shift_raw
+
+    head = denominator.term(0) if isinstance(denominator, Precision) else denominator
+    if "float" not in str(getattr(head, "dtype", "") or "").lower():
+        return numerator, denominator            # integer quotients stay integers
+    magnitude = abs(head)
+    shift = _log2_floor(magnitude)
+    if band is not None:
+        drifted = ((magnitude > band) + (magnitude < 1.0 / band)) > 0
+        shift = AbstractTensor.where(drifted, shift, magnitude * 0.0)   # 2**0: exact no-op
+    return _shift_raw(numerator, -shift), _shift_raw(denominator, -shift)
+
+
+class _RationalBase:
+    __slots__ = ("numerator", "denominator")
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return _broadcast_shape(self.numerator, self.denominator)
+
+    def components(self):
+        return self.numerator, self.denominator
+
+    def _binary_same(self, other: "_RationalBase", operation: str):
+        result = self._binary_components(other, operation)
+        numerator, denominator = result.components()
+        numerator, denominator = _rebalanced(
+            numerator, denominator, band=_REBALANCE_BAND,
+        )
+        return type(result)(numerator, denominator)
+
+    def _binary_components(self, other: "_RationalBase", operation: str):
+        a, b = self.components()
+        c, d = other.components()
+        if operation in {"add", "sub"}:
+            left = a * d
+            right = b * c
+            numerator = left - right if operation == "sub" else left + right
+            denominator = b * d
+        elif operation == "mul":
+            numerator, denominator = a * c, b * d
+        elif operation == "truediv":
+            numerator, denominator = a * d, b * c
+        else:
+            raise TypeError(f"unsupported rational operation {operation!r}")
+        return type(self)(numerator, denominator)
+
+    def reciprocal(self):
+        return type(self)(self.denominator, self.numerator)
+
+    def quotient(self):
+        return self.numerator / self.denominator
+
+    def collapse(self):
+        quotient = self.quotient()
+        return quotient.collapse() if isinstance(quotient, Precision) else quotient
+
+    def __add__(self, other): return _composed_binary("add", self, other)
+    def __radd__(self, other): return _composed_binary("add", other, self)
+    def __sub__(self, other): return _composed_binary("sub", self, other)
+    def __rsub__(self, other): return _composed_binary("sub", other, self)
+    def __mul__(self, other): return _composed_binary("mul", self, other)
+    def __rmul__(self, other): return _composed_binary("mul", other, self)
+    def __truediv__(self, other): return _composed_binary("truediv", self, other)
+    def __rtruediv__(self, other): return _composed_binary("truediv", other, self)
+
+    def __neg__(self):
+        return type(self)(-self.numerator, self.denominator)
+
+    # -- element structure -------------------------------------------------
+
+    def __getitem__(self, key):
+        """Select elements: the numerator and denominator with the same key,
+        so each selected element keeps its whole quotient."""
+
+        return type(self)(self.numerator[key], self.denominator[key])
+
+    def __len__(self) -> int:
+        return int(self.shape[0])
+
+    # -- order ---------------------------------------------------------------
+
+    def sign(self):
+        """Elementwise sign as an ordinary tensor.
+
+        Construction normalizes every denominator positive, so the quotient's
+        sign is its numerator's -- exact, no division.
+        """
+
+        return self.numerator.sign()
+
+    def __abs__(self):
+        return type(self)(abs(self.numerator), self.denominator)
+
+    def _order(self, other):
+        return (self - other).sign()
+
+    def __lt__(self, other): return self._order(other) < 0
+    def __le__(self, other): return self._order(other) <= 0
+    def __gt__(self, other): return self._order(other) > 0
+    def __ge__(self, other): return self._order(other) >= 0
+
+    # -- accumulation ----------------------------------------------------------
+
+    def cumsum(self, dim: int = 0):
+        """Running sum along the leading axis, each partial sum a quotient."""
+
+        if int(dim) != 0:
+            raise ValueError("rational cumsum runs along the leading axis only")
+        count = len(self)
+        running = self[0:1]
+        pieces = [running]
+        for index in range(1, count):
+            running = running + self[index:index + 1]
+            pieces.append(running)
+        return concat(pieces, dim=0)
+
+    # -- readout ---------------------------------------------------------------
+
+    def limb_terms(self, limbs: int) -> list:
+        """The quotient as ``limbs`` ordinary tensors whose sum is it.
+
+        Division happens here, once, at the components' own width; the
+        result is then renormalised to exactly ``limbs`` limbs (the tail is
+        folded into the last limb, so the readout is the nearest
+        ``limbs``-limb value, not a truncation).
+        """
+
+        numerator, denominator = _rebalanced(self.numerator, self.denominator)
+        quotient = numerator / denominator
+        if isinstance(quotient, Precision):
+            terms = quotient.terms()
+        else:
+            terms = [quotient]
+        return renormalise(terms, int(limbs))
+
+    def __pow__(self, exponent: int):
+        if not isinstance(exponent, int):
+            raise TypeError("rational powers require an integer exponent")
+        if exponent < 0:
+            return self.reciprocal() ** -exponent
+        result = type(self)(_component_one(self.numerator), _component_one(self.denominator))
+        base, remaining = self, exponent
+        while remaining:
+            if remaining & 1:
+                result = result * base
+            remaining >>= 1
+            if remaining:
+                base = base * base
+        return result
+
+
+class Rational(_RationalBase):
+    """A lazy real AbstractTensor quotient."""
+
+    def __init__(self, numerator: Any, denominator: Any):
+        from .abstraction import AbstractTensor
+
+        if isinstance(numerator, Precision) or isinstance(denominator, Precision):
+            raise TypeError("use RationalPrecision for Precision coefficients")
+        numerator = (
+            numerator if hasattr(numerator, "shape")
+            else AbstractTensor.get_tensor(numerator)
+        )
+        denominator = (
+            denominator if hasattr(denominator, "shape")
+            else numerator * 0.0 + denominator
+        )
+        self.numerator = numerator
+        self.denominator = denominator
+
+    @classmethod
+    def of(cls, value: Any, *, like: Any = None) -> "Rational":
+        if isinstance(value, cls):
+            return value
+        value = _real_coefficient(value, like=like)
+        return cls(value, _component_one(value))
+
+    @classmethod
+    def ratio(cls, numerator: Any, denominator: Any) -> "Rational":
+        return cls(numerator, denominator)
+
+    def __repr__(self) -> str:
+        return f"Rational(shape={self.shape!r})"
+
+
+class RationalPrecision(_RationalBase):
+    """A lazy quotient whose two real coefficients are Precision values."""
+
+    __slots__ = ("limbs",)
+
+    def __init__(self, numerator: Any, denominator: Any, limbs: int = 2):
+        width = max(
+            int(limbs), Precision.width_of(numerator),
+            Precision.width_of(denominator), 1,
+        )
+        numerator = _precision_coefficient(numerator, width)
+        denominator = _precision_coefficient(denominator, width, like=numerator)
+        self.numerator = numerator
+        self.denominator = denominator
+        self.limbs = width
+
+    @classmethod
+    def of(
+        cls, value: Any, limbs: int = 2, *, like: Any = None,
+    ) -> "RationalPrecision":
+        if isinstance(value, cls):
+            return cls(value.numerator, value.denominator, max(limbs, value.limbs))
+        coefficient = _precision_coefficient(value, limbs, like=like)
+        return cls(coefficient, _component_one(coefficient), limbs)
+
+    @classmethod
+    def ratio(
+        cls, numerator: Any, denominator: Any, limbs: int = 2,
+    ) -> "RationalPrecision":
+        return cls(numerator, denominator, limbs)
+
+    def __repr__(self) -> str:
+        return f"RationalPrecision(limbs={self.limbs}, shape={self.shape!r})"
+
+
+class _ComplexRationalBase:
+    __slots__ = ("real", "imag")
+
+    @property
+    def shape(self):
+        return _broadcast_shape(self.real, self.imag)
+
+    def components(self):
+        return self.real, self.imag
+
+    def collapse_components(self):
+        return self.real.collapse(), self.imag.collapse()
+
+    def collapse(self):
+        from .abstraction import AbstractTensor
+
+        real, imag = self.collapse_components()
+        return AbstractTensor.complex(real, imag)
+
+    def conjugate(self):
+        return type(self)(self.real, -self.imag)
+
+    conj = conjugate
+
+    def reciprocal(self):
+        one = type(self).of(_component_one(self.real.numerator), like=self)
+        return one / self
+
+    def _binary_same(self, other: "_ComplexRationalBase", operation: str):
+        a, b = self.components()
+        c, d = other.components()
+        if operation == "add":
+            return type(self)(a + c, b + d)
+        if operation == "sub":
+            return type(self)(a - c, b - d)
+        if operation == "mul":
+            return type(self)(a * c - b * d, a * d + b * c)
+        if operation == "truediv":
+            denominator = c * c + d * d
+            return type(self)(
+                (a * c + b * d) / denominator,
+                (b * c - a * d) / denominator,
+            )
+        raise TypeError(f"unsupported complex-rational operation {operation!r}")
+
+    def __add__(self, other): return _composed_binary("add", self, other)
+    def __radd__(self, other): return _composed_binary("add", other, self)
+    def __sub__(self, other): return _composed_binary("sub", self, other)
+    def __rsub__(self, other): return _composed_binary("sub", other, self)
+    def __mul__(self, other): return _composed_binary("mul", self, other)
+    def __rmul__(self, other): return _composed_binary("mul", other, self)
+    def __truediv__(self, other): return _composed_binary("truediv", self, other)
+    def __rtruediv__(self, other): return _composed_binary("truediv", other, self)
+
+    def __neg__(self):
+        return type(self)(-self.real, -self.imag)
+
+
+class ComplexRational(_ComplexRationalBase):
+    """A complex value with two real Rational coefficients."""
+
+    def __init__(self, real: Any, imag: Any):
+        self.real = _promote_numeric(real, frozenset({"rational"}), 1)
+        self.imag = _promote_numeric(
+            imag, frozenset({"rational"}), 1, like=self.real,
+        )
+
+    @classmethod
+    def of(cls, value: Any, *, like: Any = None) -> "ComplexRational":
+        return _complex_rational_of(cls, value, 1, like=like)
+
+    def __repr__(self) -> str:
+        return f"ComplexRational(shape={self.shape!r})"
+
+
+class ComplexRationalPrecision(_ComplexRationalBase):
+    """A complex value with two RationalPrecision coefficients."""
+
+    __slots__ = ("limbs",)
+
+    def __init__(self, real: Any, imag: Any, limbs: int = 2):
+        width = max(
+            int(limbs), _numeric_width(real), _numeric_width(imag), 1,
+        )
+        self.real = _promote_numeric(
+            real, frozenset({"rational", "precision"}), width,
+        )
+        self.imag = _promote_numeric(
+            imag, frozenset({"rational", "precision"}), width,
+            like=self.real,
+        )
+        self.limbs = width
+
+    @classmethod
+    def of(
+        cls, value: Any, limbs: int = 2, *, like: Any = None,
+    ) -> "ComplexRationalPrecision":
+        return _complex_rational_of(cls, value, limbs, like=like)
+
+    def __repr__(self) -> str:
+        return (
+            f"ComplexRationalPrecision(limbs={self.limbs}, "
+            f"shape={self.shape!r})"
+        )
+
+
+def _numeric_features(value: Any) -> frozenset[str]:
+    if isinstance(value, ComplexRationalPrecision):
+        return frozenset({"complex", "rational", "precision"})
+    if isinstance(value, ComplexRational):
+        return frozenset({"complex", "rational"})
+    if isinstance(value, RationalPrecision):
+        return frozenset({"rational", "precision"})
+    if isinstance(value, Rational):
+        return frozenset({"rational"})
+    if isinstance(value, ComplexPrecision):
+        return frozenset({"complex", "precision"})
+    if isinstance(value, Precision):
+        return frozenset({"precision"})
+    if _complex_dtype(value) or isinstance(value, complex):
+        return frozenset({"complex"})
+    return frozenset()
+
+
+def _numeric_width(value: Any) -> int:
+    return max(int(getattr(value, "limbs", 1) or 1), 1)
+
+
+def _coefficient_template(value: Any):
+    if isinstance(value, Precision):
+        return value.term(0)
+    if isinstance(value, ComplexPrecision):
+        return value.real.term(0)
+    if isinstance(value, _RationalBase):
+        return _coefficient_template(value.numerator)
+    if isinstance(value, _ComplexRationalBase):
+        return _coefficient_template(value.real)
+    if hasattr(value, "shape"):
+        return value
+    return None
+
+
+def _real_coefficient(value: Any, *, like: Any = None):
+    from .abstraction import AbstractTensor
+
+    if _complex_dtype(value) or isinstance(value, complex):
+        raise TypeError("a real coefficient cannot absorb a complex value")
+    if hasattr(value, "shape"):
+        return value
+    template = _coefficient_template(like)
+    if template is not None:
+        return template * 0.0 + value
+    return AbstractTensor.get_tensor(value)
+
+
+def _precision_coefficient(
+    value: Any, width: int, *, like: Any = None,
+) -> Precision:
+    width = max(int(width), 1)
+    if isinstance(value, Precision):
+        if value.limbs == width:
+            return value
+        return Precision(value.terms(width), width)
+    return Precision.of(_real_coefficient(value, like=like), width)
+
+
+def _complex_rational_of(cls, value: Any, limbs: int, *, like: Any = None):
+    from .abstraction import AbstractTensor
+
+    if isinstance(value, cls):
+        if cls is ComplexRationalPrecision:
+            return cls(value.real, value.imag, max(limbs, value.limbs))
+        return value
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        return cls(value[0], value[1], limbs) if cls is ComplexRationalPrecision else cls(*value)
+    if isinstance(value, _ComplexRationalBase):
+        return cls(value.real, value.imag, limbs) if cls is ComplexRationalPrecision else cls(value.real, value.imag)
+    if isinstance(value, ComplexPrecision):
+        return (
+            cls(value.real, value.imag, limbs)
+            if cls is ComplexRationalPrecision
+            else cls(value.real, value.imag)
+        )
+    if isinstance(value, complex):
+        template = _coefficient_template(like)
+        if template is None:
+            real = AbstractTensor.get_tensor(value.real)
+            imag = AbstractTensor.get_tensor(value.imag)
+        else:
+            real = template * 0.0 + value.real
+            imag = template * 0.0 + value.imag
+        return cls(real, imag, limbs) if cls is ComplexRationalPrecision else cls(real, imag)
+    if _complex_dtype(value):
+        tensor = value if isinstance(value, AbstractTensor) else AbstractTensor.get_tensor(value)
+        real, imag = AbstractTensor.real(tensor), AbstractTensor.imag(tensor)
+        return cls(real, imag, limbs) if cls is ComplexRationalPrecision else cls(real, imag)
+    real = value
+    template = _coefficient_template(real)
+    if template is None:
+        template = _coefficient_template(like)
+    imag = template * 0.0 if template is not None else 0.0
+    return cls(real, imag, limbs) if cls is ComplexRationalPrecision else cls(real, imag)
+
+
+_FEATURE_TYPES = {
+    frozenset({"precision"}): Precision,
+    frozenset({"complex", "precision"}): ComplexPrecision,
+    frozenset({"rational"}): Rational,
+    frozenset({"rational", "precision"}): RationalPrecision,
+    frozenset({"complex", "rational"}): ComplexRational,
+    frozenset({"complex", "rational", "precision"}): ComplexRationalPrecision,
+}
+
+
+def numeric_feature_type_registry() -> dict[str, type]:
+    """Return the eager classes that implement each numeric feature set.
+
+    The source compiler uses these exact class objects when an annotation
+    admits wrapper source into the dependency graph. Keeping the registry
+    beside eager promotion prevents annotation dispatch and runtime promotion
+    from acquiring separate notions of the canonical class.
+    """
+
+    return {
+        numeric_type.__name__: numeric_type
+        for numeric_type in _FEATURE_TYPES.values()
+    }
+
+
+def _promote_numeric(
+    value: Any, features: frozenset[str], limbs: int, *, like: Any = None,
+):
+    held = _numeric_features(value)
+    width = max(int(limbs), _numeric_width(value), 1)
+    if held == features and ("precision" not in features or _numeric_width(value) == width):
+        return value
+    if features == frozenset({"precision"}):
+        return _precision_coefficient(value, width, like=like)
+    if features == frozenset({"complex", "precision"}):
+        return ComplexPrecision.of(value, width)
+    if features == frozenset({"rational"}):
+        return Rational.of(value, like=like)
+    if features == frozenset({"rational", "precision"}):
+        if isinstance(value, Rational):
+            return RationalPrecision(value.numerator, value.denominator, width)
+        return RationalPrecision.of(value, width, like=like)
+    if features == frozenset({"complex", "rational"}):
+        return ComplexRational.of(value, like=like)
+    if features == frozenset({"complex", "rational", "precision"}):
+        return ComplexRationalPrecision.of(value, width, like=like)
+    raise TypeError(
+        f"no canonical numerical type for feature set {sorted(features)!r}"
+    )
+
+
+def _same_binary(operation: str, left: Any, right: Any):
+    if isinstance(left, Precision):
+        return Precision.dispatch(operation, left, right)
+    if isinstance(left, ComplexPrecision):
+        width = max(left.limbs, right.limbs)
+        if operation == "add":
+            return ComplexPrecision(left.real + right.real, left.imag + right.imag, width)
+        if operation == "sub":
+            return ComplexPrecision(left.real - right.real, left.imag - right.imag, width)
+        if operation == "mul":
+            return ComplexPrecision(
+                left.real * right.real - left.imag * right.imag,
+                left.real * right.imag + left.imag * right.real,
+                width,
+            )
+        if operation == "truediv":
+            denominator = right.real * right.real + right.imag * right.imag
+            return ComplexPrecision(
+                (left.real * right.real + left.imag * right.imag) / denominator,
+                (left.imag * right.real - left.real * right.imag) / denominator,
+                width,
+            )
+    if isinstance(left, _RationalBase):
+        return left._binary_same(right, operation)
+    if isinstance(left, _ComplexRationalBase):
+        return left._binary_same(right, operation)
+    raise TypeError(f"unsupported composed numerical type {type(left).__name__}")
+
+
+def _composed_binary(operation: str, left: Any, right: Any):
+    features = _numeric_features(left) | _numeric_features(right)
+    width = max(_numeric_width(left), _numeric_width(right), 1)
+    if not features:
+        raise TypeError("composed dispatch requires a numerical wrapper")
+    left_value = _promote_numeric(left, features, width, like=right)
+    right_value = _promote_numeric(right, features, width, like=left_value)
+    if type(left_value) is not type(right_value):
+        target = _FEATURE_TYPES.get(features)
+        raise TypeError(
+            f"promotion to {getattr(target, '__name__', features)!r} disagreed: "
+            f"{type(left_value).__name__}, {type(right_value).__name__}"
+        )
+    return _same_binary(operation, left_value, right_value)
+
+
+def concat(values: Sequence[Any], dim: int = 0):
+    """Concatenate numerical values of one feature set along ``dim``.
+
+    Plain tensors concatenate directly.  A ``Precision`` concatenates limb
+    by limb at the widest width present.  A rational concatenates its
+    numerators and denominators separately -- elements are independent
+    quotients, so no common denominator is formed.
+    """
+
+    from .abstraction import AbstractTensor
+
+    values = list(values)
+    if not values:
+        raise ValueError("concat needs at least one value")
+    features = frozenset().union(*(_numeric_features(value) for value in values))
+    if not features:
+        return AbstractTensor.concat(values, dim=dim)
+    width = max(_numeric_width(value) for value in values)
+    promoted = [_promote_numeric(value, features, width, like=values[0]) for value in values]
+    first = promoted[0]
+    if isinstance(first, Precision):
+        return Precision(
+            [
+                AbstractTensor.concat([value.terms(width)[limb] for value in promoted], dim=dim)
+                for limb in range(width)
+            ],
+            width,
+        )
+    if isinstance(first, _RationalBase):
+        numerator = concat([value.numerator for value in promoted], dim=dim)
+        denominator = concat([value.denominator for value in promoted], dim=dim)
+        return type(first)(numerator, denominator)
+    raise TypeError(f"concat does not support {type(first).__name__}")
+
+
+def where(mask: Any, when_true: Any, when_false: Any):
+    """Elementwise choice between two numerical values, each kept WHOLE.
+
+    A ``Precision`` chooses whole expansions (``Precision._select``: a limb
+    times 0 or 1 is exact).  A rational chooses its numerator and
+    denominator with the same mask, so each element's quotient arrives
+    intact.  Plain tensors use ``AbstractTensor.where``.
+    """
+
+    from .abstraction import AbstractTensor
+
+    features = _numeric_features(when_true) | _numeric_features(when_false)
+    if not features:
+        return AbstractTensor.where(mask, when_true, when_false)
+    width = max(_numeric_width(when_true), _numeric_width(when_false), 1)
+    true_value = _promote_numeric(when_true, features, width, like=when_false)
+    false_value = _promote_numeric(when_false, features, width, like=true_value)
+    if isinstance(true_value, Precision):
+        return true_value._select(false_value, mask)
+    if isinstance(true_value, _RationalBase):
+        return type(true_value)(
+            where(mask, true_value.numerator, false_value.numerator),
+            where(mask, true_value.denominator, false_value.denominator),
+        )
+    raise TypeError(f"where does not support {type(true_value).__name__}")
+
+
+def solve_tridiagonal(lower: Any, diagonal: Any, upper: Any, rhs: Any):
+    """Solve a tridiagonal system by forward elimination and back substitution.
+
+    ``lower[i]`` multiplies ``x[i-1]`` and ``upper[i]`` multiplies ``x[i+1]``
+    in row ``i`` (``lower[0]`` and ``upper[-1]`` are ignored).  Written only
+    in the operations every numerical type here supports -- element
+    slicing, ``+ - * /`` and ``concat`` -- so the same elimination runs on
+    plain tensors, ``Precision`` and rationals.  On a rational every division
+    is deferred as a quotient of component products.
+    """
+
+    count = len(diagonal) if hasattr(diagonal, "__len__") else int(diagonal.shape[0])
+    diag = [diagonal[i:i + 1] for i in range(count)]
+    right = [rhs[i:i + 1] for i in range(count)]
+    for i in range(1, count):
+        factor = lower[i:i + 1] / diag[i - 1]
+        diag[i] = diag[i] - factor * upper[i - 1:i]
+        right[i] = right[i] - factor * right[i - 1]
+    solution = [None] * count
+    solution[-1] = right[-1] / diag[-1]
+    for i in range(count - 2, -1, -1):
+        solution[i] = (right[i] - upper[i:i + 1] * solution[i + 1]) / diag[i]
+    return concat(solution, dim=0)
 

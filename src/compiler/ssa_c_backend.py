@@ -1811,7 +1811,7 @@ def emit_ssa_module_to_c(
 
     # Copy the working LLVM lane's extent ABI: only functions that consume
     # dynamic extents, and callers on paths to them, receive the hidden slot.
-    from .hierarchical_plan import PREDICATE_OPERATIONS
+    from .hierarchical_plan import is_predicate_operation
     from .ssa_llvm_backend import _declared_span_rank, scalar_likeness
 
     extent_users: set[str] = {
@@ -1828,7 +1828,7 @@ def emit_ssa_module_to_c(
         if instruction.res is not None
         and _declared_span_rank(instruction.res) > 0
         and scalar_likeness(str(instruction.op)) is not None
-        and str(instruction.op) not in PREDICATE_OPERATIONS
+        and not is_predicate_operation(instruction.op)
     )
 
     def _extent_needs_runtime(owner: str, instruction) -> bool:

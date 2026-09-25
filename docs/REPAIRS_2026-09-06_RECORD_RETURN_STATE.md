@@ -133,20 +133,20 @@ restore runtime control paths currently folded under the numeric-only ABI.
   cause of that failure.
 
 An intermediate whole-source run completed with 19 formals and zero undefined
-operands/unresolved calls (`build/record_return_full_formals_20260906.log`).
+operands/unresolved calls (`artifacts/compiler_evidence/record_return_full_formals_20260906.log`).
 It preceded the completed edge-matching change and is not its verification.
 The following edge-only diagnostic also completed at 19/zero undefined/zero
-unresolved (`build/record_return_edge_full_formals_20260906.log`), but still
+unresolved (`artifacts/compiler_evidence/record_return_edge_full_formals_20260906.log`), but still
 returned 1378. This caught the missing receipt remap and provisional float64
 Phi types. The alias-only diagnostic was stopped during planning before
 changing the conversion code; its partial log is not a completed result.
 The first typed diagnostic stopped earlier in lexical reduction with a
 missing cached static-reference node at topological_reducer.py's
-`reference_attributes` lookup (`build/record_return_typed_full_formals_20260906.log`).
+`reference_attributes` lookup (`artifacts/compiler_evidence/record_return_typed_full_formals_20260906.log`).
 This was before return linking. A separate clean retry is recorded below;
 the early failure is not a completed formal-count measurement.
 That retry completed with 19 formals, zero undefined operands/unresolved calls
-(`build/record_return_typed_retry_full_formals_20260906.log`), but the then
+(`artifacts/compiler_evidence/record_return_typed_retry_full_formals_20260906.log`), but the then
 over-conservative effect check still retained 1378 at the return. The exact
 receipts were now correctly remapped to receiver 434. Inspection showed the
 calls carry the full record ABI, while `_propose_dt_pen` never consumes its
@@ -165,7 +165,7 @@ the same dominance/effect checks, and original field storage from the record
 table. It preserves output Phi identities and reuses return-edge casts.
 
 Replay on `build/full_formal_diagnostic/repository-ssa.pkl` from
-`build/record_return_field_scope_full_formals_20260906.log` changed exactly four
+`artifacts/compiler_evidence/record_return_field_scope_full_formals_20260906.log` changed exactly four
 step return fields: div_inf 1368 -> 553, mass_err 1369 -> 573,
 dt_limit 1374 -> 555, and hard_failure 1378 -> Cast(593) at 9564.
 The returned hard_failure Phi remains 1482. The second publication changes
@@ -187,7 +187,7 @@ presence storage, and authored child-record ABI recovery remain open.
 
 ### Fresh source result
 
-`build/record_return_publication_full_formals_20260906.log` completed with
+`artifacts/compiler_evidence/record_return_publication_full_formals_20260906.log` completed with
 terminal exit1 at the strict provenance gate: **19 formals, zero undefined
 operands, zero unresolved calls, zero unmaterialized boundaries**, no optional
 merge/non-native findings. The saved module records four final publications:

@@ -1731,6 +1731,42 @@ def test_zero_argument_sequence_pop_loads_last_value_and_commits_length():
     )
 
 
+def test_sequence_remove_scans_shifts_rows_and_commits_length():
+    control = ControlProgram(LoopBlock(
+        "item", "0", "1", "1", SequenceBlock(()),
+        sequence_mutations=(ControlSequenceMutation(
+            20,
+            "remove",
+            (21,),
+            23,
+            policy="duplicates",
+        ),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="sequence_remove",
+        first_value_id=1000,
+        sequence_declarations=((20, "duplicates", 1, True),),
+        sequence_column_dtypes={20: ("int64",)},
+    )
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "ssa_sequence_remove"
+    ]
+    operations = {str(instruction.op).casefold() for instruction in instructions}
+
+    assert shortfalls == ()
+    assert {"eq", "load", "store", "sub"} <= operations
+    assert any(
+        str(instruction.op).casefold() == "call"
+        and instruction.attributes.get("callee") == "turing_validation_error"
+        for instruction in instructions
+    )
+
+
 def test_zero_argument_sequence_clear_commits_zero_length():
     control = ControlProgram(LoopBlock(
         "item", "0", "1", "1", SequenceBlock(()),

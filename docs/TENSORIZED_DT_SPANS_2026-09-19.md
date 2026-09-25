@@ -116,7 +116,7 @@ No compilation speedup is claimed from the small tests.
 ## Worktree cleanup
 
 wtp, wtb and wt_head were removed after preserving binary patches and untracked
-files with SHA256 checks under build/worktree_preservation_20260919. Contaminated
+files with SHA256 checks under artifacts/worktree_preservation/20260919. Contaminated
 wtp was never used as a clean b8e69910 baseline. A stale missing registration was
 pruned; main and gh-pages remain.
 

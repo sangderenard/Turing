@@ -476,20 +476,13 @@ def _exact_respelling(value):
     """An exact identity into constructs this ingestion already lowers, or None.
 
     Every entry is an identity, never an approximation: no smoothing width,
-    no tolerance.  A construct that needs a declared meaning (a Sum over a
-    symbolic bound, a domain integral, an operator on a field) is refused by
-    name instead of guessed.
+    no tolerance.  A construct that needs a declared meaning (a domain
+    integral, an operator on a field) is refused by name instead of guessed.
+    Sum and Product are not respelled here: they are declared reductions,
+    lowered through ``bitops.declare`` (see ``lower_sum_declaration``).
     """
     if isinstance(value, sympy.Subs):
         return value.doit()
-    if isinstance(value, (sympy.Sum, sympy.Product)):
-        reduced = value.doit()
-        if reduced.has(sympy.Sum, sympy.Product):
-            raise TypeError(
-                f"{type(value).__name__} survived symbolic evaluation (symbolic "
-                "bounds): declare its index axis (bitops.Sum over a Domain) so it "
-                f"lowers as a tensor reduction: {value!r}")
-        return reduced
     if isinstance(value, sympy.sign):
         (arg,) = value.args
         return sympy.Piecewise((1, arg > 0), (-1, arg < 0), (0, True))
@@ -520,6 +513,165 @@ def _gauss_legendre_rule(points: int = INTEGRAL_QUADRATURE_POINTS):
 
     nodes, weights = gauss_legendre(points, 17)
     return tuple(zip(nodes, weights))
+
+
+def _split_reduction(value):
+    """Exact identities that split a one-axis Sum/Product, or ``value`` itself.
+
+    Only identities, never approximations:
+
+    * linearity           Sum(f + g) = Sum(f) + Sum(g)
+    * index-free factor   Sum(c * f) = c * Sum(f)        Prod(c * f) = c**n * Prod(f)
+    * index-free body     Sum(c) = n * c                 Prod(c) = c**n
+    * factors of a product  Prod(f * g) = Prod(f) * Prod(g)
+
+    where ``n = hi - lo + 1``.  Each piece is then offered to SymPy again
+    (a piece may close where the whole did not); what is left is a pure
+    numeric reduction.
+    """
+
+    if len(value.limits) != 1 or len(value.limits[0]) != 3:
+        return value
+    limit = value.limits[0]
+    var, lower, upper = limit
+    body = value.function
+    count = upper - lower + 1
+    if isinstance(value, sympy.Sum):
+        if isinstance(body, sympy.Add):
+            return sympy.Add(*(sympy.Sum(term, limit) for term in body.args))
+        independent, dependent = body.as_independent(var, as_Add=False)
+        if dependent == 1:
+            return count * body
+        if independent != 1:
+            return independent * sympy.Sum(dependent, limit)
+        return value
+    independent, dependent = body.as_independent(var, as_Add=False)
+    if dependent == 1:
+        return body ** count
+    if independent != 1:
+        return independent ** count * sympy.Product(dependent, limit)
+    if isinstance(body, sympy.Mul):
+        return sympy.Mul(*(sympy.Product(factor, limit) for factor in body.args))
+    return value
+
+
+def _place_axis(ingest, node_id: int, position: int, rank: int) -> int:
+    """A 1-D axis tensor reshaped to ``rank + 1`` dims, its extent at ``position``.
+
+    The trailing dimension is left for the batch the law runs over, so every
+    ordinary law value (shape ``(batch,)``) broadcasts against every axis.
+    """
+
+    minus_one = ingest.add_node(sympy.Integer(-1))
+    zero = ingest.add_node(sympy.Integer(0))
+    for _ in range(position):
+        node_id = ingest.op("unsqueeze", (node_id, zero))
+    for _ in range(rank - position):
+        node_id = ingest.op("unsqueeze", (node_id, minus_one))
+    return node_id
+
+
+def _reduce_axes(ingest, term: int, rank: int, reduction: str) -> int:
+    zero = ingest.add_node(sympy.Integer(0))
+    for _ in range(rank):
+        term = ingest.op("prod" if reduction == "product" else "sum", (term, zero))
+    return term
+
+
+def lower_sum_declaration(declaration, graph, ingest) -> int:
+    """A declared Sum/Product as one vectorized reduction over its Domain.
+
+    Each index axis is ``lo + arange(n)``; the Domain states its own size at
+    run time (``n = max(hi - lo) + 1`` over whatever the bounds are), so no
+    extent is declared ahead.  The body is evaluated once over every axis
+    together, entries past each axis's own bound are masked to the
+    reduction's neutral element, and one reduction per axis collapses them.
+    Bounds may reference outer indices (a triangular sum): they are ingested
+    with those indices bound to their axes.
+    """
+
+    reduction = declaration.fields["reduction"]
+    neutral = sympy.Integer(1 if reduction == "product" else 0)
+    ordered = tuple(zip(declaration.domain.axes, declaration.domain.limits))[::-1]
+    rank = len(ordered)
+    bindings: dict = {}
+    masks = []
+    for position, (var, limit) in enumerate(ordered):
+        if limit is None:
+            raise TypeError(
+                f"{declaration.sympy!r}: index {var} has no bounds; a reduction "
+                "needs a Domain that states its range")
+        span = limit.upper - limit.lower
+        if span.is_number:
+            count = ingest.add_node(sympy.Integer(int(span) + 1))
+            span_id = ingest.add_node(span)
+        else:
+            span_id = ingest.bound(span, bindings)
+            extent = ingest.op("max", (span_id,))
+            step = sympy.Dummy("extent")
+            count = ingest.bound(step + 1, {step: extent})
+        offset = sympy.Dummy("k")
+        axis = _place_axis(ingest, ingest.op("arange", (count,)), position, rank)
+        spanned = sympy.Dummy("span")
+        masks.append(ingest.bound(sympy.Le(offset, spanned), {offset: axis, spanned: span_id}))
+        bindings[var] = ingest.bound(offset + limit.lower, {**bindings, offset: axis})
+    term = ingest.bound(declaration.fields["body"], bindings)
+    neutral_id = ingest.add_node(neutral)
+    for mask in masks:
+        term = ingest.op("where", (mask, term, neutral_id))
+    return _reduce_axes(ingest, term, rank, reduction)
+
+
+def lower_integral_declaration(declaration, graph, ingest) -> int:
+    """An Integral is a Sum: weights times the integrand at the rule's nodes.
+
+    Each finite axis gets the quadrature rule's nodes mapped onto its bounds
+    (``mid + half * node``) and its weights times ``half``; the weighted
+    integrand is then reduced exactly as a declared Sum is.  The node count is
+    the rule's, so no mask is needed.
+    """
+
+    if "parametric" in declaration.fields:
+        return ingest.add_node(declaration.fields["parametric"])
+    ordered = tuple(zip(declaration.domain.axes, declaration.domain.limits))[::-1]
+    rank = len(ordered)
+    rule = _gauss_legendre_rule()
+    bindings: dict = {}
+    weighted = sympy.Integer(1)
+    weight_bindings: dict = {}
+    for position, (var, limit) in enumerate(ordered):
+        if limit is None:
+            raise TypeError(
+                "Integral survived symbolic integration over a bare domain "
+                f"{var}; a quadrature needs finite bounds or a declared Domain: "
+                f"{declaration.sympy!r}")
+        if limit.linfinity or limit.rinfinity:
+            raise TypeError(
+                "Integral survived symbolic integration with an infinite bound; "
+                f"declare a mapped Domain before quadrature: {declaration.sympy!r}")
+        half = (limit.upper - limit.lower) / 2
+        mid = (limit.upper + limit.lower) / 2
+        nodes = _place_axis(ingest, ingest.op("get_tensor", (
+            ingest.literal(tuple(float(node) for node, _weight in rule)),)), position, rank)
+        weights = _place_axis(ingest, ingest.op("get_tensor", (
+            ingest.literal(tuple(float(weight) for _node, weight in rule)),)), position, rank)
+        node_symbol, weight_symbol = sympy.Dummy("node"), sympy.Dummy("weight")
+        bindings[var] = ingest.bound(mid + half * node_symbol, {**bindings, node_symbol: nodes})
+        weight_bindings[weight_symbol] = weights
+        weighted = weighted * weight_symbol * half
+    term = ingest.bound(weighted * declaration.fields["integrand"],
+                        {**bindings, **weight_bindings})
+    return _reduce_axes(ingest, term, rank, "sum")
+
+
+def _plug_reductions() -> None:
+    from . import bitops
+
+    bitops.plug(bitops.Sum, lower_sum_declaration)
+    bitops.plug(bitops.Integral, lower_integral_declaration)
+
+
+_plug_reductions()
 
 
 def ingest_sympy_expression(
@@ -587,6 +739,65 @@ def ingest_sympy_expression(
                 (node_id, role)
             )
         return node_id
+
+    _unbound = object()
+
+    def bound(value: sympy.Basic, bindings: Mapping[sympy.Basic, int]) -> int:
+        """Ingest ``value`` with some symbols standing for existing nodes.
+
+        Memo entries made while a symbol is bound -- the bound symbol and
+        every subexpression containing it -- are dropped afterwards, so the
+        same index symbol in another reduction starts clean.
+        """
+        saved = {symbol: memo.pop(symbol, _unbound) for symbol in bindings}
+        before = set(memo)
+        memo.update(bindings)
+        try:
+            return add_node(value)
+        finally:
+            for key in set(memo) - before:
+                if key in bindings or (
+                    isinstance(key, sympy.Basic) and key.has(*bindings)
+                ):
+                    del memo[key]
+            for symbol, previous in saved.items():
+                if previous is _unbound:
+                    memo.pop(symbol, None)
+                else:
+                    memo[symbol] = previous
+
+    def tensor_operation(name: str, parent_ids: Sequence[int]) -> int:
+        return make_node(
+            sympy.Dummy(name), SympyProcessGraphRule(name), tuple(parent_ids),
+            tuple(f"arg:{index}" for index in range(len(parent_ids))),
+            {"tensor_operation": name},
+        )
+
+    def literal(value: Any) -> int:
+        return make_node(
+            sympy.Dummy("literal"),
+            SympyProcessGraphRule("const", node_type="Constant"),
+            (), (), {"value": value},
+        )
+
+    class _Ingest:
+        pass
+
+    ingest = _Ingest()
+    ingest.add_node = lambda value: add_node(value)
+    ingest.bound = bound
+    ingest.op = tensor_operation
+    ingest.literal = literal
+
+    def lower_declared(value: sympy.Basic) -> int:
+        from . import bitops
+
+        declaration = bitops.declare(value)
+        if declaration is None or not declaration.complete or declaration.lowering is None:
+            raise TypeError(
+                f"{type(value).__name__} has no complete declaration to lower "
+                f"({declaration!r}): {value!r}")
+        return declaration.lowering(declaration, graph, ingest)
 
     def add_node(value: sympy.Basic) -> int:
         value = sympy.sympify(value)
@@ -792,6 +1003,23 @@ def ingest_sympy_expression(
             memo[value] = result_id
             return result_id
 
+        if isinstance(value, (sympy.Sum, sympy.Product)):
+            # SymPy first (a closed form, or a finite expansion); then the
+            # exact identities, whose pieces are each offered to SymPy again;
+            # what survives both is a numeric reduction over its Domain.
+            try:
+                reduced = value.doit()
+            except (NotImplementedError, TypeError, ValueError, ArithmeticError,
+                    sympy.PolynomialError):
+                reduced = value
+            if reduced != value:
+                result_id = add_node(reduced)
+            else:
+                split = _split_reduction(value)
+                result_id = add_node(split) if split != value else lower_declared(value)
+            memo[value] = result_id
+            return result_id
+
         if isinstance(value, sympy.Integral):
             # An unbounded limit whose symbol does not appear in the
             # integrand is a DOMAIN MEASURE (the catalogue's
@@ -820,33 +1048,12 @@ def ingest_sympy_expression(
                 memo[value] = result_id
                 return result_id
             # SymPy could not integrate it.  An integral IS a sum over a
-            # continuous domain (bitops.Integral subclasses bitops.Sum), so a
-            # DEFINITE integral over finite bounds becomes a Gauss-Legendre
-            # sum unrolled into closed form -- the pattern the compiler
-            # already uses for the reduced tire contact law
-            # (vehicle_tire_reduced_contact_law.py), exact for polynomials up
-            # to degree 2n-1.  An integral over a bare domain symbol (a
-            # surface or volume with no finite bounds) has no domain to put
-            # nodes on; it is refused by name until a Domain is declared.
-            expanded = value.function
-            for limit in reversed(value.limits):
-                if len(limit) != 3:
-                    raise TypeError(
-                        "Integral survived symbolic integration over a bare domain "
-                        f"{limit!r}; a quadrature needs finite bounds or a declared "
-                        f"Domain: {value!r}")
-                var, lower, upper = limit
-                if lower.has(sympy.oo, -sympy.oo) or upper.has(sympy.oo, -sympy.oo):
-                    raise TypeError(
-                        "Integral survived symbolic integration with an infinite "
-                        f"bound; declare a mapped Domain before quadrature: {value!r}")
-                half = (upper - lower) / 2
-                mid = (upper + lower) / 2
-                total = sympy.Integer(0)
-                for node_x, weight in _gauss_legendre_rule():
-                    total += weight * expanded.subs(var, mid + half * node_x)
-                expanded = half * total
-            result_id = add_node(expanded)
+            # continuous domain (bitops.Integral subclasses bitops.Sum): the
+            # declared Integral lowers as the Sum of the quadrature weights
+            # times the integrand at the rule's nodes
+            # (``lower_integral_declaration``).  A bare-domain or infinite
+            # bound is refused there by name.
+            result_id = lower_declared(value)
             memo[value] = result_id
             return result_id
 

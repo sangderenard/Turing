@@ -7,6 +7,13 @@ Cases (any subset as arguments; default all):
             (the PieceState view model probe)
   toplevel  the real ``_propose_dt_pen`` with its top-level early return,
             under the real Metrics/Targets ABI (repro_return_merge_toplevel)
+  energy    the real ``_energy_time_limit`` with its shape-15 Metrics ABI and
+            repository tensor kernels
+  controller the real ``STController`` update/PI methods through one record
+             receiver and repository tensor kernels
+  controller_untyped the same controller path without root scalar Python-type
+             declarations, matching callers whose identities must arrive
+             through whole-program callsite concordance
   mapping   ``for name, limit in channels.items()`` over a bare keyed
             mapping parameter (repro_loop_dominance)
 
@@ -152,6 +159,99 @@ def _lower_toplevel():
     return module
 
 
+def _lower_energy():
+    from src.common.dt_system.dt_controller import _energy_time_limit
+    from src.common.tensors import AbstractTensor
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    source = "\n\n".join((
+        inspect.getsource(_energy_time_limit),
+        "def root(metrics, targets):\n"
+        "    return _energy_time_limit(metrics, targets)\n",
+    ))
+    base = ExtractionContract(
+        CONTRACTS / "program_extraction.yaml"
+    ).program_abi.receipt()
+    policy = ExtractionContract(
+        CONTRACTS / "program_extraction.yaml"
+    ).with_program_abi({
+        "records": {
+            "Metrics": base["records"]["Metrics"],
+            "Targets": base["records"]["Targets"],
+        },
+        "bindings": [
+            {"function": "*", "parameter": "metrics", "record": "Metrics"},
+            {"function": "*", "parameter": "targets", "record": "Targets"},
+        ],
+        "values": [],
+    })
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="concordance_energy",
+        python_bindings={"AbstractTensor": AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        extraction_contract=policy,
+    )
+    return module
+
+
+def _lower_controller(*, declare_root_types: bool = True):
+    from src.common.dt_system.dt_controller import STController, _restore_type
+    from src.common.tensors import AbstractTensor
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    source = "\n\n".join((
+        inspect.getsource(_restore_type),
+        inspect.getsource(STController),
+        "def root(ctrl, max_vel, dx, dt_prev, dt_pen, osc):\n"
+        "    ctrl.update_dt_max(max_vel, dx)\n"
+        "    return ctrl.pi_update(dt_prev, dt_pen, osc)\n",
+    ))
+    base = ExtractionContract(
+        CONTRACTS / "program_extraction.yaml"
+    ).program_abi.receipt()
+    policy = ExtractionContract(
+        CONTRACTS / "program_extraction.yaml"
+    ).with_program_abi({
+        "records": {"STController": base["records"]["STController"]},
+        "bindings": [
+            {"function": "*", "parameter": "ctrl", "record": "STController"},
+        ],
+        "values": ([
+            {
+                "function": "root", "parameter": name,
+                "storage": "scalar", "dtype": dtype, "rank": 0,
+                "python_type": python_type,
+            }
+            for name, dtype, python_type in (
+                ("max_vel", "float64", "builtins.float"),
+                ("dx", "float64", "builtins.float"),
+                ("dt_prev", "float64", "builtins.float"),
+                ("dt_pen", "float64", "builtins.float"),
+                ("osc", "bool", "builtins.bool"),
+            )
+        ] if declare_root_types else []),
+    })
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="concordance_controller",
+        python_bindings={"AbstractTensor": AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        extraction_contract=policy,
+    )
+    return module
+
+
+def _lower_controller_untyped():
+    return _lower_controller(declare_root_types=False)
+
+
 def _lower_mapping():
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
@@ -172,6 +272,9 @@ def _lower_mapping():
 CASES = {
     "view": _lower_view,
     "toplevel": _lower_toplevel,
+    "energy": _lower_energy,
+    "controller": _lower_controller,
+    "controller_untyped": _lower_controller_untyped,
     "mapping": _lower_mapping,
 }
 

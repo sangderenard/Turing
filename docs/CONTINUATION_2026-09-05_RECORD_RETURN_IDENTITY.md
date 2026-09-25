@@ -1163,7 +1163,7 @@ and is a verified wait. With no Python/native compiler process present, started
 one full diagnostic (no --plan-only):
 python -u tools/lower_vehicle_validator_program.py --output
 build/vehicle_validator_project_placement_integrated
-Output redirected to build/vehicle_validator_project_placement_integrated.log.
+Output redirected to artifacts/compiler_evidence/vehicle_validator_project_placement_integrated.log.
 Unified exec session91926, Windows PID18764, started12:39:27. Latest live process
 inspection:250.30 CPU seconds,847835136 resident bytes. Session polls still say
 running; no terminal receipt exists yet. Resume this exact session, do not launch
@@ -1346,7 +1346,7 @@ GPU invocation. No placement policy change made in this turn.
 Started one real exact-entry --plan-only diagnostic after tests terminated:
 python -u tools/lower_vehicle_validator_program.py --plan-only --output
 build/vehicle_validator_thread_target_source_fix
-Log:build/vehicle_validator_thread_target_source_fix.log.
+Log:artifacts/compiler_evidence/vehicle_validator_thread_target_source_fix.log.
 Unified session47667, PID4812, start13:13:21. Confirmed running by session poll
 and Get-Process; last published stage building complete ProcessGraph source
 closure. Resume this session, do not restart on observation timeout. No source
@@ -1384,7 +1384,7 @@ Started fresh managed DT+tire prerequisite build (not whole vehicle result):
 python -u tools/build_balloon_tire_native.py --managed-dt --batch-size8
 --optimization O2 --frames0 --output build/managed_superstep_refresh_20260905
 (Actual CLI used spaces: --batch-size 8 and --frames 0.)
-Log build/managed_superstep_refresh_20260905.log. Session18206, PID13860,
+Log artifacts/compiler_evidence/managed_superstep_refresh_20260905.log. Session18206, PID13860,
 start13:16:58. Last confirmed alive20.06CPU seconds, stage reducing source topology.
 No other Python/native compiler running before launch. No source edits during
 build. Resume same session; do not relaunch on timeout. --frames0 prevents
@@ -1569,14 +1569,14 @@ planned_region10 actual0/formal76(sequence_arenaTrue) isbool(reasons) path and
 Ret76,332. Needsrealresidentsequence/presencebinding, notanarbitraryscalarinput.
 
 CURRENT LIVE BUILD:
-python -u build/run_managed_binding_probe.py
+python -u tools/compiler_probes/run_managed_binding_probe.py
 Wrapperrunsnormal tools/build_balloon_tire_native.py --managed-dt --batch-size8
 --optimization O2 --frames0 --output build/managed_dt_record_merge_receipts_20260905
 withactualspaces. It catcheserrors ONLYto saveunfinishedall_functions/tables from
 traceback asfailed-link-ssa.pkl (module,{},()), metadata diagnostic_incompleteTrue,
 thenre-raisesoriginalerror. NormalcompletedSSA/C artifacts useexistingmanaged
 emitter. Wrapperisignoredlocalbuilddiagnostic, notproductionprogram orchestration.
-Logbuild/managed_dt_record_merge_receipts_20260905.log.
+Logartifacts/compiler_evidence/managed_dt_record_merge_receipts_20260905.log.
 Session78547,PID5848,start14:26:24,lastCPU20.50s,stage reducing source topology.
 NootherPython/nativecompiler beforelaunch. Resume78547; doNOTrestartonobservation
 timeout. NofullDTexecutable/parity/performanceyet. Goalactive.
@@ -1627,7 +1627,7 @@ AFTER prior mutations; do not place it immediately after list creation.
 No sequence fix made yet. Avoid compiler edits while the live build imports it.
 
 CURRENT LIVE BUILD (supersedes earlier live notes): session90068, PID16520,
-started14:39:26. Wrapper build/run_managed_binding_probe.py now selects
+started14:39:26. Wrapper tools/compiler_probes/run_managed_binding_probe.py now selects
 build/managed_dt_output_storage_20260905; log same basename.log.
 Runs one full managed build, O2, batch8, frames0. Last observed stage selecting
 complete control/operator deployment. No other Python/native compiler at launch.
@@ -1676,8 +1676,8 @@ two existing sequence-query scheduling checks in test_fortran_c_shell.py.
 No full DT native parity yet. Do not infer full correctness from six tests.
 
 CURRENT LIVE BUILD: session41778, PID19476, start14:49:51, lastCPU21.78s,
-reducing source topology. Command python -u build/run_managed_binding_probe.py
-redirected to build/managed_dt_sequence_truth_20260905.log; wrapper's output
+reducing source topology. Command python -u tools/compiler_probes/run_managed_binding_probe.py
+redirected to artifacts/compiler_evidence/managed_dt_sequence_truth_20260905.log; wrapper's output
 now build/managed_dt_sequence_truth_20260905. Full managed DT, batch8, O2,
 frames0. No other compiler/Python process before launch. Resume SAME session;
 no restart on observation timeout. If C complete, this also builds DLL/exe,
@@ -1788,7 +1788,7 @@ PASSES. Together with scalar-result-type test and new nativeBoolean test:
 3passed12.79s. No native full record-return parity claim; first testchecksSSA.
 
 CURRENT LIVE: session8623, PID2844, start15:08:09, CPU16.50s at lastpoll.
-Wrapper build/run_managed_binding_probe.py output selects
+Wrapper tools/compiler_probes/run_managed_binding_probe.py output selects
 build/managed_dt_result_contract_refresh_20260905; log samebasename.log.
 Fullmanaged DT batch8 O2 frames0, no other heavy process at launch. Resume8623,
 do not restart on timeout. Next confirm missing47/57 gone and native build
@@ -1891,7 +1891,7 @@ Don't assumeorderingfixed from helper test. Also retainedoptional dtypeNone
 storage semantics need realparity, notforced float/int type choices.
 
 CURRENT LIVE BUILD session86224, PID15832, start15:25:42, lastCPU14.36s.
-Wrapper build/run_managed_binding_probe.py output now
+Wrapper tools/compiler_probes/run_managed_binding_probe.py output now
 build/managed_dt_forwarded_fields_20260905; log samebasename.log.
 Fullmanaged batch8 O2 frames0 includes prior indexed-store fix and newfield
 forwarding. No other compiler/Python process at launch. ResumeSAME86224; don't
@@ -1948,16 +1948,16 @@ returned output buffers only when they are not root arguments; missing inputs
 remain errors. Manifest labels output role and return index. Parity tool now
 captures eager returned values as well as mutated inputs.
 Native compilation in progress session44475/PID18872 via ignored
-build/resume_managed_native.py. Re-emits the unchanged complete fresh SSA and
+tools/compiler_probes/resume_managed_native.py. Re-emits the unchanged complete fresh SSA and
 uses corrected normal compile wrapper; no modified SSA/physics or component
 orchestration. Do not start another build. No native/parity success yet.
 Added tests/test_managed_native_output_contract.py, not run yet.
 
-Ordering diagnosis while toolchain runs: build/probe_managed_order.py is a
+Ordering diagnosis while toolchain runs: tools/compiler_probes/probe_managed_order.py is a
 small source-lowering probe. Direct source call and Python-bound direct call
 both preserve reset -> advance -> report ordering. Changing advance to take
 an authored callback produces reset -> report -> specialized advance in root
-SSA. Session49099 terminal; log build/probe_managed_order.log. No native run
+SSA. Session49099 terminal; log artifacts/compiler_evidence/probe_managed_order.log. No native run
 of this probe and no ordering source fix yet. Full DT C has a different
 manifestation (run_superstep before telemetry-reset region); investigate
 specialization/callsite anchors and region composition, not broad sorting.
@@ -1971,7 +1971,7 @@ PIDs11188/19176 (~1178CPU seconds, ~2GB). It did NOT report a compiler error
 before cancellation. Changed sequence because emitted C already has known
 ordering defect: debug native execution should precede expensive optimization.
 No competing build overlapped. Do not interpret this as optimizer failure.
-Current build session66549, ignored build/resume_managed_native.py now O0.
+Current build session66549, ignored tools/compiler_probes/resume_managed_native.py now O0.
 Same unchanged full source-lowered repository-ssa.pkl is re-emitted; saves
 native-artifact.pkl for later packaging reuse. Then normal corrected wrapper
 creates executable/manifest. Still no native run/parity yet.
@@ -2016,7 +2016,7 @@ User reminded us of slow Python setup, possible pathological configs, and the
 contract's symbolic-value policy. Setup is outside native subprocess timing;
 inspect contracts/producer binding before blaming configuration or changing it.
 
-Ignored build/trace_managed_c.py instruments a COPY of C, not a fresh compiler
+Ignored tools/compiler_probes/trace_managed_c.py instruments a COPY of C, not a fresh compiler
 product. First trace52680 timeout20s showed repeated superstep step calls.
 Narrower trace34813 TERMINAL (script0, tracedexe3) showed:
 LOOP total=0 cap=0; STEPdt0; ADVANCEdt0; step returnednext0 used0; then an alignment
@@ -2034,7 +2034,7 @@ boolean tests (generic/repository provider, return/store-to-span) + wrapper test
 7passed50.01s. New Cbackendfix NOT yet re-emitted into full DT artifact!
 Cached native-artifact.pkl contains OLD C; explicitly re-emit before next build.
 
-Cap inspector build/inspect_dt_cap.py/log: run_superstep formal175 has
+Cap inspector tools/compiler_probes/inspect_dt_cap.py/log: run_superstep formal175 has
 ssa_call_result_from=(...run_superstep...__planned_region_5,175). While Phi350
 initialinput175, updated253. Caller binds it to private zeroed160 with no producer.
 Region5 exists in module and computes minimum(capture48,capture53)->175, but
@@ -2071,7 +2071,7 @@ this one-iteration regression does not prove repeated-call carried binding.
 Fresh FULL SOURCE DT+tire lowering/build is ACTIVE session43311, O0, batch8,
 window_duration=dt_initial=2**-20, directory
 build/managed_dt_predicate_partition_20260905. Driver:
-python -u build/run_managed_binding_probe.py. No other build/native job running.
+python -u tools/compiler_probes/run_managed_binding_probe.py. No other build/native job running.
 This incorporates current planner and C backend; saved older SSA cannot validate
 planner changes. After completion run tools/managed_dt_parity.py on this directory
 with one frame and bounded timeout. Script now runs eager even after native
@@ -2106,8 +2106,8 @@ No live jobs. Full-program cap ordering remains unresolved; goal remains active.
 
 Previous goal turn was progress (source fix, native rebuild/parity evidence).
 This turn captured the full run_superstep graph and overlay before SSA via
-build/capture_dt_overlay.py, session15882 terminal0. Snapshot build/dt-overlay.pkl,
-logs build/dt-overlay.log and dt-overlay-inspection.log. Capture script currently
+tools/compiler_probes/capture_dt_overlay.py, session15882 terminal0. Snapshot build/dt-overlay.pkl,
+logs artifacts/compiler_evidence/dt-overlay.log and dt-overlay-inspection.log. Capture script currently
 predates region_dependencies keyword; update signature before reusing it.
 
 Runtime flat order was (0..14), while owned3,4,7..13, cap producer6 outside.
@@ -2128,7 +2128,7 @@ session24126 terminal0. No claim about full native behavior from these tests.
 
 Fresh full source DT+tire build ACTIVE session11416, directory
 build/managed_dt_atomic_control_order_20260905. O0,batch8,window=dt=2**-20.
-No other heavy build/native job. Driver build/run_managed_binding_probe.py.
+No other heavy build/native job. Driver tools/compiler_probes/run_managed_binding_probe.py.
 After completion run bounded parity on this directory, not previous binaries.
 
 Read-only follow-up while11416 builds: likely cause of stale loop-call inputs
@@ -2149,7 +2149,7 @@ atomic control prerequisite ordering in the actual full DT source build.
 Parity45565 TERMINAL1: original native timed out60s. Eager exit0, setup15.479724s,
 stepping0.276441s. No successful native/eager parity or performance result.
 
-Instrumented COPY built/run via updated build/trace_managed_c.py,48147TERMINAL0.
+Instrumented COPY built/run via updated tools/compiler_probes/trace_managed_c.py,48147TERMINAL0.
 trace-native.log: LOOP cap=2**-20, STEP dt=2**-20, ADVANCE dt=2**-20, then
 STEP RETURN next=0 used=0, traceexe exits0. Stack layout differs, so this is
 provenance evidence only, not an execution fix. Original executable remains hung.
@@ -2228,7 +2228,7 @@ exit0 without timeout, but 11 buffer comparisons fail. Artifact directory:
 build/managed_dt_return_order_20260905. O0,batch8,window=dt=2**-20.
 Eager setup16.650621s, stepping0.276684s; no optimized/native timing claim.
 Native advanced/dt_next remain0; material max displacement/velocity are NaN.
-Details: build/return-order-mismatches.log and artifact managed-dt-parity.json.
+Details: artifacts/compiler_evidence/return-order-mismatches.log and artifact managed-dt-parity.json.
 
 New check_definition_dominance in src/compiler/ssa_self_check.py has three
 focused passing tests (tests/test_ssa_definition_dominance.py,3passed1.87s).
@@ -2242,20 +2242,20 @@ fields1649..1660 defined in while_body. This is not a symbolic zero fixture.
 Active contract confirmed program_extraction.yaml + vehicle_full_native_execution
 with abstract_tensor/all_numeric and explicit runtime window_duration/dt_initial.
 
-build/probe_forward_loop.py is an ignored exploratory reduction, NOT a passing
+tools/compiler_probes/probe_forward_loop.py is an ignored exploratory reduction, NOT a passing
 regression. Local normalize with explicit Metrics ABI appears after its first
 consumer; real coerce_metrics with empty channels rejects missing receiver
 error_channels.length, with nonempty channels rejects undefined return field25.
 These reductions have not yet reproduced exact full-program entry relocation.
 
-ACTIVE diagnostic lowering session9550, script build/trace_coerce_placement.py,
-output build/coerce-placement-trace.log. sys.settrace watches marker/loop-anchor
+ACTIVE diagnostic lowering session9550, script tools/compiler_probes/trace_coerce_placement.py,
+output artifacts/compiler_evidence/coerce-placement-trace.log. sys.settrace watches marker/loop-anchor
 functions for exact call460 in step. No native run or C compilation is launched.
 Poll this existing session; do not restart it on observation timeout. Need inspect
 MARKER RETURN/INPUTS lines to identify why lexical loop ownership was lost.
 Goal remains full validator; DT parity prerequisite still FAILING. No commit/push.
 
-Trace9550 TERMINAL0 (LOWERING COMPLETE). See build/coerce-placement-trace.log.
+Trace9550 TERMINAL0 (LOWERING COMPLETE). See artifacts/compiler_evidence/coerce-placement-trace.log.
 Contrary to earlier relocation suspicion, FIRST replace_at_callsite_marker for
 coerce460 returnsFalse (no marker; last iterated block if_merge.20 is NOT its
 location). insert_at_loop_anchor alsoFalse. NEXT link refresh finds the existing
@@ -2265,19 +2265,19 @@ Need inspect _schedule_loop_callsites output and subsequent structural passes,
 not simply disable marker relocation. No production compiler edit made from
 unproven relocation theory.
 Reduced root(dt,metrics)->while->normalize(metrics)->return max_vel with explicit
-Metrics ABI rejects undefinedoperand6; build/probe_forward_input.py records that
+Metrics ABI rejects undefinedoperand6; tools/compiler_probes/probe_forward_input.py records that
 separate single-field forwarding seam, not yet exact missing-marker reproduction.
-New driver build/capture_step_call_schedule.py wraps only the scheduler (no global
+New driver tools/compiler_probes/capture_step_call_schedule.py wraps only the scheduler (no global
 sys.settrace overhead) and saves exact control/plan/signatures/result to
 build/step-call-schedule.pkl for cheap local replay of the scheduling defect.
-ACTIVE capture86652 writes build/step-call-schedule-capture.log; expected saved
+ACTIVE capture86652 writes artifacts/compiler_evidence/step-call-schedule-capture.log; expected saved
 build/step-call-schedule.pkl. This is full lowering only, no native/C build.
 Trace9550 is terminal; no overlap. Poll86652 next.
 
 18:45 capture86652 TERMINAL0. Exact scheduler input/output saved in
 build/step-call-schedule.pkl (433754bytes), replay via
 python -m build.inspect_step_call_schedule. Output in
-build/step-call-schedule-inspection.log. Plan DOES contain coerce460 with
+artifacts/compiler_evidence/step-call-schedule-inspection.log. Plan DOES contain coerce460 with
 binding459->460; scheduled marker lives root/2/loop616/1. Thus marker disappears
 AFTER scheduling, BEFORE initial link, not absent from hierarchy. Also advance326
 is wrongly at root/2/loop616/29, after coerce. Hierarchy anchors advance on region9
@@ -2291,7 +2291,7 @@ inputs; unknown arm content remains a barrier. New
 failed before (producer index3,consumer0), passed after.
 Focused file + test_precompile_to_ssa:76passed5failed4.84s, session25573 terminal1.
 Baseline disabling ONLY new conditional signature in memory:75passed SAME5failed
-2.31s; build/check_scheduler_baseline.py. Failures are old mean/Fill expectation,
+2.31s; tools/compiler_probes/check_scheduler_baseline.py. Failures are old mean/Fill expectation,
 index dtype, record getattr field capture, nested row alias-accounting equality,
 and nested loop result alias-accounting equality. Do not call entire file green.
 

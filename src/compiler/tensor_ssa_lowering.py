@@ -356,7 +356,9 @@ def _shape_polymorphic_function(function_name: str) -> bool:
         return False
 
 
-def _settle_operand_shapes(function_name: str, values: Any) -> None:
+def _settle_operand_shapes(
+    function_name: str, values: Any, numeric_scope: str | None = None,
+) -> None:
     """Read each operand's shape from the concordance before dispatching.
 
     An SSAValue's shape is a field somebody filled in at construction, and
@@ -383,10 +385,16 @@ def _settle_operand_shapes(function_name: str, values: Any) -> None:
         # that it speaks for itself.
         if (value.accounting or {}).get("ssa_storage_view"):
             continue
-        try:
-            settled = proven_shape_of(function_name, int(value.id))
-        except Exception:
-            continue
+        settled = None
+        for scope in (numeric_scope, function_name):
+            if scope is None:
+                continue
+            try:
+                settled = proven_shape_of(scope, int(value.id))
+            except Exception:
+                continue
+            if settled:
+                break
         if settled and tuple(value.shape or ()) != settled:
             # The call-edge concordance has already proved that this helper
             # has no single formal shape.  A nonempty shape on its exact
@@ -1933,7 +1941,8 @@ def lower_tensor_calls_to_repository_ssa(
         # a static count -- the exact read that baked a wrong element
         # count from a formal whose true rank was already proven
         # elsewhere, just not onto this particular object.
-        _settle_operand_shapes(function_name, function.args)
+        numeric_scope = (function.metadata or {}).get("source_numeric_scope")
+        _settle_operand_shapes(function_name, function.args, numeric_scope)
         function_argument_ids = {int(value.id) for value in function.args}
         unresolved_argument_ids = {
             int(value.id)
@@ -2301,9 +2310,13 @@ def lower_tensor_calls_to_repository_ssa(
                 # the opcode falls through to the scalar emitter, which writes
                 # element zero and leaves the rest of the buffer untouched.
                 # Take the settled fact for the identity before deciding.
-                _settle_operand_shapes(function_name, instruction.args)
+                _settle_operand_shapes(
+                    function_name, instruction.args, numeric_scope,
+                )
                 if instruction.res is not None:
-                    _settle_operand_shapes(function_name, (instruction.res,))
+                    _settle_operand_shapes(
+                        function_name, (instruction.res,), numeric_scope,
+                    )
                 candidate_only = bool(
                     instruction.attributes.get("tensor_candidate") is not None
                     and instruction.attributes.get("tensor_operation") is None
@@ -2967,9 +2980,11 @@ def lower_tensor_calls_to_repository_ssa(
                 # structure (shape, axis, dtype, keepdim, ...).  Dropping a
                 # constant first operand made calls such as
                 # ``broadcast_to(1.0, (m, n))`` appear to have no source.
-                _settle_operand_shapes(function_name, args)
+                _settle_operand_shapes(function_name, args, numeric_scope)
                 if instruction.res is not None:
-                    _settle_operand_shapes(function_name, (instruction.res,))
+                    _settle_operand_shapes(
+                        function_name, (instruction.res,), numeric_scope,
+                    )
                 data_positions = (
                     frozenset({0, 1, 2})
                     if operation == "where" else frozenset({0})
@@ -3473,9 +3488,33 @@ def lower_tensor_calls_to_repository_ssa(
                             callee = "cast_double_to_double_values"
                         else:
                             callee = "cast_double_to_float_values"
-                    count = need_count(source, source_count)
-                    if count is not None:
-                        emitted.append(call(callee, [source, result, count], result, instruction, output_argument=1))
+                    if not tuple(source.shape or ()) and int(
+                        (source.accounting or {}).get("program_abi_rank", 0)
+                        or 0
+                    ) == 0 and not shape_unknown(source) and identity_book(
+                        module
+                    ).page("scalar_kernel_operand_concordance").concord(
+                        (str(function_name), int(result.id)), "scalar_cast",
+                    ) == "scalar_cast":
+                        # An exact scalar conversion (``float(flag)`` on a
+                        # scalar record field) is ordinary scalar SSA, as a
+                        # scalar reduction is above.  Sending it through the
+                        # elementwise kernel invented a span of unknown
+                        # length, which the call-type pass then pushed onto
+                        # the operand and the emitter rightly refused.
+                        result.shape = ()
+                        emitted.append(Instr(
+                            "Cast", [source], result,
+                            attributes={
+                                "lowered_from": operation,
+                                "scalar_cast_identity": True,
+                            },
+                            source_span=instruction.source_span,
+                        ))
+                    else:
+                        count = need_count(source, source_count)
+                        if count is not None:
+                            emitted.append(call(callee, [source, result, count], result, instruction, output_argument=1))
 
                 elif (
                     operation in {"transpose", "swapaxes", "permute"}
@@ -3589,6 +3628,72 @@ def lower_tensor_calls_to_repository_ssa(
                                 attributes={"lowered_from": "mean"},
                                 source_span=instruction.source_span,
                             ))
+                    elif (
+                        axis is None
+                        and operation in _REDUCTION_CODES
+                        and source_count is not None
+                    ):
+                        # The repository reduction kernel is axis-based.  The
+                        # eager C backend already implements an all-axis
+                        # reduction by viewing the same storage as one flat
+                        # dimension; publish that exact view here instead of
+                        # leaving max/any/all/prod/min without call operands.
+                        # This changes only the reduction domain, never the
+                        # source tensor's storage identity or descriptor.
+                        flat_shape, flat_shape_def = int_vector((
+                            int(source_count),
+                        ))
+                        flat_rank, flat_rank_def = constant(1, "int32")
+                        flat_axis, flat_axis_def = constant(0, "int32")
+                        code, code_def = constant(
+                            _REDUCTION_CODES[operation], "int32"
+                        )
+                        domain_fact = (
+                            int(source.id), str(operation),
+                            tuple(map(int, source.shape)),
+                            int(source_count),
+                        )
+                        domain_page = identity_book(module).page(
+                            "tensor_reduction_domain_concordance"
+                        )
+                        domain_row = (str(function_name), int(result.id))
+                        incumbent = domain_page.latest(domain_row)
+                        if incumbent is not None and incumbent != domain_fact:
+                            raise ValueError(
+                                "tensor reduction domain concordance "
+                                f"disagreement for {domain_row!r}: "
+                                f"{incumbent!r} != {domain_fact!r}"
+                            )
+                        if incumbent is None:
+                            domain_page.set(domain_row, 0, domain_fact)
+                        result.shape = ()
+                        if str(result.dtype or "").casefold() in {"bool", "i1"}:
+                            result.accounting = {
+                                **dict(result.accounting or {}),
+                                "physical_dtype": "float64",
+                            }
+                        prefix.extend((
+                            flat_shape_def, flat_rank_def, flat_axis_def,
+                            code_def,
+                        ))
+                        reduction_instruction = dataclasses.replace(
+                            instruction,
+                            attributes={
+                                **dict(instruction.attributes or {}),
+                                "tensor_reduction_domain_concordance": (
+                                    domain_fact
+                                ),
+                            },
+                        )
+                        emitted.append(call(
+                            "reduce_dim_double",
+                            [
+                                source, result, flat_shape, flat_rank,
+                                flat_axis, code,
+                            ],
+                            result, reduction_instruction,
+                            output_argument=1,
+                        ))
                     elif axis is not None and shape_unknown(source) and operation in _REDUCTION_CODES:
                         # Symbolic source: shape and rank ride as runtime
                         # extents; the kernel already takes them as operands.
@@ -3846,7 +3951,32 @@ def lower_tensor_calls_to_repository_ssa(
 
                 elif operation in {"broadcast_to", "expand"} and source is not None:
                     output_shape = broadcast_shape
-                    if output_shape is not None and (
+                    if (
+                        output_shape is not None
+                        and not tuple(source.shape or ())
+                        and int((source.accounting or {}).get(
+                            "program_abi_rank", 0
+                        ) or 0) == 0
+                        and not shape_unknown(source)
+                        and identity_book(module).page(
+                            "scalar_kernel_operand_concordance"
+                        ).concord(
+                            (str(function_name), int(result.id)),
+                            "scalar_fill",
+                        ) == "scalar_fill"
+                    ):
+                        # Broadcasting an exact scalar is a fill: the value
+                        # crosses by value.  Passing it to the array kernel as
+                        # a rank-zero buffer made its caller's scalar a span
+                        # of unknown length at the call boundary.
+                        result.shape = tuple(map(int, output_shape))
+                        count = need_count(result, _known_count(result))
+                        if count is not None:
+                            emitted.append(call(
+                                "fill_double", [result, source, count],
+                                result, instruction, output_argument=0,
+                            ))
+                    elif output_shape is not None and (
                         source.shape or source.dtype is not None
                     ):
                         output_shape = tuple(map(int, output_shape))
@@ -4152,6 +4282,64 @@ def lower_tensor_calls_to_repository_ssa(
                                             data_args[1], scalar, result,
                                             count, opcode_ssa, reverse,
                                         ],
+                                        result,
+                                        instruction,
+                                        output_argument=2,
+                                    ))
+                                elif any(
+                                    not tuple(operand.shape or ())
+                                    and int((operand.accounting or {}).get(
+                                        "program_abi_rank", 0
+                                    ) or 0) == 0
+                                    and not shape_unknown(operand)
+                                    for operand in data_args
+                                ) and any(
+                                    tuple(operand.shape or ())
+                                    == tuple(result.shape or ())
+                                    and tuple(result.shape or ())
+                                    for operand in data_args
+                                ):
+                                    # One exact scalar operand against an
+                                    # array (``x > limit``): the scalar crosses
+                                    # by value into the scalar kernel, exactly
+                                    # as a literal does above.  Broadcasting
+                                    # it through ``broadcast_double`` passed a
+                                    # rank-zero buffer and made the caller's
+                                    # scalar a span of unknown length.
+                                    scalar_position = next(
+                                        position
+                                        for position, operand in enumerate(data_args)
+                                        if not tuple(operand.shape or ())
+                                        and not shape_unknown(operand)
+                                    )
+                                    identity_book(module).page(
+                                        "scalar_kernel_operand_concordance"
+                                    ).concord(
+                                        (str(function_name), int(result.id)),
+                                        ("scalar_operand", int(scalar_position)),
+                                    )
+                                    scalar = data_args[scalar_position]
+                                    array = data_args[1 - scalar_position]
+                                    if str(scalar.dtype or "").casefold() not in {
+                                        "double", "float64",
+                                    }:
+                                        promoted = fresh(shape=(), dtype="float64")
+                                        prefix.append(Instr(
+                                            "Cast", [scalar], promoted,
+                                            attributes={
+                                                "source_dtype": str(scalar.dtype),
+                                                "target_dtype": "float64",
+                                                "scalar_kernel_operand": True,
+                                            },
+                                        ))
+                                        scalar = promoted
+                                    reverse, reverse_def = constant(
+                                        1 if scalar_position == 0 else 0, "int32"
+                                    )
+                                    prefix.append(reverse_def)
+                                    emitted.append(call(
+                                        "binary_scalar_double",
+                                        [array, scalar, result, count, opcode_ssa, reverse],
                                         result,
                                         instruction,
                                         output_argument=2,

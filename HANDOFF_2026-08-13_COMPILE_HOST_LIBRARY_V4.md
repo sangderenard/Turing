@@ -3,8 +3,8 @@
 Date: 2026-08-13
 Repository: `C:\dev\Powershell\turing`
 Root target: CPython's native `compile()` / `Py_CompileString`
-Run log: `build/compile-host-library-v4.stdout.log`
-Error log: `build/compile-host-library-v4.stderr.log`
+Run log: `artifacts/compiler_evidence/compile-host-library-v4.stdout.log`
+Error log: `artifacts/compiler_evidence/compile-host-library-v4.stderr.log`
 Authoritative occurrence ledger: `build/compile-host-library-report.json`
 
 ## Executive status

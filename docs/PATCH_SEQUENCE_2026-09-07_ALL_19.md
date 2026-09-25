@@ -1477,7 +1477,7 @@ controller and metric traces remain within the parity tolerances through
 therefore amplified by the adaptive trajectory before native completes in 158
 steps and eager in 157; the trace contains no earlier discrete wrong-value
 edge. Trace:
-`build/patch_sequence_replay_v145-trace-o0/native-trace.log`.
+`artifacts/compiler_evidence/patch_sequence_replay_v145-trace-o0/native-trace.log`.
 
 ## Two-day continuity ledger and current frontier (2026-09-09 update)
 

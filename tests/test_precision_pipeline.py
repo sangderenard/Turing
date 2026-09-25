@@ -13,6 +13,7 @@ from src.compiler.ir_identities import (
     apply_precision_pipeline,
     precision_backend_shortfalls,
 )
+from src.compiler.identity_concordance import current_identity_book, identity_book
 from src.transmogrifier.ssa import (
     BasicBlock,
     Function,
@@ -240,13 +241,12 @@ def test_live_precision_wrapper_keeps_width_until_explicit_collapse():
     # divides by the element count -- so the contract this pins is the
     # ANSWER rather than the refusal.
     assert wide.mean().collapse().tolist() == [9.0]
-    # ``exp`` is routed to its proof core now, so what it refuses here is
-    # the INTERVAL: eight and ten are far outside the band the core was
-    # fitted on, and extrapolating it would return a plausible number at
-    # every limb. Anything with no wide meaning at all still refuses on
-    # the attribute.
-    with pytest.raises(ValueError, match="outside the core"):
-        wide.exp()
+    # ``exp`` reduces by ln(2) into its proof core's interval, so eight and
+    # ten are inside its domain and the pinned contract is the ANSWER.
+    import math
+
+    assert wide.exp().collapse().tolist() == [math.exp(8.0), math.exp(10.0)]
+    # Anything with no wide meaning at all still refuses on the attribute.
     with pytest.raises((AttributeError, TypeError, NotImplementedError)):
         wide.erf()
 
@@ -366,7 +366,7 @@ def test_precision_pipeline_is_idempotent():
     assert precision_backend_shortfalls(module, "fortran", ("f",)) == ()
 
 
-def test_precision_pipeline_refuses_only_width_beyond_supported_ssa_lowering():
+def test_precision_pipeline_lowers_authored_width_beyond_policy_ladder():
     x, y, result = value(1), value(2), value(3)
     module = IRModule({"f": Function("f", [x, y], {
         "entry": BasicBlock("entry", [Instr(
@@ -375,8 +375,24 @@ def test_precision_pipeline_refuses_only_width_beyond_supported_ssa_lowering():
         )])
     })})
 
-    with pytest.raises(ValueError, match="binary64: four limbs"):
-        apply_precision_pipeline(module)
+    receipt = apply_precision_pipeline(module)
+
+    assert receipt["status"] == "lowered"
+    assert len(module.functions["f"].args) == 10
+    assert len(_lowered_limbs(module.functions["f"], result.id)) == 5
+
+
+def test_automatic_precision_ceiling_is_an_explicit_optional_policy_bound():
+    from src.compiler.precision_policy import MAX_LIMBS, PrecisionPolicy
+
+    default = PrecisionPolicy(samples={})
+    explicitly_wider = PrecisionPolicy(
+        samples={}, limbs=6, max_limbs=7,
+    )
+
+    assert default.max_limbs == MAX_LIMBS == 4
+    assert explicitly_wider.limbs == 6
+    assert explicitly_wider.max_limbs == 7
 
 
 @pytest.mark.parametrize("width", (3, 4))
@@ -540,15 +556,21 @@ def test_source_compiler_runs_precision_pipeline_at_completed_module_seam(width)
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
 
+    from pathlib import Path
+
+    from src.compiler.extraction_contract import ExtractionContract
+
     module, _outputs, _exports = lower_ast_source_to_ssa(
         f"def f(x: Precision[{width}], y: Precision[{width}]):\n"
         "    return x * y\n",
         "f",
+        extraction_contract=ExtractionContract(
+            Path("extraction_contracts/program_extraction.yaml")
+        ),
     )
 
     receipt = module.metadata[PRECISION_PIPELINE_METADATA]
     assert receipt["status"] == "lowered"
-    assert receipt["source_operations"] == 1
     assert receipt["section_contracts"][0]["fma_value_ids"]
     region = next(
         function for name, function in module.functions.items()
@@ -888,8 +910,9 @@ def test_float32_limb_sections_widen_to_eight_and_split_with_4097():
     }
     assert "Fma" not in operations
 
-    # binary64 keeps its four-limb ceiling: the same width that just
-    # lowered for binary32 is refused for binary64 seeds.
+    # The same authored width also lowers for binary64.  Element type chooses
+    # the error-free transform constants; it no longer imposes an unrelated
+    # ABI ceiling on a width-generic expansion algorithm.
     x64, y64, r64 = value(11), value(12), value(13)
     wide = IRModule({"g": Function("g", [x64, y64], {
         "entry": BasicBlock("entry", [Instr(
@@ -897,8 +920,9 @@ def test_float32_limb_sections_widen_to_eight_and_split_with_4097():
             attributes={"precision_limbs": 6},
         )])
     })})
-    with pytest.raises(ValueError, match="ceiling"):
-        apply_precision_pipeline(wide)
+    wide_receipt = apply_precision_pipeline(wide, two_product_flavor="split")
+    assert wide_receipt["status"] == "lowered"
+    assert wide_receipt["section_contracts"][0]["limbs"] == 6
 
 
 def test_precision_scalar_operands_keep_element_shape():
@@ -922,3 +946,36 @@ def test_precision_scalar_operands_keep_element_shape():
     assert (wide + 1.0).collapse().tolist() == [1.1, 1.2, 1.3]
     quotients = (1.0 / wide).collapse().tolist()
     assert quotients[0] == 10.0 and abs(quotients[2] - 10.0 / 3.0) < 1e-15
+
+
+def test_precision_collapse_restores_logical_extent_equal_to_limb_width():
+    """A logical length of two is not the two-limb channel itself."""
+
+    left = SSAValue(1, dtype="float64", shape=(2,))
+    right = SSAValue(2, dtype="float64", shape=(2,))
+    result = SSAValue(3, dtype="float64", shape=(2,))
+    publication = SSAValue(4, dtype="float64", shape=())
+    function = Function("vector_add", [left, right], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                PRECISION_SINGULAR_NAMES["Add"],
+                [left, right], result,
+                attributes={"precision_limbs": 2},
+            ),
+            Instr("Phi", [result], publication),
+            Instr("Ret", [publication], None),
+        ]),
+    })
+    module = IRModule({"vector_add": function})
+
+    apply_precision_pipeline(module)
+
+    returned = function.blocks["entry"].instrs[-1].args[0]
+    assert returned is publication
+    assert returned.shape == (2,)
+    book = identity_book(module)
+    page = book.page("precision_channel_shape_concordance")
+    assert page.latest(("vector_add", 3)) == ((2,), (2, 2), 2)
+    assert book.page(
+        "single_input_phi_descriptor_concordance"
+    ).latest(("vector_add", 4)) == (3, "float64", (2,))

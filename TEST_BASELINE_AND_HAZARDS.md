@@ -219,7 +219,7 @@ line811 empty-C-file assertion because the generated ABI shim is nonempty;
 that fixture uses append, not replacement. The assertion was retained.
 See docs/REPAIRS_2026-09-07_KEYED_REPLACEMENT.md for the full diagnostic and
 missing keyed constructor/store/owned-field binding frontier.
-Fresh lower-only diagnostic `build/keyed_replace_full_formals_20260907.log`:
+Fresh lower-only diagnostic `artifacts/compiler_evidence/keyed_replace_full_formals_20260907.log`:
 19 formals, zero undefined operands/unresolved calls, scalar publication
 1482 ->9564 ->593 and earlier read1378 preserved. Terminal exit1 at strict
 gate; no full native build/parity, no live jobs.
@@ -234,7 +234,7 @@ gate and is not an end-to-end native proof. Static-reference cache eviction
 reproduced the missing-node crash; the guard fix and related reducer checks
 passed 4 tests in 2.26s. See docs/REPAIRS_2026-09-06_RECORD_RETURN_STATE.md
 for the fresh whole-source result and remaining keyed/optional-field limits.
-Fresh source diagnostic `build/record_return_publication_full_formals_20260906.log`:
+Fresh source diagnostic `artifacts/compiler_evidence/record_return_publication_full_formals_20260906.log`:
 four scalar return publications, early hard_failure read1378 unchanged,
 returned1482 -> Cast9564 -> ledger593; 19 formals, zero undefined operands or
 unresolved calls. Terminal exit1 at strict gate, no full native build/parity.
@@ -559,12 +559,12 @@ O0 microstep fixture; no overlap. See continuation before starting another job.
 2026-09-05 current terminal correction: build75251 passed; parity6606 finished
 (native0/eager0, no timeout) but11 mismatches. managed_dt_return_order_20260905
 is latest full DT diagnostic; no parity/performance claim. Dominance tests3passed.
-Active lower-only trace9550 writes build/coerce-placement-trace.log; no concurrent
+Active lower-only trace9550 writes artifacts/compiler_evidence/coerce-placement-trace.log; no concurrent
 heavy work. See continuation report for call460 loop-ownership contradiction.
 
 Trace9550 TERMINAL0: missing coerce460 marker/anchor precedes fallback insertion;
 late ABI refresh keeps already-wrong entry placement. New focused scheduler
-capture86652 ACTIVE (lower only), build/step-call-schedule-capture.log.
+capture86652 ACTIVE (lower only), artifacts/compiler_evidence/step-call-schedule-capture.log.
 
 18:45 scheduler capture86652 terminal0; no live jobs. Conditional call-order
 regression passes. Scheduler test file has5 pre-existing failures verified by
@@ -589,7 +589,7 @@ IMPORTANT USER OVERRIDE: “YOU CANNOT KEEP USING TIMEOUTS”. Do not impose fur
 execution time limits on this work. Two lower-only runs were previously killed
 at 300 and 600 seconds and produced no fresh formal report; that workflow was
 wrong for this task. The no-deadline full diagnostic is session42101 / PID11756,
-log build/patch_sequence_diagnostic_v3.log (started 07:06:28). It predates the
+log artifacts/compiler_evidence/patch_sequence_diagnostic_v3.log (started 07:06:28). It predates the
 latest bound-method and explicit-split persistence repairs. Do not mistake
 microtest passes for completion of the all-19 series or full controller parity.
 See docs/IMPLEMENTATION_2026-09-07_PATCH_SEQUENCE.md for the implementation ledger.
@@ -604,7 +604,7 @@ closure regression: 1 passed in 3.91s without native compilation.
 Saved graph replay v4 terminated on the missing dt_limit_hint deployment shell;
 method normalization now precedes dependency closure for persisted graphs.
 Current lower-only replay is session85685 / PID11580, log
-build/patch_sequence_replay_v5.log. It attempts a pre-frame-link checkpoint.
+artifacts/compiler_evidence/patch_sequence_replay_v5.log. It attempts a pre-frame-link checkpoint.
 It uses an older reduced graph, so even successful lowering cannot establish
 parity for the latest source reduction edits. Full all-19 implementation remains open.
 
@@ -615,7 +615,7 @@ use finite proof priorities with incumbent ties; incompatible physical layouts
 remain hard findings. Explicit scalar/span input and fresh-output conversions
 preserve physical storage. Four transient scalar-read regressions are repaired.
 Latest combined batch: 24 passed in 55.69s. Current lower-only replay v11 is
-session18036, log build/patch_sequence_replay_v11.log, without an execution
+session18036, log artifacts/compiler_evidence/patch_sequence_replay_v11.log, without an execution
 deadline. This cached graph still cannot establish fresh-source controller parity.
 
 2026-09-07 09:30 update: v11 is terminal; v12 completed repository SSA and saved
@@ -638,7 +638,7 @@ lowering process from this batch remains active.
 
 2026-09-07 region-view accounting update: saved pre-frame replay v16 is
 terminal and wrote `build/patch_sequence_replay_v16/repository-ssa.pkl` plus
-`build/patch_sequence_replay_v16.log`. An internal reshape/view now reaches an
+`artifacts/compiler_evidence/patch_sequence_replay_v16.log`. An internal reshape/view now reaches an
 accounted fixed point only when one owned planned region supplies an exact
 tensor descriptor, its resident storage descriptor and SSA producer agree,
 and byte extent and dtype match. The receipt records region, storage identity
@@ -661,7 +661,7 @@ outputs (26 -> 24 strict findings but exposed `_no_exchange_observed` value 11);
 replay v18 materialized that lookup at its source-call owner and reports 23
 strict findings. Artifacts:
 `build/patch_sequence_replay_v18/repository-ssa.pkl` and
-`build/patch_sequence_replay_v18.log`. Remaining: four formal-parity groups,
+`artifacts/compiler_evidence/patch_sequence_replay_v18.log`. Remaining: four formal-parity groups,
 one optional merge, sixteen dominance findings, and two call-result conflicts.
 No full native controller compile or parity claim.
 
@@ -991,7 +991,7 @@ resident `%43`, and controller/caller arity is 1,061. The raw checker reports
 two remaining formal-parity groups sized 24 and 388. The focused recovery file
 passes 5 tests. No compile, optimization, execution deadline, or parity claim.
 Artifact: `build/patch_sequence_replay_v86/repository-ssa.pkl`; log:
-`build/patch_sequence_replay_v86.log`.
+`artifacts/compiler_evidence/patch_sequence_replay_v86.log`.
 
 2026-09-08 static-slice checkpoint: a source slice used only as an index may
 become its integer lower-bound address selector only when its bounds are static
@@ -1002,13 +1002,13 @@ Replay v87 recovers 24 managed-advance and 388 vector-step selectors, giving
 exact arities 438 and 26. Final formals fall 5,619 -> 5,207 and `run_all`
 reports zero findings. Focused result: 4 passed, 81 deselected. Artifact:
 `build/patch_sequence_replay_v87/repository-ssa.pkl`; log:
-`build/patch_sequence_replay_v87.log`.
+`artifacts/compiler_evidence/patch_sequence_replay_v87.log`.
 
 The subsequent fresh `-O0` build reached frame convergence and stopped before
 C emission/compilation at one physical-input mismatch: caller `%109`
 `float64` versus Boolean optional-presence formal `%94` in `pi_update`. No
 deadline or optimized compile was used. Log:
-`build/patch_sequence_fresh_v88_o0.log`.
+`artifacts/compiler_evidence/patch_sequence_fresh_v88_o0.log`.
 
 2026-09-08 optional-presence physical-priority checkpoint: ProgramABI presence
 materialization now writes physical `bool`, retaining the incumbent tie policy
@@ -1022,8 +1022,8 @@ Boolean contracts, exact call arity 12, zero result conflicts, and zero
 `run_all` findings. Both focused optional tests pass and compile only at `-O0`.
 Saved-module C emission reports zero shortfalls; the `-O0` DLL is 1,669,632
 bytes. No runtime parity or optimized build was used. Replay log:
-`build/patch_sequence_replay_v90.log`; compile log:
-`build/patch_sequence_replay_v90/native-o0-build.log`.
+`artifacts/compiler_evidence/patch_sequence_replay_v90.log`; compile log:
+`artifacts/compiler_evidence/patch_sequence_replay_v90/native-o0-build.log`.
 
 2026-09-08 standalone checkpoint: optional-field linked aliases and private
 linked result-record workspace are now packed deterministically. The focused

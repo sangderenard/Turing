@@ -5349,6 +5349,171 @@ class _ControlSSABuilder:
             self.external_values[int(mutation.effect_node_id)] = result
             return
 
+        if operation == "remove" and not mutation.argument_kind.startswith(
+            "mapping_"
+        ):
+            expected_columns = len(destination.column_value_ids)
+            if len(mutation.argument_value_ids) != expected_columns:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", operation, location,
+                    "resident sequence remove requires one explicit value "
+                    f"per row column; expected {expected_columns}, received "
+                    f"{len(mutation.argument_value_ids)}",
+                ))
+                return
+            queries = tuple(
+                (
+                    self.lower_control_expression(expression)
+                    if expression is not None
+                    else self.external_value(value_id)
+                )
+                for value_id, expression in zip(
+                    mutation.argument_value_ids,
+                    (
+                        *mutation.argument_expressions,
+                        *(None for _ in range(
+                            len(mutation.argument_value_ids)
+                            - len(mutation.argument_expressions)
+                        )),
+                    ),
+                )
+            )
+            storage = self.sequence_storage_values[
+                int(destination.sequence_id)
+            ]
+            length_address = storage[len(destination.column_value_ids)]
+            attributes = {
+                "binding": "ssa_sequence_remove",
+                "sequence_id": int(destination.sequence_id),
+                "source_effect_node_id": int(mutation.effect_node_id),
+            }
+            length = self.fresh_value(dtype="int64")
+            self.emit(Handler.Load, [length_address], length, attributes=attributes)
+            zero = self.constant_value(0)
+            one = self.constant_value(1)
+            scan_header = self.new_block("sequence_remove_scan")
+            scan_body = self.new_block("sequence_remove_compare")
+            scan_latch = self.new_block("sequence_remove_next")
+            shift_header = self.new_block("sequence_remove_shift")
+            shift_body = self.new_block("sequence_remove_shift_row")
+            shift_latch = self.new_block("sequence_remove_shift_next")
+            store_length = self.new_block("sequence_remove_store_length")
+            absent = self.new_block("sequence_remove_absent")
+            complete = self.new_block("sequence_remove_complete")
+            scan_entry = self.current
+            self.branch(scan_header)
+
+            self.current = scan_header
+            scan_index = self.fresh_value(dtype="int64")
+            next_scan = self.fresh_value(dtype="int64")
+            self.emit(
+                Handler.Phi, [zero, next_scan], scan_index,
+                attributes={
+                    **attributes,
+                    "incoming_blocks": (scan_entry.name, scan_latch.name),
+                },
+            )
+            scanning = self.fresh_value(dtype="bool")
+            self.emit(Handler.Lt, [scan_index, length], scanning,
+                      attributes=attributes)
+            self.conditional_branch(scanning, scan_body, absent)
+
+            self.current = scan_body
+            matches = None
+            for column, query in enumerate(queries):
+                address = self.fresh_value(dtype="ptr")
+                existing = self.fresh_value(
+                    dtype=str(destination.column_dtypes[column])
+                )
+                equal = self.fresh_value(dtype="bool")
+                self.emit(
+                    Handler.GetElementPtr,
+                    [storage[column], scan_index], address,
+                    attributes=attributes,
+                )
+                self.emit(Handler.Load, [address], existing,
+                          attributes=attributes)
+                self.emit(Handler.Eq, [existing, query], equal,
+                          attributes=attributes)
+                if matches is None:
+                    matches = equal
+                else:
+                    combined = self.fresh_value(dtype="bool")
+                    self.emit(Handler.LAnd, [matches, equal], combined,
+                              attributes=attributes)
+                    matches = combined
+            self.conditional_branch(matches, shift_header, scan_latch)
+
+            self.current = scan_latch
+            self.emit(Handler.Add, [scan_index, one], next_scan,
+                      attributes=attributes)
+            self.branch(scan_header)
+
+            new_length = self.fresh_value(dtype="int64")
+            self.current = shift_header
+            self.emit(Handler.Sub, [length, one], new_length,
+                      attributes=attributes)
+            shift_index = self.fresh_value(dtype="int64")
+            next_shift = self.fresh_value(dtype="int64")
+            self.emit(
+                Handler.Phi, [scan_index, next_shift], shift_index,
+                attributes={
+                    **attributes,
+                    "incoming_blocks": (scan_body.name, shift_latch.name),
+                },
+            )
+            shifting = self.fresh_value(dtype="bool")
+            self.emit(Handler.Lt, [shift_index, new_length], shifting,
+                      attributes=attributes)
+            self.conditional_branch(shifting, shift_body, store_length)
+
+            self.current = shift_body
+            source_index = self.fresh_value(dtype="int64")
+            self.emit(Handler.Add, [shift_index, one], source_index,
+                      attributes=attributes)
+            for column, dtype in enumerate(destination.column_dtypes):
+                source_address = self.fresh_value(dtype="ptr")
+                destination_address = self.fresh_value(dtype="ptr")
+                value = self.fresh_value(dtype=str(dtype))
+                self.emit(
+                    Handler.GetElementPtr,
+                    [storage[column], source_index], source_address,
+                    attributes=attributes,
+                )
+                self.emit(Handler.Load, [source_address], value,
+                          attributes=attributes)
+                self.emit(
+                    Handler.GetElementPtr,
+                    [storage[column], shift_index], destination_address,
+                    attributes=attributes,
+                )
+                self.emit(Handler.Store, [value, destination_address],
+                          attributes=attributes)
+            self.branch(shift_latch)
+
+            self.current = shift_latch
+            self.emit(Handler.Add, [shift_index, one], next_shift,
+                      attributes=attributes)
+            self.branch(shift_header)
+
+            self.current = store_length
+            self.emit(Handler.Store, [new_length, length_address],
+                      attributes=attributes)
+            self.branch(complete)
+
+            self.current = absent
+            self.emit(
+                Handler.Call, [],
+                attributes={
+                    "callee": "turing_validation_error",
+                    "error_code": 72,
+                    **attributes,
+                },
+            )
+            self.branch(complete)
+            self.current = complete
+            return
+
         if mutation.argument_kind.startswith("mapping_"):
             if operation == "update":
                 if (
@@ -10590,7 +10755,9 @@ def lower_control_sections_to_ssa(
               file=sys.stderr, flush=True)
     expanded_plan_regions = (
         expand_plan_regions(
-            hierarchy_plan, first_free_value_id=max(known_value_ids) + 1,
+            hierarchy_plan,
+            first_free_value_id=max(known_value_ids) + 1,
+            function_scope=control_name,
         )
         if hierarchy_plan is not None else {}
     )
@@ -12753,11 +12920,31 @@ def lower_control_sections_to_ssa(
         if str((declared_contracts.get(name) or {}).get("storage") or "")
         == "span"
     }
+    # A nested record field is a descriptor correlation, never a slot: its
+    # leaves are the physical storage (see ``nested_record_by_slot`` below).
+    from .identity_concordance import current_identity_book
+
+    slot_storage_page = current_identity_book().page(
+        "field_slot_storage_concordance"
+    )
+    nested_record_slots = {
+        int(slot)
+        for slot, identity, _value_id in nested_record_fields
+        if slot_storage_page.concord(
+            (
+                str(control_function.name),
+                str(field_names[int(slot)])
+                if 0 <= int(slot) < len(field_names) else int(slot),
+            ),
+            ("nested_record", str(identity)),
+        ) == ("nested_record", str(identity))
+    }
     scalar_slots = tuple(sorted({
         int(slot)
         for _kind, _value_id, slot in field_ops
         if int(slot) not in sequence_field_slots
         and int(slot) not in span_slots
+        and int(slot) not in nested_record_slots
     }))
     compact_slot = {slot: index for index, slot in enumerate(scalar_slots)}
     scalar_field_ops = tuple(
@@ -13277,7 +13464,9 @@ def lower_precompile_and_control_to_ssa(
         region_shortfalls.extend(shortfalls)
     if hierarchy_plan is not None:
         expanded_plan_regions = expand_plan_regions(
-            hierarchy_plan, first_free_value_id=max(used_ids, default=-1) + 1,
+            hierarchy_plan,
+            first_free_value_id=max(used_ids, default=-1) + 1,
+            function_scope=control_name,
         )
         for expanded in expanded_plan_regions.values():
             for instruction in expanded:

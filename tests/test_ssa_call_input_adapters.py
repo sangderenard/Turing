@@ -1,4 +1,8 @@
-from src.compiler.ssa_call_input_adapters import adapt_physical_call_inputs, physical_call_input_conflicts
+from src.compiler.ssa_call_input_adapters import (
+    _adaptation_state_signature,
+    adapt_physical_call_inputs,
+    physical_call_input_conflicts,
+)
 from src.compiler.identity_concordance import begin_identity_book, end_identity_book
 from src.transmogrifier.ssa import SSAValue, Instr, Function, BasicBlock
 
@@ -143,6 +147,168 @@ def test_stale_same_id_region_capture_uses_incumbent_formal_type():
     assert call.args[0] is cast.res
     assert region.metadata['canonicalized_formal_use_ids'] == (47,)
     assert adapt_physical_call_inputs(functions) == 0
+
+
+def test_exact_region_feed_restores_physical_call_view_after_projection():
+    produced = SSAValue(30, 'bool', (2,), accounting={
+        'physical_dtype': 'float64',
+        'physical_dtype_provenance': ('callee_output', 'producer', 30),
+    })
+    stale_view = SSAValue(30, 'bool', (2,), accounting={
+        'ssa_storage_alias': 30,
+        'ssa_region_feed': (15, 0),
+    })
+    formal = SSAValue(40, 'bool', (2,))
+    region = Function('region', [formal], {
+        'entry': BasicBlock('entry', [Instr('Ret', [formal], None)]),
+    }, metadata={'source_region_integral': {'owner': 'root'}})
+    call = Instr('Call', [stale_view], SSAValue(50, 'ssa.aggregate'), attributes={
+        'callee': region.name,
+        'feed_ids': (37,),
+        'feed_dtypes': ('float64',),
+        'result_convention': 'ssa.aggregate',
+    })
+    caller = Function('caller', [], {
+        'entry': BasicBlock('entry', [
+            Instr('Identity', [], produced),
+            call,
+            Instr('Ret', [], None),
+        ]),
+    })
+    functions = {caller.name: caller, region.name: region}
+    book, token = begin_identity_book()
+    try:
+        assert adapt_physical_call_inputs(functions) == 2
+        exact_view = call.args[0]
+        assert exact_view is not stale_view
+        assert exact_view.id == produced.id
+        assert exact_view.dtype == 'float64'
+        assert exact_view.accounting['exact_region_feed_dtype'] == 'float64'
+        assert formal.dtype == 'float64'
+        assert formal.accounting['exact_region_feed_dtype'] == 'float64'
+        assert produced.dtype == 'bool'
+        assert adapt_physical_call_inputs(functions) == 0
+        assert book.page('exact_region_feed_dtype').latest(
+            ('feed', 'caller', 37)
+        ) == ('float64',)
+        assert book.page('exact_region_feed_dtype').latest(
+            ('formal', 'region', 40)
+        ) == ('float64',)
+    finally:
+        end_identity_book(token)
+
+
+def test_exact_region_feed_view_survives_formal_use_interning():
+    """The concorded feed view must be installed after storage interning."""
+
+    storage = SSAValue(30, 'bool', (2,), accounting={
+        'physical_dtype': 'float64',
+        'program_abi_storage': 'span',
+    })
+    stale_view = SSAValue(30, 'bool', (2,))
+    formal = SSAValue(40, 'bool', (2,))
+    region = Function('region', [formal], {
+        'entry': BasicBlock('entry', [Instr('Ret', [formal], None)]),
+    }, metadata={'source_region_integral': {'owner': 'root'}})
+    call = Instr('Call', [stale_view], None, attributes={
+        'callee': region.name,
+        'feed_ids': (37,),
+        'feed_dtypes': ('float64',),
+    })
+    caller = Function('caller', [storage], {
+        'entry': BasicBlock('entry', [call, Instr('Ret', [], None)]),
+    })
+    functions = {caller.name: caller, region.name: region}
+
+    assert adapt_physical_call_inputs(functions) == 2
+    assert call.args[0].id == storage.id
+    assert call.args[0].dtype == 'float64'
+    assert call.args[0].accounting['exact_region_feed_dtype'] == 'float64'
+    assert adapt_physical_call_inputs(functions) == 0
+
+
+def test_cycle_signature_quotients_fresh_conversion_temporary_ids():
+    source = SSAValue(1, 'bool', accounting={'physical_dtype': 'bool'})
+    first = SSAValue(2, 'float64', accounting={'physical_dtype': 'float64'})
+    formal = SSAValue(10, 'float64')
+    cast = Instr('Cast', [source], first, attributes={
+        'physical_region_input_conversion': True,
+    })
+    call = Instr('Call', [first], None, attributes={'callee': 'callee'})
+    caller = Function('caller', [source], {
+        'entry': BasicBlock('entry', [cast, call, Instr('Ret', [], None)]),
+    })
+    callee = Function('callee', [formal], {
+        'entry': BasicBlock('entry', [Instr('Ret', [formal], None)]),
+    })
+    functions = {caller.name: caller, callee.name: callee}
+    first_signature = _adaptation_state_signature(functions)
+
+    second = SSAValue(3, 'float64', accounting={'physical_dtype': 'float64'})
+    nested = Instr('Cast', [first], second, attributes={
+        'physical_region_input_conversion': True,
+    })
+    caller.blocks['entry'].instrs.insert(1, nested)
+    call.args[0] = second
+
+    assert _adaptation_state_signature(functions) == first_signature
+
+
+def test_repository_output_position_outvotes_semantic_output_identity():
+    """A semantic publication does not make a different kernel input writable."""
+    mask = SSAValue(49, 'bool', (15,), accounting={
+        'program_abi_storage': 'span',
+        'physical_dtype': 'bool',
+    })
+    condition = SSAValue(334, 'ptr', accounting={
+        'physical_dtype': 'float64',
+    })
+    output = SSAValue(337, 'ptr', accounting={
+        'physical_dtype': 'float64',
+    })
+    count = SSAValue(338, 'int32')
+    condition_ptr = SSAValue(339, 'ptr')
+    condition_value = SSAValue(340, 'float64')
+    helper = Function('where_double', [condition, output, count], {
+        'entry': BasicBlock('entry', [
+            Instr('GetElementPtr', [condition, count], condition_ptr),
+            Instr('Load', [condition_ptr], condition_value),
+            Instr('Store', [condition_value, output], None),
+            Instr('Ret', [], None),
+        ]),
+    })
+    result = SSAValue(50, 'float64', (15,))
+    call = Instr('Call', [mask, result, count], result, attributes={
+        'callee': helper.name,
+        # This is source/publication provenance copied through tensor
+        # lowering.  It is deliberately the mask identity from the observed
+        # failure; the physical kernel output is argument one.
+        'output_ids': (mask.id,),
+        'ssa_output_argument': 1,
+    })
+    caller = Function('planned_region', [mask], {
+        'entry': BasicBlock('entry', [call, Instr('Ret', [result], None)]),
+    }, metadata={'source_region_integral': {'owner': 'step_2'}})
+    functions = {caller.name: caller, helper.name: helper}
+    book, token = begin_identity_book()
+    try:
+        assert adapt_physical_call_inputs(functions) == 1
+        cast, rewritten_call, _ret = caller.blocks['entry'].instrs
+        assert cast.op == 'Cast'
+        assert cast.args == [mask]
+        assert rewritten_call.args[0] is cast.res
+        assert rewritten_call.args[1] is result
+        row = (caller.name, mask.id, helper.name, condition.id)
+        converted_id, source, target, kind = book.page(
+            'call_input_conversion'
+        ).latest(row)
+        assert converted_id == cast.res.id
+        assert (source, target, kind) == (
+            'bool', 'float64', 'physical_region',
+        )
+        assert physical_call_input_conflicts(functions) == ()
+    finally:
+        end_identity_book(token)
 
 
 def test_pointer_contract_compares_element_type_instead_of_address_marker():

@@ -4,6 +4,7 @@ import pytest
 from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.accelerator_backends import nodus_arena as na
 from src.common.tensors.accelerator_backends.nodus_backend import NodusTensorOperations
+from src.common.tensors.numpy_backend import NumPyTensorOperations
 
 
 @pytest.fixture(scope="module")
@@ -14,14 +15,25 @@ def arena():
         pytest.skip(str(error))
 
 
-def test_nodus_is_the_default_backend_when_connected(arena):
-    """AbstractTensor routes through nodus without being asked, once it is
-    connected -- that connection now happens unconditionally at import."""
+@pytest.fixture
+def nodus_selected(arena):
+    with AbstractTensor.use_backend("nodus"):
+        yield
 
-    assert AbstractTensor.check_or_build_registry() is NodusTensorOperations
+
+def test_numpy_remains_default_when_nodus_is_connected(arena, monkeypatch):
+    """Connecting an accelerator does not silently change tensor semantics."""
+
+    monkeypatch.delenv("ABSTRACT_TENSOR_BACKEND", raising=False)
+    assert AbstractTensor.check_or_build_registry() is NumPyTensorOperations
 
 
-def test_elementwise_ops_actually_reach_the_arena(arena, monkeypatch):
+def test_nodus_can_be_selected_explicitly(arena):
+    with AbstractTensor.use_backend("nodus"):
+        assert AbstractTensor.check_or_build_registry() is NodusTensorOperations
+
+
+def test_elementwise_ops_actually_reach_the_arena(arena, nodus_selected, monkeypatch):
     """Not just correct output -- proof the arena's own binary() ran."""
 
     calls = []
@@ -40,7 +52,7 @@ def test_elementwise_ops_actually_reach_the_arena(arena, monkeypatch):
     assert result.data.tolist() == [2.0, 6.0, 12.0, 20.0]
 
 
-def test_unary_and_scalar_side_match_numpy(arena):
+def test_unary_and_scalar_side_match_numpy(arena, nodus_selected):
     a = AbstractTensor.tensor([1.0, 4.0, 9.0, 16.0])
     assert np.allclose(a.sqrt().data, [1.0, 2.0, 3.0, 4.0])
 
@@ -49,7 +61,7 @@ def test_unary_and_scalar_side_match_numpy(arena):
     assert np.allclose((y - 10).data, [-9.0, -8.0, -7.0, -6.0])
 
 
-def test_comparisons_come_back_as_bool_not_zero_one_float(arena):
+def test_comparisons_come_back_as_bool_not_zero_one_float(arena, nodus_selected):
     """The ABI writes 0/1 in the input dtype for a comparison (a BOOL output
     tensor is refused -- status -5) so the backend must cast on the way out
     to keep matching NumPyTensorOperations's return type."""
@@ -66,7 +78,7 @@ def test_comparisons_come_back_as_bool_not_zero_one_float(arena):
     [((2, 3), (3,)), ((2, 3), (2, 1)), ((1, 3), (2, 1))],
 )
 def test_broadcasting_is_nodus_own_not_faked_by_numpy(
-    arena, monkeypatch, left_shape, right_shape
+    arena, nodus_selected, monkeypatch, left_shape, right_shape
 ):
     """nodus broadcasts -- row, column, and outer -- so a shape mismatch is
     handed straight to it rather than being quietly served by NumPy."""
@@ -86,7 +98,7 @@ def test_broadcasting_is_nodus_own_not_faked_by_numpy(
     assert np.allclose(result.data, left + right)
 
 
-def test_matmul_goes_through_nodus_not_around_it(arena, monkeypatch):
+def test_matmul_goes_through_nodus_not_around_it(arena, nodus_selected, monkeypatch):
     """matmul is not a CanonicalOp -- it is not elementwise -- but nodus
     implements it as tensor_matmul_f32/f64, so this backend uses it."""
 
@@ -121,7 +133,7 @@ def test_a_mismatched_matmul_is_refused_by_the_math_itself(arena):
             arena.destroy(handle)
 
 
-def test_dtype_promotion_matches_numpy(arena):
+def test_dtype_promotion_matches_numpy(arena, nodus_selected):
     integers = AbstractTensor.tensor(np.array([1, 2, 3], dtype=np.int32))
     floats = AbstractTensor.tensor(np.array([0.5, 0.5, 0.5]))
     result = (integers + floats).data

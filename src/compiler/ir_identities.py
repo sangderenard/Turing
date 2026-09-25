@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib as _contextlib
 import dataclasses
+from collections.abc import Mapping
 
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from ..transmogrifier.ssa import Instr, SSAValue
@@ -681,6 +682,11 @@ def carry_precision_through_ssa(functions) -> int:
     singular = dict(PRECISION_SINGULAR_NAMES)
     planted = {name: operation for operation, name in singular.items()}
     changed_total = 0
+    from .identity_concordance import current_identity_book
+
+    channel_shape_page = current_identity_book().page(
+        "precision_channel_shape_concordance"
+    )
 
     def limbs_of(value) -> int:
         try:
@@ -689,7 +695,12 @@ def carry_precision_through_ssa(functions) -> int:
             return 1
         return max(int(record.get("precision_limbs") or 1), 1)
 
-    def carry(value, limbs: int, element: str | None) -> bool:
+    def carry(
+        function_name: str,
+        value,
+        limbs: int,
+        element: str | None,
+    ) -> bool:
         """Give one result value the limb channel and the fact."""
 
         if value is None or limbs <= 1 or limbs_of(value) == limbs:
@@ -708,12 +719,26 @@ def carry_precision_through_ssa(functions) -> int:
         if resolved in _NARROW_LIMB_ELEMENTS and value.dtype != resolved:
             value.dtype = resolved
         existing = tuple(value.shape or ())
-        # Idempotent: a re-run must not append a second channel.
-        if not existing or existing[-1] != int(limbs):
-            value.shape = (*existing, int(limbs))
+        # ``limbs_of`` above is the idempotence fact.  Extent equality is
+        # not: a logical vector may naturally have length equal to its limb
+        # width.  Treating `(2,)` as though it already contained the channel
+        # made a two-element, two-limb value collapse to rank zero later.
+        channel_shape = (*existing, int(limbs))
+        row = (str(function_name), int(value.id))
+        proposed = (existing, channel_shape, int(limbs))
+        incumbent = channel_shape_page.latest(row)
+        if incumbent is not None and tuple(incumbent) != proposed:
+            raise ValueError(
+                "precision channel shape concordance disagreement for "
+                f"{row!r}: recorded={incumbent!r}, proposed={proposed!r}"
+            )
+        if incumbent is None:
+            channel_shape_page.set(row, 0, proposed)
+        value.accounting["precision_logical_shape"] = existing
+        value.shape = channel_shape
         return True
 
-    for function in functions.values():
+    for function_name, function in functions.items():
         while True:
             changed = 0
             for block in function.blocks.values():
@@ -752,7 +777,9 @@ def carry_precision_through_ssa(functions) -> int:
                         changed += 1
                     else:
                         continue
-                    if carry(instruction.res, limbs, element):
+                    if carry(
+                        str(function_name), instruction.res, limbs, element,
+                    ):
                         changed += 1
             # The backward half of the same fact: a value CONSUMED at width
             # n must be PRODUCED at width n. Forward renaming alone spreads
@@ -1082,7 +1109,10 @@ def reduce_precision_operations(functions) -> dict:
 
     from math import frexp
 
-    from ..common.tensors.topological_reducer import PRECISION_SINGULAR_NAMES
+    from ..common.tensors.topological_reducer import (
+        PRECISION_PACK_NAME,
+        PRECISION_SINGULAR_NAMES,
+    )
 
     add_name = PRECISION_SINGULAR_NAMES["Add"]
     sub_name = PRECISION_SINGULAR_NAMES["Sub"]
@@ -1547,14 +1577,6 @@ def _veltkamp_constant(element) -> float:
     return float(limb_element_facts(element)["split"])
 
 
-def _limb_width_ceiling(element) -> int:
-    """The widest section the repository lowering accepts for an element."""
-
-    from ..common.tensors.extended_precision import limb_element_facts
-
-    return int(limb_element_facts(element)["max_limbs"])
-
-
 #: What each destination actually delivers, as opposed to what it emits.
 #:
 #: The four lanes present a UNIFIED FRONT: every one of them accepts `Fma`
@@ -1711,7 +1733,10 @@ def precision_section_contracts(
     runs and describes the instructions that WILL exist.
     """
 
-    from ..common.tensors.topological_reducer import PRECISION_SINGULAR_NAMES
+    from ..common.tensors.topological_reducer import (
+        PRECISION_PACK_NAME,
+        PRECISION_SINGULAR_NAMES,
+    )
 
     if two_product_flavor not in TWO_PRODUCT_FLAVORS:
         raise ValueError(
@@ -1873,7 +1898,9 @@ def lower_precision_operations(
     Expansions are the same width-N algorithms as the eager tensor path:
     Knuth ``two_sum`` distillation for addition, every limb-pair through an
     error-free ``two_product`` for multiplication, and digit-at-a-time
-    expansion division. Widths two through four are retained end to end.
+    expansion division. Width is an authored integer rather than a fixed
+    catalogue tier; the recommended ladders remain policy guidance because
+    multiplication and renormalisation grow quadratically.
     Returns a count per operation.
 
     ``two_product_flavor`` selects the exact-product spelling (see
@@ -1882,7 +1909,10 @@ def lower_precision_operations(
     destinations that cannot deliver a single rounding.
     """
 
-    from ..common.tensors.topological_reducer import PRECISION_SINGULAR_NAMES
+    from ..common.tensors.topological_reducer import (
+        PRECISION_PACK_NAME,
+        PRECISION_SINGULAR_NAMES,
+    )
 
     if two_product_flavor not in TWO_PRODUCT_FLAVORS:
         raise ValueError(
@@ -1900,7 +1930,7 @@ def lower_precision_operations(
     neg_name = PRECISION_SINGULAR_NAMES["neg"]
     expandable = {
         add_name, sub_name, mul_name, div_name, sqrt_name, exp_name,
-        log_name, neg_name,
+        log_name, neg_name, PRECISION_PACK_NAME,
     }
 
     counts = {name: 0 for name in expandable}
@@ -1912,12 +1942,16 @@ def lower_precision_operations(
     promotion_page = current_identity_book().page(
         "source_precision_boundary_concordance"
     )
+    channel_shape_page = current_identity_book().page(
+        "precision_channel_shape_concordance"
+    )
     promoted_scalar_formals: dict[str, set[int]] = {}
     for name, function in functions.items():
         metadata = dict(getattr(function, "metadata", {}) or {})
         scopes = {
             str(name),
             str(metadata.get("source_qualified_name") or ""),
+            str(metadata.get("source_numeric_scope") or ""),
         }
         promoted_scalar_formals[str(name)] = {
             int(value_id)
@@ -1931,6 +1965,44 @@ def lower_precision_operations(
             and str(fact[0]) == "promote"
             for value_id in (row[1], fact[1])
         }
+
+        # Region calls retain the ProcessGraph feed identity separately from
+        # the settled SSA actual.  Structural views can therefore spell the
+        # same promoted tensor as (for example) feed ``flat`` / actual
+        # ``points``.  Carry the concorded promotion through that exact
+        # positional receipt before deciding which function formals need
+        # physical limb parameters; a promoted scalar's low limbs are zeros,
+        # never extra ABI inputs.
+        promoted = promoted_scalar_formals[str(name)]
+        aliases = metadata.get("value_aliases", ()) or ()
+        alias_pairs = (
+            aliases.items() if isinstance(aliases, Mapping) else aliases
+        )
+        changed_promotions = True
+        while changed_promotions:
+            changed_promotions = False
+            for alias, owner in alias_pairs:
+                alias, owner = int(alias), int(owner)
+                if alias in promoted or owner in promoted:
+                    before = len(promoted)
+                    promoted.update((alias, owner))
+                    changed_promotions |= len(promoted) != before
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if str(instruction.op) not in {"Call", "call"}:
+                        continue
+                    feed_ids = tuple(map(int,
+                        instruction.attributes.get("feed_ids") or ()
+                    ))
+                    for feed_id, actual in zip(
+                        feed_ids, instruction.args, strict=False,
+                    ):
+                        if feed_id not in promoted:
+                            continue
+                        actual_id = int(actual.id)
+                        if actual_id not in promoted:
+                            promoted.add(actual_id)
+                            changed_promotions = True
 
     # -- the boundary, brought into line with the interior ----------------
     #
@@ -2024,7 +2096,21 @@ def lower_precision_operations(
     parameter_widths: dict[str, dict[int, int]] = {}
     for name, function in functions.items():
         formal_ids = {int(value.id) for value in function.args}
-        widths: dict[int, int] = {}
+        # A formal whose declared type is a Precision value of some width
+        # (for example a numeral's coefficient leaf) is that many limbs,
+        # whether or not a Precision operation in this body touches it.
+        declared_width_page = current_identity_book().page(
+            "precision_declared_formal_width_concordance"
+        )
+        widths: dict[int, int] = {
+            int(value.id): int(declared_width_page.concord(
+                (str(name), int(value.id)),
+                int((value.accounting or {})["precision_limbs"]),
+            ))
+            for value in function.args
+            if int((value.accounting or {}).get("precision_limbs") or 1) > 1
+            and int(value.id) not in promoted_scalar_formals[str(name)]
+        }
         for block in function.blocks.values():
             for instruction in block.instrs:
                 if str(instruction.op) not in expandable:
@@ -2189,13 +2275,22 @@ def lower_precision_operations(
                     )
                     else like.dtype
                 )
-                logical_shape = tuple(extent_like.shape or ())
+                logical_shape = tuple(
+                    (extent_like.accounting or {}).get(
+                        "precision_logical_shape"
+                    )
+                    or tuple(extent_like.shape or ())
+                )
                 carried_width = max(int(
                     (extent_like.accounting or {}).get(
                         "precision_limbs"
                     ) or 1
                 ), 1)
                 if (
+                    not (extent_like.accounting or {}).get(
+                        "precision_logical_shape"
+                    )
+                    and
                     carried_width > 1
                     and logical_shape
                     and logical_shape[-1] == carried_width
@@ -2219,10 +2314,17 @@ def lower_precision_operations(
                     carried_width = max(int(
                         accounting.get("precision_limbs") or 1
                     ), 1)
-                    logical_rank = len(shape) - int(
-                        carried_width > 1
-                        and bool(shape)
-                        and shape[-1] == carried_width
+                    declared_logical_shape = accounting.get(
+                        "precision_logical_shape"
+                    )
+                    logical_rank = (
+                        len(tuple(declared_logical_shape))
+                        if declared_logical_shape is not None
+                        else len(shape) - int(
+                            carried_width > 1
+                            and bool(shape)
+                            and shape[-1] == carried_width
+                        )
                     )
                     declared_rank = max(
                         logical_rank,
@@ -2598,10 +2700,49 @@ def lower_precision_operations(
                 # parameter per lowered value and the call wrote through a
                 # null pointer. LLVM ignored the shape and worked, which is
                 # exactly how a disagreement like this stays hidden.
-                original.shape = tuple(original.shape or ())[:-1]
+                physical_shape = tuple(original.shape or ())
+                carried_width = max(int(
+                    (original.accounting or {}).get("precision_limbs") or 1
+                ), 1)
+                # Only the historical channel-shaped representation owns a
+                # trailing limb axis.  A specialized Precision value now
+                # carries its ordinary logical extents while the limbs are
+                # separate SSA values; removing the last logical extent here
+                # turned a `(2,)` result into a scalar at the LLVM boundary.
+                shape_fact = channel_shape_page.latest((
+                    str(function_name), int(original.id),
+                ))
+                if shape_fact is not None:
+                    logical_shape, channel_shape, recorded_width = shape_fact
+                    if int(recorded_width) != carried_width:
+                        raise ValueError(
+                            "precision collapse width disagrees with its "
+                            "channel-shape concordance for "
+                            f"{(str(function_name), int(original.id))!r}: "
+                            f"width={carried_width}, recorded={shape_fact!r}"
+                        )
+                    if physical_shape not in {
+                        tuple(logical_shape), tuple(channel_shape),
+                    }:
+                        raise ValueError(
+                            "precision collapse shape disagrees with its "
+                            "channel-shape concordance for "
+                            f"{(str(function_name), int(original.id))!r}: "
+                            f"shape={physical_shape!r}, recorded={shape_fact!r}"
+                        )
+                    original.shape = tuple(logical_shape)
+                elif (
+                    carried_width > 1
+                    and physical_shape
+                    and physical_shape[-1] == carried_width
+                ):
+                    original.shape = physical_shape[:-1]
+                else:
+                    original.shape = physical_shape
                 if original.accounting:
                     original.accounting.pop("precision_limbs", None)
                     original.accounting.pop("precision_element", None)
+                    original.accounting.pop("precision_logical_shape", None)
 
             arrays = precision_arrays.get(str(function_name)) or {}
             # pointer value id -> (base array id, index value)
@@ -2759,6 +2900,24 @@ def lower_precision_operations(
                     emitted.append(instruction)
                     continue
 
+                if operation == PRECISION_PACK_NAME:
+                    width = max(int(
+                        instruction.attributes.get("precision_limbs") or 2
+                    ), 2)
+                    source = list(instruction.args[:width])
+                    if len(source) != width:
+                        raise ValueError(
+                            "precision pack does not carry its declared "
+                            f"limbs: width={width}, operands={len(source)}"
+                        )
+                    limbs[int(instruction.res.id)] = source
+                    lowered_limb_records[int(instruction.res.id)] = tuple(
+                        int(value.id) for value in source
+                    )
+                    collapse(source, instruction.res)
+                    counts[operation] += 1
+                    continue
+
                 if operation == neg_name:
                     # Exact per limb: a sign flip cannot round.
                     width = max(int(
@@ -2840,6 +2999,82 @@ def lower_precision_operations(
 
 
 PRECISION_PIPELINE_METADATA = "precision_pipeline"
+NUMERIC_FEATURE_PIPELINE_METADATA = "numeric_feature_pipeline"
+
+
+def apply_numeric_feature_pipeline(module) -> dict:
+    """Validate composite descriptors at the completed repository-SSA seam.
+
+    Annotation ingestion and topology reduction have already selected the
+    numeric feature algebra. This seam proves that the same descriptor reached
+    repository SSA before any backend or the inner Precision transaction sees
+    the operation. Until component expansion is installed, a composite section
+    refuses here rather than degrading to its scalar spelling.
+    """
+
+    operation_names = {
+        "Add": "add",
+        "Sub": "sub",
+        "Mul": "mul",
+        "Div": "truediv",
+        "Neg": "neg",
+        "Pow": "pow_integer",
+    }
+    sections = []
+    for function_name, function in module.functions.items():
+        for block_name, block in function.blocks.items():
+            for instruction in block.instrs:
+                if not instruction.attributes.get("numeric_composite_pending"):
+                    continue
+                descriptor = dict(
+                    instruction.attributes.get(
+                        "numeric_feature_descriptor"
+                    ) or {}
+                )
+                operation = operation_names.get(str(instruction.op))
+                supported = tuple(map(str, descriptor.get("operators") or ()))
+                if operation is None or operation not in supported:
+                    raise ValueError(
+                        "numeric feature descriptor does not cover its SSA "
+                        f"operator: function={function_name!r}, "
+                        f"op={instruction.op!s}, descriptor={descriptor!r}"
+                    )
+                sections.append({
+                    "function": str(function_name),
+                    "block": str(block_name),
+                    "value_id": (
+                        None if instruction.res is None
+                        else int(instruction.res.id)
+                    ),
+                    "operand_ids": tuple(
+                        int(value.id) for value in instruction.args
+                    ),
+                    "operation": operation,
+                    "descriptor": descriptor,
+                })
+    receipt = {
+        "schema": "numeric-feature-pipeline-v1",
+        "status": (
+            "outer-lowering-required" if sections else "not-present"
+        ),
+        "sections": sections,
+    }
+    module.metadata[NUMERIC_FEATURE_PIPELINE_METADATA] = receipt
+    if sections:
+        summary = tuple(
+            (
+                section["function"], section["value_id"],
+                section["descriptor"].get("type_name"),
+                section["operation"],
+            )
+            for section in sections
+        )
+        raise NotImplementedError(
+            "numeric composite repository SSA reached the outer-algebra "
+            "lowering seam but component expansion is not installed: "
+            + repr(summary)
+        )
+    return receipt
 
 
 def _refresh_precision_call_records(module) -> int:
@@ -2947,6 +3182,28 @@ def apply_precision_pipeline(
     than answered with the wrong receipt, because the instructions already
     emitted cannot change.
     """
+    from .identity_concordance import (
+        _ACTIVE_IDENTITY_BOOK,
+        begin_identity_book,
+        end_identity_book,
+    )
+
+    active = _ACTIVE_IDENTITY_BOOK.get()
+    if active is None or getattr(active, "detached", False):
+        # Outside a compile this call is its own transaction: its facts
+        # describe this module only, so they go in the module's own book
+        # (``identity_book(module)`` reads them back after the fact).
+        metadata = getattr(module, "metadata", None)
+        own = None if metadata is None else metadata.get("identity_book")
+        token = _ACTIVE_IDENTITY_BOOK.set(own) if own is not None else None
+        if token is None:
+            own, token = begin_identity_book()
+            if metadata is not None:
+                metadata["identity_book"] = own
+        try:
+            return apply_precision_pipeline(module, two_product_flavor)
+        finally:
+            end_identity_book(token)
 
     from ..common.tensors.topological_reducer import PRECISION_SINGULAR_NAMES
 
@@ -2987,42 +3244,12 @@ def apply_precision_pipeline(
             "section_contracts": [],
         }
 
-    unsupported_seeds = tuple(
-        (str(name), int(instruction.attributes.get("precision_limbs") or 1))
-        for name, function in functions.items()
-        for block in function.blocks.values()
-        for instruction in block.instrs
-        if str(instruction.op) in precision_ops
-        and int(instruction.attributes.get("precision_limbs") or 1)
-        > _limb_width_ceiling(
-            instruction.attributes.get("precision_element")
-        )
-    )
-    if unsupported_seeds:
-        raise ValueError(
-            "repository SSA precision lowering refuses sections wider than "
-            "the element's proven ceiling (binary64: four limbs, binary32: "
-            "eight) instead of duplicating or discarding limbs: "
-            + repr(unsupported_seeds)
-        )
-
     carried = carry_precision_through_ssa(functions)
     identity_counts = reduce_precision_operations(functions)
     contracts = precision_section_contracts(functions, two_product_flavor)
-    unsupported_widths = tuple(
-        (contract.function, contract.limbs)
-        for contract in contracts
-        if int(contract.limbs) > _limb_width_ceiling(contract.element)
-    )
-    if unsupported_widths:
-        raise ValueError(
-            "repository SSA precision lowering refuses sections wider than "
-            "the element's proven ceiling (binary64: four limbs, binary32: "
-            "eight) instead of duplicating or discarding limbs: "
-            + repr(unsupported_widths)
-        )
     marked = mark_precision_sections(functions)
     lowered = lower_precision_operations(functions, two_product_flavor)
+    phi_descriptors = settle_single_input_phi_descriptors(functions)
     calls_refreshed = _refresh_precision_call_records(module)
     remaining = tuple(
         (str(name), int(instruction.res.id) if instruction.res else None,
@@ -3058,10 +3285,88 @@ def apply_precision_pipeline(
         "section_contracts": [contract.as_record() for contract in contracts],
         "marked_instructions": int(marked),
         "lowered_operations": dict(lowered),
+        "single_input_phi_descriptors": int(phi_descriptors),
         "call_records_refreshed": int(calls_refreshed),
     }
     module.metadata[PRECISION_PIPELINE_METADATA] = receipt
     return receipt
+
+
+def settle_single_input_phi_descriptors(functions) -> int:
+    """Carry an exact sole incoming descriptor through a structural Phi.
+
+    Static specialization and loop evaporation can leave a join with one
+    surviving arm.  Its value identity remains useful for control provenance,
+    but its descriptor is no longer a merge problem: the sole incoming value
+    is authoritative.  This runs after precision collapse because that is
+    when the incoming logical shape is restored.
+    """
+    from .identity_concordance import current_identity_book
+
+    page = current_identity_book().page(
+        "single_input_phi_descriptor_concordance"
+    )
+    changed = 0
+    for function_name, function in functions.items():
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    str(instruction.op).casefold() != "phi"
+                    or instruction.res is None
+                    or len(instruction.args) != 1
+                ):
+                    continue
+                source = instruction.args[0]
+                result = instruction.res
+                source_shape = tuple(source.shape or ())
+                source_dtype = str(source.dtype or "")
+                row = (str(function_name), int(result.id))
+                proposed = (
+                    int(source.id), source_dtype, source_shape,
+                )
+                incumbent = page.latest(row)
+                if incumbent is not None and tuple(incumbent) != proposed:
+                    raise ValueError(
+                        "single-input Phi descriptor concordance disagreement "
+                        f"for {row!r}: recorded={incumbent!r}, "
+                        f"proposed={proposed!r}"
+                    )
+                if incumbent is None:
+                    page.set(row, 0, proposed)
+                result_shape = tuple(result.shape or ())
+                if result_shape and result_shape != source_shape:
+                    raise ValueError(
+                        "single-input Phi shape disagrees with its sole "
+                        f"incoming value for {row!r}: result={result_shape!r}, "
+                        f"source={source_shape!r}"
+                    )
+                result_dtype = str(result.dtype or "")
+                if (
+                    result_dtype not in {"", "none", "unknown", "ssa.aggregate"}
+                    and source_dtype
+                    and result_dtype != source_dtype
+                ):
+                    raise ValueError(
+                        "single-input Phi dtype disagrees with its sole "
+                        f"incoming value for {row!r}: result={result_dtype!r}, "
+                        f"source={source_dtype!r}"
+                    )
+                before = (result_dtype, result_shape, result.device)
+                if source_dtype:
+                    result.dtype = source.dtype
+                result.shape = source_shape
+                if result.device is None:
+                    result.device = source.device
+                result.accounting = {
+                    **dict(result.accounting or {}),
+                    "single_input_phi_source_id": int(source.id),
+                }
+                after = (
+                    str(result.dtype or ""), tuple(result.shape or ()),
+                    result.device,
+                )
+                changed += before != after
+    return changed
 
 
 def precision_backend_shortfalls(

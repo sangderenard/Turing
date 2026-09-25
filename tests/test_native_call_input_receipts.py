@@ -1,3 +1,8 @@
+import pytest
+
+from src.compiler.identity_concordance import (
+    begin_identity_book, current_identity_book, end_identity_book,
+)
 from src.compiler.fortran_c_shell import (
     _complete_propagated_frame_tails, _propagate_record_field_demand,
     _harmonize_call_argument_shapes, _prune_unused_callee_formals,
@@ -5,6 +10,15 @@ from src.compiler.fortran_c_shell import (
 )
 from src.transmogrifier.ssa import SSAValue, Instr, Function, BasicBlock
 from src.transmogrifier.ssa import SSATensorDescriptor, SSATensorTable
+
+
+@pytest.fixture(autouse=True)
+def _isolated_identity_book():
+    _book, token = begin_identity_book()
+    try:
+        yield
+    finally:
+        end_identity_book(token)
 
 
 def test_exact_binding_prevents_duplicate_field_demand_and_survives_storage_growth():
@@ -34,6 +48,99 @@ def test_exact_binding_prevents_duplicate_field_demand_and_survives_storage_grow
     _harmonize_call_argument_shapes(functions)
     assert call.args[:2] == values[::-1]
     assert call.attributes['callee_input_ids'] == (6, 5, 7)
+
+
+def test_exact_binding_propagates_late_returned_record_storage():
+    value = SSAValue(5, 'float64')
+    returned = SSAValue(7, 'float64', accounting={
+        'returned_record_storage': 'Metrics',
+    })
+    actual = SSAValue(20, 'float64')
+    call = Instr('Call', [actual], None, attributes={
+        'callee': 'callee', 'callee_input_ids': (5,), 'plan_callsite_id': 9,
+    })
+    caller = Function(
+        'caller', [actual], {'entry': BasicBlock('entry', [call])},
+    )
+    callee = Function(
+        'callee', [value, returned], {'entry': BasicBlock('entry', [])},
+    )
+
+    assert _complete_propagated_frame_tails({
+        'caller': caller, 'callee': callee,
+    }) == 1
+    assert call.attributes['callee_input_ids'] == (5, 7)
+    assert call.args[-1] is caller.args[-1]
+    assert call.args[-1].accounting['propagated_formal_id'] == 7
+
+
+def test_exact_binding_reuses_concorded_late_sequence_storage():
+    value = SSAValue(5, 'float64')
+    sequence_column = SSAValue(7, 'float64')
+    actual = SSAValue(20, 'float64')
+    caller_storage = SSAValue(21, 'float64', accounting={
+        'compiler_frame_storage': 'caller',
+    })
+    call = Instr('Call', [actual], None, attributes={
+        'callee': 'callee', 'callee_input_ids': (5,), 'plan_callsite_id': 9,
+    })
+    caller = Function(
+        'caller', [actual, caller_storage],
+        {'entry': BasicBlock('entry', [call])},
+    )
+    callee = Function(
+        'callee', [value, sequence_column],
+        {'entry': BasicBlock('entry', [])},
+    )
+    current_identity_book().page('argument_binding').set(
+        ('callee', 7, 'binding'), 9, ('caller_storage', 21),
+    )
+
+    assert _complete_propagated_frame_tails({
+        'caller': caller, 'callee': callee,
+    }) == 1
+    assert caller.args == [actual, caller_storage]
+    assert call.args == [actual, caller_storage]
+    assert call.attributes['callee_input_ids'] == (5, 7)
+    assert current_identity_book().page(
+        'propagated_frame_tail_concordance'
+    ).latest(('caller', 9, 'callee', 7)) == (
+        21, 'argument_binding:caller_storage',
+    )
+
+
+def test_exact_binding_restores_removed_caller_storage_identity():
+    value = SSAValue(5, 'float64')
+    sequence_length = SSAValue(7, 'int64', shape=(1,))
+    actual = SSAValue(20, 'float64')
+    call = Instr('Call', [actual], None, attributes={
+        'callee': 'callee', 'callee_input_ids': (5,), 'plan_callsite_id': 9,
+    })
+    caller = Function(
+        'caller', [actual], {'entry': BasicBlock('entry', [call])},
+    )
+    callee = Function(
+        'callee', [value, sequence_length],
+        {'entry': BasicBlock('entry', [])},
+    )
+    current_identity_book().page('argument_binding').set(
+        ('callee', 7, 'binding'), 9, ('caller_storage', 21),
+    )
+
+    assert _complete_propagated_frame_tails({
+        'caller': caller, 'callee': callee,
+    }) == 1
+    restored = caller.args[-1]
+    assert restored.id == 21
+    assert restored.shape == (1,)
+    assert restored.accounting['restored_argument_binding'] is True
+    assert call.args == [actual, restored]
+    assert call.attributes['callee_input_ids'] == (5, 7)
+    assert current_identity_book().page(
+        'propagated_frame_tail_concordance'
+    ).latest(('caller', 9, 'callee', 7)) == (
+        21, 'argument_binding:restored_caller_storage',
+    )
 
 
 def test_pruning_updates_exact_call_input_receipt_with_operands():

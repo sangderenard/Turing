@@ -12,6 +12,8 @@ from src.compiler.glsl_deployment_strategy import (
     _walk_planned_shells,
     strategize_shell_deployment,
 )
+from src.compiler.identity_concordance import current_identity_book
+from src.compiler.compilation_units import record_compilation_unit_plan
 from src.compiler.shell_reference_tables import (
     build_class_navigation_table,
     build_map_dependency_regions,
@@ -335,6 +337,82 @@ def dead_helper():
         complete_catalogue.function_shell_types
     )
     assert references["dead_helper"] in complete_catalogue.function_shell_types
+
+
+def test_recursive_callsite_is_a_finite_backedge_not_a_new_catalogue_owner():
+    module = ast.parse(
+        '''
+def countdown(value):
+    if value <= 0:
+        return 0
+    return countdown(value - 1)
+'''
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    record_compilation_unit_plan(graph)
+
+    deployment = strategize_shell_deployment(graph)()
+    try:
+        reference = int(
+            graph.function_table.entry("countdown").reference.address
+        )
+        countdown = deployment.function_shells[reference]
+
+        assert countdown.function_shells is deployment.function_shells
+        assert countdown.callsite_function_shells == {}
+        # Module owner + one catalogue definition + one module activation.
+        # The recursive edge inside the activation is represented by the
+        # function reference and does not mint another shell.
+        assert len(tuple(_walk_planned_shells(deployment))) == 3
+        activation_page = current_identity_book().page(
+            "source_callsite_activation_concordance"
+        )
+        assert any(
+            str(row[0]).endswith("countdown")
+            and int(tuple(fact)[0]) == reference
+            and tuple(fact)[1] == "recursive_scc_backedge"
+            for row in activation_page.rows()
+            for _column, fact in activation_page.history(row)
+        )
+    finally:
+        deployment.release()
+
+
+def test_repeated_specialized_callsite_plans_one_shared_dag_node():
+    module = ast.parse(
+        '''
+def leaf(value):
+    return value + 1
+
+def helper(value):
+    return leaf(value)
+
+def root(value):
+    return helper(value) + helper(value)
+'''
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    record_compilation_unit_plan(graph)
+
+    deployment = strategize_shell_deployment(graph)()
+    try:
+        root_reference = int(
+            graph.function_table.entry("root").reference.address
+        )
+        root = deployment.function_shells[root_reference]
+        helpers = tuple(root.callsite_function_shells.values())
+        assert len(helpers) == 2
+        first_leaf = next(iter(helpers[0].callsite_function_shells.values()))
+        second_leaf = next(iter(helpers[1].callsite_function_shells.values()))
+        assert first_leaf is second_leaf
+    finally:
+        deployment.release()
 
 
 def test_method_reference_requires_receiver_class_identity():

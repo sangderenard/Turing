@@ -25,7 +25,7 @@ authored world objects/geometry delivered to the generic game renderer.
 python -u tools/lower_vehicle_validator_program.py --output build/validator_native_resume_20260914
 ```
 
-Log: `build/validator_native_resume_20260914.log`. This attempt started at
+Log: `artifacts/compiler_evidence/validator_native_resume_20260914.log`. This attempt started at
 18:11:56 local time, PID 444. The user first said to allow up to 20 minutes, then clarified
 that up to an hour is normal and asked for patience. No elapsed-time cutoff
 was imposed. It published a
@@ -57,13 +57,13 @@ context-manager group passes 38 tests with one failure:
 `test_tensor_method_candidate_requires_tensor_receiver_value` lacks the
 expected `tensor` attribute. It reproduces with the HEAD deployment-strategy
 module executed in an isolated process, without replacing the checkout.
-Logs: `build/validator_dispatch_classifier_tests_20260914.log` and
-`build/validator_dispatch_classifier_baseline_20260914.log`.
+Logs: `artifacts/compiler_evidence/validator_dispatch_classifier_tests_20260914.log` and
+`artifacts/compiler_evidence/validator_dispatch_classifier_baseline_20260914.log`.
 
 The fixed classifier also processed the saved real 22,376-node graph in
 2.470 seconds (20,204 metadata nodes), with every result checked against the
 unchanged uncached classifier. This measures classification only, not a full
-build. Evidence: `build/validator_dispatch_classifier_graph_check_20260914.log`.
+build. Evidence: `artifacts/compiler_evidence/validator_dispatch_classifier_graph_check_20260914.log`.
 
 The source graph plan predates this compiler change. A later run must respect
 the compiler fingerprint check; do not relabel the old plan as newly built.
@@ -81,12 +81,12 @@ These changes are under validation, not a working-native claim yet.
 
 `tests/test_vehicle_validator_simulation.py` compares the new eager entry with
 the existing validator's real initialization/tick/feedback and checks snapshot
-restoration. Initial test run is in `build/validator_simulation_eager_tests_20260914.log`.
+restoration. Initial test run is in `artifacts/compiler_evidence/validator_simulation_eager_tests_20260914.log`.
 
 The third eager run passed all four checks (280.82 seconds), including inactive
 and active tire state/feedback equality at rtol/atol 1e-12, full snapshot restore,
 and the existing viewer acknowledgement check. Log:
-`build/validator_simulation_eager_tests_v3_20260914.log`. The first two attempts
+`artifacts/compiler_evidence/validator_simulation_eager_tests_v3_20260914.log`. The first two attempts
 exposed a scalar `.abs()` call in the metrics adapter (fixed with built-in
 `abs`) and a test-side `float(AbstractTensor)` truncation (fixed by applying
 the same `coerce_metrics` normalization used by the real DT controller).
@@ -98,7 +98,7 @@ At 19:26 local time the eight-lane build was started with:
 python -u tools/build_vehicle_validator_simulation.py --output build/validator_simulation_native_20260914 --lanes 8
 ```
 
-Log: `build/validator_simulation_native_20260914.log`. No time limit is imposed.
+Log: `artifacts/compiler_evidence/validator_simulation_native_20260914.log`. No time limit is imposed.
 The builder retains the resolved graph and final SSA, validates structural
 findings and C emission, and compiles at O0. A working artifact must have
 `manifest.json` and its referenced DLL; source wiring alone is not readiness.
@@ -125,14 +125,14 @@ and `validator_parallel_path_after_20260914.log` in `build/`.
 The advance function alone passes the old atomic-order check. The helper
 `../speaktome/AGENTS/tools/inspect_turing_dispatch_cycle.py` is inspecting all
 function graphs using HEAD's fusion module in an isolated process, without
-checking out files. Log: `build/validator_simulation_cycle_baseline_20260914.log`.
+checking out files. Log: `artifacts/compiler_evidence/validator_simulation_cycle_baseline_20260914.log`.
 It reproduced the **identical full-build error** in `balloon_tire_vector_step`.
 The retained `cycle.json` and `function-graph.pkl` are in
 `build/validator_simulation_cycle_baseline_20260914/`. Its eight cyclic paths
 are shape dependencies: e.g. `predicted` directly feeds a reshape and also
 feeds `predicted.shape[2]` through a shape tuple into that same reshape.
 The repaired compiler passes atomic ordering on that unchanged saved function
-graph: `build/validator_simulation_cycle_fixed_20260914.log`.
+graph: `artifacts/compiler_evidence/validator_simulation_cycle_fixed_20260914.log`.
 This correlates the small regression with the real failure; no intermediate
 graph was manually reordered or repaired.
 
@@ -146,7 +146,7 @@ is now running:
 python -u tools/build_vehicle_validator_simulation.py --output build/validator_simulation_native_v2_20260914 --lanes 8
 ```
 
-Log: `build/validator_simulation_native_v2_20260914.log`. Do not mistake the
+Log: `artifacts/compiler_evidence/validator_simulation_native_v2_20260914.log`. Do not mistake the
 successful function-ordering diagnostic for a completed native simulation.
 
 The fresh rebuild passed instantiation (including the original failure) and
@@ -159,11 +159,11 @@ Generated simulation source is unchanged byte-for-byte from v1; file SHA256
 The first fusion repair is therefore verified in the fresh complete build;
 the new control-membership/dependency frontier remains to repair in the compiler.
 
-The isolated `--precompile` run (`build/validator_control_cycle_20260914.log`)
+The isolated `--precompile` run (`artifacts/compiler_evidence/validator_control_cycle_20260914.log`)
 stopped because its isolated shell has no deployment shells for the child
 tire functions. A narrower `--control-only` diagnostic, using the actual
 region-schedule, projection, nesting and overlay functions, passes on the
-unspecialized recurrence (`build/validator_control_cycle_cut_20260914.log`).
+unspecialized recurrence (`artifacts/compiler_evidence/validator_control_cycle_cut_20260914.log`).
 Do not treat that as reproducing or fixing the specialized full-build failure.
 
 The exact full deployment is now replaying from the saved resolved graph via
@@ -171,7 +171,7 @@ The exact full deployment is now replaying from the saved resolved graph via
 preparation. It wraps the real overlay only to save its exact arguments and
 the caller's target graph/regions/loop plans on failure; it does not change
 planning, scopes, dependencies, or control order. Log:
-`build/validator_control_exact_20260914.log`; output directory:
+`artifacts/compiler_evidence/validator_control_exact_20260914.log`; output directory:
 `build/validator_control_exact_20260914`. If it reaches SSA it also retains a
 pre-frame-link checkpoint. There is still no SSA/DLL or tested viewer command.
 
@@ -185,9 +185,9 @@ ordinary tensor indexing remains numerical. No edges or physics were removed.
 The classification cache now includes a schema version, so saved graph replays
 do not reuse classifications computed by an older compiler. The exact saved
 specialized graph fails before these repairs and passes actual control
-replanning afterwards (`build/validator_control_replan_v2_20260914.log`).
+replanning afterwards (`artifacts/compiler_evidence/validator_control_replan_v2_20260914.log`).
 The combined regression group now passes 86 and has the same 14 baseline
-failures (`build/validator_projection_regressions_20260914.log`).
+failures (`artifacts/compiler_evidence/validator_projection_regressions_20260914.log`).
 
 A fresh source build with both compiler repairs is running:
 
@@ -195,7 +195,7 @@ A fresh source build with both compiler repairs is running:
 python -u ../speaktome/AGENTS/tools/replay_turing_resolved_deployment.py --repo . --fresh-validator-build --output build/validator_simulation_native_v3_20260914 --lanes 8
 ```
 
-Log: `build/validator_simulation_native_v3_20260914.log`. This helper calls the
+Log: `artifacts/compiler_evidence/validator_simulation_native_v3_20260914.log`. This helper calls the
 real `build_simulation` and only observes failures / saves the pre-frame-link
 checkpoint; it does not alter compiler semantics. Native execution remains
 unverified pending SSA emission, C compilation, and the runtime comparisons.

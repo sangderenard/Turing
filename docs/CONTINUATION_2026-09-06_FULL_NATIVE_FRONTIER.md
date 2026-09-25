@@ -24,7 +24,7 @@ directly, and publishes length last. Self-aliasing and failed replacement
 preserve contents. Focused native/caller tests4 passed15.68s; broader42 passed,
 1 failed41.39s at an append fixture's empty-C-shim assertion (retained).
 
-Fresh source diagnostic `build/keyed_replace_full_formals_20260907.log`:
+Fresh source diagnostic `artifacts/compiler_evidence/keyed_replace_full_formals_20260907.log`:
 **19 formals, zero undefined operands/unresolved calls**, terminal exit1 at
 strict gate. The authoritative saved artifacts contain this run. All four
 scalar publications remain, including1482 -> Cast9564 ->593; early read1378
@@ -43,7 +43,7 @@ give the exact saved-SSA evidence and next bounded source regression.
 ## Prior repair status: scalar return publication
 
 See `REPAIRS_2026-09-06_RECORD_RETURN_STATE.md`. The fresh source diagnostic
-`build/record_return_publication_full_formals_20260906.log` completed at the
+`artifacts/compiler_evidence/record_return_publication_full_formals_20260906.log` completed at the
 strict gate with **19 formals, zero undefined operands/unresolved calls**.
 The authoritative diagnostic pickles and formals.json contain this run.
 
@@ -71,7 +71,7 @@ authored DT changes, commit, or push.
 
 See `REPAIRS_2026-09-06_EFFECT_ORDER.md`. The fresh post-repair full diagnostic
 is **19 formals, zero undefined operands/unresolved calls**, terminal exit 1
-at the provenance gate. Log: `build/effect_order_full_formals_20260906.log`.
+at the provenance gate. Log: `artifacts/compiler_evidence/effect_order_full_formals_20260906.log`.
 The authoritative diagnostic pickles and formals.json have been regenerated.
 
 The linked hard-failure test now reads incoming field 1378 instead of later
@@ -96,7 +96,7 @@ Conservative CFG reachability now runs after late source literals and before
 paired caller/callee signature pruning. The fresh full driver completed with
 **19 unaccounted formals, zero undefined operands, zero unresolved calls**.
 It exited 1 at the strict provenance gate; no full native build was launched.
-The diagnostic process is terminal. Log: `build/reachability_full_formals_20260906.log`.
+The diagnostic process is terminal. Log: `artifacts/compiler_evidence/reachability_full_formals_20260906.log`.
 
 `build/full_formal_diagnostic/{formals.json,repository-ssa.pkl,resolved-process-graph.pkl}`
 now contains this fresh run. The old 23-finding ids and second-opinion review
@@ -129,7 +129,7 @@ satisfy it.
 
 ## Historical gate before the second-opinion repairs
 
-The authoritative full driver is `build/diagnose_full_formals.py`; run it from
+The authoritative full driver is `tools/compiler_probes/diagnose_full_formals.py`; run it from
 the repository root with `PYTHONPATH=.`. It writes its evidence under
 `build/full_formal_diagnostic/`.
 
@@ -322,7 +322,7 @@ Primary evidence:
   `step_with_dt_control_used` line 207, and `run_superstep` line 532.
 - `src/common/dt_system/dt_scaler.py`: `coerce_metrics` line 62.
 
-Use `build/diagnose_full_formals.py` only if the saved artifacts cannot answer
+Use `tools/compiler_probes/diagnose_full_formals.py` only if the saved artifacts cannot answer
 the review question; a fresh run takes several minutes. Do not start a native
 build. The useful deliverable is a written disagreement or confirmation for
 each category, especially record-field state, plus the smallest general order

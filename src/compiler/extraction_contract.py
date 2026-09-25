@@ -251,6 +251,16 @@ class ProgramABIField:
     # cell plus the ordinary typed payload cell.  The payload is never used to
     # infer absence, so zero, NaN, and every finite value remain valid data.
     optional: bool = False
+    # The value's number type, beside its rank and shape.  ``precision`` is
+    # the limb count (1: one ordinary element); ``complex`` and ``rational``
+    # are the algebra layers; ``scale`` is the power-of-two exponent carried
+    # with the value (0: none); ``encoding`` names a non-binary element
+    # encoding (None: ordinary binary).
+    encoding: str | None = None
+    scale: int = 0
+    precision: int = 1
+    complex: bool = False
+    rational: bool = False
 
     @classmethod
     def from_mapping(cls, location: str, raw: Any) -> "ProgramABIField":
@@ -265,6 +275,11 @@ class ProgramABIField:
             "value_identity",
             "columns",
             "optional",
+            "encoding",
+            "scale",
+            "precision",
+            "complex",
+            "rational",
         }
         extra = sorted(set(raw) - allowed)
         if extra:
@@ -445,6 +460,37 @@ class ProgramABIField:
             raise ExtractionContractError(
                 f"{location}.optional requires scalar, reference, or record storage"
             )
+        number_type = {
+            key: raw[key]
+            for key in ("encoding", "scale", "precision", "complex", "rational")
+            if key in raw
+        }
+        if number_type and storage not in {"scalar", "span"}:
+            raise ExtractionContractError(
+                f"{location} declares a number type {sorted(number_type)} "
+                "but only scalar or span storage holds numbers"
+            )
+        encoding = raw.get("encoding")
+        if encoding is not None and (not isinstance(encoding, str) or not encoding):
+            raise ExtractionContractError(
+                f"{location}.encoding must be a non-empty string"
+            )
+        scale = raw.get("scale", 0)
+        if not isinstance(scale, int) or isinstance(scale, bool):
+            raise ExtractionContractError(f"{location}.scale must be an integer")
+        precision = raw.get("precision", 1)
+        if (
+            not isinstance(precision, int) or isinstance(precision, bool)
+            or precision < 1
+        ):
+            raise ExtractionContractError(
+                f"{location}.precision must be a positive integer"
+            )
+        for layer in ("complex", "rational"):
+            if not isinstance(raw.get(layer, False), bool):
+                raise ExtractionContractError(
+                    f"{location}.{layer} must be boolean"
+                )
         raw_shape = raw.get("shape")
         shape: tuple[int, ...] | None = None
         if raw_shape is not None:
@@ -493,6 +539,11 @@ class ProgramABIField:
             value_identity,
             table_columns,
             optional,
+            encoding,
+            scale,
+            precision,
+            bool(raw.get("complex", False)),
+            bool(raw.get("rational", False)),
         )
 
     def receipt(self) -> dict[str, Any]:
@@ -532,6 +583,16 @@ class ProgramABIField:
             ]
         if self.optional:
             result["optional"] = True
+        if self.encoding is not None:
+            result["encoding"] = self.encoding
+        if self.scale:
+            result["scale"] = self.scale
+        if self.precision != 1:
+            result["precision"] = self.precision
+        if self.complex:
+            result["complex"] = True
+        if self.rational:
+            result["rational"] = True
         return result
 
 
