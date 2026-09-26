@@ -969,6 +969,11 @@ class _ControlSSABuilder:
         #: The loops enclosing the current emission point, as keys of their
         #: ``loop_entry_state`` rows (None for a loop the book cannot key).
         self.enclosing_loop_states: list[Any] = []
+        #: Per entered loop key: its carried entries (the lowering's own
+        #: SSA values, by entry position) and whether the latch is being
+        #: lowered.  Which entry a binding is lives on the book
+        #: (``loop_carried_entry``); this is only where the entry's values are.
+        self.loop_frames: dict[Any, dict[str, Any]] = {}
         self.value_aliases = {
             int(alias): int(source)
             for alias, source in (value_aliases or {}).items()
@@ -3132,8 +3137,12 @@ class _ControlSSABuilder:
         book = self._book()
         carried_page = book.page("loop_carried_binding")
         state_page = book.page("loop_entry_state")
+        entry_page = book.page("loop_carried_entry")
+        key = (str(self.tensor_shape_concordance_scope), int(loop_node))
         states: dict[int, tuple[set, Any]] = {}
-        for updated_id, initial_id, initial_value, *_rest in carried:
+        for entry, (updated_id, initial_id, initial_value, *_rest) in (
+            enumerate(carried)
+        ):
             bindings = carried_page.latest((
                 self.lexical_read_scope, int(loop_node),
                 int(updated_id), int(initial_id),
@@ -3144,11 +3153,17 @@ class _ControlSSABuilder:
                 int(initial_id), (set(), initial_value),
             )
             owned.update(bindings)
-        key = (str(self.tensor_shape_concordance_scope), int(loop_node))
+            # Row ``(control scope, loop, binding)`` -> the carried entry
+            # that binding is.  Two bindings seeded from one value
+            # (``second = value; third = value``) share an initial id but
+            # are distinct entries with distinct header Phis.
+            for binding in bindings:
+                entry_page.concord((*key, str(binding)), int(entry))
         for initial_id, (owned, before) in states.items():
             state_page.concord(
                 (*key, initial_id), (tuple(sorted(owned)), before),
             )
+        self.loop_frames[key] = {"carried": carried, "latch": False}
         return key
 
     def _resolve_read(
@@ -3176,7 +3191,10 @@ class _ControlSSABuilder:
                 continue
             carried, before = set(state[0]), state[1]
             if bindings <= carried:
-                break
+                entry_value = self._carried_entry_value(
+                    key, int(value_id), bindings, reader,
+                )
+                return candidate if entry_value is None else entry_value
             if None in bindings:
                 raise ValueError(
                     f"{self.function_name}: {reader} reads carried initial "
@@ -3191,6 +3209,46 @@ class _ControlSSABuilder:
                 )
             candidate = before
         return candidate
+
+    def _carried_entry_value(
+        self, key: Any, value_id: int, bindings: set, reader: str,
+    ) -> Any | None:
+        """The carried entry's value for ``bindings`` read in loop ``key``.
+
+        The entry is the book's (``loop_carried_entry``); its header Phi in
+        the body, its published update while the latch re-evaluates the
+        predicate.  When the read's initial id seeds one entry only, the
+        ordinary resolution (the id's rebinding) already is that entry and
+        None is returned.  Bindings naming two entries cannot be one read.
+        """
+
+        frame = self.loop_frames.get(key)
+        if frame is None:
+            return None
+        carried = frame["carried"]
+        sharing = [
+            entry for entry, (_updated, initial_id, *_rest)
+            in enumerate(carried) if int(initial_id) == value_id
+        ]
+        if len(sharing) <= 1:
+            return None
+        entry_page = self._book().page("loop_carried_entry")
+        entries = {
+            entry_page.latest((*key, str(binding))) for binding in bindings
+        }
+        if None in entries or len(entries) != 1:
+            raise ValueError(
+                f"{self.function_name}: {reader} reads carried initial "
+                f"{value_id} as bindings {sorted(bindings, key=repr)!r}, "
+                f"which name carried entries {sorted(entries, key=repr)!r}; "
+                "one read is one entry"
+            )
+        updated_id, _initial_id, _initial, updated, current = carried[
+            int(entries.pop())
+        ]
+        if frame["latch"]:
+            return self.external_values.get(int(updated_id), updated)
+        return current
 
     def _read(self, value_id: int, bindings: set, reader: str) -> Any:
         resolved = (
@@ -3241,9 +3299,25 @@ class _ControlSSABuilder:
     def _region_feed(self, region_index: int, value_id: int) -> Any:
         """A region feed, read by the bindings of the operands it serves."""
 
+        book = self._book() if self.lexical_read_scope is not None else None
+        split = None if book is None else book.page(
+            "region_capture_binding"
+        ).latest((
+            str(self.tensor_shape_concordance_scope), int(region_index),
+            int(value_id),
+        ))
+        if split is not None:
+            # A formal the region split off one captured value: it is fed
+            # that value as read by exactly one binding.
+            source_id, binding = split
+            if not self.enclosing_loop_states:
+                return self.external_value(int(source_id))
+            return self._read(
+                int(source_id), {str(binding)},
+                f"region {region_index} formal {value_id}",
+            )
         if self.lexical_read_scope is None or not self.enclosing_loop_states:
             return self.external_value(int(value_id))
-        book = self._book()
         consumers = book.page("region_feed_consumer").latest((
             str(self.tensor_shape_concordance_scope), int(region_index),
             int(value_id),
@@ -4051,6 +4125,27 @@ class _ControlSSABuilder:
 
         return lower(expression)
 
+    def _control_leaf(self, expression: ControlExpression) -> SSAValue:
+        """A ``value`` leaf, read by the binding its operand read.
+
+        The leaf carries its operand position (``read``); the binding is
+        the book's ``lexical_read_binding`` fact.  Outside loops, or for a
+        leaf with no recorded position, the value id is the answer.
+        """
+
+        value_id = int(expression.value_id)
+        if (
+            expression.read is None
+            or self.lexical_read_scope is None
+            or not self.enclosing_loop_states
+        ):
+            return self.external_value(value_id)
+        return self._read(
+            value_id,
+            self._operand_bindings((tuple(expression.read),)),
+            f"control expression leaf {value_id}",
+        )
+
     def lower_control_expression(
         self,
         expression: ControlExpression,
@@ -4058,7 +4153,7 @@ class _ControlSSABuilder:
         result_override: SSAValue | None = None,
     ) -> SSAValue:
         if expression.op == "value":
-            return self.external_value(int(expression.value_id))
+            return self._control_leaf(expression)
         if expression.op == "const":
             result = result_override or self.fresh_value(
                 dtype="bool" if isinstance(expression.literal, bool) else None
@@ -8038,10 +8133,35 @@ class _ControlSSABuilder:
         # both publish the predicate. They must not define the same SSA id.
         # The expression owns the backedge value; numeric projection gets a
         # separate result when both representations are present.
-        self.external_values[int(loop.predicate_value_id)] = (
-            self.fresh_value(dtype="bool")
-            if loop.predicate_expression is not None else next_predicate
+        carried_test = (
+            loop.predicate_expression is not None
+            and loop.predicate_expression.op == "value"
+            and loop.predicate_expression.value_id is not None
+            and any(
+                int(initial_id) == int(loop.predicate_expression.value_id)
+                for _updated_id, initial_id, *_rest in carried
+            )
         )
+        if carried_test and loop_state is not None:
+            # Decision recorded, not held: row ``(control scope, loop)`` ->
+            # the carried binding the test reads (``loop_carried_entry``
+            # names its entry).  The latch neither re-runs the pre-loop
+            # condition regions nor re-publishes the predicate id for it.
+            self._book().page("while_carried_test").concord(
+                loop_state,
+                tuple(sorted(map(str, self._operand_bindings(
+                    (tuple(loop.predicate_expression.read),)
+                ))))
+                if loop.predicate_expression.read is not None
+                else int(loop.predicate_expression.value_id),
+            )
+        if not carried_test:
+            # A carried test's id is its binding's initial, which the latch
+            # has just rebound to the body's update; that is the next test.
+            self.external_values[int(loop.predicate_value_id)] = (
+                self.fresh_value(dtype="bool")
+                if loop.predicate_expression is not None else next_predicate
+            )
         preserved_before = set(self.preserved_region_output_ids)
         self.preserved_region_output_ids.update(
             int(initial_id) for _updated_id, initial_id, *_rest in carried
@@ -8051,14 +8171,33 @@ class _ControlSSABuilder:
         # shares a carried initial id still reads its pre-loop value, so the
         # loop's frame governs these reads exactly as it governs the body.
         self.enclosing_loop_states.append(loop_state)
+        latch_leaf = None
+        latch_frame = self.loop_frames.get(loop_state)
+        if latch_frame is not None:
+            latch_frame["latch"] = True
         try:
-            self.lower(loop.condition, path=f"{path}.condition.latch")
+            if not carried_test:
+                # A carried test (``while go:``) has no latch computation:
+                # the condition regions produced its pre-loop value, and
+                # re-running them would test that value forever.
+                self.lower(loop.condition, path=f"{path}.condition.latch")
             if loop.predicate_expression is not None:
-                self.lower_control_expression(
+                latch_predicate = self.lower_control_expression(
                     loop.predicate_expression,
                     result_override=next_predicate,
                 )
+                if latch_predicate is not next_predicate:
+                    # A bare leaf (``while go:``) computes nothing: the next
+                    # test IS the value the leaf resolves to at the latch.
+                    header_condition = next(
+                        instruction for instruction in header.instrs
+                        if instruction.res is current_predicate
+                    )
+                    header_condition.args[1] = latch_predicate
+                    latch_leaf = latch_predicate
         finally:
+            if latch_frame is not None:
+                latch_frame["latch"] = False
             self.enclosing_loop_states.pop()
             self.preserved_region_output_ids = preserved_before
         # Post-loop consumers read the converged header phi, not the last
@@ -8068,7 +8207,7 @@ class _ControlSSABuilder:
                 self.external_values.pop(initial_id, None)
             else:
                 self.external_values[initial_id] = previous
-        if not any(
+        if latch_leaf is None and not any(
             instruction.res is next_predicate
             for instruction in self.current.instrs
         ):
@@ -10883,6 +11022,104 @@ def _concord_region_feed_consumers(
         )
 
 
+def _split_region_captures_by_binding(
+    lexical_read_scope: Any,
+    control_scope: Any,
+    region_index: int,
+    instructions: Any,
+    captures: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Give each binding a region reads through one captured value its formal.
+
+    ``second = value`` then ``second = second + value`` inside a loop is one
+    captured value read as two bindings; only ``second`` is loop-carried, so
+    the two operands see different values at the call.  A region formal per
+    value id cannot carry both.  When the book attributes a capture's
+    operand slots (``lexical_read_binding`` at ``(read scope, instruction
+    result, role, ordinal)``) to more than one binding and a loop carries
+    that value under one of them (``loop_carried_binding``), every binding
+    after the first gets a fresh formal and its slots are rewired to it.
+
+    Page ``region_capture_binding`` row ``(control scope, region, formal)``
+    -> ``(source value id, binding)`` records each split formal, the first
+    binding's included; the region feed reads it by that binding.  Returns
+    the captures with the new formals appended after their source.
+    """
+
+    if lexical_read_scope is None:
+        return captures
+    from ..common.tensors.topological_reducer import _operand_positions
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    read_page = book.page("lexical_read_binding")
+    carried_page = book.page("loop_carried_binding")
+    carried_initials: dict[int, set[str]] = {}
+    for row in carried_page.scope_rows(tuple(lexical_read_scope)):
+        if len(row) == 4:
+            carried_initials.setdefault(int(row[3]), set()).update(
+                map(str, carried_page.latest(row) or ())
+            )
+    wanted = {int(value_id) for value_id in captures} & set(carried_initials)
+    if not wanted:
+        return captures
+    slots: dict[int, list[tuple[Any, int, Any]]] = {}
+    for instruction in instructions:
+        if instruction.res is None:
+            continue
+        roles = list(getattr(instruction, "arg_roles", ()) or ())
+        if len(roles) != len(instruction.args):
+            continue
+        for index, (role, ordinal, argument) in enumerate(_operand_positions(
+            zip(instruction.args, roles)
+        )):
+            if int(argument.id) not in wanted:
+                continue
+            binding = read_page.latest((
+                tuple(lexical_read_scope), int(instruction.res.id),
+                role, ordinal,
+            ))
+            slots.setdefault(int(argument.id), []).append(
+                (instruction, index, binding)
+            )
+    split_page = book.page("region_capture_binding")
+    expanded: list[int] = []
+    for value_id in map(int, captures):
+        expanded.append(value_id)
+        reads = slots.get(value_id)
+        if not reads:
+            continue
+        bindings = list(dict.fromkeys(binding for *_slot, binding in reads))
+        if (
+            len(bindings) < 2
+            or None in bindings
+            or not set(bindings) & carried_initials[value_id]
+        ):
+            continue
+        split_page.concord(
+            (str(control_scope), int(region_index), value_id),
+            (value_id, str(bindings[0])),
+        )
+        for binding in bindings[1:]:
+            formal_id = int(GLOBAL_MONOTONIC_IDS.mint())
+            for instruction, index, read in reads:
+                if read != binding:
+                    continue
+                source = instruction.args[index]
+                instruction.args[index] = SSAValue(
+                    formal_id,
+                    dtype=source.dtype,
+                    shape=source.shape,
+                    device=getattr(source, "device", None),
+                )
+            split_page.concord(
+                (str(control_scope), int(region_index), formal_id),
+                (value_id, str(binding)),
+            )
+            expanded.append(formal_id)
+    return tuple(expanded)
+
+
 def lower_control_sections_to_ssa(
     control: ControlProgram,
     *,
@@ -12727,6 +12964,10 @@ def lower_control_sections_to_ssa(
                     return occurrences[0]
                 return canonical
 
+            effective_captures = _split_region_captures_by_binding(
+                lexical_read_scope, tensor_shape_concordance_scope,
+                region_index, instructions, effective_captures,
+            )
             arguments = [region_argument(vid) for vid in effective_captures]
             region_function = Function(
                 region_name,

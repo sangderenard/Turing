@@ -10624,7 +10624,7 @@ def _consume_resident_control_values(control: Any, resident: frozenset[int]):
             return item
         return replace(item, operands=operands)
 
-    def predicate(item, predicate_value_id):
+    def predicate(item, predicate_value_id, carried_initials=frozenset()):
         rewritten = expression(item)
         if (
             rewritten is not None
@@ -10633,6 +10633,10 @@ def _consume_resident_control_values(control: Any, resident: frozenset[int]):
             and rewritten.value_id is not None
             and int(rewritten.value_id) == int(predicate_value_id)
             and int(predicate_value_id) in resident
+            # ``while go:`` with ``go`` rebound in the body: the resident
+            # region publishes only the pre-loop ``go``; the next test is
+            # the carried binding's update, which only the leaf can name.
+            and int(predicate_value_id) not in carried_initials
         ):
             return None
         return rewritten
@@ -10678,7 +10682,11 @@ def _consume_resident_control_values(control: Any, resident: frozenset[int]):
                 condition=visit(block.condition),
                 body=visit(block.body),
                 predicate_expression=predicate(
-                    block.predicate_expression, block.predicate_value_id
+                    block.predicate_expression, block.predicate_value_id,
+                    frozenset(
+                        int(initial)
+                        for _updated, initial in block.carried_aliases
+                    ),
                 ),
                 sequence_mutations=tuple(map(mutation, block.sequence_mutations)),
                 terminal_controls=tuple(map(visit, block.terminal_controls)),

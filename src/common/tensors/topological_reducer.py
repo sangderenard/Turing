@@ -5896,7 +5896,21 @@ def _normalize_lexical_values(
                 # any lexical load of the same name.
                 overwritten_before_read: set[str] = set()
                 candidate_names = before_loop.keys() & environment.keys()
-                for name in candidate_names:
+                # A ``while`` test is evaluated before every iteration, so a
+                # name it loads is read before any body write: ``go = ...``
+                # in the body is the next iteration's test value, never a
+                # dead overwrite (``while go: ...; go = second < limit``
+                # otherwise re-tested the pre-loop ``go`` forever).
+                test_loads = (
+                    {
+                        member.id
+                        for member in source_walk(body_statement.test)
+                        if isinstance(member, ast.Name)
+                        and isinstance(member.ctx, ast.Load)
+                    }
+                    if isinstance(body_statement, ast.While) else set()
+                )
+                for name in candidate_names - test_loads:
                     for nested in body_statement.body:
                         loaded = any(
                             isinstance(member, ast.Name)

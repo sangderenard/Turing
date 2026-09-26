@@ -7,7 +7,7 @@ coordinator after planning has selected a compiled target.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Iterable, Mapping
 
@@ -64,6 +64,12 @@ class ControlExpression:
     operands: tuple["ControlExpression", ...] = ()
     value_id: int | None = None
     literal: bool | int | float | None = None
+    # Where a ``value`` leaf was read: ``(consumer node, operand role,
+    # ordinal)``, the key of its ``lexical_read_binding`` row.  Structure
+    # only -- the binding it read is the book's fact, looked up by the
+    # lowering.  Not part of equality: two leaves reading one value compute
+    # the same expression wherever they sit.
+    read: tuple | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -2269,6 +2275,18 @@ def project_control_regions(
                 condition is None and block.predicate_expression is None
             ):
                 return None
+            # The test reads its leaves at every header: a carried pair whose
+            # initial the predicate reads is retained by the loop itself
+            # (``while go: ...; go = second < limit``).
+            tested_ids: set[int] = set()
+            pending = [block.predicate_expression]
+            while pending:
+                expression = pending.pop()
+                if expression is None:
+                    continue
+                if expression.op == "value" and expression.value_id is not None:
+                    tested_ids.add(int(expression.value_id))
+                pending.extend(expression.operands)
             return WhileBlock(
                 block.predicate_value_id,
                 condition or SequenceBlock(()),
@@ -2283,6 +2301,7 @@ def project_control_regions(
                     # in retained_values at all, yet the port IS its
                     # retention: the loop itself declares the continuation.
                     if retained_values is None
+                    or int(initial) in tested_ids
                     or int(updated) in retained_values
                     or int(updated) in control_defined_values
                     or (

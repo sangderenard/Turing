@@ -3741,10 +3741,17 @@ def analyze_shader_loop_reductions(
     def structured_control_expression(
         node_id: int,
         visiting: frozenset[int] = frozenset(),
+        read: tuple | None = None,
     ) -> ControlExpression | None:
+        # ``read`` is the operand position this node is read at, so a
+        # ``value`` leaf carries the key of its ``lexical_read_binding`` row
+        # and the lowering resolves it by binding, never by the value id two
+        # bindings may share.
+        from ..common.tensors.topological_reducer import _operand_positions
+
         node_id = int(node_id)
         if node_id in visiting:
-            return ControlExpression("value", value_id=node_id)
+            return ControlExpression("value", value_id=node_id, read=read)
         # State-effect and aggregate records speak in deterministic SSA value
         # identities, while loop/control membership speaks in graph node
         # identities.  They often coincide, but topology reduction may remove
@@ -3757,11 +3764,11 @@ def analyze_shader_loop_reductions(
             else node_ids_by_value.get(node_id)
         )
         if resolved_node_id is None:
-            return ControlExpression("value", value_id=node_id)
+            return ControlExpression("value", value_id=node_id, read=read)
         data = graph.G.nodes[int(resolved_node_id)]
         value_id = int(data.get("value_id", node_id))
         if value_id in carried_initial_value_ids:
-            return ControlExpression("value", value_id=value_id)
+            return ControlExpression("value", value_id=value_id, read=read)
         known, literal = _constant(graph, int(resolved_node_id))
         if known and isinstance(literal, (bool, int, float)):
             return ControlExpression(
@@ -3781,7 +3788,7 @@ def analyze_shader_loop_reductions(
             # latch and produces the next while predicate.
             return ControlExpression(
                 "sequence_nonempty",
-                (ControlExpression("value", value_id=value_id),),
+                (ControlExpression("value", value_id=value_id, read=read),),
                 value_id=value_id,
                 literal=attributes.get("aggregate_kind") in {"dict", "set"},
             )
@@ -3791,15 +3798,18 @@ def analyze_shader_loop_reductions(
                 return ControlExpression(
                     "const", value_id=value_id, literal=specialized
                 )
-            return ControlExpression("value", value_id=value_id)
+            return ControlExpression("value", value_id=value_id, read=read)
         if isinstance(expression, ast.BoolOp):
             operator_name = "and" if isinstance(expression.op, ast.And) else "or"
             values = [
-                structured_control_expression(parent, visiting | {node_id})
-                for parent, role in sorted(
-                    parents,
-                    key=lambda item: int(str(item[1]).split(":")[-1])
-                    if str(item[1]).startswith("value:") else 0,
+                structured_control_expression(
+                    parent, visiting | {node_id},
+                    (int(resolved_node_id), role, ordinal),
+                )
+                for role, ordinal, parent in sorted(
+                    _operand_positions(parents),
+                    key=lambda item: int(str(item[0]).split(":")[-1])
+                    if str(item[0]).startswith("value:") else 0,
                 )
                 if str(role).startswith("value")
             ]
@@ -3840,15 +3850,16 @@ def analyze_shader_loop_reductions(
                     "float": "float", "int": "int", "bool": "bool"
                 }.get(expression.func.id)
         if operation is None:
-            return ControlExpression("value", value_id=value_id)
+            return ControlExpression("value", value_id=value_id, read=read)
         ignored_roles = {"callee", "ops", "operator"}
         operands = tuple(
             operand
-            for parent, role in parents
+            for role, ordinal, parent in _operand_positions(parents)
             if str(role) not in ignored_roles
             for operand in (
                 structured_control_expression(
-                    int(parent), visiting | {node_id}
+                    int(parent), visiting | {node_id},
+                    (int(resolved_node_id), role, ordinal),
                 ),
             )
             if operand is not None
@@ -4449,6 +4460,27 @@ def analyze_shader_loop_reductions(
             if loop.source_type == "While" and loop.condition_nodes
             else None
         )
+        if (
+            while_predicate_expression is not None
+            and while_predicate_expression.op == "value"
+            and while_predicate_expression.read is None
+            and int(loop.node_id) in graph.G
+        ):
+            # A bare-name test (``while go:``) is read by the loop itself;
+            # its operand position keys the binding it read.
+            from ..common.tensors.topological_reducer import _operand_positions
+
+            test_reads = tuple(
+                (int(loop.node_id), role, ordinal)
+                for role, ordinal, parent in _operand_positions(
+                    graph.G.nodes[int(loop.node_id)].get("parents") or ()
+                )
+                if int(parent) == int(loop.condition_nodes[0])
+            )
+            if len(test_reads) == 1:
+                while_predicate_expression = replace(
+                    while_predicate_expression, read=test_reads[0],
+                )
         predicate_operation_values = expression_value_ids(
             while_predicate_expression
         )
