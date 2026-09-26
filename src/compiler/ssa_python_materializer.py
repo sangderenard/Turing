@@ -1092,6 +1092,22 @@ def _materialize_counted_loop(
         )
         materializer.names[int(updated_id)] = port_name
 
+    # The exit block's only predecessor is the header, so an exit phi (the
+    # loop-closed form of a carried value) has exactly one incoming value
+    # and is that value.  ``_straight_line`` skips phis; bind them here.
+    for instruction in shape["exit"].instrs:
+        if str(instruction.op) not in {"Phi", "phi"}:
+            continue
+        if len(instruction.args) != 1:
+            raise MaterializationError(
+                f"{function.name}: loop-exit phi %t{int(instruction.res.id)} "
+                f"has {len(instruction.args)} incoming values; the exit has "
+                "one predecessor"
+            )
+        materializer.assign(
+            instruction.res, materializer.operand(instruction.args[0]),
+        )
+
     _straight_line(materializer, shape["exit"])
     returned = _terminator(shape["exit"])
     if returned is not None and str(returned.op) in {"Ret", "ret", "Return", "return"}:
@@ -1376,7 +1392,15 @@ def _region_output_contracts(module: Any) -> dict[str, Any]:
                     continue
                 attributes = instruction.attributes or {}
                 callee = str(attributes.get("callee") or "")
-                declared = attributes.get("output_ids")
+                # Only a call under the aggregate convention projects its
+                # callee's outputs, and it names them in the callee's own ids
+                # (``callee_output_ids``; ``output_ids`` when the two share a
+                # numbering) -- the same reading ``ssa_llvm_backend`` makes.
+                if attributes.get("result_convention") != "ssa.aggregate":
+                    continue
+                declared = attributes.get(
+                    "callee_output_ids", attributes.get("output_ids"),
+                )
                 if not callee or declared is None:
                     continue
                 outputs = tuple(int(each) for each in declared)
@@ -1477,6 +1501,37 @@ def materialize_ir_module(
         if isinstance(contract, str):
             skipped[str(name)] = contract
             continue
+        if contract is not None and any(
+            isinstance(statement, ast.Return) for statement in body
+        ):
+            # The callers project this function's Ret as one aggregate, so
+            # the return IS that tuple -- a one-output Ret included, which
+            # ``finish`` would otherwise spell as the bare value the callers'
+            # ``[0]`` cannot index.  The Ret and the callers' projection must
+            # name the same values in the same order.
+            returned = tuple(
+                int(value.id)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if str(instruction.op) in {"Ret", "ret", "Return", "return"}
+                for value in instruction.args
+            )
+            if returned != tuple(map(int, contract)):
+                skipped[str(name)] = (
+                    f"{name}: Ret publishes {returned!r} but its callers "
+                    f"project {tuple(contract)!r}"
+                )
+                continue
+            body = [
+                ast.Return(value=ast.Tuple(
+                    elts=[statement.value], ctx=ast.Load(),
+                ))
+                if isinstance(statement, ast.Return)
+                and statement.value is not None
+                and not isinstance(statement.value, ast.Tuple)
+                else statement
+                for statement in body
+            ]
         if contract is not None and not any(
             isinstance(statement, ast.Return) for statement in body
         ):

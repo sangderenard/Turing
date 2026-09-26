@@ -16,6 +16,15 @@ from src.compiler.loop_interchange import (
 )
 
 
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
+
+
 def _run_gemm(source: str, a, b, c, *, size: int = 5):
     namespace: dict = {}
     exec(compile(source, "<gemm>", "exec"), namespace)
@@ -203,6 +212,7 @@ def _lower_under_contract(contract: str):
     try:
         return lower_ast_source_to_ssa(
             GEMM_SOURCE, "gemm", name=f"interchange_{contract}",
+            extraction_contract=CONTRACT,
         )[0]
     finally:
         set_active_contract(None)

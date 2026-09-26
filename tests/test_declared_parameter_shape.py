@@ -227,6 +227,7 @@ def test_nested_return_guards_keep_path_specific_phi_inputs():
         warnings.simplefilter("ignore")
         module, _outputs, _ = lower_ast_source_to_ssa(
             source, "guarded", name="guarded_single_exit",
+            extraction_contract=BASE_CONTRACT,
         )
 
     function = next(

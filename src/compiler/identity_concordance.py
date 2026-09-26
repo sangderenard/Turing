@@ -73,6 +73,7 @@ from __future__ import annotations
 import contextvars
 from collections import defaultdict
 from dataclasses import dataclass, field
+from collections.abc import MutableMapping
 from typing import Any, Iterable, Mapping
 
 from .id_space import group_by_prefix, label as id_label
@@ -311,6 +312,59 @@ class CorrelationTable:
         found.extend(self._tensor_reduction_domain_findings(module))
         found.extend(self._callable_identity_findings(module))
         found.extend(self._post_ssa_numeric_identity_findings(module))
+        found.extend(self._table_member_findings(module))
+        return found
+
+    @staticmethod
+    def _table_member_findings(module: Any) -> list[Finding]:
+        """Member rows that disagree with the descriptors they index.
+
+        ``record_member`` / ``sequence_member`` hold, per table owner and
+        value, every claim the live descriptors on ``record_descriptor`` /
+        ``sequence_descriptor`` make on that value.  The two are one fact
+        seen from each side; any difference is a descriptor write that
+        bypassed its table.
+        """
+
+        from ..transmogrifier.ssa import (
+            record_member_claims, sequence_member_roles,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        pages = getattr(book, "pages", {}) or {}
+        found: list[Finding] = []
+        for descriptor_page, member_page, claims_of in (
+            ("record_descriptor", "record_member", record_member_claims),
+            ("sequence_descriptor", "sequence_member", sequence_member_roles),
+        ):
+            descriptors = pages.get(descriptor_page)
+            members = pages.get(member_page)
+            if descriptors is None or members is None:
+                continue
+            for owner in tuple(descriptors.scopes):
+                expected: dict[int, set] = {}
+                for row in descriptors.scope_rows(owner):
+                    for member, claims in claims_of(
+                        descriptors.latest(row)
+                    ).items():
+                        expected.setdefault(int(member), set()).update(claims)
+                recorded = {
+                    int(row[1]): set(members.latest(row) or ())
+                    for row in members.scope_rows(owner)
+                    if members.latest(row)
+                }
+                for member in sorted(set(expected) | set(recorded)):
+                    if expected.get(member, set()) == recorded.get(member, set()):
+                        continue
+                    found.append(Finding(
+                        "table-member-disagreement",
+                        str(owner[0]) if isinstance(owner, tuple) else str(owner),
+                        int(member),
+                        f"{member_page} records "
+                        f"{sorted(recorded.get(member, ()), key=repr)!r}; "
+                        f"{descriptor_page} implies "
+                        f"{sorted(expected.get(member, ()), key=repr)!r}",
+                    ))
         return found
 
     @staticmethod
@@ -1707,11 +1761,32 @@ class IdentityPage:
     name: str
     cells: dict[tuple[Any, int], Any] = field(default_factory=dict)
     columns: list[int] = field(default_factory=list)
+    #: Rows grouped by their first element, in first-recorded order, so the
+    #: rows one scope owns (a function's table, a planning scope) are read
+    #: from the page without scanning every cell.  Part of the page itself.
+    scopes: dict[Any, dict[Any, None]] = field(default_factory=dict)
 
     def set(self, row: Any, column: int, fact: Any) -> None:
         if column not in self.columns:
             self.columns.append(column)
         self.cells[(row, column)] = fact
+        if isinstance(row, tuple) and row:
+            self.scopes.setdefault(row[0], {}).setdefault(row, None)
+
+    def scope_rows(self, scope: Any) -> tuple[Any, ...]:
+        """Every row whose first element is ``scope``, in recorded order."""
+        return tuple(self.scopes.get(scope, ()))
+
+    def revise(self, row: Any, fact: Any) -> Any:
+        """Append ``fact`` as ``row``'s next revision and return it.
+
+        For a row whose fact legitimately grows (a record descriptor gaining
+        the fields another callee projects); the full history stays on the
+        page.  Identity facts that must never change use ``concord``.
+        """
+        entries = self.history(row)
+        self.set(row, entries[-1][0] + 1 if entries else 0, fact)
+        return fact
 
     def latest(self, row: Any, default: Any = None) -> Any:
         """Return the most recently recorded fact for ``row``."""
@@ -1735,6 +1810,15 @@ class IdentityPage:
                 f"recorded={incumbent!r}, proposed={fact!r}"
             )
         return incumbent
+
+    def mapping(self, scope: Any) -> "PageMapping":
+        """This page's rows under ``scope`` as a mutable mapping.
+
+        ``mapping[key]`` is row ``(scope, key)``'s latest fact; assignment
+        is a revision and deletion a ``None`` revision, so a pass that keeps
+        its working state here keeps it on the book with its full history.
+        """
+        return PageMapping(self, scope)
 
     def bind_alias(self, scope: Any, alias: int, resident: int) -> None:
         """Concord one planning value occurrence with its resident identity.
@@ -1835,6 +1919,61 @@ class IdentityPage:
         return found
 
 
+class PageMapping(MutableMapping):
+    """Rows ``(scope, key)`` of one page, read and written as a mapping."""
+
+    def __init__(self, page: IdentityPage, scope: Any) -> None:
+        self.page = page
+        self.scope = scope
+
+    def __getitem__(self, key: Any) -> Any:
+        try:
+            fact = self.page.latest((self.scope, key))
+        except TypeError:  # an unhashable key names no row
+            raise KeyError(key) from None
+        if fact is None:
+            raise KeyError(key)
+        return fact
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if value is None:
+            raise ValueError(
+                f"{self.page.name}: None is the removal fact; delete the row"
+            )
+        row = (self.scope, key)
+        if self.page.latest(row) != value:
+            self.page.revise(row, value)
+
+    def __delitem__(self, key: Any) -> None:
+        if self.page.latest((self.scope, key)) is None:
+            raise KeyError(key)
+        self.page.revise((self.scope, key), None)
+
+    def __iter__(self):
+        for row in self.page.scope_rows(self.scope):
+            if self.page.latest(row) is not None:
+                yield row[1]
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def __repr__(self) -> str:
+        return f"PageMapping({self.page.name!r}, {self.scope!r}, {dict(self)!r})"
+
+    def __reduce__(self):
+        return (dict, (dict(self),))
+
+
+def mint_scope(label: Any) -> tuple[str, int]:
+    """A fresh scope on the active compile's book (see ``IdentityBook``)."""
+    return current_identity_book().mint_scope(label)
+
+
 class IdentityBook:
     """Every stage's page, so one identity's claim can be read across all
     of them -- the comparison none of them makes on its own."""
@@ -1848,6 +1987,19 @@ class IdentityBook:
 
     def page(self, name: str) -> IdentityPage:
         return self.pages.setdefault(name, IdentityPage(name))
+
+    def mint_scope(self, label: Any) -> tuple[str, int]:
+        """A fresh scope, numbered by this book in causal order.
+
+        Page ``scope_registry`` row ``(label, serial)`` records every scope
+        minted under ``label``; the next serial is how many exist.  The
+        numbering is the compile's own, never a process-wide counter.
+        """
+        page = self.page("scope_registry")
+        label = str(label)
+        scope = (label, len(page.scope_rows(label)))
+        page.concord(scope, True)
+        return scope
 
     def latest_by_page(self, row: Any) -> dict[str, Any]:
         """The final fact recorded for `row` on each page that ever saw it."""

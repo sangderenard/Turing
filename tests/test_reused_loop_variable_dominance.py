@@ -41,6 +41,16 @@ from src.compiler.ssa_llvm_backend import (
     compile_artifact,
     emit_ssa_function_to_llvm,
 )
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 
 def _block(suffix: str) -> str:
@@ -62,7 +72,7 @@ def _emit_and_compile(body: str, name: str):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         module, _outputs, _exports = lower_ast_source_to_ssa(
-            source, "f", name=name
+            source, "f", name=name, extraction_contract=CONTRACT
         )
     artifact = emit_ssa_function_to_llvm(module, f"{name}__f")
     assert artifact.shortfalls == (), (

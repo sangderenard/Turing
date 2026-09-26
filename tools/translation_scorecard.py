@@ -326,6 +326,15 @@ def _halve_until(value: float, limit: float) -> float:
     return value
 
 
+#: The repository's program extraction contract -- the same one the compiler
+#: tests lower under.  The compiler refuses to lower without one.
+_PROGRAM_CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
+
+
 def score(journey: Journey) -> tuple[str, str]:
     """Return ``(stage_reached, detail)`` for one journey."""
 
@@ -337,7 +346,8 @@ def score(journey: Journey) -> tuple[str, str]:
         warnings.simplefilter("ignore", DeprecationWarning)
         try:
             module, _outputs, _exports = lower_ast_source_to_ssa(
-                journey.source, "train", name=prefix
+                journey.source, "train", name=prefix,
+                extraction_contract=_PROGRAM_CONTRACT,
             )
         except Exception as error:
             return "LOWER", f"{type(error).__name__}: {str(error)[:70]}"

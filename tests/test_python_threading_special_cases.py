@@ -6,6 +6,16 @@ from src.transmogrifier.graph.python_special_cases import (
     interpret_python_special_case,
     lower_python_threading,
 )
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 
 def test_condition_scope_releases_captured_receiver_after_rebinding_and_exception():
@@ -238,7 +248,7 @@ def test_literal_seeded_counter_executes_native_iterations(tmp_path):
     from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 
     source = "def counter(n):\n    i = 0\n    while i < n:\n        i = i + 1\n    return i\n"
-    module, outputs, exports = lower_ast_source_to_ssa(source, "counter")
+    module, outputs, exports = lower_ast_source_to_ssa(source, "counter", extraction_contract=CONTRACT)
     entry = exports[0]
     artifact = emit_ssa_module_to_c(module, entry)
     assert artifact.complete, artifact.shortfalls

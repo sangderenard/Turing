@@ -25,12 +25,22 @@ import warnings
 import pytest
 
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 
 def _lower(source: str, name: str):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        return lower_ast_source_to_ssa(source, "train", name=name)
+        return lower_ast_source_to_ssa(source, "train", name=name, extraction_contract=CONTRACT)
 
 
 # Each source keeps one other function so the entrypoint is not a bare
@@ -196,10 +206,14 @@ def test_a_carried_value_round_tripped_through_a_call_lowers_and_computes(
     exec(compile(emitted, "<round-trip>", "exec"), namespace)
 
     compiled = namespace[f"{prefix}__train"]
+    # The authored program is the reference, zero-trip included: ``total``
+    # starts as ``update(w)`` before the loop, so ``epochs=0`` returns that,
+    # not ``w``.  (Stepping ``w`` by hand agreed only with the old exit that
+    # returned ``w``'s carried value for ``total``.)
+    authored: dict = {}
+    exec(compile(source, "<authored>", "exec"), authored)
     for start, epochs in ((2.0, 3), (2.0, 1), (-1.5, 4), (2.0, 0)):
-        expected = start
-        for _ in range(epochs):
-            expected = authored_step(expected)
+        expected = authored["train"](start, epochs)
         assert compiled(w=start, epochs=epochs) == pytest.approx(
             expected, abs=1e-12
         )
@@ -298,3 +312,120 @@ def test_both_carried_values_are_actually_carried(start, second, epochs):
         assert produced != pytest.approx(
             _with_second_value_frozen(start, second, epochs), abs=1e-9
         )
+
+
+# -- one value, two bindings ------------------------------------------------
+#
+# A carried binding that starts from (or updates to) the same value another
+# binding holds.  The loop may rebind only the binding it carries; every read
+# is resolved through the identity book by the binding it names, never by the
+# shared value id.  Each program here miscompiled when reads were keyed by
+# value: a loop-body region, a call argument, a call passing one value as two
+# operands, the while predicate (a latch that re-read the carried binding for
+# ``value`` never terminated), and exits of two bindings sharing an update.
+
+_SHARED_VALUE_PROGRAMS = {
+    "region-read": (
+        "def train(value, limit):\n"
+        "    total = 0.0\n"
+        "    second = value\n"
+        "    while total < limit:\n"
+        "        total = total + value\n"
+        "        second = total\n"
+        "    return second\n",
+        ((1.0, 3.0), (2.0, 7.0), (1.0, 0.0), (5.0, -1.0)),
+    ),
+    "call-argument": (
+        "def helper(a):\n"
+        "    return a * 2.0\n\n"
+        "def train(value, limit):\n"
+        "    total = 0.0\n"
+        "    second = value\n"
+        "    while total < limit:\n"
+        "        total = total + helper(value)\n"
+        "        second = total\n"
+        "    return second\n",
+        ((1.0, 3.0), (2.0, 7.0), (1.0, 0.0)),
+    ),
+    "call-two-operands": (
+        "def helper(a, b):\n"
+        "    return a + b\n\n"
+        "def train(value, count):\n"
+        "    second = value\n"
+        "    for _ in range(count):\n"
+        "        second = helper(second, value)\n"
+        "    return second\n",
+        ((1.0, 3), (2.0, 1), (1.5, 0)),
+    ),
+    "predicate-region": (
+        "def helper(a):\n"
+        "    return a\n\n"
+        "def train(value, limit):\n"
+        "    total = 0.0\n"
+        "    second = value\n"
+        "    while total < value * limit:\n"
+        "        total = total + 1.0\n"
+        "        second = total\n"
+        "    return second\n",
+        ((1.0, 3.0), (2.0, 2.0), (1.0, 0.0)),
+    ),
+    "predicate-direct": (
+        "def helper(a):\n"
+        "    return a\n\n"
+        "def train(value, limit):\n"
+        "    total = 0.0\n"
+        "    second = value\n"
+        "    while total < value:\n"
+        "        total = total + limit\n"
+        "        second = total\n"
+        "    return second\n",
+        ((3.0, 1.0), (2.0, 0.5), (0.0, 1.0)),
+    ),
+    "for-exit": (
+        "def helper(a):\n"
+        "    return a\n\n"
+        "def train(value, count):\n"
+        "    second = value\n"
+        "    total = 0.0\n"
+        "    for _ in range(count):\n"
+        "        total = total + value\n"
+        "        second = total\n"
+        "    return second\n",
+        ((1.0, 3), (2.0, 1), (1.5, 0)),
+    ),
+    "shared-update": (
+        "def helper(a):\n"
+        "    return a\n\n"
+        "def train(w, count):\n"
+        "    total = w * 1.0\n"
+        "    for _ in range(count):\n"
+        "        w = w * 0.5\n"
+        "        total = w\n"
+        "    return total, w\n",
+        ((2.0, 3), (2.0, 0), (-1.0, 2)),
+    ),
+}
+
+
+@pytest.mark.parametrize("label", sorted(_SHARED_VALUE_PROGRAMS))
+def test_one_value_held_by_two_bindings_computes_the_authored_answer(label):
+    import inspect
+
+    from src.compiler.ssa_python_materializer import materialize_ir_module
+
+    source, probes = _SHARED_VALUE_PROGRAMS[label]
+    authored_namespace: dict = {}
+    exec(compile(source, "<authored>", "exec"), authored_namespace)
+    authored = authored_namespace["train"]
+    prefix = "shared_" + label.replace("-", "_")
+    module, _outputs, _exports = _lower(source, prefix)
+    emitted, skipped = materialize_ir_module(module)
+    assert skipped == {}
+    namespace: dict = {}
+    exec(compile(emitted, "<compiled>", "exec"), namespace)
+    compiled = namespace[f"{prefix}__train"]
+    names = list(inspect.signature(authored).parameters)
+    for probe in probes:
+        expected = authored(*probe)
+        produced = compiled(**dict(zip(names, probe)))
+        assert produced == pytest.approx(expected, abs=1e-12), probe

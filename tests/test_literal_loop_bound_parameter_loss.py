@@ -34,6 +34,16 @@ from __future__ import annotations
 import warnings
 
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 
 LITERAL_BOUND = """
@@ -66,7 +76,7 @@ def _lowered(source: str, name: str):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         module, _outputs, _exports = lower_ast_source_to_ssa(
-            source, "f", name=name
+            source, "f", name=name, extraction_contract=CONTRACT
         )
     function = module.functions[f"{name}__f"]
     return (

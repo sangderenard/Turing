@@ -1557,22 +1557,67 @@ def materialize_retained_loop_ports(
             attributes=port_attributes,
             tensor=port_tensor,
         )
+        # A LoopResult continues exactly one authored binding; that is its
+        # identity on the book, which the exit lowering joins against the
+        # loop's carried bindings instead of matching value ids.
+        read_scope = graph.G.graph.get("lexical_read_scope")
+        if (
+            node_type == "LoopResult"
+            and read_scope is not None
+            and attributes.get("binding_name") is not None
+        ):
+            from .identity_concordance import current_identity_book
+
+            current_identity_book().page("loop_result_port_binding").concord(
+                (tuple(read_scope), int(node_id)),
+                str(attributes["binding_name"]),
+            )
         return node_id
 
     def rewire_continuation(
         old_value_id: int,
         new_value_id: int,
         owned_nodes: frozenset[int],
+        binding: str | None = None,
     ) -> None:
+        from ..common.tensors.topological_reducer import (
+            _operand_positions, lexical_read_binding,
+        )
+
+        def reads_binding(node_id: int, role: Any, ordinal: int) -> bool:
+            # A port continues ONE binding.  Two bindings can hold the same
+            # value after the loop (``second = total``); an edge whose read
+            # the book attributes to another binding is that binding's
+            # continuation, not this port's.
+            if binding is None:
+                return True
+            read = lexical_read_binding(graph.G, node_id, role, ordinal)
+            return read is None or str(read) == str(binding)
+
         for node_id, data in graph.G.nodes(data=True):
             if int(node_id) in owned_nodes or int(node_id) == new_value_id:
                 continue
+            parents = list(data.get("parents") or ())
+            positions = list(_operand_positions(parents))
+            reads_old = [
+                (role, ordinal) for role, ordinal, parent in positions
+                if int(parent) == old_value_id
+            ]
+            if reads_old and not any(
+                reads_binding(node_id, role, ordinal)
+                for role, ordinal in reads_old
+            ):
+                # Every read of the old value here is another binding's.
+                continue
             data["parents"] = [
                 (
-                    new_value_id if int(parent) == old_value_id else int(parent),
+                    new_value_id
+                    if int(parent) == old_value_id
+                    and reads_binding(node_id, role, ordinal)
+                    else int(parent),
                     role,
                 )
-                for parent, role in data.get("parents") or ()
+                for role, ordinal, parent in positions
             ]
             # Every cached copy of an id this edge rewrite touches -- a
             # port's `value_source_id`, the leaf ledgers, and a not-yet
@@ -1587,8 +1632,11 @@ def materialize_retained_loop_ports(
             # state_input_id=8).
             _retarget_cached_value_ids(data, old_value_id, (new_value_id,))
         graph.roots = [
-            new_value_id if int(root) == old_value_id else int(root)
-            for root in graph.roots
+            new_value_id
+            if int(root) == old_value_id
+            and reads_binding("return", "root", position)
+            else int(root)
+            for position, root in enumerate(graph.roots)
         ]
         # The plan records of loops not yet materialized are the same cache
         # one level up: `state_input_id`, a carried binding's initial, and an
@@ -1661,7 +1709,7 @@ def materialize_retained_loop_ports(
                 },
             )
             rewire_continuation(
-                int(updated), result_id, owned_nodes
+                int(updated), result_id, owned_nodes, str(name),
             )
             identities.setdefault(str(name), []).append(result_id)
             carried_results[str(name)] = result_id
@@ -1683,7 +1731,7 @@ def materialize_retained_loop_ports(
                 },
             )
             rewire_continuation(
-                int(continuation), result_id, owned_nodes
+                int(continuation), result_id, owned_nodes, str(name),
             )
             identities.setdefault(str(name), []).append(result_id)
             carried_results[str(name)] = result_id
@@ -4797,6 +4845,24 @@ def analyze_shader_loop_reductions(
         # Offering all of them as backedge candidates emits several pairs per
         # binding, and only the reducer's lexical update is the authoritative
         # version written by this cycle.  Use exactly that version here.
+        # Which authored bindings each carried (updated, initial) pair is, on
+        # the book: the pair alone is a value fact and two bindings can share
+        # it or share its initial (``second = value``).
+        read_scope = graph.G.graph.get("lexical_read_scope")
+        if read_scope is not None:
+            from .identity_concordance import current_identity_book
+
+            carried_names: dict[tuple[int, int], set[str]] = {}
+            for name, initial, updated in loop.carried_bindings:
+                carried_names.setdefault(
+                    (int(updated), int(initial)), set()
+                ).add(str(name))
+            carried_page = current_identity_book().page("loop_carried_binding")
+            for (updated, initial), names in carried_names.items():
+                carried_page.concord(
+                    (tuple(read_scope), int(loop.node_id), updated, initial),
+                    tuple(sorted(names)),
+                )
         carried_aliases = tuple(dict.fromkeys(
             (
                 int(updated),

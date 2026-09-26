@@ -892,6 +892,7 @@ class _ControlSSABuilder:
         region_value_meta: Mapping[int, Meta] | None = None,
         region_value_ranks: Mapping[int, int] | None = None,
         tensor_shape_concordance_scope: str | None = None,
+        lexical_read_scope: Any = None,
         plan_callsite_bindings: Mapping[
             int, tuple[tuple[int, ...], tuple[int, ...]]
         ] | None = None,
@@ -959,6 +960,15 @@ class _ControlSSABuilder:
         self.tensor_shape_concordance_scope = str(
             tensor_shape_concordance_scope or function_name
         )
+        # The source graph's reduction scope on the identity book: per-read
+        # bindings, per-loop carried bindings and per-region capture reads
+        # are read from its pages, never passed in as tables.
+        self.lexical_read_scope = (
+            None if lexical_read_scope is None else tuple(lexical_read_scope)
+        )
+        #: The loops enclosing the current emission point, as keys of their
+        #: ``loop_entry_state`` rows (None for a loop the book cannot key).
+        self.enclosing_loop_states: list[Any] = []
         self.value_aliases = {
             int(alias): int(source)
             for alias, source in (value_aliases or {}).items()
@@ -2990,7 +3000,8 @@ class _ControlSSABuilder:
             return
         argument_ids, result_ids = bindings
         arguments = [
-            self.external_value(int(value_id)) for value_id in argument_ids
+            self._callsite_argument(int(callsite_id), position, int(value_id))
+            for position, value_id in enumerate(argument_ids)
         ]
         self._note_callsite_arguments(callsite_id, argument_ids, arguments)
         for index, value in enumerate(arguments):
@@ -3081,6 +3092,179 @@ class _ControlSSABuilder:
         )
         self.emitted_plan_callsites.add(int(callsite_id))
 
+    # -- reads resolved through the identity book --------------------------
+    #
+    # One base fact decides every read: ``lexical_read_binding`` row
+    # ``(read scope, consumer, role, ordinal)`` names the authored binding an
+    # operand read.  Planner pages record only WHICH operand a lowering
+    # operand is (``consumer_operand``, ``call_argument_operand``,
+    # ``region_feed_consumer``); a loop's entry state records which bindings
+    # it carries under each initial id and their pre-loop value
+    # (``loop_entry_state``).  The builder keeps only its position: the
+    # loops enclosing the current emission point.
+
+    def _book(self) -> Any:
+        from .identity_concordance import current_identity_book
+
+        return current_identity_book()
+
+    def _operand_bindings(self, operands: Any) -> set:
+        """The bindings read by ``(consumer, role, ordinal)`` operands."""
+
+        page = self._book().page("lexical_read_binding")
+        return {
+            page.latest((self.lexical_read_scope, consumer, role, ordinal))
+            for consumer, role, ordinal in operands
+        }
+
+    def _enter_loop_state(self, loop: Any, carried: Any) -> Any:
+        """Commit this loop's entry state; return its key for the stack.
+
+        Row ``(control scope, loop node, initial id)`` holds the bindings the
+        loop carries under that initial id (``loop_carried_binding``) and
+        the value that initial id had before the loop.  A pair the book does
+        not attribute is not committed; its reads keep the header rebinding.
+        """
+
+        loop_node = getattr(loop, "source_loop_node_id", None)
+        if self.lexical_read_scope is None or loop_node is None:
+            return None
+        book = self._book()
+        carried_page = book.page("loop_carried_binding")
+        state_page = book.page("loop_entry_state")
+        states: dict[int, tuple[set, Any]] = {}
+        for updated_id, initial_id, initial_value, *_rest in carried:
+            bindings = carried_page.latest((
+                self.lexical_read_scope, int(loop_node),
+                int(updated_id), int(initial_id),
+            ))
+            if bindings is None:
+                continue
+            owned, before = states.setdefault(
+                int(initial_id), (set(), initial_value),
+            )
+            owned.update(bindings)
+        key = (str(self.tensor_shape_concordance_scope), int(loop_node))
+        for initial_id, (owned, before) in states.items():
+            state_page.concord(
+                (*key, initial_id), (tuple(sorted(owned)), before),
+            )
+        return key
+
+    def _resolve_read(
+        self, value_id: int, bindings: set, reader: str,
+    ) -> Any | None:
+        """The value ``bindings`` see for ``value_id`` at this point.
+
+        Walks the enclosing loops innermost first.  A loop that carries
+        every read binding under this initial id is where the value is (its
+        header, or its latch update -- the ordinary resolution); a loop
+        carrying none of them is passed through to its pre-loop value; a
+        loop carrying some, or a read no row attributes, raises.  Returns
+        None when the ordinary resolution is the answer.
+        """
+
+        if not bindings:
+            return None
+        state_page = self._book().page("loop_entry_state")
+        candidate = None
+        for key in reversed(self.enclosing_loop_states):
+            if key is None:
+                continue
+            state = state_page.latest((*key, int(value_id)))
+            if state is None:
+                continue
+            carried, before = set(state[0]), state[1]
+            if bindings <= carried:
+                break
+            if None in bindings:
+                raise ValueError(
+                    f"{self.function_name}: {reader} reads carried initial "
+                    f"{value_id} through an operand no lexical_read_binding "
+                    "row attributes"
+                )
+            if bindings & carried:
+                raise ValueError(
+                    f"{self.function_name}: {reader} reads value {value_id} "
+                    f"as bindings {sorted(bindings, key=repr)!r}, of which "
+                    f"the enclosing loop carries only {sorted(carried)!r}"
+                )
+            candidate = before
+        return candidate
+
+    def _read(self, value_id: int, bindings: set, reader: str) -> Any:
+        resolved = (
+            self._resolve_read(value_id, bindings, reader)
+            if self.enclosing_loop_states else None
+        )
+        return self.external_value(int(value_id)) if resolved is None else resolved
+
+    def _callsite_argument(
+        self, callsite_id: int, position: int, value_id: int,
+    ) -> Any:
+        """A call argument, read by the binding its operand read."""
+
+        if self.lexical_read_scope is None or not self.enclosing_loop_states:
+            return self.external_value(int(value_id))
+        operand = self._book().page("call_argument_operand").latest(
+            (self.lexical_read_scope, int(callsite_id), int(position))
+        )
+        bindings = (
+            set() if operand is None
+            else self._operand_bindings(((int(callsite_id), *operand),))
+        )
+        return self._read(
+            value_id, bindings, f"callsite {callsite_id} argument {position}",
+        )
+
+    def _break_bound_initial(self, port_id: int, initial_id: int) -> Any:
+        """A break-bound port's no-break value: its binding's pre-loop value.
+
+        The port's own identity is the binding it continues
+        (``loop_result_port_binding``).
+        """
+
+        if self.lexical_read_scope is None or not self.enclosing_loop_states:
+            return self.external_value(int(initial_id))
+        binding = self._book().page("loop_result_port_binding").latest(
+            (self.lexical_read_scope, int(port_id))
+        )
+        if binding is None:
+            raise ValueError(
+                f"{self.function_name}: break-bound result port {port_id} "
+                "has no loop_result_port_binding row"
+            )
+        return self._read(
+            initial_id, {str(binding)}, f"result port {port_id}",
+        )
+
+    def _region_feed(self, region_index: int, value_id: int) -> Any:
+        """A region feed, read by the bindings of the operands it serves."""
+
+        if self.lexical_read_scope is None or not self.enclosing_loop_states:
+            return self.external_value(int(value_id))
+        book = self._book()
+        consumers = book.page("region_feed_consumer").latest((
+            str(self.tensor_shape_concordance_scope), int(region_index),
+            int(value_id),
+        )) or ()
+        operand_page = book.page("consumer_operand")
+        operands = []
+        for consumer in consumers:
+            positions = operand_page.latest(
+                (self.lexical_read_scope, int(consumer), int(value_id))
+            )
+            if not positions:
+                operands.append((int(consumer), None, 0))
+                continue
+            operands.extend(
+                (int(consumer), role, ordinal) for role, ordinal in positions
+            )
+        return self._read(
+            value_id, self._operand_bindings(operands),
+            f"region {region_index}",
+        )
+
     def emit_region_call(self, region_index: int, *, location: str) -> None:
         if self.emit_table_region_operations(region_index):
             return
@@ -3105,7 +3289,7 @@ class _ControlSSABuilder:
         storage_arguments = [
             self.variant_row_values.get(int(value_id), self.external_value(value_id))
             if int(value_id) in array_feeds
-            else self.external_value(value_id)
+            else self._region_feed(region_index, value_id)
             for value_id in feeds
         ]
         feed_meta = self.region_feed_meta.get(int(region_index), ())
@@ -3456,7 +3640,7 @@ class _ControlSSABuilder:
         for index, (
             updated_id, initial_id, _initial, reserved, incumbent
         ) in enumerate(carried):
-            candidate = carried_updates[int(updated_id)]
+            candidate = carried_updates[index]
             incoming_values = tuple(
                 continue_by_block[predecessor][index]
                 if predecessor in continue_by_block
@@ -3503,10 +3687,10 @@ class _ControlSSABuilder:
                     file=sys.stderr,
                     flush=True,
                 )
-            carried_phis[int(updated_id)].args[1] = completed
-            carried_updates[int(updated_id)] = completed
+            carried_phis[index].args[1] = completed
+            carried_updates[index] = completed
             self.external_values[int(updated_id)] = completed
-            source_loop_node_id = carried_phis[int(updated_id)].attributes.get(
+            source_loop_node_id = carried_phis[index].attributes.get(
                 "source_loop_node_id"
             )
             if (
@@ -6506,11 +6690,50 @@ class _ControlSSABuilder:
     ) -> None:
         """Define authored LoopResult ids with edge-correct exit Phis."""
 
-        carried_by_updated = {
-            int(updated_id): (index, current)
-            for index, (updated_id, _initial_id, _initial, _updated, current)
-            in enumerate(carried)
-        }
+        # A port continues one authored binding; the carried entry it exits
+        # is the one the book attributes that binding to.  Value ids do not
+        # decide: two bindings can share an updated id (``total = w``) or an
+        # initial id (``second = value``).
+        from .identity_concordance import current_identity_book
+
+        book = current_identity_book()
+        loop_node = getattr(loop, "source_loop_node_id", None)
+        entry_bindings = [
+            tuple(book.page("loop_carried_binding").latest((
+                self.lexical_read_scope, int(loop_node),
+                int(updated_id), int(initial_id),
+            )) or ())
+            if self.lexical_read_scope is not None and loop_node is not None
+            else ()
+            for updated_id, initial_id, *_rest in carried
+        ]
+
+        def carried_entry_of(port_id: int, initial_id: int, updated_id: int):
+            if self.lexical_read_scope is None or loop_node is None:
+                # No book facts exist for a program the reducer never saw.
+                return next((
+                    (index, entry[4]) for index, entry in enumerate(carried)
+                    if int(entry[0]) == int(updated_id)
+                    and int(entry[1]) == int(initial_id)
+                ), None)
+            binding = book.page("loop_result_port_binding").latest(
+                (self.lexical_read_scope, int(port_id))
+            )
+            if binding is None:
+                raise ValueError(
+                    f"{self.function_name}: loop {loop_node} result port "
+                    f"{port_id} has no loop_result_port_binding row"
+                )
+            owners = [
+                index for index, bindings in enumerate(entry_bindings)
+                if binding in bindings
+            ]
+            if len(owners) > 1:
+                raise ValueError(
+                    f"{self.function_name}: binding {binding!r} is carried by "
+                    f"loop {loop_node} entries {owners!r}"
+                )
+            return (owners[0], carried[owners[0]][4]) if owners else None
         carried_ports = getattr(self, "_carried_port_groups", None)
         if carried_ports is None:
             carried_ports = {}
@@ -6524,7 +6747,9 @@ class _ControlSSABuilder:
         for port_id, initial_id, updated_id in getattr(
             loop, "result_ports", ()
         ):
-            carried_entry = carried_by_updated.get(int(updated_id))
+            carried_entry = carried_entry_of(
+                int(port_id), int(initial_id), int(updated_id),
+            )
             if carried_entry is None:
                 continue
             carried_index, normal_value = carried_entry
@@ -6820,13 +7045,13 @@ class _ControlSSABuilder:
         )
         carried_phis: dict[int, Instr] = {}
         bound_initial_ids: set[int] = set()
-        for (
+        for entry, (
             updated_id,
             initial_id,
             initial_value,
             updated_value,
             current_value,
-        ) in carried:
+        ) in enumerate(carried):
             self.emit(
                 Handler.Phi,
                 [initial_value, updated_value],
@@ -6844,7 +7069,7 @@ class _ControlSSABuilder:
                     "source_loop_node_id": loop.source_loop_node_id,
                 },
             )
-            carried_phis[updated_id] = self.current.instrs[-1]
+            carried_phis[entry] = self.current.instrs[-1]
             if initial_id not in bound_initial_ids:
                 self.external_values[initial_id] = current_value
                 bound_initial_ids.add(initial_id)
@@ -6872,8 +7097,10 @@ class _ControlSSABuilder:
         except Exception:
             pass
         break_bound_initials = {
-            int(initial_id): self.external_value(int(initial_id))
-            for _port_id, initial_id, updated_id
+            int(initial_id): self._break_bound_initial(
+                int(port_id), int(initial_id),
+            )
+            for port_id, initial_id, updated_id
             in getattr(loop, "result_ports", ())
             if int(updated_id) == int(initial_id)
         }
@@ -7239,6 +7466,9 @@ class _ControlSSABuilder:
             if initial_counts[int(initial_id)] > 1
         )
         self.protected_loop_alias_sources.append(protected_alias_sources)
+        self.enclosing_loop_states.append(
+            self._enter_loop_state(loop, carried)
+        )
         try:
             self.lower(loop.body, path=f"{path}.body")
             for mutation in loop.sequence_mutations:
@@ -7246,6 +7476,7 @@ class _ControlSSABuilder:
             for terminal in loop.terminal_controls:
                 self.lower(terminal, path=f"{path}.terminal")
         finally:
+            self.enclosing_loop_states.pop()
             self.protected_loop_alias_sources.pop()
             self.loop_exit_contexts.pop()
             self.loop_targets.pop()
@@ -7261,16 +7492,16 @@ class _ControlSSABuilder:
         # the value the body actually published instead of requiring the
         # placeholder object reserved before the body was lowered.
         carried_updates: dict[int, SSAValue] = {}
-        for updated_id, _initial_id, _initial, reserved, _current in carried:
+        for entry, (updated_id, _initial_id, _initial, reserved, _current) in enumerate(carried):
             published = self.external_values.get(updated_id, reserved)
-            carried_updates[updated_id] = published
+            carried_updates[entry] = published
             if published is not reserved:
-                carried_phis[updated_id].args[1] = published
+                carried_phis[entry].args[1] = published
         if os.environ.get("TURING_DEBUG_LOOP_ALIAS_PUBLICATION"):
             print(
                 "DEBUG-LOOP-CARRIED-UPDATES "
                 f"fn={self.function_name} path={path} "
-                f"updates={tuple((int(updated_id), int(value.id)) for updated_id, value in carried_updates.items())!r}",
+                f"updates={tuple((int(carried[entry][0]), int(value.id)) for entry, value in carried_updates.items())!r}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -7286,8 +7517,8 @@ class _ControlSSABuilder:
             for instruction in basic_block.instrs
             if instruction.res is not None
         }
-        for updated_id, _initial_id, _initial, updated, _current in carried:
-            if id(carried_updates[updated_id]) not in produced_results:
+        for entry, (updated_id, _initial_id, _initial, updated, _current) in enumerate(carried):
+            if id(carried_updates[entry]) not in produced_results:
                 declared_outputs = tuple(
                     region_index
                     for region_index, (_feeds, outputs)
@@ -7393,9 +7624,9 @@ class _ControlSSABuilder:
                     # sequence descriptor built from the concorded contract:
                     # an ordinary scalar recurrence must still name a real
                     # producer.
-                    current = carried_phis[updated_id].args[0]
-                    carried_phis[updated_id].args[1] = current
-                    carried_updates[updated_id] = current
+                    current = carried_phis[entry].args[0]
+                    carried_phis[entry].args[1] = current
+                    carried_updates[entry] = current
                     self.external_values[updated_id] = current
                     current.accounting["ssa_storage_identity_backedge"] = True
                     continue
@@ -7604,7 +7835,7 @@ class _ControlSSABuilder:
         self.external_values[int(loop.predicate_value_id)] = current_predicate
         carried_phis: dict[int, Instr] = {}
         bound_initial_ids: set[int] = set()
-        for updated_id, initial_id, initial, updated, current in carried:
+        for entry, (updated_id, initial_id, initial, updated, current) in enumerate(carried):
             self.emit(
                 Handler.Phi,
                 [initial, updated],
@@ -7622,7 +7853,7 @@ class _ControlSSABuilder:
                     "source_loop_node_id": loop.source_loop_node_id,
                 },
             )
-            carried_phis[updated_id] = self.current.instrs[-1]
+            carried_phis[entry] = self.current.instrs[-1]
             if initial_id not in bound_initial_ids:
                 self.external_values[initial_id] = current
                 bound_initial_ids.add(initial_id)
@@ -7650,8 +7881,10 @@ class _ControlSSABuilder:
         except Exception:
             pass
         break_bound_initials = {
-            int(initial_id): self.external_value(int(initial_id))
-            for _port_id, initial_id, updated_id
+            int(initial_id): self._break_bound_initial(
+                int(port_id), int(initial_id),
+            )
+            for port_id, initial_id, updated_id
             in getattr(loop, "result_ports", ())
             if int(updated_id) == int(initial_id)
         }
@@ -7706,6 +7939,8 @@ class _ControlSSABuilder:
             if initial_counts[int(initial_id)] > 1
         )
         self.protected_loop_alias_sources.append(protected_alias_sources)
+        loop_state = self._enter_loop_state(loop, carried)
+        self.enclosing_loop_states.append(loop_state)
         try:
             self.lower(loop.body, path=f"{path}.body")
             for mutation in loop.sequence_mutations:
@@ -7713,6 +7948,7 @@ class _ControlSSABuilder:
             for terminal in loop.terminal_controls:
                 self.lower(terminal, path=f"{path}.terminal")
         finally:
+            self.enclosing_loop_states.pop()
             self.protected_loop_alias_sources.pop()
             self.preserved_region_output_ids = preserved_before_body
             self.loop_exit_contexts.pop()
@@ -7723,16 +7959,16 @@ class _ControlSSABuilder:
             if id(candidate) not in blocks_before_body or candidate is body
         ]
         carried_updates: dict[int, SSAValue] = {}
-        for updated_id, _initial_id, _initial, reserved, _current in carried:
+        for entry, (updated_id, _initial_id, _initial, reserved, _current) in enumerate(carried):
             published = self.external_values.get(updated_id, reserved)
-            carried_updates[updated_id] = published
+            carried_updates[entry] = published
             if published is not reserved:
-                carried_phis[updated_id].args[1] = published
+                carried_phis[entry].args[1] = published
         if os.environ.get("TURING_DEBUG_LOOP_ALIAS_PUBLICATION"):
             print(
                 "DEBUG-WHILE-CARRIED-UPDATES "
                 f"fn={self.function_name} path={path} "
-                f"updates={tuple((int(updated_id), int(value.id)) for updated_id, value in carried_updates.items())!r}",
+                f"updates={tuple((int(carried[entry][0]), int(value.id)) for entry, value in carried_updates.items())!r}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -7742,8 +7978,8 @@ class _ControlSSABuilder:
             for instruction in basic_block.instrs
             if instruction.res is not None
         }
-        for updated_id, _initial_id, _initial, _updated, current in carried:
-            if id(carried_updates[updated_id]) not in produced_results:
+        for entry, (updated_id, _initial_id, _initial, _updated, current) in enumerate(carried):
+            if id(carried_updates[entry]) not in produced_results:
                 declared_outputs = tuple(
                     region_index
                     for region_index, (_feeds, outputs)
@@ -7756,8 +7992,8 @@ class _ControlSSABuilder:
                     # instruction to publish. Its latch definition is the
                     # current iteration's header Phi, not the producerless
                     # placeholder reserved for a possible real update.
-                    carried_phis[updated_id].args[1] = current
-                    carried_updates[updated_id] = current
+                    carried_phis[entry].args[1] = current
+                    carried_updates[entry] = current
                     self.external_values[updated_id] = current
                     current.accounting["ssa_identity_backedge"] = True
                     continue
@@ -7810,15 +8046,21 @@ class _ControlSSABuilder:
         self.preserved_region_output_ids.update(
             int(initial_id) for _updated_id, initial_id, *_rest in carried
         )
+        # The latch re-evaluates the predicate for the next iteration with
+        # carried bindings at their updated values; every other binding that
+        # shares a carried initial id still reads its pre-loop value, so the
+        # loop's frame governs these reads exactly as it governs the body.
+        self.enclosing_loop_states.append(loop_state)
         try:
             self.lower(loop.condition, path=f"{path}.condition.latch")
+            if loop.predicate_expression is not None:
+                self.lower_control_expression(
+                    loop.predicate_expression,
+                    result_override=next_predicate,
+                )
         finally:
+            self.enclosing_loop_states.pop()
             self.preserved_region_output_ids = preserved_before
-        if loop.predicate_expression is not None:
-            self.lower_control_expression(
-                loop.predicate_expression,
-                result_override=next_predicate,
-            )
         # Post-loop consumers read the converged header phi, not the last
         # body update: restore the loop-wide binding before leaving.
         for initial_id, previous in latch_restore:
@@ -8256,7 +8498,8 @@ class _ControlSSABuilder:
                     "control_ir": True,
                     "deployment_regions": tuple(deployment_regions),
                     "sequence_table": SSASequenceTable(
-                        dict(self.sequence_descriptors)
+                        dict(self.sequence_descriptors),
+                        owner=self.function_name,
                     ),
                     "sequence_helper_functions": tuple(
                         self.sequence_helper_functions.values()
@@ -8571,6 +8814,7 @@ def lower_control_program_to_ssa(
     region_value_meta: Mapping[int, Meta] | None = None,
     region_value_ranks: Mapping[int, int] | None = None,
     tensor_shape_concordance_scope: str | None = None,
+    lexical_read_scope: Any = None,
     plan_callsite_bindings: Mapping[
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
@@ -8625,6 +8869,7 @@ def lower_control_program_to_ssa(
         region_value_meta=region_value_meta,
         region_value_ranks=region_value_ranks,
         tensor_shape_concordance_scope=tensor_shape_concordance_scope,
+        lexical_read_scope=lexical_read_scope,
         plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=value_aliases,
         inout_value_ids=inout_value_ids,
@@ -8708,7 +8953,7 @@ def _sequence_artifacts_from_control(
             )
             for sequence_id in sequence_ids
             if sequence_id in table.sequences
-        })
+        }, owner=helper.name)
         if helper_table.sequences:
             tables[helper.name] = helper_table
     return helpers, tables
@@ -10419,9 +10664,20 @@ def _materialize_control_constants(
             "NoneValue" if is_none else "Const", [],
             SSAValue(
                 value_id,
+                # A proven dtype wins; otherwise the authored literal's own
+                # Python type is exact.  ``return True`` had no proven dtype
+                # and was declared float64 here, which only a later pass's
+                # re-inference from the literal used to hide.
                 dtype=(
                     "none" if is_none
-                    else str(value_dtypes.get(value_id) or "float64")
+                    else str(
+                        value_dtypes.get(value_id)
+                        or (
+                            "bool" if isinstance(literal, bool)
+                            else "int64" if isinstance(literal, int)
+                            else "float64"
+                        )
+                    )
                 ),
                 accounting={"authored_constant": True},
             ),
@@ -10590,6 +10846,43 @@ def _install_loop_owned_table_queries(
     )
 
 
+def _concord_region_feed_consumers(
+    lexical_read_scope: Any,
+    control_scope: Any,
+    region_index: int,
+    instructions: Any,
+    feeds: Any,
+) -> None:
+    """Commit, per region feed, the graph consumers inside the region.
+
+    Page ``region_feed_consumer`` row ``(control scope, region index, feed
+    id)`` holds the region instructions' result ids (their graph consumer
+    nodes) that read the feed.  Structure only: which binding each of those
+    operands read is the base fact ``lexical_read_binding``.
+    """
+
+    if lexical_read_scope is None:
+        return
+    from .identity_concordance import current_identity_book
+
+    page = current_identity_book().page("region_feed_consumer")
+    feed_ids = set(map(int, feeds))
+    consumers: dict[int, list[int]] = {}
+    for instruction in instructions:
+        if instruction.res is None:
+            continue
+        for argument in instruction.args:
+            if int(argument.id) in feed_ids:
+                consumers.setdefault(int(argument.id), []).append(
+                    int(instruction.res.id)
+                )
+    for feed, nodes in consumers.items():
+        page.concord(
+            (str(control_scope), int(region_index), feed),
+            tuple(dict.fromkeys(nodes)),
+        )
+
+
 def lower_control_sections_to_ssa(
     control: ControlProgram,
     *,
@@ -10599,6 +10892,7 @@ def lower_control_sections_to_ssa(
     identity_table: Mapping[str, tuple[int, ...]] | None = None,
     function_outputs: tuple[str, ...] = (),
     function_parameters: tuple[str, ...] = (),
+    lexical_read_scope: Any = None,
     value_dtypes: Mapping[int, str] | None = None,
     value_shapes: Mapping[int, tuple[int, ...]] | None = None,
     constant_values: Mapping[int, Any] | None = None,
@@ -11405,7 +11699,7 @@ def lower_control_sections_to_ssa(
     plan_line_consumed: set[int] = set()
 
     def region_free_value_ids(
-        instructions: Sequence[Instr],
+        instructions: Any,
     ) -> tuple[int, ...]:
         """Return exact body operands with no local SSA definition.
 
@@ -12489,6 +12783,10 @@ def lower_control_sections_to_ssa(
                 tuple(int(vid) for vid in effective_captures),
                 outputs,
             )
+            _concord_region_feed_consumers(
+                lexical_read_scope, tensor_shape_concordance_scope,
+                region_index, instructions, effective_captures,
+            )
             region_feed_meta[region_index] = tuple(
                 Meta(
                     tuple(argument.shape),
@@ -12822,6 +13120,7 @@ def lower_control_sections_to_ssa(
         region_value_meta=region_value_meta,
         region_value_ranks=region_value_ranks,
         tensor_shape_concordance_scope=tensor_shape_concordance_scope,
+        lexical_read_scope=lexical_read_scope,
         plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=final_value_aliases,
         inout_value_ids=tuple(map(int, record_field_write_value_ids)),
@@ -13206,7 +13505,7 @@ def lower_control_sections_to_ssa(
                         record_identity,
                         tuple(record_fields),
                     )
-            })
+            }, owner=control_function.name)
     from ..transmogrifier.ssa import (
         SSAReferenceDescriptor,
         SSAReferenceKind,

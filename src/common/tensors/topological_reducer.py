@@ -2177,6 +2177,54 @@ def _remove_node(graph: Any, node_id: int) -> None:
     graph.G.remove_node(node_id)
 
 
+def _concord_lexical_reads(
+    graph: Any, scope: str, occurrence_id: int, binding: str,
+) -> None:
+    """Commit, per consumer edge, the binding one ``Name`` occurrence read.
+
+    Page ``lexical_read_binding`` row ``(scope, consumer id, role,
+    ordinal)`` holds the authored binding that operand read; ``ordinal``
+    counts earlier parents with the same role (a tuple's ``elts``).  The value the edge points at
+    may later be rebound (a loop header, a loop result port); the binding
+    it read never changes, which is what lets those rebindings choose per
+    read instead of per value.
+    """
+
+    if occurrence_id not in graph.G:
+        return
+    page = current_identity_book().page("lexical_read_binding")
+    for consumer in tuple(graph.G.successors(occurrence_id)):
+        for role, ordinal, parent_id in _operand_positions(
+            graph.G.nodes[consumer].get("parents", ())
+        ):
+            if parent_id == occurrence_id:
+                page.concord((scope, consumer, role, ordinal), str(binding))
+
+
+def _operand_positions(parents: Any):
+    """Each ``(role, ordinal, parent)``: the operand's stable position."""
+
+    seen: dict[Any, int] = {}
+    for parent_id, role in parents:
+        ordinal = seen.get(role, 0)
+        seen[role] = ordinal + 1
+        yield role, ordinal, parent_id
+
+
+def lexical_read_binding(
+    graph: Any, consumer: int, role: Any, ordinal: int = 0,
+) -> str | None:
+    """The authored binding one operand of ``consumer`` read, if any."""
+
+    scope = (getattr(graph, "graph", None) or {}).get("lexical_read_scope")
+    if scope is None:
+        return None
+    consumer = consumer if isinstance(consumer, str) else int(consumer)
+    return current_identity_book().page("lexical_read_binding").latest(
+        (tuple(scope), consumer, role, int(ordinal))
+    )
+
+
 def _redirect_value(
     graph: Any,
     old_id: int,
@@ -2267,6 +2315,18 @@ def _normalize_lexical_values(
     value_class_scope = _source_numeric_scope(
         graph, getattr(statement, "name", "<function>")
     )
+    # One reduction is one scope of read facts, minted by the book: rows at
+    # ingestion ids (object addresses, unique only within this reduction)
+    # and, after canonical renumbering, at canonical ids.  The graph names
+    # its reduction scope, so every copy of it (a specialization) reads the
+    # facts this reduction committed.
+    read_scope = current_identity_book().mint_scope(
+        f"lexical_reads:{value_class_scope}"
+    )
+    ingestion_read_scope = (read_scope, "ingestion")
+    #: A bare ``return name`` has no consumer edge: its value becomes a root.
+    #: The bindings each returned root value was returned under.
+    return_root_bindings: dict[int, set[str]] = {}
     # A parameter annotated with an ingested class name gives a
     # receiver a real, known class identity at ingestion -- enough to
     # resolve ``receiver.attr`` through the class's own navigation table
@@ -3380,6 +3440,14 @@ def _normalize_lexical_values(
                             else "external"
                         ),
                     )
+                # Which binding each consumer read is a fact of this read,
+                # not of the value: two names can hold one value (``second
+                # = value``) and a loop carries one of them while the other
+                # stays put.  Commit it before the occurrence dissolves into
+                # a plain value edge.
+                _concord_lexical_reads(
+                    graph, ingestion_read_scope, node_id, expression.id,
+                )
                 _redirect_value(graph, node_id, producer_id)
                 return producer_id
             return environment.get(expression.id)
@@ -4973,6 +5041,12 @@ def _normalize_lexical_values(
             else:
                 current = resolve_expression(body_statement.target)
             if current is not None:
+                if isinstance(body_statement.target, ast.Name):
+                    # ``name += x`` reads ``name`` without a Load occurrence.
+                    _concord_lexical_reads(
+                        graph, ingestion_read_scope,
+                        id(body_statement.target), body_statement.target.id,
+                    )
                 _redirect_value(
                     graph,
                     id(body_statement.target),
@@ -5080,6 +5154,10 @@ def _normalize_lexical_values(
                         "return_value_nodes",
                         {},
                     )[id(body_statement)] = value
+                    if isinstance(expressions[0], ast.Name):
+                        return_root_bindings.setdefault(
+                            int(value), set()
+                        ).add(str(expressions[0].id))
                 return value
             # Preserve the structural tuple/list node for callers that consume
             # it as one Python-shaped value while the output identities above
@@ -6222,6 +6300,17 @@ def _normalize_lexical_values(
             returned_values.append(value)
     if returned_values:
         graph.roots = list(dict.fromkeys(returned_values))
+        # The function's return is a consumer of its roots: row
+        # ``(scope, "return", "root", position)`` names the binding returned
+        # there, when every return of that value names one binding.
+        return_page = current_identity_book().page("lexical_read_binding")
+        for position, root in enumerate(graph.roots):
+            names = return_root_bindings.get(int(root)) if isinstance(root, int) else None
+            if names and len(names) == 1:
+                return_page.concord(
+                    (ingestion_read_scope, "return", "root", position),
+                    next(iter(names)),
+                )
 
     # A source-linked unbound method can arrive with its receiver absent from
     # the owned subgraph even though the Attribute load itself is owned.
@@ -6507,6 +6596,19 @@ def _normalize_lexical_values(
                 class_page.set(
                     (value_class_scope, mapping[row[1]]), column, fact,
                 )
+    # The per-read bindings follow their consumers into canonical ids.  A
+    # scope reduced again revises its canonical rows rather than keeping a
+    # previous reduction's facts.
+    read_page = current_identity_book().page("lexical_read_binding")
+    for row in read_page.scope_rows(ingestion_read_scope):
+        if len(row) == 4 and row[1] == "return":
+            read_page.concord((read_scope, *row[1:]), read_page.latest(row))
+        elif len(row) == 4 and row[1] in mapping:
+            read_page.concord(
+                (read_scope, mapping[row[1]], row[2], row[3]),
+                read_page.latest(row),
+            )
+    graph.G.graph["lexical_read_scope"] = read_scope
     # Per-return slot values are ids in the pre-canonical space too.
     graph.G.graph["return_slot_values"] = {
         span: tuple(

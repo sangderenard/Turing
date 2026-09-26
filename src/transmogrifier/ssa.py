@@ -30,6 +30,7 @@
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Dict, Callable, Union
 from enum import Enum
+from collections.abc import Mapping
 from .function_table import FunctionTable
 from ..compiler.deployment_frame import DeploymentFrame, DeploymentJoin
 
@@ -353,9 +354,184 @@ class SSARecordInstancePoolDescriptor:
         }
 
 
-@dataclass
+def _mint_table_owner(book: Any, label: Any) -> tuple[str, int]:
+    """The book scope one SSA table's rows live under.
+
+    Value ids are not frame-unique (``id_space.SHARED``), and one function's
+    ids reappear in helper tables and copies, so every table is its own
+    scope, minted by the book.  ``label`` names the function the table was
+    built for, for a reader of the book.
+    """
+
+    return book.mint_scope(label or "table")
+
+
+class _BookRows(__import__("collections.abc").abc.MutableMapping):
+    """One SSA table's id -> descriptor storage, as rows of a book page.
+
+    Row ``(owner, id)`` holds the descriptor; every write is a revision and a
+    removal is a ``None`` revision, so the page is the storage and its whole
+    history.  ``on_change(old, new)`` keeps the member page in step.
+    """
+
+    def __init__(self, book: Any, page: str, owner: Any, on_change: Callable):
+        self._book = book
+        self._page = book.page(page)
+        self._owner = owner
+        self._on_change = on_change
+
+    def __getitem__(self, key: Any) -> Any:
+        # Rows are keyed by value ids; anything else (``None`` from an
+        # unbound lookup) names no row, exactly as a dict miss did.
+        try:
+            key = __import__("operator").index(key)
+        except TypeError:
+            raise KeyError(key) from None
+        fact = self._page.latest((self._owner, int(key)))
+        if fact is None:
+            raise KeyError(key)
+        return fact
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        row = (self._owner, int(key))
+        old = self._page.latest(row)
+        self._page.revise(row, value)
+        self._on_change(old, value)
+
+    def __delitem__(self, key: Any) -> None:
+        row = (self._owner, int(key))
+        old = self._page.latest(row)
+        if old is None:
+            raise KeyError(key)
+        self._page.revise(row, None)
+        self._on_change(old, None)
+
+    def __iter__(self):
+        for row in self._page.scope_rows(self._owner):
+            if self._page.latest(row) is not None:
+                yield row[1]
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    def __repr__(self) -> str:
+        return repr(dict(self))
+
+
+def _revise_member_claims(
+    page: Any, owner: Any, old: dict[int, set], new: dict[int, set],
+) -> None:
+    """Move one descriptor's member claims from ``old`` to ``new``.
+
+    Row ``(owner, member id)`` holds every claim live descriptors make on
+    that value; a value can be a member of several records (record SSA
+    versions share unchanged field storage).
+    """
+
+    for member in set(old) | set(new):
+        before = old.get(member, set())
+        after = new.get(member, set())
+        if before == after:
+            continue
+        row = (owner, int(member))
+        claims = (set(page.latest(row) or ()) - before) | after
+        page.revise(row, tuple(sorted(claims, key=repr)))
+
+
+def record_member_claims(
+    descriptor: "SSARecordDescriptor | None",
+) -> dict[int, set]:
+    """member id -> {(record id, field name, storage identity, role)}.
+
+    A SCALAR field's value ids are SSA versions of one slot (role
+    ``("slot",)``); any other field's value ids are positional members
+    (``("value", index)``).  A sequence field's descriptor handle is role
+    ``("sequence",)`` and a nested record field's record id ``("record",)``.
+    """
+
+    claims: dict[int, set] = {}
+    if descriptor is None:
+        return claims
+    record_id = int(descriptor.record_id)
+    for field_ in descriptor.fields:
+        base = (record_id, field_.name, field_.storage_identity)
+        scalar = field_.storage is SSARecordFieldStorage.SCALAR
+        for index, value_id in enumerate(field_.value_ids):
+            role = ("slot",) if scalar else ("value", index)
+            claims.setdefault(int(value_id), set()).add((*base, role))
+        if field_.sequence_id is not None:
+            claims.setdefault(int(field_.sequence_id), set()).add(
+                (*base, ("sequence",))
+            )
+        if field_.record_id is not None:
+            claims.setdefault(int(field_.record_id), set()).add(
+                (*base, ("record",))
+            )
+    return claims
+
+
 class SSARecordTable:
-    records: Dict[int, SSARecordDescriptor] = field(default_factory=dict)
+    """Function-scoped record descriptors, stored on the identity book.
+
+    Page ``record_descriptor`` holds each descriptor at ``(owner, record
+    id)``; page ``record_member`` holds, at ``(owner, value id)``, every claim
+    a live descriptor makes on that value.  Nothing is kept beside the book.
+    """
+
+    def __init__(
+        self,
+        records: Dict[int, SSARecordDescriptor] | None = None,
+        *,
+        owner: Any = None,
+        book: Any = None,
+    ) -> None:
+        from ..compiler.identity_concordance import current_identity_book
+
+        self.book = current_identity_book() if book is None else book
+        self.owner = (
+            owner if isinstance(owner, tuple)
+            else _mint_table_owner(self.book, owner)
+        )
+        member_page = self.book.page("record_member")
+        self.records = _BookRows(
+            self.book, "record_descriptor", self.owner,
+            lambda old, new: _revise_member_claims(
+                member_page, self.owner,
+                record_member_claims(old), record_member_claims(new),
+            ),
+        )
+        for record_id, descriptor in dict(records or {}).items():
+            self.records[int(record_id)] = descriptor
+
+    def member_claims(self, value_id: int) -> tuple:
+        """Every (record id, field name, storage identity, role) naming
+        ``value_id`` in this table, read from the book."""
+
+        return tuple(
+            self.book.page("record_member").latest((self.owner, int(value_id)))
+            or ()
+        )
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, SSARecordTable) and dict(self.records) == dict(
+            other.records
+        )
+
+    def __repr__(self) -> str:
+        return f"SSARecordTable(owner={self.owner!r}, records={self.records!r})"
+
+    def __deepcopy__(self, memo: dict) -> "SSARecordTable":
+        return SSARecordTable(
+            dict(self.records), owner=self.owner[0], book=self.book,
+        )
+
+    def __reduce__(self):
+        # The book scope's serial is not content; a pickle carries the label
+        # and the descriptors and is rebuilt on the book current at load.
+        return (SSARecordTable, (dict(self.records),), {"owner": self.owner[0]})
+
+    def __setstate__(self, state: dict) -> None:
+        self.__init__(dict(self.records), owner=state.get("owner"))
 
     def register(self, descriptor: SSARecordDescriptor) -> SSARecordDescriptor:
         existing = self.records.get(descriptor.record_id)
@@ -762,14 +938,88 @@ class SSAChildTablePoolDescriptor:
         }
 
 
-@dataclass
-class SSASequenceTable:
-    """Function-scoped sequence/table storage descriptions."""
+def sequence_member_roles(
+    descriptor: "SSASequenceDescriptor | None",
+) -> dict[int, set]:
+    """member id -> {(sequence id, role)} for one sequence descriptor.
 
-    sequences: Dict[int, SSASequenceDescriptor] = field(default_factory=dict)
-    #: Every column-dtype tuple ever offered for a sequence id, in order.
-    #: Diagnostic only; never consulted for a decision.
-    attempts: Dict[int, list] = field(default_factory=dict)
+    Roles: ``("handle",)``, ``("column", position)`` and one per extent or
+    status cell (``length_address_id``, ``capacity_value_id``,
+    ``status_address_id``, ``live_flags_value_id``).
+    """
+
+    claims: dict[int, set] = {}
+    if descriptor is None:
+        return claims
+    sequence_id = int(descriptor.sequence_id)
+
+    def claim(value_id: Any, role: tuple) -> None:
+        if value_id is not None:
+            claims.setdefault(int(value_id), set()).add((sequence_id, role))
+
+    claim(sequence_id, ("handle",))
+    for position, column in enumerate(descriptor.column_value_ids):
+        claim(column, ("column", position))
+    for attribute in (
+        "length_address_id", "capacity_value_id",
+        "status_address_id", "live_flags_value_id",
+    ):
+        claim(getattr(descriptor, attribute, None), (attribute,))
+    return claims
+
+
+class SSASequenceTable:
+    """Function-scoped sequence/table storage descriptions, on the book.
+
+    Page ``sequence_descriptor`` holds each descriptor at ``(owner, sequence
+    id)``; page ``sequence_member`` holds, at ``(owner, value id)``, every
+    ``(sequence id, role)`` a live descriptor gives that value; page
+    ``sequence_column_claims`` holds every column typing ever offered.
+    """
+
+    def __init__(
+        self,
+        sequences: Dict[int, SSASequenceDescriptor] | None = None,
+        *,
+        owner: Any = None,
+        book: Any = None,
+    ) -> None:
+        from ..compiler.identity_concordance import current_identity_book
+
+        self.book = current_identity_book() if book is None else book
+        self.owner = (
+            owner if isinstance(owner, tuple)
+            else _mint_table_owner(self.book, owner)
+        )
+        member_page = self.book.page("sequence_member")
+        self.sequences = _BookRows(
+            self.book, "sequence_descriptor", self.owner,
+            lambda old, new: _revise_member_claims(
+                member_page, self.owner,
+                sequence_member_roles(old), sequence_member_roles(new),
+            ),
+        )
+        for sequence_id, descriptor in dict(sequences or {}).items():
+            self.sequences[int(sequence_id)] = descriptor
+
+    def member_claims(self, value_id: int) -> tuple:
+        """Every (sequence id, role) naming ``value_id``, read from the book."""
+
+        return tuple(
+            self.book.page("sequence_member").latest(
+                (self.owner, int(value_id))
+            ) or ()
+        )
+
+    def offered_column_dtypes(self, sequence_id: int) -> list:
+        """Every column-dtype tuple offered for ``sequence_id``, in order."""
+
+        page = self.book.page("sequence_column_claims")
+        return [
+            fact[0] for _column, fact in page.history(
+                (self.owner, int(sequence_id), "column_dtypes")
+            )
+        ]
 
     def register(self, descriptor: SSASequenceDescriptor) -> SSASequenceDescriptor:
         sequence_id = int(descriptor.sequence_id)
@@ -778,28 +1028,13 @@ class SSASequenceTable:
         # only incumbent-vs-newcomer cannot distinguish two sites that
         # stably disagree from a sequence of sites that flip a value back
         # and forth, and those need opposite fixes.
-        self.attempts.setdefault(sequence_id, []).append(
-            tuple(descriptor.column_dtypes)
+        self.book.page("sequence_column_claims").revise(
+            (self.owner, sequence_id, "column_dtypes"),
+            (
+                tuple(descriptor.column_dtypes),
+                tuple(descriptor.key_columns),
+            ),
         )
-        # The same claim onto the compile's shared book, so a sequence's
-        # column typing is carried from the moment it is first claimed
-        # through every later propagation and reconciliation, rather than
-        # each pass keeping its own private view and comparing only
-        # incumbent-against-newcomer.  Recording only; nothing here decides.
-        try:
-            from ..compiler.identity_concordance import current_identity_book
-
-            current_identity_book().page("sequence_column_claims").set(
-                (int(sequence_id), "column_dtypes"),
-                len(self.attempts[sequence_id]) - 1,
-                (
-                    tuple(descriptor.column_dtypes),
-                    tuple(descriptor.key_columns),
-                ),
-            )
-        except Exception:
-            # Diagnostics must never be able to fail a lowering.
-            pass
         if existing is not None and existing != descriptor:
             # Name the id the way a reader can act on -- ``minted#1000013548``
             # rather than 2305843010213707500 -- and say WHICH fields the two
@@ -816,7 +1051,7 @@ class SSASequenceTable:
                 f"vs new={getattr(descriptor, name)!r}"
                 for name in differing
             )
-            offered = self.attempts.get(sequence_id, [])
+            offered = self.offered_column_dtypes(sequence_id)
             raise ValueError(
                 f"conflicting SSA sequence descriptor {_id_label(sequence_id)}"
                 f" (differs in: {', '.join(differing) or 'identity only'})"
@@ -828,6 +1063,31 @@ class SSASequenceTable:
 
     def by_id(self, sequence_id: int) -> SSASequenceDescriptor | None:
         return self.sequences.get(int(sequence_id))
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, SSASequenceTable) and dict(
+            self.sequences
+        ) == dict(other.sequences)
+
+    def __repr__(self) -> str:
+        return (
+            f"SSASequenceTable(owner={self.owner!r}, "
+            f"sequences={self.sequences!r})"
+        )
+
+    def __deepcopy__(self, memo: dict) -> "SSASequenceTable":
+        return SSASequenceTable(
+            dict(self.sequences), owner=self.owner[0], book=self.book,
+        )
+
+    def __reduce__(self):
+        return (
+            SSASequenceTable, (dict(self.sequences),),
+            {"owner": self.owner[0]},
+        )
+
+    def __setstate__(self, state: dict) -> None:
+        self.__init__(dict(self.sequences), owner=state.get("owner"))
 
 
 @dataclass(frozen=True)
@@ -914,6 +1174,153 @@ class SSACallRecord:
     def __post_init__(self) -> None:
         if self.resolution not in {"unresolved", "native_call", "decomposed"}:
             raise ValueError(f"unknown SSA call resolution {self.resolution!r}")
+
+
+class _BookCallList(__import__("collections.abc").abc.MutableSequence):
+    """One caller's call records as a mutable list whose storage is a book
+    row: every mutation revises the row to the whole new tuple."""
+
+    def __init__(self, page: Any, row: Any) -> None:
+        self._page = page
+        self._row = row
+
+    def _records(self) -> tuple:
+        return tuple(self._page.latest(self._row) or ())
+
+    def _commit(self, records: Any) -> None:
+        self._page.revise(self._row, tuple(records))
+
+    def __getitem__(self, index: Any) -> Any:
+        records = self._records()
+        return list(records[index]) if isinstance(index, slice) else records[index]
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        records = list(self._records())
+        records[index] = value
+        self._commit(records)
+
+    def __delitem__(self, index: Any) -> None:
+        records = list(self._records())
+        del records[index]
+        self._commit(records)
+
+    def __len__(self) -> int:
+        return len(self._records())
+
+    def insert(self, index: int, value: Any) -> None:
+        records = list(self._records())
+        records.insert(index, value)
+        self._commit(records)
+
+    def sort(self, *, key: Any = None, reverse: bool = False) -> None:
+        self._commit(sorted(self._records(), key=key, reverse=reverse))
+
+    def copy(self) -> list:
+        return list(self._records())
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(
+            other, (list, tuple, _BookCallList)
+        ) and self._records() == tuple(other)
+
+    def __repr__(self) -> str:
+        return repr(list(self._records()))
+
+    def __reduce__(self):
+        return (list, (list(self._records()),))
+
+
+class SSACallTable(__import__("collections.abc").abc.MutableMapping):
+    """caller symbol -> that caller's SSACallRecords, stored on the book.
+
+    Page ``call_record`` holds each caller's records at ``(owner, caller)``;
+    every change is a revision.  ``mutable`` tables (the linker's working
+    table) hand out list views whose in-place edits are revisions; module
+    tables hand out tuples.
+    """
+
+    def __init__(
+        self,
+        records: Any = None,
+        *,
+        owner: Any = None,
+        mutable: bool = False,
+        book: Any = None,
+    ) -> None:
+        from ..compiler.identity_concordance import current_identity_book
+
+        self.book = current_identity_book() if book is None else book
+        self.owner = (
+            owner if isinstance(owner, tuple)
+            else _mint_table_owner(self.book, owner)
+        )
+        self.mutable = bool(mutable)
+        self._page = self.book.page("call_record")
+        for caller, caller_records in dict(records or {}).items():
+            self[caller] = caller_records
+
+    def __getitem__(self, caller: Any) -> Any:
+        row = (self.owner, str(caller))
+        records = self._page.latest(row)
+        if records is None:
+            raise KeyError(caller)
+        return _BookCallList(self._page, row) if self.mutable else records
+
+    def __setitem__(self, caller: Any, records: Any) -> None:
+        row = (self.owner, str(caller))
+        records = tuple(records)
+        if self._page.latest(row) != records:
+            self._page.revise(row, records)
+
+    def __delitem__(self, caller: Any) -> None:
+        row = (self.owner, str(caller))
+        if self._page.latest(row) is None:
+            raise KeyError(caller)
+        self._page.revise(row, None)
+
+    def __iter__(self):
+        for row in self._page.scope_rows(self.owner):
+            if self._page.latest(row) is not None:
+                yield row[1]
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    def setdefault(self, caller: Any, default: Any = ()) -> Any:
+        # The stored view, never ``default`` itself: an append to the
+        # returned list must land on the book.
+        if caller not in self:
+            self[caller] = default
+        return self[caller]
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Mapping):
+            return False
+        return {k: tuple(v) for k, v in self.items()} == {
+            k: tuple(v) for k, v in other.items()
+        }
+
+    def __repr__(self) -> str:
+        return f"SSACallTable(owner={self.owner!r}, {dict(self.items())!r})"
+
+    def __reduce__(self):
+        return (
+            _rebuild_call_table,
+            (
+                {k: tuple(v) for k, v in self.items()},
+                self.owner[0], self.mutable,
+            ),
+        )
+
+    def __deepcopy__(self, memo: dict) -> "SSACallTable":
+        return SSACallTable(
+            {k: tuple(v) for k, v in self.items()},
+            owner=self.owner[0], mutable=self.mutable, book=self.book,
+        )
+
+
+def _rebuild_call_table(records: Any, label: Any, mutable: bool) -> SSACallTable:
+    return SSACallTable(records, owner=label, mutable=mutable)
 
 
 @dataclass(frozen=True)
@@ -1047,6 +1454,13 @@ class IRModule:
     # relationship among several lowered functions and must remain observable
     # even when a backend selects only one function for emission.
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # The module's call table is stored on the identity book whatever a
+        # caller assigns to it.
+        if name == "call_table" and not isinstance(value, SSACallTable):
+            value = SSACallTable(value, owner="module")
+        object.__setattr__(self, name, value)
 
     def __post_init__(self) -> None:
         if not self.deployment_table:

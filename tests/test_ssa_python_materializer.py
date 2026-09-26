@@ -41,6 +41,16 @@ from src.transmogrifier.ssa import (
     SSAClassTable,
     SSAValue,
 )
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 
 # -- vocabulary -----------------------------------------------------------
@@ -632,7 +642,7 @@ def _lower(source: str, entrypoint: str, name: str):
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        return lower_ast_source_to_ssa(source, entrypoint, name=name)
+        return lower_ast_source_to_ssa(source, entrypoint, name=name, extraction_contract=CONTRACT)
 
 
 def _run_round_trip(source: str, entrypoint: str, name: str):
@@ -685,11 +695,10 @@ def update(a):
 
 
 def test_a_region_publishes_what_its_callers_project():
-    """The contract is stated at the call site, not with the region.
+    """The contract is stated at the call site, and the region's Ret keeps it.
 
-    A region function carries no output declaration in its own metadata; the
-    ``output_ids`` tuple lives on the Call. So the emitted return has to be
-    recovered from the callers, and the order is theirs.
+    The ``output_ids`` tuple lives on the Call; the region's own Ret must
+    publish exactly those values, in the callers' order.
     """
 
     source = """
@@ -706,13 +715,18 @@ def update(a):
         if "planned_region" in name
     ]
     assert regions, "expected at least one planned region"
+    from src.compiler.ssa_python_materializer import _region_output_contracts
+
+    contracts = _region_output_contracts(module)
     for region in regions:
-        ops = {
-            str(instruction.op)
+        returned = tuple(
+            int(value.id)
             for block in region.blocks.values()
             for instruction in block.instrs
-        }
-        assert "Ret" not in ops, "a region states no return of its own"
+            if instruction.op == "Ret"
+            for value in instruction.args
+        )
+        assert returned == contracts[region.name]
 
 
 def test_functions_that_cannot_be_materialized_are_reported_not_dropped():
@@ -761,7 +775,10 @@ def test_disagreeing_call_sites_are_reported_rather_than_resolved():
             "Call",
             [SSAValue(0)],
             SSAValue(result_id),
-            attributes={"callee": callee, "output_ids": outputs},
+            attributes={
+                "callee": callee, "output_ids": outputs,
+                "result_convention": "ssa.aggregate",
+            },
         )
 
     module = _Module({
@@ -999,8 +1016,10 @@ def train(x):
         "train",
         "unnamed",
     )
+    # The recorded gap is closed where the metadata is written: the single
+    # formal of this shape now carries its authored name too.
     metadata = module.functions["unnamed__train"].metadata or {}
-    assert tuple(metadata.get("parameter_names") or ()) == ()
+    assert tuple(metadata.get("parameter_names") or ()) == (("x", 0),)
 
     module, _outputs, _exports = _lower(
         """
@@ -1072,10 +1091,13 @@ def train(x):
         "train",
         "deadstore",
     )
+    # Linking no longer leases a workspace formal for this chain at all: every
+    # frame carries only its authored formal, and none is left undeclared.
     function = module.functions["deadstore__train"]
-    declared = tuple(function.metadata.get("storage_formals") or ())
-    assert declared, "the storage formal should be declared in metadata"
-    assert declared[0]["callee"] == "deadstore__middle"
+    assert [int(value.id) for value in function.args] == [
+        int(value_id) for _name, value_id in function.metadata["parameter_names"]
+    ]
+    assert not tuple(function.metadata.get("storage_formals") or ())
     assert check_dead_storage_formals(module) == []
 
     emitted, skipped = materialize_ir_module(module)

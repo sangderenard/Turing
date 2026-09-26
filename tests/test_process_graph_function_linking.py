@@ -843,7 +843,7 @@ def test_public_source_compiler_reports_progress_by_default(monkeypatch, capsys)
 
     monkeypatch.setattr(shell, "_lower_ast_source_to_ssa_impl", fake_lower)
 
-    assert shell.lower_ast_source_to_ssa("pass") == ("module", {}, ())
+    assert shell.lower_ast_source_to_ssa("pass", extraction_contract=CONTRACT) == ("module", {}, ())
     assert "[compiler] test phase" in capsys.readouterr().err
 
 
@@ -1048,6 +1048,7 @@ def test_direct_source_to_ssa_preserves_linked_sympy_function_without_fusion():
         "root",
         linked_process_graphs={"linked_math": symbolic.process_graph},
         name="root_direct",
+        extraction_contract=CONTRACT,
     )
 
     assert "root_direct__root" in module.functions
@@ -1182,6 +1183,7 @@ def test_direct_source_to_ssa_preserves_all_linked_tuple_results():
         "root",
         linked_process_graphs={"linked_pair": symbolic.process_graph},
         name="pair_direct",
+        extraction_contract=CONTRACT,
     )
 
     root = module.functions["pair_direct__root"]
@@ -1197,8 +1199,10 @@ def test_direct_source_to_ssa_preserves_all_linked_tuple_results():
         instruction
         for block in root.blocks.values()
         for instruction in block.instrs
+        # The linked call may target a specialization of ``linked_pair``; it
+        # is the one source-linked call, identified by that declaration.
         if instruction.op == "Call"
-        and instruction.attributes.get("callee") == "pair_direct__linked_pair"
+        and instruction.attributes.get("source_linked")
         and instruction.attributes.get("result_convention") == "ssa.aggregate"
     )
     callsite_id = int(linked_call.attributes["plan_callsite_id"])
@@ -1869,12 +1873,14 @@ def test_multi_result_call_writes_the_record_fields_read_after_assignment():
     assert all(field.writable for field in fields.values())
     assert tuple(field.value_ids[0] for field in fields.values()) == output_ids
     assert all(len(field.value_ids) == 1 for field in fields.values())
-    region_call = next(
+    # The planned region that reads both fields back is the one region call
+    # in ``update``; its ordinal is the planner's, not part of this contract.
+    (region_call,) = (
         instruction
         for block in update.blocks.values()
         for instruction in block.instrs
         if instruction.op == "Call"
-        and instruction.attributes.get("region_index") == 1
+        and instruction.attributes.get("region_index") is not None
     )
     assert tuple(int(argument.id) for argument in region_call.args) == output_ids
 
@@ -2348,27 +2354,33 @@ def test_post_loop_call_uses_the_exact_break_aware_loop_result_port():
         "    return total, second\n",
         "root",
         name="break_aware_loop_call",
+        extraction_contract=CONTRACT,
     )
 
     root = module.functions["break_aware_loop_call__root"]
-    linked = next(
-        instruction
-        for block in root.blocks.values()
-        for instruction in block.instrs
-        if instruction.op == "Call"
-        and instruction.attributes.get("callee")
-        == "break_aware_loop_call__step"
-    )
+    # ``step`` returns its argument, so the compiler folds the call through
+    # its identity-return aliases; what follows the inner loop reads the
+    # inner loop's break-aware result port directly.  That port merges the
+    # no-break value -- ``value``, which ``current`` held before the loop,
+    # NOT the outer loop's carried ``second`` that starts from the same
+    # value -- with the break edge's ``boundary - total``.
+    parameters = dict(root.metadata["parameter_names"])
+    inner_exit = root.blocks["loop_exit"]
     loop_result = next(
-        instruction
+        instruction for instruction in inner_exit.instrs
+        if instruction.attributes.get("binding") == "loop_result_port"
+    )
+    assert len(loop_result.args) == 2
+    assert int(loop_result.args[0].id) == int(parameters["value"])
+    assert any(
+        instruction.op == "Call"
+        and any(
+            int(argument.id) == int(loop_result.res.id)
+            for argument in instruction.args
+        )
         for block in root.blocks.values()
         for instruction in block.instrs
-        if instruction.attributes.get("binding") == "loop_result_port"
-        and instruction.res is linked.args[0]
     )
-
-    assert loop_result.res.id == linked.args[0].id
-    assert len(loop_result.args) == 2
     assert not root.metadata.get("unresolved_call_diagnostics")
     assert not root.metadata.get("structural_output_shortfalls")
 
@@ -2383,6 +2395,7 @@ def test_structural_boolean_call_feed_is_materialized_before_linking():
         "    return child(value, left or right)\n",
         "root",
         name="structural_call_feed",
+        extraction_contract=CONTRACT,
     )
 
     root = module.functions["structural_call_feed__root"]
@@ -2782,10 +2795,17 @@ def test_comprehension_element_is_evaluated_inside_its_own_loop():
     ]
     assert direct or region_calls
     if region_calls:
-        region = module.functions[str(region_calls[0].attributes["callee"])]
+        # The element expression may span several loop-body regions (the
+        # cast in one, the comparison in the next); all of them run inside
+        # the loop.
         region_ops = [
             instruction.op
-            for block in region.blocks.values()
+            for call in body.instrs
+            if call.op == "Call"
+            and "planned_region" in str(call.attributes.get("callee", ""))
+            for block in module.functions[
+                str(call.attributes["callee"])
+            ].blocks.values()
             for instruction in block.instrs
         ]
         assert "Gt" in region_ops
@@ -3384,6 +3404,7 @@ def test_declared_record_span_is_a_planner_tensor_descriptor():
     assert _tensor_descriptor(graph, 2) == {
         "shape": (2, 3, 4),
         "dtype": "float64",
+        "rank": 3,
     }
 
 
@@ -3414,7 +3435,7 @@ def test_single_aggregate_return_keeps_structured_tensor_descriptors():
     assert _tensor_descriptor(caller, node_id) is None
     descriptors = call["attributes"]["tensor_output_descriptors"]
     assert isinstance(descriptors[0], tuple)
-    assert {"shape": (3,), "dtype": "float64"} in descriptors[0]
+    assert {"shape": (3,), "dtype": "float64", "rank": 1} in descriptors[0]
 
 
 def test_callsite_shape_discards_padded_scalar_result_descriptors():
@@ -3710,6 +3731,7 @@ def test_specialized_function_argument_is_erased_from_runtime_frame():
         "    return apply(value, increment)\n",
         "root",
         name="function_argument",
+        extraction_contract=CONTRACT,
     )
 
     root = module.functions["function_argument__root"]
@@ -3767,6 +3789,7 @@ def test_parameter_default_does_not_replace_later_same_name_ssa_value():
         "root",
         name="default_identity_scope",
         python_bindings={"child": _default_identity_child},
+        extraction_contract=CONTRACT,
     )
 
     root = module.functions["default_identity_scope__root"]
@@ -3789,6 +3812,7 @@ def test_specialized_dictionary_argument_has_no_runtime_argument_binding():
         "    return child({'primitive': 'disc', 'radius': 2.0})\n",
         "root",
         name="specialized_dictionary",
+        extraction_contract=CONTRACT,
     )
 
     root = module.functions["specialized_dictionary__root"]
@@ -3809,6 +3833,7 @@ def test_precompile_does_not_fold_inactive_module_definitions():
         "root",
         name="catalogue_range",
         runtime_closure_only=True,
+        extraction_contract=CONTRACT,
     )
 
     root = module.functions["catalogue_range__root"]

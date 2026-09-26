@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import replace
+from types import SimpleNamespace
 import copy
 from fnmatch import fnmatchcase
 import json
@@ -2358,6 +2359,267 @@ def _prune_dead_entry_field_aliases(
     return removed
 
 
+def _sequence_member_role(descriptor: Any, value_id: int) -> tuple | None:
+    """The role ``value_id`` plays in one sequence descriptor, or None."""
+
+    value_id = int(value_id)
+    if int(descriptor.sequence_id) == value_id:
+        return ("handle",)
+    for position, column in enumerate(descriptor.column_value_ids):
+        if int(column) == value_id:
+            return ("column", position)
+    for attribute in (
+        "length_address_id", "capacity_value_id",
+        "status_address_id", "live_flags_value_id",
+    ):
+        member = getattr(descriptor, attribute, None)
+        if member is not None and int(member) == value_id:
+            return (attribute,)
+    return None
+
+
+def _sequence_member_by_role(descriptor: Any, role: tuple) -> int | None:
+    if role[0] == "handle":
+        return int(descriptor.sequence_id)
+    if role[0] == "column":
+        columns = tuple(descriptor.column_value_ids)
+        return int(columns[role[1]]) if role[1] < len(columns) else None
+    member = getattr(descriptor, role[0], None)
+    return None if member is None else int(member)
+
+
+def _linked_caller_member(
+    caller_symbol: str,
+    record: Any,
+    callee_id: int,
+    callee_records: Any,
+    caller_records: Any,
+    callee_sequences: Any,
+    caller_sequences: Any,
+    caller_formal_ids: Collection[int] = (),
+    linked_sequence_members: set[int] | None = None,
+    grow_caller_field: Any = None,
+) -> int | None:
+    """The caller value a callee record member is, by recorded ids only.
+
+    The callee formal's identity was written when it was minted: the record
+    descriptor (or that field's sequence descriptor) names it as one member
+    of one declared field.  The call's ``argument_bindings`` -- or, for a
+    nested record, ``call_record_pair_concordance`` -- names the caller
+    record bound to that callee record, and the caller record's same declared
+    field names the caller member.  Nothing is matched by parameter spelling,
+    position among formals, dtype or shape.  Returns None when the callee
+    formal is no member of a record bound at this call (it is then frame
+    storage leased for exactly this callee formal).  Two chains naming
+    different caller values, or a bound caller record without the declared
+    field, raise: the links disagree and nothing may choose between them.
+    """
+
+    from .identity_concordance import current_identity_book
+    from ..transmogrifier.ssa import SSARecordFieldStorage
+
+    callee_id = int(callee_id)
+    caller_formal_ids = set(map(int, caller_formal_ids))
+    bound = {
+        int(callee_value): int(caller_value)
+        for caller_value, callee_value in record.argument_bindings
+    }
+    pair_page = current_identity_book().page("call_record_pair_concordance")
+    resolved: set[int] = set()
+    sequence_members: set[int] = set()
+    # The callee formal's memberships, read from the book: ``record_member``
+    # names the record fields whose values it is, ``sequence_member`` the
+    # sequence descriptors it belongs to, whose handles ``record_member``
+    # names as sequence fields.
+    memberships: list[tuple[int, str, tuple]] = []
+    if callee_records is not None:
+        for record_id, field_name, _identity, role in (
+            callee_records.member_claims(callee_id)
+        ):
+            if role[0] == "slot":
+                memberships.append((int(record_id), field_name, ("value", 0)))
+            elif role[0] == "value":
+                memberships.append((int(record_id), field_name, role))
+        if callee_sequences is not None:
+            for sequence_id, role in callee_sequences.member_claims(callee_id):
+                for record_id, field_name, _identity, field_role in (
+                    callee_records.member_claims(sequence_id)
+                ):
+                    if field_role == ("sequence",):
+                        memberships.append((
+                            int(record_id), field_name, ("sequence", role),
+                        ))
+    for record_id, field_name, member in dict.fromkeys(memberships):
+        descriptor = callee_records.records.get(record_id)
+        field = None if descriptor is None else next((
+            candidate for candidate in descriptor.fields
+            if candidate.name == field_name
+        ), None)
+        if field is None:
+            raise ValueError(
+                f"{caller_symbol} callsite {record.callsite_id}: book claims "
+                f"callee {record.callee_symbol} formal {callee_id} is member "
+                f"{member!r} of field {field_name!r} of record {record_id}, "
+                f"which the record_descriptor page does not hold"
+            )
+        caller_record_id = bound.get(record_id)
+        if caller_record_id is None:
+            caller_record_id = pair_page.latest((
+                str(caller_symbol), int(record.callsite_id), record_id,
+            ))
+        if caller_record_id is None:
+            continue
+        caller_descriptor = getattr(caller_records, "records", {}).get(
+            int(caller_record_id)
+        )
+        if caller_descriptor is None:
+            continue
+        caller_field = next((
+            candidate for candidate in caller_descriptor.fields
+            if candidate.storage_identity == field.storage_identity
+        ), None)
+        if caller_field is None and grow_caller_field is not None:
+            caller_field = grow_caller_field(
+                int(caller_record_id), field, member, callee_id,
+            )
+        if caller_field is None:
+            raise ValueError(
+                f"{caller_symbol} callsite {record.callsite_id}: callee "
+                f"{record.callee_symbol} formal {callee_id} is member "
+                f"{member!r} of declared field {field.storage_identity!r} "
+                f"of record {record_id}, bound to caller record "
+                f"{caller_record_id}, which has no such field"
+            )
+        if member[0] == "value" and (
+            field.storage is SSARecordFieldStorage.SCALAR
+        ):
+            # A scalar field's value_ids are the SSA versions of ONE
+            # slot (versioned writes).  The callee formal is its input
+            # slot; the caller's input slot is the one version it
+            # receives as a formal.
+            caller_inputs = [
+                int(value_id) for value_id in caller_field.value_ids
+                if int(value_id) in caller_formal_ids
+            ]
+            if not caller_inputs and len(caller_field.value_ids) == 1:
+                # A caller-local record: its field's only version is
+                # the slot.
+                caller_inputs = [int(caller_field.value_ids[0])]
+            if len(caller_inputs) != 1:
+                raise ValueError(
+                    f"{caller_symbol} callsite {record.callsite_id}: "
+                    f"scalar field {field.storage_identity!r} of caller "
+                    f"record {caller_record_id} has input slots "
+                    f"{caller_inputs!r} among versions "
+                    f"{tuple(caller_field.value_ids)!r}"
+                )
+            resolved.add(caller_inputs[0])
+            continue
+        if member[0] == "value":
+            caller_values = tuple(map(int, caller_field.value_ids))
+            if len(caller_values) != len(field.value_ids):
+                raise ValueError(
+                    f"{caller_symbol} callsite {record.callsite_id}: "
+                    f"declared field {field.storage_identity!r} has "
+                    f"{len(field.value_ids)} members in callee record "
+                    f"{record_id} and {len(caller_values)} in caller "
+                    f"record {caller_record_id}: callee {field!r}; "
+                    f"caller {caller_field!r}"
+                )
+            resolved.add(caller_values[member[1]])
+            continue
+        caller_sequence = (
+            None if caller_field.sequence_id is None
+            or caller_sequences is None
+            else caller_sequences.by_id(int(caller_field.sequence_id))
+        )
+        caller_member = (
+            None if caller_sequence is None
+            else _sequence_member_by_role(caller_sequence, member[1])
+        )
+        if caller_member is None:
+            raise ValueError(
+                f"{caller_symbol} callsite {record.callsite_id}: callee "
+                f"{record.callee_symbol} formal {callee_id} is sequence "
+                f"member {member[1]!r} of {field.storage_identity!r}; the "
+                f"bound caller record {caller_record_id} names no such "
+                f"member"
+            )
+        resolved.add(int(caller_member))
+        sequence_members.add(int(caller_member))
+    if len(resolved) > 1:
+        raise ValueError(
+            f"{caller_symbol} callsite {record.callsite_id}: callee "
+            f"{record.callee_symbol} formal {callee_id} links to caller "
+            f"values {sorted(resolved)!r}"
+        )
+    if resolved and linked_sequence_members is not None:
+        linked_sequence_members.update(resolved & sequence_members)
+    return next(iter(resolved), None)
+
+
+def _restore_linked_sequence_member(
+    caller: Any, values: dict, member_id: int, callee_formal: Any,
+    callee_symbol: str, callsite_id: int,
+) -> Any:
+    """Materialize the caller's descriptor-named sequence member by its id.
+
+    The caller's sequence descriptor already owns this exact storage
+    identity; it is only not yet a physical value.  Restore that identity
+    (the ``restored_caller_storage`` rule of frame-tail completion) rather
+    than leasing a replacement, which would hand the callee storage the
+    caller's record never sees.
+    """
+
+    from ..transmogrifier.ssa import SSAValue
+
+    slot = SSAValue(
+        int(member_id),
+        dtype=callee_formal.dtype,
+        shape=tuple(callee_formal.shape or ()),
+        device=callee_formal.device,
+        accounting={
+            "linked_call_frame_storage": str(callee_symbol),
+            "callsite_id": int(callsite_id),
+            "propagated_formal_id": int(callee_formal.id),
+            "restored_linked_sequence_member": True,
+        },
+    )
+    caller.args.append(slot)
+    values[int(member_id)] = slot
+    return slot
+
+
+def _lease_source(formal: Any) -> Any:
+    """The callee formal a lease is shaped after, minus the callee's names.
+
+    A lease is identified by its ``frame_lease_link`` row (callsite, callee,
+    callee formal id).  The callee's ``program_abi_*`` accounting names the
+    callee's record; copied onto caller storage it claimed a caller ABI
+    field the caller does not have (identity_concordance
+    conflicting-storage-claims).
+    """
+
+    return replace(formal, accounting={
+        key: value for key, value in dict(formal.accounting or {}).items()
+        if not str(key).startswith("program_abi_")
+    })
+
+
+def _link_frame_lease(
+    caller_symbol: str, slot_id: int, callsite_id: Any,
+    callee_symbol: str, callee_id: int,
+) -> None:
+    """Write the one identity of a leased caller slot; it never changes."""
+
+    from .identity_concordance import current_identity_book
+
+    current_identity_book().page("frame_lease_link").concord(
+        (str(caller_symbol), int(slot_id)),
+        (callsite_id, str(callee_symbol), int(callee_id)),
+    )
+
+
 def _linked_frame_storage_owner(
     formal: Any,
     storage_identity: str | None,
@@ -2816,9 +3078,52 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
     return appended
 
 
+def _live_sequence_member_ids(function: Any, sequence_table: Any) -> set[int]:
+    """Every storage cell named by a live sequence descriptor of ``function``.
+
+    A descriptor is live when its handle or a column is a formal, or is
+    defined and read by an instruction (the rule `_prune_dead_local_sequences`
+    retires by).  Its length/capacity/status cells are storage of that
+    sequence even when no instruction of this body happens to read them:
+    pruning one leaves the descriptor naming a cell nothing defines
+    (identity_concordance ``descriptor-member-unknown``; woodshop
+    step_with_dt_control_used lost seq35/160/365/368 capacity this way).
+    """
+
+    sequences = getattr(sequence_table, "sequences", None) or {}
+    if not sequences:
+        return set()
+    formal_ids = {int(value.id) for value in function.args}
+    defined_ids = set()
+    consumed_ids = set()
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            if instruction.res is not None:
+                defined_ids.add(int(instruction.res.id))
+            consumed_ids.update(int(argument.id) for argument in instruction.args)
+    members: set[int] = set()
+    for descriptor in sequences.values():
+        anchors = (
+            int(descriptor.sequence_id), *map(int, descriptor.column_value_ids),
+        )
+        if not any(
+            value_id in formal_ids
+            or (value_id in defined_ids and value_id in consumed_ids)
+            for value_id in anchors
+        ):
+            continue
+        members.update(anchors)
+        members.update(int(value_id) for value_id in (
+            descriptor.length_address_id, descriptor.capacity_value_id,
+            descriptor.status_address_id, descriptor.live_flags_value_id,
+        ) if value_id is not None)
+    return members
+
+
 def _prune_unused_callee_formals(
     functions: Mapping[str, Any],
     call_records: Mapping[str, list[Any]] | None = None,
+    sequence_tables: Mapping[str, Any] | None = None,
 ) -> int:
     """Prune to a fixed point: a formal whose only use was forwarding to a
     callee formal that one pass removes becomes unused itself, so a chain of
@@ -2826,7 +3131,9 @@ def _prune_unused_callee_formals(
 
     total = 0
     while True:
-        removed = _prune_unused_callee_formals_once(functions, call_records)
+        removed = _prune_unused_callee_formals_once(
+            functions, call_records, sequence_tables,
+        )
         total += removed
         if not removed:
             return total
@@ -2835,6 +3142,7 @@ def _prune_unused_callee_formals(
 def _prune_unused_callee_formals_once(
     functions: Mapping[str, Any],
     call_records: Mapping[str, list[Any]] | None = None,
+    sequence_tables: Mapping[str, Any] | None = None,
 ) -> int:
     """Rewrite dead callee formals and every call operand as one transaction.
 
@@ -2884,6 +3192,9 @@ def _prune_unused_callee_formals_once(
         )
         protected.update(map(
             int, metadata.get("sequence_array_argument_ids", ())
+        ))
+        protected.update(_live_sequence_member_ids(
+            callee, (sequence_tables or {}).get(str(callee_name)),
         ))
         record_parameter_names = set(map(
             str, dict(metadata.get("parameter_record_abi") or {}),
@@ -13758,7 +14069,12 @@ def _call_argument_identity(
     return None
 
 
-def _propagate_record_field_demand(all_functions: Mapping[str, Any]) -> None:
+def _propagate_record_field_demand(
+    all_functions: Mapping[str, Any],
+    call_records: Mapping[str, Any] | None = None,
+    all_record_tables: Mapping[str, Any] | None = None,
+    all_sequence_tables: Mapping[str, Any] | None = None,
+) -> None:
     """Grow a caller's formals to include every record field a callee it
     calls needs, transitively, before anything tries to align call shapes.
 
@@ -13794,10 +14110,91 @@ def _propagate_record_field_demand(all_functions: Mapping[str, Any]) -> None:
 
     from ..transmogrifier.ssa import SSAValue
 
+    call_records = call_records or {}
+    all_record_tables = all_record_tables or {}
+    all_sequence_tables = all_sequence_tables or {}
+
+    def linked_member(caller_symbol, caller, callee_symbol, callee, instruction, formal):
+        """The caller member a callee field formal is, by recorded ids."""
+
+        callsite_id = instruction.attributes.get("plan_callsite_id")
+        record = next((
+            candidate for candidate in call_records.get(str(caller_symbol), ())
+            if candidate.callsite_id == callsite_id
+            and str(candidate.callee_symbol) == str(callee_symbol)
+        ), None) if callsite_id is not None else None
+        if record is None:
+            return None
+        caller_values = {int(value.id): value for value in caller.args}
+        caller_values.update({
+            int(item.res.id): item.res
+            for block in caller.blocks.values() for item in block.instrs
+            if item.res is not None
+        })
+
+        def grow(caller_record_id, callee_field, member, callee_id):
+            # The bound caller record has not materialized this declared
+            # field (lazy materialization).  It is the caller's own field:
+            # mint its one formal and register it on the caller record, so
+            # the link is written where the member is minted.
+            from ..transmogrifier.ssa import SSARecordFieldStorage
+            if member[0] != "value" or callee_field.storage not in {
+                SSARecordFieldStorage.SCALAR, SSARecordFieldStorage.SPAN,
+            }:
+                return None
+            table = all_record_tables.get(str(caller_symbol))
+            descriptor = table.records.get(int(caller_record_id))
+            sibling = next((
+                caller_values[int(value_id)]
+                for sibling_field in descriptor.fields
+                for value_id in sibling_field.value_ids
+                if int(value_id) in caller_values
+                and (caller_values[int(value_id)].accounting or {}).get(
+                    "program_abi_parameter"
+                ) is not None
+            ), None)
+            sibling_accounting = dict(
+                {} if sibling is None else sibling.accounting or {}
+            )
+            formal_accounting = dict(formal.accounting or {})
+            grown = SSAValue(
+                GLOBAL_MONOTONIC_IDS.mint(),
+                dtype=formal.dtype,
+                shape=tuple(formal.shape or ()),
+                device=formal.device,
+                accounting={
+                    **formal_accounting,
+                    **{
+                        key: sibling_accounting[key]
+                        for key in ("program_abi_parameter", "program_abi_record")
+                        if key in sibling_accounting
+                    },
+                    "program_abi_field_written": False,
+                },
+            )
+            caller.args.append(grown)
+            caller_values[int(grown.id)] = grown
+            grown_field = replace(callee_field, value_ids=(int(grown.id),))
+            table.register(replace(
+                descriptor, fields=(*descriptor.fields, grown_field),
+            ))
+            return grown_field
+
+        member_id = _linked_caller_member(
+            str(caller_symbol), record, int(formal.id),
+            all_record_tables.get(str(callee_symbol)),
+            all_record_tables.get(str(caller_symbol)),
+            all_sequence_tables.get(str(callee_symbol)),
+            all_sequence_tables.get(str(caller_symbol)),
+            {int(value.id) for value in caller.args},
+            grow_caller_field=grow,
+        )
+        return None if member_id is None else caller_values.get(int(member_id))
+
     grew = True
     while grew:
         grew = False
-        for caller in all_functions.values():
+        for caller_symbol, caller in all_functions.items():
             caller_fields = {
                 ((formal.accounting or {}).get("program_abi_record"),
                  (formal.accounting or {}).get("program_abi_field")): formal
@@ -13835,7 +14232,12 @@ def _propagate_record_field_demand(all_functions: Mapping[str, Any]) -> None:
                         key = (formal_accounting.get("program_abi_record"), field)
                         if (int(formal.id) in declared if declared is not None else key in supplied):
                             continue
-                        existing = caller_fields.get(key)
+                        existing = linked_member(
+                            caller_symbol, caller,
+                            instruction.attributes.get("callee"), callee,
+                            instruction, formal,
+                        )
+
                         if existing is not None:
                             # Already materialized somewhere in the caller
                             # (a different call, or its own body) -- this
@@ -14446,11 +14848,23 @@ def _prune_dead_local_sequences(
             for instruction in block.instrs
             if instruction.res is not None
         }
+        consumed_ids = {
+            int(argument.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            for argument in instruction.args
+        }
         for sequence_id, descriptor in tuple(table.sequences.items()):
             handle = int(descriptor.sequence_id)
             columns = tuple(map(int, descriptor.column_value_ids))
+            # A definition nothing reads does not make the sequence readable.
+            # woodshop run_superstep: seq3's handle was an unconsumed entry
+            # ``NoneValue`` (the ``None`` default of an optional sequence);
+            # it kept the descriptor alive here, later DCE removed it, and
+            # the descriptor was left naming cells nothing defines.
             if any(
-                value_id in formal_ids or value_id in defined_ids
+                value_id in formal_ids
+                or (value_id in defined_ids and value_id in consumed_ids)
                 for value_id in (handle, *columns)
             ):
                 continue
@@ -17373,6 +17787,7 @@ def _class_surface_ssa_program(
                 function_parameters=tuple(
                     graph_obj.graph.get("function_parameters") or ()
                 ),
+                lexical_read_scope=graph_obj.graph.get("lexical_read_scope"),
                 value_dtypes=parameter_value_dtypes,
                 value_shapes=parameter_value_shapes,
                 constant_values=constant_values,
@@ -20344,9 +20759,23 @@ def _class_surface_ssa_program(
     # descendants.  Propagating these names backward through PlanCall's exact
     # argument bindings avoids both Python object handles and the rejected
     # alternative of expanding every schema field at every call boundary.
-    record_parameter_specs: dict[tuple[str, str], Mapping[str, Any]] = {}
-    record_parameter_by_value: dict[str, dict[int, tuple[str, str]]] = {}
-    record_field_demands: dict[tuple[str, str], set[str]] = {}
+    # All of this pass's working state is on the identity book, under one
+    # scope per invocation: the declared record parameter each value id is
+    # (``record_parameter_value``), the field set each record parameter
+    # needs (``record_field_demand``) and writes (``record_field_write``),
+    # and the exact call edges that forward one parameter into another
+    # (``record_forwarding_edge``).  The declared layouts themselves are the
+    # source graphs' ``parameter_record_abi``.
+    from .identity_concordance import mint_scope
+
+    demand_scope = mint_scope("record_field_demand")
+    demand_book = current_identity_book()
+    record_parameter_by_value = demand_book.page(
+        "record_parameter_value"
+    ).mapping(demand_scope)
+    record_field_demands = demand_book.page(
+        "record_field_demand"
+    ).mapping(demand_scope)
     # A typed sequence row has one complete, fixed physical ABI.  Once a
     # record identity is used as such a row anywhere in this source closure,
     # demand-minimizing one occurrence of that same exact type to a field
@@ -20399,23 +20828,25 @@ def _class_surface_ssa_program(
     # to (observed: ``last_wave_speed``/``last_height_violation``/
     # ``last_tracer_violation``, each written only inside a deeply nested
     # callee, stayed at their initial 0.0 in the compiled output).
-    record_field_writes: dict[tuple[str, str], set[str]] = {}
+    record_field_writes = demand_book.page(
+        "record_field_write"
+    ).mapping(demand_scope)
     for source_symbol, source_graph in source_graphs_by_symbol.items():
         identities = source_graph.graph.get("identity_table") or {}
         declared = dict(
             source_graph.graph.get("parameter_record_abi") or {}
         )
-        by_value = record_parameter_by_value.setdefault(source_symbol, {})
         for parameter_name, record in declared.items():
             key = (str(source_symbol), str(parameter_name))
-            record_parameter_specs[key] = record
-            record_field_demands.setdefault(key, set())
-            record_field_writes.setdefault(key, set())
+            record_field_demands.setdefault(key, frozenset())
+            record_field_writes.setdefault(key, frozenset())
             parameter_ids = set(map(
                 int, identities.get(str(parameter_name), ())
             ))
             for value_id in parameter_ids:
-                by_value[int(value_id)] = key
+                demand_book.page("record_parameter_value").concord(
+                    (demand_scope, (str(source_symbol), int(value_id))), key,
+                )
             declared_fields = set(map(
                 str, dict(record.get("fields") or {})
             ))
@@ -20425,7 +20856,7 @@ def _class_surface_ssa_program(
                 or record_identity.rsplit(".", 1)[-1] == row_identity
                 for row_identity in sequence_row_record_identities
             ):
-                record_field_demands[key].update(declared_fields)
+                record_field_demands[key] |= frozenset(declared_fields)
             if any(
                 row[0] == record_identity
                 for row in numeric_record_abi_page.rows()
@@ -20447,7 +20878,7 @@ def _class_surface_ssa_program(
                                 f"{path}.",
                                 dict(abi_records[str(field.get("record"))]),
                             ))
-                record_field_demands[key].update(
+                record_field_demands[key] |= frozenset(
                     current_identity_book().page(
                         "record_field_demand_concordance"
                     ).concord(key, tuple(sorted(leaf_paths)))
@@ -20466,7 +20897,7 @@ def _class_surface_ssa_program(
                         owner_id in parameter_ids
                         and attribute in declared_fields
                     ):
-                        record_field_demands[key].add(attribute)
+                        record_field_demands[key] |= {attribute}
                         direct_field_by_value[result_id] = attribute
                     continue
                 if operation != "setattr":
@@ -20482,7 +20913,7 @@ def _class_surface_ssa_program(
                     for parent, role in data.get("parents") or ()
                 ):
                     continue
-                record_field_writes[key].add(attribute)
+                record_field_writes[key] |= {attribute}
             # Subscript assignment mutates the field's resident span through
             # IndexedStore; it does not need (and therefore does not create) a
             # SetAttr node.  Follow the same graph-owned storage aliases used
@@ -20503,7 +20934,16 @@ def _class_surface_ssa_program(
                     resolve_indexed_storage(int(value_id))
                 )
                 if attribute is not None:
-                    record_field_writes[key].add(attribute)
+                    record_field_writes[key] |= {attribute}
+
+    def declared_record_parameter(key: tuple[str, str]) -> Mapping[str, Any]:
+        """The declared ``parameter_record_abi`` layout one key names."""
+
+        symbol, parameter_name = key
+        return dict(
+            source_graphs_by_symbol[symbol].graph.get("parameter_record_abi")
+            or {}
+        )[parameter_name]
 
     def planned_callee_symbol(
         planned_call: Any, caller_graph: Any, caller_shell: Any,
@@ -20530,7 +20970,9 @@ def _class_surface_ssa_program(
             else function_symbols.get(int(reference))
         )
 
-    record_forwarding_edges = []
+    record_forwarding_edges = demand_book.page(
+        "record_forwarding_edge"
+    ).mapping(demand_scope)
     for caller_symbol, planned_call, caller_graph, _module, caller_shell in (
         pending_call_records
     ):
@@ -20539,43 +20981,44 @@ def _class_surface_ssa_program(
         )
         if callee_symbol is None:
             continue
-        caller_by_value = record_parameter_by_value.get(
-            str(caller_symbol), {}
-        )
-        callee_by_value = record_parameter_by_value.get(
-            str(callee_symbol), {}
-        )
         for caller_id, callee_id in planned_call.argument_bindings:
-            caller_key = caller_by_value.get(int(caller_id))
-            callee_key = callee_by_value.get(int(callee_id))
+            caller_key = record_parameter_by_value.get(
+                (str(caller_symbol), int(caller_id))
+            )
+            callee_key = record_parameter_by_value.get(
+                (str(callee_symbol), int(callee_id))
+            )
             if caller_key is None or callee_key is None:
                 continue
-            caller_record = record_parameter_specs[caller_key]
-            callee_record = record_parameter_specs[callee_key]
+            caller_record = declared_record_parameter(caller_key)
+            callee_record = declared_record_parameter(callee_key)
             if str(caller_record.get("identity")) != str(
                 callee_record.get("identity")
             ):
                 continue
-            record_forwarding_edges.append((caller_key, callee_key))
+            record_forwarding_edges[(caller_key, callee_key)] = (
+                int(planned_call.callsite_id),
+            )
 
     changed = True
     while changed:
         changed = False
-        for caller_key, callee_key in record_forwarding_edges:
+        for caller_key, callee_key in tuple(record_forwarding_edges):
             missing = (
                 record_field_demands[callee_key]
                 - record_field_demands[caller_key]
             )
             if missing:
-                record_field_demands[caller_key].update(missing)
+                record_field_demands[caller_key] |= missing
                 changed = True
             missing_writes = (
-                record_field_writes.get(callee_key, set())
-                - record_field_writes.get(caller_key, set())
+                record_field_writes.get(callee_key, frozenset())
+                - record_field_writes.get(caller_key, frozenset())
             )
             if missing_writes:
-                record_field_writes.setdefault(caller_key, set()).update(
-                    missing_writes
+                record_field_writes[caller_key] = (
+                    record_field_writes.get(caller_key, frozenset())
+                    | missing_writes
                 )
                 changed = True
 
@@ -20604,7 +21047,9 @@ def _class_surface_ssa_program(
         # Coalescing that proven field identity prevents a native aggregate
         # result from being written into a private projection while later
         # reads continue to observe the untouched input field.
-        record_storage_aliases: dict[int, int] = {}
+        record_storage_aliases = current_identity_book().page(
+            "record_storage_alias"
+        ).mapping(mint_scope(("record_storage_alias", str(symbol))))
         indexed_storage_aliases = _loop_carried_storage_aliases(graph)
 
         def resolve_indexed_storage(value_id: int) -> int:
@@ -20630,8 +21075,6 @@ def _class_surface_ssa_program(
             parameter_ids: set[int], field_name: str, mutable: bool,
             storage: str, optional: bool,
         ) -> None:
-            if not mutable:
-                return
             getters: list[tuple[int, bool]] = []
             write_sources: list[int] = []
             for node_id, data in graph.nodes(data=True):
@@ -20672,7 +21115,33 @@ def _class_surface_ssa_program(
                 if resolve_indexed_storage(int(value_id)) in getter_ids
             )
             write_sources = list(dict.fromkeys(write_sources))
-            if not write_sources:
+            if not mutable or not write_sources:
+                # One declared field of one parameter is one storage, read
+                # or not written.  Every authored read of it is that one
+                # value; minting a formal per read forked woodshop
+                # penalties' ``metrics.pub_values`` into members (5, 7)
+                # against its callee's single member.
+                read_ids = list(dict.fromkeys(
+                    value_id for value_id, _after_write in getters
+                ))
+                if len(read_ids) < 2:
+                    return
+                resident_id = next((
+                    value_id for value_id in read_ids
+                    if any(
+                        int(argument.id) == value_id
+                        for argument in function.args
+                    )
+                ), read_ids[0])
+                resident_id = int(current_identity_book().page(
+                    "record_field_resident_concordance"
+                ).concord(
+                    (str(symbol), min(parameter_ids), str(field_name)),
+                    int(resident_id),
+                ))
+                for value_id in read_ids:
+                    if value_id != resident_id:
+                        record_storage_aliases[value_id] = resident_id
                 return
             prewrite_getters = [
                 value_id for value_id, after_write in getters if not after_write
@@ -20755,7 +21224,7 @@ def _class_surface_ssa_program(
                 provenance="parameter_record_storage",
             )
             values = function_values(function)
-        table = all_record_tables.setdefault(symbol, SSARecordTable())
+        table = all_record_tables.setdefault(symbol, SSARecordTable(owner=symbol))
         pooled_scalar_columns: dict[tuple[str, str], SSAValue] = {}
 
         def record_field_candidates(
@@ -21295,7 +21764,7 @@ def _class_surface_ssa_program(
                                 if int(argument.id) not in dropped
                             ]
                             sequence_table = all_sequence_tables.setdefault(
-                                symbol, SSASequenceTable()
+                                symbol, SSASequenceTable(owner=symbol)
                             )
                             sequence_table.register(SSASequenceDescriptor(
                                 int(sequence_id),
@@ -21897,7 +22366,7 @@ def _class_surface_ssa_program(
                     continue
                 if storage == "table":
                     sequence_table = all_sequence_tables.setdefault(
-                        symbol, SSASequenceTable()
+                        symbol, SSASequenceTable(owner=symbol)
                     )
                     sequence_id = next((
                         int(value_id)
@@ -22445,7 +22914,7 @@ def _class_surface_ssa_program(
             return
         values = function_values(function)
         constants = []
-        table = all_record_tables.setdefault(symbol, SSARecordTable())
+        table = all_record_tables.setdefault(symbol, SSARecordTable(owner=symbol))
         layouts = []
         for node_id, data in graph.nodes(data=True):
             matched = abi_record_for_call(data)
@@ -23062,6 +23531,7 @@ def _class_surface_ssa_program(
                         if all(field.name in mapping for mapping in fields_by_name[1:])
                     ]
                     common_fields = []
+                    members_pending = False
                     for name in common_names:
                         candidates = tuple(
                             mapping[name] for mapping in fields_by_name
@@ -23077,15 +23547,27 @@ def _class_surface_ssa_program(
                             ) != signature
                             for candidate in candidates[1:]
                         ):
-                            continue
+                            raise ValueError(
+                                f"{symbol}: record Phi {result_id} merges "
+                                f"field {name!r} with disagreeing layouts "
+                                f"{[(c.storage.value, c.storage_identity, tuple(c.value_ids), c.dtype) for c in candidates]!r}"
+                            )
                         if any(
                             int(value_id) not in values
                             for candidate in candidates
                             for value_id in candidate.value_ids
                         ):
-                            continue
+                            # A member defined by a call this round has not
+                            # linked yet (woodshop run_superstep's back edge
+                            # carries step_with_dt_control_used's result
+                            # fields).  Dropping the field here registered an
+                            # 8-of-27-field Metrics that was never revisited,
+                            # so run_superstep returned no scalar metrics.
+                            # Merge the whole record once every member exists.
+                            members_pending = True
+                            break
                         common_fields.append(candidates)
-                    if not common_fields:
+                    if members_pending or not common_fields:
                         rebuilt.append(instruction)
                         continue
                     merged_fields = []
@@ -24223,10 +24705,10 @@ def _class_surface_ssa_program(
                 continue
             available = function_values(caller)
             caller_records = all_record_tables.setdefault(
-                caller_symbol, SSARecordTable()
+                caller_symbol, SSARecordTable(owner=caller_symbol)
             )
             caller_sequences = all_sequence_tables.setdefault(
-                caller_symbol, SSASequenceTable()
+                caller_symbol, SSASequenceTable(owner=caller_symbol)
             )
             for node_id, node_data in sorted(
                 caller_graph.nodes(data=True), key=lambda item: int(item[0])
@@ -24955,7 +25437,11 @@ def _class_surface_ssa_program(
         symbol: link_order_page.concord((str(artifact_name), symbol), rank)
         for symbol, rank in link_rank.items()
     }
-    call_records: dict[str, list[SSACallRecord]] = {}
+    from ..transmogrifier.ssa import SSACallTable
+
+    # The linker's call records are stored on the identity book; every
+    # in-place edit below is a revision of its caller's row.
+    call_records = SSACallTable(owner="call_records", mutable=True)
     result_storage_bindings_by_call: dict[
         tuple[str, int], dict[int, int]
     ] = {}
@@ -25309,127 +25795,14 @@ def _class_surface_ssa_program(
             callee_result_records = all_record_tables.get(callee_symbol)
             callee_result_sequences = all_sequence_tables.get(callee_symbol)
             caller_result_records = all_record_tables.setdefault(
-                caller_symbol, SSARecordTable()
+                caller_symbol, SSARecordTable(owner=caller_symbol)
             )
             caller_result_sequences = all_sequence_tables.setdefault(
-                caller_symbol, SSASequenceTable()
+                caller_symbol, SSASequenceTable(owner=caller_symbol)
             )
-            parameter_aliases = _linked_authored_parameter_aliases(
-                all_functions[caller_symbol],
-                callee_function,
-                caller_graph,
-                child_graph,
-                planned_call.argument_bindings,
-                caller_result_records,
-                callee_result_records,
-            )
-            # A callee's own per-field formal for a declared record (for
-            # example ``_propose_dt_pen``'s formal for ``metrics.max_vel``)
-            # is a distinct id from anything exact_bindings/storage_bindings
-            # above know about whenever the actual argument is itself the
-            # forwarded result of an earlier call in this same caller
-            # (``coerced = coerce_metrics(metrics)``, then
-            # ``_propose_dt_pen(coerced, ...)``) -- the field formal fell
-            # through to allocate_result_storage and leased a second,
-            # duplicate physical slot for a field the caller already owns.
-            # An ABI-declared (record, field) pair names one physical slot
-            # per caller regardless of which call produced the reference to
-            # it, exactly as _propagate_record_field_demand's caller_fields
-            # lookup already assumes elsewhere in this module; reuse that
-            # same identity here instead of minting a duplicate.
-            # A slot some OTHER callsite already took as its own frame
-            # storage is that callsite's frame, not a shared identity -- and
-            # the book is what knows the difference.  ``caller.args`` alone
-            # cannot answer it: ``allocate_result_storage`` appends its
-            # per-callsite lease to that same list carrying the callee's
-            # ``(record, field)`` accounting, so a later callsite scanning
-            # for that name finds the earlier lease and adopts it.
-            #
-            # ``pi_update`` is called twice from
-            # ``step_with_dt_control_used``, and the binding page shows the
-            # cost exactly: its formals 88/7/8 each leased a fresh slot per
-            # callsite (415 -> minted#1000005224/5225/5226, 460 ->
-            # minted#1000005235/5236/5237) while formal 94 alone had
-            # callsite 460 reusing callsite 415's private lease
-            # minted#1000005223.  The column IS the callsite, so "who else
-            # already claimed this slot" is a question the page answers and
-            # no single callsite can.
-            current_callsite = int(planned_call.callsite_id)
-            leased_by_another_callsite = {
-                int(source)
-                for (_row, column), fact in argument_binding_page.cells.items()
-                if isinstance(fact, tuple) and len(fact) == 2
-                and str(fact[0]) == "caller_storage"
-                and isinstance(fact[1], int)
-                and int(column) != current_callsite
-                for source in (fact[1],)
-            }
-            caller_field_formals: dict[tuple[Any, Any], Any] = {}
-            for formal in all_functions[caller_symbol].args:
-                formal_accounting = formal.accounting or {}
-                field_name = formal_accounting.get("program_abi_field")
-                if field_name is None:
-                    continue
-                if int(formal.id) in leased_by_another_callsite:
-                    continue
-                key = (formal_accounting.get("program_abi_record"), field_name)
-                # A caller can carry more than one formal claiming the same
-                # (record, field): the genuinely declared one, and a
-                # compiler-minted duplicate an earlier call's greedy result-
-                # storage allocation already leased for it (the exact
-                # ``error_channels`` phantom this fix exists to stop
-                # aliasing to).  Whichever happens to iterate last must not
-                # arbitrarily decide the identity; a compiler-minted formal
-                # never displaces an already-found genuinely declared one.
-                if key in caller_field_formals and (
-                    formal_accounting.get("linked_call_frame_storage")
-                    or formal_accounting.get("compiler_frame_storage")
-                ):
-                    continue
-                caller_field_formals[key] = formal
-            for formal in callee_function.args:
-                formal_id = int(formal.id)
-                if formal_id in identity_aliases:
-                    continue
-                accounting = formal.accounting or {}
-                field = accounting.get("program_abi_field")
-                if field is None:
-                    continue
-                existing_formal = caller_field_formals.get(
-                    (accounting.get("program_abi_record"), field)
-                )
-                if existing_formal is None:
-                    continue
-                existing = int(existing_formal.id)
-                if existing == formal_id:
-                    continue
-                # A shared (record, field) NAME is only one physical slot
-                # when both sides also agree on physical representation --
-                # the tire's ``pi_update`` build proved that name alone is
-                # not enough: a bool formal and a float64 formal were
-                # matched by name and aliased, and the compiler's own
-                # immutable-storage-type check correctly refused the
-                # resulting call ("2 incompatible physical call inputs").
-                # The storage KIND (scalar/keyed/span/...) must always
-                # agree -- a keyed handle's own ``dtype`` is routinely None
-                # (its identity is the handle, not a scalar type), so
-                # requiring dtype equality unconditionally would refuse
-                # the "error_channels" keyed-field alias this fix exists to
-                # make.  Only when both sides are plain scalars does dtype
-                # become the compatibility signal that actually caught the
-                # tire's bool/float64 collision.
-                existing_accounting = existing_formal.accounting or {}
-                if accounting.get("program_abi_storage") != existing_accounting.get(
-                    "program_abi_storage"
-                ):
-                    continue
-                if accounting.get("program_abi_storage") == "scalar" and (
-                    formal.dtype is None
-                    or existing_formal.dtype is None
-                    or formal.dtype != existing_formal.dtype
-                ):
-                    continue
-                identity_aliases[formal_id] = existing
+            # Callee record members bind to caller members only through
+            # recorded ids (``discovery_linked_member``); no (record, field)
+            # spelling over the caller's formals names a slot.
             caller_values = function_values(all_functions[caller_symbol])
             # Only ids a node EXPLICITLY declares. The old fallback to
             # ``node_id`` reached ProcessGraph's node keys, which are ``id()``
@@ -25453,15 +25826,7 @@ def _class_surface_ssa_program(
                 source = function_values(callee_function).get(
                     old_id, SSAValue(old_id)
                 )
-                source_parameter = dict(
-                    getattr(source, "accounting", {}) or {}
-                ).get("program_abi_parameter")
-                value = clone_value(source, new_id, accounting={
-                    **({
-                        "program_abi_parameter": parameter_aliases[
-                            str(source_parameter)
-                        ],
-                    } if str(source_parameter) in parameter_aliases else {}),
+                value = clone_value(_lease_source(source), new_id, accounting={
                     "returned_record_storage": str(callee_symbol),
                     "callsite_id": int(planned_call.callsite_id),
                     **({
@@ -26269,6 +26634,42 @@ def _class_surface_ssa_program(
                     int(formal.id): contract
                     for formal, contract in zip(formals, contracts)
                 }
+        discovery_record = SimpleNamespace(
+            callsite_id=int(planned_call.callsite_id),
+            callee_symbol=callee_symbol,
+            argument_bindings=tuple(planned_call.argument_bindings),
+        )
+
+        def discovery_linked_member(callee_formal: Any) -> int | None:
+            """The caller member this callee formal is, by recorded ids."""
+
+            if callee_symbol is None:
+                return None
+            caller_function = all_functions[caller_symbol]
+            sequence_members: set[int] = set()
+            member = _linked_caller_member(
+                str(caller_symbol), discovery_record, int(callee_formal.id),
+                all_record_tables.get(callee_symbol),
+                all_record_tables.get(caller_symbol),
+                all_sequence_tables.get(callee_symbol),
+                all_sequence_tables.get(caller_symbol),
+                {int(argument.id) for argument in caller_function.args},
+                sequence_members,
+            )
+            if member is None:
+                return None
+            present = function_values(caller_function)
+            if int(member) not in present:
+                if int(member) not in sequence_members:
+                    # A member a later link defines (a call result); the
+                    # linking reconcile binds it once it exists.
+                    return None
+                _restore_linked_sequence_member(
+                    caller_function, present, int(member), callee_formal,
+                    str(callee_symbol), int(planned_call.callsite_id),
+                )
+            return int(member)
+
         for value in (
             () if callee_function is None else tuple(callee_function.args)
         ):
@@ -26380,6 +26781,10 @@ def _class_surface_ssa_program(
             elif value_id in default_literals:
                 frame_bindings.append((
                     value_id, "default_literal", default_literals[value_id]
+                ))
+            elif (linked_discovery := discovery_linked_member(value)) is not None:
+                frame_bindings.append((
+                    value_id, "caller_storage", int(linked_discovery),
                 ))
             elif "record_instance" in dict(value.accounting or {}):
                 # Storage introduced while constructing an object remains
@@ -26811,6 +27216,10 @@ def _class_surface_ssa_program(
                 ),
             )
         }
+        # A live sequence descriptor is a storage receipt too.
+        record_storage |= _live_sequence_member_ids(
+            callee, all_sequence_tables.get(callee_symbol),
+        )
         removable = set()
         for argument in callee.args:
             argument_id = int(argument.id)
@@ -26942,7 +27351,14 @@ def _class_surface_ssa_program(
         ]
     frame_ledgers = {}
     frame_round = 0
-    scheduled_call_sources: dict[tuple[str, int], dict[int, SSAValue]] = {}
+    # The resident value each scheduled call's operand resolved to at its
+    # lexical position, on the book: row ``(caller, callsite, callee
+    # formal)``.  The formal is the operand's identity -- one caller value
+    # passed twice (``helper(second, value)`` where both hold one value) is
+    # two operands the loop lowering resolved differently.
+    scheduled_call_sources = current_identity_book().page(
+        "scheduled_call_argument"
+    ).mapping(mint_scope("scheduled_call_argument"))
 
     def mint_compiler_value_id() -> int:
         return GLOBAL_MONOTONIC_IDS.mint()
@@ -27204,9 +27620,6 @@ def _class_surface_ssa_program(
                     ))
                 call_records[caller_symbol] = refreshed_records
             changed = True
-        callee_callers = {
-            caller: tuple(records) for caller, records in call_records.items()
-        }
         for caller_symbol, records in tuple(call_records.items()):
             report(
                 f"ssa-frame round {frame_round}: linking caller "
@@ -28119,22 +28532,9 @@ def _class_surface_ssa_program(
             slot_by_owner: dict[tuple[int, tuple[str, Any]], int] = {}
             frame_ledger = frame_ledgers.get(str(caller_symbol))
             if frame_ledger is None:
-                frame_ledger = frame_transformation_ledger()
+                frame_ledger = frame_transformation_ledger(str(caller_symbol))
                 frame_ledgers[str(caller_symbol)] = frame_ledger
                 caller.metadata["frame_transformation_provenance"] = frame_ledger.events
-            field_candidates = {}
-            for argument in caller.args:
-                accounting = argument.accounting or {}
-                parameter = accounting.get("program_abi_parameter")
-                field = accounting.get("program_abi_field")
-                if parameter is not None and field is not None and not accounting.get("linked_call_frame_storage"):
-                    key = (
-                        parameter, field,
-                        _linked_frame_storage_role(accounting),
-                        argument.dtype,
-                        _linked_frame_physical_shape(argument),
-                    )
-                    field_candidates.setdefault(key, []).append(argument)
             for record in records:
                 result_storage_bindings = (
                     result_storage_bindings_by_call.setdefault(
@@ -28195,15 +28595,6 @@ def _class_surface_ssa_program(
                                 in record.result_bindings
                             ),
                         )
-                    parameter_aliases = _linked_authored_parameter_aliases(
-                        caller,
-                        callee,
-                        caller_graph,
-                        source_graphs_by_symbol.get(str(record.callee_symbol)),
-                        record.argument_bindings,
-                        all_record_tables.get(str(caller_symbol)),
-                        all_record_tables.get(str(record.callee_symbol)),
-                    )
                     current_frame_ids = {
                         int(argument.id) for argument in callee.args
                     }
@@ -28216,65 +28607,52 @@ def _class_surface_ssa_program(
                     # authored parameter. Reconcile that binding too, not
                     # only newly discovered frame arguments below.
                     callee_formals = {int(value.id): value for value in callee.args}
+                    linked_sequence_members: set[int] = set()
                     reconciled_bindings = []
                     for callee_id, kind, source in refreshed_frame_bindings:
-                        formal = callee_formals.get(int(callee_id))
-                        accounting = {} if formal is None else (formal.accounting or {})
-                        parameter = parameter_aliases.get(str(accounting.get("program_abi_parameter")))
-                        field_name = accounting.get("program_abi_field")
                         existing = values.get(int(source)) if str(kind) == "caller_storage" else None
                         existing_accounting = {} if existing is None else (existing.accounting or {})
                         explicitly_split = any(existing_accounting.get(key) is not None for key in
                                                ("split_from_unproven_alias", "split_from_result_storage"))
-                        field_key = (
-                            parameter, field_name,
-                            _linked_frame_storage_role(accounting),
-                            formal.dtype,
-                            _linked_frame_physical_shape(formal),
+                        linked_member = (
+                            _linked_caller_member(
+                                str(caller_symbol), record, int(callee_id),
+                                all_record_tables.get(str(record.callee_symbol)),
+                                all_record_tables.get(str(caller_symbol)),
+                                all_sequence_tables.get(str(record.callee_symbol)),
+                                all_sequence_tables.get(str(caller_symbol)),
+                                {int(value.id) for value in caller.args},
+                                linked_sequence_members,
+                            )
+                            if str(kind) == "caller_storage" and not explicitly_split
+                            else None
                         )
-                        candidates = _preferred_linked_field_candidates(
-                            field_candidates.get(field_key, [])
-                        )
-                        if (not candidates and str(kind) in {"caller_value", "caller_alias", "caller_storage"}
-                                and not explicitly_split and parameter is not None and field_name is not None):
-                            declared_field = (((caller_graph.graph.get("parameter_record_abi") or {})
-                                               .get(str(parameter), {}).get("fields") or {}).get(str(field_name)))
-                            if (declared_field is not None
-                                    and declared_field.get("storage") == accounting.get("program_abi_storage")
-                                    and declared_field.get("dtype") == formal.dtype):
-                                # The receiver handle is not its scalar member.
-                                # Materialize the exact declared member when a
-                                # read-only method is the caller's first use.
-                                member = clone_value(formal, mint_compiler_value_id(), accounting={
-                                    "program_abi_parameter": str(parameter),
-                                    "linked_parameter_provenance": "exact_receiver_field",
-                                    "linked_call_frame_storage": None,
-                                    "split_from_unproven_alias": None,
-                                    "split_from_result_storage": None,
-                                })
-                                member.shape = _linked_frame_physical_shape(formal)
-                                caller.args.append(member)
-                                values[int(member.id)] = member
-                                candidates = [member]
-                                field_candidates[field_key] = candidates
-                                kind, source = "caller_storage", int(member.id)
-                                changed = True
-                        if str(kind) == "caller_storage" and len(candidates) == 1 and not explicitly_split:
-                            candidate_id = int(candidates[0].id)
-                            if frame_ledger.propose(
-                                (str(caller_symbol), int(record.callsite_id), str(record.callee_symbol), int(callee_id)),
-                                "receiver_field", (
-                                    str(parameter), str(field_name),
-                                    formal.dtype,
-                                    _linked_frame_physical_shape(formal),
-                                ),
-                                before=int(source), after=candidate_id,
+                        if linked_member is not None and int(linked_member) != int(source):
+                            if (
+                                int(linked_member) not in values
+                                and int(linked_member) in linked_sequence_members
                             ):
-                                source = candidate_id
+                                _restore_linked_sequence_member(
+                                    caller, values, int(linked_member),
+                                    callee_formals[int(callee_id)],
+                                    str(record.callee_symbol),
+                                    int(record.callsite_id),
+                                )
+                            if int(linked_member) not in values:
+                                raise ValueError(
+                                    f"{caller_symbol} callsite {record.callsite_id}: "
+                                    f"callee {record.callee_symbol} formal {callee_id} "
+                                    f"links to caller member {linked_member}, which the "
+                                    "caller neither receives nor defines"
+                                )
+                            identity = (str(caller_symbol), int(record.callsite_id), str(record.callee_symbol), int(callee_id))
+                            if frame_ledger.propose(
+                                identity, "linked_record_member", int(linked_member),
+                                before=int(source), after=int(linked_member),
+                            ):
+                                source = int(linked_member)
                             else:
-                                source = int(frame_ledger.incumbent_target(
-                                    (str(caller_symbol), int(record.callsite_id), str(record.callee_symbol), int(callee_id))
-                                ))
+                                source = int(frame_ledger.incumbent_target(identity))
                         reconciled_bindings.append((callee_id, kind, source))
                     refreshed_frame_bindings = reconciled_bindings
                     bound_frame_ids = {
@@ -28315,65 +28693,55 @@ def _class_surface_ssa_program(
                             # compiled output because the caller's own return
                             # expression referenced the orphaned clone, not
                             # the one the call chain actually mutated.
-                            field_key = None
-                            argument_accounting = dict(
-                                argument.accounting or {}
+                            # The callee formal's identity is linked at its
+                            # mint; follow only recorded ids to the caller
+                            # member (never a parameter spelling or a
+                            # dtype/shape key over the caller's formals).
+                            linked_member = _linked_caller_member(
+                                str(caller_symbol), record, argument_id,
+                                all_record_tables.get(str(record.callee_symbol)),
+                                all_record_tables.get(str(caller_symbol)),
+                                all_sequence_tables.get(str(record.callee_symbol)),
+                                all_sequence_tables.get(str(caller_symbol)),
+                                {int(value.id) for value in caller.args},
+                                linked_sequence_members,
                             )
-                            parameter_name = argument_accounting.get(
-                                "program_abi_parameter"
-                            )
-                            field_name = argument_accounting.get(
-                                "program_abi_field"
-                            )
-                            if parameter_name is not None:
-                                parameter_name = parameter_aliases.get(
-                                    str(parameter_name), str(parameter_name)
-                                )
-                            if parameter_name is not None and field_name is not None:
-                                field_key = (
-                                    str(parameter_name), str(field_name),
-                                    _linked_frame_storage_role(
-                                        argument_accounting
-                                    ),
-                                    argument.dtype, tuple(argument.shape),
-                                )
-                            existing_storage = None
-                            if field_key is not None:
-                                existing_storage = next((
-                                    caller_argument
-                                    for caller_argument in caller.args
-                                    if (
-                                        str((caller_argument.accounting or {}).get(
-                                            "program_abi_parameter"
-                                        )),
-                                        str((caller_argument.accounting or {}).get(
-                                            "program_abi_field"
-                                        )),
-                                        _linked_frame_storage_role(
-                                            caller_argument.accounting or {}
-                                        ),
-                                        caller_argument.dtype,
-                                        tuple(caller_argument.shape),
-                                    ) == field_key
-                                    and int(caller_argument.id) != argument_id
-                                ), None)
-                            if existing_storage is not None:
-                                caller_storage = existing_storage
+                            if linked_member is not None:
+                                caller_storage = values.get(int(linked_member))
+                                if (
+                                    caller_storage is None
+                                    and int(linked_member) in linked_sequence_members
+                                ):
+                                    caller_storage = _restore_linked_sequence_member(
+                                        caller, values, int(linked_member),
+                                        argument, str(record.callee_symbol),
+                                        int(record.callsite_id),
+                                    )
+                                if caller_storage is None:
+                                    raise ValueError(
+                                        f"{caller_symbol} callsite "
+                                        f"{record.callsite_id}: callee "
+                                        f"{record.callee_symbol} formal "
+                                        f"{argument_id} links to caller "
+                                        f"member {linked_member}, which the "
+                                        "caller neither receives nor defines"
+                                    )
                             else:
                                 caller_storage = clone_value(
-                                    argument,
+                                    _lease_source(argument),
                                     mint_compiler_value_id(),
                                     accounting={
-                                        **({
-                                            "program_abi_parameter": str(
-                                                parameter_name
-                                            ),
-                                        } if parameter_name is not None else {}),
                                         "linked_call_frame_storage": str(
                                             record.callee_symbol
                                         ),
                                         "callsite_id": int(record.callsite_id),
+                                        "propagated_formal_id": argument_id,
                                     },
+                                )
+                                _link_frame_lease(
+                                    str(caller_symbol), int(caller_storage.id),
+                                    int(record.callsite_id),
+                                    str(record.callee_symbol), argument_id,
                                 )
                                 caller.args.append(caller_storage)
                                 values[int(caller_storage.id)] = caller_storage
@@ -28397,9 +28765,6 @@ def _class_surface_ssa_program(
                         ),
                     )
                 was_unresolved = record.resolution == "unresolved"
-                callee_records = callee_callers.get(
-                    str(record.callee_symbol), ()
-                )
                 callee_outputs = (
                     () if callee is None
                     else emit_outputs(record.callee_symbol, callee)
@@ -28500,7 +28865,7 @@ def _class_surface_ssa_program(
                     and caller_record_table is None
                 ):
                     caller_record_table = all_record_tables.setdefault(
-                        str(record.caller), SSARecordTable()
+                        str(record.caller), SSARecordTable(owner=str(record.caller))
                     )
                 # A callee record can itself become physical during an inner
                 # call-linking round. Materialize the corresponding caller
@@ -28678,7 +29043,7 @@ def _class_surface_ssa_program(
                             str(record.callee_symbol)
                         )
                         caller_sequence_table = all_sequence_tables.setdefault(
-                            str(record.caller), SSASequenceTable()
+                            str(record.caller), SSASequenceTable(owner=str(record.caller))
                         )
 
                         def materialize_sequence(sequence_id: int) -> int:
@@ -29022,7 +29387,7 @@ def _class_surface_ssa_program(
                                 int(callee_id), SSAValue(int(callee_id))
                             )
                             replacement = clone_value(
-                                argument,
+                                _lease_source(argument),
                                 replacement_id,
                                 accounting={
                                     "linked_call_frame_storage": str(
@@ -29033,6 +29398,11 @@ def _class_surface_ssa_program(
                                 },
                             )
                             caller.args.append(replacement)
+                            _link_frame_lease(
+                                str(caller_symbol), int(replacement.id),
+                                int(record.callsite_id), str(record.callee_symbol),
+                                int(callee_id),
+                            )
                             values[int(replacement.id)] = replacement
                             refreshed_bindings.append((
                                 int(callee_id), "caller_storage",
@@ -29052,14 +29422,6 @@ def _class_surface_ssa_program(
                         int(callee_id): int(caller_id)
                         for caller_id, callee_id in record.argument_bindings
                     }
-                    storage_identity_by_value = {}
-                    if callee_record_table is not None:
-                        for descriptor in callee_record_table.records.values():
-                            for field in descriptor.fields:
-                                for value_id in field.value_ids:
-                                    storage_identity_by_value[int(value_id)] = (
-                                        str(field.storage_identity)
-                                    )
                     distinct_bindings = []
                     for callee_id, kind, source in record.frame_bindings:
                         if str(kind) != "caller_storage":
@@ -29100,14 +29462,25 @@ def _class_surface_ssa_program(
                                 ("authored_argument", int(exact_caller_id)),
                             )
                             continue
-                        storage_identity = storage_identity_by_value.get(
-                            int(callee_id)
+                        # A slot's owner is its link: the caller record
+                        # member the callee formal is (shared by every
+                        # formal linked to it), else the lease minted for
+                        # exactly this callee formal at this call.
+                        linked_owner = _linked_caller_member(
+                            str(caller_symbol), record, int(callee_id),
+                            callee_record_table,
+                            caller_record_table,
+                            all_sequence_tables.get(str(record.callee_symbol)),
+                            all_sequence_tables.get(str(caller_symbol)),
+                            {int(value.id) for value in caller.args},
                         )
-                        owner = _linked_frame_storage_owner(
-                            callee_values.get(int(callee_id)),
-                            storage_identity,
-                            str(record.callee_symbol),
-                            int(callee_id),
+                        owner = (
+                            ("linked_member", int(linked_owner))
+                            if linked_owner is not None
+                            else (
+                                "lease", str(record.callee_symbol),
+                                int(callee_id),
+                            )
                         )
                         first_owner = owner_by_slot.setdefault(source_id, owner)
                         if first_owner == owner:
@@ -29136,7 +29509,7 @@ def _class_surface_ssa_program(
                                 int(callee_id), SSAValue(int(callee_id))
                             )
                             replacement = clone_value(
-                                argument,
+                                _lease_source(argument),
                                 proposed_replacement_id,
                                 accounting={
                                     "linked_call_frame_storage": str(
@@ -29147,6 +29520,11 @@ def _class_surface_ssa_program(
                                 },
                             )
                             caller.args.append(replacement)
+                            _link_frame_lease(
+                                str(caller_symbol), int(replacement.id),
+                                int(record.callsite_id), str(record.callee_symbol),
+                                int(callee_id),
+                            )
                             values[int(replacement.id)] = replacement
                             replacement_id = int(replacement.id)
                             slot_by_owner[(source_id, owner)] = replacement_id
@@ -29785,7 +30163,12 @@ def _class_surface_ssa_program(
                 # instead of asking the function-wide value table for a
                 # pre-loop spelling that may not exist.
                 scheduled_key = (str(caller_symbol), int(record.callsite_id))
-                scheduled_sources = scheduled_call_sources.get(scheduled_key, {})
+
+                def scheduled_source(formal_id: int) -> Any:
+                    return scheduled_call_sources.get(
+                        (*scheduled_key, int(formal_id))
+                    )
+
                 marker = next((
                     instruction
                     for block in caller.blocks.values()
@@ -29796,17 +30179,16 @@ def _class_surface_ssa_program(
                     )) == int(record.callsite_id)
                 ), None)
                 if marker is not None:
-                    scheduled_sources = {
-                        int(caller_id): argument
-                        for (caller_id, _callee_id), argument in zip(
-                            record.argument_bindings, marker.args
-                        )
-                    }
                     # The marker is consumed on the first linking round.
                     # Keep its exact lexical bindings for later frame rounds;
                     # reconstructing from global source IDs then would reset
                     # a loop-carried argument to its pre-loop seed.
-                    scheduled_call_sources[scheduled_key] = scheduled_sources
+                    for (_caller_id, callee_id), argument in zip(
+                        record.argument_bindings, marker.args
+                    ):
+                        scheduled_call_sources[
+                            (*scheduled_key, int(callee_id))
+                        ] = argument
                 if eligible:
                     call_arguments = []
                     constants = []
@@ -30119,7 +30501,7 @@ def _class_surface_ssa_program(
                             physical_source = physical_caller_storage(
                                 int(source)
                             )
-                            value = scheduled_sources.get(physical_source)
+                            value = scheduled_source(int(argument.id))
                             source_node_id = (
                                 physical_source
                                 if caller_graph is not None
@@ -30150,7 +30532,7 @@ def _class_surface_ssa_program(
                                 # so restore the callee-shaped storage value
                                 # rather than treating it as a Python input.
                                 value = clone_value(
-                                    argument,
+                                    _lease_source(argument),
                                     int(source),
                                     accounting={
                                         "linked_call_frame_storage": str(
@@ -30193,8 +30575,8 @@ def _class_surface_ssa_program(
                                         f"formal_name={formal_name!r} "
                                         f"kind={kind!r} source={int(source)!r} "
                                         f"source_name={source_name!r} "
-                                        f"scheduled_sources_keys="
-                                        f"{sorted(scheduled_sources)!r} "
+                                        f"scheduled_source="
+                                        f"{scheduled_source(int(argument.id))!r} "
                                         f"caller_arg_ids="
                                         f"{sorted(int(a.id) for a in caller.args)!r} "
                                         f"caller_value_names={caller_value_names!r} "
@@ -30235,9 +30617,8 @@ def _class_surface_ssa_program(
                         actual = actual_by_formal.get(int(formal_id))
                         if (str(kind) in {"caller_value", "caller_alias", "caller_storage"}
                                 and actual is not None
-                                and scheduled_sources.get(physical_caller_storage(int(source))) is actual):
+                                and scheduled_source(int(formal_id)) is actual):
                             source = int(actual.id)
-                            scheduled_sources[source] = actual
                         current_frame_bindings.append((formal_id, kind, source))
                     record = replace(record, frame_bindings=tuple(current_frame_bindings))
                     aliased_return_argument_index = None
@@ -32632,7 +33013,9 @@ def _class_surface_ssa_program(
     # short by that tail; complete those calls (stamping the propagated
     # identity the harmonizer reads) before anything judges call shapes.
     _complete_propagated_frame_tails(all_functions)
-    _propagate_record_field_demand(all_functions)
+    _propagate_record_field_demand(
+        all_functions, call_records, all_record_tables, all_sequence_tables,
+    )
     _harmonize_call_argument_shapes(all_functions)
     report("post-frame cleanup complete; call type settlement start")
 
@@ -34763,7 +35146,7 @@ def _class_surface_ssa_program(
             # every resident member has an exact frame binding.
             callee_sequences = all_sequence_tables.get(callee_symbol)
             caller_sequences = all_sequence_tables.setdefault(
-                str(caller_symbol), SSASequenceTable()
+                str(caller_symbol), SSASequenceTable(owner=str(caller_symbol))
             )
             if callee_sequences is not None:
                 for descriptor in callee_sequences.sequences.values():
@@ -34963,7 +35346,7 @@ def _class_surface_ssa_program(
                     ] = tuple(provenance)
             callee_records = all_record_tables.get(callee_symbol)
             caller_records = all_record_tables.setdefault(
-                str(caller_symbol), SSARecordTable()
+                str(caller_symbol), SSARecordTable(owner=str(caller_symbol))
             )
             record_map = {
                 int(callee_id): int(caller_id)
@@ -35624,7 +36007,7 @@ def _class_surface_ssa_program(
                 int(argument.id): argument for argument in caller.args
             }
             caller_sequences = all_sequence_tables.setdefault(
-                str(caller_symbol), SSASequenceTable()
+                str(caller_symbol), SSASequenceTable(owner=str(caller_symbol))
             )
             for record in records:
                 callee_symbol = str(record.callee_symbol or "")
@@ -35849,7 +36232,9 @@ def _class_surface_ssa_program(
                     sequence.live_flags_value_id,
                 ) if value_id is not None)
         function.metadata["unused_phi_removals"] = prune_unused_phis(function, protected)
-    _prune_unused_callee_formals(all_functions, call_records)
+    _prune_unused_callee_formals(
+        all_functions, call_records, all_sequence_tables,
+    )
 
     called_function_names = {
         str(instruction.attributes.get("callee") or "")
@@ -39208,12 +39593,18 @@ def _lower_ast_source_to_ssa_impl(
             # only values no instruction references, rewriting every matching
             # call and call-table receipt in the same transaction before the
             # authored ABI is audited.
-            final_call_records = {
-                str(caller): list(records)
-                for caller, records in module.call_table.items()
-            }
+            from ..transmogrifier.ssa import SSACallTable
+
+            final_call_records = SSACallTable(
+                {
+                    str(caller): tuple(records)
+                    for caller, records in module.call_table.items()
+                },
+                owner="final_call_records", mutable=True,
+            )
             final_pruned_formals = _prune_unused_callee_formals(
                 module.functions, final_call_records,
+                module.sequence_tables,
             )
             # Signature completion inside the prune above is the final stage
             # allowed to expose propagated operands. Reconcile exact authored
@@ -39251,8 +39642,19 @@ def _lower_ast_source_to_ssa_impl(
                         for record in final_call_records.get(caller_name, ())
                     ]
                     module.call_table[caller_name] = tuple(final_call_records[caller_name])
+            # Constant control flow and dead pure calls above can remove the
+            # last reader of a sequence handle (woodshop
+            # step_with_dt_control_used seq6) after the linked-frame
+            # retirement ran; retire those descriptors with the same pass
+            # before the signature transaction.
+            module.metadata["final_dead_local_sequences"] = (
+                _prune_dead_local_sequences(
+                    module.functions, module.sequence_tables,
+                )
+            )
             final_pruned_formals += _prune_unused_callee_formals(
                 module.functions, final_call_records,
+                module.sequence_tables,
             )
             final_pruned_entry_field_aliases = _prune_dead_entry_field_aliases(
                 module.functions, final_call_records,

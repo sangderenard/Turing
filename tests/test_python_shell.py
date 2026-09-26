@@ -22,6 +22,16 @@ from src.compiler.ssa_self_check import (
     run_all,
     suspicious_loop_invariant_formals,
 )
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 _LOOP = """
 def helper(a):
@@ -40,7 +50,7 @@ def train(w, n):
 def _lower(source, name):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        return lower_ast_source_to_ssa(source, "train", name=name)[0]
+        return lower_ast_source_to_ssa(source, "train", name=name, extraction_contract=CONTRACT)[0]
 
 
 @pytest.fixture(scope="module")

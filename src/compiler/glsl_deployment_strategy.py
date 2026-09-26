@@ -2206,6 +2206,72 @@ def _precision_indivisible_node_groups(
     return tuple(groups)
 
 
+def _concord_consumer_operands(
+    graph: Any, consumer_nodes: Any, values: Any,
+) -> None:
+    """Commit, per consumer node and value, which operands read it.
+
+    Page ``consumer_operand`` row ``(read scope, node, value)`` holds the
+    ``(role, ordinal)`` positions of ``node``'s operands that read
+    ``value``.  Structure only: the binding each operand read is the base
+    fact ``lexical_read_binding``, at ``(read scope, node, role, ordinal)``.
+    """
+
+    from ..common.tensors.topological_reducer import _operand_positions
+    from .identity_concordance import current_identity_book
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is None:
+        return
+    wanted = set(map(int, values))
+    page = current_identity_book().page("consumer_operand")
+    for node_id in consumer_nodes:
+        if int(node_id) not in graph.G:
+            continue
+        positions: dict[int, list[tuple[Any, int]]] = {}
+        for role, ordinal, parent in _operand_positions(
+            graph.G.nodes[int(node_id)].get("parents") or ()
+        ):
+            if int(parent) in wanted:
+                positions.setdefault(int(parent), []).append((role, ordinal))
+        for parent, operand_positions in positions.items():
+            page.concord(
+                (tuple(scope), int(node_id), parent), tuple(operand_positions),
+            )
+
+
+def _concord_call_argument_operands(
+    graph: Any, callsite_id: int, operand_edges: Mapping[int, tuple[int, str]],
+) -> None:
+    """Commit, per argument position of one call, which operand it is.
+
+    Page ``call_argument_operand`` row ``(read scope, callsite, position)``
+    holds the ``(role, ordinal)`` of the call node's operand that produced
+    that argument binding.  One value passed twice is two operands; the
+    binding each read is the base fact ``lexical_read_binding``.
+    """
+
+    from ..common.tensors.topological_reducer import _operand_positions
+    from .identity_concordance import current_identity_book
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is None or int(callsite_id) not in graph.G:
+        return
+    positions = list(_operand_positions(
+        graph.G.nodes[int(callsite_id)].get("parents") or ()
+    ))
+    page = current_identity_book().page("call_argument_operand")
+    for index, (parent, role) in operand_edges.items():
+        ordinal = next((
+            edge_ordinal for edge_role, edge_ordinal, edge_parent in positions
+            if str(edge_role) == str(role) and int(edge_parent) == int(parent)
+        ), None)
+        if ordinal is not None:
+            page.concord(
+                (tuple(scope), int(callsite_id), int(index)), (role, ordinal),
+            )
+
+
 def _build_shell_hierarchy_plan(
     shell: Any,
     _memo: dict[int, PlanClosure] | None = None,
@@ -2404,7 +2470,18 @@ def _build_shell_hierarchy_plan(
                     argument_bindings.append((
                         int(node_id), int(receiver_identities[0])
                     ))
-            for parent, role in call_parents:
+            # Which call edge produced each argument binding, whatever path
+            # the body below takes: the operand's authored read is the edge's.
+            operand_edges: dict[int, tuple[int, str]] = {}
+
+            def attributed_call_parents():
+                for edge_parent, edge_role in call_parents:
+                    start = len(argument_bindings)
+                    yield edge_parent, edge_role
+                    for index in range(start, len(argument_bindings)):
+                        operand_edges[index] = (int(edge_parent), str(edge_role))
+
+            for parent, role in attributed_call_parents():
                 position = _positional_argument_index(role)
                 call_expression = graph.G.nodes[node_id].get("expr_obj")
                 argument_expression = None
@@ -2747,6 +2824,7 @@ def _build_shell_hierarchy_plan(
                     if path in caller_projection_paths
                 )
             child_outputs = tuple(child_output_paths.values())
+            _concord_call_argument_operands(graph, int(node_id), operand_edges)
             items.append(PlanCall(
                 int(node_id),
                 _build_shell_hierarchy_plan(child, memo),
@@ -3470,6 +3548,7 @@ def _build_shell_hierarchy_plan(
             for descriptor in (_tensor_descriptor(graph, int(value_id)),)
             if descriptor is not None
         )
+        _concord_consumer_operands(graph, region_nodes, region_captures)
         items.append(PlanClosure(
             name=f"region_{region_index}",
             captures=region_captures,

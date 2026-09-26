@@ -1,5 +1,15 @@
 from src.compiler.ir_identities import inline_host_linear_source_regions
 from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 
 def test_single_callsite_outputless_source_region_inlines_for_host_view_only():
@@ -78,6 +88,7 @@ def test_fortran_host_view_splices_a_real_planned_loop_body():
         "        y[i] = x[i] * 2.0\n"
         "    return y\n",
         "scale",
+        extraction_contract=CONTRACT,
     )
     artifact = emit_module(
         module, name="host_inline_test", outputs=outputs,

@@ -16,10 +16,10 @@ def test_declared_rule_cycle_rejected_before_execution():
 def test_fresh_allocation_ids_cannot_restart_join_split_cycle():
     ledger = frame_transformation_ledger()
     identity = ("caller", 7, "callee", 3)
-    assert ledger.propose(identity, "receiver_field", ("state", "limit"), before=19, after=4)
+    assert ledger.propose(identity, "linked_record_member", ("state", "limit"), before=19, after=4)
     assert ledger.propose(identity, "distinct_owner", ("record", "second"), before=4, after=20)
     for new_allocation in range(21, 121):
-        assert not ledger.propose(identity, "receiver_field", ("state", "limit"),
+        assert not ledger.propose(identity, "linked_record_member", ("state", "limit"),
                                   before=new_allocation, after=4)
     assert len(ledger.events) == 3
     assert ledger.events[-1]["retained"] == ("distinct_owner", ("record", "second"))
@@ -39,7 +39,7 @@ def test_repeated_proof_is_idempotent_and_identities_stay_independent():
     ledger = frame_transformation_ledger()
     for identity in (1, 2):
         for _ in range(4):
-            assert ledger.propose(identity, "receiver_field", identity)
+            assert ledger.propose(identity, "linked_record_member", identity)
     assert len(ledger.events) == 2
     assert ledger.propose(1, "distinct_result", "output")
     assert not ledger.propose(1, "distinct_owner", "temporary")

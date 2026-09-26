@@ -7,6 +7,16 @@ from src.compiler.fortran_c_shell import (
 )
 from src.common.tensors.accelerator_backends.aot_compile import compile_ast_aot
 from src.compiler import compiler_bootstrap_runtime
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 
 def test_complete_source_ssa_is_the_declared_canonical_compiler():
@@ -24,7 +34,7 @@ def test_canonical_compiler_activates_the_durable_bootstrap_registry(
         lambda: calls.append("activate") or (),
     )
 
-    lower_ast_source_to_ssa("def identity(value):\n    return value\n", "identity")
+    lower_ast_source_to_ssa("def identity(value):\n    return value\n", "identity", extraction_contract=CONTRACT)
 
     assert calls == ["activate"]
 
@@ -60,7 +70,7 @@ class Pair:
 
 def helper(value):
     return value + 1
-""")
+""", extraction_contract=CONTRACT)
 
     pair = module.class_table.by_identity("Pair")
     assert pair is not None

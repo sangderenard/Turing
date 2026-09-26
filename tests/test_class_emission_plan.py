@@ -19,6 +19,16 @@ from src.transmogrifier.ssa import (
     SSAClassTable,
     SSAValue,
 )
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 
 def test_canonical_python_class_plan_joins_logical_and_physical_method_abis():
@@ -35,7 +45,7 @@ class Counter:
 
     def twice(self, amount):
         return self.bump(amount) + self.bump(amount)
-""")
+""", extraction_contract=CONTRACT)
     plan = plan_class_emission(module)
 
     assert plan.complete, tuple(issue.format() for issue in plan.issues)

@@ -23,6 +23,16 @@ import pytest
 from src.common.tensors import AbstractTensor
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.ssa_python_materializer import materialize_ir_module
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 
 def _auto_port(
@@ -33,7 +43,7 @@ def _auto_port(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         module, outputs, _exports = lower_ast_source_to_ssa(
-            source, entrypoint, name=name
+            source, entrypoint, name=name, extraction_contract=CONTRACT
         )
     assert outputs.get(f"{name}__{entrypoint}"), (
         f"{entrypoint} lowered to no outputs at all -- the statement was "
@@ -191,7 +201,7 @@ def test_the_authored_parameter_list_is_still_recoverable():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         module, _outputs, _exports = lower_ast_source_to_ssa(
-            SLICED_BANDWIDTH, "interior_bandwidth", name="pn"
+            SLICED_BANDWIDTH, "interior_bandwidth", name="pn", extraction_contract=CONTRACT
         )
     function = module.functions["pn__interior_bandwidth"]
     authored = dict(function.metadata["parameter_names"])

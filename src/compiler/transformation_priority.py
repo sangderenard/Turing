@@ -5,7 +5,9 @@ Rules may strengthen a proof, repeat it, or be rejected by a stronger proof.
 Equal priorities retain the incumbent and record the rejected challenger.
 """
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Hashable, Mapping
+
 
 
 class TransformationConflict(ValueError):
@@ -18,9 +20,46 @@ class TransformationRule:
     priority: int
 
 
+class _BookEventLog(Sequence):
+    """A ledger's events, read live from its ``transformation_event`` rows."""
+
+    def __init__(self, page, scope):
+        self._page = page
+        self._scope = scope
+
+    def _events(self) -> tuple:
+        return tuple(self._page.latest(row) for row in self._page.scope_rows(self._scope))
+
+    def __getitem__(self, index):
+        return self._events()[index]
+
+    def __len__(self) -> int:
+        return len(self._page.scope_rows(self._scope))
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, (list, tuple, _BookEventLog)) and self._events() == tuple(other)
+
+    def __repr__(self) -> str:
+        return repr(list(self._events()))
+
+    def __reduce__(self):
+        return (list, (list(self._events()),))
+
+
 class TransformationLedger:
+    """Priority-ordered rewrite decisions, stored on the identity book.
+
+    Page ``transformation_decision`` holds each identity's retained
+    ``(rule, proof, target)`` at ``(scope, identity)``, revised on every
+    accepted proposal; page ``transformation_event`` holds every accepted
+    and rejected proposal in order at ``(scope, serial)``.
+    """
+
     def __init__(self, rules: tuple[TransformationRule, ...],
-                 successors: Mapping[str, tuple[str, ...]]):
+                 successors: Mapping[str, tuple[str, ...]], *,
+                 scope: Hashable = None, book=None):
+        from .identity_concordance import current_identity_book
+
         self.rules = {rule.name: rule for rule in rules}
         if len(self.rules) != len(rules):
             raise ValueError("Duplicate transformation rule")
@@ -31,27 +70,40 @@ class TransformationLedger:
                 if self.rules[target].priority <= self.rules[source].priority:
                     raise TransformationConflict(
                         f"Non-increasing transformation edge: {source} -> {target}")
-        self._decisions: dict[Hashable, tuple[str, Hashable]] = {}
-        self._targets: dict[Hashable, object] = {}
         self._successors = {name: tuple(targets) for name, targets in successors.items()}
-        self.events: list[dict] = []
-        self._rejected: set[tuple] = set()
+        self.book = current_identity_book() if book is None else book
+        self.scope = self.book.mint_scope(scope or "transformation_ledger")
+        self._decision_page = self.book.page("transformation_decision")
+        self._event_page = self.book.page("transformation_event")
+        self.events = _BookEventLog(self._event_page, self.scope)
+
+    def _decision(self, identity: Hashable):
+        return self._decision_page.latest((self.scope, identity))
+
+    def _record_event(self, event: dict) -> None:
+        self._event_page.concord((self.scope, len(self.events)), event)
 
     def propose(self, identity: Hashable, rule: str, proof: Hashable,
                 *, before=None, after=None) -> bool:
         self.rules[rule]  # Reject unregistered rules even on a first decision.
-        previous = self._decisions.get(identity)
+        decision = self._decision(identity)
+        previous = None if decision is None else (decision[0], decision[1])
         if previous is not None:
             old_rule, old_proof = previous
             rank = self.rules[rule].priority
             old_rank = self.rules[old_rule].priority
-            if previous == (rule, proof) and after == self._targets[identity]:
+            if previous == (rule, proof) and after == decision[2]:
                 return True
             if rank <= old_rank:
-                rejection = (identity, rule, proof, old_rule, old_proof)
-                if rejection not in self._rejected:
-                    self._rejected.add(rejection)
-                    self.events.append(dict(identity=identity, rule=rule,
+                rejected = any(
+                    not event.get("accepted")
+                    and (event.get("identity"), event.get("rule"),
+                         event.get("proof"), *event.get("retained"))
+                    == (identity, rule, proof, old_rule, old_proof)
+                    for event in self.events
+                )
+                if not rejected:
+                    self._record_event(dict(identity=identity, rule=rule,
                         proof=proof, accepted=False, retained=previous,
                         priority=rank, retained_priority=old_rank,
                         reason="incumbent_tie" if rank == old_rank else "stronger_incumbent",
@@ -60,9 +112,8 @@ class TransformationLedger:
             if rule not in self._successors.get(old_rule, ()):
                 raise TransformationConflict(
                     f"Undeclared transformation for {identity!r}: {old_rule} -> {rule}")
-        self._decisions[identity] = (rule, proof)
-        self._targets[identity] = after
-        self.events.append(dict(identity=identity, rule=rule, proof=proof,
+        self._decision_page.revise((self.scope, identity), (rule, proof, after))
+        self._record_event(dict(identity=identity, rule=rule, proof=proof,
                                 priority=self.rules[rule].priority,
                                 accepted=True, previous=previous,
                                 before=before, after=after))
@@ -70,23 +121,26 @@ class TransformationLedger:
 
     def incumbent_target(self, identity: Hashable):
         """Physical payload of the retained decision; excluded from proof identity."""
-        return self._targets[identity]
+        decision = self._decision(identity)
+        if decision is None:
+            raise KeyError(identity)
+        return decision[2]
 
     def incumbent_priority(self, identity: Hashable) -> int | None:
-        previous = self._decisions.get(identity)
-        return None if previous is None else self.rules[previous[0]].priority
+        decision = self._decision(identity)
+        return None if decision is None else self.rules[decision[0]].priority
 
 
-def frame_transformation_ledger() -> TransformationLedger:
+def frame_transformation_ledger(scope: Hashable = None) -> TransformationLedger:
     return TransformationLedger((
-        TransformationRule("receiver_field", 1),
+        TransformationRule("linked_record_member", 1),
         TransformationRule("distinct_owner", 2),
         TransformationRule("exact_argument_binding", 3),
         TransformationRule("distinct_result", 4),
     ), {
-        "receiver_field": (
+        "linked_record_member": (
             "distinct_owner", "exact_argument_binding", "distinct_result",
         ),
         "distinct_owner": ("exact_argument_binding", "distinct_result"),
         "exact_argument_binding": ("distinct_result",),
-    })
+    }, scope=scope or "frame_transformation")

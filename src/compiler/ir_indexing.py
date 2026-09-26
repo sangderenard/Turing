@@ -101,6 +101,14 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
     _propagate_scalar_dtypes(functions)
 
 
+#: Scalar dtypes a ``Const`` may declare; a declared one is kept as stated.
+_DECLARED_LITERAL_DTYPES = frozenset({
+    "bool",
+    "int", "int8", "int16", "int32", "int64", "i32", "i64",
+    "float", "float16", "float32", "float64", "double", "f32", "f64",
+})
+
+
 def _propagate_scalar_dtypes(functions) -> None:
     """Settle scalar contracts after structural indexing is expanded.
 
@@ -175,6 +183,14 @@ def _propagate_scalar_dtypes(functions) -> None:
                         # address value, not an integer inferred from its
                         # Python spelling. Preserve that physical contract.
                         declared if "ptr" in declared.casefold()
+                        # A declared scalar dtype is the literal's identity;
+                        # the Python spelling is only evidence when nothing
+                        # was declared.  ``Metrics.advanced_dt: float |
+                        # None = None`` mints its absent payload as a
+                        # float64 ``Const 0``; retyping it int64 from the
+                        # ``0`` left the callee returning an int64 slot the
+                        # caller's declared field projection reads as float64.
+                        else declared if declared in _DECLARED_LITERAL_DTYPES
                         else "bool" if isinstance(literal, bool)
                         else "int64" if isinstance(literal, int)
                         else "float64" if isinstance(literal, float)

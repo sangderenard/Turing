@@ -34,6 +34,16 @@ from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.glsl_deployment_strategy import (
     CompilationSubdivisionRequired,
 )
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 
 GUARD_CLAUSE_RAISE_SOURCE = (
@@ -78,7 +88,7 @@ BENIGN_CONTROL_SOURCE = (
 def _lower(source: str, name: str):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        return lower_ast_source_to_ssa(source, "train", name=name)
+        return lower_ast_source_to_ssa(source, "train", name=name, extraction_contract=CONTRACT)
 
 
 def test_a_bare_raise_inside_a_loop_still_refuses():

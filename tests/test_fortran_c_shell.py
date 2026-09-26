@@ -48,6 +48,15 @@ from src.compiler.shell_io import (
 )
 
 
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
+
+
 def test_fortran_shell_name_is_alias_of_backend_neutral_native_renderer():
     assert emit_fortran_c_shell_source is emit_native_c_shell_source
 
@@ -1123,6 +1132,7 @@ def test_starred_generator_max_is_a_resident_ordered_reduction():
         "    return max(initial, *(value * 2.0 for value in values), suffix)\n",
         "root",
         name="starred_generator_max",
+        extraction_contract=CONTRACT,
     )
     function = module.functions["starred_generator_max__root"]
     instructions = [
@@ -1918,6 +1928,7 @@ def run(count):
         source,
         "run",
         name="nested_loop_record",
+        extraction_contract=CONTRACT,
     )
     records = module.record_tables["nested_loop_record__run"].records
     outer = next(record for record in records.values()
@@ -2155,6 +2166,7 @@ def test_nested_if_threads_inner_phi_into_outer_phi():
         "    return value\n",
         "nested",
         name="nested_conditional",
+        extraction_contract=CONTRACT,
     )
     function = module.functions["nested_conditional__nested"]
     phis = [
@@ -2184,6 +2196,7 @@ def test_outer_if_threads_inner_only_assignment_phi():
         "    return value\n",
         "nested",
         name="inner_only_conditional",
+        extraction_contract=CONTRACT,
     )
     function = module.functions["inner_only_conditional__nested"]
     phis = [
@@ -2218,6 +2231,7 @@ def test_iterable_loop_target_is_accounted_as_coordinator_lowered():
         "    return result\n",
         "total",
         name="iterable_target_accounting",
+        extraction_contract=CONTRACT,
     )
     function = module.functions["iterable_target_accounting__total"]
     iterable_targets = {
@@ -2252,6 +2266,7 @@ def test_annotated_string_sequence_is_a_typed_token_arena():
         "    return total\n",
         "count_x",
         name="annotated_string_sequence",
+        extraction_contract=CONTRACT,
     )
     function = module.functions["annotated_string_sequence__count_x"]
     parameter_ids = dict(function.metadata["parameter_names"])
@@ -2290,6 +2305,7 @@ def test_sequence_of_authored_records_projects_fields_inside_loop():
         "    return result\n",
         "total",
         name="record_row_projection",
+        extraction_contract=CONTRACT,
     )
     function = module.functions["record_row_projection__total"]
 
@@ -2323,6 +2339,7 @@ def test_filtered_authored_record_sequence_keeps_row_provenance():
         "    return result\n",
         "total",
         name="filtered_record_row_projection",
+        extraction_contract=CONTRACT,
     )
     function = module.functions["filtered_record_row_projection__total"]
     unexplained = _unexplained_root_argument_ids(function)
@@ -2363,6 +2380,7 @@ def test_local_record_sequence_expands_linked_record_return_into_typed_row():
         "    return first.count\n",
         "total",
         name="local_record_sequence",
+        extraction_contract=CONTRACT,
     )
     function = module.functions["local_record_sequence__total"]
     descriptor = next(iter(

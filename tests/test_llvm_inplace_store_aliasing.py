@@ -43,6 +43,16 @@ from src.compiler.ssa_llvm_backend import (
     emit_ssa_function_to_llvm,
     prepare_artifact_execution,
 )
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 
 PAIR_UPDATE = """
@@ -60,7 +70,7 @@ def _run_native(source: str, entrypoint: str, name: str, arrays, scalars, read):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         module, _outputs, _exports = lower_ast_source_to_ssa(
-            source, entrypoint, name=name
+            source, entrypoint, name=name, extraction_contract=CONTRACT
         )
     qualified = f"{name}__{entrypoint}"
     function = module.functions[qualified]
@@ -115,7 +125,7 @@ def total(a, n):
 """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        module, outputs, _ = lower_ast_source_to_ssa(source, "total", name="ctl")
+        module, outputs, _ = lower_ast_source_to_ssa(source, "total", name="ctl", extraction_contract=CONTRACT)
     function = module.functions["ctl__total"]
     parameters = dict(function.metadata["parameter_names"])
     artifact = emit_ssa_function_to_llvm(module, "ctl__total")
@@ -194,7 +204,7 @@ def test_the_loaded_value_is_pinned_rather_than_re_read(pair_update_native):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         module, _outputs, _exports = lower_ast_source_to_ssa(
-            PAIR_UPDATE, "pair_update", name="ir"
+            PAIR_UPDATE, "pair_update", name="ir", extraction_contract=CONTRACT
         )
     ir = emit_ssa_function_to_llvm(module, "ir__pair_update").llvm_ir
     region = ir.split("define void @__ssa_ir__pair_update__planned_region_0")[1]

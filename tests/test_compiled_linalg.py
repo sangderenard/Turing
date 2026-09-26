@@ -56,6 +56,16 @@ from src.compiler.ssa_llvm_backend import (
     emit_ssa_function_to_llvm,
     prepare_artifact_execution,
 )
+from pathlib import Path
+
+
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
 
 
 def _run_native(source, entrypoint, name, arrays, scalars, reads, scratch_len):
@@ -70,7 +80,7 @@ def _run_native(source, entrypoint, name, arrays, scalars, reads, scratch_len):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         module, _outputs, _exports = lower_ast_source_to_ssa(
-            source, entrypoint, name=name
+            source, entrypoint, name=name, extraction_contract=CONTRACT
         )
     qualified = f"{name}__{entrypoint}"
     function = module.functions[qualified]
@@ -318,7 +328,7 @@ def test_fully_size_baked_gemm_is_exact_within_the_unroll_limit():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         module, _outputs, _exports = lower_ast_source_to_ssa(
-            BAKED_GEMM_TEMPLATE.format(size=size), "gemm", name="lintiny"
+            BAKED_GEMM_TEMPLATE.format(size=size), "gemm", name="lintiny", extraction_contract=CONTRACT
         )
     function = module.functions["lintiny__gemm"]
     parameters = dict(function.metadata["parameter_names"])

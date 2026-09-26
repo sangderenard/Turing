@@ -26,6 +26,15 @@ from src.transmogrifier.ssa import (
 )
 
 
+#: The repository's program extraction contract; the compiler refuses
+#: to lower without one.
+CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts"
+    / "program_extraction.yaml"
+)
+
+
 def _run_module(tmp_path: Path, source: str, body: str):
     module_path = tmp_path / "program.mjs"
     runner_path = tmp_path / "runner.mjs"
@@ -136,7 +145,7 @@ def test_authored_python_none_reaches_javascript_as_ssa_none(tmp_path):
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
     module, _outputs, _exports = lower_ast_source_to_ssa(
-        "def absent():\n    return None\n"
+        "def absent():\n    return None\n", extraction_contract=CONTRACT
     )
     function_name = next(iter(module.functions))
     instructions = [
@@ -337,6 +346,7 @@ class Counter:
     def twice(self, amount):
         return self.bump(amount) + self.bump(amount)
 """,
+extraction_contract=CONTRACT,
     )
     artifact = emit_ssa_module_to_javascript(module)
 
