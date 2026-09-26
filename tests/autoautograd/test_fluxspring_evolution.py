@@ -63,3 +63,20 @@ def test_simulated_fluxspring_edges_publish_live_activation():
     assert np.isfinite(frame.edge_activation).all()
     assert abs(float(frame.edge_activation[0])) > 0.0
     assert frame.edge_colors[0, 3] > 0.22
+
+
+def test_visual_haze_is_observer_state_not_a_force_term():
+    physics = MultiNetworkFluxSpring(seed=5)
+    physics.synchronize(
+        (EvolutionNode("source", "program"), EvolutionNode("child", "program")),
+        (EvolutionEdge("source", "child"),),
+    )
+    before_positions = physics.positions.copy()
+    before_velocities = physics.velocities.copy()
+
+    physics.set_visual_haze({0: 0.8, 1: -0.4})
+
+    assert physics.visual_haze == {0: 0.8, 1: -0.4}
+    assert physics._system.visual_haze == physics.visual_haze
+    assert np.array_equal(physics.positions, before_positions)
+    assert np.array_equal(physics.velocities, before_velocities)

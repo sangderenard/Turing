@@ -174,6 +174,8 @@ class Opcode(Enum):
     MU = 0x8
     LENGTH = 0x9
     ZEROS = 0xA
+    LOAD = 0xB
+    STORE = 0xC
     HALT = 0xF
 
 
@@ -184,6 +186,42 @@ class InstructionWord:
     reg_b: int
     dest: int
     param: int
+
+
+def pack_instruction_word(instruction: InstructionWord) -> int:
+    """Pack the authoritative 4/2/2/2/6 tape instruction layout."""
+
+    fields = {
+        "reg_a": (instruction.reg_a, 2),
+        "reg_b": (instruction.reg_b, 2),
+        "dest": (instruction.dest, 2),
+        "param": (instruction.param, 6),
+    }
+    for name, (value, width) in fields.items():
+        if not 0 <= int(value) < (1 << width):
+            raise ValueError(f"{name} does not fit in {width} bits")
+    return (
+        (int(instruction.opcode.value) & 0xF) << 12
+        | (int(instruction.reg_a) & 0x3) << 10
+        | (int(instruction.reg_b) & 0x3) << 8
+        | (int(instruction.dest) & 0x3) << 6
+        | (int(instruction.param) & 0x3F)
+    )
+
+
+def unpack_instruction_word(word: int) -> InstructionWord:
+    """Decode one word using the same layout used by the compiler."""
+
+    if not 0 <= int(word) <= 0xFFFF:
+        raise ValueError("tape instruction word must be unsigned 16-bit")
+    encoded = int(word)
+    return InstructionWord(
+        opcode=Opcode((encoded >> 12) & 0xF),
+        reg_a=(encoded >> 10) & 0x3,
+        reg_b=(encoded >> 8) & 0x3,
+        dest=(encoded >> 6) & 0x3,
+        param=encoded & 0x3F,
+    )
 
 # ---------------------------------------------------------------------------
 # 4. Register Behaviour (skeletal)

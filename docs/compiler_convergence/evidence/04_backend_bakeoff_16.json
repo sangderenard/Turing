@@ -1,0 +1,105 @@
+{
+  "schema": "turing.blas-backend-bakeoff.v1",
+  "oracle": "numpy",
+  "rows": [
+    {
+      "backend": "ssa-reference",
+      "status": "timed",
+      "source_sha256": "016ff4c853b0fccfab10a57bd3ef8edc26cae458475dd7c5383fa87febfb3115",
+      "ssa_sha256": "bc4ed9822c2fa2e44cbc3a32845ddf9ec56b9c5c5d711ca5d0804281271d8a75",
+      "contract": "fast",
+      "sizes": {
+        "m": 16,
+        "n": 16,
+        "k": 16
+      },
+      "lower_seconds": 0.48031869999249466,
+      "machine": "Windows-10-10.0.19045-SP0",
+      "python": "3.11.7",
+      "compile_seconds": 0.0,
+      "first_launch_seconds": 0.5708279999962542,
+      "relaunch_median_seconds": 0.5693669999891426,
+      "compute_median_seconds": null,
+      "repetitions": 1,
+      "worst_abs_error": 7.105427357601002e-15
+    },
+    {
+      "backend": "llvm",
+      "status": "timed",
+      "source_sha256": "016ff4c853b0fccfab10a57bd3ef8edc26cae458475dd7c5383fa87febfb3115",
+      "ssa_sha256": "bc4ed9822c2fa2e44cbc3a32845ddf9ec56b9c5c5d711ca5d0804281271d8a75",
+      "contract": "fast",
+      "sizes": {
+        "m": 16,
+        "n": 16,
+        "k": 16
+      },
+      "lower_seconds": 0.48031869999249466,
+      "machine": "Windows-10-10.0.19045-SP0",
+      "python": "3.11.7",
+      "compile_seconds": 0.8776381000061519,
+      "first_launch_seconds": 0.007653599983314052,
+      "relaunch_median_seconds": 8.270001853816211e-05,
+      "compute_median_seconds": 6.000016583129764e-06,
+      "repetitions": 3,
+      "worst_abs_error": 7.105427357601002e-15,
+      "toolchain": "ziglang clang"
+    },
+    {
+      "backend": "fortran",
+      "status": "timed",
+      "source_sha256": "016ff4c853b0fccfab10a57bd3ef8edc26cae458475dd7c5383fa87febfb3115",
+      "ssa_sha256": "bc4ed9822c2fa2e44cbc3a32845ddf9ec56b9c5c5d711ca5d0804281271d8a75",
+      "contract": "fast",
+      "sizes": {
+        "m": 16,
+        "n": 16,
+        "k": 16
+      },
+      "lower_seconds": 0.48031869999249466,
+      "machine": "Windows-10-10.0.19045-SP0",
+      "python": "3.11.7",
+      "compile_seconds": 1.1360275000042748,
+      "first_launch_seconds": 0.0021521000016946346,
+      "relaunch_median_seconds": 0.0017559000116307288,
+      "compute_median_seconds": 0.0017262999899685383,
+      "repetitions": 3,
+      "worst_abs_error": 7.105427357601002e-15,
+      "toolchain": "C:\\msys64\\mingw64\\bin\\gfortran.exe"
+    },
+    {
+      "backend": "direct-c",
+      "status": "unsupported",
+      "source_sha256": "016ff4c853b0fccfab10a57bd3ef8edc26cae458475dd7c5383fa87febfb3115",
+      "ssa_sha256": "bc4ed9822c2fa2e44cbc3a32845ddf9ec56b9c5c5d711ca5d0804281271d8a75",
+      "contract": "fast",
+      "sizes": {
+        "m": 16,
+        "n": 16,
+        "k": 16
+      },
+      "lower_seconds": 0.48031869999249466,
+      "machine": "Windows-10-10.0.19045-SP0",
+      "python": "3.11.7",
+      "emission_seconds": 3.300001844763756e-05,
+      "reason": "direct scalar C requires one entry block"
+    },
+    {
+      "backend": "webgpu",
+      "status": "unsupported",
+      "source_sha256": "016ff4c853b0fccfab10a57bd3ef8edc26cae458475dd7c5383fa87febfb3115",
+      "ssa_sha256": "bc4ed9822c2fa2e44cbc3a32845ddf9ec56b9c5c5d711ca5d0804281271d8a75",
+      "contract": "fast",
+      "sizes": {
+        "m": 16,
+        "n": 16,
+        "k": 16
+      },
+      "lower_seconds": 0.48031869999249466,
+      "machine": "Windows-10-10.0.19045-SP0",
+      "python": "3.11.7",
+      "emission_seconds": 0.015430200000992045,
+      "reason": "backend_bakeoff__gemm__planned_region_1: return: multi-output numerical regions are not yet supported"
+    }
+  ]
+}

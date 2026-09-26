@@ -22,6 +22,8 @@ to a declarative graph.
 
 from __future__ import annotations
 
+from ..tensors import AbstractTensor
+
 import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -36,7 +38,9 @@ from .state_table import sync_engine_from_table, publish_engine_to_table
 from .integrator.integrator import Integrator
 
 import time
-from .realtime import RealtimeConfig, RealtimeState, compile_allocations
+from .realtime import (
+    RealtimeConfig, RealtimeState, compile_allocations, compute_penalty,
+)
 
 # 
 # Node types
@@ -174,9 +178,15 @@ def _combine_metrics(values: List[Metrics]) -> Metrics:
         for value in values
         if value.dt_limit is not None
     ]
-    error_names = {
-        name for value in values for name in value.error_channels
-    }
+    channels = values[0].error_channels.copy()
+    present = values[0].error_present.copy()
+    for value in values[1:]:
+        channels = AbstractTensor.where(
+            value.error_present,
+            AbstractTensor.where(present, AbstractTensor.maximum(channels, value.error_channels), value.error_channels),
+            channels,
+        )
+        present = AbstractTensor.maximum(present, value.error_present)
     return Metrics(
         max_vel=max(float(value.max_vel) for value in values),
         max_flux=max(float(value.max_flux) for value in values),
@@ -187,13 +197,18 @@ def _combine_metrics(values: List[Metrics]) -> Metrics:
         sim_frame=max(int(value.sim_frame) for value in values),
         proc_ms=sum(float(value.proc_ms) for value in values),
         dt_limit=min(limits) if limits else None,
-        error_channels={
-            name: max(
-                float(value.error_channels.get(name, 0.0))
-                for value in values
-            )
-            for name in error_names
-        },
+        error_channels=channels,
+        error_present=present,
+        pub_exchange_time=AbstractTensor.cat([value.pub_exchange_time for value in values], dim=0),
+        pub_exchange_time_present=AbstractTensor.cat([value.pub_exchange_time_present for value in values], dim=0),
+        pub_contract=AbstractTensor.cat([value.pub_contract for value in values], dim=0),
+        pub_dt_limit=AbstractTensor.cat([value.pub_dt_limit for value in values], dim=0),
+        pub_dt_limit_present=AbstractTensor.cat([value.pub_dt_limit_present for value in values], dim=0),
+        pub_values=AbstractTensor.cat([value.pub_values for value in values], dim=0),
+        pub_present=AbstractTensor.cat([value.pub_present for value in values], dim=0),
+        pub_limits=AbstractTensor.cat([value.pub_limits for value in values], dim=0),
+        pub_limits_present=AbstractTensor.cat([value.pub_limits_present for value in values], dim=0),
+
         hard_failure=any(bool(value.hard_failure) for value in values),
         advanced_dt=min(
             (
@@ -389,7 +404,15 @@ class MetaLoopRunner:
                     clamped=False,
                     metrics=None,
                 )
-            for adv, alloc in zip(self._schedule, self._realtime_allocations):
+            # `compile_allocations` returns a MAPPING keyed by id(adv), not a
+            # sequence. Zipping the schedule against the mapping itself walks
+            # its KEYS, so every engine was handed a pointer address as its
+            # millisecond allocation -- measured: 2429530572816 ms, a step_dt
+            # of 2.4e9 seconds, which is how a car came to travel 1.8e21 m in
+            # 120 frames. Look each one up by the identity it was keyed under.
+            allocations = self._realtime_allocations or {}
+            for adv in self._schedule:
+                alloc = allocations.get(id(adv))
                 step_dt_ms = alloc if alloc is not None else dt*1000.0 if dt is not None else 1.0
                 step_dt = step_dt_ms / 1000.0  # convert ms to seconds
                 t0 = time.perf_counter()
@@ -398,6 +421,17 @@ class MetaLoopRunner:
                 t1 = time.perf_counter()
                 elapsed = t1 - t0
                 self._last_timings.append(elapsed)
+                metrics.proc_ms = elapsed * 1000.0
+                if self._realtime_state is not None and self._realtime_config is not None:
+                    identity = id(adv)
+                    alpha = self._realtime_config.ema_alpha
+                    self._realtime_state.update_proc_ms(
+                        identity, metrics.proc_ms, alpha)
+                    self._realtime_state.update_penalty(
+                        identity,
+                        compute_penalty(metrics, self._root_round.controller.targets),
+                        alpha,
+                    )
                 adv.state.state = new_state
                 if table is not None:
                     table.set("dt_tape", adv.label, "metrics", metrics)
@@ -459,7 +493,20 @@ class MetaLoopRunner:
                 eps=round_node.plan.eps,
                 event_boundaries=round_node.plan.event_boundaries,
                 attempt_log=attempt_log,
+                rollback_threshold_multiplier=(
+                    round_node.plan.rollback_threshold_multiplier
+                ),
+                rollback=round_node.plan.rollback,
+                distribution=round_node.distribution,
             )
+            if (
+                float(total) < float(window) - round_node.plan.eps
+                or bool(getattr(metrics, "hard_failure", False))
+            ):
+                raise RuntimeError(
+                    "scientific dt controller failed to complete its window: "
+                    f"advanced={float(total):.17g} window={float(window):.17g}"
+                )
         except Exception:
             transaction.restore(window_checkpoint)
             del round_stats.attempted[attempted_before:]
@@ -530,6 +577,10 @@ class MetaLoopRunner:
         """Return the list of per-node timings (in seconds) for the last frame, in schedule order."""
         return list(self._last_timings)
 
+    def get_schedule_labels(self) -> list[str]:
+        """Return scheduled advance labels in the order used by timings."""
+        return [advance.label for advance in (self._schedule or ())]
+
     def get_latest_metrics(self, node: Union[RoundNode, AdvanceNode, ControllerNode]) -> Optional[Metrics]:
         """Return the latest Metrics observed at the given node, if any."""
         st = self._stats.get(node.label)
@@ -586,7 +637,19 @@ class MetaLoopRunner:
                         sim_frame=m.sim_frame,
                         proc_ms=m.proc_ms,
                         dt_limit=m.dt_limit,
-                        error_channels=dict(m.error_channels),
+                        error_channels=m.error_channels.copy(),
+                        error_present=m.error_present.copy(),
+                        pub_exchange_time=m.pub_exchange_time.copy(),
+                        pub_exchange_time_present=m.pub_exchange_time_present.copy(),
+                        pub_contract=m.pub_contract.copy(),
+                        pub_dt_limit=m.pub_dt_limit.copy(),
+                        pub_dt_limit_present=m.pub_dt_limit_present.copy(),
+                        pub_values=m.pub_values.copy(),
+                        pub_present=m.pub_present.copy(),
+                        pub_limits=m.pub_limits.copy(),
+                        pub_limits_present=m.pub_limits_present.copy(),
+                        control_values=m.control_values.copy(),
+                        control_present=m.control_present.copy(),
                         hard_failure=True,
                         advanced_dt=m.advanced_dt,
                     )
@@ -726,8 +789,6 @@ class GraphBuilder:
                                 if m.div_inf > targets.div_max:
                                     penalty += float(m.div_inf - targets.div_max)
                         m.penalty = penalty
-                        if realtime and realtime_state is not None:
-                            realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
                         return True, m, _state_obj
                     return AdvanceNode(
                         advance=advance,
@@ -753,8 +814,6 @@ class GraphBuilder:
                     
                     ok, m, state_new = adv.advance(state_obj, dt, realtime=realtime, state_table=state_table)
 
-                    if realtime and realtime_state is not None:
-                        realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
                     return ok, m, state_new
                 children.append(AdvanceNode(
                     advance=adv_with_timing,
@@ -789,8 +848,6 @@ class GraphBuilder:
                 else:
                     def adv_with_timing(state_obj, dt, *, realtime=False, adv=adv, label=unique_label, state_table=None):
                         ok, m, state_new = adv.advance(state_obj, dt, realtime=realtime, state_table=state_table)
-                        if realtime and realtime_state is not None:
-                            realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
                         return ok, m, state_new
                     children.append(AdvanceNode(
                         advance=adv_with_timing,
@@ -801,8 +858,6 @@ class GraphBuilder:
             else:
                 def adv_with_timing(state_obj, dt, *, realtime=False, adv=adv, label=unique_label, state_table=None):
                     ok, m, state_new = adv.advance(state_obj, dt, realtime=realtime, state_table=state_table)
-                    if realtime and realtime_state is not None:
-                        realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
                     return ok, m, state_new
                 children.append(AdvanceNode(
                     advance=adv_with_timing,

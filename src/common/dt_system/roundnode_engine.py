@@ -8,6 +8,7 @@ the inner RoundNode using dt as the round_max window.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import copy
 from typing import Optional
 
 from .dt_scaler import Metrics
@@ -29,6 +30,29 @@ class RoundNodeEngine(DtCompatibleEngine):
     def __post_init__(self) -> None:
         if self.runner is None:
             self.runner = MetaLoopRunner()
+
+    def snapshot(self):
+        from .dt_graph import _RoundTransaction
+
+        table = getattr(self, "_state_table", None) or self.inner.state_table
+        return (
+            _RoundTransaction(self.inner, table).copy_shallow(),
+            copy.deepcopy(self.runner._stats),
+            copy.deepcopy(self.runner._last_timings),
+            float(getattr(self, "world_time", 0.0)),
+            float(getattr(self, "observer_time", 0.0)),
+        )
+
+    def restore(self, snapshot) -> None:
+        from .dt_graph import _RoundTransaction
+
+        transaction, stats, timings, world_time, observer_time = snapshot
+        table = getattr(self, "_state_table", None) or self.inner.state_table
+        _RoundTransaction(self.inner, table).restore(transaction)
+        self.runner._stats = copy.deepcopy(stats)
+        self.runner._last_timings = copy.deepcopy(timings)
+        self.world_time = float(world_time)
+        self.observer_time = float(observer_time)
 
     def step(self, dt: float, state=None, state_table=None):
         # Optionally update runner state from state dict

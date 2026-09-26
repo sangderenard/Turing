@@ -42,23 +42,73 @@ def test_elementwise_program_emits_a_complete_module():
     assert "br_if $done" in module.source
 
 
-def test_what_has_no_table_is_reported_not_approximated():
-    """The transcendentals now arrive as bounded, measured tables. What is
-    left has no table for a stated reason -- tan's poles, or not being a
-    function of one float at all -- and is named as a shortfall rather than
-    approximated by something that happens to be nearby."""
+def test_tan_composes_the_existing_sine_and_cosine_tables():
 
-    for operation in ("tan", "pow", "mod", "sign"):
+    module = emit_wasm_module(
+        _program(
+            OpStep(step_id=0, op_name="tan", input_ids=[1], attrs={}, result_id=2),
+            feeds=(1,),
+            outputs={"result": 2},
+        ),
+        name="t",
+    )
+    assert module.complete, module.shortfall_report()
+    assert module.binary
+
+
+def test_composed_pow_mod_and_sign_are_real_wasm_lowerings():
+    for operation in ("pow", "mod"):
         module = emit_wasm_module(
             _program(
-                OpStep(step_id=0, op_name=operation, input_ids=[1], attrs={}, result_id=2),
-                feeds=(1,),
-                outputs={"result": 2},
+                OpStep(
+                    step_id=0, op_name=operation, input_ids=[1, 2],
+                    attrs={}, result_id=3,
+                ),
+                feeds=(1, 2),
+                outputs={"result": 3},
             ),
-            name="t",
+            name=operation,
         )
-        assert not module.complete
-        assert operation in module.shortfall_report()
+        assert module.complete, module.shortfall_report()
+        assert module.binary
+    sign = emit_wasm_module(
+        _program(
+            OpStep(step_id=0, op_name="sign", input_ids=[1], attrs={}, result_id=2),
+            feeds=(1,), outputs={"result": 2},
+        ),
+        name="sign",
+    )
+    assert sign.complete, sign.shortfall_report()
+    assert sign.binary
+
+
+@pytest.mark.parametrize(
+    ("operation", "inputs"),
+    [
+        ("isfinite", [1]),
+        ("isnan", [1]),
+        ("isinf", [1]),
+        ("logical_not", [1]),
+        ("invert", [1]),
+        ("logical_and", [1, 2]),
+        ("logical_or", [1, 2]),
+    ],
+)
+def test_predicate_logical_and_invert_paths_emit_runnable_wasm(operation, inputs):
+    result_id = 3 if len(inputs) == 2 else 2
+    module = emit_wasm_module(
+        _program(
+            OpStep(
+                step_id=0, op_name=operation, input_ids=inputs,
+                attrs={}, result_id=result_id,
+            ),
+            feeds=tuple(inputs), outputs={"result": result_id},
+        ),
+        name=operation,
+        dtype="float64",
+    )
+    assert module.complete, module.shortfall_report()
+    assert module.binary
 
 
 def test_a_scalar_operand_becomes_a_constant_not_a_second_feed():
@@ -117,7 +167,32 @@ def test_comparisons_come_back_in_the_value_type():
 def test_an_unrepresentable_dtype_is_refused():
     program = _sub_abs_plus_one()
     with pytest.raises(WasmEmissionError):
-        emit_wasm_module(program, name="t", dtype="int64")
+        # A dtype WebAssembly genuinely has no value type for. This used to
+        # assert "int64", which was accurate while the module could only
+        # compute in f32/f64; integer working types are real now, so an
+        # integral program is compiled rather than refused and the refusal
+        # has to be demonstrated with something actually unrepresentable.
+        emit_wasm_module(program, name="t", dtype="complex128")
+
+
+def test_an_integral_program_computes_in_integer_instructions():
+    """An all-integer program is not silently computed in floating point.
+
+    ``//`` and ``%`` are not float operations, bit patterns are not float
+    values, and a 64-bit integer does not survive f64's 2**53 exact range --
+    so a program whose dtype is integral has to reach integer opcodes.
+    """
+
+    module = emit_wasm_module(_sub_abs_plus_one(), name="t", dtype="int64")
+
+    assert module.value_type == "i64"
+    assert "i64.sub" in module.source
+    # Signedness is explicit for integers, unlike the float comparisons.
+    assert "f64." not in module.source
+    # And it assembles, not only prints: the WAT text and the binary are two
+    # independent emitters, so an integer type existing in one but not the
+    # other would emit readable text that cannot run.
+    assert module.binary
 
 
 def test_float32_programs_use_four_byte_strides():
@@ -140,7 +215,8 @@ def test_wasm_is_registered_and_declares_what_it_cannot_do():
     # It writes the elementwise walk itself but does not lower a program's
     # own control flow.
     assert wasm.control_flow is False
-    assert {"tan", "pow", "mod", "sign"} <= wasm.unsupported_operations
+    assert not wasm.unsupported_operations
+    assert {"tan", "pow", "mod", "sign"} <= wasm.supported_operations
     # The tabulated functions are no longer advertised as out of reach.
     assert not ({"sin", "cos", "exp", "log", "tanh"} & wasm.unsupported_operations)
 
@@ -163,7 +239,7 @@ def test_the_hub_chooses_before_emitting_rather_than_by_failing():
     )
 
     assert "wasm" in machine_targets.targets_for(representable)
-    assert "wasm" not in machine_targets.targets_for(unreachable)
+    assert "wasm" in machine_targets.targets_for(unreachable)
     # A function with a table is reachable, and the hub knows it without
     # having to emit first.
     assert "wasm" in machine_targets.targets_for(tabulated)

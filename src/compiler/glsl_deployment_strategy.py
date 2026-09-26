@@ -1,33 +1,81 @@
-"""GLSL deployment-strategy stage for ProcessGraphs."""
+"""Deployment-strategy stage for ProcessGraphs.
+
+Despite the module's filename, ``strategize_shell_deployment`` (formerly
+``strategize_glsl_deployment``) is not GLSL-specific: it is the single
+compilation choke point every backend passes through -- c, python, glsl,
+fortran-via-precompile_only, webgl, and (once registered) webgpu all
+funnel through this one control-planning stage before diverging into
+backend-specific emission later in the pipeline. See
+``accelerator_backends/aot_compile.py`` for the full pipeline this stage
+sits in.
+"""
 
 from __future__ import annotations
 
 import ast
 import builtins
+import concurrent.futures
 import copy
 import gc
+import hashlib
 import operator
+import os
+import re
+import sys
 import time
 import traceback
 from collections import deque
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
-from dataclasses import replace
-from typing import Any, Iterable, Mapping
+from dataclasses import dataclass, replace
+from typing import Any, Iterable, Mapping, Sequence
+from types import ModuleType, SimpleNamespace
 
 import networkx as nx
 import numpy as np
 
+
+class CompilationSubdivisionRequired(ValueError):
+    """A correct control owner exists, but this unit is too coarse to lower.
+
+    This remains a ``ValueError`` for callers which historically treated the
+    refusal as an invalid lowering. The structured receipt lets the bounded
+    project compiler distinguish a partition frontier from an opaque worker
+    crash and creep at the named source/control boundary.
+    """
+
+    def __init__(self, message: str, *, boundaries=()):
+        super().__init__(message)
+        self.boundaries = tuple(dict(item) for item in boundaries)
+
+    def to_failure_mapping(self) -> dict[str, Any]:
+        return {
+            "frontier_kind": "compilation-subdivision-required",
+            "subdivision_boundaries": [
+                dict(item) for item in self.boundaries
+            ],
+        }
+
 from .deployment_fifo import DeploymentFIFO
 from .control_source import (
+    CallBlock,
+    ControlExpression,
+    ControlOverlayScopeError,
     ControlProgram,
+    LoopBlock,
+    ParallelDeployment,
     SequenceBlock,
+    StatementBlock,
+    StateMachineTick,
     StreamPublishBlock,
     ValidationBlock,
+    WhileBlock,
     overlay_scheduled_control,
+    place_validations_after_region_producers,
     project_control_regions,
 )
 from .hierarchical_control import compose_hierarchical_control
+from .process_graph_value_ids import next_process_value_id
 from .hierarchical_plan import (
     PlanCall,
     PlanClosure,
@@ -38,19 +86,26 @@ from .hierarchical_plan import (
 from .loop_composer import (
     LoopBackendCapabilities,
     LoopComposer,
+    LoopStrategy,
     _destructure_loop_target,
+    _retarget_cached_value_ids,
     analyze_shader_loop_reductions,
     bind_control_deployments_to_regions,
     evaporate_unrolled_loops,
     materialize_retained_loop_ports,
 )
+from .loop_ir import MODELLED_STATE_OPERATORS as _MODELLED_STATE_OPERATORS
+from .loop_ir import LoopStateEffectMode
 from .process_graph_callable import EphemeralProcessGraphCallable
 from .process_graph_fusion import (
+    DispatchRegion,
+    dispatch_region_to_fused_program,
     extract_clean_process_subgraph,
     reduce_scheduled_shader_regions,
 )
 from .shell_reference_tables import build_shell_reference_tables
-from ..common.tensors.abstraction import AbstractTensor
+from ..transmogrifier.function_table import FunctionReference
+from ..common.tensors.abstraction import AbstractTensor, tensor_identity
 from ..common.tensors.accelerator_backends.glsl_fused_network import (
     GLSLFusedProgramNetwork,
 )
@@ -78,9 +133,18 @@ from ..common.tensors.fused_ir import (
     FusedProgram,
     Meta,
     OpStep,
+    canonical_elementwise_op,
+    flatten_tensor_constant,
     ordered_feed_ids,
 )
-from ..common.tensors.operator_catalog import ACCESSOR_OPERATORS
+from ..common.tensors.operator_catalog import (
+    ACCESSOR_OPERATORS,
+    CREATION_OPERATORS,
+)
+from ..transmogrifier.graph.edge_roles import (
+    ordered_arguments,
+    positional_argument_index,
+)
 from ..transmogrifier.graph.graph_deep_compiler import GraphDeepCompiler
 from ..transmogrifier.operator_defs import (
     abstract_tensor_funcs,
@@ -89,23 +153,298 @@ from ..transmogrifier.operator_defs import (
 
 
 def _dependency_order(graph: Any) -> tuple[int, ...]:
-    """Return DAG order, or stable condensation order for retained loops."""
+    """Return DAG order, or stable condensation order for retained loops.
 
+    The result is cached on the graph, keyed by a cheap (node count, edge
+    count) fingerprint. During deployment planning the same shell graph is
+    dependency-ordered repeatedly (once per ``_build_shell_hierarchy_plan``,
+    which runs on shell construction and on every ``refresh_hierarchy_plan``),
+    yet it is only read there -- so re-running the topological sort each time
+    was pure repeated work. The fingerprint invalidates the cache the moment
+    the graph gains or loses a node/edge, so a genuinely mutated graph is
+    re-ordered.
+    """
+
+    G = graph.G
+    semantic_parent_edges = tuple(
+        (int(parent), int(node_id))
+        for node_id, data in G.nodes(data=True)
+        for parent, _role in (data.get("parents") or ())
+        if int(parent) in G and int(parent) != int(node_id)
+    )
+    semantic_fingerprint = sum(
+        ((left * 1_000_003) ^ right)
+        for left, right in semantic_parent_edges
+    )
+    # Counts alone collide: removing two dead constants and adding two
+    # edge-less member inputs leaves every count and the edge hash unchanged
+    # while the node identity set differs, so a stale order would name nodes
+    # that no longer exist.  The identity set is part of the fingerprint.
+    node_fingerprint = sum(
+        (int(node_id) * 1_000_003) ^ (int(node_id) >> 3) for node_id in G
+    )
+    fingerprint = (
+        G.number_of_nodes(), G.number_of_edges(),
+        len(semantic_parent_edges), semantic_fingerprint, node_fingerprint,
+    )
+    cached = G.graph.get("_dependency_order_cache")
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    dependency_graph = G.copy()
+    dependency_graph.add_edges_from(semantic_parent_edges)
     try:
-        return tuple(nx.lexicographical_topological_sort(
-            graph.G, key=lambda value_id: int(value_id)
+        order = tuple(nx.lexicographical_topological_sort(
+            dependency_graph, key=lambda value_id: int(value_id)
         ))
     except nx.NetworkXUnfeasible:
-        recursive = graph.G.graph.get("recursion_table")
-        if not recursive or set(graph.levels) != set(graph.G):
+        recursive = G.graph.get("recursion_table")
+        if not recursive or set(graph.levels) != set(G):
             raise
-        return tuple(sorted(
-            graph.G,
+        order = tuple(sorted(
+            G,
             key=lambda node_id: (
                 int(graph.levels[node_id]),
                 int(node_id),
             ),
         ))
+    G.graph["_dependency_order_cache"] = (fingerprint, order)
+    return order
+
+
+def _lower_python_scalar_intrinsics(graph: Any) -> None:
+    """Turn primitive method syntax with exact semantics into graph operators."""
+
+    G = graph.G
+    for node_id, data in tuple(G.nodes(data=True)):
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+            and expression.func.attr == "bit_length"
+            and not expression.args
+            and not expression.keywords
+        ):
+            continue
+        attribute_id = next((
+            int(parent)
+            for parent, role in data.get("parents") or ()
+            if str(role) in {"func", "callee", "function"}
+            and parent in G
+            and isinstance(G.nodes[parent].get("expr_obj"), ast.Attribute)
+        ), None)
+        receiver_id = (
+            None if attribute_id is None else next((
+                int(parent)
+                for parent, role in G.nodes[attribute_id].get("parents") or ()
+                if str(role) in {"value", "object", "base", "operand"}
+            ), None)
+        )
+        if receiver_id is None:
+            receiver_id = next((
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) == "operand"
+            ), None)
+        if os.environ.get("TURING_DEBUG_SCALAR_INTRINSIC"):
+            print(
+                "DEBUGSCALARINTRINSIC "
+                f"fn={G.graph.get('function_name')} node={int(node_id)} "
+                f"parents={data.get('parents')} attribute={attribute_id} "
+                f"receiver={receiver_id}",
+                file=sys.stderr,
+            )
+        if receiver_id is None or receiver_id not in G:
+            continue
+        for parent, _role in tuple(data.get("parents") or ()):
+            if G.has_edge(int(parent), int(node_id)):
+                G.remove_edge(int(parent), int(node_id))
+            G.nodes[int(parent)]["children"] = [
+                (child, role)
+                for child, role in G.nodes[int(parent)].get("children", ())
+                if int(child) != int(node_id)
+            ]
+        data["parents"] = [(int(receiver_id), "operand")]
+        G.add_edge(int(receiver_id), int(node_id), role="operand")
+        receiver_children = list(G.nodes[int(receiver_id)].get("children", ()))
+        if not any(int(child) == int(node_id) for child, _ in receiver_children):
+            receiver_children.append((int(node_id), "operand"))
+        G.nodes[int(receiver_id)]["children"] = receiver_children
+        attributes = dict(data.get("attributes") or {})
+        attributes.update({
+            "source_operator": "builtins.int.bit_length",
+            "python_scalar_intrinsic": True,
+            "extraction_identity": "builtins.int.bit_length",
+        })
+        data.update({
+            "type": "BitLength",
+            "op": "BitLength",
+            "attributes": attributes,
+        })
+
+
+def _refresh_specialized_python_precision(graph: Any) -> None:
+    """Apply exact numeric identity after planner specialization is known."""
+
+    from ..common.tensors.topological_reducer import (
+        specialize_python_precision_widths,
+    )
+
+    function_table = getattr(graph, "function_table", None)
+    if function_table is not None:
+        # Shared catalogue facts are installed only when every callsite
+        # agrees.  Settle those callees first so the caller can read their
+        # exact specialized return identity in this same planning phase.
+        for entry in function_table:
+            callee = getattr(entry, "graph", None)
+            if (
+                callee is not None
+                and callee is not graph
+                and (
+                    callee.G.graph.get("planner_specializations")
+                    or callee.G.graph.get("planner_parameter_classes")
+                )
+            ):
+                specialize_python_precision_widths(callee)
+    specialize_python_precision_widths(graph)
+
+
+def _topological_region_order(shell: Any, candidate_regions: Any) -> tuple[int, ...]:
+    return _topological_region_schedule(shell, candidate_regions)[0]
+
+
+def _topological_region_schedule(shell: Any, candidate_regions: Any):
+    """Order dispatch region indices to respect data dependencies.
+
+    ``range(len(dispatch_subgraphs))`` -- discovery/creation order -- is
+    NOT execution order: nothing about it guarantees a region discovered
+    later doesn't produce a value a region discovered earlier reads (e.g.
+    a loop that fills an array vs. a later whole-array copy of it). Two
+    call sites here fed that naive numeric order straight into
+    ``overlay_scheduled_control`` as the flat scheduled region sequence,
+    which silently discarded any dependency edge between regions -- see
+    tools/HANDOFF_fluid_c_shell.md and tools/DIFFERENTIAL_PHASES.md.
+
+    A hierarchy item is discovered when the *first* member of its region is
+    encountered.  That is a useful stable tie-break, but it is not a proof of
+    atomic call order: another member can consume a value from a region whose
+    first independent member appears later.  Build the region dependency DAG
+    from canonical ProcessGraph ancestry and topologically order that instead.
+    """
+
+    candidates = tuple(int(index) for index in candidate_regions)
+    candidate_set = set(candidates)
+    plan = getattr(shell, "hierarchy_plan", None)
+    plan_items = getattr(plan, "items", None) if plan is not None else None
+    from_plan = tuple(
+        int(item.name.split("_", 1)[1])
+        for item in (plan_items or ())
+        if isinstance(item, PlanClosure)
+        and item.name.startswith("region_")
+        and int(item.name.split("_", 1)[1]) in candidate_set
+    )
+    preference = tuple(dict.fromkeys((*from_plan, *candidates)))
+    rank = {region: index for index, region in enumerate(preference)}
+    graph = shell.process_graph
+    nodes_by_region = {
+        region: frozenset(map(
+            int,
+            shell.dispatch_subgraphs[region].G.graph.get(
+                "deployment_nodes", (),
+            ),
+        ))
+        for region in candidates
+    }
+    region_by_node = {
+        node_id: region
+        for region, nodes in nodes_by_region.items()
+        for node_id in nodes
+    }
+    # A retained loop's own internal state-effect chain (for example two
+    # mutually exclusive branches each doing ``ctrl.clamp_events += 1``)
+    # legitimately closes a cycle in raw ProcessGraph ancestry: one
+    # branch's result feeds the next iteration's read of the other. That
+    # is exactly what ``recursion_table``/``control_members`` -- already
+    # published for ``reduce_scheduled_shader_regions``, which drops edges
+    # incident to those nodes before checking its own scheduling graph is
+    # acyclic -- exists to name. This function walked raw, un-filtered
+    # ancestry instead, so the very cycle the scheduler had already
+    # discounted came back as an unresolvable region dependency cycle
+    # (diagnosed via tools/repro_step_with_dt_control_used.py: regions
+    # holding two branch-exclusive ``ctrl.clamp_events += 1`` computations
+    # inside ``step_with_dt_control_used``'s retry loop). Apply the same
+    # discount here instead of inventing a second rule for one graph.
+    recursion_control_nodes = frozenset(
+        int(node_id)
+        for record in (graph.G.graph.get("recursion_table") or {}).values()
+        if record.get("control_ir", True)
+        for node_id in record.get("control_members", ())
+        if int(node_id) in graph.G
+    )
+    ancestry_graph = (
+        graph.G if not recursion_control_nodes
+        else graph.G.copy()
+    )
+    if recursion_control_nodes:
+        ancestry_graph.remove_edges_from(tuple(
+            (left, right) for left, right in ancestry_graph.edges
+            if left in recursion_control_nodes or right in recursion_control_nodes
+        ))
+    dependency_graph = nx.DiGraph()
+    dependency_graph.add_nodes_from(candidates)
+    for consumer, nodes in nodes_by_region.items():
+        for node_id in nodes:
+            if node_id not in ancestry_graph:
+                continue
+            for ancestor in nx.ancestors(ancestry_graph, node_id):
+                producer = region_by_node.get(int(ancestor))
+                if producer is not None and producer != consumer:
+                    dependency_graph.add_edge(producer, consumer)
+    # Closure captures are the compiler's explicit cross-unit ABI.  Some
+    # structural operations preserve the canonical value correlation without
+    # retaining a direct ProcessGraph edge after compartment extraction, so
+    # graph ancestry alone can miss exactly the dependency that a native call
+    # signature still exposes.  Order from the typed capture/result surface as
+    # well; names and temporary discovery IDs are intentionally irrelevant.
+    closures = {
+        int(item.name.split("_", 1)[1]): item
+        for item in (plan_items or ())
+        if isinstance(item, PlanClosure)
+        and item.name.startswith("region_")
+        and int(item.name.split("_", 1)[1]) in candidate_set
+    }
+    producers_by_value: dict[int, set[int]] = {}
+    for region, closure in closures.items():
+        for line in closure.items:
+            if not isinstance(line, PlanLine):
+                continue
+            for value_id in line.outputs:
+                producers_by_value.setdefault(int(value_id), set()).add(region)
+    for consumer, closure in closures.items():
+        for value_id in closure.captures:
+            for producer in producers_by_value.get(int(value_id), ()):
+                if producer != consumer:
+                    dependency_graph.add_edge(producer, consumer)
+    try:
+        result = tuple(nx.lexicographical_topological_sort(
+            dependency_graph,
+            key=lambda region: (rank.get(int(region), len(rank)), int(region)),
+        ))
+    except nx.NetworkXUnfeasible as error:
+        cycles = tuple(nx.simple_cycles(dependency_graph))
+        raise ValueError(
+            "dispatch regions are not atomic compilation units: canonical "
+            f"data dependencies cross region boundaries cyclically: {cycles!r}"
+        ) from error
+    import os as _os, sys as _sys
+    if _os.environ.get("TURING_DEBUG_REGION_ORDER"):
+        _fn = getattr(getattr(shell, "process_graph", None), "G", None)
+        _fn = _fn.graph.get("function_name") if _fn is not None else None
+        print(
+            f"DEBUGTOPOORDER fn={_fn} plan_items_present={plan_items is not None} "
+            f"candidates={candidates} result={result}",
+            file=_sys.stderr,
+        )
+    return result, tuple(dependency_graph.edges)
 
 
 _scheduled_capture_backend: ContextVar[str] = ContextVar(
@@ -150,10 +489,69 @@ def _observe_process_graph_node(
     context = _planned_capture_context.get()
     if context is None:
         return result
+    if not isinstance(result, AbstractTensor):
+        # This must be checked before the identity-aliasing logic below:
+        # ``result is parent_value`` is only a meaningful alias signal for a
+        # tensor, where object identity means shared storage.  For a plain
+        # Python value it can be a pure CPython implementation detail --
+        # small integers are interned, so ``0 + 1`` and the literal ``1``
+        # operand satisfy ``is`` by cache coincidence, not because they are
+        # the same computation.  Treating that as an alias would silently
+        # drop the operation instead of recording it.
+        #
+        # Generated numeric-kernel code runs real Python operators, and this
+        # observer is its only per-operation hook -- but everything below is
+        # tape-primitive correlation, which exists to resolve which of
+        # several possible dynamically-dispatched tensor primitives this
+        # call produced.  A plain value has no such ambiguity: its own
+        # graph node id already is its unambiguous identity, and it will
+        # never enter ``tape._nodes`` no matter how long this waits.  Record
+        # it directly, in exact execution order, the same way a reference
+        # operator (SetAttr/GetAttr) already is.
+        shell = context.get("shell")
+        if shell is not None:
+            shell.reference_operator_sequence.append(int(node_id))
+        return result
     tape = context["tape"]
-    capture_id = id(result)
+    capture_id = tensor_identity(result)
+    aliased_parents = tuple(
+        int(parent_id)
+        for parent_id, parent_value in zip(parent_ids, parent_values)
+        if result is parent_value
+    )
+    if len(aliased_parents) == 1 and int(node_id) != aliased_parents[0]:
+        # The result is literally an existing explicit operand.  Its tape
+        # entry therefore belongs to that pre-existing value; this operation
+        # did not publish a new primitive result.  Record the ProcessGraph
+        # endpoint as an SSA alias before primitive ownership is considered,
+        # otherwise the same tape identity is incorrectly assigned both to
+        # the call result and to its input socket.
+        context["value_aliases"][int(node_id)] = aliased_parents[0]
+        return result
     if capture_id in tape._nodes:
         primitive = tape._nodes[capture_id]
+        self_parent_slots = tuple(
+            int(slot)
+            for primitive_id, slot in primitive.parents
+            if int(primitive_id) == int(capture_id)
+        )
+        graph = context.get("graph")
+        graph_node = (
+            graph.G.nodes[int(node_id)]
+            if graph is not None and int(node_id) in graph.G
+            else {}
+        )
+        if (
+            self_parent_slots
+            and len(parent_ids) == 1
+            and graph_node.get("type") not in {"Store", "IndexedStore"}
+        ):
+            # An identity-preserving tensor adapter can be recorded by the
+            # tape under the same object ID as its operand.  Such a node is a
+            # self-edge in object-keyed tape space, not a numerical kernel.
+            # The ProcessGraph supplies the unambiguous SSA relationship.
+            context["value_aliases"][int(node_id)] = int(parent_ids[0])
+            return result
         existing_owner = primitive.ctx.get("process_graph_node_id")
         if existing_owner is not None:
             # A structural Store, call return, or other pass-through node may
@@ -166,7 +564,48 @@ def _observe_process_graph_node(
             int(node_id), []
         ).append(int(capture_id))
         primitive.ctx["process_graph_node_id"] = int(node_id)
-        graph = context.get("graph")
+        tensor_op = (graph_node.get("attributes") or {}).get("tensor")
+        if tensor_op in CREATION_OPERATORS and graph is not None:
+            # The first positional argument is the size. Its role varies by
+            # which ingestion path resolved this call -- "args" (generic
+            # schema descent, taken here since a static class reference like
+            # ``AbstractTensor.zeros`` doesn't go through the ordinary
+            # receiver-argument rewiring), "arg0", or "arg:0" (other call
+            # shapes) -- so match any arg-prefixed role instead of guessing
+            # one spelling, and take the first by parent id for determinism.
+            # Where the role states an index, use it: that is the actual
+            # first argument rather than the smallest parent id, which was
+            # only ever a stand-in for an order the caller could not
+            # recover. Bare "arg" carries no index, so that spelling still
+            # falls back to the deterministic-by-id choice.
+            _declared_arguments = ordered_arguments(
+                graph_node.get("parents") or ()
+            )
+            size_parent_id = (
+                int(_declared_arguments[0]) if _declared_arguments
+                else min(
+                    (
+                        int(parent)
+                        for parent, role in (graph_node.get("parents") or ())
+                        if str(role).lower().startswith("arg")
+                    ),
+                    default=None,
+                )
+            )
+            if (
+                size_parent_id is not None
+                and size_parent_id in graph.G
+                and not _source_static_value(graph, size_parent_id)
+            ):
+                # The size argument is itself computed (not a literal), so
+                # this result's shape is only what this one discovery trace
+                # happened to observe, not a compile-time fact.  Record the
+                # real origin (see Meta.shape_source_ids) instead of letting
+                # it silently freeze into a fixed number downstream.
+                dimensions = len(tuple(getattr(result, "shape", ()) or ()))
+                primitive.ctx["shape_source_ids"] = tuple(
+                    size_parent_id for _ in range(dimensions)
+                )
         collection_owners = context.get("collection_owner_ids", frozenset())
 
         def collection_source(value_id: int) -> int | None:
@@ -239,7 +678,7 @@ def _observe_process_graph_node(
             for graph_id, parent_value in zip(
                 parent_ids, parent_values
             ):
-                primitive_id = id(parent_value)
+                primitive_id = tensor_identity(parent_value)
                 if primitive_id not in primitive_ids:
                     continue
                 exact.append((int(primitive_id), int(graph_id)))
@@ -711,8 +1150,19 @@ def _attach_profiler(
         )
 
 
-def _walk_planned_shells(shell: Any):
-    """Yield every planner-created shell instance exactly once."""
+def _walk_planned_shells(
+    shell: Any,
+    *,
+    include_function_registry: bool = True,
+):
+    """Yield planner-created shell instances exactly once.
+
+    ``function_shells`` is the definition catalogue;
+    ``callsite_function_shells`` is one selected program's activation tree.
+    Compilation/capture of one entrypoint passes
+    ``include_function_registry=False`` so catalogue entries are not mistaken
+    for executed children.  Administrative callers retain the broad default.
+    """
     pending = [shell]
     seen = set()
     while pending:
@@ -721,9 +1171,27 @@ def _walk_planned_shells(shell: Any):
             continue
         seen.add(id(current))
         yield current
-        pending.extend(
-            getattr(current, "function_shells", {}).values()
-        )
+        if include_function_registry:
+            pending.extend(
+                getattr(current, "function_shells", {}).values()
+            )
+        elif (
+            getattr(current, "runtime_closure_only", False)
+            and getattr(current, "_owns_function_shells", False)
+        ):
+            # In runtime-root mode this shell is an administrative owner of
+            # the definition catalogue.  Its executable children are exactly
+            # the submitted activation roots, not every catalogued definition
+            # and not zero children.  Each selected root then exposes its full
+            # explicit callsite tree below.
+            function_shells = getattr(current, "function_shells", {})
+            pending.extend(
+                function_shells[int(reference)]
+                for reference in reversed(tuple(
+                    getattr(current, "activation_root_references", ())
+                ))
+                if int(reference) in function_shells
+            )
         pending.extend(
             getattr(current, "callsite_function_shells", {}).values()
         )
@@ -925,8 +1393,56 @@ def _identity_parameter_projection(graph) -> tuple[int, str] | None:
     return None
 
 
+def _synthetic_device_scalar_shell(graph: Any, predicate_id: int) -> Any:
+    """Add the node chain ``_identity_parameter_projection`` already
+    recognizes (``bool(param[item])``) so an ordinary, non-call predicate
+    passes the same device-scalar check a real callsite would.  Its own
+    node ids are throwaway: the caller only reads the projection's
+    verdict, then falls back to ``predicate_id`` itself.
+
+    UNVERIFIED: no passing test exercises this yet. It targets the
+    ``if predicate: raise`` guard condition only; re-running
+    ``tools/compile_re_probe.py`` after adding it showed no change in the
+    "no registered callee" shortfall list, because that failure is in the
+    raise *bodies* (constructing/raising the exception), a separate,
+    still-unaddressed gap this function does not touch.
+    """
+
+    next_id = (max(graph.nodes, default=0)) + 1
+    input_id, item_id, call_id = next_id, next_id + 1, next_id + 2
+    graph.add_node(
+        input_id, type="Input", op="Input", parents=[], children=[],
+        attributes={"binding_kind": "parameter"}, expr_obj=None,
+    )
+    graph.add_node(
+        item_id, type="Item", op="item", parents=[(input_id, "operand")],
+        children=[], attributes={}, expr_obj=None,
+    )
+    graph.add_edge(input_id, item_id, role="operand")
+    call_expr = ast.Call(func=ast.Name(id="bool", ctx=ast.Load()), args=[], keywords=[])
+    graph.add_node(
+        call_id, type="Call", op="Call", parents=[(item_id, "value")],
+        children=[], attributes={"static_python_reference": "builtins.bool"},
+        expr_obj=call_expr,
+    )
+    graph.add_edge(item_id, call_id, role="value")
+    wrapper = graph.__class__()
+    wrapper.add_nodes_from(graph.nodes(data=True))
+    wrapper.add_edges_from(graph.edges(data=True))
+    wrapper.graph["function_outputs"] = ("result",)
+    wrapper.graph["identity_table"] = {"result": (call_id,)}
+    return SimpleNamespace(process_graph=SimpleNamespace(G=wrapper))
+
+
 def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
-    """Translate ordinary ``if predicate: raise`` guards into typed control."""
+    """Translate terminal raise guards into typed control.
+
+    A guard may compute locals used only to construct its exception message
+    before the final raise. Invalid calls route through authored-source
+    fallback before native invocation, so those diagnostics and any prelude
+    effects remain exact; the compiled validation needs only the predicate and
+    exception identity.
+    """
 
     graph = shell.process_graph.G
     expression_nodes = {
@@ -934,26 +1450,135 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
         for node_id, data in graph.nodes(data=True)
         if isinstance(data.get("expr_obj"), ast.AST)
     }
-    blocks = []
+    signature_nodes: dict[tuple[Any, ...], set[int]] = {}
     for node_id, data in graph.nodes(data=True):
-        statement = data.get("expr_obj")
-        if not (
-            isinstance(statement, ast.If)
-            and statement.body
-            and all(isinstance(item, ast.Raise) for item in statement.body)
-            and not statement.orelse
+        expression = data.get("expr_obj")
+        if isinstance(expression, ast.AST):
+            signature_nodes.setdefault(
+                _ast_source_signature(expression), set()
+            ).add(int(node_id))
+
+    def node_for_expression(expression: ast.AST) -> int | None:
+        exact = expression_nodes.get(id(expression))
+        if exact is not None:
+            return exact
+        candidates = tuple(sorted(signature_nodes.get(
+            _ast_source_signature(expression), (),
+        )))
+        return candidates[0] if candidates else None
+
+    def scalar_expression(
+        value_id: int, visiting: frozenset[int] = frozenset(),
+    ) -> ControlExpression | None:
+        value_id = int(value_id)
+        if value_id in visiting or value_id not in graph:
+            return None
+        data = graph.nodes[value_id]
+        node_type = str(data.get("type") or "")
+        if node_type in {"Const", "const", "Constant"}:
+            return ControlExpression(
+                "const", value_id=value_id,
+                literal=_constant_value(data),
+            )
+        if node_type in {"Input", "input"}:
+            if (data.get("attributes") or {}).get("value_kind") != "scalar":
+                return None
+            return ControlExpression("value", value_id=value_id)
+        operation = {
+            "less": "lt", "lt": "lt",
+            "lessequal": "le", "le": "le",
+            "greater": "gt", "gt": "gt",
+            "greaterequal": "ge", "ge": "ge",
+            "equal": "eq", "eq": "eq",
+            "notequal": "ne", "ne": "ne",
+            "logical_and": "and", "land": "and",
+            "logical_or": "or", "lor": "or",
+            "logical_not": "not", "lnot": "not",
+            "add": "add", "sub": "sub", "mul": "mul",
+            "div": "div", "truediv": "div", "neg": "neg",
+            "bitand": "bitand", "bitor": "bitor",
+            "bitxor": "bitxor", "shl": "shl", "shr": "shr",
+        }.get(str(data.get("op") or node_type).lower())
+        if operation is None:
+            return None
+        operands = tuple(
+            scalar_expression(int(parent), visiting | {value_id})
+            for parent, role in data.get("parents") or ()
+            if str(role) not in {"callee", "ops", "operator"}
+        )
+        arity = 1 if operation in {"not", "neg"} else 2
+        if len(operands) < arity or any(
+            operand is None for operand in operands[:arity]
+        ):
+            return None
+        return ControlExpression(
+            operation, operands[:arity], value_id=value_id,
+        )
+    nested_in_loop = {
+        _ast_source_signature(member)
+        for _node_id, node_data in graph.nodes(data=True)
+        for loop in (node_data.get("expr_obj"),)
+        if isinstance(loop, (ast.For, ast.While))
+        for member in ast.walk(loop)
+        if isinstance(member, ast.If)
+    }
+    blocks = []
+
+    def terminal_raise(statements: Sequence[ast.stmt]) -> ast.Raise | None:
+        if not statements or not isinstance(statements[-1], ast.Raise):
+            return None
+        # Keep this a straight-line guard arm. Compound control, return, and
+        # loop control could bypass the terminal raise and therefore are not a
+        # validation contract.
+        if any(not isinstance(statement, (
+            ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr, ast.Pass,
+        )) for statement in statements[:-1]):
+            return None
+        return statements[-1]
+
+    # Planning a scalar predicate may attach a synthetic callsite shell to the
+    # same graph.  Iterate a stable snapshot: validation discovery is allowed
+    # to enrich planning metadata, but must not invalidate its own traversal.
+    for node_id, record in _source_control_records(graph).items():
+        statement = record.get("expression")
+        if not isinstance(statement, ast.If) or (
+            _ast_source_signature(statement) in nested_in_loop
         ):
             continue
+        body_raise = terminal_raise(statement.body)
+        orelse_raise = terminal_raise(statement.orelse)
+        if body_raise is not None and not statement.orelse:
+            raised_statement = body_raise
+            raises_when_true = True
+        elif orelse_raise is not None and body_raise is None:
+            raised_statement = orelse_raise
+            raises_when_true = False
+        else:
+            continue
         test = statement.test
-        raises_when_true = True
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
             test = test.operand
-            raises_when_true = False
-        predicate_id = expression_nodes.get(id(test))
+            raises_when_true = not raises_when_true
+        predicate_id = _retained_control_value_id(
+            graph, record.get("predicate_id"), test,
+        )
+        if predicate_id is None:
+            predicate_id = node_for_expression(test)
         if predicate_id is None:
             continue
-        child = shell.callsite_function_shells.get(predicate_id)
-        if child is not None:
+        predicate_id = int(predicate_id)
+        predicate_expression = scalar_expression(predicate_id)
+        child = None
+        if predicate_expression is None:
+            child = shell.callsite_function_shells.get(predicate_id)
+        if predicate_expression is None and child is None:
+            child = _synthetic_device_scalar_shell(graph, predicate_id)
+            # This wrapper exists only to classify the predicate projection.
+            # It is not an authored callsite and has no independent roots,
+            # lifecycle, or deployment ABI, so registering it as a child shell
+            # makes the compilation-tree walker attempt to compile analysis
+            # scaffolding as a function.
+        if predicate_expression is None and child is not None:
             projection = _identity_parameter_projection(
                 child.process_graph.G
             )
@@ -970,27 +1595,74 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
                 )
                 if str(role) in {"arg:0", "arg0", "operand", "value"}
             ), predicate_id)
-        else:
-            # Static scalar/shape guards are resolved during planning; only a
-            # tensor scalar projection becomes runtime validation control.
+        elif predicate_expression is None:
             continue
+        raised = raised_statement.exc
+        raised_name = (
+            raised.func.id
+            if isinstance(raised, ast.Call) and isinstance(raised.func, ast.Name)
+            else raised.id if isinstance(raised, ast.Name) else None
+        )
         blocks.append(ValidationBlock(
             predicate_id,
             int(node_id),
             expect_true=not raises_when_true,
+            predicate_expression=predicate_expression,
+            extraction_identity=(
+                f"builtins.{raised_name}" if raised_name else None
+            ),
         ))
     return tuple(blocks)
 
 
-def _positional_argument_index(role: str) -> int | None:
-    """Normalize the two ProcessGraph spellings used for positional edges."""
+def _place_validation_blocks(
+    control: ControlProgram,
+    validations: Iterable[ValidationBlock],
+    retained_regions: Iterable[int],
+    dispatch_subgraphs: Sequence[Any],
+) -> ControlProgram:
+    """Correlate guard predicates with their unique numerical producers."""
 
-    role = str(role)
-    if role.startswith("arg:") and role[4:].isdigit():
-        return int(role[4:])
-    if role.startswith("arg") and role[3:].isdigit():
-        return int(role[3:])
-    return None
+    validations = tuple(validations)
+    if not validations:
+        return control
+    wanted = {int(block.predicate_value_id) for block in validations}
+    producers: dict[int, int] = {}
+    for region_index in map(int, retained_regions):
+        subgraph = dispatch_subgraphs[region_index]
+        produced_here = {
+            int(node_id)
+            for node_id in subgraph.G.graph.get("deployment_nodes", ())
+        } | {
+            int(subgraph.G.nodes[node_id].get("value_id", node_id))
+            for node_id in subgraph.G.graph.get("deployment_nodes", ())
+            if node_id in subgraph.G
+        }
+        for predicate_id in sorted(wanted.intersection(produced_here)):
+            previous = producers.get(predicate_id)
+            if previous is not None and previous != region_index:
+                raise ValueError(
+                    "a validation predicate has more than one scheduled "
+                    f"producer region: value={predicate_id}, "
+                    f"regions=({previous}, {region_index})"
+                )
+            producers[predicate_id] = region_index
+    return place_validations_after_region_producers(
+        control, validations, predicate_regions=producers,
+    )
+
+
+def _positional_argument_index(role: str) -> int | None:
+    """Normalize the two ProcessGraph spellings used for positional edges.
+
+    Delegates to the graph package, which owns edge roles and therefore
+    owns the operator that reads them. Kept as a name here because callers
+    in this module already use it; the implementation must not be a second
+    copy, since the two would drift and a position is not a thing to be
+    slightly wrong about.
+    """
+
+    return positional_argument_index(role)
 
 
 def _method_parameter_layout(graph: Any) -> tuple[
@@ -1029,6 +1701,184 @@ def _method_parameter_layout(graph: Any) -> tuple[
         name for name in positional if name != receiver
     )
     return receiver, call_positional, all_parameters
+
+
+def _record_aggregate_ledger_lookup(
+    graph: Any, value_id: int, data: Any, attributes: Any, leaves: Any,
+) -> None:
+    """Put every ledger lookup on the book, found or not.
+
+    This is the chokepoint every aggregate-member decision passes through,
+    and a miss here is silent: no ledger means no callsite aggregate
+    descriptors, so no indexed member leaves, so no ``parameter_member_
+    formals`` receipt, so the members read as formals no caller can name --
+    and the first thing that says so is the full-native contract at the far
+    end of the build, naming value ids with nothing to tie them back to.
+
+    ``restore(self, snapshot)`` is the live case.  Its snapshot comes from
+    ``saved = state.copy_shallow() if rollback else None`` -- a CONDITIONAL
+    producer.  The ledger belongs to ``copy_shallow()``'s own result node,
+    and what the conditional node in between carries instead is what this
+    record exists to show, without guessing at it.
+    """
+    try:
+        from .identity_concordance import (
+            authored_function_name,
+            current_identity_book,
+        )
+
+        owner = (
+            graph.G.graph.get("function_name")
+            or graph.G.graph.get("qualified_name")
+            or graph.G.graph.get("function_ref")
+        )
+        interesting = {
+            "aggregate_leaf_value_ids", "optional_presence",
+            "conditional_member_bindings", "producer_kind", "aggregate_kind",
+            "aggregate_index", "aggregate_parent_binding",
+        }
+        # An EMPTIED ledger -- the key present, the tuple empty -- is the
+        # case worth the extra detail.  It is indistinguishable from "never
+        # had one" to every reader, because the lookup below tests the
+        # tuple's truth and not the key's presence.  The full attribute key
+        # set fingerprints which writer produced the node, which is the one
+        # thing the shorter record could not say.
+        emptied = "aggregate_leaf_value_ids" in attributes and not leaves
+        # Holding a ledger is not enough.  The consumer additionally
+        # requires every leaf to still be RESIDENT in the graph
+        # (``all(int(leaf) in caller.G ...)`` where callsite aggregate
+        # descriptors are collected), and a ledger whose leaves were folded
+        # away fails that test as silently as a missing ledger does.
+        # ``_repair_missing_aggregate_leaf_projections`` is supposed to
+        # rebuild those, but it declines whenever the stored descriptor
+        # count does not match the leaf count, which leaves the dangling
+        # ledger in place and nobody the wiser.
+        resident = sum(1 for leaf in leaves if int(leaf) in graph.G)
+        current_identity_book().page("aggregate_ledger").set(
+            (str(owner), int(value_id), "ledger_lookup"),
+            0,
+            (
+                "emptied" if emptied
+                else "absent" if not leaves
+                else "resident" if resident == len(leaves)
+                else "dangling",
+                len(leaves),
+                resident,
+                str(data.get("type") or data.get("op") or ""),
+                type(data.get("expr_obj")).__name__,
+                tuple(sorted(interesting.intersection(attributes))),
+                *((
+                    tuple(sorted(map(str, attributes))),
+                    len(tuple(attributes.get("tensor_output_descriptors") or ())),
+                ) if emptied else ()),
+            ),
+        )
+    except Exception:  # noqa: BLE001 -- diagnostics never fail a build
+        pass
+
+
+def _authored_aggregate_leaves(graph: Any, value_id: int) -> tuple[int, ...]:
+    """Return the exact leaf ledger for an authored aggregate value.
+
+    ``*value`` has its own AST node, while the aggregate ledger belongs to
+    ``value``. Follow only that explicit Starred-to-value edge; absence of a
+    ledger is absence of a compiler fact and must not trigger reconstruction
+    from shapes, names, or neighboring values.
+    """
+
+    value_id = int(value_id)
+    if value_id not in graph.G:
+        return ()
+    data = graph.G.nodes[value_id]
+    attributes = data.get("attributes") or {}
+    leaves = tuple(map(int, attributes.get("aggregate_leaf_value_ids", ())))
+    _record_aggregate_ledger_lookup(graph, value_id, data, attributes, leaves)
+    if leaves:
+        return leaves
+    if not isinstance(data.get("expr_obj"), ast.Starred):
+        return ()
+    sources = tuple(
+        int(parent)
+        for parent, role in data.get("parents") or ()
+        if str(role) in {"value", "operand", "arg:0"}
+    )
+    if len(sources) != 1 or sources[0] not in graph.G:
+        return ()
+    source_attributes = graph.G.nodes[sources[0]].get("attributes") or {}
+    return tuple(map(
+        int, source_attributes.get("aggregate_leaf_value_ids", ()),
+    ))
+
+
+def _authored_aggregate_descriptor_tree(graph: Any, value_id: int) -> Any:
+    """Return the exact nested descriptor tree of an authored aggregate.
+
+    Aggregate identity is recursive: a tuple member may itself be a tuple.
+    Flattening the outer ledger to one descriptor per member discarded the
+    coefficient-limb rows in ``((c00, c01), ..., (c30, c31))``.  Preserve the
+    authored tree; leaves remain ordinary tensor descriptors (or ``None``
+    when no shape has yet been proved).
+    """
+
+    value_id = int(value_id)
+    leaves = _authored_aggregate_leaves(graph, value_id)
+    if leaves:
+        return tuple(
+            _authored_aggregate_descriptor_tree(graph, int(leaf))
+            for leaf in leaves
+        )
+    descriptor = _tensor_descriptor(graph, value_id)
+    return (
+        None if descriptor is None
+        else copy.deepcopy(dict(descriptor))
+    )
+
+
+def _expanded_callsite_argument_edges(
+    graph: Any, node_id: int,
+) -> tuple[tuple[int, str], ...]:
+    """Apply Python's positional ``*aggregate`` binding to graph edges.
+
+    Expansion is permitted only from ProcessGraph's authored aggregate-leaf
+    ledger. An unrecorded aggregate remains unexpanded so the missing source
+    identity becomes an honest call-boundary error instead of an inferred ABI.
+    """
+
+    raw = tuple(
+        (int(parent), str(role))
+        for parent, role in graph.G.nodes[int(node_id)].get("parents") or ()
+        if str(role) not in {"callee", "func", "definition"}
+    )
+    positional = sorted(
+        (
+            (_positional_argument_index(role), parent)
+            for parent, role in raw
+            if _positional_argument_index(role) is not None
+        ),
+        key=lambda item: int(item[0]),
+    )
+    non_positional = tuple(
+        (parent, role)
+        for parent, role in raw
+        if _positional_argument_index(role) is None
+    )
+    expanded: list[tuple[int, str]] = []
+    next_position = 0
+    for original_position, parent in positional:
+        next_position = max(next_position, int(original_position))
+        parent_data = graph.G.nodes.get(int(parent), {})
+        if isinstance(parent_data.get("expr_obj"), ast.Starred):
+            leaves = _authored_aggregate_leaves(graph, int(parent))
+            if leaves:
+                expanded.extend(
+                    (leaf, f"arg:{next_position + offset}")
+                    for offset, leaf in enumerate(leaves)
+                )
+                next_position += len(leaves)
+                continue
+        expanded.append((int(parent), f"arg:{next_position}"))
+        next_position += 1
+    return (*expanded, *non_positional)
 
 
 def _declared_output_terminals(
@@ -1110,14 +1960,418 @@ def _declared_output_terminals(
     return terminals
 
 
-def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
+def _control_dependency_value_ids(control: Any) -> frozenset[int]:
+    from .control_source import control_dependency_value_ids
+
+    return control_dependency_value_ids(control)
+
+def _atomic_region_node_order(
+    graph: Any,
+    topological_nodes: tuple[int, ...],
+    region_by_node: Mapping[int, int],
+) -> tuple[int, ...]:
+    """Node walk order in which every dispatch region is one atomic unit.
+
+    ``_dependency_order`` orders NODES.  The hierarchy plan emits a region
+    closure when the walk meets the region's FIRST member, so a region whose
+    members straddle another region's output was emitted before its
+    producer: ``pi_update``'s region_1 holds the line-5 ``dt_prev``/``dt_pen``
+    casts AND the line-13 ``self.acc`` update, which reads the field written
+    from region_0's line-7 cast (``GetAttr`` ``after_write`` edge).  The
+    plan listed region_1 first, the control lowering called it first, and
+    the accumulator update ran on the stale field.  Contract each region to
+    one unit, order the units topologically over the forward semantic
+    parent edges between different units (with the same retained-loop
+    control-member discount ``_topological_region_order`` applies), break
+    ties by the first member's node position so every already-valid order
+    is unchanged, and expand each unit back to its members in node order.
+    """
+
+    G = graph.G
+    order_index = {
+        int(node_id): index for index, node_id in enumerate(topological_nodes)
+    }
+
+    def unit_of(node_id: int) -> tuple[str, int]:
+        region_index = region_by_node.get(int(node_id))
+        if region_index is None:
+            return ("node", int(node_id))
+        return ("region", int(region_index))
+
+    members: dict[tuple[str, int], list[int]] = {}
+    for node_id in topological_nodes:
+        members.setdefault(unit_of(int(node_id)), []).append(int(node_id))
+    if not any(unit[0] == "region" for unit in members):
+        return tuple(topological_nodes)
+    recursion_control_nodes = frozenset(
+        int(node_id)
+        for record in (G.graph.get("recursion_table") or {}).values()
+        if record.get("control_ir", True)
+        for node_id in record.get("control_members", ())
+        if int(node_id) in G
+    )
+    unit_graph = nx.DiGraph()
+    unit_graph.add_nodes_from(members)
+    for node_id in topological_nodes:
+        node_id = int(node_id)
+        if node_id in recursion_control_nodes:
+            continue
+        consumer = unit_of(node_id)
+        for parent, _role in (G.nodes[node_id].get("parents") or ()):
+            parent = int(parent)
+            if (
+                parent not in order_index
+                or parent in recursion_control_nodes
+                or order_index[parent] >= order_index[node_id]
+            ):
+                continue
+            producer = unit_of(parent)
+            if producer != consumer:
+                unit_graph.add_edge(producer, consumer)
+    first_position = {
+        unit: order_index[unit_members[0]]
+        for unit, unit_members in members.items()
+    }
+    try:
+        ordered_units = tuple(nx.lexicographical_topological_sort(
+            unit_graph, key=lambda unit: first_position[unit],
+        ))
+    except nx.NetworkXUnfeasible as error:
+        cycles = tuple(
+            tuple(unit for unit in cycle if unit[0] == "region")
+            for cycle in nx.simple_cycles(unit_graph)
+        )
+        raise ValueError(
+            "dispatch regions are not atomic compilation units: canonical "
+            "data dependencies cross region boundaries cyclically: "
+            f"{cycles!r}"
+        ) from error
+    return tuple(
+        node_id
+        for unit in ordered_units
+        for node_id in members[unit]
+    )
+
+
+def _shader_fusible_node_ids(
+    graph: Any, node_ids: Iterable[int],
+) -> tuple[int, ...]:
+    """Elementwise nodes that may share one generated shader body.
+
+    Shape/layout changes, reductions, contractions, constructors and other
+    native kernels remain executable, but each is a reserved dispatch region.
+    The captured backend already has dedicated lowerings for those regions;
+    admitting them to elementwise fixed-point fusion merely hides their
+    ordering boundary and hands ``program_snippet`` an impossible mixed body.
+    """
+
+    fusible = []
+    for node_id in node_ids:
+        data = graph.G.nodes[int(node_id)]
+        operation = str(
+            (data.get("attributes") or {}).get("tensor")
+            or (data.get("attributes") or {}).get("tensor_operation")
+            or data.get("op") or data.get("type") or data.get("label")
+        )
+        try:
+            canonical_elementwise_op(operation)
+        except KeyError:
+            continue
+        fusible.append(int(node_id))
+    return tuple(fusible)
+
+
+def _precision_indivisible_node_groups(
+    graph: Any,
+    executable_node_ids: Iterable[int],
+) -> tuple[tuple[int, ...], ...]:
+    """Reserve each concorded Precision interval as one compiler region.
+
+    Precision limbs are not independent region values. The source
+    concordance is the authority for both boundaries and every
+    precision-bearing interior value. Connected components of those facts
+    are therefore the exact non-separable units supplied to the ordinary
+    region reducer; source ranges and backend operator lists are irrelevant.
+    """
+
+    from .identity_concordance import current_identity_book
+
+    executable = {
+        int(node_id) for node_id in executable_node_ids
+        if int(node_id) in graph.G
+    }
+    if not executable:
+        return ()
+    scope = str(
+        graph.G.graph.get("source_numeric_scope")
+        or graph.G.graph.get("function_name")
+        or graph.G.graph.get("qualified_name")
+        or "<module>"
+    )
+    book = current_identity_book()
+    class_page = book.page("source_value_class_concordance")
+    boundary_page = book.page("source_precision_boundary_concordance")
+    precision_values = {
+        int(row[1])
+        for row in class_page.rows()
+        for fact in (class_page.latest(row),)
+        if (
+            isinstance(row, tuple)
+            and len(row) == 2
+            and str(row[0]) == scope
+            and int(row[1]) in executable
+            and isinstance(fact, tuple)
+            and len(fact) >= 2
+            and str(fact[0]).rsplit(".", 1)[-1] == "Precision"
+        )
+    }
+    boundaries = {
+        int(row[1]): (str(fact[0]), int(fact[1]), int(fact[2]))
+        for row in boundary_page.rows()
+        for fact in (boundary_page.latest(row),)
+        if (
+            isinstance(row, tuple)
+            and len(row) == 2
+            and str(row[0]) == scope
+            and int(row[1]) in graph.G
+            and isinstance(fact, tuple)
+            and len(fact) == 3
+        )
+    }
+    members = precision_values | set(boundaries)
+    if len(members) < 2:
+        return ()
+
+    semantic = nx.Graph()
+    semantic.add_nodes_from(members)
+    for node_id in members:
+        for parent, _role in graph.G.nodes[node_id].get("parents", ()):
+            parent = int(parent)
+            if parent in members:
+                semantic.add_edge(parent, node_id)
+        for parent in graph.G.predecessors(node_id):
+            if int(parent) in members:
+                semantic.add_edge(int(parent), node_id)
+
+    region_page = book.page("source_precision_region_concordance")
+    groups = []
+    order = {
+        int(node_id): index
+        for index, node_id in enumerate(_dependency_order(graph))
+    }
+    for component in nx.connected_components(semantic):
+        component_boundaries = {
+            node_id: boundaries[node_id]
+            for node_id in component if node_id in boundaries
+        }
+        promotes = tuple(sorted(
+            node_id for node_id, fact in component_boundaries.items()
+            if fact[0] in {"promote", "pack"}
+        ))
+        collapses = tuple(sorted(
+            node_id for node_id, fact in component_boundaries.items()
+            if fact[0] == "collapse"
+        ))
+        # A helper may return Precision directly.  Its authored interval is
+        # open at the function boundary rather than closed by ``collapse``;
+        # the promotion and every concorded Precision result are still one
+        # non-separable numerical region.  Requiring a collapse stranded the
+        # promoted high limbs as anonymous frame formals in precisely these
+        # helpers, so native execution read uninitialized storage.
+        if not promotes:
+            continue
+        ordered = tuple(sorted(
+            component.intersection(executable), key=order.__getitem__,
+        ))
+        if len(ordered) < 2:
+            continue
+        widths = tuple(sorted({
+            int(fact[2]) for fact in component_boundaries.values()
+        }))
+        row = (scope, collapses[-1] if collapses else ordered[-1])
+        proposed = (ordered, promotes, collapses, widths)
+        incumbent = region_page.latest(row)
+        if incumbent is not None and tuple(incumbent) != proposed:
+            raise ValueError(
+                "source precision region concordance disagreement for "
+                f"{row!r}: recorded={incumbent!r}, proposed={proposed!r}"
+            )
+        if incumbent is None:
+            region_page.set(row, 0, proposed)
+        for node_id in ordered:
+            graph.G.nodes[node_id].setdefault("attributes", {})[
+                "source_precision_region"
+            ] = row
+        groups.append(ordered)
+    return tuple(groups)
+
+
+def _concord_consumer_operands(
+    graph: Any, consumer_nodes: Any, values: Any,
+) -> None:
+    """Commit, per consumer node and value, which operands read it.
+
+    Page ``consumer_operand`` row ``(read scope, node, value)`` holds the
+    ``(role, ordinal)`` positions of ``node``'s operands that read
+    ``value``.  Structure only: the binding each operand read is the base
+    fact ``lexical_read_binding``, at ``(read scope, node, role, ordinal)``.
+    """
+
+    from ..common.tensors.topological_reducer import _operand_positions
+    from .identity_concordance import current_identity_book
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is None:
+        return
+    wanted = set(map(int, values))
+    page = current_identity_book().page("consumer_operand")
+    for node_id in consumer_nodes:
+        if int(node_id) not in graph.G:
+            continue
+        positions: dict[int, list[tuple[Any, int]]] = {}
+        for role, ordinal, parent in _operand_positions(
+            graph.G.nodes[int(node_id)].get("parents") or ()
+        ):
+            if int(parent) in wanted:
+                positions.setdefault(int(parent), []).append((role, ordinal))
+        for parent, operand_positions in positions.items():
+            page.concord(
+                (tuple(scope), int(node_id), parent), tuple(operand_positions),
+            )
+
+
+def _concord_call_argument_operands(
+    graph: Any, callsite_id: int, operand_edges: Mapping[int, tuple[int, str]],
+) -> None:
+    """Commit, per argument position of one call, which operand it is.
+
+    Page ``call_argument_operand`` row ``(read scope, callsite, position)``
+    holds the ``(role, ordinal)`` of the call node's operand that produced
+    that argument binding.  One value passed twice is two operands; the
+    binding each read is the base fact ``lexical_read_binding``.
+    """
+
+    from ..common.tensors.topological_reducer import _operand_positions
+    from .identity_concordance import current_identity_book
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is None or int(callsite_id) not in graph.G:
+        return
+    positions = list(_operand_positions(
+        graph.G.nodes[int(callsite_id)].get("parents") or ()
+    ))
+    page = current_identity_book().page("call_argument_operand")
+    for index, (parent, role) in operand_edges.items():
+        ordinal = next((
+            edge_ordinal for edge_role, edge_ordinal, edge_parent in positions
+            if str(edge_role) == str(role) and int(edge_parent) == int(parent)
+        ), None)
+        if ordinal is not None:
+            page.concord(
+                (tuple(scope), int(callsite_id), int(index)), (role, ordinal),
+            )
+
+
+def _build_shell_hierarchy_plan(
+    shell: Any,
+    _memo: dict[int, PlanClosure] | None = None,
+) -> PlanClosure:
     """Freeze call/region ownership before backend source composition."""
 
+    memo = {} if _memo is None else _memo
+    incumbent_plan = memo.get(id(shell))
+    if incumbent_plan is not None:
+        return incumbent_plan
+
     graph = shell.process_graph
+    # The plan freezes tensor descriptors into ``PlanClosure.value_shapes``.
+    # Some catalogue and callsite shells are constructed before their
+    # ProgramABI descriptors arrive; freezing them at that point permanently
+    # records reshape results as scalars even though the graph can now resolve
+    # their structural shape tuples. Make the documented ordering invariant
+    # local to the freeze operation itself. The fold is structural,
+    # idempotent, and executes no numerical source code.
+    if graph.G.graph.get("function_name"):
+        _fold_callsite_structural_values(graph)
+    # An Indexed successor used to unpack a multi-result source call is a
+    # call-boundary projection, not a numerical gather owned by a region.
+    # Dispatch regions can be carved before callsite shells are attached, so
+    # remove these exact projection nodes when freezing final ownership. If
+    # both the PlanCall and a stale region produce the same caller value, the
+    # repository-SSA type linker sees two physical definitions and can
+    # oscillate between their shapes indefinitely.
+    def call_result_projections(value_id: int) -> set[int]:
+        # Every literal-index projection below a call result is a structural
+        # path onto that call's outputs: ``r[1]`` (an intermediate aggregate
+        # with no physical value of its own) as much as ``r[1][0]`` (a bound
+        # leaf).  None of them is an operator a region may compute.
+        found: set[int] = set()
+        pending = [int(value_id)]
+        while pending:
+            current = pending.pop()
+            for successor in graph.G.successors(current):
+                successor_data = graph.G.nodes[successor]
+                if str(
+                    successor_data.get("op")
+                    or successor_data.get("type")
+                    or ""
+                ).casefold() != "indexed":
+                    continue
+                if not any(
+                    str(role) in {"value", "base", "operand", "object"}
+                    and int(parent) == current
+                    for parent, role in successor_data.get("parents") or ()
+                ):
+                    continue
+                # Only a literal integer index is a structural path onto a
+                # call's outputs.  A slice or a tuple of slices over a tensor
+                # call result (``moment[:, :, 1]``, ``m[:, :, 0:2]``) is a
+                # numerical view an owning region must compute; treating it
+                # as a projection left it with no producer at all.
+                index_parents = tuple(
+                    int(parent)
+                    for parent, role in successor_data.get("parents") or ()
+                    if str(role) == "index"
+                )
+                if len(index_parents) != 1 or index_parents[0] not in graph.G:
+                    continue
+                index_data = graph.G.nodes[index_parents[0]]
+                if str(index_data.get("type")) not in {
+                    "Const", "const", "Constant",
+                }:
+                    continue
+                try:
+                    index_value = _constant_value(index_data)
+                except KeyError:
+                    continue
+                if not isinstance(index_value, int) or isinstance(
+                    index_value, bool
+                ):
+                    continue
+                if int(successor) in found:
+                    continue
+                found.add(int(successor))
+                # Keep descending only while the projection is itself an
+                # intermediate aggregate.  ``r[1][0]`` is a structural path
+                # when ``r[1]`` is another tuple, and an ordinary element read
+                # when ``r[1]`` is a tensor.  Walking through a tensor removed
+                # that read from every region, so nothing computed it and the
+                # caller kept a formal for it.
+                if _tensor_descriptor(graph, int(successor)) is None:
+                    pending.append(int(successor))
+        return found
+
+    call_result_projection_ids = {
+        projection
+        for callsite_id in shell.callsite_function_shells
+        if int(callsite_id) in graph.G
+        for projection in call_result_projections(int(callsite_id))
+    }
     region_by_node = {
         int(node_id): int(region_index)
         for region_index, subgraph in enumerate(shell.dispatch_subgraphs)
         for node_id in subgraph.G.graph.get("deployment_nodes", ())
+        if int(node_id) not in call_result_projection_ids
     }
     emitted_regions = set()
     items = []
@@ -1126,7 +2380,6 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         int(node_id): index
         for index, node_id in enumerate(topological_nodes)
     }
-
     def source_position(node_id: int) -> tuple[int, int] | None:
         expression = graph.G.nodes[int(node_id)].get("expr_obj")
         line = getattr(expression, "lineno", None)
@@ -1136,16 +2389,66 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         return int(line), int(column or 0)
 
     caller_identities = graph.G.graph.get("identity_table") or {}
-    for node_id in topological_nodes:
+    # Regions are emitted atomically at the position of their first member,
+    # so the walk must already respect region-level dependencies.
+    walk_order = _atomic_region_node_order(
+        graph, topological_nodes, region_by_node,
+    )
+
+    def direct_return_value_ids(child_graph: Any) -> tuple[int, ...]:
+        """Resolve one direct return by deterministic source coordinates.
+
+        ProcessGraph return_value_nodes historically held ``id(ast_node)``
+        correlations, which do not survive graph reduction/reconstruction.
+        The reduced nodes retain exact source spans, so correlate the authored
+        Return.value to its graph value without restoring transient ids.
+        """
+
+        return_signatures = set()
+        for _candidate_id, candidate_data in child_graph.nodes(data=True):
+            expression = candidate_data.get("expr_obj")
+            if not isinstance(expression, ast.AST):
+                continue
+            for nested in ast.walk(expression):
+                if not isinstance(nested, ast.Return) or nested.value is None:
+                    continue
+                return_signatures.add(_ast_source_signature(nested.value))
+        matched = []
+        for candidate_id, candidate_data in child_graph.nodes(data=True):
+            expression = candidate_data.get("expr_obj")
+            if not isinstance(expression, ast.AST):
+                continue
+            if _ast_source_signature(expression) not in return_signatures:
+                continue
+            value_id = int(candidate_data.get("value_id", candidate_id))
+            attributes = candidate_data.get("attributes") or {}
+            if (
+                str(attributes.get("extraction_identity") or "") in {
+                    "builtins.bytes", "builtins.bytearray", "builtins.list",
+                    "builtins.tuple", "builtins.frozenset", "builtins.set",
+                }
+                or str(attributes.get("producer_kind") or "")
+                == "aggregate_materialization"
+            ):
+                backing = tuple(
+                    int(parent)
+                    for parent, role in candidate_data.get("parents") or ()
+                    if str(role) in {"arg:0", "operand", "value"}
+                )
+                if len(backing) == 1:
+                    value_id = backing[0]
+            matched.append(value_id)
+        unique = tuple(dict.fromkeys(matched))
+        # Multiple lexical returns need control-aware result merging; never
+        # guess that they are a tuple-valued return surface.
+        return unique if len(unique) == 1 else ()
+
+    for node_id in walk_order:
         child = shell.callsite_function_shells.get(node_id)
         if child is not None:
-            call_parents = tuple(
-                (int(parent), str(role))
-                for parent, role in (
-                    graph.G.nodes[node_id].get("parents") or ()
-                )
-                if str(role) not in {"callee", "func", "definition"}
-            )
+            call_attributes = graph.G.nodes[node_id].get("attributes") or {}
+            constructor_call = call_attributes.get("constructor_ref") is not None
+            call_parents = _expanded_callsite_argument_edges(graph, node_id)
             parents = tuple(parent for parent, _role in call_parents)
             child_graph = child.process_graph.G
             child_identities = (
@@ -1155,8 +2458,121 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                 _method_parameter_layout(child_graph)
             )
             argument_bindings = []
-            for parent, role in call_parents:
+            if constructor_call and receiver_parameter is not None:
+                receiver_identities = child_identities.get(
+                    receiver_parameter, ()
+                )
+                if receiver_identities:
+                    # The class-call result is the caller-owned record identity
+                    # initialized by __init__/__new__.  It is both the
+                    # constructor callsite and the concrete ``self`` binding;
+                    # its fields remain ordinary caller-owned arena values.
+                    argument_bindings.append((
+                        int(node_id), int(receiver_identities[0])
+                    ))
+            # Which call edge produced each argument binding, whatever path
+            # the body below takes: the operand's authored read is the edge's.
+            operand_edges: dict[int, tuple[int, str]] = {}
+
+            def attributed_call_parents():
+                for edge_parent, edge_role in call_parents:
+                    start = len(argument_bindings)
+                    yield edge_parent, edge_role
+                    for index in range(start, len(argument_bindings)):
+                        operand_edges[index] = (int(edge_parent), str(edge_role))
+
+            for parent, role in attributed_call_parents():
                 position = _positional_argument_index(role)
+                call_expression = graph.G.nodes[node_id].get("expr_obj")
+                argument_expression = None
+                if isinstance(call_expression, ast.Call):
+                    if (
+                        position is not None
+                        and position < len(call_expression.args)
+                    ):
+                        argument_expression = call_expression.args[position]
+                    elif role.startswith("kw:"):
+                        keyword_name = role.split(":", 1)[1]
+                        argument_expression = next((
+                            keyword.value
+                            for keyword in call_expression.keywords
+                            if keyword.arg == keyword_name
+                        ), None)
+                # The ProcessGraph edge for a mutable aggregate may retain
+                # its construction producer (``types = []``) even after the
+                # lexical spelling denotes the resident mutation result.
+                # A Name argument has an exact source-time identity: choose
+                # the latest deterministic definition preceding this call.
+                # This is SSA correlation, not name-based backend recovery.
+                # Retained-loop materialization has already rewired a use
+                # after the loop onto its LoopResult/LoopExit port.  That
+                # edge is the control-aware current definition.  Replacing it
+                # with the latest source-coordinate candidate can select an
+                # assignment inside the loop body instead, moving a call
+                # behind the consumer of its own result.  Name-history repair
+                # is only for stale ordinary producer edges; never override a
+                # planner-owned loop exit correlation.
+                parent_operation = str(
+                    graph.G.nodes.get(int(parent), {}).get("op")
+                    or graph.G.nodes.get(int(parent), {}).get("type")
+                    or ""
+                ).casefold()
+                # The same holds for a conditional merge: a ``Phi`` is the
+                # reducer's exact, control-aware definition of the name after
+                # an ``if`` (``dt_next = minimum(...)`` in one arm, the
+                # pi_update value otherwise).  A Phi has no source position,
+                # so the source-ordered candidate scan below can never select
+                # it and instead picks the arm-local producer, which does not
+                # dominate the call (step_with_dt_control_used:
+                # ``_apply_energy_sidechain(dt_next, ...)`` was bound to the
+                # ``minimum`` inside ``if metrics.dt_limit is not None`` and
+                # refused as an undefined operand).  Never override a merge.
+                if (
+                    isinstance(argument_expression, ast.Name)
+                    and parent_operation not in {"loopresult", "loopexit", "phi"}
+                ):
+                    call_position = source_position(int(node_id))
+                    # ``state, out = f(state)`` spells its targets left of
+                    # the call.  A definition that consumes this call's
+                    # result is a successor of the call, so it can never be
+                    # a preceding definition regardless of its column; using
+                    # it feeds the call its own result and leaves the loop
+                    # carry without a producer.
+                    candidates = [
+                        int(definition)
+                        for definition in caller_identities.get(
+                            argument_expression.id, ()
+                        )
+                        if (
+                            int(definition) in order_index
+                            and not nx.has_path(
+                                graph.G, int(node_id), int(definition)
+                            )
+                            and (
+                                call_position is not None
+                                and source_position(int(definition)) is not None
+                                and source_position(int(definition))
+                                < call_position
+                                or (
+                                    (
+                                        call_position is None
+                                        or source_position(int(definition))
+                                        is None
+                                    )
+                                    and order_index[int(definition)]
+                                    < order_index[int(node_id)]
+                                )
+                            )
+                        )
+                    ]
+                    if candidates:
+                        parent = max(
+                            candidates,
+                            key=lambda definition: (
+                                source_position(definition)
+                                or (-1, order_index[definition])
+                            ),
+                        )
                 if position is not None:
                     name = (
                         positional_parameters[position]
@@ -1170,13 +2586,97 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     name = receiver_parameter
                 elif role.startswith("kw:"):
                     name = role.split(":", 1)[1]
+                elif role.startswith("closure:"):
+                    name = role.split(":", 1)[1]
                 else:
                     name = None
                 identities = child_identities.get(name, ())
-                if identities:
-                    argument_bindings.append(
-                        (parent, int(identities[0]))
+                caller_leaves = _authored_aggregate_leaves(
+                    graph, int(parent),
+                )
+                # Member formals materialized for an aggregate parameter
+                # carry their exact member path.  They outlive the
+                # shapeless aggregate formal, which is dropped once every
+                # authored projection reads its member directly, so the
+                # member binding must not depend on that formal's identity.
+                member_inputs = {
+                    tuple(map(int, member_attributes.get(
+                        "aggregate_path",
+                        (member_attributes["aggregate_index"],),
+                    ))): int(member_id)
+                    for member_id, member_data in child_graph.nodes(data=True)
+                    if member_data.get("type") == "Input"
+                    and str(
+                        (member_data.get("attributes") or {}).get(
+                            "aggregate_parent_binding"
+                        )
+                    ) == str(name)
+                    for member_attributes in (
+                        member_data.get("attributes") or {},
                     )
+                    if member_attributes.get("aggregate_index") is not None
+                }
+                if member_inputs:
+                    caller_member_ids: dict[tuple[int, ...], int] = {}
+
+                    def record_caller_members(
+                        value_id: int, path: tuple[int, ...] = (),
+                    ) -> None:
+                        member_leaves = _authored_aggregate_leaves(
+                            graph, int(value_id),
+                        )
+                        if not member_leaves:
+                            if path:
+                                caller_member_ids[path] = int(value_id)
+                            return
+                        for member_index, member_id in enumerate(member_leaves):
+                            record_caller_members(
+                                int(member_id), (*path, int(member_index)),
+                            )
+
+                    record_caller_members(int(parent))
+                    missing_paths = tuple(
+                        path for path in member_inputs
+                        if path not in caller_member_ids
+                    )
+                    if missing_paths:
+                        raise ValueError(
+                            f"aggregate call binding for {name!r} names "
+                            f"paths {missing_paths!r} absent from caller "
+                            f"paths {tuple(caller_member_ids)!r}"
+                        )
+                    for path in sorted(member_inputs):
+                        argument_bindings.append((
+                            int(caller_member_ids[path]), member_inputs[path],
+                        ))
+                if identities and not member_inputs:
+                    # With member formals bound above, the aggregate itself
+                    # has no physical storage to pass: the callee's formal is
+                    # the tuple of its members.  Binding it too would turn an
+                    # authored tuple node into an untyped caller argument.
+                    child_input = int(identities[0])
+                    child_input_data = child_graph.nodes.get(child_input, {})
+                    if (child_input_data.get("attributes") or {}).get(
+                        "structural_specialization"
+                    ):
+                        # This exact formal has already become a callee-owned
+                        # literal. Its source identity remains in the ledger,
+                        # but it no longer accepts a runtime argument frame.
+                        continue
+                    argument_bindings.append((parent, child_input))
+                    child_leaves = _authored_aggregate_leaves(
+                        child.process_graph, child_input,
+                    )
+                    if caller_leaves or child_leaves:
+                        if len(caller_leaves) != len(child_leaves):
+                            raise ValueError(
+                                f"aggregate call binding for {name!r} has "
+                                "different caller/callee arity: "
+                                f"{len(caller_leaves)} != {len(child_leaves)}"
+                            )
+                        argument_bindings.extend(zip(
+                            caller_leaves, child_leaves, strict=True,
+                        ))
             bound_child_inputs = {
                 int(child_input)
                 for _caller, child_input in argument_bindings
@@ -1196,6 +2696,9 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     for definition in caller_identities.get(name, ())
                     if (
                         int(definition) in order_index
+                        and not nx.has_path(
+                            graph.G, int(node_id), int(definition)
+                        )
                         and (
                             (
                                 call_position is not None
@@ -1234,11 +2737,45 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                 )
                 if child_identities.get(name)
             )
-            unpacked = {}
-            for successor in graph.G.successors(node_id):
-                successor_data = graph.G.nodes[successor]
+            if not child_outputs:
+                # ``return bytes(out)`` and other direct aggregate-return
+                # expressions have no authored assignment name, so
+                # function_outputs is legitimately empty.  Capture analysis
+                # already records their exact ProcessGraph value ids; use
+                # that structural return surface for the call binding instead
+                # of silently turning a value-returning call into void.
+                child_outputs = tuple(map(int, getattr(
+                    child, "_captured_return_value_ids", (),
+                )))
+            if not child_outputs:
+                child_outputs = direct_return_value_ids(child_graph)
+            # A returned aggregate is a structural path, not one position in
+            # a flat list.  ``return total, (hub, angle), valid`` has leaf
+            # paths (0,), (1, 0), (1, 1), (2,); the caller's ``r[1][0]`` is
+            # the projection path (1, 0).  Expanding the callee leaves and
+            # zipping them against the caller's first-level projections
+            # shifts every member after the aggregate onto the wrong result.
+            child_output_paths: dict[tuple[int, ...], int] = {}
+
+            def expand_child_output(
+                path: tuple[int, ...], value_id: int,
+            ) -> None:
+                leaves = _authored_aggregate_leaves(
+                    child.process_graph, int(value_id),
+                )
+                if not leaves:
+                    child_output_paths[path] = int(value_id)
+                    return
+                for index, leaf in enumerate(leaves):
+                    expand_child_output((*path, int(index)), int(leaf))
+
+            for position, child_output in enumerate(child_outputs):
+                expand_child_output((int(position),), int(child_output))
+
+            def literal_projection_index(successor: int) -> int | None:
+                successor_data = graph.G.nodes[int(successor)]
                 if str(successor_data.get("op", "")).lower() != "indexed":
-                    continue
+                    return None
                 index_parents = tuple(
                     int(parent)
                     for parent, role in (
@@ -1246,27 +2783,51 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     )
                     if str(role) == "index"
                 )
-                if not index_parents:
-                    continue
+                if len(index_parents) != 1:
+                    return None
                 index_data = graph.G.nodes[index_parents[0]]
                 index_value = index_data.get("constant")
                 if index_value is None:
                     index_value = (
                         index_data.get("attributes") or {}
                     ).get("value")
-                if isinstance(index_value, int):
-                    unpacked[int(index_value)] = int(successor)
-            if len(child_outputs) == 1:
-                result_bindings = ((child_outputs[0], int(node_id)),)
+                if isinstance(index_value, bool) or not isinstance(
+                    index_value, int
+                ):
+                    return None
+                return int(index_value)
+
+            caller_projection_paths: dict[tuple[int, ...], int] = {}
+
+            def collect_caller_projections(
+                path: tuple[int, ...], value_id: int,
+            ) -> None:
+                for successor in graph.G.successors(int(value_id)):
+                    index = literal_projection_index(int(successor))
+                    if index is None:
+                        continue
+                    projection_path = (*path, index)
+                    caller_projection_paths[projection_path] = int(successor)
+                    collect_caller_projections(projection_path, int(successor))
+
+            collect_caller_projections((), int(node_id))
+            if tuple(child_output_paths) == ((0,),) and not (
+                graph.G.nodes[int(node_id)].get("attributes") or {}
+            ).get("authored_return_container"):
+                result_bindings = (
+                    (child_output_paths[(0,)], int(node_id)),
+                )
             else:
                 result_bindings = tuple(
-                    (child_output, unpacked[index])
-                    for index, child_output in enumerate(child_outputs)
-                    if index in unpacked
+                    (child_output_paths[path], caller_projection_paths[path])
+                    for path in child_output_paths
+                    if path in caller_projection_paths
                 )
+            child_outputs = tuple(child_output_paths.values())
+            _concord_call_argument_operands(graph, int(node_id), operand_edges)
             items.append(PlanCall(
                 int(node_id),
-                _build_shell_hierarchy_plan(child),
+                _build_shell_hierarchy_plan(child, memo),
                 parents,
                 tuple(caller for _callee, caller in result_bindings),
                 tuple(argument_bindings),
@@ -1292,125 +2853,714 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             continue
         emitted_regions.add(region_index)
         subgraph = shell.dispatch_subgraphs[region_index]
+        # The dispatch subgraph was carved before loop evaporation could
+        # replace the nodes it named.  The live graph is the authority for
+        # what this region still contains, so drop members it no longer
+        # holds instead of indexing them and raising a bare KeyError.
         region_nodes = tuple(
             int(value)
             for value in subgraph.G.graph.get("deployment_nodes", ())
+            if int(value) not in call_result_projection_ids
+            and int(value) in graph.G
         )
-        items.append(PlanClosure(
-            name=f"region_{region_index}",
-            captures=tuple(
-                int(value)
-                for value in subgraph.G.graph.get("deployment_inputs", ())
-            ),
-            items=tuple(
-                PlanLine.create(
-                    str(
-                        graph.G.nodes[value].get("op")
-                        or graph.G.nodes[value].get("type")
-                    ),
-                    inputs=tuple(
-                        int(parent)
-                        for parent, _role in (
-                            graph.G.nodes[value].get("parents") or ()
-                        )
-                    ),
-                    outputs=(value,),
-                    attributes={"region": region_index},
-                )
-                for value in region_nodes
-            ),
-        ))
-    control_values = set()
-    control = getattr(shell, "shell_control_program", None)
-    if control is not None:
-        control_values.update(
-            int(uniform.value_id) for uniform in control.uniforms
+        original_region_node_set = set(region_nodes)
+        carried_initial_boundaries = {
+            int(initial)
+            for loop_plan in getattr(shell, "loop_plans", ())
+            for _name, initial, updated in loop_plan.loop.carried_bindings
+            if int(updated) in original_region_node_set
+            and int(initial) != int(updated)
+        }
+        # A carried initializer is the entry arm of the coordinator-owned Phi.
+        # If the numerical compartment also owns that initializer, its body
+        # recomputes from the iteration-zero value on every trip.  Cut it from
+        # this region so the ordinary capture calculation below binds the
+        # current Phi value into the update operation.
+        region_nodes = tuple(
+            value_id for value_id in region_nodes
+            if value_id not in carried_initial_boundaries
         )
-        control_values.update(
-            int(value_id)
-            for iterable, target, _induction, sources
-            in control.closure_iterable_bindings
-            for value_id in (iterable, target, *sources)
-        )
-        control_values.update(
-            int(value_id)
-            for pair in control.value_aliases
-            for value_id in pair
-        )
-        control_values.update(
-            int(value_id)
-            for iterable, target, _induction
-            in control.iterable_bindings
-            for value_id in (iterable, target)
-        )
-        control_values.update(
-            int(value_id)
-            for source, collection, _induction, _start
-            in control.collection_bindings
-            for value_id in (source, collection)
-        )
-        control_values.update(
-            int(value_id)
-            for iterable, target, _induction, _values
-            in control.static_iterable_bindings
-            for value_id in (iterable, target)
-        )
+        region_node_set = set(region_nodes)
 
-        def validation_values(block) -> None:
-            from .control_source import (
-                CallBlock,
-                LoopControlBlock,
-                LoopBlock,
-                ParallelDeployment,
-                SequenceBlock,
-                StateMachineTick,
-                WhileBlock,
+        def numerical_region_parents(
+            node_id: int,
+        ) -> tuple[tuple[int, str], ...]:
+            """Expose structural tensor-call leaves at the numerical ABI.
+
+            A Python list/tuple is one source argument, but stack/cat consume
+            each tensor element as a separate numerical operand.  The graph's
+            aggregate leaf ledger is the exact authored correspondence; the
+            container identity itself is coordinator storage and must not
+            replace those producers at a numerical region cut.
+            """
+
+            node_data = graph.G.nodes.get(int(node_id))
+            if node_data is None:
+                # Loop evaporation removes the nodes it replaced, and a region
+                # view carved before that still names them.  The graph is the
+                # authority this recomputation exists to consult, so a node it
+                # no longer holds contributes no parents rather than raising.
+                return ()
+            operation = str(
+                node_data.get("op") or node_data.get("type") or ""
+            )
+            expanded: list[tuple[int, str]] = []
+            for parent, role in node_data.get("parents") or ():
+                parent = int(parent)
+                parent_data = graph.G.nodes.get(parent, {})
+                attributes = parent_data.get("attributes") or {}
+                leaves = tuple(map(
+                    int,
+                    attributes.get("aggregate_leaf_value_ids", ()),
+                ))
+                if (
+                    operation in {"stack", "cat", "concat"}
+                    and str(role).startswith("arg")
+                    and attributes.get("producer_kind") == "aggregate"
+                    and attributes.get("aggregate_kind") in {"list", "tuple"}
+                    and leaves
+                ):
+                    expanded.extend(
+                        (leaf, f"{role}:element:{index}")
+                        for index, leaf in enumerate(leaves)
+                    )
+                else:
+                    expanded.append((parent, str(role)))
+            return tuple(expanded)
+
+        # Loop-port materialization can rewrite a region's live parents after
+        # its dispatch subgraph was first carved. Recompute region captures
+        # from the authoritative current graph instead of
+        # reusing stale deployment_inputs from the numeric view.
+        region_captures = tuple(dict.fromkeys((
+            *(
+                int(parent)
+                for node_id in region_nodes
+                for parent, _role in numerical_region_parents(node_id)
+                if int(parent) not in region_node_set
+            ),
+        )))
+
+        # A region capture is not necessarily a runtime input. Structural
+        # arguments such as ``transpose(-2, -1)`` often sit just outside the
+        # tensor region as a tiny constant-expression chain (Const -> neg, or
+        # several constants -> Tuple). Preserve that source closure in the
+        # region instead of promoting its terminal to an unexplained ABI
+        # parameter. This is graph-source pursuit, not value specialization:
+        # only expressions whose complete producer closure is literal are
+        # admitted here.
+        # Keep evaluator state separate from its values.  A Python ``object()``
+        # sentinel used to be written into this runtime-indexed cache for an
+        # unavailable producer.  When this planner itself is ingested, that is
+        # a static Python reference flowing through dynamic table storage --
+        # something complete SSA correctly refuses to pretend is data.
+        _CONSTANT_KNOWN = 1
+        _CONSTANT_UNAVAILABLE = 2
+        _constant_status: dict[int, int] = {}
+        _constant_values: dict[int, Any] = {}
+        # A loop-carried initial is the entry arm of a runtime Phi, not a
+        # literal every consumer may fold: inside the loop the name holds
+        # the previous iteration's update.  Region extraction already
+        # captures such a seed as an Input; a capture derived from it
+        # (``i + 1`` over the seed ``0``) is likewise a runtime input, never
+        # a region-local constant.  Seeding the evaluator state here keeps
+        # every closure through a carried seed unavailable.
+        for _node_id, _node_data in graph.G.nodes(data=True):
+            for _initial, _updated in (
+                (_node_data.get("attributes") or {}).get(
+                    "loop_carried_bindings"
+                ) or {}
+            ).values():
+                _constant_status[int(_initial)] = _CONSTANT_UNAVAILABLE
+
+        def _constant_expression(value_id: int):
+            """Evaluate a literal producer closure without Python recursion.
+
+            A retained loop can expose feedback in the ProcessGraph, and a
+            large whole-object compile can contain a perfectly acyclic closure
+            deeper than Python's call-stack limit. Neither makes the capture a
+            constant. Use an explicit post-order walk, marking every active
+            frame nonconstant if a feedback edge is encountered.
+            """
+
+            root = int(value_id)
+            if root in _constant_status:
+                return (
+                    _constant_status[root] == _CONSTANT_KNOWN,
+                    _constant_values.get(root),
+                )
+
+            # 0/absent = unseen, 1 = active DFS frame, 2 = evaluated.
+            states: dict[int, int] = {}
+            stack: list[tuple[int, bool]] = [(root, False)]
+            while stack:
+                current, expanded = stack.pop()
+                if current in _constant_status:
+                    states[current] = 2
+                    continue
+                node = graph.G.nodes.get(current, {})
+                opcode = str(node.get("op") or node.get("type") or "")
+                attributes = dict(node.get("attributes") or {})
+                parents = tuple(
+                    int(parent)
+                    for parent, _role in (node.get("parents") or ())
+                )
+
+                if not expanded:
+                    if states.get(current) == 1:
+                        # This node is already on the active producer path: a
+                        # feedback closure cannot be a literal expression.
+                        for active, state in tuple(states.items()):
+                            if state == 1:
+                                _constant_status[active] = (
+                                    _CONSTANT_UNAVAILABLE
+                                )
+                                states[active] = 2
+                        continue
+                    states[current] = 1
+                    if opcode in {"const", "Const", "Constant"}:
+                        expression = node.get("expr_obj")
+                        if "value" in attributes:
+                            value = attributes["value"]
+                            known = True
+                        elif "constant" in node:
+                            value = node["constant"]
+                            known = True
+                        elif isinstance(expression, ast.Constant):
+                            value = expression.value
+                            known = True
+                        else:
+                            value = None
+                            known = False
+                        if known:
+                            _constant_values[current] = value
+                            _constant_status[current] = _CONSTANT_KNOWN
+                        else:
+                            _constant_status[current] = (
+                                _CONSTANT_UNAVAILABLE
+                            )
+                        states[current] = 2
+                        continue
+                    stack.append((current, True))
+                    for parent in reversed(parents):
+                        if parent in _constant_status:
+                            continue
+                        if states.get(parent) == 1:
+                            for active, state in tuple(states.items()):
+                                if state == 1:
+                                    _constant_status[active] = (
+                                        _CONSTANT_UNAVAILABLE
+                                    )
+                                    states[active] = 2
+                            break
+                        stack.append((parent, False))
+                    continue
+
+                if states.get(current) == 2:
+                    continue
+                if any(
+                    _constant_status.get(parent) != _CONSTANT_KNOWN
+                    for parent in parents
+                ):
+                    known = False
+                elif opcode in {"neg", "USub"} and len(parents) == 1:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    try:
+                        value = -values[0]
+                    except (ArithmeticError, TypeError, ValueError):
+                        known = False
+                    else:
+                        known = True
+                elif opcode in {"pos", "UAdd"} and len(parents) == 1:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    try:
+                        value = +values[0]
+                    except (ArithmeticError, TypeError, ValueError):
+                        known = False
+                    else:
+                        known = True
+                elif opcode in {"Tuple", "tuple"}:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    value = tuple(values)
+                    known = True
+                elif opcode in {"List", "list"}:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    value = list(values)
+                    known = True
+                elif opcode in {"add", "Add"} and len(parents) == 2:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    try:
+                        value = values[0] + values[1]
+                    except (ArithmeticError, TypeError, ValueError):
+                        known = False
+                    else:
+                        known = True
+                elif opcode in {"sub", "Sub"} and len(parents) == 2:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    try:
+                        value = values[0] - values[1]
+                    except (ArithmeticError, TypeError, ValueError):
+                        known = False
+                    else:
+                        known = True
+                elif opcode in {"mul", "Mul"} and len(parents) == 2:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    try:
+                        value = values[0] * values[1]
+                    except (ArithmeticError, TypeError, ValueError):
+                        known = False
+                    else:
+                        known = True
+                else:
+                    known = False
+                if known:
+                    _constant_values[current] = value
+                    _constant_status[current] = _CONSTANT_KNOWN
+                else:
+                    _constant_status[current] = _CONSTANT_UNAVAILABLE
+                states[current] = 2
+            return (
+                _constant_status.get(root) == _CONSTANT_KNOWN,
+                _constant_values.get(root),
             )
 
-            def expression_values(expression):
-                if expression is None:
-                    return
-                if expression.value_id is not None:
-                    control_values.add(int(expression.value_id))
-                for operand in expression.operands:
-                    expression_values(operand)
+        # A loop target's value is per-iteration even though its INITIALIZER
+        # is a literal; folding it froze ``row`` at 0 inside every region a
+        # nested body formed, so value = row*4+col compiled as value = col.
+        loop_target_value_ids = {
+            int(bound_target)
+            for _loop_id, loop_data in graph.G.nodes(data=True)
+            for bound_target in (
+                (loop_data.get("attributes") or {}).get(
+                    "loop_target_bindings", {}
+                ) or {}
+            ).values()
+        }
+        capture_constants = {}
+        for value_id in region_captures:
+            if value_id in carried_initial_boundaries:
+                continue
+            if int(value_id) in loop_target_value_ids:
+                continue
+            known, value = _constant_expression(value_id)
+            if known:
+                capture_constants[value_id] = value
+        region_captures = tuple(
+            value_id
+            for value_id in region_captures
+            if value_id not in capture_constants
+        )
+        compute_lines = []
+        for value in region_nodes:
+            node_data = graph.G.nodes[value]
+            expression = node_data.get("expr_obj")
+            parents = numerical_region_parents(value)
+            opcode = str(node_data.get("op") or node_data.get("type"))
+            line_attributes = dict(node_data.get("attributes") or {})
+            if (
+                isinstance(expression, ast.Attribute)
+                or (
+                    str(node_data.get("op") or node_data.get("type") or "")
+                    .casefold() == "getattr"
+                    and line_attributes.get("tensor") is not None
+                )
+            ):
+                tensor_property = line_attributes.get("tensor")
+                if tensor_property in abstract_tensor_funcs:
+                    # NumPy/Torch expose ``real``/``imag`` as properties;
+                    # after receiver grounding they are the same abstract
+                    # tensor operations as ``AbstractTensor.real(x)`` and
+                    # ``AbstractTensor.imag(x)``.
+                    opcode = str(tensor_property)
+                else:
+                    # The graph may retain the frontend spelling ``Attribute``;
+                    # repository SSA uses the semantic memory operation and must
+                    # retain the selected field name in its record ABI.
+                    opcode = "GetAttr"
+                    line_attributes.setdefault("attribute", expression.attr)
+            elif opcode in {"Call", "call"} and str(
+                line_attributes.get("tensor") or ""
+            ) in abstract_tensor_funcs:
+                # A builtin arriving as a Call names its catalogued operator
+                # in ``tensor`` (``max``/``min``); the operator IS the
+                # semantics, exactly as ``float`` respells to a cast.
+                opcode = str(line_attributes["tensor"])
+            compute_lines.append(PlanLine.create(
+                opcode,
+                inputs=tuple(parent for parent, _role in parents),
+                outputs=(int(value),),
+                attributes={
+                    **line_attributes,
+                    "region": region_index,
+                },
+                input_roles=tuple(role for _parent, role in parents),
+            ))
+        compute_lines = tuple(compute_lines)
+        # A constant operand (``self.n + 1``) is a leaf the region consumes but
+        # neither produces nor captures -- it is not a runtime input, so it never
+        # entered ``deployment_inputs``. The fused capture folds it into a scalar
+        # attribute; the plan lines reference it by value id, so without a
+        # defining line it is a dangling SSA value the backend emits as an
+        # undeclared variable. Materialise each such constant as its own ``const``
+        # line, ahead of the consumers, so the region is self-contained.
+        produced = set(region_nodes)
+        captured = set(region_captures)
+        const_lines = []
+        materialised: set[int] = set()
+        for value_id, value in capture_constants.items():
+            materialised.add(int(value_id))
+            const_lines.append(PlanLine.create(
+                "Const",
+                inputs=(),
+                outputs=(int(value_id),),
+                attributes={"value": value, "region": region_index},
+            ))
+        for value in region_nodes:
+            for parent, _role in (graph.G.nodes[value].get("parents") or ()):
+                parent = int(parent)
+                if (
+                    parent in produced
+                    or parent in captured
+                    or parent in materialised
+                ):
+                    continue
+                parent_data = graph.G.nodes.get(parent, {})
+                if (
+                    parent_data.get("op") or parent_data.get("type")
+                ) not in ("const", "Constant"):
+                    continue
+                materialised.add(parent)
+                const_lines.append(PlanLine.create(
+                    "Const",
+                    inputs=(),
+                    outputs=(parent,),
+                    attributes={
+                        **dict(parent_data.get("attributes") or {}),
+                        "region": region_index,
+                    },
+                ))
+        # Carry each region value's shape/dtype from its process-graph node's
+        # domain so the lowered SSA is shaped: a value that is an array lowers
+        # as an array, not a scalar. A domain padded with size-1 dims (a scalar
+        # is (1, 1, 1)) squeezes to its logical shape -- () for a scalar.
+        _shape_dtype_cache: dict[int, tuple[tuple[int, ...], str]] = {}
 
-            if isinstance(block, ValidationBlock):
-                control_values.add(int(block.predicate_value_id))
-            elif isinstance(block, StreamPublishBlock):
-                control_values.add(int(block.value_id))
-                if block.count_value_id is not None:
-                    control_values.add(int(block.count_value_id))
-                if block.predicate_value_id is not None:
-                    control_values.add(int(block.predicate_value_id))
-            elif isinstance(block, SequenceBlock):
-                for child in block.blocks:
-                    validation_values(child)
-            elif isinstance(block, LoopBlock):
-                validation_values(block.body)
-            elif isinstance(block, WhileBlock):
-                control_values.add(int(block.predicate_value_id))
-                expression_values(block.predicate_expression)
-                validation_values(block.condition)
-                validation_values(block.body)
-            elif isinstance(block, LoopControlBlock):
-                if block.predicate_value_id is not None:
-                    control_values.add(int(block.predicate_value_id))
-                expression_values(block.predicate_expression)
-            elif isinstance(block, StateMachineTick):
-                for _value, body in block.cases:
-                    validation_values(body)
-                if block.default is not None:
-                    validation_values(block.default)
-            elif isinstance(block, ParallelDeployment):
-                for lane in block.lanes:
-                    validation_values(lane)
-            elif isinstance(block, CallBlock):
-                validation_values(block.callee)
+        def _value_shape_dtype(value_id):
+            """Infer one value record with a bounded explicit producer stack.
 
-        validation_values(control.root)
+            Feedback is a retained-loop boundary.  When the work stack sees a
+            parent already active, it seeds that loop-carried record from the
+            parent's declared tensor/domain metadata and does not expand the
+            edge again.  This is finite even for irreducible recursion and does
+            not turn a loop into an unbounded source expansion.
+            """
 
-    return PlanClosure(
+            root = int(value_id)
+
+            def declared(current: int):
+                node = graph.G.nodes.get(int(current), {})
+                tensor = node.get("tensor") or {}
+                domain = node.get("domain_node")
+                attributes = dict(node.get("attributes") or {})
+                binding_name = attributes.get("binding_name")
+                specialization = (
+                    (graph.G.graph.get("planner_specializations") or {}).get(
+                        str(binding_name)
+                    )
+                    if binding_name is not None else None
+                )
+                specialized_shape = tuple(
+                    int(extent)
+                    for extent in (
+                        getattr(specialization, "shape", ()) or ()
+                    )
+                )
+                # Extents the source-program boundary states for this
+                # parameter. Rank alone cannot serve here: the scalar-versus-
+                # tensor decision reads EXTENTS (an operation is spelled with
+                # its scalar opcode when result and operands all have empty
+                # shape), so a parameter that declares `storage: span,
+                # rank: 1` and nothing else still arrives shapeless and its
+                # arithmetic is compiled as scalar arithmetic. A declared
+                # shape is authoritative the same way a planner
+                # specialization is -- it is a statement by the boundary, not
+                # an inference from a default domain.
+                abi_shape: tuple[int, ...] = ()
+                if binding_name is not None:
+                    abi_entry = (
+                        graph.G.graph.get("parameter_value_abi") or {}
+                    ).get(str(binding_name))
+                    if isinstance(abi_entry, Mapping):
+                        abi_shape = tuple(
+                            int(extent)
+                            for extent in (abi_entry.get("shape") or ())
+                        )
+                tensor_shape_declared = "shape" in tensor
+                if tensor_shape_declared:
+                    # An empty static extent tuple can be the exact companion
+                    # to a nonzero dynamic rank.  It means "runtime extents",
+                    # not "consult the padded DomainNode default".
+                    shape = tuple(tensor.get("shape") or ())
+                elif specialized_shape:
+                    shape = specialized_shape
+                elif abi_shape:
+                    shape = abi_shape
+                else:
+                    shape = tuple(getattr(domain, "shape", ()) or ())
+                logical = (
+                    tuple(map(int, shape))
+                    if tensor_shape_declared
+                    or specialized_shape
+                    or abi_shape
+                    else tuple(int(dim) for dim in shape if int(dim) != 1)
+                )
+                dtype = str(
+                    tensor.get("dtype")
+                    or getattr(specialization, "dtype", None)
+                    or node.get("dtype")
+                    or getattr(domain, "dtype", None)
+                    or "float64"
+                )
+                field_name = attributes.get("attribute")
+                if (
+                    not logical
+                    and field_name is not None
+                    and str(node.get("type")) in {"GetAttr", "Attribute"}
+                ):
+                    # A record field read through a mutable, non-array-typed
+                    # receiver (``state.next_height``) has no tensor/domain
+                    # shape of its own -- ``specialized_shape`` above only
+                    # covers a receiver bound *directly* to an array. By this
+                    # pass, ``expr_obj`` is gone (nodes created during SSA
+                    # normalization carry none), so the receiver is found via
+                    # the graph edge instead of the AST. The receiver's own
+                    # bound specialization (a real object, set by
+                    # ``propagate_bound_planner_specializations`` before this
+                    # pass runs) still has the real field on it; read it
+                    # structurally, the same safe, side-effect-free
+                    # ``getattr`` this module already uses for call-argument
+                    # specialization. Without this, every whole-array read of
+                    # a record field silently collapses to ``()`` and a
+                    # downstream array op is emitted as a scalar op on one
+                    # element (see tools/HANDOFF_fluid_c_shell.md, Defect 1).
+                    receiver_id = next((
+                        int(parent)
+                        for parent, role in (node.get("parents") or ())
+                        if str(role) in {"value", "base", "object"}
+                    ), None)
+                    receiver_binding = (
+                        (
+                            graph.G.nodes.get(receiver_id, {}).get(
+                                "attributes"
+                            ) or {}
+                        ).get("binding_name")
+                        if receiver_id is not None else None
+                    )
+                    receiver_value = (
+                        (graph.G.graph.get("planner_specializations") or {})
+                        .get(str(receiver_binding))
+                        if receiver_binding is not None else None
+                    )
+                    if receiver_value is not None:
+                        try:
+                            field_value = getattr(
+                                receiver_value, str(field_name)
+                            )
+                        except AttributeError:
+                            field_value = None
+                        field_shape = getattr(field_value, "shape", None)
+                        if field_shape:
+                            logical = tuple(int(dim) for dim in field_shape)
+                            field_dtype = getattr(field_value, "dtype", None)
+                            if field_dtype is not None:
+                                dtype = str(field_dtype)
+                operation = str(
+                    attributes.get("tensor")
+                    or attributes.get("tensor_operation")
+                    or attributes.get("tensor_candidate")
+                    or node.get("op")
+                    or node.get("type")
+                    or ""
+                ).casefold()
+                if operation in {"const", "constant"}:
+                    literal = attributes.get("value", node.get("constant"))
+                    if isinstance(literal, bool):
+                        dtype = "bool"
+                    elif isinstance(literal, int):
+                        dtype = "int"
+                    elif isinstance(literal, float):
+                        dtype = "float64"
+                # Callable/operator-reference edges are provenance, not
+                # numeric operands.  Letting their default domain dtype enter
+                # scalar promotion made an all-integer ``min`` or arithmetic
+                # chain appear float-valued merely because ``builtins.min``
+                # itself was represented by a graph node.
+                parents = tuple(
+                    int(parent)
+                    for parent, role in (node.get("parents") or ())
+                    if int(parent) in graph.G
+                    and str(role).casefold() not in {
+                        "callee", "func", "function", "definition",
+                        "operator", "operator_reference",
+                    }
+                )
+                return node, tensor, attributes, logical, dtype, operation, parents
+
+            states: dict[int, int] = {}
+            stack: list[tuple[int, bool]] = [(root, False)]
+            while stack:
+                current, expanded = stack.pop()
+                if current in _shape_dtype_cache:
+                    states[current] = 2
+                    continue
+                (
+                    _node,
+                    tensor,
+                    attributes,
+                    logical,
+                    dtype,
+                    operation,
+                    parents,
+                ) = declared(current)
+                if not expanded:
+                    states[current] = 1
+                    stack.append((current, True))
+                    for parent in reversed(parents):
+                        if parent in _shape_dtype_cache:
+                            continue
+                        if states.get(parent) == 1:
+                            # The edge closes a retained loop. Its declared
+                            # record is the finite boundary condition.
+                            (_n, _t, _a, parent_shape, parent_dtype, _o, _p) = (
+                                declared(parent)
+                            )
+                            _shape_dtype_cache[parent] = (
+                                parent_shape, parent_dtype
+                            )
+                            states[parent] = 2
+                            continue
+                        stack.append((parent, False))
+                    continue
+                if states.get(current) == 2:
+                    continue
+                parent_records = [
+                    (parent, *_shape_dtype_cache[parent])
+                    for parent in parents
+                    if parent in _shape_dtype_cache
+                ]
+                parent_shapes = [record[1] for record in parent_records]
+                parent_dtypes = [record[2] for record in parent_records]
+                # DomainNode historically pads scalars with unit axes. If it
+                # says scalar but a canonical tensor op consumes a shaped
+                # tensor, carry that shape through.
+                if operation in {
+                    "neg", "abs", "sqrt", "exp", "log", "round", "trunc",
+                    "floor", "ceil", "isfinite", "isnan", "isinf",
+                    "logical_not", "tanh", "sin", "cos", "tan", "asin",
+                    "acos", "atan", "sinh", "cosh", "asinh", "acosh",
+                    "atanh", "sign", "add", "sub", "mul", "truediv",
+                    "floordiv", "mod", "pow", "less", "less_equal",
+                    "greater", "greater_equal", "equal", "not_equal",
+                    "maximum", "minimum", "where", "float", "double",
+                    "long", "int", "to", "to_dtype", "astype", "cbrt",
+                    "zeros_like", "empty_like", "ones_like", "full_like",
+                }:
+                    shaped = [candidate for candidate in parent_shapes if candidate]
+                    if shaped:
+                        try:
+                            logical = tuple(np.broadcast_shapes(*shaped))
+                        except ValueError:
+                            # Preserve the declared descriptor for an invalid
+                            # expression.  Kernel lowering will report the
+                            # incompatible operands precisely; choosing one
+                            # tuple here would fabricate a region ABI.
+                            pass
+                    if parent_dtypes and not tensor.get("dtype"):
+                        numeric_dtypes = {
+                            "int" if candidate in {"i32", "int32"}
+                            else "int64" if candidate == "i64"
+                            else "float64" if candidate in {
+                                "float", "double", "f64",
+                            }
+                            else str(candidate)
+                            for candidate in parent_dtypes
+                        }
+                        if numeric_dtypes.intersection({
+                            "float16", "float32", "float64",
+                        }):
+                            dtype = "float64"
+                        elif "int64" in numeric_dtypes:
+                            dtype = "int64"
+                        elif "int" in numeric_dtypes:
+                            dtype = "int"
+                        elif "bool" in numeric_dtypes:
+                            dtype = "bool"
+                if operation in {"sum", "prod", "min", "max", "any", "all"}:
+                    axis = attributes.get("axis", attributes.get("dim"))
+                    source_shape = next(
+                        (candidate for candidate in parent_shapes if candidate),
+                        (),
+                    )
+                    if axis is None:
+                        logical = ()
+                    elif source_shape:
+                        normalized = int(axis) % len(source_shape)
+                        logical = (
+                            source_shape[:normalized]
+                            + source_shape[normalized + 1:]
+                        )
+                if operation == "matmul" and len(parent_shapes) >= 2:
+                    left_shape, right_shape = parent_shapes[:2]
+                    if (
+                        len(left_shape) >= 2
+                        and len(right_shape) >= 2
+                        and left_shape[-1] == right_shape[-2]
+                    ):
+                        try:
+                            batch_shape = tuple(np.broadcast_shapes(
+                                left_shape[:-2], right_shape[:-2]
+                            ))
+                        except ValueError:
+                            pass
+                        else:
+                            logical = (
+                                *batch_shape, left_shape[-2], right_shape[-1]
+                            )
+                _shape_dtype_cache[current] = (logical, dtype)
+                states[current] = 2
+            logical, dtype = _shape_dtype_cache.get(
+                root, declared(root)[3:5]
+            )
+            return (root, logical, dtype)
+
+        value_shapes = tuple(
+            _value_shape_dtype(value_id)
+            for value_id in (*region_nodes, *region_captures)
+        )
+        value_ranks = tuple(
+            (
+                int(value_id),
+                int((descriptor or {}).get(
+                    "rank", len(tuple((descriptor or {}).get("shape") or ()))
+                )),
+            )
+            for value_id in (*region_nodes, *region_captures)
+            for descriptor in (_tensor_descriptor(graph, int(value_id)),)
+            if descriptor is not None
+        )
+        _concord_consumer_operands(graph, region_nodes, region_captures)
+        items.append(PlanClosure(
+            name=f"region_{region_index}",
+            captures=region_captures,
+            items=(*const_lines, *compute_lines),
+            value_shapes=value_shapes,
+            value_ranks=value_ranks,
+        ))
+    control_values = set(_control_dependency_value_ids(
+        getattr(shell, "shell_control_program", None)
+    ))
+
+    planned = PlanClosure(
         name=str(
             graph.G.graph.get("function_name")
             or type(shell).__name__
@@ -1426,6 +3576,234 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         ))),
         items=tuple(items),
     )
+    memo[id(shell)] = planned
+    return planned
+
+
+def _loop_induction_name(loop_node_id: int) -> str:
+    return f"iteration_{loop_node_id}"
+
+
+def _find_nested_loop_node_ids_in_block(
+    block: Any,
+) -> "frozenset[int]":
+    """Collect the node_ids of all LoopBlock/WhileBlock induction names in a
+    block tree by parsing the ``iteration_{node_id}`` induction convention."""
+
+    found: set[int] = set()
+
+    def walk(b: Any) -> None:
+        if isinstance(b, LoopBlock):
+            name = str(b.induction)
+            if name.startswith("iteration_"):
+                try:
+                    found.add(int(name[len("iteration_"):]))
+                except ValueError:
+                    pass
+            walk(b.body)
+        elif isinstance(b, WhileBlock):
+            walk(b.condition)
+            walk(b.body)
+        elif isinstance(b, SequenceBlock):
+            for child in b.blocks:
+                walk(child)
+        elif isinstance(b, StateMachineTick):
+            for _value, body in b.cases:
+                walk(body)
+            if b.default is not None:
+                walk(b.default)
+        elif isinstance(b, ParallelDeployment):
+            for lane in b.lanes:
+                walk(lane)
+        elif isinstance(b, CallBlock):
+            walk(b.callee)
+
+    walk(block)
+    return frozenset(found)
+
+
+def _loop_reduction_nesting_hints(
+    reductions: "Sequence[LoopShaderReduction]",
+    loop_plans: "Iterable[LoopPlan]",
+    graph: Any | None = None,
+) -> dict[int, frozenset[int]]:
+    """Direct-child hints for ``overlay_scheduled_control``'s
+    ``known_nesting``, keyed by index into ``reductions``.
+
+    Region-set containment is only a proxy for "this loop is lexically
+    nested inside that one" -- it fails when the outer loop's entire body
+    is the inner loop (``while a: while b: ...`` with nothing of the
+    outer's own between them), since then both compute the identical
+    region set rather than the outer being a superset. The real signal is
+    the same one ``analyze_shader_loop_reductions`` already used to
+    compute each reduction's own ``region_indices`` in the first place:
+    ``LoopDescriptor.body_nodes``, the set of graph nodes lexically inside
+    a loop's body. A loop is a direct concern of this hint only if its own
+    node id is a member of another loop's ``body_nodes`` -- real AST
+    nesting, not inferred from schedule position or edge traversal.
+
+    Fallback: when ``loop_plans`` does not provide ``body_nodes`` for a
+    candidate outer loop (e.g. the plan was evaporated or belongs to a
+    different shell), equal-region-set pairs are disambiguated by
+    inspecting the ``control_program.root`` block tree.  The outer loop's
+    un-projected ``LoopBlock`` body must contain the inner loop's
+    ``LoopBlock`` as a direct or indirect child; this is always true for
+    genuinely nested reductions because the planner embeds the inner loop's
+    ``LoopBlock`` inside the outer one before any region projection occurs.
+    """
+
+    loop_plans = tuple(loop_plans or ())
+    body_nodes_by_loop_id = {
+        int(plan.loop.node_id): frozenset(map(int, plan.loop.body_nodes))
+        for plan in loop_plans
+    }
+    loop_ids = [int(reduction.loop_node_id) for reduction in reductions]
+    hints: dict[int, frozenset[int]] = {}
+    for parent_index, parent_loop_id in enumerate(loop_ids):
+        body = body_nodes_by_loop_id.get(parent_loop_id)
+        if not body:
+            continue
+        children = frozenset(
+            child_index
+            for child_index, child_loop_id in enumerate(loop_ids)
+            if child_index != parent_index and child_loop_id in body
+        )
+        if children:
+            hints[parent_index] = children
+
+    # Fallback for equal-region-set pairs missed by the body_nodes pass.
+    # Two reductions whose projected region sets are equal but whose loop
+    # plans did not provide a nesting signal are resolved structurally: the
+    # outer reduction's un-projected control_program.root should embed the
+    # inner reduction's LoopBlock (identifiable by its ``iteration_{id}``
+    # induction name) somewhere in its tree.
+    already_covered_as_child = frozenset(
+        child for children in hints.values() for child in children
+    )
+    for parent_index, parent_reduction in enumerate(reductions):
+        if parent_reduction.control_program is None:
+            continue
+        parent_region_set = frozenset(parent_reduction.region_indices)
+        if not parent_region_set:
+            continue
+        parent_nested_ids = _find_nested_loop_node_ids_in_block(
+            parent_reduction.control_program.root
+        )
+        if not parent_nested_ids:
+            continue
+        fallback_children = frozenset(
+            child_index
+            for child_index, child_reduction in enumerate(reductions)
+            if child_index != parent_index
+            and child_index not in already_covered_as_child
+            and frozenset(child_reduction.region_indices) == parent_region_set
+            and int(child_reduction.loop_node_id) in parent_nested_ids
+        )
+        if fallback_children:
+            merged = hints.get(parent_index, frozenset()) | fallback_children
+            hints[parent_index] = merged
+
+    # Comprehension clauses are represented as sibling ``generators`` parents
+    # of one aggregate materializer, not as one clause's body containing the
+    # next clause's node. Their ordered parent list is nevertheless the exact
+    # Python lexical nesting order: ``for outer ... for inner ...``. Preserve
+    # that order explicitly when multiple clauses reduce to the same region.
+    if graph is not None:
+        reduction_index_by_loop_id = {
+            int(reduction.loop_node_id): index
+            for index, reduction in enumerate(reductions)
+        }
+        for _node_id, data in graph.G.nodes(data=True):
+            generator_indices = tuple(
+                reduction_index_by_loop_id[int(parent_id)]
+                for parent_id, role in data.get("parents", ())
+                if str(role) == "generators"
+                and int(parent_id) in reduction_index_by_loop_id
+            )
+            for parent_index, child_index in zip(
+                generator_indices, generator_indices[1:]
+            ):
+                parent_regions = frozenset(
+                    reductions[parent_index].region_indices
+                )
+                child_regions = frozenset(
+                    reductions[child_index].region_indices
+                )
+                if parent_regions and child_regions == parent_regions:
+                    hints[parent_index] = (
+                        hints.get(parent_index, frozenset()) | {child_index}
+                    )
+
+    return hints
+
+
+def _planned_operator_node_ids(hierarchy: PlanClosure) -> tuple[int, ...]:
+    """Return this closure's operators in planner-owned segment order."""
+
+    return tuple(
+        int(output_id)
+        for item in hierarchy.items
+        if isinstance(item, PlanClosure)
+        and item.name.startswith("region_")
+        for line in item.items
+        if isinstance(line, PlanLine)
+        for output_id in line.outputs
+    )
+
+
+@dataclass(frozen=True)
+class PlannedOperatorImplementation:
+    node_id: int
+    kind: str
+    fused_step_ids: tuple[int, ...] = ()
+
+
+def _build_planned_operator_implementations(
+    hierarchy: PlanClosure,
+    captured_regions: Mapping[int, CapturedFusedProgram],
+    observed_plain_node_ids: Iterable[int],
+) -> dict[int, tuple[PlannedOperatorImplementation, ...]]:
+    """Attach lowering evidence to planner-owned operators by node ID."""
+
+    observed_plain = set(map(int, observed_plain_node_ids))
+    implementations = {}
+    for item in hierarchy.items:
+        if not (
+            isinstance(item, PlanClosure)
+            and item.name.startswith("region_")
+        ):
+            continue
+        region_index = int(item.name.split("_", 1)[1])
+        captured = captured_regions.get(region_index)
+        fused_steps: dict[int, list[int]] = {}
+        if captured is not None:
+            for program in captured.execution_programs:
+                for step in program.steps:
+                    fused_steps.setdefault(
+                        int(step.result_id), []
+                    ).append(int(step.step_id))
+        region_implementations = []
+        for line in item.items:
+            if not isinstance(line, PlanLine):
+                continue
+            for node_id in line.outputs:
+                node_id = int(node_id)
+                step_ids = tuple(fused_steps.get(node_id, ()))
+                region_implementations.append(
+                    PlannedOperatorImplementation(
+                        node_id,
+                        "plain"
+                        if node_id in observed_plain
+                        else "fused"
+                        if step_ids
+                        else "structural",
+                        step_ids,
+                    )
+                )
+        implementations[region_index] = tuple(
+            region_implementations
+        )
+    return implementations
 
 
 def _refresh_hierarchy_control_captures(
@@ -1452,81 +3830,7 @@ def _refresh_hierarchy_control_captures(
         WhileBlock,
     )
 
-    values: set[int] = set()
-    control = shell.shell_control_program
-    if control is not None:
-        values.update(int(uniform.value_id) for uniform in control.uniforms)
-        values.update(
-            int(value_id)
-            for pair in control.value_aliases
-            for value_id in pair
-        )
-        values.update(
-            int(value_id)
-            for iterable, target, _induction in control.iterable_bindings
-            for value_id in (iterable, target)
-        )
-        values.update(
-            int(value_id)
-            for iterable, target, _induction, _items
-            in control.static_iterable_bindings
-            for value_id in (iterable, target)
-        )
-        values.update(
-            int(value_id)
-            for source, collection, _induction, _start
-            in control.collection_bindings
-            for value_id in (source, collection)
-        )
-        values.update(
-            int(value_id)
-            for iterable, target, _induction, sources
-            in control.closure_iterable_bindings
-            for value_id in (iterable, target, *sources)
-        )
-
-        def visit(block) -> None:
-            def expression_values(expression):
-                if expression is None:
-                    return
-                if expression.value_id is not None:
-                    values.add(int(expression.value_id))
-                for operand in expression.operands:
-                    expression_values(operand)
-            if isinstance(block, ValidationBlock):
-                values.add(int(block.predicate_value_id))
-            elif isinstance(block, StreamPublishBlock):
-                values.add(int(block.value_id))
-                if block.count_value_id is not None:
-                    values.add(int(block.count_value_id))
-                if block.predicate_value_id is not None:
-                    values.add(int(block.predicate_value_id))
-            elif isinstance(block, SequenceBlock):
-                for child in block.blocks:
-                    visit(child)
-            elif isinstance(block, LoopBlock):
-                visit(block.body)
-            elif isinstance(block, WhileBlock):
-                values.add(int(block.predicate_value_id))
-                expression_values(block.predicate_expression)
-                visit(block.condition)
-                visit(block.body)
-            elif isinstance(block, LoopControlBlock):
-                if block.predicate_value_id is not None:
-                    values.add(int(block.predicate_value_id))
-                expression_values(block.predicate_expression)
-            elif isinstance(block, StateMachineTick):
-                for _case, body in block.cases:
-                    visit(body)
-                if block.default is not None:
-                    visit(block.default)
-            elif isinstance(block, ParallelDeployment):
-                for lane in block.lanes:
-                    visit(lane)
-            elif isinstance(block, CallBlock):
-                visit(block.callee)
-
-        visit(control.root)
+    values = set(_control_dependency_value_ids(shell.shell_control_program))
 
     refreshed_items = []
     for item in closure.items:
@@ -1551,7 +3855,10 @@ def _refresh_hierarchy_control_captures(
         tuple(dict.fromkeys((*closure.captures, *sorted(values)))),
         tuple(refreshed_items),
         closure.closure_id,
+        closure.value_shapes,
+        closure.value_ranks,
     )
+
 
 
 def _build_hierarchical_glsl_artifact(shell: Any):
@@ -1652,6 +3959,14 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                 return False
             control = ControlProgram(SequenceBlock(()), ())
         controls[closure_id] = control
+        import os as _os, sys as _sys
+        if _os.environ.get("TURING_DEBUG_REGION_ORDER"):
+            _fn = owner.process_graph.G.graph.get("function_name")
+            print(
+                f"DEBUGGATHER fn={_fn} closure_id={closure_id} "
+                f"region_indices={getattr(control, 'region_indices', None)}",
+                file=_sys.stderr,
+            )
         for item in closure.items:
             if not isinstance(item, PlanCall):
                 continue
@@ -1681,6 +3996,32 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         for _source, collection, _induction, _start
         in control.collection_bindings
     }
+    loop_carried_update_endpoints: set[tuple[int, int]] = set()
+
+    def collect_loop_carried_updates(
+        closure_id: int,
+        block: Any,
+    ) -> None:
+        carried = (
+            block.carried_aliases
+            if isinstance(block, (LoopBlock, WhileBlock))
+            else ()
+        )
+        loop_carried_update_endpoints.update(
+            (int(closure_id), int(updated))
+            for updated, _initial in carried
+        )
+        if isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                collect_loop_carried_updates(closure_id, child)
+        elif isinstance(block, LoopBlock):
+            collect_loop_carried_updates(closure_id, block.body)
+        elif isinstance(block, WhileBlock):
+            collect_loop_carried_updates(closure_id, block.condition)
+            collect_loop_carried_updates(closure_id, block.body)
+
+    for closure_id, control in controls.items():
+        collect_loop_carried_updates(int(closure_id), control.root)
     control_alias_sources = {
         (int(closure_id), int(updated)): (
             int(closure_id),
@@ -1690,7 +4031,81 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         for updated, initial in control.value_aliases
         if (int(closure_id), int(updated))
         not in collection_owner_endpoints
+        and (int(closure_id), int(updated))
+        not in loop_carried_update_endpoints
     }
+    for closure_id, owner in shells.items():
+        selected_returns = tuple(getattr(
+            owner, "_captured_return_value_ids", ()
+        ))
+        output_names = tuple(
+            owner.process_graph.G.graph.get("function_outputs", ())
+        )
+        if len(selected_returns) != 1 or len(output_names) != 1:
+            continue
+        selected = int(selected_returns[0])
+        identities = owner.process_graph.G.graph.get(
+            "identity_table", {}
+        ) or {}
+        for output_id in identities.get(output_names[0], ()):
+            output_id = int(output_id)
+            if output_id == selected:
+                continue
+            # A statically selected early return is the sole producer of a
+            # single-output invocation.  Normalization may still correlate
+            # the function output with a later, unexecuted return expression;
+            # collapse that stale endpoint before global value projection so
+            # it cannot veto the caller-argument redirect.
+            control_alias_sources[(int(closure_id), output_id)] = (
+                int(closure_id), selected
+            )
+    for call in calls.values():
+        child_id = int(call.callee.closure_id)
+        child_owner = shells[child_id]
+        selected_returns = tuple(getattr(
+            child_owner, "_captured_return_value_ids", ()
+        ))
+        if len(selected_returns) != 1 or len(call.result_bindings) != 1:
+            continue
+        callee_result, _caller_result = call.result_bindings[0]
+        selected = int(selected_returns[0])
+        if int(callee_result) != selected:
+            control_alias_sources[(child_id, int(callee_result))] = (
+                child_id, selected
+            )
+    for closure_id, owner in shells.items():
+        parameter_inputs: dict[str, list[int]] = {}
+        for local_id, data in owner.process_graph.G.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            if (
+                data.get("type") != "Input"
+                or attributes.get("binding_kind") != "parameter"
+            ):
+                continue
+            name = attributes.get("binding_name") or data.get("label")
+            if name is not None:
+                parameter_inputs.setdefault(str(name), []).append(
+                    int(local_id)
+                )
+        for local_ids in parameter_inputs.values():
+            bound = [
+                local_id
+                for local_id in local_ids
+                if (int(closure_id), int(local_id)) in argument_sources
+            ]
+            if len(bound) != 1:
+                continue
+            canonical = int(bound[0])
+            for local_id in local_ids:
+                if int(local_id) == canonical:
+                    continue
+                # AST normalization may retain multiple Input occurrences for
+                # one source parameter while PlanCall binds only its canonical
+                # occurrence.  They are the same lexical SSA source; route
+                # every duplicate through the explicit argument edge.
+                control_alias_sources[(
+                    int(closure_id), int(local_id)
+                )] = (int(closure_id), canonical)
     shell._profiler.trace(
         path=shell.profile_path,
         section="hierarchical-artifact",
@@ -1985,6 +4400,33 @@ def _build_hierarchical_glsl_artifact(shell: Any):
             if endpoint in synthetic_static_values:
                 return synthetic_static_values[endpoint]
             root, path = rooted
+            root_owner = shells.get(int(root[0]))
+            root_graph = (
+                None if root_owner is None
+                else root_owner.process_graph.G
+            )
+            root_data = (
+                None
+                if root_graph is None or int(root[1]) not in root_graph
+                else root_graph.nodes[int(root[1])]
+            )
+            root_name = (
+                None
+                if root_data is None
+                else (root_data.get("attributes") or {}).get(
+                    "binding_name"
+                )
+            )
+            static_fields = (
+                {}
+                if root_owner is None
+                else getattr(
+                    root_owner, "_capture_input_static_fields", {}
+                )
+            )
+            static_key = (str(root_name), tuple(map(str, path)))
+            if root_name is not None and static_key in static_fields:
+                return static_fields[static_key]
             projected = leaves(*root)
             target = projected.get(tuple(path))
             if target is not None and target != endpoint:
@@ -2059,7 +4501,9 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     and body_value == else_value
                 ):
                     return body_value
-        if isinstance(expression, ast.Attribute) and expression.attr == "shape":
+        if isinstance(expression, ast.Attribute) and expression.attr in {
+            "shape", "ndim", "ndims", "dtype", "device",
+        }:
             base = next((
                 parent
                 for role, parent in parents.items()
@@ -2071,9 +4515,19 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     projected = leaves(endpoint[0], base)
                     if len(projected) == 1 and () in projected:
                         meta = value_meta(projected[()])
-                shape = None if meta is None else meta.shape
-                if shape is not None:
-                    return tuple(int(size) for size in shape)
+                if meta is not None:
+                    if expression.attr == "shape" and meta.shape is not None:
+                        return tuple(int(size) for size in meta.shape)
+                    if expression.attr in {"ndim", "ndims"} and (
+                        meta.shape is not None
+                    ):
+                        return len(meta.shape)
+                    if expression.attr == "dtype" and meta.dtype is not None:
+                        return str(meta.dtype)
+                    if expression.attr == "device":
+                        device = getattr(meta, "device", None)
+                        if device is not None:
+                            return device
         if (
             isinstance(expression, ast.Subscript)
             or data.get("type") in {"Indexed", "indexed"}
@@ -2212,7 +4666,7 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         if (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Attribute)
-            and expression.func.attr == "ndims"
+            and expression.func.attr in {"numel", "ndim", "ndims"}
         ):
             base = next((
                 parent
@@ -2227,31 +4681,129 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                         meta = value_meta(projected[()])
                 shape = None if meta is None else meta.shape
                 if shape is not None:
-                    return len(shape)
+                    if expression.func.attr in {"ndim", "ndims"}:
+                        return len(shape)
+                    count = 1
+                    for extent in shape:
+                        count *= int(extent)
+                    return count
         if (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Name)
-            and expression.func.id in {"bool", "int", "float"}
         ):
-            argument = next((
+            builtin_name = expression.func.id
+            positional = tuple(
                 parent
-                for role, parent in parents.items()
-                if _positional_argument_index(role) == 0
-            ), None)
-            fixed = (
-                unresolved_static
-                if argument is None
-                else static_endpoint_value(
-                    (endpoint[0], argument), visiting
+                for role, parent in sorted(
+                    parents.items(),
+                    key=lambda item: (
+                        _positional_argument_index(item[0])
+                        if _positional_argument_index(item[0]) is not None
+                        else 1 << 30
+                    ),
                 )
+                if _positional_argument_index(role) is not None
             )
-            if fixed is not unresolved_static:
+            fixed_arguments = tuple(
+                static_endpoint_value((endpoint[0], argument), visiting)
+                for argument in positional
+            )
+            if builtin_name == "getattr" and len(fixed_arguments) >= 2:
+                attribute_name = fixed_arguments[1]
+                base_id = positional[0]
+                if (
+                    isinstance(attribute_name, str)
+                    and not attribute_name.startswith("_")
+                ):
+                    meta = value_meta((endpoint[0], base_id))
+                    if meta is not None:
+                        if attribute_name == "shape" and meta.shape is not None:
+                            return tuple(int(size) for size in meta.shape)
+                        if attribute_name in {"ndim", "ndims"} and (
+                            meta.shape is not None
+                        ):
+                            return len(meta.shape)
+                        if attribute_name == "dtype" and meta.dtype is not None:
+                            return str(meta.dtype)
+                        if attribute_name == "device":
+                            device = getattr(meta, "device", None)
+                            if device is not None:
+                                return device
+                    owner_value = fixed_arguments[0]
+                    if owner_value is not unresolved_static and isinstance(
+                        owner_value,
+                        (tuple, list, dict, range, str, bytes),
+                    ):
+                        try:
+                            return getattr(owner_value, attribute_name)
+                        except AttributeError:
+                            pass
+                if (
+                    len(fixed_arguments) >= 3
+                    and fixed_arguments[2] is not unresolved_static
+                ):
+                    return fixed_arguments[2]
+            if builtin_name == "isinstance" and positional:
+                candidate = fixed_arguments[0]
+                type_expression = (
+                    expression.args[1] if len(expression.args) > 1 else None
+                )
+
+                def safe_types(node: ast.AST | None):
+                    if isinstance(node, ast.Name):
+                        return {
+                            "bool": (bool,), "int": (int,),
+                            "float": (float,), "str": (str,),
+                            "bytes": (bytes,), "tuple": (tuple,),
+                            "list": (list,), "dict": (dict,),
+                            "set": (set,), "range": (range,),
+                        }.get(node.id)
+                    if isinstance(node, ast.Tuple):
+                        collected = tuple(
+                            item
+                            for element in node.elts
+                            for item in (safe_types(element) or ())
+                        )
+                        return collected or None
+                    return None
+
+                accepted = safe_types(type_expression)
+                if candidate is not unresolved_static and accepted is not None:
+                    return isinstance(candidate, accepted)
+            if all(
+                argument is not unresolved_static
+                for argument in fixed_arguments
+            ):
                 try:
-                    return {
-                        "bool": bool,
-                        "int": int,
-                        "float": float,
-                    }[expression.func.id](fixed)
+                    if builtin_name in {"bool", "int", "float"}:
+                        return {"bool": bool, "int": int, "float": float}[
+                            builtin_name
+                        ](*fixed_arguments)
+                    if builtin_name in {"tuple", "list", "set"}:
+                        constructor = {
+                            "tuple": tuple, "list": list, "set": set,
+                        }[builtin_name]
+                        return constructor(*fixed_arguments)
+                    if builtin_name == "len":
+                        return len(*fixed_arguments)
+                    if builtin_name == "range":
+                        return range(*fixed_arguments)
+                    if builtin_name == "enumerate":
+                        return tuple(enumerate(*fixed_arguments))
+                    if builtin_name == "zip":
+                        return tuple(zip(*fixed_arguments))
+                    if builtin_name == "sorted":
+                        return sorted(*fixed_arguments)
+                    if builtin_name == "max":
+                        return max(*fixed_arguments)
+                    if builtin_name == "min":
+                        return min(*fixed_arguments)
+                    if builtin_name == "all":
+                        return all(*fixed_arguments)
+                    if builtin_name == "any":
+                        return any(*fixed_arguments)
+                    if builtin_name == "slice":
+                        return slice(*fixed_arguments)
                 except (TypeError, ValueError, OverflowError):
                     pass
         if isinstance(data.get("expr_obj"), ast.Attribute):
@@ -2321,6 +4873,17 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     # this does not inspect or specialize the captured value.
                     if value_meta(projected[()]) is not None:
                         return True
+                argument_data = graph.nodes[int(argument)]
+                argument_name = (
+                    argument_data.get("attributes") or {}
+                ).get("binding_name")
+                if (
+                    argument_data.get("type") == "Input"
+                    and argument_name in getattr(
+                        owner, "_capture_tensor_input_names", ()
+                    )
+                ):
+                    return True
         if not (
             isinstance(expression, ast.Compare)
             and len(expression.ops) == 1
@@ -2340,7 +4903,27 @@ def _build_hierarchical_glsl_artifact(shell: Any):
             ) in argument_sources:
                 # An explicitly bound argument is a value edge, regardless of
                 # whether its runtime payload is a tensor or aggregate.  It
-                # cannot be the omitted/default None branch.
+                # cannot be the omitted/default None branch -- unless the
+                # bound value itself is declared None: a caller forwarding a
+                # parameter whose ProgramABI fact is ``builtins.NoneType``
+                # (``distribution`` through ``_propose_dt_pen``), or passing
+                # the literal ``None``.  Treating that edge as "not None"
+                # selected ``return distribution(...)`` over an opaque
+                # callable and emptied the specialized callee.
+                bound = leaves(int(closure_id), int(parameter_ids[0]))
+                endpoint = bound.get(()) if len(bound) == 1 else None
+                fact = (
+                    unresolved_static if endpoint is None
+                    else static_endpoint_value(endpoint)
+                )
+                declared_none = fact is None or (
+                    isinstance(fact, _ProgramABIValueFact)
+                    and str(fact.python_type) in {
+                        "builtins.NoneType", "NoneType",
+                    }
+                )
+                if declared_none:
+                    return isinstance(expression.ops[0], ast.Is)
                 return isinstance(expression.ops[0], ast.IsNot)
         parents = {
             str(role): int(parent)
@@ -2461,6 +5044,29 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     ),
                     None,
                 )
+                control_parent = next((
+                    parent
+                    for parent, role in parents
+                    if role == "control"
+                ), None)
+                if (
+                    data.get("type") == "LoopResult"
+                    and control_parent is not None
+                    and getattr(
+                        owner, "_captured_loop_iterations", {}
+                    ).get(int(control_parent)) == 0
+                ):
+                    binding_name = attributes.get("binding_name")
+                    control_attributes = (
+                        graph.nodes[int(control_parent)].get("attributes")
+                        or {}
+                    )
+                    carried = (
+                        control_attributes.get("loop_carried_bindings")
+                        or {}
+                    ).get(binding_name)
+                    if carried is not None:
+                        value_parent = int(carried[0])
                 if (
                     value_parent is not None
                     and key not in collection_owner_endpoints
@@ -2597,6 +5203,21 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                             selected_role = (
                                 "body" if predicate else "orelse"
                             )
+                if selected_role is None:
+                    test_id = next((
+                        parent
+                        for parent, role in parents
+                        if role == "test"
+                    ), None)
+                    predicate = (
+                        None
+                        if test_id is None
+                        else static_predicate(key[0], test_id)
+                    )
+                    if predicate is not None:
+                        selected_role = (
+                            "body" if predicate else "orelse"
+                        )
                 selected = next((
                     parent
                     for parent, role in parents
@@ -2780,7 +5401,22 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                 call := calls.get(key)
             ) is not None:
                 child_id = int(call.callee.closure_id)
-                child = shells[child_id].process_graph.G
+                child_owner = shells[child_id]
+                child = child_owner.process_graph.G
+                selected_returns = tuple(
+                    getattr(
+                        child_owner,
+                        "_captured_return_value_ids",
+                        (),
+                    )
+                )
+                if len(selected_returns) == 1:
+                    result = dict(leaves(
+                        child_id, int(selected_returns[0])
+                    ))
+                    resolved_leaves[key] = result
+                    resolving.remove(key)
+                    return result
                 output_names = tuple(
                     child.graph.get("function_outputs", ())
                 )
@@ -2803,6 +5439,20 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         return result
 
     def canonical_global(closure_id: int, local_id: int) -> int:
+        if (int(closure_id), int(local_id)) in loop_carried_update_endpoints:
+            # A loop backedge is a cut in the projection graph.  Structural
+            # leaf resolution walks value/alias/call edges as if the program
+            # were acyclic, so it happily fuses the two endpoints of a cycle:
+            # a LoopResult carries its value edge through to the very update
+            # it publishes, and a caller result, local copy, or IndexedStore
+            # correlated with the same source name resolves to that same leaf.
+            # Both endpoints then land on one global and the header Phi
+            # degenerates to Phi(x, x), leaving no body producer to find.
+            # Storage reuse across the backedge stays an arena decision; the
+            # update keeps its own SSA identity here so the pair survives to
+            # Phi construction.  Same exclusion the alias table already
+            # applies, extended to the projection that assigns identity.
+            return global_value(closure_id, local_id)
         projected = leaves(closure_id, local_id)
         if len(projected) == 1 and () in projected:
             return global_value(*projected[()])
@@ -3163,20 +5813,33 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     stop,
                     block.step,
                     fix_aggregate_loop_bounds(block.body),
-                    block.carried_aliases,
-                    block.parallel_iterations,
-                    block.dispatch_shell,
-                    block.recursion_region_id,
-                    block.schedule_preference,
+                    carried_aliases=block.carried_aliases,
+                    result_ports=block.result_ports,
+                    carried_seeds=block.carried_seeds,
+                    parallel_iterations=block.parallel_iterations,
+                    dispatch_shell=block.dispatch_shell,
+                    recursion_region_id=block.recursion_region_id,
+                    schedule_preference=block.schedule_preference,
+                    sequence_mutations=block.sequence_mutations,
+                    comparison=block.comparison,
+                    terminal_controls=block.terminal_controls,
+                    source_loop_node_id=block.source_loop_node_id,
+                    control_site_ids=block.control_site_ids,
                 )
             if isinstance(block, WhileBlock):
                 return WhileBlock(
                     block.predicate_value_id,
                     fix_aggregate_loop_bounds(block.condition),
                     fix_aggregate_loop_bounds(block.body),
-                    block.carried_aliases,
-                    block.recursion_region_id,
-                    block.predicate_expression,
+                    carried_aliases=block.carried_aliases,
+                    result_ports=block.result_ports,
+                    carried_seeds=block.carried_seeds,
+                    recursion_region_id=block.recursion_region_id,
+                    predicate_expression=block.predicate_expression,
+                    sequence_mutations=block.sequence_mutations,
+                    source_loop_node_id=block.source_loop_node_id,
+                    terminal_controls=block.terminal_controls,
+                    control_site_ids=block.control_site_ids,
                 )
             if isinstance(block, LoopControlBlock):
                 return block
@@ -3292,7 +5955,9 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                 for value_id in all_ids
             }
             captured_regions[global_region] = (
-                _remap_captured_all_ids(captured, id_map)
+                _remap_captured_all_ids(
+                    captured, id_map, source_closure_id=closure_id,
+                )
             )
         # Nested callsite shells are logical compartments of this artifact,
         # not separately finalized shaders.  Carry their typed specialization
@@ -3565,6 +6230,63 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     in owner.compiled_feed_meta.items()
                 }
             ),
+            "captured_return_value_ids": (
+                ()
+                if owner is None
+                else tuple(sorted(getattr(
+                    owner, "_captured_return_value_ids", ()
+                )))
+            ),
+            "hierarchy_call": (
+                int(closure_id), int(local_id)
+            ) in calls,
+            "call_result_bindings": tuple(
+                getattr(
+                    calls.get((int(closure_id), int(local_id))),
+                    "result_bindings",
+                    (),
+                )
+            ),
+            "argument_source": argument_sources.get((
+                int(closure_id), int(local_id)
+            )),
+            "control_alias_source": control_alias_sources.get((
+                int(closure_id), int(local_id)
+            )),
+            "parent_details": (
+                ()
+                if graph is None
+                else tuple(
+                    (
+                        int(parent),
+                        str(role),
+                        graph.nodes[int(parent)].get("type"),
+                        graph.nodes[int(parent)].get("label"),
+                        dict(
+                            graph.nodes[int(parent)].get("attributes") or {}
+                        ),
+                    )
+                    for parent, role in (data.get("parents") or ())
+                    if int(parent) in graph
+                )
+            ),
+            "capture_input_types": (
+                {}
+                if owner is None
+                else {
+                    str(name): tuple(sorted(types))
+                    for name, types in getattr(
+                        owner, "_capture_input_type_names", {}
+                    ).items()
+                }
+            ),
+            "captured_source_branches": (
+                ()
+                if owner is None
+                else tuple(getattr(
+                    owner, "_captured_source_branches", ()
+                ))
+            ),
             "expr": (
                 None
                 if not isinstance(data.get("expr_obj"), ast.AST)
@@ -3591,6 +6313,85 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         global_id: tuple(details)
         for global_id, details in endpoint_details.items()
     }
+    # Preserve source provenance through graph-inert tensor accommodation.
+    # A common example is ``x if isinstance(x, AbstractTensor) else
+    # AbstractTensor.tensor(x)``: both arms name the same semantic input, but
+    # the IfExp owns a private ProcessGraph endpoint.  It must not become a
+    # fabricated native ABI input merely because tensor discovery selected
+    # one arm.  This is derived exclusively from scoped graph edges and the
+    # hierarchy value table, never from observed values or wrapper identity.
+    transparent_cache: dict[tuple[int, int], int | None] = {}
+
+    def transparent_origin(
+        closure_id: int,
+        local_id: int,
+        visiting: frozenset[tuple[int, int]] = frozenset(),
+    ) -> int | None:
+        endpoint = (int(closure_id), int(local_id))
+        if endpoint in transparent_cache:
+            return transparent_cache[endpoint]
+        if endpoint in visiting:
+            return None
+        owner = shells.get(endpoint[0])
+        graph = None if owner is None else owner.process_graph.G
+        if graph is None or endpoint[1] not in graph:
+            return None
+        data = graph.nodes[endpoint[1]]
+        parents = {
+            str(role): int(parent)
+            for parent, role in (data.get("parents") or ())
+        }
+        next_visiting = visiting | {endpoint}
+        origin = None
+        if data.get("type") == "Input":
+            origin = composed_global(*endpoint)
+        elif isinstance(data.get("expr_obj"), ast.IfExp):
+            body = parents.get("body")
+            orelse = parents.get("orelse")
+            body_origin = (
+                None if body is None else transparent_origin(
+                    endpoint[0], body, next_visiting
+                )
+            )
+            orelse_origin = (
+                None if orelse is None else transparent_origin(
+                    endpoint[0], orelse, next_visiting
+                )
+            )
+            if body_origin is not None and body_origin == orelse_origin:
+                origin = body_origin
+        elif isinstance(data.get("expr_obj"), ast.Call):
+            expression = data["expr_obj"]
+            function = expression.func
+            is_tensor_accommodation = (
+                isinstance(function, ast.Attribute)
+                and function.attr == "tensor"
+                and isinstance(function.value, ast.Name)
+                and function.value.id == "AbstractTensor"
+            )
+            if is_tensor_accommodation:
+                argument = next((
+                    int(parent)
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"arg", "args", "arg:0", "arg0"}
+                ), None)
+                if argument is not None:
+                    origin = transparent_origin(
+                        endpoint[0], argument, next_visiting
+                    )
+        transparent_cache[endpoint] = origin
+        return origin
+
+    hierarchical_value_aliases = {}
+    for global_id, details in shell.hierarchical_endpoint_details.items():
+        for detail in details:
+            origin = transparent_origin(
+                int(detail["closure"]), int(detail["local"])
+            )
+            if origin is not None and int(origin) != int(global_id):
+                hierarchical_value_aliases[int(global_id)] = int(origin)
+                break
+    shell.hierarchical_value_aliases = hierarchical_value_aliases
     root_parameter_names = {
         str((data.get("attributes") or {}).get("binding_name"))
         for _node_id, data in shell.process_graph.G.nodes(data=True)
@@ -3687,6 +6488,8 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         if value_id in resident_values
     }
     shell.hierarchical_public_output_ids = set(terminals.values())
+    shell.hierarchical_terminal_outputs = dict(terminals)
+    shell.hierarchical_specialized_values = dict(specialized_values)
     stream_outputs = {}
     for plan in shell.loop_plans:
         for statement_id, published_value_id, _count_id in (
@@ -3812,6 +6615,11 @@ def _diagnostic_value_summary(value: Any) -> str:
     if isinstance(value, type):
         return f"type:{value.__module__}.{value.__qualname__}"
     shape = getattr(value, "shape", None)
+    if callable(shape):
+        # Namespace objects may export an operation called ``shape``.  Mirror
+        # the runtime tensorization rule so failure reporting cannot mask the
+        # original exception while trying to iterate that function.
+        shape = None
     dtype = getattr(value, "dtype", None)
     device = getattr(value, "device", None)
     prefix = type(value).__name__
@@ -3968,6 +6776,14 @@ def _inert_routing_nodes(graph: Any) -> frozenset[int]:
     or deletion target, and never a call or statement with no consumer.
     """
 
+    fingerprint = (
+        graph.G.number_of_nodes(),
+        graph.G.number_of_edges(),
+        tuple(map(int, getattr(graph, "roots", ()) or ())),
+    )
+    cached = graph.G.graph.get("_inert_routing_nodes_cache")
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
     roots = set(getattr(graph, "roots", ()) or ())
     children = _semantic_children(graph)
     inert: set[int] = set()
@@ -3983,13 +6799,80 @@ def _inert_routing_nodes(graph: Any) -> frozenset[int]:
             continue
         if all(child in inert for child in children[node_id]):
             inert.add(node_id)
-    return frozenset(inert)
+    result = frozenset(inert)
+    graph.G.graph["_inert_routing_nodes_cache"] = (fingerprint, result)
+    return result
+
+
+# Serialized ProcessGraphs retain this derived cache. Bump its schema when
+# classification semantics change, so a compiler replay recomputes old facts.
+_DISPATCH_METADATA_CACHE_SCHEMA = 3
+
+
+def _dispatch_metadata_node_classifier(graph: Any):
+    """Return a cached classifier for one pass over a stable planning graph.
+
+    NetworkX counts edges by walking node degrees. Validate the cache once
+    per pass, rather than doing that graph-wide walk for every queried node.
+    Obtain a new classifier after changing the graph's structure.
+    """
+
+    G = graph.G
+    fingerprint = (_DISPATCH_METADATA_CACHE_SCHEMA,
+                   G.number_of_nodes(), G.number_of_edges())
+    cache = G.graph.get("_dispatch_metadata_cache")
+    if cache is None or cache.get("__fingerprint__") != fingerprint:
+        cache = {"__fingerprint__": fingerprint,
+                 "__carried_initials__": frozenset(
+                     int(initial)
+                     for _, data in G.nodes(data=True)
+                     for initial, _updated in (data.get("attributes") or {}).get(
+                         "loop_carried_bindings", {}
+                     ).values()
+                 )}
+        G.graph["_dispatch_metadata_cache"] = cache
+    def classify(node_id: int) -> bool:
+        key = int(node_id)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        result = _is_dispatch_metadata_node_impl(graph, node_id)
+        cache[key] = result
+        return result
+
+    return classify
 
 
 def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
-    """Return whether a node routes syntax but performs no computation."""
+    """Classify a single node, validating the graph cache before the query."""
+    return _dispatch_metadata_node_classifier(graph)(node_id)
 
+
+def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
     data = graph.G.nodes[node_id]
+    precision_operator = (data.get("attributes") or {}).get(
+        "python_precision_operator"
+    )
+    if precision_operator is True:
+        # The authored syntax is a method call, but the concorded rewrite has
+        # already made this a repository precision operator. It is numerical
+        # region work, not a coordinator call. Its detached Attribute node is
+        # separately marked ``*-selector`` and remains metadata.
+        return False
+    if isinstance(precision_operator, str) and precision_operator.endswith(
+        "-selector"
+    ):
+        return True
+    if (data.get("attributes") or {}).get("authored_call_result_projection"):
+        # Specialization publishes typed leaves of a callee's tuple return.
+        # Their tensor descriptors describe the payload, not a tensor gather
+        # to dispatch. Keep the projection at its owning call/branch; a free
+        # numerical region here escapes the loop that produces the return.
+        return True
+    if (data.get("attributes") or {}).get("bound_method_ref") is not None:
+        return True
+    if (data.get("attributes") or {}).get("conditional_result_of") is not None:
+        return True
     node_type = str(data.get("type"))
     expression = data.get("expr_obj")
     parents = tuple(data.get("parents") or ())
@@ -4008,6 +6891,17 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
             str(data.get("label", "")).startswith("unpack[")
             or graph.G.nodes[indexed_base].get("type")
             in {"Tuple", "List", "Set", "Dict"}
+            or any(
+                parent in graph.G
+                and graph.G.nodes[parent].get("type")
+                in {"Const", "const", "Constant"}
+                and isinstance(
+                    _constant_value(graph.G.nodes[parent]),
+                    (str, bytes),
+                )
+                for parent, role in parents
+                if str(role) == "index"
+            )
         )
     )
     compares_none = (
@@ -4020,8 +6914,55 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
             for parent, _role in parents
         )
     )
+    non_numeric_constant_operand = False
+    def basic_index_literal(value):
+        if value is None or isinstance(value, int):
+            return True
+        if isinstance(value, slice):
+            return all(part is None or isinstance(part, int)
+                       for part in (value.start, value.stop, value.step))
+        if isinstance(value, tuple):
+            return all(basic_index_literal(part) for part in value)
+        return False
+
+    for parent, role in parents:
+        if parent not in graph.G:
+            continue
+        parent_data = graph.G.nodes[parent]
+        if str(parent_data.get("type")) not in {
+            "Const", "const", "Constant",
+        }:
+            continue
+        # A slice tuple is index metadata for a numerical load/store, not
+        # a non-numeric data operand that makes the operation coordinator-only.
+        if (
+            node_type in {"Indexed", "IndexedStore"}
+            and str(role) == "index"
+            and basic_index_literal(_constant_value(parent_data))
+        ):
+            continue
+        # A dtype spelling (``x.to_dtype("int64")``) is operation metadata
+        # for a numerical cast, not a non-numeric data operand.  Treating it
+        # as one severed every cast from its region: ``cell_index`` and
+        # ``upper`` in the periodic terrain became unproduced region feeds.
+        if (
+            str(data.get("op") or node_type).casefold()
+            in _DTYPE_CAST_OPERATIONS
+            and isinstance(_constant_value(parent_data), str)
+        ):
+            continue
+        try:
+            flatten_tensor_constant(parent_data.get("constant"))
+        except (TypeError, ValueError):
+            non_numeric_constant_operand = True
+            break
     def is_scalar_value(candidate: int, visiting=frozenset()) -> bool:
         if candidate in visiting or candidate not in graph.G:
+            return False
+        if candidate in (graph.G.graph.get("_dispatch_metadata_cache") or {}).get(
+            "__carried_initials__", ()
+        ):
+            # A literal seed is a runtime loop value after the first iteration.
             return False
         candidate_data = graph.G.nodes[candidate]
         candidate_expression = candidate_data.get("expr_obj")
@@ -4065,10 +7006,13 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
     coordinator_accessor = (
         str(data.get("op") or node_type) in ACCESSOR_OPERATORS
     )
-    coordinator_bit_shift = (
-        isinstance(expression, ast.BinOp)
-        and isinstance(expression.op, (ast.LShift, ast.RShift))
-    )
+    # ``<<``/``>>`` are ordinary numeric tensor operators (bitfield extraction
+    # in a byte decoder, for example), not inherently coordinator-side. A
+    # genuine *scalar* shift -- address/index arithmetic -- is already caught
+    # by ``static_scalar_expression`` below (every operand a scalar), exactly
+    # as a scalar ``&`` is; there is deliberately no ``coordinator_bitand``.
+    # Special-casing every shift as coordinator metadata additionally swallowed
+    # tensor-parallel shifts, which then never reached a numeric region.
     coordinator_boolean_not = (
         isinstance(expression, ast.UnaryOp)
         and isinstance(expression.op, ast.Not)
@@ -4085,15 +7029,77 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
     # Loop-target initializers are coordinator state setup.  Their values may
     # use ordinary tensor operations, but emitting them as an independent GPU
     # region duplicates work before the retained loop owns the binding.
-    loop_target_initializer = any(
-        node_id in set(
-            (candidate.get("attributes") or {})
-            .get("loop_target_initials", {})
-            .values()
-        )
-        for _candidate_id, candidate in graph.G.nodes(data=True)
-        if isinstance(candidate.get("expr_obj"), (ast.For, ast.While))
+    loop_target_initializers = getattr(
+        graph,
+        "_dispatch_loop_target_initializers",
+        None,
     )
+    if loop_target_initializers is None:
+        loop_target_initializers = frozenset(
+            int(initializer)
+            for _candidate_id, candidate in graph.G.nodes(data=True)
+            if isinstance(
+                candidate.get("expr_obj"),
+                (ast.For, ast.While),
+            )
+            for initializer in (
+                (candidate.get("attributes") or {})
+                .get("loop_target_initials", {})
+                .values()
+            )
+        )
+        graph._dispatch_loop_target_initializers = (
+            loop_target_initializers
+        )
+    loop_target_initializer = node_id in loop_target_initializers
+    attributes = data.get("attributes") or {}
+    ungrounded_tensor_method = (
+        attributes.get("tensor_candidate") is not None
+        and attributes.get("tensor") is None
+        and str(attributes.get("tensor_candidate")) in {"split"}
+        and isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+    )
+    # A builtin Call naming a catalogued operator in ``tensor`` computes
+    # exactly as the operator it names: ``max(a, b)`` is numeric work as
+    # surely as ``a + b``.  Classifying these coordination severed every
+    # carried max reduction -- and every post-loop ``abs``/``max``
+    # temporary -- from its region while the adds flowed.  Method calls
+    # (an Attribute callee: ``d.get``) and linked references stay
+    # coordinator work; those have their own machinery.
+    if (
+        node_type in {"Call", "call"}
+        and str(
+            (data.get("attributes") or {}).get("tensor") or ""
+        ) in abstract_tensor_funcs
+        and not isinstance(
+            getattr(expression, "func", None), ast.Attribute
+        )
+        and not any(
+            (data.get("attributes") or {}).get(name) is not None
+            for name in ("callee_ref", "method_ref", "class_ref")
+        )
+    ):
+        return False
+    if (
+        str(data.get("op") or node_type).casefold() == "getattr"
+        and str(attributes.get("tensor") or "")
+        in abstract_tensor_funcs
+        and attributes.get("tensor_candidate") == attributes.get("tensor")
+        and not any(
+            attributes.get(name) is not None
+            for name in ("callee_ref", "method_ref", "class_ref")
+        )
+    ):
+        # A receiver-grounded NumPy/Torch tensor property is numerical work,
+        # despite retaining its authored Attribute syntax.  The source
+        # candidate plus the exact receiver tensor descriptor is the proof;
+        # an ordinary object field with the same name never reaches here.
+        return False
+    if node_type == "BitLength" and bool(
+        (data.get("attributes") or {}).get("python_scalar_intrinsic")
+    ):
+        return False
     return (
         bool(
             (data.get("attributes") or {}).get(
@@ -4135,6 +7141,8 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
             "Call",
             "StaticReference",
             "SetAttr",
+            "DelAttr",
+            "DelItem",
             "Phi",
             "LoopExit",
             "LoopStateTransition",
@@ -4149,7 +7157,10 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
         (
             isinstance(data.get("expr_obj"), ast.Call)
             and isinstance(data["expr_obj"].func, ast.Attribute)
-            and node_type not in abstract_tensor_funcs
+            and (
+                node_type not in abstract_tensor_funcs
+                or ungrounded_tensor_method
+            )
         )
         or
         bool(
@@ -4201,9 +7212,9 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
         or python_routing_index
         or python_shape_index
         or compares_none
+        or non_numeric_constant_operand
         or static_scalar_expression
         or coordinator_accessor
-        or coordinator_bit_shift
         or coordinator_boolean_not
         or chained_comparison
         or loop_target_initializer
@@ -4212,6 +7223,178 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
             and (data.get("attributes") or {}).get("source_type") == "Name"
         )
     )
+
+
+def _subgraph_reduction_digest(subgraph: Any) -> str:
+    """Content key for one region's structural lowering.
+
+    ``_structural_region_program_from_subgraph`` is a pure function of the
+    dispatch subgraph, so hashing the subgraph identifies the region program it
+    will produce -- letting the incremental backup reuse an already-lowered
+    region whenever its subgraph is unchanged.
+    """
+
+    from joblib.externals import cloudpickle
+
+    graph_digest = hashlib.sha256(cloudpickle.dumps(subgraph)).hexdigest()
+    # Region artifacts depend on the transcription contract as well as graph
+    # topology.  Version that contract so a provenance/lowering fix cannot
+    # keep resurrecting an older region program from the reduction cache.
+    return hashlib.sha256(
+        (
+            "structural-region-v7-source-value-receipts|" + graph_digest
+        ).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _structural_region_program_from_subgraph(
+    subgraph: Any,
+) -> CapturedFusedProgram:
+    """Build one region's numeric program from its dispatch subgraph structure.
+
+    This is the value-free counterpart to a captured region program: the same
+    ``dispatch_region_to_fused_program`` the JIT/tape path uses, driven by the
+    subgraph the planner already isolated rather than by an observed tape. It
+    is how the graph-only precompile (an unfed mutable parameter left symbolic,
+    the exact case an autograd tape cannot observe) still produces real region
+    programs -- transcribing the ops faithfully, no hand-synthesis. Layout/cast
+    ops flow through under their own names for the backend to lower.
+    """
+
+    graph_data = subgraph.G.graph
+    region = DispatchRegion(
+        tuple(int(n) for n in graph_data.get("deployment_nodes", ())),
+        tuple(int(n) for n in graph_data.get("deployment_inputs", ())),
+        tuple(
+            (f"value_{int(v)}", int(v))
+            for v in graph_data.get("deployment_outputs", ())
+        ),
+        0.0,
+    )
+    # This is the handoff from the compiler's provenance backbone into the
+    # backend-neutral numeric IR.  Several descriptors are proven recursively
+    # by the concordance and therefore do not live in the source node's
+    # shallow ``tensor`` snapshot.  Materialize those proven facts onto the
+    # dispatch subgraph before transcription; otherwise a later region seam
+    # forgets the shape even though the concordance still knows it.
+    for value_id in (*region.input_ids, *region.node_ids):
+        descriptor = _tensor_descriptor(subgraph, int(value_id))
+        if descriptor is None:
+            continue
+        node = subgraph.G.nodes[int(value_id)]
+        tensor = dict(node.get("tensor") or {})
+        tensor.update({
+            key: copy.deepcopy(descriptor[key])
+            for key in ("shape", "dtype", "device", "rank")
+            if descriptor.get(key) is not None
+        })
+        node["tensor"] = tensor
+    program = dispatch_region_to_fused_program(subgraph, region)
+    # Region-local integers are useful execution slots, but they are not the
+    # identity a diagnostic or later compiler pass should have to remember.
+    # Preserve the source graph's deterministic structural token chain for
+    # every exposed value while the graph still owns that correlation.
+    identity_tokens = dict(graph_data.get("ssa_identity_tokens") or {})
+    exposed_values = {
+        *map(int, program.feeds),
+        *map(int, program.outputs.values()),
+    }
+    program.extras = {
+        **dict(program.extras or {}),
+        "source_function": str(graph_data.get("function_name") or ""),
+        "source_value_ids": {
+            int(value_id): int(value_id)
+            for value_id in sorted(exposed_values)
+        },
+    }
+    exposed_identity_tokens = {
+        int(value_id): tuple(map(str, identity_tokens[value_id]))
+        for value_id in sorted(exposed_values)
+        if value_id in identity_tokens
+    }
+    if exposed_identity_tokens:
+        program.extras = {
+            **dict(program.extras or {}),
+            "ssa_identity_tokens": exposed_identity_tokens,
+        }
+    structural_table_stores = []
+    structural_sequences: dict[int, dict[str, Any]] = {}
+    for node_id in graph_data.get("deployment_nodes", ()):
+        data = subgraph.G.nodes[int(node_id)]
+        operation = str(data.get("op") or data.get("type") or "").casefold()
+        if operation != "indexedstore":
+            continue
+        by_role = {
+            str(role): int(parent)
+            for parent, role in data.get("parents") or ()
+            if int(parent) in subgraph.G
+        }
+        base_id = by_role.get("base")
+        key_id = by_role.get("index")
+        value_id = by_role.get("value")
+        if None in {base_id, key_id, value_id}:
+            continue
+        base_data = subgraph.G.nodes[int(base_id)]
+        attributes = dict(base_data.get("attributes") or {})
+        if attributes.get("aggregate_kind") != "dict":
+            continue
+        key_dtype = attributes.get("mapping_key_dtype")
+        value_dtype = attributes.get("mapping_value_dtype")
+        if key_dtype is None or value_dtype is None:
+            # The mutation is structural, but its physical ABI is not stated.
+            # Preserve that fact for diagnostics; never guess scalar widths.
+            program.extras = {
+                **dict(program.extras or {}),
+                "structural_boundary_shortfalls": ({
+                    "kind": "unresolved-resident-table-contract",
+                    "sequence_value_id": int(base_id),
+                    "effect_value_id": int(node_id),
+                    "record_field": attributes.get("record_field"),
+                },),
+            }
+            continue
+        sequence_id = int(base_data.get("value_id", base_id))
+        structural_sequences[sequence_id] = {
+            "sequence_id": sequence_id,
+            "policy": "unique",
+            "column_count": int(
+                attributes.get("sequence_column_count") or 2
+            ),
+            "writable": bool(attributes.get("sequence_writable", True)),
+            "column_dtypes": [str(key_dtype), str(value_dtype)],
+            "storage_identity": ".".join(map(
+                str, attributes.get("record_field") or ("mapping", sequence_id),
+            )),
+            "value_record": attributes.get("mapping_value_record"),
+            "value_optional": bool(
+                attributes.get("mapping_value_optional", False)
+            ),
+        }
+        structural_table_stores.append({
+            "effect_value_id": int(data.get("value_id", node_id)),
+            "key_value_id": int(
+                subgraph.G.nodes[key_id].get("value_id", key_id)
+            ),
+            "stored_value_id": int(
+                subgraph.G.nodes[value_id].get("value_id", value_id)
+            ),
+            "sequence_value_id": sequence_id,
+        })
+    if structural_table_stores:
+        program.extras = {
+            **dict(program.extras or {}),
+            "structural_resident_table_contract": {
+                "schema": "turing.structural-resident-table-integral.v1",
+                "sequences": [
+                    structural_sequences[key]
+                    for key in sorted(structural_sequences)
+                ],
+                "stores": structural_table_stores,
+            },
+        }
+    return CapturedFusedProgram(program, {})
 
 
 def _dispatch_subgraph(
@@ -4277,6 +7460,9 @@ def _dispatch_subgraph(
     }
     included = selected | boundary
     subgraph = extract_clean_process_subgraph(graph, included)
+    subgraph.python_bindings = dict(
+        getattr(graph, "python_bindings", {}) or {}
+    )
     for child in included:
         roles = {
             parent: role
@@ -4291,11 +7477,37 @@ def _dispatch_subgraph(
                     role=roles.get(parent, "dependency"),
                 )
 
+    carried_initials = {
+        int(initial)
+        for _, data in graph.G.nodes(data=True)
+        for initial, _updated in (data.get("attributes") or {}).get(
+            "loop_carried_bindings", {}
+        ).values()
+    }
     for node_id in boundary:
         data = subgraph.G.nodes[node_id]
-        if str(data.get("type")) in {"Const", "const", "Constant"}:
+        # Ask the concordance while the source graph still owns this value's
+        # complete causal parents.  Turning a boundary into an Input below is
+        # intentionally lossy compartmentalization; without materializing the
+        # proven descriptor first, a chained layout operation (for example
+        # ``literal.unsqueeze(1).unsqueeze(2)``) loses the first view's shape
+        # exactly at the region seam.
+        descriptor = _tensor_descriptor(graph, int(node_id))
+        if descriptor_states_a_shape(descriptor):
+            tensor = dict(data.get("tensor") or {})
+            tensor.update({
+                key: copy.deepcopy(descriptor[key])
+                for key in ("shape", "dtype", "device", "rank")
+                if descriptor.get(key) is not None
+            })
+            data["tensor"] = tensor
+        if str(data.get("type")) in {"Const", "const", "Constant"} and node_id not in carried_initials:
             continue
         data["type"] = "Input"
+        if node_id in carried_initials:
+            data["constant"] = None
+            data["attributes"] = dict(data.get("attributes") or {})
+            data["attributes"].pop("value", None)
         data["op"] = "input"
         data["label"] = f"value_{node_id}"
         data["parents"] = []
@@ -4363,17 +7575,20 @@ def _dispatch_subgraph(
     subgraph.G.graph["compartment_schedule_preference"] = (
         schedule_preference
     )
+    # One topological sort, then bucket by level -- not one full sort per
+    # level. The order within a level is identical (it is the single sort's
+    # order, filtered), so the schedule is unchanged; only the redundant
+    # O(levels x sort) work is removed.
+    _compartment_order = nx.lexicographical_topological_sort(
+        subgraph.G, key=lambda value_id: int(value_id)
+    )
+    _nodes_by_level: dict[int, list[int]] = {}
+    for node_id in _compartment_order:
+        _nodes_by_level.setdefault(
+            int(subgraph.levels.get(node_id, 0)), []
+        ).append(node_id)
     subgraph.G.graph["compartment_schedule"] = tuple(
-        (
-            level,
-            tuple(
-                node_id
-                for node_id in nx.lexicographical_topological_sort(
-                    subgraph.G, key=lambda value_id: int(value_id)
-                )
-                if int(subgraph.levels.get(node_id, 0)) == level
-            ),
-        )
+        (level, tuple(_nodes_by_level.get(level, ())))
         for level in sorted(set(subgraph.levels.values()))
     )
     subgraph.G.graph["deployment_inputs"] = tuple(
@@ -4389,6 +7604,265 @@ def _dispatch_subgraph(
     return subgraph
 
 
+def _ast_source_location(expression: ast.AST) -> tuple[Any, ...]:
+    return (
+        type(expression),
+        getattr(expression, "lineno", None),
+        getattr(expression, "col_offset", None),
+        getattr(expression, "end_lineno", None),
+        getattr(expression, "end_col_offset", None),
+    )
+
+
+def _ast_source_signature(expression: ast.AST) -> tuple[Any, ...]:
+    """Stable authored-occurrence key for reduced/copied AST nodes."""
+
+    return (*_ast_source_location(expression), ast.dump(expression, include_attributes=False))
+
+
+def _retain_source_control_records(graph_obj: Any) -> None:
+    """Snapshot authored controls before structural folding removes nodes."""
+
+    records = dict(graph_obj.graph.get("source_control_records") or {})
+    for node_id, data in graph_obj.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not isinstance(
+            expression, (ast.If, ast.IfExp, ast.Try, ast.BoolOp),
+        ):
+            continue
+        predicate_id = next((
+            int(parent) for parent, role in (data.get("parents") or ())
+            if str(role) == "test"
+        ), None)
+        records[int(node_id)] = {
+            "expression": expression,
+            "predicate_id": predicate_id,
+        }
+    if records:
+        graph_obj.graph["source_control_records"] = records
+
+
+def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
+    """Snapshot authored append/add effects before structural reduction."""
+
+    records = dict(
+        graph_obj.graph.get("source_sequence_mutation_records") or {}
+    )
+    for node_id, data in graph_obj.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+            and expression.func.attr in {"append", "add"}
+        ):
+            continue
+        parents = tuple(data.get("parents") or ())
+        destination = next((
+            int(parent) for parent, role in parents
+            if str(role) == "operand" and int(parent) in graph_obj
+        ), None)
+        arguments = tuple(
+            int(parent) for parent, role in parents
+            if str(role).startswith("arg:") and int(parent) in graph_obj
+        )
+        if destination is None or len(arguments) != 1:
+            continue
+        destination_data = graph_obj.nodes[destination]
+        if (destination_data.get("attributes") or {}).get(
+            "aggregate_kind"
+        ) not in {"list", "set", "bytes", "bytearray"}:
+            continue
+        records[int(node_id)] = {
+            "expression": expression,
+            "sequence_value_id": int(destination_data.get(
+                "value_id", destination
+            )),
+            "argument_value_ids": (
+                int(graph_obj.nodes[arguments[0]].get(
+                    "value_id", arguments[0]
+                )),
+            ),
+            "operator": str(expression.func.attr),
+            "policy": (
+                "unique" if expression.func.attr == "add"
+                else "duplicates"
+            ),
+        }
+    controls = dict(graph_obj.graph.get("source_control_records") or {})
+    effect_signatures = {
+        int(effect_id): _ast_source_signature(record["expression"])
+        for effect_id, record in records.items()
+        if isinstance(record.get("expression"), ast.AST)
+    }
+    effect_locations = {signature[:-1] for signature in effect_signatures.values()}
+    memberships_by_signature = {}
+    for control_id, control_record in controls.items():
+        conditional = control_record.get("expression")
+        if not isinstance(conditional, ast.If):
+            continue
+        for arm, statements in (("body", conditional.body), ("orelse", conditional.orelse)):
+            for statement in statements:
+                for member in ast.walk(statement):
+                    if _ast_source_location(member) in effect_locations:
+                        memberships_by_signature.setdefault(_ast_source_signature(member), []).append(
+                            (int(control_id), arm))
+    for effect_id, record in records.items():
+        expression = record.get("expression")
+        if not isinstance(expression, ast.AST):
+            continue
+        effect_signature = effect_signatures[int(effect_id)]
+        memberships = memberships_by_signature.get(effect_signature, ())
+        record["branch_memberships"] = tuple(dict.fromkeys(memberships))
+    if records:
+        graph_obj.graph["source_sequence_mutation_records"] = records
+
+
+def _source_control_records(graph_obj: Any) -> dict[int, dict[str, Any]]:
+    """Return retained plus still-live authored control records."""
+
+    _retain_source_control_records(graph_obj)
+    return {
+        int(node_id): dict(record)
+        for node_id, record in (
+            graph_obj.graph.get("source_control_records") or {}
+        ).items()
+    }
+
+
+def _source_control_expression(
+    graph_obj: Any, node_id: int,
+) -> ast.AST | None:
+    record = _source_control_records(graph_obj).get(int(node_id))
+    expression = None if record is None else record.get("expression")
+    return expression if isinstance(expression, ast.AST) else None
+
+
+def _retained_control_value_id(
+    graph_obj: Any,
+    source_value_id: int | None,
+    expression: ast.AST | None,
+) -> int | None:
+    """Correlate a pre-fold control value with its retained graph identity."""
+
+    if source_value_id is not None and int(source_value_id) in graph_obj:
+        return int(source_value_id)
+    if expression is not None:
+        signature = _ast_source_signature(expression)
+        matches = tuple(sorted(
+            int(node_id)
+            for node_id, data in graph_obj.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.AST)
+            and _ast_source_signature(data["expr_obj"]) == signature
+        ))
+        if matches:
+            return matches[0]
+    if source_value_id is not None:
+        source_value_id = int(source_value_id)
+        for history in (graph_obj.graph.get("identity_table") or {}).values():
+            ordered = tuple(map(int, history))
+            if source_value_id in ordered:
+                retained = tuple(value for value in ordered if value in graph_obj)
+                if retained:
+                    return retained[-1]
+        matches = tuple(sorted(
+            int(node_id)
+            for node_id, data in graph_obj.nodes(data=True)
+            if int(data.get("value_id", node_id)) == source_value_id
+        ))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _optional_presence_control_expression(
+    graph_obj: Any,
+    expression: ast.AST | None,
+) -> ControlExpression | None:
+    """Recover an erased ``optional_record_field is [not] None`` test.
+
+    ProgramABI splits an optional scalar field into a typed payload and an
+    explicit Boolean presence slot. Structural folding can remove the Python
+    ``None`` comparison after the effective local name has become the field
+    payload. The payload's existence is not proof that the value is present:
+    absent values deliberately retain a typed filler. Recover only the exact
+    one-name, one-field, one-presence-slot relation and leave every ambiguous
+    case to the incumbent unresolved behavior.
+    """
+
+    if not (
+        isinstance(expression, ast.Compare)
+        and len(expression.ops) == 1
+        and isinstance(expression.ops[0], (ast.Is, ast.IsNot))
+        and len(expression.comparators) == 1
+        and isinstance(expression.comparators[0], ast.Constant)
+        and expression.comparators[0].value is None
+        and isinstance(expression.left, ast.Name)
+    ):
+        return None
+    histories = graph_obj.graph.get("identity_table") or {}
+    payload_ids = tuple(dict.fromkeys(
+        int(value_id)
+        for value_id in histories.get(expression.left.id, ())
+        if int(value_id) in graph_obj
+    ))
+    if len(payload_ids) != 1:
+        return None
+    payload_id = payload_ids[0]
+    payload = graph_obj.nodes[payload_id]
+    if str(payload.get("type") or payload.get("op") or "").casefold() != "getattr":
+        return None
+    field = (payload.get("attributes") or {}).get("attribute")
+    receiver_ids = tuple(dict.fromkeys(
+        int(parent)
+        for parent, role in payload.get("parents") or ()
+        if str(role) in {"value", "object", "base", "receiver"}
+        and int(parent) in graph_obj
+    ))
+    if field is None or len(receiver_ids) != 1:
+        return None
+    receiver = graph_obj.nodes[receiver_ids[0]]
+    parameter = (receiver.get("attributes") or {}).get("binding_name")
+    if parameter is None:
+        return None
+    presence = tuple(
+        (int(node_id), attributes)
+        for node_id, data in graph_obj.nodes(data=True)
+        for attributes in (data.get("attributes") or {},)
+        if attributes.get("program_abi_optional_presence")
+        and str(attributes.get("program_abi_parameter")) == str(parameter)
+        and str(attributes.get("program_abi_field")) == str(field)
+    )
+    if len(presence) != 1:
+        return None
+    presence_id, attributes = presence[0]
+    present_when = bool(attributes.get(
+        "program_abi_optional_present_when", True,
+    ))
+    is_not_none = isinstance(expression.ops[0], ast.IsNot)
+    direct = present_when == is_not_none
+    predicate = ControlExpression("value", value_id=presence_id)
+    if not direct:
+        predicate = ControlExpression("not", (predicate,), value_id=presence_id)
+    receipt = {
+        "name": str(expression.left.id),
+        "payload_value_id": int(payload_id),
+        "presence_value_id": int(presence_id),
+        "parameter": str(parameter),
+        "field": str(field),
+        "comparison": "is_not_none" if is_not_none else "is_none",
+        "predicate": "presence" if direct else "not_presence",
+        "priority": "exact_program_abi_optional_presence",
+        "tie_policy": "incumbent",
+    }
+    receipts = list(graph_obj.graph.get(
+        "optional_presence_control_receipts", ()
+    ))
+    if receipt not in receipts:
+        receipts.append(receipt)
+        graph_obj.graph["optional_presence_control_receipts"] = tuple(receipts)
+    return predicate
+
+
 def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
     """Map every node to the conditional branches that guard it.
 
@@ -4400,14 +7874,46 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
     or to mix two branches of the same test with each other.
     """
 
+    # ``ast.Load``/``ast.Store`` and operator/context nodes are locationless
+    # singleton helpers.  They are shared by otherwise unrelated expressions,
+    # so correlating them by object identity (or by their identical dump)
+    # makes one small branch appear to guard every name load in the function.
+    # Branch ownership belongs only to source-positioned syntax.  Real names,
+    # calls, expressions, and statements all carry ``lineno``; helper tokens
+    # do not.
+    def source_positioned(expression: Any) -> bool:
+        return (
+            isinstance(expression, ast.AST)
+            and getattr(expression, "lineno", None) is not None
+        )
+
     expression_nodes = {
         id(data.get("expr_obj")): node_id
         for node_id, data in graph.G.nodes(data=True)
-        if isinstance(data.get("expr_obj"), ast.AST)
+        if source_positioned(data.get("expr_obj"))
     }
-    memberships: dict[int, set[tuple[int, str]]] = {}
-    for control_id, data in graph.G.nodes(data=True):
+    location_nodes = {}
+    signatures = {}
+
+    def signature(expression):
+        key = id(expression)
+        if key not in signatures:
+            signatures[key] = _ast_source_signature(expression)
+        return signatures[key]
+    effect_span_nodes: dict[tuple[Any, ...], set[int]] = {}
+    for node_id, data in graph.G.nodes(data=True):
         expression = data.get("expr_obj")
+        for source_expression in (expression, data.get("authored_expr_obj")):
+            if source_positioned(source_expression):
+                location_nodes.setdefault(_ast_source_location(source_expression), []).append((source_expression, int(node_id)))
+        if not source_positioned(expression) and str(data.get("type") or "").casefold() == "setattr":
+            span = data.get("source_span") or {}
+            if span.get("line") is not None:
+                effect_span_nodes.setdefault(tuple(span.get(key) for key in
+                    ("line", "column", "end_line", "end_column")), set()).add(int(node_id))
+    memberships: dict[int, set[tuple[int, str]]] = {}
+    for control_id, record in _source_control_records(graph.G).items():
+        expression = record.get("expression")
         if isinstance(expression, ast.If):
             branches = {
                 "body": tuple(expression.body),
@@ -4438,15 +7944,1419 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
         for role, statements in branches.items():
             for statement in statements:
                 for member in ast.walk(statement):
-                    guarded = expression_nodes.get(id(member))
-                    if guarded is not None and guarded != control_id:
-                        memberships.setdefault(guarded, set()).add(
-                            (control_id, role)
-                        )
+                    if not source_positioned(member):
+                        continue
+                    guarded_nodes = (
+                        (int(expression_nodes[id(member)]),)
+                        if id(member) in expression_nodes
+                        else tuple(sorted({candidate_id
+                            for candidate, candidate_id in location_nodes.get(_ast_source_location(member), ())
+                            if signature(candidate) == signature(member)}))
+                    )
+                    guarded_nodes = (*guarded_nodes, *effect_span_nodes.get(
+                        (member.lineno, member.col_offset,
+                         getattr(member, "end_lineno", None), getattr(member, "end_col_offset", None)), ()))
+                    for guarded in guarded_nodes:
+                        if guarded != control_id:
+                            memberships.setdefault(guarded, set()).add(
+                                (control_id, role)
+                            )
+    # Reducer-authored Phi values do not own an AST expression, but they run
+    # at the continuation of their exact source conditional.  When that
+    # conditional is itself nested in another branch, its merge is therefore
+    # guarded by the enclosing branch and must be a candidate outgoing value
+    # for the enclosing Phi.  Inherit only the source conditional's outer
+    # memberships; never mark the merge as belonging to either of its own
+    # mutually exclusive arms.
+    for node_id, data in graph.G.nodes(data=True):
+        source_conditional_id = int((data.get("attributes") or {}).get(
+            "source_conditional_id", -1
+        ))
+        if source_conditional_id in memberships:
+            memberships.setdefault(int(node_id), set()).update(
+                memberships[source_conditional_id]
+            )
     return {
         node_id: frozenset(roles)
         for node_id, roles in memberships.items()
     }
+
+
+def _record_field_state_keys(
+    graph: Any,
+    node_by_value: Mapping[int, int],
+    value_ids: Iterable[int],
+) -> frozenset[tuple[int, str]]:
+    """Return exact receiver/field identities represented by graph values."""
+
+    keys: set[tuple[int, str]] = set()
+    for value_id in value_ids:
+        node_id = node_by_value.get(int(value_id))
+        if node_id is None or node_id not in graph:
+            continue
+        data = graph.nodes[node_id]
+        attributes = data.get("attributes") or {}
+        state = attributes.get("record_field_state")
+        if (
+            isinstance(state, (tuple, list))
+            and len(state) == 2
+            and state[0] is not None
+            and state[1] is not None
+        ):
+            keys.add((int(state[0]), str(state[1])))
+        operation = str(data.get("type") or data.get("op") or "").casefold()
+        attribute = attributes.get("attribute")
+        if operation not in {"getattr", "setattr"} or attribute is None:
+            continue
+        receiver_roles = (
+            {"object", "base", "receiver"}
+            if operation == "setattr"
+            else {"value", "object", "base", "receiver"}
+        )
+        receiver = next((
+            int(parent)
+            for parent, role in data.get("parents") or ()
+            if str(role) in receiver_roles
+        ), None)
+        if receiver is not None:
+            keys.add((receiver, str(attribute)))
+    return frozenset(keys)
+
+
+def _ordinary_conditional_control_programs(
+    graph: Any,
+    retained_regions: Iterable[int],
+    dispatch_subgraphs: Iterable[Any],
+) -> tuple[ControlProgram, ...]:
+    """Preserve source conditional arms and their lexical SSA merges."""
+
+    from .control_source import ConditionalBlock, LoopControlBlock
+
+    retained_regions = tuple(map(int, retained_regions))
+    retained = frozenset(retained_regions)
+    subgraphs = tuple(dispatch_subgraphs)
+    memberships = _branch_compartments(graph)
+    node_by_value = {
+        int(data.get("value_id", node_id)): int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("value_id", node_id), int)
+    }
+    reducer_phi_record_fields = _record_field_state_keys(
+        graph.G,
+        node_by_value,
+        (
+            int(data.get("value_id", node_id))
+            for node_id, data in graph.G.nodes(data=True)
+            if str(data.get("type") or data.get("op") or "").casefold()
+            == "phi"
+            and (data.get("attributes") or {}).get("record_field_state")
+            is not None
+        ),
+    )
+    programs = []
+    for control_id, record in _source_control_records(graph.G).items():
+        expression = record.get("expression")
+        if not isinstance(expression, (ast.If, ast.IfExp)):
+            continue
+        is_expression = isinstance(expression, ast.IfExp)
+        body_statements = (expression.body,) if is_expression else expression.body
+        else_statements = (expression.orelse,) if is_expression else expression.orelse
+        result_aliases = ()
+        if is_expression:
+            data = graph.G.nodes.get(int(control_id))
+            if data is None:
+                continue
+            parents = dict((str(role), int(parent))
+                           for parent, role in data.get("parents", ()))
+            if not all(parents.get(role) in graph.G for role in ("body", "orelse")):
+                continue
+            result_aliases = (data.get("attributes") or {}).get("conditional_member_bindings") or ((
+                int(graph.G.nodes[parents["body"]].get("value_id", parents["body"])),
+                int(graph.G.nodes[parents["orelse"]].get("value_id", parents["orelse"])),
+                int(data.get("value_id", control_id)),
+            ),)
+        predicate_id = _retained_control_value_id(
+            graph.G,
+            record.get("predicate_id"),
+            expression.test,
+        )
+        predicate_expression = None
+        if predicate_id is None:
+            predicate_expression = _optional_presence_control_expression(
+                graph.G, expression.test,
+            )
+            if predicate_expression is None:
+                continue
+            predicate_value_id = int(predicate_expression.value_id)
+            predicate_id = predicate_value_id
+        else:
+            predicate_value_id = int(
+                graph.G.nodes[predicate_id].get("value_id", predicate_id)
+            )
+            predicate_expression = ControlExpression(
+                "value", value_id=int(predicate_value_id)
+            )
+        body_regions = tuple(
+            region_index
+            for region_index, subgraph in enumerate(subgraphs)
+            if region_index in retained
+            and any(
+                (int(control_id), "body") in memberships.get(int(node_id), ())
+                for node_id in subgraph.G.graph.get("deployment_nodes", ())
+            )
+        )
+        else_regions = tuple(
+            region_index
+            for region_index, subgraph in enumerate(subgraphs)
+            if region_index in retained
+            and any(
+                (int(control_id), "orelse") in memberships.get(int(node_id), ())
+                for node_id in subgraph.G.graph.get("deployment_nodes", ())
+            )
+        )
+        # The comparison node is only the last link in the predicate.  Every
+        # retained numerical region containing one of its transitive graph
+        # producers must execute before the branch.  Selecting only the region
+        # that contains ``predicate_id`` leaves earlier producer regions in
+        # the flat tail, and control lowering then mistakes their canonical
+        # result IDs for additional public arguments.
+        predicate_scope = memberships.get(int(predicate_id), frozenset())
+        predicate_dependencies = {
+            int(candidate)
+            for candidate in {
+                int(predicate_id),
+                *map(int, nx.ancestors(graph.G, int(predicate_id))),
+            }
+            # A nested predicate can read a value produced outside its source
+            # arm, but that producer remains owned by the enclosing scope.
+            # Only dependencies physically evaluated in the predicate's own
+            # branch compartment belong in this conditional prelude.  Exact
+            # source membership is the lexical proof; graph ancestry alone is
+            # deliberately insufficient.
+            if memberships.get(int(candidate), frozenset()) == predicate_scope
+        }
+        predicate_regions = tuple(
+            region_index
+            for region_index in retained_regions
+            if int(region_index) in retained
+            for subgraph in (subgraphs[int(region_index)],)
+            if predicate_dependencies.intersection(map(
+                int, subgraph.G.graph.get("deployment_nodes", ())
+            ))
+        )
+        predicate_terminal_regions = tuple(
+            region_index
+            for region_index in retained_regions
+            if int(region_index) in retained
+            for subgraph in (subgraphs[int(region_index)],)
+            if int(predicate_id) in set(map(
+                int, subgraph.G.graph.get("deployment_nodes", ())
+            ))
+        )
+        # A ``return`` ending an arm is a control effect of that arm: it
+        # leaves the function carrying the arm's values. The overlay removes
+        # the loop schedule's copy when the exact anchor and slots agree.
+        return_slot_values = dict(graph.G.graph.get("return_slot_values") or {})
+        enclosing_loop_spans = tuple(
+            (int(loop_expression.lineno), int(getattr(
+                loop_expression, "end_lineno", loop_expression.lineno
+            )))
+            for _loop_id, loop_data in graph.G.nodes(data=True)
+            for loop_expression in (loop_data.get("expr_obj"),)
+            if isinstance(loop_expression, (ast.For, ast.While))
+        )
+        inside_loop = any(
+            start <= int(expression.lineno) <= end
+            for start, end in enclosing_loop_spans
+        )
+        # A ``break``/``continue`` ending an arm is that arm's exit edge: it
+        # leaves the loop carrying the arm's OWN bindings, which dominate
+        # the edge only inside the arm.  Place it there (the loop schedule
+        # skips arm-owned sites, `LoopDescriptor.control_sites`), with the
+        # site's live bindings from the owning loop's ``loop_break_sites``.
+        enclosing_loops = tuple(
+            (
+                int(loop_expression.lineno),
+                int(getattr(
+                    loop_expression, "end_lineno", loop_expression.lineno
+                )),
+                dict((loop_data.get("attributes") or {}).get(
+                    "loop_break_sites"
+                ) or {}),
+            )
+            for _loop_id, loop_data in graph.G.nodes(data=True)
+            for loop_expression in (loop_data.get("expr_obj"),)
+            if isinstance(loop_expression, (ast.For, ast.While))
+        )
+        retained_region_nodes = {
+            int(member)
+            for region_index in sorted(retained)
+            for member in subgraphs[int(region_index)].G.graph.get(
+                "deployment_nodes", ()
+            )
+        }
+        control_node_by_statement = {
+            id(node_data.get("expr_obj")): int(node_id)
+            for node_id, node_data in graph.G.nodes(data=True)
+            if isinstance(
+                node_data.get("expr_obj"), (ast.Break, ast.Continue)
+            )
+        }
+
+        def arm_loop_control(statements, arm_name):
+            if not inside_loop or not statements:
+                return None
+            terminal = statements[-1]
+            if not isinstance(terminal, (ast.Break, ast.Continue)):
+                return None
+            action = "break" if isinstance(terminal, ast.Break) else "continue"
+            line = int(getattr(terminal, "lineno", -1))
+            span = (
+                line,
+                int(getattr(terminal, "col_offset", -1)),
+                int(getattr(terminal, "end_lineno", -1)),
+                int(getattr(terminal, "end_col_offset", -1)),
+            )
+            # Innermost loop whose source range holds the site owns it.
+            owner = min(
+                (
+                    (end - start, break_sites)
+                    for start, end, break_sites in enclosing_loops
+                    if start <= line <= end
+                ),
+                key=lambda item: item[0],
+                default=None,
+            )
+            declared_identity_ids = {
+                int(value_id)
+                for history in (graph.G.graph.get("identity_table") or {}).values()
+                for value_id in history
+            }
+            site_values = {
+                int(initial): int(value)
+                for initial, value in (
+                    (owner[1].get(span) or {}) if owner else {}
+                ).items()
+                if int(value) in graph.G
+                and (int(initial) in graph.G or int(initial) in declared_identity_ids)
+            }
+            # Same rule as the loop schedule (``arm_owned_site`` in
+            # loop_composer): the arm owns the site only when a value it
+            # carries is produced by a retained region INSIDE this arm.
+            owned = any(
+                int(value) in retained_region_nodes
+                and int(value) in node_by_value
+                and (int(control_id), arm_name) in memberships.get(
+                    node_by_value[int(value)], ()
+                )
+                for value in site_values.values()
+            )
+            if os.environ.get("TURING_DEBUG_BREAK_EDGE"):
+                print(
+                    "DEBUG-ARM-OWNED builder "
+                    f"fn={graph.G.graph.get('function_name')} "
+                    f"control={int(control_id)} arm={arm_name} "
+                    f"site={control_node_by_statement.get(id(terminal))} "
+                    f"site_values={site_values} owned={owned}",
+                    file=sys.stderr, flush=True,
+                )
+            if not owned:
+                return None
+            return LoopControlBlock(
+                action, None, True, None,
+                source_action=action,
+                site_node_id=control_node_by_statement.get(id(terminal)),
+                site_values=tuple(sorted(
+                    (int(initial), int(value))
+                    for initial, value in site_values.items()
+                )),
+            )
+
+        def arm_return_control(statements):
+            if not statements:
+                return None
+            terminal = statements[-1]
+            if not isinstance(terminal, ast.Return) or terminal.value is None:
+                return None
+            returned = terminal.value
+            slots = return_slot_values.get((
+                int(getattr(returned, "lineno", -1)),
+                int(getattr(returned, "col_offset", -1)),
+                int(getattr(returned, "end_lineno", -1)),
+                int(getattr(returned, "end_col_offset", -1)),
+            ))
+            if slots is None:
+                return None
+            # LoopDescriptor.return_controls anchors a return at its value,
+            # not an ast.Return statement node. Tuple containers can be
+            # reduced away, in which case its last surviving exact slot is
+            # the anchor, as in LoopComposer.describe.
+            signature = lambda expr: (
+                *(getattr(expr, key, None) for key in (
+                    "lineno", "col_offset", "end_lineno", "end_col_offset")),
+                ast.dump(expr, include_attributes=False),
+            )
+            sites = [int(node_id) for node_id, node_data in graph.G.nodes(data=True)
+                     if isinstance(node_data.get("expr_obj"), ast.AST)
+                     and signature(node_data["expr_obj"]) == signature(returned)]
+            site_id = min(sites) if sites else next((
+                int(value_id) for value_id in reversed(slots)
+                if value_id is not None and int(value_id) in graph.G
+            ), None)
+            if inside_loop and site_id is None:
+                return None
+            return LoopControlBlock(
+                "return", None, True, None,
+                source_action="return",
+                site_node_id=site_id,
+                return_value_ids=tuple(slots),
+            )
+
+        body_return_control = (
+            arm_return_control(body_statements)
+            or arm_loop_control(body_statements, "body")
+        )
+        else_return_control = (
+            arm_return_control(else_statements)
+            or arm_loop_control(else_statements, "orelse")
+        )
+        def arm_callsites(arm):
+            return tuple(sorted(
+                int(node_id)
+                for node_id, roles in memberships.items()
+                if (int(control_id), arm) in roles
+                and int(node_id) in graph.G
+                for data in (graph.G.nodes[int(node_id)],)
+                if str(data.get("op") or data.get("type") or "").casefold() == "call"
+                or (
+                    isinstance(data.get("expr_obj"), ast.Call)
+                    and any((data.get("attributes") or {}).get(key) is not None
+                            for key in ("method_ref", "callee_ref"))
+                )
+            ))
+
+        # A resolved method keeps its method name as the graph operation.
+        # Its lexical control ownership does not depend on numerical regions
+        # or on the generic operation spelling "call".
+        body_callsites = arm_callsites("body")
+        else_callsites = arm_callsites("orelse")
+        if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
+            terminal_spans = [
+                (
+                    int(getattr(arm[-1].value, "lineno", -1)),
+                    int(getattr(arm[-1].value, "col_offset", -1)),
+                    int(getattr(arm[-1].value, "end_lineno", -1)),
+                    int(getattr(arm[-1].value, "end_col_offset", -1)),
+                )
+                for arm in (body_statements, else_statements)
+                if arm and isinstance(arm[-1], ast.Return)
+                and arm[-1].value is not None
+            ]
+            print(
+                "DEBUG-RETURN-ARM "
+                f"fn={graph.G.graph.get('function_name')} "
+                f"control={int(control_id)} inside_loop={inside_loop} "
+                f"terminal_return_spans={terminal_spans!r} "
+                f"table_keys={sorted(return_slot_values)!r} "
+                f"body={body_return_control is not None} "
+                f"else={else_return_control is not None}",
+                file=sys.stderr,
+            )
+        has_structural_branch_effect = (
+            body_return_control is not None
+            or else_return_control is not None
+            or any(
+                isinstance(member, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                or (
+                    isinstance(member, ast.Call)
+                    and isinstance(member.func, ast.Attribute)
+                    and member.func.attr in {"append", "add", "extend"}
+                )
+                for statement in (*body_statements, *else_statements)
+                for member in ast.walk(statement)
+            )
+        )
+        if (
+            not body_regions
+            and not else_regions
+            and body_return_control is None
+            and else_return_control is None
+            and not body_callsites
+            and not else_callsites
+            and not result_aliases
+            and not (predicate_regions and has_structural_branch_effect)
+        ):
+            if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
+                print(
+                    "DEBUGIFMISS "
+                    f"fn={graph.G.graph.get('function_name')} "
+                    f"control={int(control_id)} "
+                    f"source={ast.unparse(expression)!r} "
+                    f"predicate={predicate_id} "
+                    f"memberships={sum(1 for roles in memberships.values() if any(owner == int(control_id) for owner, _arm in roles))}",
+                    file=sys.stderr,
+                )
+            continue
+
+        # The reducer already owns the path-specific SSA values for an
+        # authored assignment merge.  Consume those Phi parents directly
+        # whenever it published the pre-branch identity.  Reconstructing the
+        # same relation from a flat spelling history loses nesting and, for
+        # attribute assignments, used to confuse SetAttr event ids with the
+        # values they store.
+        carried = []
+        direct_phi_bindings: set[str] = set()
+        direct_phi_record_fields: set[tuple[int, str]] = set()
+        for phi_node_id, phi_data in graph.G.nodes(data=True):
+            phi_attributes = phi_data.get("attributes") or {}
+            if (
+                str(phi_data.get("type") or phi_data.get("op") or "")
+                .casefold() != "phi"
+                or int(phi_attributes.get("source_conditional_id", -1))
+                != int(control_id)
+            ):
+                continue
+            phi_parents = {
+                str(role): int(graph.G.nodes[parent].get(
+                    "value_id", parent
+                ))
+                for parent, role in phi_data.get("parents") or ()
+                if parent in graph.G
+            }
+            if not {"body", "orelse"}.issubset(phi_parents):
+                continue
+            merged_id = int(phi_data.get("value_id", phi_node_id))
+            binding_name = phi_attributes.get("binding_name")
+            if (
+                binding_name is not None
+                and str(binding_name).startswith("__turing_single_exit_result")
+            ):
+                # Guard-return normalization creates a fresh result only in
+                # the two arms.  Its reducer Phi may name the first arm as an
+                # ``initial_value_id`` compatibility fallback, but there is
+                # no incumbent value before the branch.  Lower it through
+                # the exact conditional-result path so each arm resolves its
+                # own source identity instead of the missing arm falling
+                # back to the first arm's constant.
+                result_aliases = (*result_aliases, (
+                    int(phi_parents["body"]),
+                    int(phi_parents["orelse"]),
+                    merged_id,
+                ))
+                direct_phi_bindings.add(str(binding_name))
+                continue
+            if phi_attributes.get("initial_value_id") is None:
+                continue
+            carried.append((
+                int(phi_parents["body"]),
+                int(phi_parents["orelse"]),
+                int(phi_attributes["initial_value_id"]),
+                merged_id,
+            ))
+            if binding_name is not None:
+                direct_phi_bindings.add(str(binding_name))
+            direct_phi_record_fields.update(
+                _record_field_state_keys(
+                    graph.G, node_by_value, (merged_id,),
+                )
+            )
+        positional_output_names = set(
+            graph.G.graph.get("positional_output_names") or ()
+        )
+        for name, history in (
+            graph.G.graph.get("identity_table") or {}
+        ).items():
+            if str(name) in positional_output_names:
+                # A positional output slot's history lists one value PER
+                # RETURN SITE; it is not a variable rebound in these arms.
+                # Merging it here manufactured degenerate `Phi [v, v]`
+                # aliases between return sites and rebound each earlier
+                # return's value onto the next one ("last return wins").
+                # Return sites merge at the function exit instead
+                # (control-aware result merging).
+                continue
+            if str(name) in direct_phi_bindings:
+                continue
+            ordered = tuple(
+                int(value_id) for value_id in history
+                if int(value_id) in node_by_value
+            )
+            if not ordered:
+                continue
+            # The reducer's record-field Phi is the exact state transition for
+            # this receiver slot.  A dotted attribute identity history also
+            # contains its SetAttr event ids; reconstructing that flat history
+            # creates a second carried chain whose pre-branch "value" is an
+            # effect node with no definition.  The exact field-state Phi wins.
+            ordered_record_fields = _record_field_state_keys(
+                graph.G, node_by_value, ordered,
+            )
+            authoritative_record_fields = (
+                direct_phi_record_fields | reducer_phi_record_fields
+            ).intersection(ordered_record_fields)
+            if authoritative_record_fields:
+                receipt = {
+                    "source_conditional_id": int(control_id),
+                    "binding_name": str(name),
+                    "candidate_value_ids": ordered,
+                    "record_field_keys": tuple(sorted(
+                        authoritative_record_fields
+                    )),
+                    "outcome": "exact_field_state_phi_retained",
+                    "priority": "exact_reducer_record_field_state",
+                    "tie_policy": "incumbent",
+                }
+                receipts = list(graph.G.graph.get(
+                    "suppressed_flat_record_field_alias_receipts", ()
+                ))
+                if receipt not in receipts:
+                    receipts.append(receipt)
+                    graph.G.graph[
+                        "suppressed_flat_record_field_alias_receipts"
+                    ] = tuple(receipts)
+                continue
+            # An arm that ends in return/break/continue never reaches the
+            # merge point: the values it binds leave through its own edge
+            # (return merge, break edge) and are not this conditional's
+            # carried aliases.  Merging them here manufactured a Phi with an
+            # unreachable incoming edge and rebound the fall-through value.
+            body_values = tuple(
+                value_id for value_id in ordered
+                if body_return_control is None
+                and (int(control_id), "body") in memberships.get(
+                    node_by_value[value_id], ()
+                )
+            )
+            else_values = tuple(
+                value_id for value_id in ordered
+                if else_return_control is None
+                and (int(control_id), "orelse") in memberships.get(
+                    node_by_value[value_id], ()
+                )
+            )
+            if not body_values and not else_values:
+                continue
+            branch_positions = tuple(
+                ordered.index(value_id)
+                for value_id in (*body_values, *else_values)
+            )
+            first_branch = min(branch_positions)
+            last_branch = max(branch_positions)
+            initial_candidate = next((
+                ordered[position]
+                for position in range(first_branch - 1, -1, -1)
+                if ordered[position] not in {*body_values, *else_values}
+            ), None)
+            initial = (
+                ordered[0]
+                if initial_candidate is None
+                else int(initial_candidate)
+            )
+            # Deterministic identity order is the authoritative Phi
+            # correlation.  Nested conditionals are completed inside-out by
+            # the frontend, and older ``source_conditional_id`` annotations
+            # can consequently name the enclosing/inner merge in the reverse
+            # order.  The first version after this conditional's lexical arm
+            # values is its merge by SSA construction.  Retain the annotation
+            # only as a compatibility fallback for graphs without complete
+            # ordered histories.
+            # A loop port (LoopResult/LoopExit) is the value AFTER an
+            # enclosing loop, never a conditional's own merge.
+            merged = next((
+                ordered[position]
+                for position in range(last_branch + 1, len(ordered))
+                if ordered[position] not in {*body_values, *else_values}
+                and str(graph.G.nodes[node_by_value[ordered[position]]].get(
+                    "type"
+                ) or "") not in {"LoopResult", "LoopExit"}
+            ), None)
+            if merged is None:
+                merged = next((
+                    value_id for value_id in ordered
+                    if int((graph.G.nodes[node_by_value[value_id]].get(
+                        "attributes"
+                    ) or {}).get("source_conditional_id", -1))
+                    == int(control_id)
+                ), None)
+            if (
+                merged is None
+                and initial_candidate is not None
+                and (body_values or else_values)
+            ):
+                # A source alias assignment can replace a local name without
+                # creating a separately numbered reducer Phi.  The identity
+                # history then ends at the branch-local value even though the
+                # untouched arm must retain the pre-branch incumbent.  Use
+                # the authored arm value as the merge spelling; conditional
+                # SSA lowering sees that it is already defined in an arm and
+                # allocates a fresh join version.  This is finite (one choice
+                # from the ordered history), and an equal-priority untouched
+                # arm keeps its incumbent.
+                merged = int(
+                    body_values[-1] if body_values else else_values[-1]
+                )
+                receipt = {
+                    "source_conditional_id": int(control_id),
+                    "binding_name": str(name),
+                    "body_value_id": int(
+                        body_values[-1] if body_values else initial
+                    ),
+                    "orelse_value_id": int(
+                        else_values[-1] if else_values else initial
+                    ),
+                    "initial_value_id": int(initial),
+                    "merge_spelling_value_id": int(merged),
+                    "priority": "exact_ordered_identity_history",
+                    "tie_policy": "incumbent",
+                }
+                receipts = list(graph.G.graph.get(
+                    "synthesized_conditional_merge_receipts", ()
+                ))
+                if receipt not in receipts:
+                    receipts.append(receipt)
+                    graph.G.graph[
+                        "synthesized_conditional_merge_receipts"
+                    ] = tuple(receipts)
+            if merged is None:
+                continue
+            carried.append((
+                body_values[-1] if body_values else initial,
+                else_values[-1] if else_values else initial,
+                initial,
+                merged,
+            ))
+        represented_binding_names = {
+            str(binding) for binding in direct_phi_bindings
+        }
+        represented_binding_names.update(
+            str(receipt["binding_name"])
+            for receipt in graph.G.graph.get(
+                "synthesized_conditional_merge_receipts", ()
+            )
+            if int(receipt.get("source_conditional_id", -1))
+            == int(control_id)
+            and receipt.get("binding_name") is not None
+        )
+
+        def direct_name_assignments(
+            statements: Iterable[ast.stmt],
+        ) -> dict[str, int]:
+            """Return exact retained RHS values for direct alias assignments."""
+
+            assignments: dict[str, int] = {}
+            for statement in statements:
+                targets: tuple[ast.expr, ...]
+                if isinstance(statement, ast.Assign):
+                    targets = tuple(statement.targets)
+                    value_expression = statement.value
+                elif isinstance(statement, ast.AnnAssign):
+                    targets = (statement.target,)
+                    value_expression = statement.value
+                else:
+                    continue
+                if value_expression is None:
+                    continue
+                rhs_node_id = _retained_control_value_id(
+                    graph.G, None, value_expression,
+                )
+                if rhs_node_id is not None and rhs_node_id in graph.G:
+                    rhs_value_id = int(graph.G.nodes[rhs_node_id].get(
+                        "value_id", rhs_node_id,
+                    ))
+                elif isinstance(value_expression, ast.Name):
+                    # Reduction can remove the load syntax for a direct alias
+                    # while retaining the bound producer under its exact
+                    # source name. Resolve only one resident identity; equal
+                    # candidates are deliberately left to the incumbent.
+                    resident = tuple(dict.fromkeys(
+                        int(value_id)
+                        for value_id in (
+                            (graph.G.graph.get("identity_table") or {}).get(
+                                str(value_expression.id), ()
+                            )
+                        )
+                        if int(value_id) in node_by_value
+                    ))
+                    if len(resident) != 1:
+                        continue
+                    rhs_value_id = int(resident[0])
+                else:
+                    continue
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        assignments[str(target.id)] = rhs_value_id
+            return assignments
+
+        direct_body_assignments = direct_name_assignments(body_statements)
+        direct_else_assignments = direct_name_assignments(else_statements)
+        for binding_name in dict.fromkeys((
+            *direct_body_assignments,
+            *direct_else_assignments,
+        )):
+            if (
+                binding_name in represented_binding_names
+                or binding_name in positional_output_names
+            ):
+                continue
+            body_value = direct_body_assignments.get(binding_name)
+            else_value = direct_else_assignments.get(binding_name)
+            authored_values = tuple(dict.fromkeys(
+                int(value)
+                for value in (body_value, else_value)
+                if value is not None
+            ))
+            history = tuple(dict.fromkeys(
+                int(value_id)
+                for value_id in (
+                    (graph.G.graph.get("identity_table") or {}).get(
+                        binding_name, ()
+                    )
+                )
+                if int(value_id) in node_by_value
+                and int(value_id) not in authored_values
+            ))
+            if not history or not authored_values:
+                continue
+            rhs_nodes = tuple(
+                int(node_by_value[value_id])
+                for value_id in authored_values
+                if value_id in node_by_value
+            )
+            if len(rhs_nodes) != len(authored_values):
+                continue
+            ranked_incumbents = []
+            for candidate_value_id in history:
+                candidate_node_id = int(node_by_value[candidate_value_id])
+                if not all(
+                    nx.has_path(graph.G, candidate_node_id, rhs_node_id)
+                    for rhs_node_id in rhs_nodes
+                ):
+                    continue
+                distances = tuple(
+                    int(nx.shortest_path_length(
+                        graph.G, candidate_node_id, rhs_node_id,
+                    ))
+                    for rhs_node_id in rhs_nodes
+                )
+                ranked_incumbents.append((
+                    max(distances), sum(distances),
+                    int(candidate_value_id),
+                ))
+            if not ranked_incumbents:
+                continue
+            ranked_incumbents.sort()
+            best_rank = ranked_incumbents[0][:2]
+            best = tuple(
+                candidate
+                for maximum, total, candidate in ranked_incumbents
+                if (maximum, total) == best_rank
+            )
+            if len(best) != 1:
+                unresolved = {
+                    "source_conditional_id": int(control_id),
+                    "binding_name": str(binding_name),
+                    "candidate_value_ids": best,
+                    "reason": "equal_priority_incumbents",
+                    "tie_policy": "incumbent",
+                }
+                unresolved_receipts = list(graph.G.graph.get(
+                    "unresolved_conditional_alias_assignments", ()
+                ))
+                if unresolved not in unresolved_receipts:
+                    unresolved_receipts.append(unresolved)
+                    graph.G.graph[
+                        "unresolved_conditional_alias_assignments"
+                    ] = tuple(unresolved_receipts)
+                continue
+            initial = int(best[0])
+            true_value = int(
+                body_value if body_value is not None else initial
+            )
+            false_value = int(
+                else_value if else_value is not None else initial
+            )
+            merge_spelling = int(
+                body_value if body_value is not None else else_value
+            )
+            carried.append((
+                true_value, false_value, initial, merge_spelling,
+            ))
+            represented_binding_names.add(str(binding_name))
+            receipt = {
+                "source_conditional_id": int(control_id),
+                "binding_name": str(binding_name),
+                "body_value_id": true_value,
+                "orelse_value_id": false_value,
+                "initial_value_id": initial,
+                "merge_spelling_value_id": merge_spelling,
+                "dataflow_rank": best_rank,
+                "priority": "exact_nearest_dataflow_ancestor",
+                "tie_policy": "incumbent",
+            }
+            receipts = list(graph.G.graph.get(
+                "synthesized_conditional_merge_receipts", ()
+            ))
+            if receipt not in receipts:
+                receipts.append(receipt)
+                graph.G.graph[
+                    "synthesized_conditional_merge_receipts"
+                ] = tuple(receipts)
+        body = SequenceBlock((
+            *(
+                StatementBlock((f"__scheduled_region_{index}__",))
+                for index in body_regions
+            ),
+            *((body_return_control,) if body_return_control is not None else ()),
+        ))
+        orelse = (
+            SequenceBlock((
+                *(
+                    StatementBlock((f"__scheduled_region_{index}__",))
+                    for index in else_regions
+                ),
+                *(
+                    (else_return_control,)
+                    if else_return_control is not None else ()
+                ),
+            ))
+            if else_regions or else_return_control is not None or else_callsites else None
+        )
+        arm_regions = tuple(dict.fromkeys((*body_regions, *else_regions)))
+        split_regions = set(predicate_regions).intersection(arm_regions)
+        if split_regions:
+            raise ValueError(
+                "a dispatch region crosses a source conditional boundary: "
+                f"conditional={int(control_id)}, "
+                f"regions={sorted(split_regions)!r}. The region must be "
+                "divided before it can be scheduled atomically."
+            )
+        # Predicate-producing regions are dataflow predecessors, not lexical
+        # property of this branch. They can be shared by sibling conditions
+        # or owned by an enclosing arm. Leave them in the flat dependency
+        # schedule whenever this conditional has real arm regions.
+        predicate_owned = not arm_regions
+        # A structural-only arm still needs the region that materializes its
+        # predicate under conditional control, but the predicate's transitive
+        # numerical ancestors are ordinary dataflow predecessors.  Owning all
+        # of them here pulls an enclosing loop (and often the function prefix)
+        # into a post-loop ``if`` merely because its test reads a carried
+        # result.  Leave those predecessor regions in the flat dependency
+        # schedule and claim only the region containing the predicate value.
+        owned_predicate_regions = (
+            predicate_terminal_regions if predicate_owned else ()
+        )
+        root = SequenceBlock((
+            *(
+                StatementBlock((f"__scheduled_region_{index}__",))
+                for index in owned_predicate_regions
+            ),
+            ConditionalBlock(
+                int(predicate_value_id), body, orelse,
+                predicate_expression=predicate_expression,
+                carried_aliases=tuple(carried),
+                source_node_id=int(control_id),
+                # Call nodes lexically inside each arm: the callsite
+                # scheduler anchors a planned call on numerical regions,
+                # which an arm consisting only of a call does not have.
+                body_callsite_ids=body_callsites,
+                orelse_callsite_ids=else_callsites,
+                result_aliases=result_aliases,
+            ),
+        ))
+        anchor_region = None
+        if not owned_predicate_regions and not arm_regions:
+            control_end = (
+                int(getattr(expression, "end_lineno", expression.lineno)),
+                int(getattr(expression, "end_col_offset", expression.col_offset)),
+            )
+            for region_index in retained_regions:
+                positions = []
+                for node_id in subgraphs[region_index].G.graph.get("deployment_nodes", ()):
+                    span = graph.G.nodes[int(node_id)].get("source_span") or {}
+                    if span.get("line") is not None:
+                        positions.append((int(span["line"]), int(span.get("column", 0))))
+                if positions and min(positions) > control_end:
+                    anchor_region = region_index
+                    break
+        programs.append(ControlProgram(
+            root=root,
+            region_indices=tuple(dict.fromkeys((
+                *owned_predicate_regions,
+                *arm_regions,
+            ))),
+            # A call-only arm has no numerical marker to replace. Its source
+            # position must still precede later mutation/read regions. Publish
+            # the existing overlay anchor at planning time, rather than relying
+            # on a later shell reconstruction to happen to rebuild this branch.
+            anchor_region=anchor_region,
+        ))
+    return tuple(programs)
+
+
+def _repair_missing_phi_initial_identities(graph_obj):
+    """Recover a removed conditional incumbent from exact dataflow identity.
+
+    Reduction may remove an intermediate spelling while a surviving Phi still
+    carries that spelling in ``initial_value_id``. Treating the absent integer
+    as an external value fabricates a function formal. Recovery is legal only
+    when one resident value in the Phi binding's identity history is the unique
+    nearest common dataflow ancestor of both authored arms. A resident initial
+    is the incumbent and is never challenged; equal nearest candidates remain
+    unresolved.
+    """
+    import networkx as nx
+
+    node_by_value = {
+        int(data.get("value_id", node_id)): node_id
+        for node_id, data in graph_obj.nodes(data=True)
+    }
+    dataflow = nx.DiGraph()
+    dataflow.add_nodes_from(graph_obj.nodes)
+    for node_id, data in graph_obj.nodes(data=True):
+        for parent, _role in data.get("parents") or ():
+            if parent in graph_obj:
+                dataflow.add_edge(parent, node_id)
+    identity_table = graph_obj.graph.get("identity_table") or {}
+    receipts = []
+    for phi_node_id, phi_data in graph_obj.nodes(data=True):
+        if str(phi_data.get("type") or phi_data.get("op") or "").casefold() != "phi":
+            continue
+        attributes = phi_data.get("attributes") or {}
+        initial_value_id = attributes.get("initial_value_id")
+        binding_name = attributes.get("binding_name")
+        if (
+            initial_value_id is None
+            or int(initial_value_id) in node_by_value
+            or binding_name is None
+        ):
+            continue
+        parents = {
+            str(role): parent
+            for parent, role in phi_data.get("parents") or ()
+            if parent in graph_obj
+        }
+        if not {"body", "orelse"}.issubset(parents):
+            continue
+        body_node = parents["body"]
+        orelse_node = parents["orelse"]
+        common = (
+            nx.ancestors(dataflow, body_node) | {body_node}
+        ) & (
+            nx.ancestors(dataflow, orelse_node) | {orelse_node}
+        )
+        candidates = []
+        for ordinal, value_id in enumerate(
+            identity_table.get(str(binding_name), ())
+        ):
+            value_id = int(value_id)
+            candidate = node_by_value.get(value_id)
+            if candidate not in common or candidate == phi_node_id:
+                continue
+            try:
+                distance = (
+                    nx.shortest_path_length(dataflow, candidate, body_node)
+                    + nx.shortest_path_length(
+                        dataflow, candidate, orelse_node
+                    )
+                )
+            except nx.NetworkXNoPath:
+                continue
+            candidates.append((int(distance), int(ordinal), value_id))
+        if not candidates:
+            continue
+        nearest_distance = min(item[0] for item in candidates)
+        nearest = [
+            item for item in candidates if item[0] == nearest_distance
+        ]
+        nearest_value_ids = tuple(dict.fromkeys(
+            item[2] for item in nearest
+        ))
+        if len(nearest_value_ids) != 1:
+            unresolved = {
+                "phi_value_id": int(phi_data.get(
+                    "value_id", phi_node_id
+                )),
+                "binding_name": str(binding_name),
+                "missing_initial_value_id": int(initial_value_id),
+                "candidate_value_ids": nearest_value_ids,
+                "reason": "equal_priority_candidates",
+                "tie_policy": "incumbent",
+            }
+            ledger = graph_obj.graph.setdefault(
+                "unresolved_phi_initial_identities", []
+            )
+            if unresolved not in ledger:
+                ledger.append(unresolved)
+            continue
+        replacement = nearest_value_ids[0]
+        attributes["initial_value_id"] = int(replacement)
+        attributes["recovered_initial_value_id"] = int(initial_value_id)
+        receipts.append({
+            "phi_value_id": int(phi_data.get("value_id", phi_node_id)),
+            "binding_name": str(binding_name),
+            "missing_initial_value_id": int(initial_value_id),
+            "resident_initial_value_id": int(replacement),
+            "dataflow_distance": int(nearest_distance),
+            "priority": "exact_common_dataflow_ancestor",
+            "tie_policy": "incumbent",
+        })
+    if receipts:
+        graph_obj.graph["phi_initial_identity_repairs"] = tuple((
+            *graph_obj.graph.get("phi_initial_identity_repairs", ()),
+            *receipts,
+        ))
+    return tuple(receipts)
+
+
+def _ordinary_conditional_nesting(
+    graph: Any,
+    programs: Iterable[ControlProgram],
+    *,
+    offset: int = 0,
+    root_index: int | None = None,
+) -> dict[int, tuple[int, ...]]:
+    """Return exact lexical parentage for source-derived conditional IR."""
+
+    from .control_source import ConditionalBlock
+
+    controls = tuple(programs)
+    blocks = tuple(
+        next((
+            block for block in program.root.blocks
+            if isinstance(block, ConditionalBlock)
+        ), None)
+        if isinstance(program.root, SequenceBlock)
+        else (
+            program.root
+            if isinstance(program.root, ConditionalBlock) else None
+        )
+        for program in controls
+    )
+    expressions = {
+        index: graph.G.nodes[int(block.source_node_id)].get("expr_obj")
+        for index, block in enumerate(blocks)
+        if block is not None and block.source_node_id is not None
+    }
+    parent_by_child: dict[int, int] = {}
+    for child_index, child_expression in expressions.items():
+        candidates = []
+        for parent_index, parent_expression in expressions.items():
+            if parent_index == child_index:
+                continue
+            descendants = {
+                id(member)
+                for statement in (
+                    (parent_expression.body, parent_expression.orelse)
+                    if isinstance(parent_expression, ast.IfExp)
+                    else (*parent_expression.body, *parent_expression.orelse)
+                )
+                for member in ast.walk(statement)
+            }
+            if id(child_expression) not in descendants:
+                continue
+            span = int(getattr(
+                parent_expression, "end_lineno", parent_expression.lineno
+            )) - int(parent_expression.lineno)
+            candidates.append((span, parent_index))
+        if candidates:
+            parent_by_child[child_index] = min(candidates)[1]
+    children: dict[int, list[int]] = {}
+    for child_index in range(len(blocks)):
+        parent = parent_by_child.get(child_index)
+        if parent is not None:
+            children.setdefault(offset + parent, []).append(
+                offset + child_index
+            )
+        elif root_index is not None:
+            children.setdefault(int(root_index), []).append(
+                offset + child_index
+            )
+    return {parent: tuple(items) for parent, items in children.items()}
+
+
+def _source_control_nesting_hints(
+    reductions: "Sequence[LoopShaderReduction]",
+    conditional_programs: "Sequence[ControlProgram]",
+    loop_plans: "Iterable[LoopPlan]",
+    graph: Any,
+) -> dict[int, frozenset[int]]:
+    """Correlate loop and conditional controls by authored AST identity.
+
+    Overlay receives a heterogeneous control catalogue.  Region containment
+    proves most nesting, but equal-region controls and comprehension clauses
+    require the authored relation.  Compute one index space for both kinds so
+    a top-level ``if`` can own a loop in its body and a loop can own an inner
+    ``if`` without either construct being flattened.
+    """
+
+    reductions = tuple(reductions)
+    conditionals = tuple(conditional_programs)
+    offset = len(reductions)
+    expressions: dict[int, ast.AST] = {}
+    for index, reduction in enumerate(reductions):
+        if int(reduction.loop_node_id) not in graph.G:
+            continue
+        expression = graph.G.nodes[int(reduction.loop_node_id)].get("expr_obj")
+        if isinstance(expression, ast.AST):
+            expressions[index] = expression
+    from .control_source import ConditionalBlock
+    for local_index, program in enumerate(conditionals):
+        block = next((
+            item for item in (
+                program.root.blocks
+                if isinstance(program.root, SequenceBlock)
+                else (program.root,)
+            )
+            if isinstance(item, ConditionalBlock)
+        ), None)
+        if (
+            block is None
+            or block.source_node_id is None
+        ):
+            continue
+        expression = _source_control_expression(
+            graph.G, int(block.source_node_id)
+        )
+        if isinstance(expression, ast.AST):
+            expressions[offset + local_index] = expression
+
+    children: dict[int, set[int]] = {
+        int(parent): set(map(int, nested))
+        for parent, nested in _loop_reduction_nesting_hints(
+            reductions, loop_plans, graph,
+        ).items()
+    }
+    # Select the closest authored container for every control.  AST object
+    # identity is the compiler's exact ingestion correlation; node count and
+    # source span merely rank multiple real ancestors to find the direct one.
+    for child_index, child_expression in expressions.items():
+        candidates = []
+        for parent_index, parent_expression in expressions.items():
+            if parent_index == child_index:
+                continue
+            descendants = tuple(ast.walk(parent_expression))
+            child_signature = _ast_source_signature(child_expression)
+            if not any(
+                id(member) == id(child_expression)
+                or _ast_source_signature(member) == child_signature
+                for member in descendants
+            ):
+                continue
+            span = int(getattr(
+                parent_expression, "end_lineno",
+                getattr(parent_expression, "lineno", 0),
+            ) or 0) - int(getattr(parent_expression, "lineno", 0) or 0)
+            candidates.append((len(descendants), span, parent_index))
+        if candidates:
+            _size, _span, parent_index = min(candidates)
+            children.setdefault(int(parent_index), set()).add(int(child_index))
+    return {
+        parent: frozenset(sorted(nested))
+        for parent, nested in children.items() if nested
+    }
+
+
+def _overlay_control_or_require_subdivision(
+    graph: Any,
+    runtime_regions: Iterable[int],
+    reductions: Sequence[Any],
+    loop_controls: Sequence[ControlProgram],
+    conditional_controls: Sequence[ControlProgram],
+    nesting: Mapping[int, Iterable[int]],
+    *, region_dependencies: Iterable[tuple[int, int]] = (),
+) -> ControlProgram:
+    """Turn a named cross-scope overlay refusal into loop-owned frontier data."""
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, LoopBlock, LoopControlBlock, SequenceBlock, WhileBlock,
+    )
+
+    def children(block):
+        if isinstance(block, SequenceBlock):
+            return block.blocks
+        if isinstance(block, ConditionalBlock):
+            return (block.body,) + (() if block.orelse is None else (block.orelse,))
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            return (block.body, *block.terminal_controls)
+        if isinstance(block, CallBlock):
+            return (block.callee,)
+        return ()
+
+    owned_returns = {}
+    def collect(block):
+        if (isinstance(block, LoopControlBlock) and block.action == "return"
+                and block.site_node_id is not None and block.predicate_value_id is None
+                and block.predicate_expression is None):
+            owned_returns.setdefault(int(block.site_node_id), set()).add(tuple(block.return_value_ids))
+        for child in children(block):
+            collect(child)
+
+    for conditional in conditional_controls:
+        collect(conditional.root)
+
+    def remove_duplicate_return(block):
+        if (isinstance(block, LoopControlBlock) and block.action == "return"
+                and block.site_node_id is not None
+                and owned_returns.get(int(block.site_node_id)) == {tuple(block.return_value_ids)}):
+            return SequenceBlock(())
+        if isinstance(block, SequenceBlock):
+            return replace(block, blocks=tuple(remove_duplicate_return(child) for child in block.blocks))
+        if isinstance(block, ConditionalBlock):
+            return replace(block, body=remove_duplicate_return(block.body),
+                           orelse=None if block.orelse is None else remove_duplicate_return(block.orelse))
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            return replace(block, body=remove_duplicate_return(block.body),
+                           terminal_controls=tuple(remove_duplicate_return(child) for child in block.terminal_controls))
+        if isinstance(block, CallBlock):
+            return replace(block, callee=remove_duplicate_return(block.callee))
+        return block
+
+    # A terminal return belongs inside its authored conditional arm. The
+    # loop's flat guarded copy is the same source site, not another return.
+    # Keeping both postponed the real edge until after the branch merge and
+    # left its return value without a dominating definition.
+    if owned_returns:
+        loop_controls = tuple(replace(control, root=remove_duplicate_return(control.root))
+                              for control in loop_controls)
+
+    try:
+        from .control_source import order_control_region_dependencies
+        program = overlay_scheduled_control(
+            runtime_regions,
+            (*loop_controls, *conditional_controls),
+            known_nesting=nesting,
+        )
+        return order_control_region_dependencies(program, region_dependencies)
+    except ValueError as error:
+        if not isinstance(error, ControlOverlayScopeError):
+            implicated_regions = {
+                int(value)
+                for value in re.findall(r"\d+", str(error))
+            }
+
+            def source_nodes(block):
+                from .control_source import (
+                    CallBlock, ConditionalBlock, LoopBlock, SequenceBlock,
+                    WhileBlock,
+                )
+                found = []
+                if isinstance(block, ConditionalBlock):
+                    if block.source_node_id is not None:
+                        found.append(int(block.source_node_id))
+                    found.extend(source_nodes(block.body))
+                    if block.orelse is not None:
+                        found.extend(source_nodes(block.orelse))
+                elif isinstance(block, (LoopBlock, WhileBlock)):
+                    if block.source_loop_node_id is not None:
+                        found.append(int(block.source_loop_node_id))
+                    if isinstance(block, WhileBlock):
+                        found.extend(source_nodes(block.condition))
+                    found.extend(source_nodes(block.body))
+                elif isinstance(block, SequenceBlock):
+                    for child in block.blocks:
+                        found.extend(source_nodes(child))
+                elif isinstance(block, CallBlock):
+                    found.extend(source_nodes(block.callee))
+                return tuple(dict.fromkeys(found))
+
+            catalogue = []
+            for control_index, control in enumerate((
+                *loop_controls, *conditional_controls,
+            )):
+                regions = tuple(map(int, control.region_indices))
+                if implicated_regions and not implicated_regions.intersection(
+                    regions
+                ):
+                    continue
+                nodes = source_nodes(control.root)
+                catalogue.append({
+                    "index": control_index,
+                    "regions": regions,
+                    "source_nodes": nodes,
+                    "source": tuple(
+                        ast.unparse(expression)
+                        for node_id in nodes
+                        for expression in (
+                            _source_control_expression(graph.G, node_id),
+                        )
+                        if isinstance(expression, ast.AST)
+                    ),
+                })
+            raise ValueError(
+                f"{error}; function="
+                f"{graph.G.graph.get('function_name', '?')!r}; "
+                f"controls={catalogue!r}"
+            ) from error
+        conflict_regions = frozenset(map(int, error.region_indices))
+        overlapping = tuple(
+            (reduction, control)
+            for reduction, control in zip(
+                reductions, loop_controls, strict=True,
+            )
+            if conflict_regions.intersection(map(int, control.region_indices))
+        )
+        named_scope_inductions = {
+            component[len("loop("):-1]
+            for scope in error.scopes
+            for component in scope
+            if component.startswith("loop(") and component.endswith(")")
+        }
+
+        def loop_inductions(block: Any) -> frozenset[str]:
+            if isinstance(block, LoopBlock):
+                return frozenset((str(block.induction),)) | loop_inductions(
+                    block.body
+                )
+            if isinstance(block, SequenceBlock):
+                return frozenset().union(*(
+                    loop_inductions(child) for child in block.blocks
+                )) if block.blocks else frozenset()
+            return frozenset()
+
+        named = tuple(
+            (reduction, control)
+            for reduction, control in overlapping
+            if named_scope_inductions.intersection(loop_inductions(control.root))
+        )
+        implicated = named or overlapping
+        # A conditional/conditional conflict has no loop owner at which the
+        # subdivision planner can make progress. Preserve the original named
+        # refusal in that case instead of fabricating a boundary.
+        if not implicated:
+            raise
+        owner_reference = graph.G.graph.get("function_ref")
+        owner_qualified_name = None
+        owner_table = getattr(graph, "function_table", None)
+        if owner_reference is not None and owner_table is not None:
+            try:
+                owner_qualified_name = str(
+                    owner_table.entry(int(owner_reference)).qualified_name
+                )
+            except (IndexError, KeyError, TypeError, ValueError):
+                owner_qualified_name = None
+        scope_blockers = tuple(
+            "scope:" + ">".join(scope) for scope in sorted(error.scopes)
+        )
+        boundaries = tuple({
+            "kind": "loop-control-owner",
+            "loop_node_id": int(reduction.loop_node_id),
+            "region_indices": list(map(
+                int, sorted(control.region_indices),
+            )),
+            "blockers": [
+                "control-overlay-sequence-scope",
+                *scope_blockers,
+            ],
+            **({
+                "function_reference": int(owner_reference),
+            } if owner_reference is not None else {}),
+            **({
+                "qualified_name": owner_qualified_name,
+            } if owner_qualified_name is not None else {}),
+        } for reduction, control in implicated)
+        raise CompilationSubdivisionRequired(
+            str(error), boundaries=boundaries,
+        ) from error
 
 
 def _control_partition_keys(
@@ -4467,6 +9377,50 @@ def _control_partition_keys(
 
     plans = tuple(loop_plans)
     branches = _branch_compartments(graph)
+    expression_nodes = {
+        id(data.get("expr_obj")): int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.AST)
+    }
+    # A while predicate is evaluated again at the latch. Its numerical
+    # region cannot also own pre-loop initialization: the control overlay
+    # replaces that whole region with the loop, moving intervening cap/
+    # limit computations behind the loop that consumes them.
+    condition_owners_by_node: dict[int, list[int]] = {}
+    for plan in plans:
+        loop_expression = graph.G.nodes[int(plan.loop.node_id)].get("expr_obj")
+        if not isinstance(loop_expression, ast.While):
+            continue
+        signatures = {
+            _ast_source_signature(member)
+            for member in ast.walk(loop_expression.test)
+            if getattr(member, "lineno", None) is not None
+        }
+        members = set(map(int, getattr(plan.loop, "condition_nodes", ())))
+        members.update(int(node_id) for node_id, data in graph.G.nodes(data=True)
+                       if isinstance(data.get("expr_obj"), ast.AST)
+                       and _ast_source_signature(data["expr_obj"]) in signatures)
+        for node_id in members:
+            condition_owners_by_node.setdefault(node_id, []).append(int(plan.loop.node_id))
+    ordinary_if_frontiers = tuple(
+        (
+            int(control_id),
+            int(getattr(expression, "end_lineno", expression.lineno)),
+        )
+        for control_id, data in graph.G.nodes(data=True)
+        for expression in (data.get("expr_obj"),)
+        if isinstance(expression, ast.If)
+    )
+    branch_frontiers_by_node: dict[int, list[int]] = {}
+    for control_id, end_line in ordinary_if_frontiers:
+        for node_id, data in graph.G.nodes(data=True):
+            expression = data.get("expr_obj")
+            if not isinstance(expression, ast.AST):
+                continue
+            if int(getattr(expression, "lineno", -1)) > end_line:
+                branch_frontiers_by_node.setdefault(
+                    int(node_id), []
+                ).append(int(control_id))
     callsites = tuple(
         int(node_id)
         for node_id, data in graph.G.nodes(data=True)
@@ -4480,19 +9434,115 @@ def _control_partition_keys(
         callsite: nx.descendants(graph.G, callsite)
         for callsite in callsites
     }
+    comprehension_owners = tuple(dict.fromkeys(
+        int(node_id)
+        for plan in plans
+        if isinstance(
+            graph.G.nodes[int(plan.loop.node_id)].get("expr_obj"),
+            ast.comprehension,
+        )
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(
+            data.get("expr_obj"),
+            (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+        )
+        and any(
+            int(parent) == int(plan.loop.node_id)
+            and str(role) == "generators"
+            for parent, role in data.get("parents", ())
+        )
+    ))
+    comprehension_descendants = {
+        owner: nx.descendants(graph.G, owner)
+        for owner in comprehension_owners
+    }
+    expression_nodes = {
+        id(data.get("expr_obj")): int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.AST)
+    }
+    comprehension_body_members = {}
+    for owner in comprehension_owners:
+        aggregate = graph.G.nodes[owner].get("expr_obj")
+        body_roots = (
+            (aggregate.key, aggregate.value)
+            if isinstance(aggregate, ast.DictComp)
+            else (aggregate.elt,)
+        )
+        comprehension_body_members[owner] = frozenset(
+            expression_nodes[id(member)]
+            for body_root in body_roots
+            for member in ast.walk(body_root)
+            if id(member) in expression_nodes
+        )
+    loop_control_frontiers = tuple(
+        (
+            int(plan.loop.node_id),
+            int(control_id),
+            int(getattr(expression, "end_lineno", expression.lineno)),
+            frozenset(map(int, plan.loop.body_nodes)),
+        )
+        for plan in plans
+        for control_id in plan.loop.body_nodes
+        if control_id in graph.G
+        for expression in (graph.G.nodes[control_id].get("expr_obj"),)
+        if isinstance(expression, ast.If)
+        and any(
+            isinstance(member, (ast.Break, ast.Continue))
+            for member in ast.walk(expression)
+        )
+    )
+    # Invert every owner->members relation into member->owners once, in owner
+    # order, so each node's key is a set of dict lookups rather than a rescan of
+    # every plan/callsite/comprehension/frontier. The old per-node membership
+    # scans were O(nodes x owners) and dominated the planning pass; this is
+    # O(sum of membership sizes + nodes) with byte-identical output.
+    def _invert(owners, member_sets):
+        by_node: dict[int, list[Any]] = {}
+        for owner in owners:
+            for member in member_sets(owner):
+                by_node.setdefault(int(member), []).append(owner)
+        return by_node
+
+    loops_by_node = _invert(
+        plans, lambda plan: plan.loop.body_nodes,
+    )
+    loops_by_node = {
+        node_id: tuple(plan.loop.node_id for plan in owners)
+        for node_id, owners in loops_by_node.items()
+    }
+    comp_body_by_node = _invert(
+        comprehension_owners, lambda owner: comprehension_body_members[owner],
+    )
+    callsites_by_node = _invert(
+        callsites, lambda callsite: call_descendants[callsite],
+    )
+    comp_desc_by_node = _invert(
+        comprehension_owners, lambda owner: comprehension_descendants[owner],
+    )
+    frontiers_by_node: dict[int, list[tuple[int, int]]] = {}
+    for loop_id, control_id, end_line, body in loop_control_frontiers:
+        for member in body:
+            member = int(member)
+            if member not in graph.G:
+                continue
+            if int(getattr(
+                graph.G.nodes[member].get("expr_obj"), "lineno", -1,
+            )) > end_line:
+                frontiers_by_node.setdefault(member, []).append(
+                    (loop_id, control_id)
+                )
+
     return {
         node_id: (
-            tuple(
-                plan.loop.node_id
-                for plan in plans
-                if node_id in plan.loop.body_nodes
-            ),
+            tuple(loops_by_node.get(int(node_id), ())),
             tuple(sorted(branches.get(node_id, ()))),
-            tuple(
-                callsite
-                for callsite in callsites
-                if node_id in call_descendants[callsite]
-            ),
+            tuple(comp_body_by_node.get(int(node_id), ())),
+            tuple(callsites_by_node.get(int(node_id), ())),
+            tuple(comp_desc_by_node.get(int(node_id), ())),
+            tuple(frontiers_by_node.get(int(node_id), ())),
+            tuple(branch_frontiers_by_node.get(int(node_id), ())),
+            tuple(condition_owners_by_node.get(int(node_id), ())),
         )
         for node_id in node_ids
     }
@@ -4597,6 +9647,29 @@ def _compiler_input_name(label: str) -> str:
     else:
         prefix = "float"
     return f"{prefix}{name}"
+
+
+def _graph_source_binding_name(graph: Any, node_id: int) -> str | None:
+    """Recover a dotted public-input path for a numerical boundary node."""
+
+    data = graph.G.nodes[int(node_id)]
+    if data.get("type") == "Input":
+        return str(data.get("label"))
+    if data.get("type") != "Attribute":
+        return None
+    parent = next(
+        (
+            int(candidate)
+            for candidate, role in (data.get("parents") or ())
+            if str(role) == "value"
+        ),
+        None,
+    )
+    attribute = getattr(data.get("expr_obj"), "attr", None)
+    if parent is None or attribute is None:
+        return None
+    root = _graph_source_binding_name(graph, parent)
+    return None if root is None else f"{root}.{attribute}"
 
 
 def _bind_capture_tape(
@@ -4746,6 +9819,8 @@ def _remap_captured_program(
 def _remap_captured_all_ids(
     captured: CapturedFusedProgram,
     id_map: Mapping[int, int],
+    *,
+    source_closure_id: int | None = None,
 ) -> CapturedFusedProgram:
     """Namespace every captured IR identity for hierarchical composition."""
 
@@ -4753,6 +9828,47 @@ def _remap_captured_all_ids(
         remap = lambda value_id: int(
             id_map.get(int(value_id), int(value_id))
         )
+        extras = copy.deepcopy(dict(source.extras or {}))
+        if source_closure_id is not None:
+            extras["source_closure_id"] = int(source_closure_id)
+        for table_name in (
+            "ssa_identity_tokens",
+            "capture_feed_origins",
+            "descriptor_derivations",
+        ):
+            table = extras.get(table_name)
+            if not isinstance(table, Mapping):
+                continue
+            extras[table_name] = {
+                remap(value_id): value
+                for value_id, value in table.items()
+            }
+        source_value_ids = extras.get("source_value_ids")
+        if isinstance(source_value_ids, Mapping):
+            extras["source_value_ids"] = {
+                remap(value_id): int(source_id)
+                for value_id, source_id in source_value_ids.items()
+            }
+        derivations = extras.get("descriptor_derivations")
+        if isinstance(derivations, Mapping):
+            extras["descriptor_derivations"] = {
+                int(value_id): {
+                    **dict(receipt),
+                    **(
+                        {"source_id": remap(receipt["source_id"])}
+                        if isinstance(receipt, Mapping)
+                        and receipt.get("source_id") is not None else {}
+                    ),
+                    **(
+                        {"input_ids": tuple(
+                            remap(item) for item in receipt["input_ids"]
+                        )}
+                        if isinstance(receipt, Mapping)
+                        and receipt.get("input_ids") is not None else {}
+                    ),
+                }
+                for value_id, receipt in derivations.items()
+            }
         target = FusedProgram(
             version=source.version,
             feeds={remap(value_id) for value_id in source.feeds},
@@ -4778,10 +9894,22 @@ def _remap_captured_all_ids(
                 else {remap(value_id) for value_id in source.state_in}
             ),
             meta={
-                remap(value_id): meta
+                remap(value_id): replace(
+                    meta,
+                    source_id=(
+                        None if meta.source_id is None
+                        else remap(meta.source_id)
+                    ),
+                    shape_source_ids=(
+                        None if meta.shape_source_ids is None else tuple(
+                            None if item is None else remap(item)
+                            for item in meta.shape_source_ids
+                        )
+                    ),
+                )
                 for value_id, meta in (source.meta or {}).items()
             },
-            extras=source.extras,
+            extras=extras,
         )
         if hasattr(source, "glsl_linear_output_shape"):
             target.glsl_linear_output_shape = tuple(
@@ -4958,6 +10086,13 @@ def _project_captured_program(
         if allowed_result_ids is None
         else {int(value) for value in allowed_result_ids}
     )
+    synthetic_results = {
+        int(value_id)
+        for program in (captured.program, *captured.execution_programs)
+        for value_id in (
+            (program.extras or {}).get("synthetic_result_ids", ())
+        )
+    }
     all_steps = [
         step
         for program in captured.execution_programs
@@ -5008,6 +10143,7 @@ def _project_captured_program(
             or (
                 allowed_results is not None
                 and value_id not in allowed_results
+                and value_id not in synthetic_results
                 and not is_region_output
             )
             or value_id in selected
@@ -5025,6 +10161,7 @@ def _project_captured_program(
                 and (
                     allowed_results is None
                     or input_id in allowed_results
+                    or input_id in synthetic_results
                 )
             ):
                 pending.append((input_id, False))
@@ -5133,7 +10270,9 @@ def _resolve_binding_name(shell: Any, captured: Any, feed_id: int):
     storage = _capture_storage_identity(value) if value is not None else None
     candidates = [shell]
     try:
-        candidates.extend(_walk_planned_shells(shell))
+        candidates.extend(_walk_planned_shells(
+            shell, include_function_registry=False
+        ))
     except Exception:
         pass
     for candidate in candidates:
@@ -5141,6 +10280,25 @@ def _resolve_binding_name(shell: Any, captured: Any, feed_id: int):
         direct = names.get(feed_id)
         if direct:
             return direct
+        for aggregate_map in (
+            getattr(candidate, "compiled_aggregate_feed_paths", ()) or ()
+        ):
+            for capture_id, graph_input_id, path in aggregate_map:
+                if int(capture_id) != int(feed_id):
+                    continue
+                graph = getattr(candidate, "process_graph", None)
+                if graph is None or int(graph_input_id) not in graph.G:
+                    continue
+                root = _compiler_input_name(
+                    graph.G.nodes[int(graph_input_id)]["label"]
+                )
+                suffix = "".join(
+                    f".{part}" if isinstance(part, str)
+                    and part.isidentifier()
+                    else f"[{part!r}]"
+                    for part in path
+                )
+                return root + suffix
     if storage is None:
         return None
     for candidate in candidates:
@@ -5257,11 +10415,32 @@ def _constant_value(data: dict[str, Any]) -> Any:
     if isinstance(expression, ast.Constant):
         return expression.value
     if "constant" in data:
-        return data["constant"]
+        payload = data["constant"]
+        # Every graph-express node is born with ``constant=None`` (see
+        # ProcessGraph.add_node), so the key's presence alone proves
+        # nothing: reading it unconditionally resolved arbitrary
+        # computations -- an ``if``'s live predicate included -- to the
+        # literal ``None``, and bool(None) then "proved" the branch
+        # statically false. A ``None`` payload only counts as a literal
+        # when the node itself is declared constant.
+        if payload is not None or str(
+            data.get("type")
+        ) in {"Constant", "Const", "const"} or str(
+            data.get("op") or ""
+        ).casefold() == "const":
+            return payload
     attributes = data.get("attributes") or {}
     if "value" in attributes:
         return attributes["value"]
     raise KeyError("constant ProcessGraph node has no literal payload")
+
+
+class _SourceReturnSignal(Exception):
+    """Internal non-error transfer for a compiled Python ``return``."""
+
+    def __init__(self, value: Any):
+        super().__init__()
+        self.value = value
 
 
 def _call_arguments(
@@ -5291,11 +10470,13 @@ def _call_arguments(
         if role in {"operand", "func", "callee"}:
             continue
         index = fallback_index
-        if role.startswith("arg:"):
-            index = int(role[4:])
-        elif role.startswith("arg") and role[3:].isdigit():
-            index = int(role[3:])
+        declared = positional_argument_index(role)
+        if declared is not None:
+            index = declared
         elif role == "arg":
+            # A bare, unnumbered positional edge: the only case where
+            # arrival order legitimately decides, because the role states
+            # no index of its own.
             index = len(positional)
         else:
             continue
@@ -5331,9 +10512,18 @@ def _static_python_value(bindings: dict[str, Any], path: str) -> Any:
     try:
         value = bindings[parts[0]]
     except KeyError as exc:
-        raise KeyError(
-            f"static Python reference {path!r} has no retained binding"
-        ) from exc
+        candidates = []
+        for module in tuple(sys.modules.values()):
+            namespace = getattr(module, "__dict__", None)
+            if isinstance(namespace, dict) and parts[0] in namespace:
+                candidates.append(namespace[parts[0]])
+        identities = {id(candidate): candidate for candidate in candidates}
+        if len(identities) != 1:
+            raise KeyError(
+                f"static Python reference {path!r} has no retained binding"
+            ) from exc
+        value = next(iter(identities.values()))
+        bindings[parts[0]] = value
     for part in parts[1:]:
         value = getattr(value, part)
     return value
@@ -5341,6 +10531,19 @@ def _static_python_value(bindings: dict[str, Any], path: str) -> Any:
 
 def _tensorize_graph_input(value: Any, *, device: Any) -> Any:
     """Move array-shaped public inputs onto the selected AbstractTensor backend."""
+
+    def has_array_protocol(candidate: Any) -> bool:
+        return (
+            isinstance(candidate, np.ndarray)
+            or callable(getattr(candidate, "__array__", None))
+            or hasattr(candidate, "__cuda_array_interface__")
+            or callable(getattr(candidate, "__dlpack__", None))
+            or (
+                getattr(candidate, "dtype", None) is not None
+                and getattr(candidate, "shape", None) is not None
+                and not callable(getattr(candidate, "shape", None))
+            )
+        )
 
     if isinstance(value, AbstractTensor):
         return value
@@ -5364,8 +10567,52 @@ def _tensorize_graph_input(value: Any, *, device: Any) -> Any:
         # calls through.  Its ``shape`` attribute is the unbound descriptor of
         # its instances, not the extent of an array-shaped input.
         return value
+    if isinstance(value, ModuleType):
+        return value
+    fields = getattr(value, "__dict__", None)
+    if isinstance(fields, dict) and not callable(value):
+        replacements = {}
+        for name, field_value in fields.items():
+            if isinstance(field_value, (type, ModuleType)) or callable(
+                field_value
+            ):
+                continue
+            if isinstance(field_value, AbstractTensor):
+                continue
+            if isinstance(field_value, np.dtype):
+                continue
+            field_shape = getattr(field_value, "shape", None)
+            if (
+                field_shape is None
+                or callable(field_shape)
+                or not has_array_protocol(field_value)
+            ):
+                continue
+            replacements[str(name)] = AbstractTensor.tensor(
+                field_value,
+                device=device,
+            )
+        if replacements:
+            # Discovery must not rewrite the caller's live Python object. A
+            # shallow structural copy retains its scalar configuration and
+            # the preallocated storage beneath each tensor wrapper, while
+            # method assignments describe arena state on the capture copy.
+            resident = copy.copy(value)
+            for name, field_value in replacements.items():
+                setattr(resident, name, field_value)
+            return resident
     shape = getattr(value, "shape", None)
-    if shape is None:
+    if shape is None or callable(shape):
+        # Imported scientific modules can export a public function named
+        # ``shape`` (SymPy is one example).  Attribute presence alone is not
+        # an array protocol: a callable shape describes an operation supplied
+        # by the namespace, not the resident extent of the namespace object.
+        # Keep such coordinator values intact so nested closures can continue
+        # to call module constructors such as ``sympy.Symbol``.
+        return value
+    if not has_array_protocol(value):
+        # Domain objects may expose a structural ``shape`` through dynamic
+        # attribute routing.  Shape alone is not an upload protocol.
         return value
     return AbstractTensor.tensor(value, device=device)
 
@@ -5398,11 +10645,118 @@ def _coordinate_scheduled_capture_impl(
         shell._execute_invocations += 1
     graph = shell.process_graph
     supplied = dict(initial_values)
+    live_binding_unavailable = object()
+
+    def live_function_module_binding(name: str) -> Any:
+        """Read a callee global from its owning live Python module.
+
+        Static bindings describe the namespace at planning time.  A program
+        may deliberately populate module globals later (lazy imports are the
+        usual case), so a compiled callee must consult its own module at the
+        source-ordered point where the name is first read.  The function
+        table's qualified identity keeps this lookup lexical and prevents
+        globals from unrelated discovered modules from being merged.
+        """
+
+        function_table = getattr(graph, "function_table", None)
+        function_reference = graph.G.graph.get("function_ref")
+        if function_table is None or function_reference is None:
+            return live_binding_unavailable
+        try:
+            qualified_name = str(
+                function_table.entry(int(function_reference)).qualified_name
+            )
+        except (KeyError, TypeError, ValueError):
+            return live_binding_unavailable
+        qualified_candidates = [qualified_name]
+        method_owner = graph.G.graph.get("method_owner")
+        if method_owner is not None:
+            map_ir = graph.G.graph.get("map_ir") or {}
+            for object_schema in map_ir.get("objects", ()):
+                if str(object_schema.get("class_name")) == str(method_owner):
+                    qualified_candidates.append(
+                        str(object_schema.get("class_identity", ""))
+                    )
+        for qualified_candidate in qualified_candidates:
+            components = qualified_candidate.split(".")
+            for stop in range(len(components), 0, -1):
+                module = sys.modules.get(".".join(components[:stop]))
+                if module is None:
+                    continue
+                namespace = vars(module)
+                return namespace.get(name, live_binding_unavailable)
+        return live_binding_unavailable
+
     values: dict[int, Any] = {
         int(key): value
         for key, value in supplied.items()
         if isinstance(key, int)
     }
+    function_identities = graph.G.graph.get("identity_table", {}) or {}
+
+    def record_static_input_fields(
+        binding_name: str,
+        value: Any,
+        path: tuple[str, ...] = (),
+        visiting: frozenset[int] = frozenset(),
+    ) -> None:
+        if value is None or isinstance(
+            value, (bool, int, float, str, bytes)
+        ):
+            shell._capture_input_static_fields[
+                (str(binding_name), tuple(path))
+            ] = value
+            return
+        identity = id(value)
+        if identity in visiting or len(path) >= 8:
+            return
+        fields = getattr(value, "__dict__", None)
+        if not isinstance(fields, dict) or callable(value):
+            return
+        next_visiting = visiting | {identity}
+        for field_name, field_value in fields.items():
+            record_static_input_fields(
+                binding_name,
+                field_value,
+                (*path, str(field_name)),
+                next_visiting,
+            )
+
+    def bound_target_names(target: ast.AST | None) -> tuple[str, ...]:
+        if target is None:
+            return ()
+        if isinstance(target, ast.Name):
+            return (target.id,)
+        if isinstance(target, ast.Starred):
+            return bound_target_names(target.value)
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return tuple(
+                name
+                for item in target.elts
+                for name in bound_target_names(item)
+            )
+        return ()
+
+    source_with_bindings = frozenset(
+        name
+        for statement in graph.G.graph.get("function_body", ())
+        for member in ast.walk(statement)
+        if isinstance(member, ast.With)
+        for item in member.items
+        for name in bound_target_names(item.optional_vars)
+    )
+
+    def has_deferred_local_definition(name: str, input_id: int) -> bool:
+        """Whether source execution, rather than invocation, defines name."""
+
+        return name in source_with_bindings or any(
+            int(identity) != int(input_id)
+            and int(identity) in graph.G
+            and str(graph.G.nodes[int(identity)].get("type"))
+            not in {"Input", "input"}
+            for identity in function_identities.get(name, ())
+        )
+
     for node_id, data in graph.G.nodes(data=True):
         if str(data.get("type")) not in {"Input", "input"}:
             continue
@@ -5417,6 +10771,14 @@ def _coordinate_scheduled_capture_impl(
                 (data.get("attributes") or {}).get("binding_kind")
             )
             if binding_kind in {"loop", "exception"}:
+                continue
+            live_binding = live_function_module_binding(name)
+            if (
+                binding_kind == "external"
+                and live_binding is not live_binding_unavailable
+            ):
+                values[node_id] = live_binding
+                shell.static_python_bindings[name] = live_binding
                 continue
             class_descriptor = graph.G.graph.get(
                 "class_table",
@@ -5434,13 +10796,52 @@ def _coordinate_scheduled_capture_impl(
             ):
                 values[node_id] = shell.static_python_bindings[name]
                 continue
+            if (
+                binding_kind == "external"
+                and name not in supplied
+                and has_deferred_local_definition(name, node_id)
+            ):
+                # Control-flow normalization can retain an Input-shaped
+                # occurrence before its assignment producer (notably a
+                # local assigned inside ``try``).  It is a Python local, not
+                # an invocation requirement; its use will resolve from the
+                # source frame after the defining statement executes.
+                continue
             if name not in supplied:
                 raise KeyError(
                     f"missing ProcessGraph input {name!r} in "
                     f"{graph.G.graph.get('function_name', '?')} at node "
                     f"{node_id}; binding_kind={binding_kind!r}"
                 )
-            values[node_id] = supplied[name]
+            supplied_value = supplied[name]
+            supplied_shape = getattr(supplied_value, "shape", None)
+            if (
+                isinstance(supplied_value, AbstractTensor)
+                or isinstance(supplied_value, np.ndarray)
+                or callable(getattr(supplied_value, "__array__", None))
+                or (
+                    supplied_shape is not None
+                    and not callable(supplied_shape)
+                    and getattr(supplied_value, "dtype", None) is not None
+                )
+            ):
+                # Public array parameters enter the selected capture device
+                # at the function boundary.  Deferring this until the first
+                # numerical region lets an enclosing structural call observe
+                # NumPy while its callee observes AbstractTensor, changing
+                # source branches such as dt_system._restore_type and baking
+                # an incidental host conversion into the graph.
+                values[node_id] = _tensorize_graph_input(
+                    supplied_value, device=device
+                )
+            else:
+                values[node_id] = supplied_value
+            shell._capture_input_type_names.setdefault(
+                str(name), set()
+            ).add(type(values[node_id]).__qualname__)
+            if isinstance(values[node_id], AbstractTensor):
+                shell._capture_tensor_input_names.add(str(name))
+            record_static_input_fields(str(name), values[node_id])
             # Keep the name against both the object and the storage under
             # it. The object is wrapped into an AbstractTensor before it is
             # ever used, so object identity alone does not survive to the
@@ -5454,7 +10855,10 @@ def _coordinate_scheduled_capture_impl(
             except AttributeError:
                 pass
 
-    inert_nodes = _inert_routing_nodes(graph)
+    # Source execution can prove a graph-inert expression live at runtime
+    # (for example the selected arm of an IfExp), so this coordinator view is
+    # intentionally mutable even though the planner returns a frozenset.
+    inert_nodes = set(_inert_routing_nodes(graph))
     regions = tuple(
         zip(
             shell.deep_compilers,
@@ -5463,6 +10867,7 @@ def _coordinate_scheduled_capture_impl(
         )
     )
     region_for_node: dict[int, int] = {}
+    coordinator_override_nodes: set[int] = set()
     for region_index, (_compiler, subgraph, _ephemeral) in enumerate(regions):
         if region_index in shell.coordinator_region_indices:
             continue
@@ -5472,6 +10877,45 @@ def _coordinate_scheduled_capture_impl(
                     f"ProcessGraph node {node_id} belongs to two dispatches"
                 )
             region_for_node[node_id] = region_index
+        deployment_nodes = tuple(
+            subgraph.G.graph.get("deployment_nodes", ())
+        )
+        if any(
+            graph.G.nodes[node_id].get("type") == "Indexed"
+            and any(
+                parent in graph.G
+                and graph.G.nodes[parent].get("type")
+                in {"Const", "const", "Constant"}
+                and isinstance(
+                    _constant_value(graph.G.nodes[parent]),
+                    (str, bytes),
+                )
+                for parent, role in (
+                    graph.G.nodes[node_id].get("parents") or ()
+                )
+                if str(role) == "index"
+            )
+            for node_id in deployment_nodes
+            if node_id in graph.G
+        ):
+            coordinator_override_nodes.update(deployment_nodes)
+        if any(
+            graph.G.nodes[node_id].get("type") == "IndexedStore"
+            and any(
+                isinstance(values.get(int(parent)), (dict, list, set))
+                for parent, role in (
+                    graph.G.nodes[node_id].get("parents") or ()
+                )
+                if str(role) == "base"
+            )
+            for node_id in deployment_nodes
+            if node_id in graph.G
+        ):
+            # A fused region cannot clone or shader-store a Python container.
+            # Runtime input type is authoritative during discovery; route the
+            # whole coupled region through coordinator mutation so no sibling
+            # dispatch claims the same structural store first.
+            coordinator_override_nodes.update(deployment_nodes)
 
     controlled_nodes = {
         parent
@@ -5484,6 +10928,42 @@ def _coordinate_scheduled_capture_impl(
         id(data.get("expr_obj")): node_id
         for node_id, data in graph.G.nodes(data=True)
         if isinstance(data.get("expr_obj"), ast.AST)
+    }
+    function_body = tuple(graph.G.graph.get("function_body", ()))
+    source_returns: list[ast.Return] = []
+    nonlocal_names: set[str] = set()
+
+    class _CurrentFunctionReturnVisitor(ast.NodeVisitor):
+        def visit_Return(self, statement):
+            if statement.value is not None:
+                source_returns.append(statement)
+
+        def visit_Nonlocal(self, statement):
+            nonlocal_names.update(map(str, statement.names))
+
+        def visit_FunctionDef(self, statement):
+            return None
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Lambda(self, statement):
+            return None
+
+        def visit_ClassDef(self, statement):
+            return None
+
+    return_visitor = _CurrentFunctionReturnVisitor()
+    for body_statement in function_body:
+        return_visitor.visit(body_statement)
+    ordered_return_values = tuple(
+        (graph.G.graph.get("return_value_nodes", {}) or {}).values()
+    )
+    checkpoint_return_value_nodes = {
+        id(statement): int(value_node)
+        for statement, value_node in zip(
+            source_returns, ordered_return_values
+        )
+        if int(value_node) in graph.G
     }
     for _control_id, data in graph.G.nodes(data=True):
         expression = data.get("expr_obj")
@@ -5553,6 +11033,11 @@ def _coordinate_scheduled_capture_impl(
     }
     comprehension_owner_by_binding: dict[int, int] = {}
     comprehension_owner_by_generator: dict[int, int] = {}
+    loop_owner_by_binding = {
+        int(binding): int(plan.loop.node_id)
+        for plan in shell.loop_plans
+        for _name, binding in plan.loop.target_bindings
+    }
     for plan in shell.loop_plans:
         loop_expression = graph.G.nodes[
             plan.loop.node_id
@@ -5582,10 +11067,31 @@ def _coordinate_scheduled_capture_impl(
     loop_invalidated_nodes: dict[int, set[int]] = {}
     for plan in shell.loop_plans:
         controlled_nodes.add(plan.loop.node_id)
-        controlled_nodes.update(plan.loop.body_nodes)
-        invalidated = set(plan.loop.body_nodes)
-        for body_node in plan.loop.body_nodes:
+        # Lexical normalization can fold or remove a body node after the loop
+        # plan records its source identity.  The surviving graph is the
+        # executable authority; stale source ids must not be handed to
+        # NetworkX as traversal roots.
+        live_body_nodes = {
+            int(body_node)
+            for body_node in plan.loop.body_nodes
+            if int(body_node) in graph.G
+        }
+        controlled_nodes.update(live_body_nodes)
+        invalidated = set(live_body_nodes)
+        for body_node in live_body_nodes:
             invalidated.update(nx.descendants(graph.G, body_node))
+        # Retained-loop backedges make the graph cyclic.  A raw descendants
+        # walk can therefore wrap through the loop and reach invariant
+        # producers that dominate the control node.  Clearing those values
+        # replays effectful work performed before the loop (for example the
+        # dt system's completed superstep while iterating its attempt log).
+        # Body identities remain iteration-owned; other ancestors of the
+        # loop control are already-computed invariants.
+        invariant_ancestors = (
+            set(nx.ancestors(graph.G, plan.loop.node_id))
+            - live_body_nodes
+        )
+        invalidated.difference_update(invariant_ancestors)
         loop_invalidated_nodes[plan.loop.node_id] = invalidated
         # The planner loop owns the complete work cone fed by its body,
         # including numerical regions that consume the induction binding.
@@ -5734,10 +11240,98 @@ def _coordinate_scheduled_capture_impl(
         inputs: dict[str, Any] = {}
         for input_id in subgraph.G.graph["deployment_inputs"]:
             input_value = evaluate_node(input_id)
+            tensorized_input = _tensorize_graph_input(
+                input_value,
+                device=device,
+            )
+            if tensorized_input is not input_value:
+                # Object-field projections become numerical region feeds only
+                # after structural attribute evaluation.  Public inputs were
+                # tensorized earlier, but these late projections must join the
+                # same resident/tape path or ndarray methods execute invisibly
+                # in Python during discovery.
+                values[input_id] = tensorized_input
+                input_value = tensorized_input
+            source_binding = _graph_source_binding_name(graph, input_id)
+            if source_binding is not None:
+                shell._capture_input_names[id(input_value)] = source_binding
+                storage = _capture_storage_identity(input_value)
+                if storage is not None:
+                    shell._capture_input_storage[storage] = source_binding
             name = _compiler_input_name(
                 subgraph.G.nodes[input_id]["label"]
             )
             inputs[name] = input_value
+
+        deployment_nodes = tuple(
+            subgraph.G.graph.get("deployment_nodes", ())
+        )
+        has_structural_store = any(
+            str(
+                graph.G.nodes[candidate].get("op")
+                or graph.G.nodes[candidate].get("type")
+            ) == "IndexedStore"
+            and any(
+                str(role) == "base"
+                and isinstance(values.get(int(parent)), (dict, list, set))
+                for parent, role in (
+                    graph.G.nodes[candidate].get("parents") or ()
+                )
+            )
+            for candidate in deployment_nodes
+            if candidate in graph.G
+        )
+        has_structural_container_call = any(
+            isinstance(expression := graph.G.nodes[candidate].get("expr_obj"), ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+            and (
+                any(
+                    str(role) in {"operand", "receiver"}
+                    and isinstance(values.get(int(parent)), (dict, list, set))
+                    for parent, role in (
+                        graph.G.nodes[candidate].get("parents") or ()
+                    )
+                )
+                or (
+                    isinstance(expression.func.value, ast.Name)
+                    and isinstance(
+                        source_binding_values.get(expression.func.value.id),
+                        (dict, list, set),
+                    )
+                )
+            )
+            for candidate in deployment_nodes
+            if candidate in graph.G
+        )
+        has_structural_indexed_read = any(
+            str(
+                graph.G.nodes[candidate].get("op")
+                or graph.G.nodes[candidate].get("type")
+            ) == "Indexed"
+            and any(
+                str(role) == "base"
+                and isinstance(
+                    values.get(int(parent)), (dict, list, tuple, set)
+                )
+                for parent, role in (
+                    graph.G.nodes[candidate].get("parents") or ()
+                )
+            )
+            for candidate in deployment_nodes
+            if candidate in graph.G
+        )
+        if (
+            has_structural_store
+            or has_structural_container_call
+            or has_structural_indexed_read
+        ):
+            shell.coordinator_region_indices.add(region_index)
+            coordinator_override_nodes.update(deployment_nodes)
+            active_nodes.difference_update(map(int, deployment_nodes))
+            for deployment_node in deployment_nodes:
+                evaluate_node(int(deployment_node))
+            completed_regions.add(region_index)
+            return
 
         operations = [
             str(subgraph.G.nodes[node_id].get("op") or
@@ -5916,6 +11510,10 @@ def _coordinate_scheduled_capture_impl(
                                     if len(indices) == 1
                                     else tuple(indices)
                                 )
+                                if isinstance(
+                                    base, (dict, list, tuple, set)
+                                ):
+                                    index = coordinator_index(index)
                                 result = base[index]
                             elif isinstance(expression, ast.BinOp):
                                 operands = [
@@ -5971,7 +11569,7 @@ def _coordinate_scheduled_capture_impl(
                 # this one discovery invocation; they cannot add tape nodes.
                 capture_context = autograd.forward_capture(discovery_tape)
             else:
-                capture_context = autograd.no_grad()
+                capture_context = autograd.forward_observation()
             region_nodes_before = (
                 set(discovery_tape._nodes)
                 if capture and discovery_tape is not None
@@ -5989,6 +11587,7 @@ def _coordinate_scheduled_capture_impl(
                 planned_capture = {
                     "tape": discovery_tape,
                     "graph": graph,
+                    "shell": shell,
                     "node_capture_ids": {},
                     "step_input_ids": {},
                     "collection_materializations": (
@@ -6223,6 +11822,13 @@ def _coordinate_scheduled_capture_impl(
                                 item,
                                 (*path, name),
                             )
+                    elif isinstance(getattr(value, "__dict__", None), dict):
+                        for name, item in vars(value).items():
+                            record_aggregate_paths(
+                                graph_input_id,
+                                item,
+                                (*path, str(name)),
+                            )
 
                 for input_id in subgraph.G.graph["deployment_inputs"]:
                     name = _compiler_input_name(
@@ -6297,15 +11903,165 @@ def _coordinate_scheduled_capture_impl(
             defaults = graph.G.graph.get("parameter_defaults") or {}
             if expression.id in defaults:
                 return defaults[expression.id]
+            if expression.id in supplied:
+                value = supplied[expression.id]
+                if value is None or isinstance(
+                    value,
+                    (list, tuple, dict, set),
+                ):
+                    return value
         if isinstance(expression, ast.Attribute):
             return getattr(
                 evaluate_static_expression(expression.value),
                 expression.attr,
             )
+        if (
+            isinstance(expression, ast.Call)
+            and not expression.args
+            and not expression.keywords
+        ):
+            function = evaluate_static_expression(expression.func)
+            if callable(function):
+                return function()
+        if (
+            isinstance(expression, ast.Compare)
+            and len(expression.ops) == 1
+            and len(expression.comparators) == 1
+            and isinstance(expression.ops[0], (ast.Is, ast.IsNot))
+        ):
+            left = evaluate_static_expression(expression.left)
+            right = evaluate_static_expression(expression.comparators[0])
+            result = left is right
+            return not result if isinstance(expression.ops[0], ast.IsNot) else result
         raise KeyError(ast.unparse(expression))
+
+    def evaluate_source_container_item(
+        source: ast.AST,
+        fallback_node: int | None = None,
+    ) -> Any:
+        """Evaluate a container element at its exact lexical source point."""
+
+        if isinstance(source, ast.Name):
+            if source.id in source_binding_values:
+                return source_binding_values[source.id]
+            if source.id in supplied:
+                return supplied[source.id]
+        if isinstance(source, ast.Dict):
+            result = {}
+            for key, value in zip(source.keys, source.values):
+                item = evaluate_source_container_item(
+                    value, expression_nodes.get(id(value))
+                )
+                if key is None:
+                    result.update(dict(item))
+                else:
+                    result[evaluate_source_container_item(
+                        key, expression_nodes.get(id(key))
+                    )] = item
+            return result
+        if isinstance(source, (ast.Tuple, ast.List, ast.Set)):
+            items = [
+                evaluate_source_container_item(
+                    item, expression_nodes.get(id(item))
+                )
+                for item in source.elts
+            ]
+            if isinstance(source, ast.Tuple):
+                return tuple(items)
+            if isinstance(source, ast.Set):
+                return set(items)
+            return items
+        if isinstance(source, (ast.IfExp, ast.BoolOp)) or (
+            isinstance(source, ast.Compare)
+            and len(source.ops) == 1
+            and isinstance(source.ops[0], (ast.Is, ast.IsNot))
+        ):
+            return evaluate_reduced_control_expression(source)
+        node = (
+            fallback_node
+            if fallback_node is not None
+            else expression_nodes.get(id(source))
+        )
+        if node is not None:
+            return evaluate_node(int(node))
+        return evaluate_reduced_control_expression(source)
+
+    def coordinator_index(value: Any) -> Any:
+        """Project tensor scalars into Python container index semantics."""
+
+        if isinstance(value, AbstractTensor):
+            if tuple(value.shape) == ():
+                return value.item()
+            return value
+        if isinstance(value, tuple):
+            return tuple(coordinator_index(item) for item in value)
+        if isinstance(value, slice):
+            return slice(
+                coordinator_index(value.start),
+                coordinator_index(value.stop),
+                coordinator_index(value.step),
+            )
+        return value
+
+    def _resolve_reference_node(expression: ast.expr) -> int | None:
+        """Find the live graph node a reference-typed expression resolves to.
+
+        A bound-method call's receiver (``machine``, ``machine.runner``, ...)
+        is a reference value, not a tensor -- it has no numeric identity to
+        fall back on. The existing, narrower check this replaces
+        (``id(expression) in graph.G``) asks only "does this exact AST node
+        still happen to be a node in the graph", which silently fails
+        whenever an earlier reduction pass legitimately rebuilt or pruned
+        that specific node while the value it represents is still perfectly
+        live under its name. ``identity_table`` already tracks every SSA
+        version of every name for exactly this reason (it is the same
+        mechanism ``live_function_module_binding`` above uses); grounding
+        receiver resolution in it instead of a raw ``id()`` presence check
+        means a receiver resolves by what it *is*, not by whether one
+        specific AST node object happened to survive unchanged.
+        """
+
+        if isinstance(expression, ast.Name):
+            candidates = graph.G.graph.get("identity_table", {}).get(
+                expression.id, ()
+            )
+            for candidate in reversed(candidates):
+                if int(candidate) in graph.G:
+                    return int(candidate)
+            return None
+        if isinstance(expression, ast.Attribute):
+            if id(expression) in graph.G:
+                return id(expression)
+            base_node = _resolve_reference_node(expression.value)
+            if base_node is None:
+                return None
+            for successor in graph.G.successors(base_node):
+                successor_expr = graph.G.nodes[successor].get("expr_obj")
+                if (
+                    isinstance(successor_expr, ast.Attribute)
+                    and successor_expr.attr == expression.attr
+                ):
+                    return successor
+            return None
+        return None
 
     def evaluate_node(node_id: int) -> Any:
         if node_id in values:
+            cached_data = graph.G.nodes[node_id]
+            if str(cached_data.get("type")) in {"Input", "input"}:
+                if node_id in generator_binding_values:
+                    values[node_id] = generator_binding_values[node_id]
+                    return values[node_id]
+                cached_attributes = cached_data.get("attributes") or {}
+                cached_name = str(
+                    cached_attributes.get(
+                        "binding_name",
+                        cached_data.get("label", node_id),
+                    )
+                )
+                if cached_name in source_binding_values:
+                    values[node_id] = source_binding_values[cached_name]
+                    return values[node_id]
             return values[node_id]
         if node_id in inert_nodes:
             # A name or attribute lookup nobody reads.  Producing it would
@@ -6321,7 +12077,41 @@ def _coordinate_scheduled_capture_impl(
             )
         active_nodes.add(node_id)
         try:
-            region_index = region_for_node.get(node_id)
+            data = graph.G.nodes[node_id]
+            node_type = str(data.get("type"))
+            parents = tuple(data.get("parents") or ())
+            if node_type == "Indexed":
+                base_parent = next(
+                    (
+                        parent
+                        for parent, role in parents
+                        if str(role) == "base"
+                    ),
+                    None,
+                )
+                available_base = values.get(base_parent)
+                available_indices = tuple(
+                    values[parent]
+                    for parent, role in parents
+                    if str(role) == "index" and parent in values
+                )
+                if isinstance(
+                    available_base,
+                    (dict, list, tuple, set),
+                ) or any(
+                    isinstance(index, (str, bytes))
+                    for index in available_indices
+                ):
+                    # Runtime loop bindings can carry structural keys that
+                    # were not literals during planning. Container routing is
+                    # a type fact, not value specialization, and must be
+                    # decided before a numerical region claims the node.
+                    coordinator_override_nodes.add(node_id)
+            region_index = (
+                None
+                if node_id in coordinator_override_nodes
+                else region_for_node.get(node_id)
+            )
             if region_index is not None:
                 evaluate_region(region_index)
                 if node_id not in values:
@@ -6347,15 +12137,26 @@ def _coordinate_scheduled_capture_impl(
                     )
                 return values[node_id]
 
-            data = graph.G.nodes[node_id]
-            node_type = str(data.get("type"))
             expression = data.get("expr_obj")
-            parents = tuple(data.get("parents") or ())
             attributes = data.get("attributes") or {}
 
             if node_type in {"Input", "input"}:
                 if node_id in generator_binding_values:
                     result = generator_binding_values[node_id]
+                    values[node_id] = result
+                    return result
+                # Retained stores and attribute writes may still point at an
+                # Input-shaped identity for a local whose value is selected
+                # by source control.  Once that statement has executed, the
+                # active source frame is the authority for the spelling.
+                name = str(
+                    attributes.get(
+                        "binding_name",
+                        data.get("label", node_id),
+                    )
+                )
+                if name in source_binding_values:
+                    result = source_binding_values[name]
                     values[node_id] = result
                     return result
                 comprehension_owner = (
@@ -6367,7 +12168,28 @@ def _coordinate_scheduled_capture_impl(
                         result = generator_binding_values[node_id]
                         values[node_id] = result
                         return result
-                name = str(data.get("label", node_id))
+                loop_owner = loop_owner_by_binding.get(node_id)
+                if (
+                    loop_owner is not None
+                    and loop_owner not in active_nodes
+                ):
+                    # Normalized LoopExit/value dependencies can request an
+                    # inner loop's iterable before the flat evaluator has
+                    # visited the outer ``for`` statement.  A target is a
+                    # definition produced by its owner loop, never a public
+                    # function input.  Execute that owner first, then resolve
+                    # the binding from the exact iteration/source frame.
+                    evaluate_node(loop_owner)
+                    if node_id in generator_binding_values:
+                        result = generator_binding_values[node_id]
+                        values[node_id] = result
+                        return result
+                    if node_id in values:
+                        return values[node_id]
+                    if name in source_binding_values:
+                        result = source_binding_values[name]
+                        values[node_id] = result
+                        return result
                 raise KeyError(
                     f"missing ProcessGraph input {name!r} in "
                     f"{graph.G.graph.get('function_name', '?')} at node "
@@ -6394,11 +12216,17 @@ def _coordinate_scheduled_capture_impl(
                         ),
                         None,
                     )
-                    result = (
-                        evaluate_node(carried_initial)
-                        if carried_initial is not None
-                        else evaluate_node(by_role["value"])
-                    )
+                    if carried_initial is not None and carried_initial in values:
+                        result = values[carried_initial]
+                    elif (
+                        carried_initial is not None
+                        and carried_initial in graph.G
+                    ):
+                        result = evaluate_node(carried_initial)
+                    elif binding_name in source_binding_values:
+                        result = source_binding_values[binding_name]
+                    else:
+                        result = evaluate_node(by_role["value"])
                 else:
                     result = evaluate_node(by_role["value"])
             elif node_type in {"LoopStateTransition", "LoopStatePort"}:
@@ -6417,13 +12245,18 @@ def _coordinate_scheduled_capture_impl(
             elif node_type == "LoopAggregateResult":
                 result = tuple(
                     evaluate_node(parent)
-                    for parent, role in parents
-                    if str(role).startswith("arg")
+                    for parent in ordered_arguments(parents)
                 )
             elif isinstance(expression, (ast.Tuple, ast.List, ast.Set)):
+                element_parents = [parent for parent, _role in parents]
                 items = [
-                    evaluate_node(parent)
-                    for parent, _role in parents
+                    evaluate_source_container_item(
+                        item,
+                        element_parents[index]
+                        if index < len(element_parents)
+                        else None,
+                    )
+                    for index, item in enumerate(expression.elts)
                 ]
                 if isinstance(expression, ast.Tuple):
                     result = tuple(items)
@@ -6432,23 +12265,7 @@ def _coordinate_scheduled_capture_impl(
                 else:
                     result = items
             elif isinstance(expression, ast.Dict):
-                keys = [
-                    evaluate_node(parent)
-                    for parent, role in parents
-                    if str(role) == "keys"
-                ]
-                items = [
-                    evaluate_node(parent)
-                    for parent, role in parents
-                    if str(role) == "values"
-                ]
-                result = {}
-                key_values = iter(keys)
-                for key_expression, item in zip(expression.keys, items):
-                    if key_expression is None:
-                        result.update(dict(item))
-                    else:
-                        result[next(key_values)] = item
+                result = evaluate_source_container_item(expression, node_id)
             elif (
                 isinstance(expression, ast.Attribute)
                 and node_type != "SetAttr"
@@ -6471,15 +12288,31 @@ def _coordinate_scheduled_capture_impl(
                         f"{(data.get('attributes') or {})!r}"
                     )
                 receiver = evaluate_node(parent)
-                try:
-                    result = getattr(receiver, expression.attr)
-                except AttributeError as exc:
-                    raise AttributeError(
-                        f"{graph.G.graph.get('function_name', '?')} attribute "
-                        f"{expression.attr!r} at node {node_id} has receiver "
-                        f"{type(receiver).__name__}; parent={parent}, "
-                        f"parents={parents!r}"
-                    ) from exc
+                if isinstance(receiver, _CompiledStructuralObject):
+                    # A field read on a compiler-owned structural object is
+                    # not a static Python fact to freeze into ``values``:
+                    # the field is genuine per-call state (see
+                    # ``_CompiledStructuralObject.state``), and a plain
+                    # ``getattr`` here would capture whatever this one
+                    # discovery trace happened to observe as if it were a
+                    # constant -- the exact one-value trap that makes
+                    # ``counter.value`` invisible to region capture. Keep
+                    # the field's own identity live instead of collapsing
+                    # it to a bare Python value.
+                    result = receiver.state.get(expression.attr)
+                else:
+                    try:
+                        result = getattr(receiver, expression.attr)
+                    except AttributeError as exc:
+                        raise AttributeError(
+                            f"{graph.G.graph.get('function_name', '?')} "
+                            f"attribute {expression.attr!r} at node "
+                            f"{node_id} has receiver "
+                            f"{type(receiver).__name__}; parent={parent}, "
+                            f"parents={parents!r}"
+                        ) from exc
+                if node_type == "GetAttr":
+                    shell.reference_operator_sequence.append(int(node_id))
             elif isinstance(expression, ast.Slice):
                 parts = {
                     str(role): evaluate_node(parent)
@@ -6507,6 +12340,30 @@ def _coordinate_scheduled_capture_impl(
                     str(evaluate_node(parent))
                     for parent, _role in parents
                 )
+            elif node_type == "IndexedStore":
+                by_role: dict[str, list[int]] = {}
+                for parent, role in parents:
+                    by_role.setdefault(str(role), []).append(parent)
+                base = evaluate_node(by_role["base"][0])
+                if isinstance(expression, ast.Subscript):
+                    index = evaluate_reduced_control_expression(
+                        expression.slice
+                    )
+                else:
+                    indices = [
+                        evaluate_node(parent)
+                        for parent in by_role.get("index", ())
+                    ]
+                    index = (
+                        indices[0]
+                        if len(indices) == 1
+                        else tuple(indices)
+                    )
+                value = evaluate_node(by_role["value"][0])
+                if isinstance(base, (dict, list, tuple, set)):
+                    index = coordinator_index(index)
+                base[index] = value
+                result = base
             elif node_type == "Indexed":
                 base = evaluate_node(
                     next(
@@ -6521,6 +12378,8 @@ def _coordinate_scheduled_capture_impl(
                     if str(role) == "index"
                 ]
                 index = indices[0] if len(indices) == 1 else tuple(indices)
+                if isinstance(base, (dict, list, tuple, set)):
+                    index = coordinator_index(index)
                 result = base[index]
             elif isinstance(expression, ast.BoolOp):
                 if isinstance(expression.op, ast.And):
@@ -6567,23 +12426,34 @@ def _coordinate_scheduled_capture_impl(
                     ),
                 )
             ):
-                materialized = [
-                    evaluate_node(parent)
-                    for parent, role in parents
-                    if str(role).startswith("arg")
-                ]
-                if isinstance(expression, ast.SetComp):
-                    result = set(materialized)
-                elif isinstance(expression, ast.DictComp):
-                    result = dict(materialized)
-                elif isinstance(expression, ast.GeneratorExp):
-                    # Keep a replayable finite sequence during discovery.
-                    # Consumers such as any/all/sum and starred calls preserve
-                    # their Python argument semantics without re-entering the
-                    # evaporated generator control node.
-                    result = tuple(materialized)
+                try:
+                    materialized = [
+                        evaluate_node(parent)
+                        for parent in ordered_arguments(parents)
+                    ]
+                except KeyError:
+                    # An evaporated structural comprehension can retain a
+                    # cloned target-shaped Input after its loop binding was
+                    # removed. Reconstruct from source semantics, whose
+                    # comprehension frame publishes every destructured name.
+                    result = evaluate_reduced_control_expression(expression)
                 else:
-                    result = materialized
+                    if not materialized:
+                        result = evaluate_reduced_control_expression(
+                            expression
+                        )
+                    elif isinstance(expression, ast.SetComp):
+                        result = set(materialized)
+                    elif isinstance(expression, ast.DictComp):
+                        result = dict(materialized)
+                    elif isinstance(expression, ast.GeneratorExp):
+                        # Keep a replayable finite sequence during discovery.
+                        # Consumers such as any/all/sum and starred calls preserve
+                        # their Python argument semantics without re-entering the
+                        # evaporated generator control node.
+                        result = tuple(materialized)
+                    else:
+                        result = materialized
             elif isinstance(
                 expression,
                 (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
@@ -6641,9 +12511,15 @@ def _coordinate_scheduled_capture_impl(
                     for item in iterator:
                         targets = loop.target_bindings
                         items_by_name = dict(_destructure_loop_target(
-                            generator_expression.generators[index].target,
+                            expression.generators[index].target,
                             item,
                         ))
+                        # A later generator in the same comprehension may
+                        # consume a destructured name that never enters a
+                        # numerical target binding.  Publish the complete
+                        # Python target frame, just as retained ``for`` source
+                        # execution does.
+                        source_binding_values.update(items_by_name)
                         invalidated = set()
                         assignments = tuple(
                             (
@@ -6761,7 +12637,7 @@ def _coordinate_scheduled_capture_impl(
                         f"{type(expression.op).__name__}"
                     )
                 result = unary(operand)
-            elif isinstance(expression, ast.BinOp):
+            elif isinstance(expression, (ast.BinOp, ast.AugAssign)):
                 operands = [
                     evaluate_node(parent)
                     for parent, _role in parents
@@ -6795,7 +12671,42 @@ def _coordinate_scheduled_capture_impl(
                         f"parents={parents!r}"
                     )
                 result = binary(operands[0], operands[1])
+                if not isinstance(result, AbstractTensor):
+                    # A tensor-bearing structural op still enters the tape
+                    # (see _observe_process_graph_node); this branch runs for
+                    # plain values too, and a plain value never touches the
+                    # tape at all.  Record it the same way a reference
+                    # operator is recorded, in exact order, so an arithmetic
+                    # step feeding a field write is a real internal step
+                    # instead of looking like a phantom external input.
+                    shell.reference_operator_sequence.append(int(node_id))
             elif isinstance(expression, ast.Call):
+                if (
+                    isinstance(expression.func, ast.Attribute)
+                    and isinstance(expression.func.value, ast.Name)
+                    and expression.func.value.id in source_binding_values
+                ):
+                    receiver_parent = next(
+                        (
+                            int(parent)
+                            for parent, role in parents
+                            if str(role) in {"operand", "receiver"}
+                        ),
+                        None,
+                    )
+                    if receiver_parent is not None:
+                        # The receiver visible at this lexical callsite is
+                        # authoritative.  A normalized receiver edge can run
+                        # through a later LoopExit carrying the same spelling,
+                        # creating a false dependency cycle such as an outer
+                        # ``mapping.items()`` requiring its inner loop before
+                        # the outer target has been assigned.  Seed the exact
+                        # receiver identity before traversing call parents;
+                        # the ordinary callable/method routing below remains
+                        # responsible for compiling or invoking the method.
+                        values[receiver_parent] = source_binding_values[
+                            expression.func.value.id
+                        ]
                 for parent, _role in parents:
                     evaluate_node(parent)
                 attributes = data.get("attributes") or {}
@@ -6814,9 +12725,275 @@ def _coordinate_scheduled_capture_impl(
                     static_arguments,
                     graph,
                 )
+                # Exact source-name arguments observe the active lexical
+                # frame. A reduced edge may otherwise alias a saved value to
+                # a later write bearing the same spelling.
+                if not any(
+                    isinstance(argument, ast.Starred)
+                    for argument in expression.args
+                ):
+                    # Normalization can retain multiple SSA parents for one
+                    # source spelling after loop-carried/container rebinding.
+                    # Those are candidate identities, not additional Python
+                    # arguments.  Source syntax owns call arity; keep exactly
+                    # one planned slot per written positional argument before
+                    # applying lexical/live-value corrections below.
+                    source_args = list(args[: len(expression.args)])
+                    for index, argument in enumerate(expression.args):
+                        if (
+                            isinstance(argument, ast.Name)
+                            and argument.id in source_binding_values
+                            and index < len(source_args)
+                        ):
+                            source_args[index] = source_binding_values[
+                                argument.id
+                            ]
+                        elif (
+                            isinstance(argument, ast.Name)
+                            and argument.id not in supplied
+                            and index < len(source_args)
+                        ):
+                            live_argument = live_function_module_binding(
+                                argument.id
+                            )
+                            if live_argument is not live_binding_unavailable:
+                                source_args[index] = live_argument
+                        elif (
+                            index < len(source_args)
+                            and (
+                                isinstance(argument, (ast.IfExp, ast.BoolOp))
+                                or (
+                                    isinstance(argument, ast.Compare)
+                                    and len(argument.ops) == 1
+                                    and isinstance(
+                                        argument.ops[0],
+                                        (ast.Is, ast.IsNot),
+                                    )
+                                )
+                            )
+                        ):
+                            source_args[index] = (
+                                evaluate_reduced_control_expression(argument)
+                            )
+                    args = tuple(source_args)
+                for keyword in expression.keywords:
+                    if (
+                        keyword.arg is not None
+                        and isinstance(keyword.value, ast.Name)
+                        and keyword.value.id in source_binding_values
+                    ):
+                        kwargs[keyword.arg] = source_binding_values[
+                            keyword.value.id
+                        ]
+                    elif (
+                        keyword.arg is not None
+                        and isinstance(keyword.value, ast.Name)
+                        and keyword.value.id not in supplied
+                    ):
+                        live_argument = live_function_module_binding(
+                            keyword.value.id
+                        )
+                        if live_argument is not live_binding_unavailable:
+                            kwargs[keyword.arg] = live_argument
                 external_ref = attributes.get("external_callee_ref")
-                callee_ref = attributes.get("callee_ref")
+                callee_ref = attributes.get(
+                    "callee_ref", attributes.get("method_ref")
+                )
+                direct_self_recursion = (
+                    isinstance(expression.func, ast.Name)
+                    and expression.func.id
+                    == graph.G.graph.get("function_name")
+                )
+                if direct_self_recursion:
+                    callee_ref = graph.G.graph.get("function_ref", callee_ref)
                 class_ref = attributes.get("class_ref")
+                static_callable = None
+                runtime_bound_callable = None
+                static_reference = attributes.get(
+                    "static_python_reference"
+                )
+                if isinstance(expression.func, ast.Name):
+                    source_name = expression.func.id
+                    exact_callable = None
+                    if source_name in source_binding_values:
+                        candidate = source_binding_values[source_name]
+                        if callable(candidate):
+                            exact_callable = candidate
+                    elif source_name in supplied:
+                        candidate = supplied[source_name]
+                        if callable(candidate):
+                            exact_callable = candidate
+                    else:
+                        candidate = shell.static_python_bindings.get(
+                            source_name,
+                            getattr(builtins, source_name, None),
+                        )
+                        if callable(candidate):
+                            exact_callable = candidate
+                    if exact_callable is not None:
+                        # A bare source spelling has Python lexical authority.
+                        # Normalization may merge call edges whose constructors
+                        # have equal-looking scalar results (notably int(1)
+                        # and bool(1)); it may not change which callable the
+                        # source named.
+                        static_callable = exact_callable
+                        static_reference = source_name
+                        external_ref = None
+                        callable_name = getattr(
+                            exact_callable, "__name__", None
+                        )
+                        internal_ref = callee_ref
+                        if internal_ref is None:
+                            for reference_name in (
+                                source_name,
+                                callable_name,
+                            ):
+                                if reference_name is None:
+                                    continue
+                                reference = graph.function_table.reference(
+                                    reference_name
+                                )
+                                if reference is not None:
+                                    internal_ref = reference.address
+                                    if internal_ref in shell.function_shells:
+                                        break
+                        internal_shell = None
+                        if internal_ref is not None:
+                            internal_shell = shell.function_shells.get(
+                                int(internal_ref)
+                            )
+                        internal_name = (
+                            internal_shell.process_graph.G.graph.get(
+                                "function_name"
+                            )
+                            if internal_shell is not None
+                            else None
+                        )
+                        # Keep a source-ingested function linked to its
+                        # planner shell.  Only discard a spelling-derived
+                        # reference when it actually names a different
+                        # callable (the int(1)/bool(1) collision described
+                        # above).  Calling host Python with a compiled
+                        # callback argument would escape the compiler and is
+                        # invalid.
+                        callee_ref = (
+                            internal_ref
+                            if internal_shell is not None
+                            and str(internal_name) == str(callable_name)
+                            else None
+                        )
+                        class_ref = None
+                if static_reference is not None:
+                    try:
+                        candidate = _static_python_value(
+                            shell.static_python_bindings,
+                            static_reference,
+                        )
+                    except (AttributeError, KeyError):
+                        candidate = None
+                    if callable(candidate):
+                        static_callable = candidate
+                        if getattr(candidate, "__self__", None) is not None:
+                            # Exact bound-call authority outranks a bare-name
+                            # function-table collision and retains its receiver.
+                            callee_ref = None
+                if isinstance(expression.func, ast.Attribute):
+                    receiver_parent = next(
+                        (
+                            int(parent)
+                            for parent, role in parents
+                            if str(role) in {"operand", "receiver"}
+                        ),
+                        None,
+                    )
+                    if (
+                        receiver_parent is None
+                        and id(expression.func.value) in graph.G
+                    ):
+                        # Older compiled-plan checkpoints may have already
+                        # consumed the explicit operand edge while retaining
+                        # the original Attribute AST.  Its value node remains
+                        # the exact receiver identity and is safe to recover.
+                        receiver_parent = id(expression.func.value)
+                    source_receiver_name = (
+                        expression.func.value.id
+                        if isinstance(expression.func.value, ast.Name)
+                        else None
+                    )
+                    receiver_value = (
+                        source_binding_values[source_receiver_name]
+                        if source_receiver_name in source_binding_values
+                        else evaluate_node(receiver_parent)
+                        if receiver_parent is not None
+                        else None
+                    )
+                    if isinstance(
+                        receiver_value,
+                        (_CompiledStructuralObject, _CompiledStructuralClass),
+                    ):
+                        bound_method = getattr(
+                            receiver_value, expression.func.attr, None
+                        )
+                        if isinstance(bound_method, _CompiledStructuralMethod):
+                            # Runtime structural type identity is stronger than
+                            # a spelling-only method-table guess.
+                            callee_ref = bound_method.method_ref
+                    elif receiver_value is not None:
+                        candidate = getattr(
+                            receiver_value, expression.func.attr, None
+                        )
+                        if callable(candidate):
+                            candidate_name = getattr(
+                                getattr(candidate, "__func__", candidate),
+                                "__name__",
+                                None,
+                            )
+                            internal_ref = callee_ref
+                            if internal_ref is None and candidate_name:
+                                reference = graph.function_table.reference(
+                                    candidate_name
+                                )
+                                if reference is not None:
+                                    internal_ref = reference.address
+                            internal_shell = (
+                                shell.function_shells.get(int(internal_ref))
+                                if internal_ref is not None
+                                else None
+                            )
+                            internal_graph = (
+                                internal_shell.process_graph.G.graph
+                                if internal_shell is not None
+                                else {}
+                            )
+                            method_owner = internal_graph.get("method_owner")
+                            receiver_type = type(receiver_value)
+                            receiver_owner_names = {
+                                receiver_type.__name__,
+                                receiver_type.__qualname__,
+                                f"{receiver_type.__module__}."
+                                f"{receiver_type.__qualname__}",
+                            }
+                            if (
+                                internal_shell is not None
+                                and internal_graph.get("method_binding")
+                                == "instance"
+                                and str(internal_graph.get("function_name"))
+                                == str(candidate_name)
+                                and str(method_owner) in receiver_owner_names
+                            ):
+                                # The exact runtime bound method validates the
+                                # planner's class-method reference.  Keep the
+                                # call inside the source hierarchy so its
+                                # numerical regions enter the one discovery
+                                # tape.  Spelling alone remains insufficient:
+                                # unrelated same-named methods still take the
+                                # host-bound path below.
+                                callee_ref = internal_ref
+                                runtime_bound_callable = None
+                            else:
+                                runtime_bound_callable = candidate
+                                callee_ref = None
+                                external_ref = None
                 if class_ref is not None:
                     descriptor = (
                         graph.G.graph.get("class_table", {}).get(class_ref)
@@ -6825,12 +13002,94 @@ def _coordinate_scheduled_capture_impl(
                         raise RuntimeError(
                             f"unknown compiled class reference {class_ref!r}"
                         )
+                    host_factory = (
+                        static_callable
+                        if isinstance(static_callable, type)
+                        and getattr(static_callable, "__new__", object.__new__)
+                        is not object.__new__
+                        else None
+                    )
+                    if host_factory is not None:
+                        # A custom ``__new__`` is an allocation/factory
+                        # protocol, not an initializer.  Until allocation IR
+                        # exists, replacing it with a field-only structural
+                        # object is observably wrong (Path -> WindowsPath is
+                        # the canonical example). Preserve the exact available
+                        # factory and let subsequent bound calls retain their
+                        # real receiver.
+                        result = host_factory(*args, **kwargs)
+                        values[node_id] = result
+                        return result
                     result = _CompiledStructuralObject(
                         class_ref,
                         descriptor,
                         args,
                         kwargs,
                     )
+                    initializer_ref = (
+                        descriptor.get("methods") or {}
+                    ).get("__init__")
+                    initializer = (
+                        shell.function_shells.get(int(initializer_ref))
+                        if initializer_ref is not None
+                        else None
+                    )
+                    if initializer is not None:
+                        initializer.static_python_bindings = {
+                            **shell.static_python_bindings,
+                            **initializer.static_python_bindings,
+                        }
+                        receiver_parameter, positional_parameters, _ = (
+                            _method_parameter_layout(
+                                initializer.process_graph.G
+                            )
+                        )
+                        initializer_inputs = dict(
+                            zip(positional_parameters, args)
+                        ) | kwargs
+                        if receiver_parameter is not None:
+                            initializer_inputs[receiver_parameter] = result
+                        for name, default in (
+                            initializer.process_graph.G.graph.get(
+                                "parameter_defaults",
+                                {},
+                            ).items()
+                        ):
+                            initializer_inputs.setdefault(name, default)
+                        if capture:
+                            _coordinate_scheduled_capture(
+                                initializer,
+                                initializer_inputs,
+                                device=device,
+                                capture=True,
+                                discovery_session=discovery_session,
+                            )
+                        elif initializer.whole_program_compiled:
+                            initializer.execute_process_graph(
+                                initializer_inputs
+                            )
+                        else:
+                            initializer.coordinate_first_invocation(
+                                initializer_inputs,
+                                device=device,
+                            )
+                elif runtime_bound_callable is not None:
+                    try:
+                        result = runtime_bound_callable(*args, **kwargs)
+                    except Exception as error:
+                        if hasattr(error, "add_note"):
+                            error.add_note(
+                                "runtime-bound Python call failed; "
+                                f"shell={shell.profile_path!r}; "
+                                f"node={node_id}; "
+                                f"call={ast.dump(expression, include_attributes=False)!r}; "
+                                f"callable={_diagnostic_value_summary(runtime_bound_callable)!r}; "
+                                f"args={tuple(_diagnostic_value_summary(value) for value in args)!r}; "
+                                f"kwargs={{{', '.join(f'{name!r}: {_diagnostic_value_summary(value)!r}' for name, value in kwargs.items())}}}; "
+                                f"parents={parents!r}; "
+                                f"static_arguments={static_arguments!r}"
+                            )
+                        raise
                 elif external_ref is not None:
                     try:
                         external_label = (
@@ -6855,11 +13114,17 @@ def _coordinate_scheduled_capture_impl(
                     callee_ref is not None
                 ):
                     nested = (
-                        getattr(shell, "callsite_function_shells", {}).get(
-                            node_id
-                        )
+                        shell
+                        if direct_self_recursion
+                        else getattr(
+                            shell, "callsite_function_shells", {}
+                        ).get(node_id)
                         or shell.function_shells[int(callee_ref)]
                     )
+                    nested.static_python_bindings = {
+                        **shell.static_python_bindings,
+                        **nested.static_python_bindings,
+                    }
                     if shell._profiler.verbose:
                         shell._profiler.trace(
                             path=shell.profile_path,
@@ -6896,6 +13161,7 @@ def _coordinate_scheduled_capture_impl(
                         )
                     )
                     receiver_value = None
+                    call_args = args
                     if nested_graph_metadata.get("method_binding") == "class":
                         owner = nested_graph_metadata.get("method_owner")
                         descriptor = (
@@ -6910,8 +13176,32 @@ def _coordinate_scheduled_capture_impl(
                         receiver_value = _CompiledStructuralClass(
                             owner, descriptor
                         )
+                    elif nested_graph_metadata.get("method_binding") == "instance":
+                        receiver_parent = next(
+                            (
+                                int(parent)
+                                for parent, role in parents
+                                if str(role) in {"operand", "receiver"}
+                            ),
+                            None,
+                        )
+                        if (
+                            receiver_parent is None
+                            and isinstance(expression.func, ast.Attribute)
+                        ):
+                            receiver_parent = _resolve_reference_node(
+                                expression.func.value
+                            )
+                        if receiver_parent is not None:
+                            receiver_value = evaluate_node(receiver_parent)
+                        elif args:
+                            # A method discovered through a named Python
+                            # binding is an unbound function call: its first
+                            # explicit positional argument is the instance.
+                            receiver_value = args[0]
+                            call_args = args[1:]
                     nested_inputs = dict(
-                        zip(positional_parameters, args)
+                        zip(positional_parameters, call_args)
                     ) | kwargs
                     if receiver_parameter is not None and receiver_value is not None:
                         nested_inputs[receiver_parameter] = receiver_value
@@ -6935,17 +13225,40 @@ def _coordinate_scheduled_capture_impl(
                         if name in nested_inputs:
                             continue
                         resolution_errors = []
-                        for identity in reversed(
-                            caller_identities.get(name, ())
+                        if (
+                            name not in nested_inputs
+                            and discovery_session is not None
                         ):
-                            try:
-                                nested_inputs[name] = evaluate_node(identity)
-                            except (KeyError, RuntimeError) as error:
-                                resolution_errors.append(
-                                    (identity, str(error))
+                            for lexical_frame in reversed(
+                                discovery_session.get(
+                                    "lexical_frames", ()
                                 )
-                                continue
-                            break
+                            ):
+                                try:
+                                    resolved, lexical_value = (
+                                        lexical_frame["resolve"](name)
+                                    )
+                                except (KeyError, RuntimeError):
+                                    continue
+                                if resolved:
+                                    nested_inputs[name] = lexical_value
+                                    break
+                        if name not in nested_inputs and name in supplied:
+                            nested_inputs[name] = supplied[name]
+                        if name not in nested_inputs:
+                            for identity in reversed(
+                                caller_identities.get(name, ())
+                            ):
+                                try:
+                                    nested_inputs[name] = evaluate_node(
+                                        identity
+                                    )
+                                except (KeyError, RuntimeError) as error:
+                                    resolution_errors.append(
+                                        (identity, str(error))
+                                    )
+                                    continue
+                                break
                         if (
                             name not in nested_inputs
                             and caller_identities.get(name)
@@ -6983,8 +13296,20 @@ def _coordinate_scheduled_capture_impl(
                             device=device,
                         )
                     result = nested.last_result
-                elif attributes.get("static_python_reference"):
-                    reference = attributes["static_python_reference"]
+                    if discovery_session is not None:
+                        history = discovery_session.setdefault(
+                            "call_return_history", []
+                        )
+                        history.append((
+                            nested.profile_path,
+                            _diagnostic_value_summary(result),
+                        ))
+                        del history[:-64]
+                elif static_reference:
+                    # Exact lexical/builtin resolution can establish a static
+                    # source reference even when the normalized call node did
+                    # not originally carry metadata for one.
+                    reference = static_reference
                     structural_constructors = {
                         "tuple": tuple,
                         "list": list,
@@ -7007,13 +13332,109 @@ def _coordinate_scheduled_capture_impl(
                                 )
                             result = constructor(args)
                         else:
-                            result = constructor(*args, **kwargs)
+                            try:
+                                result = constructor(*args, **kwargs)
+                            except Exception as error:
+                                if hasattr(error, "add_note"):
+                                    error.add_note(
+                                        "static structural constructor failed; "
+                                        f"shell={shell.profile_path!r}; "
+                                        f"node={node_id}; "
+                                        f"call={ast.dump(expression, include_attributes=False)!r}; "
+                                        f"args={tuple(_diagnostic_value_summary(value) for value in args)!r}; "
+                                        f"kwargs={{{', '.join(f'{name!r}: {_diagnostic_value_summary(value)!r}' for name, value in kwargs.items())}}}"
+                                    )
+                                raise
                     else:
-                        callable_value = _static_python_value(
-                            shell.static_python_bindings,
-                            reference,
+                        callable_value = static_callable or _static_python_value(
+                            shell.static_python_bindings, reference
                         )
-                        result = callable_value(*args, **kwargs)
+                        if any(
+                            isinstance(value, _CompiledStructuralFunction)
+                            for value in (*args, *kwargs.values())
+                        ):
+                            available_shells = tuple(
+                                (
+                                    int(address),
+                                    child.process_graph.G.graph.get(
+                                        "function_name"
+                                    ),
+                                )
+                                for address, child in sorted(
+                                    shell.function_shells.items()
+                                )
+                            )
+                            raise RuntimeError(
+                                "source callable with compiled callback was "
+                                "not linked to a planner shell; "
+                                f"reference={reference!r}; "
+                                f"callable={getattr(callable_value, '__name__', callable_value)!r}; "
+                                f"callee_ref={attributes.get('callee_ref')!r}; "
+                                f"available_shells={available_shells!r}"
+                            )
+                        if (
+                            reference in {"max", "min"}
+                            and not kwargs
+                            and len(args) >= 2
+                            and any(
+                                isinstance(value, AbstractTensor)
+                                for value in args
+                            )
+                        ):
+                            # Python's scalar max/min returns one of its
+                            # operands by identity.  During tensor discovery
+                            # that would collapse the Call result onto the
+                            # selected input from this one sample, assigning
+                            # one primitive occurrence to two ProcessGraph
+                            # endpoints and (worse) specializing away the
+                            # runtime comparison.  Preserve the source scalar
+                            # semantics as an elementwise tensor operation;
+                            # scalar and singleton arenas are its degenerate
+                            # case and therefore retain a distinct SSA result.
+                            result = args[0]
+                            method_name = (
+                                "maximum" if reference == "max" else "minimum"
+                            )
+                            for operand in args[1:]:
+                                if not isinstance(result, AbstractTensor):
+                                    result = AbstractTensor.tensor(result)
+                                result = getattr(result, method_name)(operand)
+                        else:
+                            call_args = args
+                            if (
+                                reference == "next"
+                                and call_args
+                                and isinstance(call_args[0], (list, tuple))
+                            ):
+                                # A GeneratorExp/comprehension argument is
+                                # traced as an already-materialized list here
+                                # (this simulator has no lazy generator
+                                # value), but the real builtin `next()` --
+                                # reached as a static host call because it
+                                # has no compiled lowering -- requires an
+                                # actual iterator, not a list, and raises
+                                # TypeError otherwise. `next(genexpr, default)`
+                                # is an ordinary, common idiom (used by
+                                # MachineExecutionOrchestrator._relative_target,
+                                # among others); wrap the materialized
+                                # sequence in iter() so it behaves exactly
+                                # like the real generator would have.
+                                call_args = (iter(call_args[0]), *call_args[1:])
+                            try:
+                                result = callable_value(*call_args, **kwargs)
+                            except Exception as error:
+                                if hasattr(error, "add_note"):
+                                    error.add_note(
+                                        "static Python host call failed; "
+                                        f"shell={shell.profile_path!r}; "
+                                        f"node={node_id}; "
+                                        f"reference={reference!r}; "
+                                        f"call={ast.dump(expression, include_attributes=False)!r}; "
+                                        f"callable={_diagnostic_value_summary(callable_value)!r}; "
+                                        f"args={tuple(_diagnostic_value_summary(value) for value in call_args)!r}; "
+                                        f"kwargs={{{', '.join(f'{name!r}: {_diagnostic_value_summary(value)!r}' for name, value in kwargs.items())}}}"
+                                    )
+                                raise
                 elif any(
                     str(role) == "callee" for _parent, role in parents
                 ):
@@ -7023,6 +13444,71 @@ def _coordinate_scheduled_capture_impl(
                         if str(role) == "callee"
                     )
                     callee_value = evaluate_node(callee_parent)
+                    if isinstance(callee_value, _CompiledStructuralFunction):
+                        nested = (
+                            getattr(shell, "callsite_function_shells", {}).get(
+                                node_id
+                            )
+                            or shell.function_shells[
+                                int(callee_value.function_ref)
+                            ]
+                        )
+                        _receiver, positional_parameters, _all_parameters = (
+                            _method_parameter_layout(nested.process_graph.G)
+                        )
+                        nested_inputs = dict(
+                            zip(positional_parameters, args)
+                        ) | kwargs
+                        caller_identities = graph.G.graph.get(
+                            "identity_table", {}
+                        )
+                        for _input_id, input_data in (
+                            nested.process_graph.G.nodes(data=True)
+                        ):
+                            input_attributes = input_data.get(
+                                "attributes"
+                            ) or {}
+                            if (
+                                input_data.get("type") != "Input"
+                                or input_attributes.get("binding_kind")
+                                != "external"
+                            ):
+                                continue
+                            name = input_attributes.get("binding_name")
+                            if name in nested_inputs:
+                                continue
+                            for identity in reversed(
+                                caller_identities.get(name, ())
+                            ):
+                                try:
+                                    nested_inputs[name] = evaluate_node(identity)
+                                except (KeyError, RuntimeError):
+                                    continue
+                                break
+                        for name, value in (
+                            nested.process_graph.G.graph.get(
+                                "parameter_defaults", {}
+                            ).items()
+                        ):
+                            nested_inputs.setdefault(name, value)
+                        if capture:
+                            _coordinate_scheduled_capture(
+                                nested,
+                                nested_inputs,
+                                device=device,
+                                capture=True,
+                                discovery_session=discovery_session,
+                            )
+                        elif nested.whole_program_compiled:
+                            nested.execute_process_graph(nested_inputs)
+                        else:
+                            nested.coordinate_first_invocation(
+                                nested_inputs,
+                                device=device,
+                            )
+                        result = nested.last_result
+                        values[node_id] = result
+                        return result
                     if callable(callee_value) and not isinstance(
                         callee_value,
                         (
@@ -7174,6 +13660,15 @@ def _coordinate_scheduled_capture_impl(
                             None,
                         )
                         if receiver_parent is None:
+                            live_callable = (
+                                evaluate_reduced_control_expression(
+                                    expression.func
+                                )
+                            )
+                            if callable(live_callable):
+                                result = live_callable(*args, **kwargs)
+                                values[node_id] = result
+                                return result
                             raise RuntimeError(
                                 "attribute call has neither a callable nor "
                                 f"receiver edge at ProcessGraph node {node_id}: "
@@ -7456,6 +13951,17 @@ def _coordinate_scheduled_capture_impl(
                         values.pop(dependent, None)
                     for (_name, binding), value in target_assignments:
                         values[binding] = value
+                        generator_binding_values[binding] = value
+                    # A flat graph dependency can demand a nested loop before
+                    # the source-statement walker reaches that loop.  Its
+                    # destructured targets are still ordinary Python lexical
+                    # assignments, so publish every leaf into both runtime
+                    # identity tables and the source frame.  Keeping only the
+                    # planner-selected bindings makes a sibling target (for
+                    # example ``value_ids`` in ``for name, value_ids in ...``)
+                    # look like a missing function input when the inner loop
+                    # consumes it.
+                    source_binding_values.update(items_by_name)
                     for region_index in loop_runtime_region_indices.get(
                         node_id,
                         (),
@@ -7465,10 +13971,9 @@ def _coordinate_scheduled_capture_impl(
                     try:
                         for body_node in (
                             candidate
-                            for candidate in _dependency_order(graph)
+                            for candidate in loop.body_nodes
                             if (
-                                candidate in set(loop.body_nodes)
-                                and candidate not in nested_body_nodes_by_loop[
+                                candidate not in nested_body_nodes_by_loop[
                                     int(node_id)
                                 ]
                             )
@@ -7482,11 +13987,20 @@ def _coordinate_scheduled_capture_impl(
                         loop_signal = "break"
                     except _LoopContinueSignal:
                         loop_signal = "continue"
-                    for _name, initial, updated in loop.carried_bindings:
-                        values[initial] = evaluate_node(updated)
-                    iterations_completed += 1
                     if loop_signal == "break":
+                        iterations_completed += 1
                         break
+                    for carried_name, initial, updated in loop.carried_bindings:
+                        if (
+                            loop_signal == "continue"
+                            and carried_name in source_binding_values
+                        ):
+                            values[initial] = source_binding_values[
+                                carried_name
+                            ]
+                        elif loop_signal != "continue":
+                            values[initial] = evaluate_node(updated)
+                    iterations_completed += 1
                     if loop_signal == "continue":
                         continue
                     if shell._profiler.verbose:
@@ -7576,16 +14090,201 @@ def _coordinate_scheduled_capture_impl(
                     value,
                 )
                 result = value
+                shell.reference_operator_sequence.append(int(node_id))
+            elif node_type == "DelAttr":
+                by_role = {
+                    str(role): parent for parent, role in parents
+                }
+                receiver = evaluate_node(by_role["object"])
+                delattr(
+                    receiver,
+                    (data.get("attributes") or {})["attribute"],
+                )
+                result = None
+            elif node_type == "DelItem":
+                base = evaluate_node(
+                    next(
+                        parent
+                        for parent, role in parents
+                        if str(role) == "base"
+                    )
+                )
+                indices = [
+                    evaluate_node(parent)
+                    for parent, role in parents
+                    if str(role) == "index"
+                ]
+                index = indices[0] if len(indices) == 1 else tuple(indices)
+                del base[index]
+                result = None
             elif node_type == "StaticReference":
                 # This is a compiler-owned link to a function subgraph or
                 # structural symbol.  It is deliberately not a Python object
                 # and performs no runtime work.
                 attributes = data.get("attributes") or {}
-                result = attributes.get(
-                    "function_ref",
-                    attributes.get("static_python_reference"),
+                first_class_ref = attributes.get(
+                    "first_class_function_ref"
                 )
-            elif node_type in {"Return", "return", "Store", "store", "Output", "output"}:
+                static_reference = attributes.get("static_python_reference")
+                static_value = None
+                if static_reference is not None:
+                    try:
+                        static_value = _static_python_value(
+                            shell.static_python_bindings,
+                            static_reference,
+                        )
+                    except (AttributeError, KeyError):
+                        pass
+                if isinstance(static_value, type):
+                    # Classes used as first-class values (most importantly in
+                    # isinstance/issubclass tuples) retain Python type
+                    # identity. Constructor calls remain governed by the
+                    # class_ref branch above.
+                    result = static_value
+                else:
+                    result = (
+                        _CompiledStructuralFunction(first_class_ref)
+                        if first_class_ref is not None
+                        else attributes.get(
+                            "function_ref",
+                            static_reference,
+                        )
+                    )
+            elif isinstance(expression, ast.Lambda):
+                lambda_expression = expression
+                positional_parameters = tuple(
+                    (*lambda_expression.args.posonlyargs,
+                     *lambda_expression.args.args)
+                )
+                positional_defaults = {
+                    parameter.arg: evaluate_reduced_control_expression(default)
+                    for parameter, default in zip(
+                        positional_parameters[
+                            len(positional_parameters)
+                            - len(lambda_expression.args.defaults):
+                        ],
+                        lambda_expression.args.defaults,
+                    )
+                }
+                keyword_defaults = {
+                    parameter.arg: evaluate_reduced_control_expression(default)
+                    for parameter, default in zip(
+                        lambda_expression.args.kwonlyargs,
+                        lambda_expression.args.kw_defaults,
+                    )
+                    if default is not None
+                }
+
+                def structural_lambda(*call_args, **call_kwargs):
+                    remaining_kwargs = dict(call_kwargs)
+                    bound = {}
+                    if (
+                        len(call_args) > len(positional_parameters)
+                        and lambda_expression.args.vararg is None
+                    ):
+                        raise TypeError("lambda received too many arguments")
+                    for index, parameter in enumerate(positional_parameters):
+                        if index < len(call_args):
+                            if parameter.arg in remaining_kwargs:
+                                raise TypeError(
+                                    f"lambda got multiple values for "
+                                    f"{parameter.arg!r}"
+                                )
+                            bound[parameter.arg] = call_args[index]
+                        elif parameter.arg in remaining_kwargs:
+                            bound[parameter.arg] = remaining_kwargs.pop(
+                                parameter.arg
+                            )
+                        elif parameter.arg in positional_defaults:
+                            bound[parameter.arg] = positional_defaults[
+                                parameter.arg
+                            ]
+                        else:
+                            raise TypeError(
+                                f"lambda missing argument {parameter.arg!r}"
+                            )
+                    if lambda_expression.args.vararg is not None:
+                        bound[lambda_expression.args.vararg.arg] = tuple(
+                            call_args[len(positional_parameters):]
+                        )
+                    for parameter in lambda_expression.args.kwonlyargs:
+                        if parameter.arg in remaining_kwargs:
+                            bound[parameter.arg] = remaining_kwargs.pop(
+                                parameter.arg
+                            )
+                        elif parameter.arg in keyword_defaults:
+                            bound[parameter.arg] = keyword_defaults[
+                                parameter.arg
+                            ]
+                        else:
+                            raise TypeError(
+                                "lambda missing keyword-only argument "
+                                f"{parameter.arg!r}"
+                            )
+                    if lambda_expression.args.kwarg is not None:
+                        bound[lambda_expression.args.kwarg.arg] = (
+                            remaining_kwargs
+                        )
+                        remaining_kwargs = {}
+                    if remaining_kwargs:
+                        unexpected = next(iter(remaining_kwargs))
+                        raise TypeError(
+                            f"lambda got unexpected keyword {unexpected!r}"
+                        )
+                    missing = object()
+                    previous = {
+                        name: source_binding_values.get(name, missing)
+                        for name in bound
+                    }
+                    source_binding_values.update(bound)
+                    try:
+                        return evaluate_reduced_control_expression(
+                            lambda_expression.body
+                        )
+                    finally:
+                        for name, prior in previous.items():
+                            if prior is missing:
+                                source_binding_values.pop(name, None)
+                            else:
+                                source_binding_values[name] = prior
+
+                result = structural_lambda
+            elif isinstance(expression, ast.Return) or node_type in {
+                "Return",
+                "return",
+            }:
+                result = (
+                    evaluate_node(parents[0][0])
+                    if parents
+                    else None
+                )
+                values[node_id] = result
+                if capture:
+                    shell.forward_feed_ids = tuple(feed_maps)
+                    shell.forward_aggregate_feed_paths = tuple(
+                        aggregate_feed_maps
+                    )
+                    shell.forward_subgraphs = tuple(captured_subgraphs)
+                    shell.forward_compilers = tuple(captured_compilers)
+                    shell.forward_region_indices = tuple(
+                        captured_region_indices
+                    )
+                    shell.forward_output_values = tuple(
+                        captured_output_values
+                    )
+                    shell.forward_region_capture_node_ids = tuple(
+                        captured_region_node_ids
+                    )
+                    shell.forward_region_planned_capture_ids = tuple(
+                        captured_region_planned_ids
+                    )
+                    shell.forward_region_planned_input_ids = tuple(
+                        captured_region_planned_input_ids
+                    )
+                shell.captured_values = values
+                shell.last_result = result
+                raise _SourceReturnSignal(result)
+            elif node_type in {"Store", "store", "Output", "output"}:
                 result = (
                     evaluate_node(parents[0][0])
                     if parents
@@ -7599,12 +14298,549 @@ def _coordinate_scheduled_capture_impl(
             values[node_id] = result
             return result
         finally:
-            active_nodes.remove(node_id)
+            # Coordinator region arbitration can deliberately clear a
+            # region's active markers before replaying it structurally.
+            active_nodes.discard(node_id)
 
     generator_binding_values: dict[int, Any] = {}
+    source_binding_values: dict[str, Any] = {
+        str((data.get("attributes") or {}).get(
+            "binding_name", data.get("label", "")
+        )): values[int(node_id)]
+        for node_id, data in graph.G.nodes(data=True)
+        if str(data.get("type")) in {"Input", "input"}
+        and (data.get("attributes") or {}).get("binding_kind")
+        == "parameter"
+        and int(node_id) in values
+    }
+    source_binding_node_ids: dict[str, int] = {
+        str((data.get("attributes") or {}).get(
+            "binding_name", data.get("label", "")
+        )): int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if str(data.get("type")) in {"Input", "input"}
+        and (data.get("attributes") or {}).get("binding_kind")
+        == "parameter"
+        and int(node_id) in values
+    }
+
+    def has_live_source_root(expression: ast.AST) -> bool:
+        current = expression
+        while isinstance(current, (ast.Attribute, ast.Subscript)):
+            current = current.value
+        return (
+            isinstance(current, ast.Name)
+            and (
+                current.id in source_binding_values
+                or current.id in supplied
+                or live_function_module_binding(current.id)
+                is not live_binding_unavailable
+            )
+        )
+
+    def evaluate_reduced_control_expression(expression: ast.AST) -> Any:
+        if isinstance(
+            expression,
+            (ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp),
+        ):
+            def target_names(target: ast.AST) -> tuple[str, ...]:
+                if isinstance(target, ast.Name):
+                    return (target.id,)
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    return tuple(
+                        name
+                        for item in target.elts
+                        for name in target_names(item)
+                    )
+                raise NotImplementedError(
+                    "reduced comprehension target is not supported: "
+                    f"{ast.unparse(target)}"
+                )
+
+            def bind_target(target: ast.AST, value: Any) -> None:
+                if isinstance(target, ast.Name):
+                    source_binding_values[target.id] = value
+                    return
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    unpacked = tuple(value)
+                    if len(unpacked) != len(target.elts):
+                        raise ValueError(
+                            "comprehension target/value arity mismatch"
+                        )
+                    for item, item_value in zip(target.elts, unpacked):
+                        bind_target(item, item_value)
+                    return
+                raise NotImplementedError(
+                    "reduced comprehension target is not supported: "
+                    f"{ast.unparse(target)}"
+                )
+
+            missing = object()
+
+            def iterate(generators, index=0):
+                if index >= len(generators):
+                    if isinstance(expression, ast.DictComp):
+                        yield (
+                            evaluate_reduced_control_expression(
+                                expression.key
+                            ),
+                            evaluate_reduced_control_expression(
+                                expression.value
+                            ),
+                        )
+                    else:
+                        yield evaluate_reduced_control_expression(
+                            expression.elt
+                        )
+                    return
+                generator = generators[index]
+                if generator.is_async:
+                    raise NotImplementedError(
+                        "async reduced comprehensions are not supported"
+                    )
+                iterable = evaluate_reduced_control_expression(
+                    generator.iter
+                )
+                names = target_names(generator.target)
+                previous = {
+                    name: source_binding_values.get(name, missing)
+                    for name in names
+                }
+                try:
+                    for item in iterable:
+                        bind_target(generator.target, item)
+                        if all(
+                            bool(evaluate_reduced_control_expression(test))
+                            for test in generator.ifs
+                        ):
+                            yield from iterate(generators, index + 1)
+                finally:
+                    for name, value in previous.items():
+                        if value is missing:
+                            source_binding_values.pop(name, None)
+                        else:
+                            source_binding_values[name] = value
+
+            items = iterate(expression.generators)
+            if isinstance(expression, ast.GeneratorExp):
+                return items
+            if isinstance(expression, ast.ListComp):
+                return list(items)
+            if isinstance(expression, ast.SetComp):
+                return set(items)
+            return dict(items)
+        if isinstance(expression, ast.Name):
+            if expression.id in source_binding_values:
+                return source_binding_values[expression.id]
+            if expression.id in supplied:
+                return supplied[expression.id]
+            live_binding = live_function_module_binding(expression.id)
+            if live_binding is not live_binding_unavailable:
+                return live_binding
+            identities = graph.G.graph.get("identity_table", {}) or {}
+            for identity in reversed(identities.get(expression.id, ())):
+                identity = int(identity)
+                if identity in values or identity in graph.G:
+                    return evaluate_node(identity)
+            return evaluate_static_expression(expression)
+        if isinstance(expression, ast.IfExp):
+            branch = (
+                expression.body
+                if bool(evaluate_reduced_control_expression(expression.test))
+                else expression.orelse
+            )
+            return evaluate_reduced_control_expression(branch)
+        if isinstance(expression, ast.BoolOp):
+            if isinstance(expression.op, ast.And):
+                result = True
+                for operand in expression.values:
+                    result = evaluate_reduced_control_expression(operand)
+                    if not result:
+                        break
+                return result
+            result = False
+            for operand in expression.values:
+                result = evaluate_reduced_control_expression(operand)
+                if result:
+                    break
+            return result
+        if isinstance(expression, ast.UnaryOp):
+            operand = evaluate_reduced_control_expression(
+                expression.operand
+            )
+            unary = {
+                ast.Not: operator.not_,
+                ast.UAdd: operator.pos,
+                ast.USub: operator.neg,
+                ast.Invert: operator.invert,
+            }.get(type(expression.op))
+            if unary is None:
+                raise NotImplementedError(
+                    "reduced unary operator is not supported: "
+                    f"{ast.unparse(expression)}"
+                )
+            return unary(operand)
+        if isinstance(expression, ast.BinOp):
+            left = evaluate_reduced_control_expression(expression.left)
+            right = evaluate_reduced_control_expression(expression.right)
+            binary = {
+                ast.Add: operator.add,
+                ast.Sub: operator.sub,
+                ast.Mult: operator.mul,
+                ast.MatMult: operator.matmul,
+                ast.Div: operator.truediv,
+                ast.FloorDiv: operator.floordiv,
+                ast.Mod: operator.mod,
+                ast.Pow: operator.pow,
+                ast.LShift: operator.lshift,
+                ast.RShift: operator.rshift,
+                ast.BitOr: operator.or_,
+                ast.BitXor: operator.xor,
+                ast.BitAnd: operator.and_,
+            }.get(type(expression.op))
+            if binary is None:
+                raise NotImplementedError(
+                    "reduced binary operator is not supported: "
+                    f"{ast.unparse(expression)}"
+                )
+            return binary(left, right)
+        if (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+        ):
+            source_callable = shell.static_python_bindings.get(
+                expression.func.id
+            )
+            if discovery_session is not None:
+                history = discovery_session.setdefault(
+                    "structural_predicate_history", []
+                )
+                history.append((
+                    "source-call",
+                    expression.func.id,
+                    repr(source_callable),
+                    bool(
+                        isinstance(source_callable, type)
+                        and getattr(
+                            source_callable, "__new__", object.__new__
+                        ) is not object.__new__
+                    ),
+                ))
+                del history[:-32]
+            if (
+                isinstance(source_callable, type)
+                and getattr(source_callable, "__new__", object.__new__)
+                is not object.__new__
+            ):
+                positional = []
+                for argument in expression.args:
+                    if isinstance(argument, ast.Starred):
+                        positional.extend(
+                            evaluate_reduced_control_expression(
+                                argument.value
+                            )
+                        )
+                    else:
+                        positional.append(
+                            evaluate_reduced_control_expression(argument)
+                        )
+                keywords = {}
+                for keyword in expression.keywords:
+                    value = evaluate_reduced_control_expression(
+                        keyword.value
+                    )
+                    if keyword.arg is None:
+                        keywords.update(value)
+                    else:
+                        keywords[keyword.arg] = value
+                return source_callable(*positional, **keywords)
+        if (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+            and expression.func.id in {"isinstance", "issubclass"}
+            and len(expression.args) == 2
+            and not expression.keywords
+        ):
+            def evaluate_type_spec(type_expression: ast.AST) -> Any:
+                if isinstance(type_expression, ast.Tuple):
+                    return tuple(
+                        evaluate_type_spec(item)
+                        for item in type_expression.elts
+                    )
+                if isinstance(type_expression, ast.Name):
+                    if type_expression.id in shell.static_python_bindings:
+                        return shell.static_python_bindings[type_expression.id]
+                    builtin_type = getattr(
+                        builtins, type_expression.id, None
+                    )
+                    if isinstance(builtin_type, type):
+                        return builtin_type
+                if isinstance(type_expression, ast.Attribute):
+                    return getattr(
+                        evaluate_type_spec(type_expression.value),
+                        type_expression.attr,
+                    )
+                return evaluate_reduced_control_expression(type_expression)
+
+            predicate = (
+                isinstance
+                if expression.func.id == "isinstance"
+                else issubclass
+            )
+            subject = evaluate_reduced_control_expression(expression.args[0])
+            type_spec = evaluate_type_spec(expression.args[1])
+            result = predicate(subject, type_spec)
+            if discovery_session is not None:
+                history = discovery_session.setdefault(
+                    "structural_predicate_history", []
+                )
+                history.append((
+                    expression.func.id,
+                    _diagnostic_value_summary(subject),
+                    repr(type_spec),
+                    bool(result),
+                ))
+                del history[:-32]
+            return result
+        if (
+            isinstance(expression, ast.Compare)
+            and len(expression.ops) == 1
+            and len(expression.comparators) == 1
+            and isinstance(expression.ops[0], (ast.Is, ast.IsNot))
+        ):
+            def identity_operand(operand: ast.AST) -> Any:
+                # Identity tests are coordinator/source semantics all the way
+                # through an attribute path.  Do not let a retained Attribute
+                # node substitute an equal normalized value: SymPy's ``One``
+                # and ``true`` are especially sensitive to singleton identity.
+                if isinstance(operand, ast.Attribute):
+                    return getattr(
+                        identity_operand(operand.value), operand.attr
+                    )
+                return evaluate_reduced_control_expression(operand)
+
+            left = identity_operand(expression.left)
+            right = identity_operand(expression.comparators[0])
+            result = left is right
+            return (
+                not result
+                if isinstance(expression.ops[0], ast.IsNot)
+                else result
+            )
+        if isinstance(expression, ast.Compare):
+            operands = [
+                evaluate_reduced_control_expression(expression.left),
+                *(
+                    evaluate_reduced_control_expression(comparator)
+                    for comparator in expression.comparators
+                ),
+            ]
+            for index, comparison in enumerate(expression.ops):
+                comparator = {
+                    ast.Is: operator.is_,
+                    ast.IsNot: operator.is_not,
+                    ast.Eq: operator.eq,
+                    ast.NotEq: operator.ne,
+                    ast.Lt: operator.lt,
+                    ast.LtE: operator.le,
+                    ast.Gt: operator.gt,
+                    ast.GtE: operator.ge,
+                    ast.In: lambda left, right: left in right,
+                    ast.NotIn: lambda left, right: left not in right,
+                }.get(type(comparison))
+                if comparator is None:
+                    break
+                if not bool(comparator(operands[index], operands[index + 1])):
+                    return False
+            else:
+                return True
+        if isinstance(expression, ast.Subscript):
+            base = evaluate_reduced_control_expression(expression.value)
+            slice_expression = expression.slice
+            if isinstance(slice_expression, ast.Slice):
+                index = slice(
+                    evaluate_reduced_control_expression(
+                        slice_expression.lower
+                    ) if slice_expression.lower is not None else None,
+                    evaluate_reduced_control_expression(
+                        slice_expression.upper
+                    ) if slice_expression.upper is not None else None,
+                    evaluate_reduced_control_expression(
+                        slice_expression.step
+                    ) if slice_expression.step is not None else None,
+                )
+            elif isinstance(slice_expression, ast.Tuple):
+                index = tuple(
+                    evaluate_reduced_control_expression(item)
+                    for item in slice_expression.elts
+                )
+            else:
+                index = evaluate_reduced_control_expression(
+                    slice_expression
+                )
+            if isinstance(base, (dict, list, tuple, set)):
+                index = coordinator_index(index)
+            return base[index]
+        if (
+            isinstance(expression, ast.Attribute)
+            and has_live_source_root(expression)
+        ):
+            return getattr(
+                evaluate_reduced_control_expression(expression.value),
+                expression.attr,
+            )
+        if isinstance(expression, (ast.Tuple, ast.List, ast.Set)):
+            items = [
+                evaluate_reduced_control_expression(item)
+                for item in expression.elts
+            ]
+            if isinstance(expression, ast.Tuple):
+                return tuple(items)
+            if isinstance(expression, ast.Set):
+                return set(items)
+            return items
+        if isinstance(expression, ast.Dict):
+            result = {}
+            for key, value in zip(expression.keys, expression.values):
+                item = evaluate_reduced_control_expression(value)
+                if key is None:
+                    result.update(dict(item))
+                else:
+                    result[
+                        evaluate_reduced_control_expression(key)
+                    ] = item
+            return result
+        retained_node = expression_nodes.get(id(expression))
+        if retained_node is not None:
+            # Reduction can classify a value as graph-inert when its only
+            # consumer is a source assignment/control expression. Source
+            # execution is itself a real consumer: once it demands the AST
+            # expression, suppressing the node would replace the value with
+            # None and violate Python branch semantics.
+            inert_nodes.discard(retained_node)
+            return evaluate_node(retained_node)
+        if isinstance(expression, ast.Call):
+            # A structural method call can disappear from the numerical
+            # graph while its result is still consumed by source control.
+            # Resolve it against the live lexical bindings (not only the
+            # restricted static-binding table) and preserve Python's
+            # starred argument/keyword semantics.  State snapshots such as
+            # ``saved = state.copy_shallow()`` in the dt controller are the
+            # canonical case.
+            function = evaluate_reduced_control_expression(expression.func)
+            positional = []
+            for argument in expression.args:
+                if isinstance(argument, ast.Starred):
+                    positional.extend(
+                        evaluate_reduced_control_expression(argument.value)
+                    )
+                else:
+                    positional.append(
+                        evaluate_reduced_control_expression(argument)
+                    )
+            keywords = {}
+            for keyword in expression.keywords:
+                value = evaluate_reduced_control_expression(keyword.value)
+                if keyword.arg is None:
+                    keywords.update(value)
+                else:
+                    keywords[keyword.arg] = value
+            return function(*positional, **keywords)
+        if isinstance(expression, ast.Constant):
+            return expression.value
+        if isinstance(expression, ast.Attribute):
+            return getattr(
+                evaluate_reduced_control_expression(expression.value),
+                expression.attr,
+            )
+        return evaluate_static_expression(expression)
 
     def execute_generator_statements(statements):
+        source_value_unavailable = object()
+
+        def publish_nonlocal(name: str, value: Any) -> None:
+            if discovery_session is None:
+                return
+            for lexical_frame in reversed(
+                discovery_session.get("lexical_frames", ())
+            ):
+                if lexical_frame.get("shell") is shell:
+                    continue
+                if lexical_frame["assign"](name, value):
+                    return
+
+        def assign_source_target(target: ast.AST, value: Any) -> None:
+            if isinstance(target, ast.Name):
+                source_binding_values[target.id] = value
+                if discovery_session is not None:
+                    history = discovery_session.setdefault(
+                        "source_assignment_history", []
+                    )
+                    history.append((
+                        shell.profile_path,
+                        target.id,
+                        _diagnostic_value_summary(value),
+                    ))
+                    del history[:-64]
+                if target.id in nonlocal_names:
+                    publish_nonlocal(target.id, value)
+                return
+            if isinstance(target, (ast.Tuple, ast.List)):
+                unpacked = tuple(value)
+                starred = tuple(
+                    index
+                    for index, item in enumerate(target.elts)
+                    if isinstance(item, ast.Starred)
+                )
+                if len(starred) > 1:
+                    raise ValueError(
+                        "multiple starred assignment targets are invalid"
+                    )
+                if not starred:
+                    if len(unpacked) != len(target.elts):
+                        raise ValueError(
+                            "assignment target/value arity mismatch"
+                        )
+                    assigned = tuple(zip(target.elts, unpacked))
+                else:
+                    star_index = starred[0]
+                    trailing = len(target.elts) - star_index - 1
+                    minimum = len(target.elts) - 1
+                    if len(unpacked) < minimum:
+                        raise ValueError(
+                            "not enough values to unpack assignment"
+                        )
+                    assigned = (
+                        tuple(zip(target.elts[:star_index], unpacked[:star_index]))
+                        + ((
+                            target.elts[star_index].value,
+                            list(
+                                unpacked[
+                                    star_index:
+                                    len(unpacked) - trailing
+                                    if trailing
+                                    else len(unpacked)
+                                ]
+                            ),
+                        ),)
+                        + tuple(zip(
+                            target.elts[star_index + 1 :],
+                            unpacked[len(unpacked) - trailing :]
+                            if trailing
+                            else (),
+                        ))
+                    )
+                for item_target, item_value in assigned:
+                    assign_source_target(item_target, item_value)
+                return
+
         for statement in statements:
+            if isinstance(statement, ast.Break):
+                # Source control remains authoritative even when reduction
+                # removes the marker node because it has no numerical value.
+                raise _LoopBreakSignal()
+            if isinstance(statement, ast.Continue):
+                raise _LoopContinueSignal()
             if isinstance(statement, ast.Expr) and isinstance(
                 statement.value,
                 (ast.Yield, ast.YieldFrom),
@@ -7648,30 +14884,31 @@ def _coordinate_scheduled_capture_impl(
                     yield value
                 continue
             if isinstance(statement, ast.If):
-                test_node = expression_nodes.get(id(statement.test))
-                if test_node is None:
-                    statement_node = expression_nodes.get(id(statement))
-                    if statement_node is not None:
-                        test_node = next(
-                            (
-                                parent
-                                for parent, role in (
-                                    graph.G.nodes[statement_node].get(
-                                        "parents",
-                                        (),
-                                    )
-                                )
-                                if str(role) == "test"
-                            ),
-                            None,
-                        )
-                if test_node is None:
+                try:
+                    test = evaluate_reduced_control_expression(
+                        statement.test
+                    )
+                except (KeyError, TypeError) as error:
                     raise RuntimeError(
                         "generator branch test was not retained in "
                         f"{graph.G.graph.get('function_name', '?')}: "
                         f"{ast.dump(statement.test, include_attributes=False)}"
+                    ) from error
+                if discovery_session is not None:
+                    history = discovery_session.setdefault(
+                        "source_branch_history", []
                     )
-                test = evaluate_node(test_node)
+                    history.append((
+                        shell.profile_path,
+                        ast.dump(statement.test, include_attributes=False),
+                        _diagnostic_value_summary(test),
+                    ))
+                    del history[:-512]
+                shell._captured_source_branches.append((
+                    ast.dump(statement.test, include_attributes=False),
+                    _diagnostic_value_summary(test),
+                ))
+                del shell._captured_source_branches[:-64]
                 if shell._profiler.verbose:
                     shell._profiler.trace(
                         path=shell.profile_path,
@@ -7690,8 +14927,85 @@ def _coordinate_scheduled_capture_impl(
                 branch = statement.body if bool(test) else statement.orelse
                 yield from execute_generator_statements(branch)
                 continue
+            if isinstance(statement, ast.With):
+                # ``with`` is source-ordered Python control, including for
+                # context managers whose enter/exit effects do not produce a
+                # numerical graph value (locks are a common example).  Let
+                # ExitStack implement Python's ordered entry, reverse exit,
+                # and exception-suppression protocol while the coordinator
+                # remains responsible for evaluating expressions and binding
+                # optional ``as`` targets in the active lexical frame.
+                with ExitStack() as context_stack:
+                    for item in statement.items:
+                        context_manager = (
+                            evaluate_reduced_control_expression(
+                                item.context_expr
+                            )
+                        )
+                        entered_value = context_stack.enter_context(
+                            context_manager
+                        )
+                        if item.optional_vars is not None:
+                            assign_source_target(
+                                item.optional_vars, entered_value
+                            )
+                    yield from execute_generator_statements(statement.body)
+                continue
+            if isinstance(statement, ast.Try):
+                try:
+                    try:
+                        yield from execute_generator_statements(statement.body)
+                    except (
+                        _SourceReturnSignal,
+                        _LoopBreakSignal,
+                        _LoopContinueSignal,
+                    ):
+                        raise
+                    except BaseException as error:
+                        selected_handler = None
+                        for handler in statement.handlers:
+                            if handler.type is None:
+                                selected_handler = handler
+                                break
+                            exception_type = (
+                                evaluate_reduced_control_expression(
+                                    handler.type
+                                )
+                            )
+                            if isinstance(error, exception_type):
+                                selected_handler = handler
+                                break
+                        if selected_handler is None:
+                            raise
+                        exception_name = selected_handler.name
+                        if exception_name is not None:
+                            source_binding_values[exception_name] = error
+                        try:
+                            yield from execute_generator_statements(
+                                selected_handler.body
+                            )
+                        finally:
+                            # CPython clears an ``except ... as name`` target
+                            # when the handler suite exits.
+                            if exception_name is not None:
+                                source_binding_values.pop(exception_name, None)
+                    else:
+                        yield from execute_generator_statements(
+                            statement.orelse
+                        )
+                finally:
+                    yield from execute_generator_statements(
+                        statement.finalbody
+                    )
+                continue
             if isinstance(statement, ast.For):
-                loop_node = expression_nodes[id(statement)]
+                loop_node = expression_nodes.get(id(statement))
+                if loop_node is None:
+                    # A statically bounded loop may already have evaporated
+                    # into cloned straight-line graph nodes.  Those nodes are
+                    # evaluated by the ordinary dependency sweep; replaying
+                    # the removed source loop would duplicate the body.
+                    continue
                 plan = loop_plans_by_node[loop_node]
                 loop = plan.loop
                 target_initials = (
@@ -7731,10 +15045,26 @@ def _coordinate_scheduled_capture_impl(
                     ))
                 else:
                     iterator = iter(evaluate_node(loop.iterable_node))
+                loop_broken = False
+                # Source execution is now the authoritative owner of this
+                # retained loop.  Publish that fact before entering the body:
+                # a LoopExit demanded by a body expression must not recursively
+                # replay the generic flat-loop evaluator with an empty target
+                # frame while the source loop is already active.
+                values[loop_node] = None
+                iteration_count = 0
                 for item in iterator:
+                    iteration_count += 1
                     items_by_name = dict(_destructure_loop_target(
                         statement.target, item
                     ))
+                    # Numerical reduction is allowed to omit loop targets
+                    # that never enter a tensor region, but Python source
+                    # control may still read any destructured target.  Keep
+                    # the complete source binding environment in step with
+                    # the iterator rather than treating target_bindings as a
+                    # complete account of Python assignment semantics.
+                    source_binding_values.update(items_by_name)
                     assignments = tuple(
                         (
                             (name, binding),
@@ -7752,30 +15082,101 @@ def _coordinate_scheduled_capture_impl(
                         (),
                     ):
                         completed_regions.discard(region_index)
-                    yield from execute_generator_statements(statement.body)
-                    for _name, initial, updated in loop.carried_bindings:
-                        values[initial] = evaluate_node(updated)
+                    try:
+                        yield from execute_generator_statements(statement.body)
+                    except _LoopBreakSignal:
+                        loop_broken = True
+                        break
+                    except _LoopContinueSignal:
+                        loop_continued = True
+                    else:
+                        loop_continued = False
+                    for carried_name, initial, updated in loop.carried_bindings:
+                        if (
+                            loop_continued
+                            and carried_name in source_binding_values
+                        ):
+                            values[initial] = source_binding_values[
+                                carried_name
+                            ]
+                        elif not loop_continued:
+                            values[initial] = evaluate_node(updated)
                 # The generator interpreter is the planner-owned execution of
                 # this loop.  Publish completion so a downstream LoopExit
                 # cannot replay the same body through the generic flat loop
                 # evaluator (which would also lose nested branch semantics).
                 values[loop_node] = None
-                yield from execute_generator_statements(statement.orelse)
+                shell._captured_loop_iterations[int(loop_node)] = (
+                    int(iteration_count)
+                )
+                if not loop_broken:
+                    yield from execute_generator_statements(statement.orelse)
                 continue
             if isinstance(statement, ast.While):
-                loop_node = expression_nodes[id(statement)]
+                loop_node = expression_nodes.get(id(statement))
+                if loop_node is None:
+                    continue
+                source_loop_nodes = frozenset(
+                    int(member_node)
+                    for member in ast.walk(statement)
+                    if (
+                        member_node := expression_nodes.get(id(member))
+                    ) is not None
+                    and int(member_node) != int(loop_node)
+                )
                 iterations = 0
-                while bool(
-                    evaluate_node(expression_nodes[id(statement.test)])
-                ):
-                    for dependent in loop_invalidated_nodes[loop_node]:
+                loop_broken = False
+                plan = loop_plans_by_node[loop_node]
+                if plan.strategy is LoopStrategy.NATIVE_SOURCE:
+                    # Discovery traces the body of a retained native loop; it
+                    # must not execute the runtime trip count.  This is vital
+                    # for event/render loops whose configured bound is
+                    # intentionally infinite.  The semantic loop/control IR
+                    # owns repetition after capture.
+                    for dependent in (
+                        *loop_invalidated_nodes[loop_node],
+                        *source_loop_nodes,
+                    ):
+                        values.pop(dependent, None)
+                    for region_index in loop_runtime_region_indices.get(
+                        loop_node, ()
+                    ):
+                        completed_regions.discard(region_index)
+                    test = evaluate_reduced_control_expression(statement.test)
+                    if bool(test):
+                        try:
+                            yield from execute_generator_statements(
+                                statement.body
+                            )
+                        except (_LoopBreakSignal, _LoopContinueSignal):
+                            pass
+                    values[loop_node] = None
+                    # The runtime loop, not discovery, decides whether it
+                    # exhausts normally and therefore enters ``else``.
+                    continue
+                while True:
+                    for dependent in (
+                        *loop_invalidated_nodes[loop_node],
+                        *source_loop_nodes,
+                    ):
                         values.pop(dependent, None)
                     for region_index in loop_runtime_region_indices.get(
                         loop_node,
                         (),
                     ):
                         completed_regions.discard(region_index)
-                    yield from execute_generator_statements(statement.body)
+                    test = evaluate_reduced_control_expression(
+                        statement.test
+                    )
+                    if not bool(test):
+                        break
+                    try:
+                        yield from execute_generator_statements(statement.body)
+                    except _LoopBreakSignal:
+                        loop_broken = True
+                        break
+                    except _LoopContinueSignal:
+                        pass
                     iterations += 1
                     if iterations > 1_000_000:
                         raise RuntimeError(
@@ -7783,39 +15184,258 @@ def _coordinate_scheduled_capture_impl(
                             "safety limit"
                         )
                 values[loop_node] = None
-                yield from execute_generator_statements(statement.orelse)
+                if not loop_broken:
+                    yield from execute_generator_statements(statement.orelse)
                 continue
             if isinstance(statement, ast.Return):
-                if statement.value is not None:
-                    evaluate_node(expression_nodes[id(statement.value)])
-                return
+                source_return = object()
+                value = source_return
+                if isinstance(statement.value, ast.Name):
+                    if statement.value.id in source_binding_values:
+                        value = source_binding_values[statement.value.id]
+                    elif statement.value.id in supplied:
+                        value = supplied[statement.value.id]
+                elif (
+                    statement.value is not None
+                    and has_live_source_root(statement.value)
+                ):
+                    value = evaluate_reduced_control_expression(
+                        statement.value
+                    )
+                # The executing Return statement and its value expression are
+                # the exact source-order authority.  Normalized/checkpointed
+                # ``return_value_nodes`` can collapse multiple returns onto a
+                # function's syntactically last output identity; consulting
+                # it first made an executed early tensor return appear to be
+                # the later ``float(value.item())`` branch.  Prefer the live
+                # expression node and retain both metadata tables solely as
+                # compatibility fallbacks when AST identity was serialized.
+                value_node = (
+                    source_binding_node_ids.get(statement.value.id)
+                    if isinstance(statement.value, ast.Name)
+                    else expression_nodes.get(id(statement.value))
+                    if statement.value is not None
+                    else None
+                )
+                if value_node is None and statement.value is not None:
+                    value_node = graph.G.graph.get(
+                        "return_value_nodes", {}
+                    ).get(id(statement))
+                if value_node is None and statement.value is not None:
+                    value_node = checkpoint_return_value_nodes.get(
+                        id(statement)
+                    )
+                if value_node is not None and value_node not in graph.G:
+                    output_names = tuple(
+                        graph.G.graph.get("function_outputs", ())
+                    )
+                    identities = graph.G.graph.get("identity_table", {})
+                    candidates = tuple(
+                        int(identities[name][-1])
+                        for name in output_names
+                        if identities.get(name)
+                        and int(identities[name][-1]) in graph.G
+                    )
+                    value_node = (
+                        candidates[0]
+                        if len(candidates) == 1
+                        else graph.roots[0]
+                        if len(graph.roots) == 1
+                        else None
+                    )
+                if capture and value_node is not None:
+                    shell._captured_return_value_ids.add(int(value_node))
+                if value is source_return:
+                    value = (
+                        values[value_node]
+                        if value_node in values
+                        else evaluate_node(value_node)
+                        if value_node is not None
+                        else None
+                    )
+                if capture:
+                    shell.forward_feed_ids = tuple(feed_maps)
+                    shell.forward_aggregate_feed_paths = tuple(
+                        aggregate_feed_maps
+                    )
+                    shell.forward_subgraphs = tuple(captured_subgraphs)
+                    shell.forward_compilers = tuple(captured_compilers)
+                    shell.forward_region_indices = tuple(
+                        captured_region_indices
+                    )
+                    shell.forward_output_values = tuple(
+                        captured_output_values
+                    )
+                    shell.forward_region_capture_node_ids = tuple(
+                        captured_region_node_ids
+                    )
+                    shell.forward_region_planned_capture_ids = tuple(
+                        captured_region_planned_ids
+                    )
+                    shell.forward_region_planned_input_ids = tuple(
+                        captured_region_planned_input_ids
+                    )
+                shell.captured_values = values
+                shell.last_result = value
+                raise _SourceReturnSignal(value)
             if isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 value_expression = statement.value
+                assigned_value = None
                 if value_expression is not None:
-                    evaluate_node(expression_nodes[id(value_expression)])
+                    value_node = expression_nodes.get(id(value_expression))
+                    # A bare source name denotes the value visible at this
+                    # statement, not necessarily the last normalized SSA
+                    # identity bearing that spelling.  The distinction is
+                    # observable whenever a value is saved before a later
+                    # write, for example ``saved = counter; counter += 1``.
+                    # Consult the active lexical/source frame first; retained
+                    # compound expressions remain owned by the planned graph.
+                    if isinstance(
+                        value_expression,
+                        (ast.Name, ast.IfExp, ast.BoolOp),
+                    ):
+                        assigned_value = evaluate_reduced_control_expression(
+                            value_expression
+                        )
+                    elif value_node is not None:
+                        if is_shader_internal_node(value_node):
+                            evaluate_region(region_for_node[value_node])
+                            assigned_value = values.get(
+                                value_node,
+                                source_value_unavailable,
+                            )
+                        else:
+                            assigned_value = evaluate_node(value_node)
+                    else:
+                        assigned_value = evaluate_reduced_control_expression(
+                            value_expression
+                        )
                 targets = (
                     tuple(statement.targets)
                     if isinstance(statement, ast.Assign)
                     else (statement.target,)
                 )
                 for target in targets:
+                    if (
+                        assigned_value is not source_value_unavailable
+                        and isinstance(target, (ast.Name, ast.Tuple, ast.List))
+                    ):
+                        assign_source_target(target, assigned_value)
                     target_node = expression_nodes.get(id(target))
                     if (
                         target_node is not None
                         and target_node in graph.G
                         and graph.G.nodes[target_node].get("type")
-                        == "SetAttr"
+                        in {"SetAttr", "IndexedStore"}
                     ):
+                        if is_shader_internal_node(target_node):
+                            evaluate_region(region_for_node[target_node])
+                            continue
+                        # The source statement has already evaluated its RHS
+                        # at this exact program point.  A normalized store can
+                        # still refer to the final SSA identity with the same
+                        # spelling (for example ``result`` assigned in many
+                        # arms of a long if/elif chain).  Publish the live RHS
+                        # into the store's value port so structural mutation
+                        # observes Python's source-order value, not a later
+                        # predicate or branch identity.
+                        for parent, role in graph.G.nodes[target_node].get(
+                            "parents", ()
+                        ):
+                            if (
+                                str(role) == "value"
+                                and assigned_value
+                                is not source_value_unavailable
+                            ):
+                                values[int(parent)] = assigned_value
+                                inert_nodes.discard(int(parent))
                         evaluate_node(target_node)
+                continue
+            if isinstance(statement, ast.AugAssign):
+                statement_node = expression_nodes.get(id(statement))
+                if (
+                    statement_node is not None
+                    and is_shader_internal_node(statement_node)
+                ):
+                    evaluate_region(region_for_node[statement_node])
+                    if isinstance(statement.target, ast.Name):
+                        source_binding_values.pop(
+                            statement.target.id,
+                            None,
+                        )
+                    continue
+                assigned_value = None
+                scalar_source_update = False
+                if (
+                    isinstance(statement.target, ast.Name)
+                    and statement.target.id in source_binding_values
+                    and not isinstance(
+                        source_binding_values[statement.target.id],
+                        AbstractTensor,
+                    )
+                ):
+                    try:
+                        right_value = evaluate_reduced_control_expression(
+                            statement.value
+                        )
+                    except (KeyError, TypeError):
+                        right_value = None
+                    if not isinstance(right_value, AbstractTensor):
+                        binary = {
+                            ast.Add: operator.add,
+                            ast.Sub: operator.sub,
+                            ast.Mult: operator.mul,
+                            ast.Div: operator.truediv,
+                            ast.FloorDiv: operator.floordiv,
+                            ast.Mod: operator.mod,
+                            ast.Pow: operator.pow,
+                            ast.LShift: operator.lshift,
+                            ast.RShift: operator.rshift,
+                            ast.BitOr: operator.or_,
+                            ast.BitXor: operator.xor,
+                            ast.BitAnd: operator.and_,
+                            ast.MatMult: operator.matmul,
+                        }.get(type(statement.op))
+                        if binary is not None:
+                            assigned_value = binary(
+                                source_binding_values[statement.target.id],
+                                right_value,
+                            )
+                            scalar_source_update = True
+                if statement_node is not None:
+                    values.pop(statement_node, None)
+                    statement_region = region_for_node.get(statement_node)
+                    if statement_region is not None:
+                        completed_regions.discard(statement_region)
+                if not scalar_source_update:
+                    assigned_value = (
+                        evaluate_node(statement_node)
+                        if statement_node is not None
+                        else evaluate_reduced_control_expression(statement)
+                    )
+                if isinstance(statement.target, ast.Name):
+                    source_binding_values[
+                        statement.target.id
+                    ] = assigned_value
+                    if statement.target.id in nonlocal_names:
+                        publish_nonlocal(
+                            statement.target.id, assigned_value
+                        )
                 continue
             statement_node = expression_nodes.get(id(statement))
             if statement_node is not None and statement_node in graph.G:
-                evaluate_node(statement_node)
+                if is_shader_internal_node(statement_node):
+                    evaluate_region(region_for_node[statement_node])
+                else:
+                    evaluate_node(statement_node)
                 continue
             for member in ast.iter_child_nodes(statement):
                 member_node = expression_nodes.get(id(member))
                 if member_node is not None and member_node in graph.G:
-                    evaluate_node(member_node)
+                    if is_shader_internal_node(member_node):
+                        evaluate_region(region_for_node[member_node])
+                    else:
+                        evaluate_node(member_node)
 
     if graph.G.graph.get("generator_stream"):
         for input_id in tuple(values):
@@ -7870,6 +15490,37 @@ def _coordinate_scheduled_capture_impl(
         )
         return shell.last_result
 
+    if discovery_session is not None:
+        def resolve_lexical_name(name: str) -> tuple[bool, Any]:
+            if name in source_binding_values:
+                return True, source_binding_values[name]
+            if name in supplied:
+                return True, supplied[name]
+            for identity in reversed(
+                graph.G.graph.get("identity_table", {}).get(name, ())
+            ):
+                try:
+                    return True, evaluate_node(identity)
+                except (KeyError, RuntimeError):
+                    continue
+            return False, None
+
+        def assign_lexical_name(name: str, value: Any) -> bool:
+            if (
+                name not in source_binding_values
+                and name not in supplied
+                and name not in graph.G.graph.get("identity_table", {})
+            ):
+                return False
+            source_binding_values[name] = value
+            return True
+
+        discovery_session.setdefault("lexical_frames", []).append({
+            "shell": shell,
+            "resolve": resolve_lexical_name,
+            "assign": assign_lexical_name,
+        })
+
     with AbstractTensor.use_backend(
         _scheduled_capture_backend.get(),
         device,
@@ -7906,6 +15557,17 @@ def _coordinate_scheduled_capture_impl(
         if capture:
             for validation in _validation_control_blocks(shell):
                 evaluate_node(int(validation.predicate_value_id))
+
+        # Structural Python control is ordered by its retained source body,
+        # not by numerical dependency levels.  In particular, a later branch
+        # predicate must not run after an earlier branch returned.  Statement
+        # execution still demands each planned numerical region through
+        # evaluate_node; it does not replace or reinterpret numeric lowering.
+        if function_body:
+            for _yielded in execute_generator_statements(function_body):
+                raise RuntimeError(
+                    "non-generator ProcessGraph produced a yielded value"
+                )
 
         for node_id in _dependency_order(graph):
             if node_id in inert_nodes:
@@ -8017,12 +15679,50 @@ def _coordinate_scheduled_capture(
             capture=capture,
             discovery_session=discovery_session,
         )
+    except _SourceReturnSignal as signal:
+        shell.last_result = signal.value
+        return signal.value
     except Exception as error:
         if hasattr(error, "add_note"):
+            structural_state = tuple(
+                (
+                    str(name),
+                    {
+                        str(field): _diagnostic_value_summary(field_value)
+                        for field, field_value in list(value.state.items())[:24]
+                    },
+                )
+                for name, value in initial_values.items()
+                if isinstance(value, _CompiledStructuralObject)
+            )
+            active_session = discovery_session or getattr(
+                shell, "_discovery_session", None
+            )
+            call_returns = tuple(
+                (active_session or {}).get("call_return_history", ())
+            )
+            structural_predicates = tuple(
+                (active_session or {}).get(
+                    "structural_predicate_history", ()
+                )
+            )
+            source_assignments = tuple(
+                (active_session or {}).get(
+                    "source_assignment_history", ()
+                )
+            )
+            source_branches = tuple(
+                (active_session or {}).get("source_branch_history", ())
+            )
             error.add_note(
                 "while coordinating ProcessGraph shell "
                 f"{shell.profile_path!r} with inputs="
-                f"{tuple((str(name), _diagnostic_value_summary(value)) for name, value in initial_values.items())!r}"
+                f"{tuple((str(name), _diagnostic_value_summary(value)) for name, value in initial_values.items())!r}; "
+                f"structural_state={structural_state!r}; "
+                f"recent_call_returns={call_returns!r}; "
+                f"recent_structural_predicates={structural_predicates!r}; "
+                f"recent_source_assignments={source_assignments!r}; "
+                f"recent_source_branches={source_branches!r}"
             )
         shell._profiler.record_exception(
             error,
@@ -8031,6 +15731,15 @@ def _coordinate_scheduled_capture(
         )
         raise
     finally:
+        active_session = discovery_session or getattr(
+            shell, "_discovery_session", None
+        )
+        if active_session is not None:
+            frames = active_session.get("lexical_frames", [])
+            for index in range(len(frames) - 1, -1, -1):
+                if frames[index].get("shell") is shell:
+                    del frames[index]
+                    break
         shell._profiler.end_shell(shell.profile_path, token)
         if capture:
             shell._profiler._runtime_suppression -= 1
@@ -8040,6 +15749,7 @@ def _compile_whole_process_graph(
     shell: Any,
     *,
     device: Any = None,
+    prepare_ephemerals: bool = False,
     _visited: set[int] | None = None,
 ) -> Any:
     if getattr(shell, "process_graph_boundary", None):
@@ -8060,16 +15770,52 @@ def _compile_whole_process_graph(
         return shell
     visited.add(identity)
 
+    if (
+        getattr(shell, "runtime_closure_only", False)
+        and getattr(shell, "_owns_function_shells", False)
+    ):
+        # The outer shell owns the complete source catalogue and map records;
+        # it is not a second execution of the module containing the requested
+        # entrypoint.  Compile the proven activation roots.  Their complete
+        # call topology is represented by callsite_function_shells and is
+        # recursively validated by the ordinary path below.
+        activation_roots = tuple(
+            getattr(shell, "activation_root_references", ())
+        )
+        if not activation_roots:
+            raise RuntimeError(
+                "runtime-root ProcessGraph has no activation root"
+            )
+        for reference in activation_roots:
+            function_shell = shell.function_shells.get(int(reference))
+            if function_shell is None:
+                raise RuntimeError(
+                    "ProcessGraph activation root has no deployment shell: "
+                    f"{reference}"
+                )
+            _compile_whole_process_graph(
+                function_shell,
+                device=device,
+                prepare_ephemerals=prepare_ephemerals,
+                _visited=visited,
+            )
+        shell.compiled_dispatch_functions = ()
+        shell.compiled_dispatch_sources = ()
+        shell.whole_program_compiled = True
+        shell.whole_program_device = device
+        return shell
+
     covered = {
         node_id
         for subgraph in shell.dispatch_subgraphs
         for node_id in subgraph.G.graph.get("deployment_nodes", ())
     }
+    is_dispatch_metadata = _dispatch_metadata_node_classifier(shell.process_graph)
     uncovered = [
         node_id
         for node_id in shell.process_graph.G
         if node_id not in covered
-        and not _is_dispatch_metadata_node(shell.process_graph, node_id)
+        and not is_dispatch_metadata(node_id)
     ]
     if uncovered:
         details = ", ".join(
@@ -8083,10 +15829,22 @@ def _compile_whole_process_graph(
 
     functions = []
     sources = []
-    for ephemeral in shell.ephemeral_callables:
-        ephemeral.prepare(device=device)
-        functions.append(ephemeral)
-        sources.append(ephemeral.generated_source)
+    # An ephemeral is a GraphDeepCompiler-built PYTHON callable for a numeric
+    # region -- only useful when a numeric region has to stay executable as
+    # Python (runtime execution). Deriving the dual IR (the whole-program,
+    # no-bake precompile) does not execute anything, so it does not need them,
+    # and eagerly building them here forces the deep compiler over the whole
+    # graph -- including control/binding constructs (a walrus, an annotation)
+    # that are not tensor operators and have no op-table entry -- which is the
+    # wrong question to ask of them. So prepare them only when explicitly asked.
+    # The runtime consumer falls back to the ephemeral itself (prepared lazily
+    # on first call) when compiled_dispatch_functions is empty, so leaving them
+    # unprepared here is safe.
+    if prepare_ephemerals:
+        for ephemeral in shell.ephemeral_callables:
+            ephemeral.prepare(device=device)
+            functions.append(ephemeral)
+            sources.append(ephemeral.generated_source)
     direct_callees = [
         (node_id, int(reference))
         for node_id, data in shell.process_graph.G.nodes(data=True)
@@ -8102,13 +15860,57 @@ def _compile_whole_process_graph(
             or shell.function_shells.get(reference)
         )
         if function_shell is None:
+            try:
+                referenced_entry = shell.process_graph.function_table.entry(
+                    reference
+                )
+            except (AttributeError, KeyError):
+                referenced_entry = None
+            if (
+                referenced_entry is not None
+                and referenced_entry.metadata.get("host_ssa_module") is not None
+            ):
+                # The callee is already fully represented as repository SSA;
+                # it does not need or admit a source-planning shell.
+                continue
+            if (
+                referenced_entry is not None
+                and referenced_entry.metadata.get("implementation_kind")
+                == "authored-source-fallback"
+            ):
+                # A bounded function-shell subdivision deliberately compiles
+                # only one authored function's numerical regions. Calls that
+                # leave the cut remain exact authored source and are restored
+                # whenever recursive compilation dives through them. This is
+                # an explicit implementation contract attached by the
+                # subdivision orchestrator, not permission to overlook an
+                # accidentally missing deployment shell in an ordinary build.
+                continue
+            function_name = shell.process_graph.G.graph.get(
+                "function_name", "?"
+            )
+            try:
+                referenced_name = (
+                    shell.process_graph.function_table.entry(reference)
+                    .qualified_name
+                )
+            except (AttributeError, KeyError):
+                referenced_name = "?"
+            node_data = shell.process_graph.G.nodes[node_id]
+            expression = node_data.get("expr_obj")
             raise RuntimeError(
                 "ProcessGraph references a function with no deployment "
-                f"shell: {reference}"
+                f"shell: {reference}; owner={function_name!r}; "
+                f"referenced={referenced_name!r}; node={node_id}; "
+                f"type={node_data.get('type')!r}; "
+                f"source={ast.dump(expression, include_attributes=False) if isinstance(expression, ast.AST) else repr(expression)}; "
+                "planned_references="
+                f"{tuple(sorted(map(int, shell.function_shells)))}"
             )
         _compile_whole_process_graph(
             function_shell,
             device=device,
+            prepare_ephemerals=prepare_ephemerals,
             _visited=visited,
         )
     shell.compiled_dispatch_functions = tuple(functions)
@@ -8116,6 +15918,115 @@ def _compile_whole_process_graph(
     shell.whole_program_compiled = True
     shell.whole_program_device = device
     return shell
+
+
+_FORMAL_LITERAL_CONFLICT = object()
+
+
+def _publish_formal_literal(
+    function: str, parameter: str, value: Any, caller: str,
+) -> None:
+    """Record that a callsite proved one literal for one formal."""
+
+    try:
+        from .identity_concordance import current_identity_book
+
+        page = current_identity_book().page("formal_literal")
+        row = (str(function), str(parameter))
+        previous = page.latest(row)
+        if previous is None:
+            page.set(row, 0, ("proven", value, caller))
+            return
+        if previous[0] == "conflicting":
+            return
+        try:
+            agrees = bool(previous[1] == value)
+        except Exception:
+            agrees = False
+        if not agrees:
+            # Genuinely parametric: two callsites, two values.
+            page.set(
+                row, len(page.history(row)),
+                ("conflicting", (previous[1], value), caller),
+            )
+    except Exception:
+        pass
+
+
+def _publish_formal_shape(
+    function: str, parameter: str, descriptor: Any, caller: str,
+) -> bool:
+    """Record that a callsite proved one shape for one formal."""
+
+    try:
+        from .identity_concordance import (
+            authored_function_name,
+            current_identity_book,
+        )
+
+        extents = tuple(int(e) for e in (descriptor.get("shape") or ()))
+        dtype = str(descriptor.get("dtype") or "float64")
+        page = current_identity_book().page("formal_shape")
+        row = (authored_function_name(function), str(parameter))
+        previous = page.latest(row)
+        if previous is None:
+            page.set(row, 0, ("proven", extents, dtype, caller))
+            return True
+        elif previous[0] == "proven" and tuple(previous[1]) != extents:
+            page.set(
+                row, len(page.history(row)),
+                ("conflicting", extents, dtype, caller),
+            )
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _proven_formal_shape(graph: Any, name: Any) -> Any:
+    """The shape every callsite agrees this formal carries, if any."""
+
+    if not name:
+        return None
+    try:
+        from .identity_concordance import (
+            authored_function_name,
+            current_identity_book,
+        )
+
+        page = current_identity_book().page("formal_shape")
+        row = (
+            authored_function_name(graph.G.graph.get("function_name")),
+            str(name),
+        )
+        proven = page.latest(row)
+    except Exception:
+        return None
+    if proven is None or proven[0] != "proven":
+        return None
+    return {
+        "shape": tuple(proven[1]),
+        "dtype": str(proven[2]),
+        "rank": len(tuple(proven[1])),
+    }
+
+
+def _proven_formal_literal(graph: Any, name: Any) -> Any:
+    """The literal every callsite agrees this formal carries, if any."""
+
+    if not name:
+        return _FORMAL_LITERAL_CONFLICT
+    try:
+        from .identity_concordance import current_identity_book
+
+        page = current_identity_book().page("formal_literal")
+        row = (str(graph.G.graph.get("function_name")), str(name))
+        proven = page.latest(row)
+    except Exception:
+        return _FORMAL_LITERAL_CONFLICT
+    if proven is None or proven[0] != "proven":
+        return _FORMAL_LITERAL_CONFLICT
+    return proven[1]
 
 
 def _source_static_value(graph: Any, node_id: int, visiting=None) -> bool:
@@ -8128,7 +16039,38 @@ def _source_static_value(graph: Any, node_id: int, visiting=None) -> bool:
     visiting.add(node_id)
     data = graph.G.nodes[node_id]
     if data.get("type") in {"Constant", "Const", "const", "StaticReference"}:
+        # A structurally specialized aggregate is not source data.
+        #
+        # Deciding WHICH arm of ``x if flag else y`` survives is a decision
+        # about structure; it says nothing about the contents.  The fold
+        # rewrites the node's type to Constant and records that distinction
+        # as ``structural_specialization``, and the aggregate ledger it
+        # carries still names runtime values.
+        #
+        # Read as static, such a node takes the literal-specialization path
+        # and never the aggregate-member path, so its members are never
+        # given per-index leaves and never earn a ``parameter_member_
+        # formals`` receipt -- they reach emission as formals no caller can
+        # name.  ``saved = state.copy_shallow() if rollback else None`` in
+        # dt_controller is the case: ``rollback=True`` arrives as a literal,
+        # the ternary folds, and 52 live tensor copies start reading as a
+        # compile-time constant.
+        attributes = data.get("attributes") or {}
+        if attributes.get("structural_specialization") and tuple(
+            attributes.get("aggregate_leaf_value_ids") or ()
+        ):
+            return False
         return True
+    if data.get("type") == "Input":
+        name = (data.get("attributes") or {}).get("binding_name")
+        if name in (graph.G.graph.get("planner_specializations") or {}):
+            return True
+        # Not told HERE is not the same as unknown.  Copies of one function
+        # share its formals; if every callsite that proved this one agrees,
+        # the value is a literal in all of them.
+        return _proven_formal_literal(
+            graph, name
+        ) is not _FORMAL_LITERAL_CONFLICT
     expression = data.get("expr_obj")
     if isinstance(expression, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
         return all(
@@ -8151,6 +16093,24 @@ def _source_static_literal(
     data = graph.G.nodes[node_id]
     if data.get("type") in {"Constant", "Const", "const"}:
         return _constant_value(data)
+    if data.get("type") == "StaticReference":
+        attributes = data.get("attributes") or {}
+        reference = attributes.get(
+            "first_class_function_ref",
+            attributes.get("function_ref"),
+        )
+        if reference is not None:
+            return FunctionReference(int(reference))
+        raise ValueError("static reference is not a graph-backed function")
+    if data.get("type") == "Input":
+        name = (data.get("attributes") or {}).get("binding_name")
+        specializations = graph.G.graph.get("planner_specializations") or {}
+        if name in specializations:
+            return specializations[name]
+        proven = _proven_formal_literal(graph, name)
+        if proven is not _FORMAL_LITERAL_CONFLICT:
+            return proven
+        raise ValueError("input has no source-static planner binding")
     expression = data.get("expr_obj")
     parents = tuple(data.get("parents") or ())
     nested = visiting | {node_id}
@@ -8169,13 +16129,26 @@ def _source_static_literal(
         values = tuple(expression.values)
         if len(keys) != len(values):
             raise ValueError("invalid static dictionary")
-        resolved = [
-            _source_static_literal(graph, parent, nested)
-            for parent, _role in parents
-        ]
-        if len(resolved) != len(keys) * 2:
+        if any(key is None for key in keys):
+            # ``{**other}`` occupies a key slot with no key expression, so the
+            # mapping's contents are not decidable from this literal alone.
+            raise ValueError("dictionary unpacking is not source-static")
+        # Parents arrive grouped by the AST field they came from -- every
+        # ``keys`` parent, then every ``values`` parent -- not interleaved per
+        # entry, so pair them by role rather than by position.
+        key_parents = tuple(
+            parent for parent, role in parents if str(role) == "keys"
+        )
+        value_parents = tuple(
+            parent for parent, role in parents if str(role) == "values"
+        )
+        if len(key_parents) != len(keys) or len(value_parents) != len(values):
             raise ValueError("dictionary parents are not literal leaves")
-        return dict(zip(resolved[::2], resolved[1::2]))
+        return {
+            _source_static_literal(graph, key_parent, nested):
+                _source_static_literal(graph, value_parent, nested)
+            for key_parent, value_parent in zip(key_parents, value_parents)
+        }
     raise ValueError("value is not source-static")
 
 
@@ -8190,6 +16163,7 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
         entry.graph for entry in function_table if entry.graph is not None
     )
     candidates: dict[tuple[int, str], list[Any]] = {}
+    dynamic_argument = object()
     for caller in graphs:
         for _node_id, data in caller.G.nodes(data=True):
             attributes = data.get("attributes") or {}
@@ -8203,7 +16177,10 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
             if callee is None:
                 continue
             _receiver, positional, _all = _method_parameter_layout(callee.G)
-            for parent, role_value in data.get("parents") or ():
+            bound_parameters: set[str] = set()
+            for parent, role_value in _expanded_callsite_argument_edges(
+                caller, int(_node_id),
+            ):
                 role = str(role_value)
                 position = _positional_argument_index(role)
                 parameter = (
@@ -8216,19 +16193,36 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                     if role.startswith("kw:")
                     else None
                 )
-                if parameter is None or not _source_static_value(
-                    caller, int(parent)
-                ):
+                if parameter is None:
                     continue
-                try:
-                    value = _source_static_literal(caller, int(parent))
-                except ValueError:
-                    continue
+                parameter = str(parameter)
+                bound_parameters.add(parameter)
+                if _source_static_value(caller, int(parent)):
+                    try:
+                        value = _source_static_literal(caller, int(parent))
+                    except ValueError:
+                        value = dynamic_argument
+                else:
+                    value = dynamic_argument
                 candidates.setdefault(
-                    (int(reference), str(parameter)), []
+                    (int(reference), parameter), []
                 ).append(value)
+            # Omitted arguments are just as exact as authored literal
+            # arguments: Python binds them to the signature default before
+            # the body starts. Include them in the same consistency proof so
+            # optional-selection idioms can be resolved without turning
+            # ``None`` into a runtime scalar. A dynamic argument at any other
+            # callsite vetoes shared specialization below.
+            for parameter, default in (
+                callee.G.graph.get("parameter_defaults") or {}
+            ).items():
+                parameter = str(parameter)
+                if parameter not in bound_parameters:
+                    candidates.setdefault(
+                        (int(reference), parameter), []
+                    ).append(copy.deepcopy(default))
     for (reference, parameter), values in candidates.items():
-        if not values:
+        if not values or any(value is dynamic_argument for value in values):
             continue
         first = values[0]
         try:
@@ -8244,10 +16238,1136 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
             )[parameter] = first
 
 
+def _source_fallthrough_predicate_facts(graph: Any, controls, predicate_fact):
+    """Facts reaching source expressions, excluding paths which already exit.
+
+    Predicates are graph value identities. Loop exits and exception handlers
+    do not export newly inferred facts; nested function bodies are separate
+    scopes. Unknown control remains conservative rather than guessing a path.
+    """
+    body = graph.G.graph.get("function_body")
+    if not body:
+        return None
+    expressions = {}
+    for node_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        if isinstance(expression, ast.AST):
+            expressions.setdefault(_ast_source_signature(expression), []).append(int(node_id))
+    predicates = {}
+    for record in controls.values():
+        if record.get("predicate_id") in graph.G:
+            predicates[_ast_source_signature(record["expression"])] = int(record["predicate_id"])
+    reached = {}
+
+    def observed(node, facts):
+        for node_id in expressions.get(_ast_source_signature(node), ()):
+            reached[node_id] = facts if node_id not in reached else reached[node_id] & facts
+
+    def branch_facts(node, facts, truth):
+        predicate = predicates.get(_ast_source_signature(node))
+        return facts if predicate is None else facts | {predicate_fact(predicate, truth)}
+
+    def expression(node, facts):
+        if node is None or isinstance(node, (ast.Lambda, ast.GeneratorExp)):
+            return
+        observed(node, facts)
+        if isinstance(node, ast.IfExp):
+            expression(node.test, facts)
+            expression(node.body, branch_facts(node, facts, True))
+            expression(node.orelse, branch_facts(node, facts, False))
+        else:
+            for child in ast.iter_child_nodes(node):
+                if not isinstance(child, ast.stmt):
+                    expression(child, facts)
+
+    def sequence(statements, facts):
+        for statement in statements:
+            if facts is None:
+                break
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            observed(statement, facts)
+            if isinstance(statement, ast.If):
+                expression(statement.test, facts)
+                left = sequence(statement.body, branch_facts(statement, facts, True))
+                right = sequence(statement.orelse, branch_facts(statement, facts, False))
+                facts = right if left is None else left if right is None else left & right
+            elif isinstance(statement, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+                for child in ast.iter_child_nodes(statement):
+                    expression(child, facts)
+                facts = None
+            elif isinstance(statement, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
+                for child in ast.iter_child_nodes(statement):
+                    if not isinstance(child, ast.stmt):
+                        expression(child, facts)
+                sequence(statement.body, facts)
+                sequence(getattr(statement, "orelse", ()), facts)
+            elif isinstance(statement, (ast.Try, ast.TryStar)):
+                sequence(statement.body, facts)
+                sequence(statement.orelse, facts)
+                sequence(statement.finalbody, facts)
+                for handler in statement.handlers:
+                    sequence(handler.body, facts)
+            else:
+                expression(statement, facts)
+        return facts
+
+    sequence(body, frozenset())
+    return reached
+
+
+def _publish_conditional_tuple_members(graph: Any) -> bool:
+    """Publish position-matched tuple members as control-owned merge values."""
+    changed = False
+    memberships = _branch_compartments(graph)
+    controls = _source_control_records(graph.G)
+
+    def predicate_fact(value_id, truth):
+        data = graph.G.nodes.get(int(value_id), {})
+        if isinstance(data.get("expr_obj"), ast.UnaryOp) and isinstance(data["expr_obj"].op, ast.Not):
+            operand = next((int(parent) for parent, role in data.get("parents", ())
+                            if str(role) == "operand"), None)
+            if operand is not None:
+                return predicate_fact(operand, not truth)
+        return int(value_id), bool(truth)
+
+    fallthrough_facts = _source_fallthrough_predicate_facts(graph, controls, predicate_fact)
+    for node_id, data in tuple(graph.G.nodes(data=True)):
+        if not isinstance(data.get("expr_obj"), ast.IfExp):
+            continue
+        attributes = dict(data.get("attributes") or {})
+        if attributes.get("conditional_member_bindings"):
+            continue
+        parents = {str(role): int(parent) for parent, role in data.get("parents", ())}
+        if not all(parents.get(role) in graph.G for role in ("test", "body", "orelse")):
+            continue
+        arms = [graph.G.nodes[parents[role]].get("attributes") or {}
+                for role in ("body", "orelse")]
+        leaves = [_authored_aggregate_leaves(graph, parents[role]) for role in ("body", "orelse")]
+        optional = None
+        absent_arms = [
+            graph.G.nodes[parents[role]].get("type") in {"Constant", "Const", "const"}
+            and _constant_value(graph.G.nodes[parents[role]]) is None
+            for role in ("body", "orelse")
+        ]
+        if sum(absent_arms) == 1:
+            present_arm = 1 if absent_arms[0] else 0
+            if arms[present_arm].get("aggregate_kind") != "tuple" or not leaves[present_arm]:
+                continue
+            descriptors = [_tensor_descriptor(graph, leaf) for leaf in leaves[present_arm]]
+            if any(item is None for item in descriptors):
+                continue
+            required = predicate_fact(parents["test"], present_arm == 0)
+            consumers = tuple(graph.G.successors(node_id))
+            guarded = []
+            for consumer in consumers:
+                facts = {
+                    predicate_fact(controls[control]["predicate_id"], arm == "body")
+                    for control, arm in memberships.get(int(consumer), ())
+                    if control in controls and controls[control].get("predicate_id") in graph.G
+                    and arm in {"body", "orelse"}
+                }
+                if fallthrough_facts is not None:
+                    facts = fallthrough_facts.get(int(consumer), frozenset())
+                if required not in facts:
+                    raise ValueError(
+                        f"optional tuple {node_id} consumer {consumer} has no "
+                        "proven presence guard in function "
+                        f"{graph.G.graph.get('function_name')!r}"
+                    )
+                guarded.append(int(consumer))
+            if not consumers or any(node_id in values for values in
+                                    (graph.G.graph.get("return_slot_values") or {}).values()):
+                raise ValueError(f"optional tuple {node_id} escapes without a presence ABI")
+            inactive = []
+            for descriptor in descriptors:
+                value_id = next_process_value_id(graph)
+                graph.G.add_node(value_id, type="Constant", op="const", value_id=value_id,
+                                 constant=0, parents=[], children=[],
+                                 tensor={"shape": (), "dtype": "ptr" if descriptor["shape"] else descriptor["dtype"]},
+                                 attributes={"value": 0, "conditional_result_of": int(node_id),
+                                             "optional_inactive_payload": True})
+                inactive.append(value_id)
+            leaves[1 - present_arm] = tuple(inactive)
+            optional = {"predicate_id": required[0], "present_when": required[1],
+                        "guarded_consumers": tuple(guarded), "inactive_value_ids": tuple(inactive)}
+            descriptors = [descriptors, descriptors]
+        else:
+            if any(arm.get("aggregate_kind") != "tuple" for arm in arms):
+                continue
+            descriptors = [[_tensor_descriptor(graph, leaf) for leaf in arm] for arm in leaves]
+        if not leaves[0] or len(leaves[0]) != len(leaves[1]):
+            continue
+        if descriptors[0] != descriptors[1] or any(item is None for item in descriptors[0]):
+            continue
+        bindings = []
+        for left, right, descriptor in zip(*leaves, descriptors[0]):
+            member = next_process_value_id(graph)
+            edges = [(left, "body"), (right, "orelse"), (parents["test"], "test")]
+            graph.G.add_node(member, type="Phi", op="Phi", value_id=member,
+                             parents=edges, children=[], tensor=copy.deepcopy(descriptor),
+                             attributes={"conditional_result_of": int(node_id)})
+            for parent, role in edges:
+                graph.G.add_edge(parent, member, role=role)
+                graph.G.nodes[parent].setdefault("children", []).append((member, role))
+            graph.G.add_edge(member, int(node_id), role="elts")
+            graph.G.nodes[member]["children"].append((int(node_id), "elts"))
+            data.setdefault("parents", []).append((member, "elts"))
+            bindings.append((int(left), int(right), member))
+        attributes.update({
+            "producer_kind": "aggregate", "aggregate_kind": "tuple",
+            "aggregate_leaf_value_ids": tuple(item[2] for item in bindings),
+            "tensor_output_descriptors": tuple(copy.deepcopy(descriptors[0])),
+            "conditional_member_bindings": tuple(bindings),
+        })
+        if optional is not None:
+            attributes["optional_presence"] = optional
+        data["attributes"] = attributes
+        data.pop("tensor", None)
+        changed = True
+    return changed
+
+
+def _callsite_descriptor_receipt(descriptor: Any) -> Any:
+    """Stable concordance spelling for one structured return descriptor."""
+
+    if isinstance(descriptor, Mapping):
+        return (
+            tuple(descriptor.get("shape") or ()),
+            str(descriptor.get("dtype") or "unknown"),
+        )
+    if isinstance(descriptor, tuple):
+        return tuple(_callsite_descriptor_receipt(item) for item in descriptor)
+    return None
+
+
+def _invalidate_tensor_descriptor_dependents(
+    graph: Any, source_ids: Any, reason: str,
+) -> None:
+    """Invalidate every cached descriptor derived from changed exact values."""
+
+    sources = {int(source_id) for source_id in source_ids}
+    affected = set(sources)
+    changed = True
+    while changed:
+        changed = False
+        for node_id, data in graph.G.nodes(data=True):
+            node_id = int(node_id)
+            if node_id in affected:
+                continue
+            parents = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) not in {"callee", "func", "definition"}
+            )
+            causes = tuple(parent for parent in parents if parent in affected)
+            if not causes:
+                continue
+            affected.add(node_id)
+            data.pop("tensor", None)
+            try:
+                from .identity_concordance import invalidate_proven_shape
+
+                invalidate_proven_shape(
+                    graph.G.graph.get("function_name"),
+                    int(data.get("value_id", node_id)),
+                    int(causes[0]),
+                    str(reason),
+                )
+            except Exception:
+                pass
+            changed = True
+
+
+def _publish_callsite_return_members(
+    caller: Any, node_id: int, descriptors: Any, kind: str,
+) -> bool:
+    """Materialize or enrich the exact projections of one aggregate call.
+
+    Projection ids are stable identities.  Their descriptors are fixed-point
+    facts and may become more precise after those ids are first materialized.
+    Existing ids therefore receive the newer fact in place; node existence is
+    not evidence that their metadata has settled.
+    """
+
+    node_id = int(node_id)
+    data = caller.G.nodes[node_id]
+    attributes = dict(data.get("attributes") or {})
+    descriptors = tuple(copy.deepcopy(tuple(descriptors)))
+    incumbent_leaves = tuple(map(
+        int, attributes.get("aggregate_leaf_value_ids") or (),
+    ))
+
+    from .identity_concordance import current_identity_book
+
+    page = current_identity_book().page("callsite_projection_specialization")
+    caller_name = str(caller.G.graph.get("function_name") or "")
+
+    def record(index: int, leaf_id: int, action: str, descriptor: Any) -> None:
+        row = (caller_name, node_id, int(index), int(leaf_id))
+        fact = (str(action), _callsite_descriptor_receipt(descriptor))
+        if page.latest(row) != fact:
+            page.set(row, len(page.history(row)), fact)
+
+    if (
+        len(incumbent_leaves) == len(descriptors)
+        and incumbent_leaves
+        and all(leaf_id in caller.G for leaf_id in incumbent_leaves)
+    ):
+        changed = False
+        for index, (leaf_id, descriptor) in enumerate(zip(
+            incumbent_leaves, descriptors,
+        )):
+            if not isinstance(descriptor, Mapping):
+                continue
+            replacement = copy.deepcopy(dict(descriptor))
+            leaf = caller.G.nodes[leaf_id]
+            if dict(leaf.get("tensor") or {}) == replacement:
+                continue
+            leaf["tensor"] = replacement
+            record(index, leaf_id, "enriched", descriptor)
+            _invalidate_tensor_descriptor_dependents(
+                caller, (leaf_id,), "aggregate-return-projection-enriched",
+            )
+            changed = True
+        if tuple(attributes.get("tensor_output_descriptors") or ()) != descriptors:
+            attributes["tensor_output_descriptors"] = descriptors
+            data["attributes"] = attributes
+            changed = True
+        return changed
+
+    stale_leaves = tuple(
+        leaf_id for leaf_id in incumbent_leaves if leaf_id not in caller.G
+    )
+
+    def resident_direct_projection(index: int) -> int | None:
+        """Return the one authored ``call[index]`` value, when exact.
+
+        Lexical tuple unpacking creates these projections before callsite
+        return descriptors settle.  Reusing that identity is essential:
+        loop/effect metadata already names it, so minting a parallel leaf
+        makes the call publish one value while the effect consumes another.
+        """
+
+        candidates = []
+        for successor in caller.G.successors(node_id):
+            projection = caller.G.nodes[int(successor)]
+            if str(
+                projection.get("op") or projection.get("type") or ""
+            ).casefold() != "indexed":
+                continue
+            if not any(
+                int(parent) == node_id
+                and str(role) in {"base", "value", "operand", "object"}
+                for parent, role in projection.get("parents") or ()
+            ):
+                continue
+            indices = tuple(
+                int(parent)
+                for parent, role in projection.get("parents") or ()
+                if str(role) == "index" and int(parent) in caller.G
+            )
+            if len(indices) != 1:
+                continue
+            try:
+                projected_index = _constant_value(
+                    caller.G.nodes[indices[0]]
+                )
+            except KeyError:
+                continue
+            if (
+                isinstance(projected_index, int)
+                and not isinstance(projected_index, bool)
+                and int(projected_index) == int(index)
+            ):
+                candidates.append(int(successor))
+        unique = tuple(dict.fromkeys(candidates))
+        return unique[0] if len(unique) == 1 else None
+
+    # Materialize exact member projections of the authored return. These are
+    # call results, never extra caller inputs or copies of the payload.
+    leaves = []
+    for index, descriptor in enumerate(descriptors):
+        resident_projection = resident_direct_projection(index)
+        if resident_projection is not None:
+            member = caller.G.nodes[int(resident_projection)]
+            member.setdefault("attributes", {})[
+                "authored_call_result_projection"
+            ] = True
+            member["tensor"] = (
+                {} if descriptor is None or isinstance(descriptor, tuple)
+                else copy.deepcopy(dict(descriptor))
+            )
+            leaves.append(int(resident_projection))
+            record(index, int(resident_projection), "reused", descriptor)
+            continue
+        index_id = next_process_value_id(caller)
+        caller.G.add_node(index_id, type="Constant", op="const",
+                          value_id=index_id, constant=index,
+                          attributes={"value": index}, parents=[], children=[])
+        member_id = next_process_value_id(caller)
+        caller.G.add_node(
+            member_id, type="Indexed", op="Indexed", value_id=member_id,
+            parents=[(node_id, "base"), (index_id, "index")], children=[],
+            attributes={"authored_call_result_projection": True},
+            # A member that is itself an aggregate has no tensor fact of its
+            # own; its structure stays in the ordered output descriptors,
+            # where the nested projection path reads it.
+            tensor=(
+                {} if descriptor is None or isinstance(descriptor, tuple)
+                else copy.deepcopy(dict(descriptor))
+            ),
+        )
+        caller.G.add_edge(node_id, member_id, role="base")
+        caller.G.add_edge(index_id, member_id, role="index")
+        data.setdefault("children", []).append((member_id, "base"))
+        caller.G.nodes[index_id]["children"].append((member_id, "index"))
+        leaves.append(member_id)
+        record(index, member_id, "materialized", descriptor)
+    attributes.update({
+        "authored_return_container": kind,
+        "producer_kind": "aggregate", "aggregate_kind": kind,
+        "aggregate_leaf_value_ids": tuple(leaves),
+        "tensor_output_descriptors": descriptors,
+    })
+    if stale_leaves:
+        # The old leaf ids are not merely descriptor cache entries.  Source
+        # control can name them from cached loop/effect receipts even after a
+        # specialized call republishes the same return slots under fresh
+        # resident ids.  Concord the exact slot transition, then move every
+        # cached occurrence through that recorded identity before exposing
+        # the replacement ledger.  Otherwise ``append(result_record)`` can
+        # retain the dead pre-specialization projection while the call itself
+        # publishes the new one.
+        projection_identity = current_identity_book().page(
+            "callsite_projection_identity_concordance"
+        )
+        projection_scope = (
+            caller_name,
+            int(node_id),
+            id(caller.G),
+        )
+        for index, (stale_id, replacement_id) in enumerate(zip(
+            incumbent_leaves, leaves,
+        )):
+            if int(stale_id) == int(replacement_id):
+                continue
+            row = (projection_scope, int(index), int(stale_id))
+            fact = int(replacement_id)
+            incumbent = projection_identity.latest(row)
+            if incumbent is not None and int(incumbent) != fact:
+                raise ValueError(
+                    "callsite projection identity concordance disagreement "
+                    f"for {row!r}: recorded={incumbent!r}, "
+                    f"replacement={fact!r}"
+                )
+            if incumbent is None:
+                projection_identity.set(row, 0, fact)
+            _retarget_all_cached_value_ids(
+                caller, int(stale_id),
+                int(projection_identity.latest(row)),
+            )
+            if os.environ.get("TURING_DEBUG_SEQUENCE_EFFECT_IDENTITY"):
+                print(
+                    "DEBUG-CALLSITE-PROJECTION-IDENTITY "
+                    f"function={caller_name!r} callsite={int(node_id)} "
+                    f"slot={int(index)} stale={int(stale_id)} "
+                    f"resident={int(replacement_id)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        attributes["aggregate_leaf_republication"] = {
+            "replaced_missing_value_ids": stale_leaves,
+            "replacement_value_ids": tuple(map(int, leaves)),
+            "rule": "exact-stored-output-descriptors",
+            "tie_policy": "incumbent",
+        }
+    data["attributes"] = attributes
+    data.pop("tensor", None)
+    return True
+
+
+def _propagate_callsite_tensor_specializations(
+    graph: Any,
+    *,
+    runtime_references: frozenset[int] | None = None,
+    _progress: Any = None,
+) -> None:
+    """Carry consistent tensor descriptors through the function table.
+
+    This is the descriptor analogue of literal planner specialization.  It
+    settles to a fixed point so a root call can shape ``bw_matmul`` and that
+    shaped wrapper can in turn shape ``matmul_vjp`` before either function's
+    logical control is partitioned. Conflicting callsite shapes remain
+    parametric and are left for per-callsite specialization.
+    """
+
+    function_table = getattr(graph, "function_table", None)
+    if function_table is None:
+        return
+    # A source-catalogue graph owns the table but is not itself an executable
+    # caller.  Its per-definition graphs contain the actual parameter ABI,
+    # call edges, and numerical dependencies.  Including the catalogue here
+    # both duplicates all callsites and lets tuple/return publication rewrite
+    # a map container which the structural-fold stage explicitly excludes.
+    graphs = (
+        [graph] if graph.G.graph.get("function_name") else []
+    )
+    graphs.extend(
+        entry.graph
+        for entry in function_table
+        if entry.graph is not None
+        and (
+            runtime_references is None
+            or int(entry.reference.address) in runtime_references
+        )
+    )
+
+    def call_result_descriptor(
+        caller: Any,
+        node_id: int,
+        callee: Any,
+    ) -> tuple[dict[str, Any] | None, ...]:
+        """Infer the ordered tensor returns of an exact callsite."""
+
+        _receiver, positional, _all = _method_parameter_layout(callee.G)
+        descriptors: dict[str, dict[str, Any]] = {}
+        aggregate_descriptors: dict[str, tuple[Any, ...]] = {}
+        specializations: dict[str, Any] = {}
+        bound_parameters: set[str] = set()
+        for parent, role_value in _expanded_callsite_argument_edges(
+            caller, int(node_id),
+        ):
+            role = str(role_value)
+            position = _positional_argument_index(role)
+            parameter = (
+                positional[position]
+                if position is not None and position < len(positional)
+                else role[3:] if role.startswith("kw:") else None
+            )
+            if parameter is None:
+                continue
+            parameter = str(parameter)
+            bound_parameters.add(parameter)
+            descriptor = _tensor_descriptor(caller, int(parent))
+            if descriptor is not None:
+                descriptors[parameter] = descriptor
+            static_argument = _source_static_value(caller, int(parent))
+            leaves = _authored_aggregate_leaves(caller, int(parent))
+            if leaves and not static_argument and all(
+                int(leaf) in caller.G for leaf in leaves
+            ):
+                # Same member-identity rule as callsite specialization: the
+                # callee's return descriptors may depend on aggregate members
+                # (``previous_hub, ... = history``), so the propagation copy
+                # must see those members bound, not an opaque formal.
+                aggregate_descriptors[parameter] = tuple(
+                    _authored_aggregate_descriptor_tree(caller, int(leaf))
+                    for leaf in leaves
+                )
+            if static_argument:
+                try:
+                    specializations[parameter] = _source_static_literal(
+                        caller, int(parent)
+                    )
+                except ValueError:
+                    pass
+        for parameter, default in (
+            callee.G.graph.get("parameter_defaults") or {}
+        ).items():
+            if str(parameter) not in bound_parameters:
+                specializations[str(parameter)] = copy.deepcopy(default)
+        if not descriptors and not aggregate_descriptors and not callee.G.graph.get("parameter_record_abi"):
+            return ()
+        specialized = extract_clean_process_subgraph(callee, callee.G)
+        specialized.G.graph["planner_specializations"] = copy.deepcopy(
+            specializations
+        )
+        specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
+            descriptors
+        )
+        _apply_callsite_tensor_descriptors(specialized, descriptors)
+        _apply_callsite_aggregate_descriptors(
+            specialized, aggregate_descriptors,
+        )
+        if not _expand_specialized_unbroadcast_identity(specialized):
+            _fold_callsite_structural_values(specialized)
+        output_descriptors: list[dict[str, Any] | None] = []
+        identities = specialized.G.graph.get("identity_table") or {}
+        for output_name in specialized.G.graph.get("function_outputs") or ():
+            output_ids = tuple(identities.get(str(output_name), ()))
+            value_id = next((
+                int(candidate)
+                for candidate in reversed(output_ids)
+                if int(candidate) in specialized.G
+            ), None)
+            if value_id is None:
+                output_descriptors.append(None)
+                continue
+            nested = (
+                specialized.G.nodes[value_id].get("attributes") or {}
+            ).get("tensor_output_descriptors")
+            if nested:
+                output_descriptors.extend(
+                    copy.deepcopy(tuple(nested))
+                )
+            else:
+                descriptor = _structured_output_descriptor(
+                    specialized, value_id,
+                )
+                if not descriptor_states_a_shape(descriptor):
+                    # The identity table lists every value that IS this
+                    # binding; they are one storage by construction.  The last
+                    # resident one is what the return names, but a store or a
+                    # loop-carried port among them can answer the descriptor
+                    # query with nothing at all.  Read the shape from whichever
+                    # identity states it rather than publish a factless return
+                    # that every caller installs as a rank-0 scalar.
+                    for candidate in reversed(output_ids):
+                        if int(candidate) == value_id:
+                            continue
+                        alternative = _structured_output_descriptor(
+                            specialized, int(candidate),
+                        )
+                        if isinstance(alternative, Mapping) and (
+                            descriptor_states_a_shape(alternative)
+                        ):
+                            descriptor = alternative
+                            break
+                output_descriptors.append(descriptor)
+
+        def any_descriptor(item: Any) -> bool:
+            if isinstance(item, tuple):
+                return any(any_descriptor(member) for member in item)
+            return item is not None
+
+        # Record this round's decision in the concordance.  The
+        # specialization fixed point below has no bound of its own: it repeats
+        # until nothing changes.  Writing each round's published return shape
+        # to its own page means ``IdentityPage.oscillating_rows`` can name a
+        # row that leaves a shape and comes back to it -- a round trip, which
+        # a settling fixed point never makes -- instead of the whole compile
+        # merely looking slow from outside.
+        from .identity_concordance import current_identity_book
+
+        _page = current_identity_book().page("callsite_return_specialization")
+        _row = (
+            str(caller.G.graph.get("function_name")),
+            str(callee.G.graph.get("function_name")),
+            int(node_id),
+        )
+        _page.set(_row, len(_page.history(_row)), tuple(
+            None if item is None or not isinstance(item, Mapping)
+            else (tuple(item.get("shape") or ()), str(item.get("dtype") or ""))
+            for item in output_descriptors
+        ))
+        return (
+            tuple(copy.deepcopy(output_descriptors))
+            if any(any_descriptor(item) for item in output_descriptors)
+            else ()
+        )
+
+    round_index = 0
+    seen_round_states: dict[str, int] = {}
+
+    def specialization_state() -> tuple[str, int]:
+        facts = []
+        tensor_fact_count = 0
+        for item in graphs:
+            function_name = str(item.G.graph.get("function_name") or "")
+            planner = item.G.graph.get("planner_tensor_descriptors") or {}
+            facts.append((function_name, "planner", repr(planner)))
+            for value_id, node in item.G.nodes(data=True):
+                tensor = node.get("tensor")
+                if tensor:
+                    tensor_fact_count += 1
+                    facts.append((
+                        function_name,
+                        int(value_id),
+                        repr(_callsite_descriptor_receipt(tensor)),
+                    ))
+        digest = hashlib.sha256(repr(tuple(facts)).encode("utf-8")).hexdigest()
+        return digest[:16], tensor_fact_count
+
+    changed = True
+    while changed:
+        round_index += 1
+        round_started = time.monotonic()
+        callsites = 0
+        mutation_counts = {
+            "conditional_members": 0,
+            "return_members": 0,
+            "single_returns": 0,
+            "structured_returns": 0,
+            "formal_shapes": 0,
+            "callee_descriptors": 0,
+        }
+        if _progress is not None:
+            _progress({
+                "specialization_state": "round-begin",
+                "round": round_index,
+                "graphs": len(graphs),
+                "graph_nodes": sum(item.G.number_of_nodes() for item in graphs),
+            })
+        changed = False
+        # The outer catalogue graph owns the function table, but its entry
+        # graphs own the parameter ABI and numerical dependencies.  Settle
+        # each caller locally before reading its call arguments; otherwise a
+        # shaped ``material_state[:, :, 3]`` still looks scalar here and only
+        # a later backend happens to rediscover its extent after the call ABI
+        # has already been frozen.
+        for caller_index, caller in enumerate(graphs):
+            if caller.G.graph.get("function_name"):
+                fold_started = time.monotonic()
+                if _progress is not None:
+                    _progress({
+                        "specialization_state": "prefold-begin",
+                        "round": round_index,
+                        "caller_index": int(caller_index),
+                        "caller": str(caller.G.graph.get("function_name")),
+                        "caller_nodes": caller.G.number_of_nodes(),
+                    })
+                _fold_callsite_structural_values(
+                    caller,
+                    _progress=(
+                        None if _progress is None else
+                        lambda facts, caller=caller: _progress({
+                            "specialization_state": "prefold-fixed-point",
+                            "round": round_index,
+                            "caller": str(
+                                caller.G.graph.get("function_name") or ""
+                            ),
+                            **facts,
+                        })
+                    ),
+                )
+                if _progress is not None:
+                    _progress({
+                        "specialization_state": "prefold-end",
+                        "round": round_index,
+                        "caller_index": int(caller_index),
+                        "caller": str(caller.G.graph.get("function_name")),
+                        "caller_nodes": caller.G.number_of_nodes(),
+                        "duration_seconds": round(
+                            time.monotonic() - fold_started, 6
+                        ),
+                    })
+        candidates: dict[tuple[int, str], list[dict[str, Any]]] = {}
+        for caller in graphs:
+            conditional_changed = _publish_conditional_tuple_members(caller)
+            changed |= conditional_changed
+            mutation_counts["conditional_members"] += int(conditional_changed)
+            for _node_id, data in tuple(caller.G.nodes(data=True)):
+                attributes = data.get("attributes") or {}
+                reference = attributes.get("callee_ref")
+                if reference is None:
+                    reference = attributes.get("method_ref")
+                if reference is None:
+                    continue
+                try:
+                    callee = function_table.entry(int(reference)).graph
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if callee is None:
+                    continue
+                callsites += 1
+                if _progress is not None and (
+                    callsites == 1 or callsites % 16 == 0
+                ):
+                    _progress({
+                        "specialization_state": "callsite-progress",
+                        "round": round_index,
+                        "callsites": callsites,
+                        "caller": str(
+                            caller.G.graph.get("function_name") or ""
+                        ),
+                        "callee": str(
+                            callee.G.graph.get("function_name") or reference
+                        ),
+                        "round_elapsed_seconds": round(
+                            time.monotonic() - round_started, 6
+                        ),
+                    })
+                # A call node can carry an early catalogue descriptor that is
+                # no longer exact after its operands are specialized.  Calls
+                # are equality edges, so recompute their return contract on
+                # every fixed-point round and replace only when the exact
+                # callee result differs.  The decision itself is recorded by
+                # ``call_result_descriptor`` in the concordance.
+                result_descriptors = call_result_descriptor(
+                    caller, int(_node_id), callee
+                )
+                if result_descriptors:
+                    return_kinds = set((callee.G.graph.get("return_container_kinds") or {}).values())
+                    if (
+                        len(return_kinds) == 1
+                        and return_kinds <= {"tuple", "list"}
+                        and result_descriptors
+                        # An authored return may mix tensors with nested
+                        # aggregates -- the vehicle tick returns fifteen
+                        # tensors and one four-member history tuple.  Refusing
+                        # the whole publication because one member is nested
+                        # left every sibling projection unresolved, so each
+                        # ``result[k]`` became a formal no caller could fill.
+                        and all(item is None
+                                or isinstance(item, (Mapping, tuple))
+                                for item in result_descriptors)
+                    ):
+                        return_members_changed = _publish_callsite_return_members(
+                            caller, int(_node_id), result_descriptors,
+                            next(iter(return_kinds)),
+                        )
+                        changed |= return_members_changed
+                        mutation_counts["return_members"] += int(
+                            return_members_changed
+                        )
+                    elif len(result_descriptors) == 1 and isinstance(
+                        result_descriptors[0], Mapping
+                    ):
+                        # A single returned aggregate still has a nested
+                        # descriptor tree. Only a tensor leaf belongs in
+                        # the node's tensor slot; preserve aggregate returns
+                        # in the structured output ledger below.
+                        replacement = copy.deepcopy(dict(
+                            result_descriptors[0]
+                        ))
+                        if dict(data.get("tensor") or {}) != replacement:
+                            previous = copy.deepcopy(data.get("tensor"))
+                            data["tensor"] = replacement
+                            _invalidate_tensor_descriptor_dependents(
+                                caller, (int(_node_id),),
+                                "call-result-specialization-changed",
+                            )
+                            from .identity_concordance import current_identity_book
+
+                            mutation_page = current_identity_book().page(
+                                "callsite_tensor_result_specialization"
+                            )
+                            mutation_row = (
+                                str(caller.G.graph.get("function_name")),
+                                int(_node_id),
+                            )
+                            mutation_page.set(
+                                mutation_row,
+                                len(mutation_page.history(mutation_row)),
+                                (
+                                    _callsite_descriptor_receipt(previous),
+                                    _callsite_descriptor_receipt(replacement),
+                                ),
+                            )
+                            changed = True
+                            mutation_counts["single_returns"] += 1
+                    elif result_descriptors:
+                        attributes = dict(data.get("attributes") or {})
+                        if attributes.get(
+                            "tensor_output_descriptors"
+                        ) != result_descriptors:
+                            attributes["tensor_output_descriptors"] = (
+                                result_descriptors
+                            )
+                            data["attributes"] = attributes
+                            changed = True
+                            mutation_counts["structured_returns"] += 1
+                _receiver, positional, _all = _method_parameter_layout(callee.G)
+                for parent, role_value in _expanded_callsite_argument_edges(
+                    caller, int(_node_id),
+                ):
+                    role = str(role_value)
+                    position = _positional_argument_index(role)
+                    parameter = (
+                        positional[position]
+                        if position is not None and position < len(positional)
+                        else role[3:] if role.startswith("kw:") else None
+                    )
+                    descriptor = _tensor_descriptor(caller, int(parent))
+                    if parameter is not None and descriptor is not None:
+                        # This fixed point is the first stage that knows the
+                        # exact caller value and the callee formal together.
+                        # Publish that agreement now, under the authored
+                        # identity, so recursive return specialization can
+                        # recover the formal shape from every clean or hashed
+                        # graph copy on its next round.  Keeping the fact only
+                        # in ``planner_tensor_descriptors`` made it local to
+                        # one catalogue graph; a fresh specialization then
+                        # reverted the same formal to an unknown scalar.
+                        if tuple(descriptor.get("shape") or ()):
+                            formal_shape_changed = _publish_formal_shape(
+                                str(callee.G.graph.get("function_name")),
+                                str(parameter),
+                                descriptor,
+                                str(caller.G.graph.get("function_name")),
+                            )
+                            changed |= formal_shape_changed
+                            mutation_counts["formal_shapes"] += int(
+                                formal_shape_changed
+                            )
+                        candidates.setdefault(
+                            (int(reference), str(parameter)), []
+                        ).append(copy.deepcopy(dict(descriptor)))
+                # A nested function reads bindings its caller owns, and those
+                # captures are ordinary values of this exact caller.  The
+                # callee had no contract for them, so every shape expression
+                # over a capture -- ``wrench_k.shape[:2]`` inside
+                # ``_wrench_force`` -- stayed unresolved and escaped as an
+                # anonymous formal.  Offer the enclosing value's descriptor
+                # under the capture's own name; the agreement check below
+                # applies to it exactly as it does to a bound argument, so a
+                # shared catalogue graph is only specialized when every
+                # callsite names the same contract.
+                caller_identities = caller.G.graph.get("identity_table") or {}
+                for _capture_id, capture in callee.G.nodes(data=True):
+                    capture_attributes = capture.get("attributes") or {}
+                    if str(capture.get("type") or "") != "Input":
+                        continue
+                    if str(
+                        capture_attributes.get("binding_kind") or ""
+                    ) not in {"closure", "external"}:
+                        continue
+                    capture_name = str(
+                        capture_attributes.get("binding_name") or ""
+                    )
+                    if not capture_name:
+                        continue
+                    capture_values = tuple(dict.fromkeys(
+                        int(value_id)
+                        for value_id in caller_identities.get(capture_name, ())
+                        if int(value_id) in caller.G
+                    ))
+                    capture_descriptor = (
+                        None if len(capture_values) != 1
+                        else _tensor_descriptor(caller, capture_values[0])
+                    )
+                    if os.environ.get("TURING_DEBUG_CAPTURE_DESCRIPTOR"):
+                        print(
+                            "DEBUG-CAPTURE-DESCRIPTOR "
+                            f"caller={caller.G.graph.get('function_name')!r} "
+                            f"callee_ref={int(reference)} name={capture_name!r} "
+                            f"values={capture_values!r} "
+                            f"descriptor={capture_descriptor!r}",
+                            file=sys.stderr, flush=True,
+                        )
+                    if capture_descriptor is None:
+                        continue
+                    candidates.setdefault(
+                        (int(reference), capture_name), []
+                    ).append(copy.deepcopy(dict(capture_descriptor)))
+        by_reference: dict[int, dict[str, dict[str, Any]]] = {}
+        for (reference, parameter), descriptors in candidates.items():
+            if not descriptors or any(
+                descriptor != descriptors[0] for descriptor in descriptors[1:]
+            ):
+                continue
+            by_reference.setdefault(reference, {})[parameter] = descriptors[0]
+        for reference, descriptors in by_reference.items():
+            callee = function_table.entry(reference).graph
+            if callee is None:
+                continue
+            existing = callee.G.graph.setdefault(
+                "planner_tensor_descriptors", {}
+            )
+            additions = {
+                name: descriptor
+                for name, descriptor in descriptors.items()
+                if existing.get(name) != descriptor
+            }
+            if not additions:
+                continue
+            existing.update(copy.deepcopy(additions))
+            _apply_callsite_tensor_descriptors(callee, additions)
+            # The catalogue graph is shared by every callsite.  A tensor
+            # descriptor alone is not a complete structural specialization:
+            # helpers such as ``unbroadcast(G, target_shape)`` also require a
+            # callsite-local shape value before their source control can be
+            # selected.  Folding the shared graph here permanently discarded
+            # branches before that value was known.  The copied graph is
+            # folded below by ``_callsite_specialized_shell_type`` after both
+            # descriptor and literal arguments have been collected.
+            changed = True
+            mutation_counts["callee_descriptors"] += len(additions)
+
+        state_digest, tensor_fact_count = specialization_state()
+        repeated_round = seen_round_states.get(state_digest)
+        seen_round_states.setdefault(state_digest, round_index)
+        from .identity_concordance import current_identity_book
+
+        return_page = current_identity_book().page(
+            "callsite_return_specialization"
+        )
+        oscillating_rows = return_page.oscillating_rows()
+        if _progress is not None:
+            _progress({
+                "specialization_state": "round-end",
+                "round": round_index,
+                "duration_seconds": round(
+                    time.monotonic() - round_started, 6
+                ),
+                "changed": bool(changed),
+                "callsites": callsites,
+                "tensor_facts": tensor_fact_count,
+                "state_digest": state_digest,
+                "repeats_round": repeated_round,
+                "oscillating_rows": len(oscillating_rows),
+                **mutation_counts,
+            })
+
+
+def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
+    """Restore only aggregate leaves removed by structural branch folding.
+
+    Aggregate leaf IDs are metadata edges.  A selected producer can survive
+    while a projection associated with the rejected source arm is removed,
+    leaving the producer's exact output descriptor but a dangling leaf ID.
+    Keep every resident incumbent and recreate only missing positions from
+    those stored descriptors.  A second visit is therefore a no-op.
+    """
+
+    repaired = 0
+    for node_id, data in tuple(graph.G.nodes(data=True)):
+        attributes = dict(data.get("attributes") or {})
+        leaves = tuple(map(
+            int, attributes.get("aggregate_leaf_value_ids") or (),
+        ))
+        if not leaves or all(leaf_id in graph.G for leaf_id in leaves):
+            continue
+        descriptors = tuple(
+            attributes.get("tensor_output_descriptors") or (),
+        )
+        if len(descriptors) != len(leaves):
+            continue
+        replacements = []
+        replaced = []
+        for index, (leaf_id, descriptor) in enumerate(zip(
+            leaves, descriptors,
+        )):
+            if leaf_id in graph.G:
+                replacements.append(int(leaf_id))
+                continue
+            index_id = next_process_value_id(graph)
+            graph.G.add_node(
+                index_id, type="Constant", op="const", value_id=index_id,
+                constant=index, attributes={"value": index},
+                parents=[], children=[],
+            )
+            member_id = next_process_value_id(graph)
+            graph.G.add_node(
+                member_id,
+                type="Indexed", op="Indexed", value_id=member_id,
+                parents=[(int(node_id), "base"), (index_id, "index")],
+                children=[],
+                attributes={
+                    "authored_call_result_projection": True,
+                    "aggregate_leaf_republication": True,
+                },
+                tensor=(
+                    {} if descriptor is None
+                    else copy.deepcopy(dict(descriptor))
+                ),
+            )
+            graph.G.add_edge(int(node_id), member_id, role="base")
+            graph.G.add_edge(index_id, member_id, role="index")
+            data.setdefault("children", []).append((member_id, "base"))
+            graph.G.nodes[index_id]["children"].append((member_id, "index"))
+            replacements.append(member_id)
+            replaced.append((int(leaf_id), int(member_id)))
+            repaired += 1
+        if replaced:
+            from .identity_concordance import current_identity_book
+
+            projection_identity = current_identity_book().page(
+                "callsite_projection_identity_concordance"
+            )
+            projection_scope = (
+                str(graph.G.graph.get("function_name") or ""),
+                int(node_id),
+                id(graph.G),
+            )
+            replacement_by_stale = dict(replaced)
+            for index, stale_id in enumerate(leaves):
+                replacement_id = replacement_by_stale.get(int(stale_id))
+                if replacement_id is None:
+                    continue
+                row = (projection_scope, int(index), int(stale_id))
+                incumbent = projection_identity.latest(row)
+                if (
+                    incumbent is not None
+                    and int(incumbent) != int(replacement_id)
+                ):
+                    raise ValueError(
+                        "callsite projection identity concordance "
+                        f"disagreement for {row!r}: "
+                        f"recorded={incumbent!r}, "
+                        f"replacement={replacement_id!r}"
+                    )
+                if incumbent is None:
+                    projection_identity.set(
+                        row, 0, int(replacement_id)
+                    )
+                _retarget_all_cached_value_ids(
+                    graph, int(stale_id),
+                    int(projection_identity.latest(row)),
+                )
+                if os.environ.get(
+                    "TURING_DEBUG_SEQUENCE_EFFECT_IDENTITY"
+                ):
+                    print(
+                        "DEBUG-CALLSITE-PROJECTION-IDENTITY "
+                        f"function={projection_scope[0]!r} "
+                        f"callsite={int(node_id)} slot={int(index)} "
+                        f"stale={int(stale_id)} "
+                        f"resident={int(replacement_id)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        attributes["aggregate_leaf_value_ids"] = tuple(replacements)
+        attributes["aggregate_leaf_republication"] = {
+            "replacements": tuple(replaced),
+            "rule": "exact-stored-output-descriptors",
+            "tie_policy": "incumbent",
+        }
+        data["attributes"] = attributes
+    return repaired
+
+
+def _resolve_bound_function_references(graph: Any) -> None:
+    """Turn a specialized callable parameter into an ordinary call edge.
+
+    A first-class source function is represented by its opaque function-table
+    address.  When that address crosses a function parameter (for example the
+    dt system's ``advance`` callback), the call remains parametric, but this
+    specialized card invocation can still link it to the selected callee.
+    No Python callable is retained or executed to establish the edge.
+    """
+
+    specializations = graph.G.graph.get("planner_specializations") or {}
+    for _node_id, data in graph.G.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if (
+            attributes.get("python_precision_boundary")
+            or
+            attributes.get("callee_ref") is not None
+            or attributes.get("method_ref") is not None
+        ):
+            continue
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+        ):
+            continue
+        bound = specializations.get(expression.func.id)
+        if not isinstance(bound, FunctionReference):
+            continue
+        attributes = dict(attributes)
+        attributes["callee_ref"] = int(bound.address)
+        attributes["callee_resolution"] = "bound-function-parameter"
+        data["attributes"] = attributes
+
+
 def propagate_bound_planner_specializations(
     graph: Any,
     entrypoint: str,
     bindings: Mapping[str, Any],
+    mutable_parameters: Iterable[str] = (),
 ) -> None:
     """Carry safe structural feed values through the linked call graph.
 
@@ -8304,10 +17424,54 @@ def propagate_bound_planner_specializations(
                     return getattr(owner, node.func.attr)()
         raise ValueError("expression is not a safe structural binding")
 
+    mutable = frozenset(map(str, mutable_parameters))
     entry = function_table.entry(reference.address).graph
     if entry is None:
         return
-    queue: list[tuple[Any, dict[str, Any]]] = [(entry, dict(bindings))]
+
+    # Mutable public tensors are values, not planner literals, but their
+    # extents and element type are still the fixed Program-ABI contract for
+    # this compilation.  Previously the mutable filter below discarded both
+    # facts together.  The root web shell consequently entered hierarchy
+    # planning without descriptors, specialized every helper as rank zero,
+    # and only rediscovered the real shapes after its regions had already
+    # been cut.  Attach the non-value boundary facts to the exact formal
+    # identities and publish them through the same concordance used by
+    # callsite specialization.  No payload value is retained or folded.
+    mutable_descriptors: dict[str, dict[str, Any]] = {}
+    for name in mutable:
+        value = bindings.get(name)
+        shape = getattr(value, "shape", None)
+        dtype = getattr(value, "dtype", None)
+        if shape is None or callable(shape) or dtype is None:
+            continue
+        try:
+            extents = tuple(map(int, shape))
+        except (TypeError, ValueError):
+            continue
+        descriptor = {
+            "shape": extents,
+            "dtype": str(dtype),
+            "rank": len(extents),
+        }
+        mutable_descriptors[name] = descriptor
+        _publish_formal_shape(
+            str(entry.G.graph.get("function_name") or entrypoint),
+            name,
+            descriptor,
+            "program-abi",
+        )
+    if mutable_descriptors:
+        _apply_callsite_tensor_descriptors(entry, mutable_descriptors)
+
+    queue: list[tuple[Any, dict[str, Any]]] = [(
+        entry,
+        {
+            str(name): value
+            for name, value in bindings.items()
+            if str(name) not in mutable
+        },
+    )]
     visited: set[tuple[int, tuple[str, ...]]] = set()
     while queue:
         current, environment = queue.pop(0)
@@ -8364,6 +17528,4208 @@ def propagate_bound_planner_specializations(
 
 
 _CALLSITE_SHELL_TYPE_CACHE: dict[tuple[object, ...], type] = {}
+_UNRESOLVED_STRUCTURAL_VALUE = object()
+
+
+@dataclass(frozen=True)
+class _StructuralValueAlias:
+    source_id: int
+
+
+@dataclass(frozen=True)
+class _ProgramABIValueFact:
+    """Declared source type attached to a physical native parameter."""
+
+    python_type: str
+    storage: str
+    dtype: str | None
+    # A keyed container can return a schema-known record row.  This is a type
+    # fact about the lookup result, not a second identity for the lookup or its
+    # deterministic key.
+    value_python_type: str | None = None
+    value_storage: str | None = None
+    token_vocabulary: tuple[str, ...] | None = None
+    shape: tuple[int, ...] | None = None
+    # Logical tensor rank is distinct from the flat span used to carry its
+    # elements.  ``None`` means the annotation did not state a rank; tensor
+    # operations may constrain it without inventing extents.
+    rank: int | None = None
+    value_rank: int | None = None
+
+
+def _contains_program_abi_fact(value: Any) -> bool:
+    """Return whether a structural value carries a ProgramABI fact anywhere.
+
+    A fact describes runtime storage/type; it is not a literal.  An authored
+    aggregate whose members are facts (``history = (hub, angle)`` over span
+    parameters) is therefore a dataflow aggregate, never a foldable constant.
+    """
+
+    if isinstance(value, _ProgramABIValueFact):
+        return True
+    if isinstance(value, Mapping):
+        return any(
+            _contains_program_abi_fact(key) or _contains_program_abi_fact(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return any(_contains_program_abi_fact(item) for item in value)
+    return False
+
+
+def _structured_output_descriptor(graph: Any, value_id: int) -> Any:
+    """A tensor descriptor, or a nested tuple of them for an aggregate.
+
+    ``return total, (hub, angle), valid`` publishes ``(hub, angle)`` as one
+    output whose members are two tensors.  The structure is the exact leaf
+    ledger; nothing is inferred from shapes.
+    """
+
+    value_id = int(value_id)
+    if value_id not in graph.G:
+        return None
+    attributes = graph.G.nodes[value_id].get("attributes") or {}
+    leaves = tuple(map(int, attributes.get("aggregate_leaf_value_ids", ())))
+    if attributes.get("producer_kind") == "aggregate" and leaves:
+        return tuple(
+            _structured_output_descriptor(graph, leaf) for leaf in leaves
+        )
+    return _tensor_descriptor(graph, value_id)
+
+
+def _operand_descriptor(graph: Any, value_id: int) -> dict[str, Any] | None:
+    """A tensor descriptor, treating an authored scalar literal as rank 0."""
+
+    descriptor = _tensor_descriptor(graph, int(value_id))
+    if descriptor is not None:
+        return descriptor
+    node = graph.G.nodes.get(int(value_id), {})
+    if str(node.get("type")) not in {"Constant", "Const", "const"}:
+        return None
+    literal = node.get("constant")
+    if literal is None:
+        literal = (node.get("attributes") or {}).get("value")
+    if isinstance(literal, bool):
+        return {"shape": (), "dtype": "bool"}
+    if isinstance(literal, int):
+        return {"shape": (), "dtype": "int64"}
+    if isinstance(literal, float):
+        return {"shape": (), "dtype": "float64"}
+    return None
+
+
+_DTYPE_CAST_OPERATIONS = frozenset({
+    "to_dtype", "astype", "cast", "type_as", "to", "float", "double",
+    "int", "long", "bool_",
+})
+
+
+# Elementwise operations whose result shape is the broadcast of its operands.
+# ``matmul`` is deliberately absent: it contracts rather than broadcasts and
+# has its own rule where it is lowered.
+def _attribute_axis(data: Any) -> int | None:
+    """The axis an operation names in its own attributes, when it names one."""
+
+    attributes = data.get("attributes") or {}
+    for key in ("dim", "axis", "dims", "axes"):
+        value = attributes.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return int(value)
+    return None
+
+
+# Spellings are the CATALOG's, not Python's: a comparison arrives as
+# ``equal`` / ``greater_equal``, never ``eq`` / ``ge``.  Guessing the names
+# here meant the rule silently never fired on any comparison, which is what
+# builds every mask in axis-oriented source.
+_ELEMENTWISE_BINARY_OPERATIONS = frozenset({
+    "add", "sub", "mul", "div", "truediv", "floordiv", "mod", "pow",
+    "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
+    "eq", "ne", "lt", "le", "gt", "ge",
+    "maximum", "minimum", "clamp_min", "clamp_max",
+    "logical_and", "logical_or", "logical_xor",
+    "bitwise_and", "bitwise_or", "bitwise_xor",
+})
+
+
+_DEPENDENCY_LEVEL_CACHE: dict[int, tuple[int, dict[int, int]]] = {}
+
+
+def _dependency_levels(graph: Any) -> dict[int, int]:
+    """ASAP level per node, over the condensation so cycles stay defined.
+
+    This is `ILPScheduler.compute_asap_levels` -- longest path from the roots
+    -- with strongly connected components collapsed first, because a retained
+    loop is irreducible recursion rather than an invalid schedule and every
+    member of one is at the same causal position.
+    """
+
+    key = id(graph.G)
+    cached = _DEPENDENCY_LEVEL_CACHE.get(key)
+    if cached is not None and cached[0] == graph.G.number_of_nodes():
+        return cached[1]
+    levels: dict[int, int] = {}
+    try:
+        import networkx as _nx
+
+        condensed = _nx.condensation(graph.G)
+        component_level: dict[int, int] = {}
+        for component in _nx.topological_sort(condensed):
+            parents = tuple(condensed.predecessors(component))
+            component_level[component] = (
+                0 if not parents
+                else 1 + max(component_level[parent] for parent in parents)
+            )
+        for component, members in condensed.nodes(data="members"):
+            depth = int(component_level.get(component, 0))
+            for member in members or ():
+                levels[int(member)] = depth
+    except Exception:
+        levels = {}
+    _DEPENDENCY_LEVEL_CACHE[key] = (graph.G.number_of_nodes(), levels)
+    return levels
+
+
+def _deepest_fact(page: Any, row: Any) -> Any:
+    """The fact recorded at the deepest causal position for this row."""
+
+    recorded = page.history(row)
+    if not recorded:
+        return None
+    return max(recorded, key=lambda entry: int(entry[0]))[1]
+
+
+def descriptor_states_a_shape(descriptor: Any) -> bool:
+    """True only when a tensor descriptor actually states its extents.
+
+    ``_tensor_descriptor`` answers every query, so its answer must be read
+    for what it says.  Two of its answers state nothing:
+
+    * ``rank`` larger than the extents listed -- a flat span whose extent is
+      still unknown, which is not the rank-0 scalar ``shape=()`` reads as;
+    * an empty shape with an unknown dtype -- what the query returns when
+      recovery stops, as it does on a loop-carried result.
+
+    An empty shape WITH a known dtype is a genuine rank-0 scalar and is a
+    fact.  Treating the other two as facts retyped a matrix as one number at
+    a call edge and folded ``get_shape()`` to ``()`` inside the callee.
+    """
+
+    if not isinstance(descriptor, Mapping):
+        return False
+    shape = tuple(descriptor.get("shape") or ())
+    if int(descriptor.get("rank", len(shape))) != len(shape):
+        return False
+    return bool(shape) or str(
+        descriptor.get("dtype") or "unknown"
+    ) != "unknown"
+
+
+def _tensor_descriptor(
+    graph: Any, node_id: int, _seen: set[int] | None = None,
+) -> dict[str, Any] | None:
+    """The compiler-owned shape query, with its answer recorded."""
+
+    row = None
+    page = None
+    try:
+        from .identity_concordance import (
+            authored_function_name,
+            current_identity_book,
+        )
+
+        data = graph.G.nodes[int(node_id)] if int(node_id) in graph.G else {}
+        page = current_identity_book().page("proven_shape")
+        row = (
+            str(graph.G.graph.get("function_name")),
+            int(data.get("value_id", node_id)),
+        )
+        from .identity_concordance import proven_shape_of
+
+        settled = proven_shape_of(row[0], row[1])
+        descriptor_operation = str(
+            data.get("op") or data.get("type") or ""
+        ).casefold()
+        specialized_operator = bool(
+            graph.G.graph.get("planner_tensor_descriptors")
+            and descriptor_operation in (
+                {
+                    "matmul", "sum", "mean", "prod", "min", "max",
+                    "any", "all",
+                }
+                | _ELEMENTWISE_BINARY_OPERATIONS
+            )
+        )
+        binding_name = str(
+            (data.get("attributes") or {}).get("binding_name") or ""
+        )
+        localized_formal = bool(
+            str(data.get("type") or "") == "Input"
+            and binding_name
+            and binding_name in (
+                graph.G.graph.get("planner_tensor_descriptors") or {}
+            )
+        )
+        authored_owner = authored_function_name(
+            graph.G.graph.get("function_name")
+        )
+        formal_conflict = False
+        if str(data.get("type") or "") == "Input" and binding_name:
+            formal_page = current_identity_book().page("formal_shape")
+            formal_fact = formal_page.latest((
+                authored_function_name(
+                    graph.G.graph.get("function_name")
+                ),
+                binding_name,
+            ))
+            formal_conflict = bool(
+                isinstance(formal_fact, tuple)
+                and formal_fact
+                and formal_fact[0] == "conflicting"
+            )
+        # Once two exact call edges disagree on any formal, this authored
+        # function has no single descriptor graph.  Every intermediate in a
+        # callsite-specialized copy must then be derived from that copy's
+        # exact operands.  Reusing a previously proven authored-row result for
+        # an elementwise intermediate is precisely how `_row((2, 1), ...)`
+        # inherited the `(2, 2)` lane's multiply and consequently returned
+        # `(2,)` instead of `(1,)`.
+        formal_page = current_identity_book().page("formal_shape")
+        polymorphic_specialization = bool(
+            graph.G.graph.get("planner_tensor_descriptors")
+            and any(
+                isinstance(formal_row, tuple)
+                and len(formal_row) >= 2
+                and authored_function_name(formal_row[0]) == authored_owner
+                and isinstance(formal_page.latest(formal_row), tuple)
+                and formal_page.latest(formal_row)
+                and formal_page.latest(formal_row)[0] == "conflicting"
+                for formal_row in formal_page.rows()
+            )
+        )
+        if (
+            settled
+            and not formal_conflict
+            and not localized_formal
+            and not specialized_operator
+            and not polymorphic_specialization
+        ):
+            # Already proven.  Answering from the concordance is what makes
+            # the query a function of the value rather than of the moment.
+            return {
+                "shape": settled,
+                "dtype": str(
+                    (_deepest_fact(page, row) or ("", (), "float64"))[2]
+                ),
+                "rank": len(settled),
+            }
+    except Exception:
+        row = None
+
+    answer = _tensor_descriptor_rule(graph, node_id, _seen)
+
+    if row is not None and page is not None:
+        try:
+            extents = tuple(answer.get("shape") or ()) if answer else ()
+            dynamic = bool(
+                answer and str(answer.get("metadata_state") or "") == "dynamic"
+            )
+            # Only an answer with real extents is a proof.  An empty shape is
+            # never cemented: it is indistinguishable from "recovery stopped".
+            if extents and not dynamic:
+                from .identity_concordance import record_proven_shape
+
+                record_proven_shape(
+                    row[0], row[1], extents,
+                    (answer or {}).get("dtype"),
+                    int(_dependency_levels(graph).get(int(node_id), 0)),
+                )
+        except Exception:
+            pass
+    return answer
+
+
+def _tensor_descriptor_rule(
+    graph: Any, node_id: int, _seen: set[int] | None = None,
+) -> dict[str, Any] | None:
+    """Return compiler-owned tensor facts without inspecting a runtime value."""
+
+    if int(node_id) not in graph.G:
+        return None
+    seen = set(_seen or ())
+    if int(node_id) in seen:
+        return None
+    seen.add(int(node_id))
+    data = graph.G.nodes[int(node_id)]
+    tensor = dict(data.get("tensor") or {})
+    literal_operation = str(
+        (data.get("attributes") or {}).get("tensor")
+        or (data.get("attributes") or {}).get("tensor_candidate")
+        or data.get("op")
+        or data.get("type")
+        or ""
+    ).casefold()
+    if "shape" not in tensor and (
+        str(data.get("type")) in {"Constant", "Const", "const"}
+        or literal_operation == "tensor_from_list"
+    ):
+        literal = data.get("constant")
+        if literal is None:
+            literal_attributes = data.get("attributes") or {}
+            literal = literal_attributes.get(
+                "values", literal_attributes.get("value")
+            )
+        literal_shape = getattr(literal, "shape", None)
+        literal_dtype = getattr(literal, "dtype", None)
+        if (
+            literal_shape is not None
+            and not callable(literal_shape)
+            and literal_dtype is not None
+            and not isinstance(literal, np.dtype)
+        ):
+            # Capture-time feed arrays can become Constant nodes after their
+            # values are structurally bound, but their shape/dtype remain
+            # physical boundary facts.  Publish those facts through the
+            # descriptor query so a mutable tensor combined with a pointer
+            # lane keeps its rank in the web hierarchy.  This reads no array
+            # element and does not make the payload a planner literal.
+            try:
+                literal_shape = tuple(map(int, literal_shape))
+            except (TypeError, ValueError):
+                pass
+            else:
+                tensor = {
+                    "shape": literal_shape,
+                    "dtype": str(literal_dtype),
+                    "rank": len(literal_shape),
+                }
+        elif isinstance(literal, (list, tuple)) and literal:
+            # A source-authored nested numeric literal is the payload of a
+            # ``tensor_from_list`` once it enters tensor dataflow.  Its
+            # rectangular extents and numeric dtype are compile-time facts,
+            # just like a captured NumPy constant's ``shape``/``dtype`` above.
+            # Publishing them here lets rank-changing views and the following
+            # matmul inherit one concordance descriptor instead of collapsing
+            # the literal to an untyped structural aggregate.
+            literal_array = np.asarray(literal)
+            if (
+                literal_array.size
+                and literal_array.dtype.kind in {"b", "i", "u", "f", "c"}
+                and literal_array.dtype.kind != "O"
+            ):
+                literal_shape = tuple(map(int, literal_array.shape))
+                tensor = {
+                    "shape": literal_shape,
+                    "dtype": str(literal_array.dtype),
+                    "rank": len(literal_shape),
+                }
+    # A generic tensor annotation publishes flat native span storage before a
+    # caller is known, so its graph node deliberately starts with dynamic
+    # metadata and an empty static shape.  Whole-program planning later puts
+    # the exact caller contract on this value identity.  Read that contract
+    # before the provisional local descriptor: otherwise ``Tensor``'s flat
+    # span rank wins over a caller's logical ``(m, n)`` shape and fundamental
+    # operations such as get_shape()/dim() are frozen as runtime scalar feeds.
+    linked = (
+        graph.G.graph.get("linked_value_abi") or {}
+    ).get(int(data.get("value_id", node_id)))
+    if (
+        isinstance(linked, Mapping)
+        and linked.get("shape") is not None
+    ):
+        linked_shape = tuple(map(int, linked["shape"]))
+        tensor = {
+            **tensor,
+            "shape": linked_shape,
+            "dtype": str(
+                linked.get("dtype") or tensor.get("dtype") or "float64"
+            ),
+            "rank": len(linked_shape),
+        }
+        tensor.pop("metadata_state", None)
+    # A source-level tensor builtin remains a syntactic ``Call`` node while
+    # its compiler-resolved numerical identity is recorded on the node.  The
+    # descriptor law must follow that concordance identity: dispatching on
+    # the word ``Call`` loses shape at perfectly ordinary views such as
+    # ``abs(pixel_x)`` even though the tensor operand is already proven.
+    descriptor_operation = str(
+        (data.get("attributes") or {}).get("tensor")
+        or (data.get("attributes") or {}).get("tensor_candidate")
+        or data.get("op")
+        or data.get("type")
+        or ""
+    ).casefold()
+    if descriptor_operation.startswith("precision_"):
+        precision_operation = descriptor_operation.removeprefix(
+            "precision_"
+        )
+        if precision_operation in (
+            _ELEMENTWISE_BINARY_OPERATIONS
+            | {"neg", "abs"}
+        ):
+            descriptor_operation = precision_operation
+    provisional_tensor = None
+    if (
+        graph.G.graph.get("planner_tensor_descriptors")
+        and descriptor_operation in (
+            {
+                "matmul", "sum", "mean", "prod", "min", "max",
+                "any", "all",
+            }
+            | _ELEMENTWISE_BINARY_OPERATIONS
+        )
+        and "shape" in tensor
+    ):
+        # A catalogue node's result descriptor predates this exact callsite's
+        # operand bindings.  Re-evaluate shape-changing operator laws from
+        # those local operands, retaining the catalogue descriptor only as a
+        # fallback when the law cannot prove a result.  The query records the
+        # resulting exact shape in the concordance below.
+        provisional_tensor = dict(tensor)
+        tensor = {}
+    elif tensor.get("metadata_state") == "dynamic" or (
+        descriptor_operation in {
+            "identity", "loopresult", "loopexit", "loopstateport",
+        }
+        and not tuple(tensor.get("shape") or ())
+        and str(tensor.get("dtype") or "unknown") == "unknown"
+    ):
+        # Dynamic metadata is a physical span/rank fallback, not a settled
+        # logical shape.  Give exact operator identity (clone, loop result,
+        # indexing, cast, and call-result projection) a chance to recover the
+        # caller-proven descriptor before returning that fallback.
+        provisional_tensor = dict(tensor)
+        tensor = {}
+    declared_rank = int(
+        (data.get("attributes") or {}).get("program_abi_rank", 0) or 0
+    )
+    if "shape" not in tensor:
+        # Whole-object lowering propagates exact Program-ABI contracts over
+        # PlanCall argument bindings by SSA value identity. A callee input
+        # need not have a useful local binding-name contract, so consult that
+        # shared value ledger before attempting operation inference. This is
+        # the same declared boundary fact, not backend shape recovery.
+        if isinstance(linked, Mapping) and linked.get("shape") is not None:
+            tensor = {
+                "shape": tuple(map(int, linked["shape"])),
+                "dtype": str(linked.get("dtype") or "float64"),
+            }
+    if "shape" not in tensor and str(
+        data.get("op") or data.get("type") or ""
+    ).casefold() == "getattr":
+        # A declared record span is already a tensor boundary even when the
+        # receiver is an opaque Python-shaped record. Resolve that exact
+        # contract here, in the compiler-owned descriptor query used by both
+        # callsite specialization and region shape planning. Waiting until
+        # record-slot SSA materialization is too late: callees have already
+        # partitioned gather/matmul regions by then.
+        field_name = str(
+            (data.get("attributes") or {}).get("attribute") or ""
+        )
+        receiver = next((
+            int(parent)
+            for parent, role in data.get("parents") or ()
+            if str(role) in {"value", "base", "object", "receiver"}
+            and int(parent) in graph.G
+        ), None)
+        receiver_binding = (
+            None
+            if receiver is None
+            else str(
+                (
+                    graph.G.nodes[receiver].get("attributes") or {}
+                ).get("binding_name") or ""
+            )
+        )
+        record = (
+            (graph.G.graph.get("parameter_record_abi") or {}).get(
+                receiver_binding
+            )
+            if receiver_binding else None
+        )
+        field = (
+            (record.get("fields") or {}).get(field_name)
+            if isinstance(record, Mapping) else None
+        )
+        if isinstance(field, Mapping) and field.get("shape") is not None:
+            tensor = {
+                "shape": tuple(map(int, field["shape"])),
+                "dtype": str(field.get("dtype") or "float64"),
+            }
+        elif field_name in {"real", "imag"} and receiver is not None:
+            inherited = _tensor_descriptor(graph, receiver, seen)
+            if inherited is not None:
+                tensor = dict(inherited)
+                # Both projections expose real-valued elements while
+                # preserving the source tensor's storage/rank contract.
+                tensor["dtype"] = "float64"
+    if "shape" not in tensor and data.get("type") == "Input":
+        binding_name = (data.get("attributes") or {}).get("binding_name")
+        # A copy with no caller was told nothing; the formal still has the
+        # shape its callsites proved.
+        agreed = _proven_formal_shape(graph, binding_name)
+        if agreed is not None:
+            return agreed
+        boundary = (
+            graph.G.graph.get("planner_tensor_descriptors") or {}
+        ).get(str(binding_name))
+        if boundary is None:
+            boundary = (
+                graph.G.graph.get("parameter_value_abi") or {}
+            ).get(str(binding_name))
+        if isinstance(boundary, Mapping) and (
+            boundary.get("shape") is not None
+            or str(boundary.get("storage") or "").casefold() == "scalar"
+        ):
+            # A scalar ProgramABI binding commonly omits ``shape`` because its
+            # storage class already proves rank zero.  Treat it as the empty
+            # tensor descriptor here so that the physical value fact survives
+            # successive callsite specializations.  Requiring an explicit
+            # shape silently lost scalar type/non-None facts at the first call
+            # edge (dt_init -> ref_dt -> ref).
+            tensor = {
+                "shape": tuple(
+                    int(extent) for extent in (boundary.get("shape") or ())
+                ),
+                "dtype": str(boundary.get("dtype") or "float64"),
+            }
+            # The declared Python type travels with the descriptor.  A
+            # callee re-deriving the type from the dtype alone turned a
+            # declared ``builtins.NoneType`` scalar into ``builtins.int``
+            # and folded ``distribution is not None`` the wrong way.
+            if boundary.get("python_type"):
+                tensor["python_type"] = str(boundary["python_type"])
+    if "shape" not in tensor:
+        operation = descriptor_operation
+        if operation in {
+            "identity", "loopresult", "loopexit", "loopstateport",
+        }:
+            semantic_roles = (
+                {"state", "value"}
+                if operation == "loopstateport" else {"value"}
+            )
+            sources = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role).casefold() in semantic_roles
+            )
+            declared_source = (data.get("attributes") or {}).get(
+                "value_source_id"
+            )
+            if declared_source is not None:
+                declared_source = int(declared_source)
+                if sources and sources != (declared_source,):
+                    raise ValueError(
+                        f"{operation} value-source identity conflicts with "
+                        f"its semantic edge: declared={declared_source}, "
+                        f"edges={sources!r}"
+                    )
+                sources = (declared_source,)
+            inherited = (
+                _tensor_descriptor(graph, sources[0], seen)
+                if len(sources) == 1 else None
+            )
+            # EXTENTS, not merely "states a shape".  A carried matrix whose
+            # update resolves to a bare rank-0 answer is not a scalar -- it is
+            # the query giving up -- and accepting it here meant the seed,
+            # which knows the real shape, was never consulted.  A genuinely
+            # scalar carried value (a running sign, a counter) resolves to the
+            # same rank-0 answer through the seed below, so preferring extents
+            # costs it nothing.
+            if inherited is not None and tuple(inherited.get("shape") or ()):
+                return inherited
+            # The carried chain is a CYCLE: the updated value is produced from
+            # the port itself, so following it alone stops at the recursion
+            # guard and publishes an empty descriptor.  The loop node declares
+            # the pairing -- ``loop_carried_bindings[name] = (initial,
+            # updated)`` -- and a carried binding is ONE storage across the
+            # loop, so the seed states this port's storage exactly.  Reading
+            # it here keeps a loop-carried matrix (LU) shaped for every callee
+            # it is then passed to.
+            attributes = data.get("attributes") or {}
+            binding_name = str(attributes.get("binding_name") or "")
+            loop_id = attributes.get("loop_id")
+            if (
+                str(attributes.get("result_kind") or "") == "carried"
+                and binding_name
+                and loop_id is not None
+                and int(loop_id) in graph.G
+            ):
+                carried_binding = (
+                    (graph.G.nodes[int(loop_id)].get("attributes") or {})
+                    .get("loop_carried_bindings") or {}
+                ).get(binding_name)
+                if carried_binding:
+                    initial_id = int(tuple(carried_binding)[0])
+                    if initial_id in graph.G and initial_id not in seen:
+                        seeded = _tensor_descriptor(graph, initial_id, seen)
+                        if seeded is not None:
+                            return seeded
+            if inherited is not None:
+                return inherited
+        # Shape-preserving unary expressions are ordinary dynamic tensor
+        # values too.  Callsite specialization used to see ``-g`` as having
+        # no descriptor, specialize the callee only for its static shape
+        # argument, and accidentally erase G from that callee's ABI.  Follow
+        # the exact unary data edge so nested calls retain their numerical
+        # argument without inspecting any runtime payload.
+        if operation in {"unsqueeze", "squeeze", "expand", "broadcast_to"}:
+            parents = data.get("parents") or ()
+            source_id = next((
+                int(parent)
+                for parent, role in parents
+                if str(role).casefold() in {
+                    "operand", "value", "base", "input", "self", "receiver",
+                }
+                and int(parent) in graph.G
+            ), None)
+
+            def _axis_literal(candidate: int) -> Any:
+                node = graph.G.nodes[int(candidate)]
+                literal = node.get("constant")
+                if literal is None:
+                    literal = (node.get("attributes") or {}).get("value")
+                return literal
+
+            arguments = [
+                _axis_literal(int(parent))
+                for parent, role in parents
+                if str(role).casefold().startswith("arg:")
+                and int(parent) in graph.G
+            ]
+            declared_axis = _attribute_axis(data)
+            if declared_axis is not None:
+                arguments = [declared_axis, *arguments]
+            if source_id is not None:
+                base = _tensor_descriptor(graph, source_id, seen)
+                if base is not None and descriptor_states_a_shape(base):
+                    extents = tuple(int(e) for e in (base.get("shape") or ()))
+                    dtype = str(base.get("dtype") or "float64")
+                    settled = None
+                    first = arguments[0] if arguments else None
+                    if operation == "unsqueeze" and isinstance(first, int):
+                        # A new axis of length one; a negative position counts
+                        # from the END OF THE RESULT, which is one longer.
+                        position = (
+                            first if first >= 0 else first + len(extents) + 1
+                        )
+                        if 0 <= position <= len(extents):
+                            settled = (
+                                extents[:position] + (1,) + extents[position:]
+                            )
+                    elif operation == "squeeze":
+                        if isinstance(first, int):
+                            position = (
+                                first if first >= 0 else first + len(extents)
+                            )
+                            if (
+                                0 <= position < len(extents)
+                                and extents[position] == 1
+                            ):
+                                settled = (
+                                    extents[:position]
+                                    + extents[position + 1:]
+                                )
+                        elif not arguments:
+                            settled = tuple(e for e in extents if e != 1)
+                    else:
+                        requested = (
+                            first
+                            if isinstance(first, (tuple, list))
+                            else tuple(arguments)
+                        )
+                        if requested and all(
+                            isinstance(extent, int) and not isinstance(
+                                extent, bool
+                            )
+                            for extent in requested
+                        ):
+                            settled = tuple(int(e) for e in requested)
+                    if settled is not None:
+                        return {
+                            "shape": settled,
+                            "dtype": dtype,
+                            "rank": len(settled),
+                        }
+        if operation in _ELEMENTWISE_BINARY_OPERATIONS:
+            operands = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role).casefold() in {
+                    "lhs", "rhs", "left", "right", "operand", "value", "other",
+                }
+                and int(parent) in graph.G
+            )
+            if len(operands) == 2:
+                sides = []
+                for operand in operands:
+                    side = _tensor_descriptor(graph, operand, seen)
+                    if side is None:
+                        # An authored scalar literal is rank 0, the same
+                        # reading `_operand_descriptor` gives it.
+                        node = graph.G.nodes[operand]
+                        if str(node.get("type")) in {
+                            "Constant", "Const", "const",
+                        }:
+                            literal = node.get("constant")
+                            if literal is None:
+                                literal = (
+                                    node.get("attributes") or {}
+                                ).get("value")
+                            if isinstance(literal, (int, float, bool)):
+                                side = {"shape": (), "dtype": "float64"}
+                    sides.append(side)
+                # A HOST SCALAR broadcasts against anything.  ``index >= k``
+                # compares a vector with an ordinary Python ``int`` argument,
+                # which has no tensor descriptor and never will; demanding one
+                # from both sides refused valid source and left every mask
+                # built that way shapeless.  A side with no descriptor counts
+                # as rank 0 only when its node produces no tensor -- no tensor
+                # metadata, no catalogued tensor operation -- so a tensor whose
+                # shape merely failed to derive still refuses.
+                for index, (side, operand) in enumerate(zip(sides, operands)):
+                    if side is not None:
+                        continue
+                    node = graph.G.nodes[operand]
+                    attributes = node.get("attributes") or {}
+                    if node.get("tensor") or attributes.get("tensor_candidate"):
+                        continue
+                    if str(node.get("op") or node.get("type") or "").casefold() in (
+                        _ELEMENTWISE_BINARY_OPERATIONS
+                    ):
+                        continue
+                    sides[index] = {"shape": (), "dtype": "float64"}
+                # An empty shape is a rank-0 scalar only when the node
+                # produces a scalar.  For a tensor-producing node it is what
+                # the query returns while its extents are still unsettled,
+                # and broadcasting against it yields an answer that LOOKS
+                # complete -- (2,) against an unknown gives (1,) -- which the
+                # proof short-circuit then makes permanent, so no later round
+                # ever revises it.  This is the rule already stated above for
+                # a side with NO descriptor; a side whose descriptor STATES
+                # nothing is the same case, and a known dtype does not turn an
+                # unsettled extent into a fact.  A call's result is included:
+                # its extents arrive when the callee settles, and until then
+                # the honest answer is that we do not know.
+                for index, (side, operand) in enumerate(zip(sides, operands)):
+                    if side is None or tuple(side.get("shape") or ()):
+                        continue
+                    node = graph.G.nodes[operand]
+                    attributes = node.get("attributes") or {}
+                    semantic_operand = str(
+                        attributes.get("tensor")
+                        or attributes.get("tensor_candidate")
+                        or node.get("op")
+                        or node.get("type")
+                        or ""
+                    ).casefold()
+                    if (
+                        int(side.get("rank", 0)) == 0
+                        and semantic_operand in {
+                            "sum", "mean", "prod", "min", "max", "any", "all",
+                        }
+                    ):
+                        # An all-axis reduction has an exact rank-zero result.
+                        # It is not the empty placeholder returned by an
+                        # unsettled tensor call, so retain the reduction law's
+                        # descriptor when it enters later elementwise work.
+                        continue
+                    if (
+                        node.get("tensor")
+                        or attributes.get("tensor_candidate")
+                        or str(
+                            node.get("op") or node.get("type") or ""
+                        ).casefold() == "call"
+                    ):
+                        sides[index] = None
+                if all(side is not None for side in sides) and all(
+                    descriptor_states_a_shape(side) for side in sides
+                ):
+                    left_shape = tuple(sides[0].get("shape") or ())
+                    right_shape = tuple(sides[1].get("shape") or ())
+                    rank = max(len(left_shape), len(right_shape))
+                    left_aligned = (1,) * (rank - len(left_shape)) + left_shape
+                    right_aligned = (
+                        (1,) * (rank - len(right_shape)) + right_shape
+                    )
+                    broadcast: list[int] = []
+                    compatible = True
+                    for left_extent, right_extent in zip(
+                        left_aligned, right_aligned
+                    ):
+                        if left_extent == right_extent:
+                            broadcast.append(int(left_extent))
+                        elif left_extent == 1:
+                            broadcast.append(int(right_extent))
+                        elif right_extent == 1:
+                            broadcast.append(int(left_extent))
+                        else:
+                            # Not broadcastable: say nothing rather than
+                            # invent an extent neither operand has.
+                            compatible = False
+                            break
+                    if compatible:
+                        dtype = (
+                            "bool"
+                            if operation in {
+                                "equal", "not_equal", "less", "less_equal",
+                                "greater", "greater_equal", "eq", "ne", "lt",
+                                "le", "gt", "ge", "logical_and", "logical_or",
+                                "logical_xor",
+                            }
+                            else str(np.result_type(*(
+                                np.dtype(str(side.get("dtype")))
+                                for side in sides
+                                if str(side.get("dtype") or "unknown")
+                                != "unknown"
+                            )))
+                        )
+                        return {
+                            "shape": tuple(broadcast),
+                            "dtype": dtype,
+                            "rank": len(broadcast),
+                        }
+        if operation == "matmul":
+            operands = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role).casefold() in {
+                    "lhs", "rhs", "left", "right", "operand", "value",
+                    "other", "self", "receiver",
+                }
+                and int(parent) in graph.G
+            )
+            if len(operands) == 2:
+                sides = tuple(
+                    _tensor_descriptor(graph, operand, seen)
+                    for operand in operands
+                )
+                if all(
+                    side is not None and descriptor_states_a_shape(side)
+                    for side in sides
+                ):
+                    left = tuple(map(int, sides[0].get("shape") or ()))
+                    right = tuple(map(int, sides[1].get("shape") or ()))
+                    if left and right:
+                        left_vector = len(left) == 1
+                        right_vector = len(right) == 1
+                        matrix_left = (1, *left) if left_vector else left
+                        matrix_right = (*right, 1) if right_vector else right
+                        if matrix_left[-1] == matrix_right[-2]:
+                            try:
+                                batch = tuple(np.broadcast_shapes(
+                                    matrix_left[:-2], matrix_right[:-2]
+                                ))
+                            except ValueError:
+                                pass
+                            else:
+                                result = (
+                                    *batch,
+                                    matrix_left[-2],
+                                    matrix_right[-1],
+                                )
+                                if left_vector:
+                                    result = result[:-2] + result[-1:]
+                                if right_vector:
+                                    result = result[:-1]
+                                dtype = next((
+                                    str(side.get("dtype"))
+                                    for side in sides
+                                    if str(
+                                        side.get("dtype") or "unknown"
+                                    ) != "unknown"
+                                ), "float64")
+                                return {
+                                    "shape": tuple(result),
+                                    "dtype": dtype,
+                                    "rank": len(result),
+                                }
+        if operation in {
+            "sum", "mean", "prod", "min", "max", "any", "all",
+        }:
+            operand_roles = {
+                "operand", "value", "base", "input", "self", "receiver",
+            }
+            source_id = next((
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role).casefold() in operand_roles
+                and int(parent) in graph.G
+            ), None)
+            source = (
+                None if source_id is None
+                else _tensor_descriptor(graph, source_id, seen)
+            )
+            if source is not None and descriptor_states_a_shape(source):
+                source_shape = tuple(map(int, source.get("shape") or ()))
+                attributes = data.get("attributes") or {}
+                axis = attributes.get("axis", attributes.get("dim"))
+                keepdim = bool(attributes.get(
+                    "keepdim", attributes.get("keepdims", False)
+                ))
+                if axis is None:
+                    reduced = (1,) * len(source_shape) if keepdim else ()
+                else:
+                    axes = (
+                        tuple(axis)
+                        if isinstance(axis, (tuple, list))
+                        else (axis,)
+                    )
+                    if not source_shape:
+                        # An explicit reduction axis cannot be normalized
+                        # against rank zero.  During callsite specialization
+                        # this combination means the local operand descriptor
+                        # and the authored reduction disagree; it is not a
+                        # proof that the authored result is scalar.  Leave the
+                        # result unsettled so the exact value identity falls
+                        # through to its tracked provisional descriptor (and
+                        # can be revised when the operand's concordance fact
+                        # arrives) instead of dividing by zero or cementing a
+                        # false shape.
+                        reduced = None
+                    elif all(
+                        isinstance(item, int) and not isinstance(item, bool)
+                        for item in axes
+                    ):
+                        normalized = tuple(sorted({
+                            int(item) % len(source_shape) for item in axes
+                        }))
+                        reduced = tuple(
+                            1 if keepdim and index in normalized else extent
+                            for index, extent in enumerate(source_shape)
+                            if keepdim or index not in normalized
+                        )
+                    else:
+                        reduced = None
+                if reduced is not None:
+                    dtype = str(source.get("dtype") or "float64")
+                    if operation in {"any", "all"}:
+                        dtype = "bool"
+                    return {
+                        "shape": tuple(reduced),
+                        "dtype": dtype,
+                        "rank": len(reduced),
+                    }
+        if operation in {
+            "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
+            "tanh", "clone", "copy", "identity", "real", "imag", "conj",
+            # A prefix scan is not a reduction: it emits one element per
+            # input element, so it keeps its operand's shape exactly.  With
+            # no rule here it answered nothing, its result was never proven,
+            # and the cast that consumed it read a rank-0 scalar and wrote
+            # no elements at all.
+            "cumsum", "cumprod",
+        }:
+            operand_roles = {"operand", "value", "base", "self", "receiver"}
+            by_role = tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role).casefold() in operand_roles
+                and int(parent) in graph.G
+            )
+            parents = by_role or tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) not in {"callee", "func", "definition"}
+                and int(parent) in graph.G
+            )
+            if len(parents) == 1:
+                return _tensor_descriptor(graph, parents[0], seen)
+        if operation in _DTYPE_CAST_OPERATIONS:
+            # ``x.to_dtype("int64")`` preserves the shape exactly and only
+            # changes the element type.  Leaving it descriptor-less made
+            # every subscript on a cast value, and every value after it,
+            # shapeless (``cell_index[:, :, 1]`` in the periodic terrain).
+            parents = tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) not in {"callee", "func", "definition"}
+                and int(parent) in graph.G
+            )
+            # The VALUE being cast is the one in an operand role.  Counting
+            # every non-constant parent made ``x.to_dtype(y.get_dtype())``
+            # look like two tensor operands -- the dtype argument is a
+            # computed call, not a literal -- so the rule declined and every
+            # mask built with a dtype taken from another tensor lost its
+            # shape at the cast.
+            operand_roles = {"operand", "value", "base", "self", "receiver"}
+            by_role = tuple(
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role).casefold() in operand_roles
+                and int(parent) in graph.G
+            )
+            tensor_parents = by_role or tuple(
+                parent for parent in parents
+                if str(
+                    graph.G.nodes[parent].get("type") or ""
+                ).casefold() not in {"constant", "const"}
+            )
+            if len(tensor_parents) == 1:
+                inherited = _tensor_descriptor(graph, tensor_parents[0], seen)
+                if inherited is not None:
+                    def _literal_dtype(candidate: int) -> str | None:
+                        # The dtype argument may be a computed call --
+                        # ``other.get_dtype()`` -- which carries no literal at
+                        # all.  That is not an error: the cast then keeps the
+                        # operand's dtype, which is what the source means.
+                        try:
+                            literal = _constant_value(graph.G.nodes[candidate])
+                        except (KeyError, TypeError, ValueError):
+                            return None
+                        return str(literal) if isinstance(literal, str) else None
+
+                    cast_dtype = next((
+                        named
+                        for parent in parents
+                        if parent not in tensor_parents
+                        for named in (_literal_dtype(parent),)
+                        if named is not None
+                    ), None)
+                    result = dict(inherited)
+                    if cast_dtype:
+                        result["dtype"] = cast_dtype
+                    return result
+        if operation in {"indexedstore", "index_set", "setitem"}:
+            base = next((
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) == "base"
+            ), None)
+            if base is not None:
+                return _tensor_descriptor(graph, base, seen)
+        if operation in {"indexed", "getitem", "subscript"}:
+            base = next((
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) == "base"
+            ), None)
+            indices = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) == "index"
+            )
+            if base is not None and base in graph.G and len(indices) == 1:
+                base_attributes = (
+                    graph.G.nodes[base].get("attributes") or {}
+                )
+                leaves = tuple(map(
+                    int,
+                    base_attributes.get("aggregate_leaf_value_ids", ()),
+                ))
+                index_attributes = (
+                    graph.G.nodes[indices[0]].get("attributes") or {}
+                )
+                index = index_attributes.get("value")
+                if index is None:
+                    index = graph.G.nodes[indices[0]].get("constant")
+                if isinstance(index, slice):
+                    base_descriptor = _tensor_descriptor(graph, base, seen)
+                    base_shape = tuple(
+                        (base_descriptor or {}).get("shape") or ()
+                    )
+                    if base_shape:
+                        start, stop, step = index.indices(int(base_shape[0]))
+                        sliced = len(range(start, stop, step))
+                        return {
+                            "shape": (int(sliced), *base_shape[1:]),
+                            "dtype": str(
+                                (base_descriptor or {}).get("dtype")
+                                or "float64"
+                            ),
+                            "rank": len(base_shape),
+                        }
+                output_descriptors = base_attributes.get(
+                    "tensor_output_descriptors"
+                ) or ()
+                if (
+                    output_descriptors
+                    and isinstance(index, int)
+                    and not isinstance(index, bool)
+                    and -len(output_descriptors) <= index < len(output_descriptors)
+                ):
+                    descriptor = output_descriptors[
+                        index % len(output_descriptors)
+                    ]
+                    if isinstance(descriptor, Mapping):
+                        return copy.deepcopy(dict(descriptor))
+                # ``r[1][0]``: the base is itself a projection of a call
+                # whose output descriptor at that position is a nested tuple.
+                # Follow the exact literal-index path; a structural path is
+                # an identity, not an inference.
+                path = [index] if isinstance(index, int) and not isinstance(
+                    index, bool
+                ) else None
+                top = base
+                while path is not None and top in graph.G:
+                    top_data = graph.G.nodes[top]
+                    top_attributes = top_data.get("attributes") or {}
+                    nested = top_attributes.get("tensor_output_descriptors")
+                    if nested:
+                        structure: Any = tuple(nested)
+                        for step in path:
+                            if not isinstance(structure, tuple) or not (
+                                -len(structure) <= step < len(structure)
+                            ):
+                                structure = None
+                                break
+                            structure = structure[step % len(structure)]
+                        if isinstance(structure, Mapping):
+                            return copy.deepcopy(dict(structure))
+                        break
+                    if str(
+                        top_data.get("op") or top_data.get("type") or ""
+                    ).casefold() not in {"indexed", "getitem", "subscript"}:
+                        break
+                    top_base = next((
+                        int(parent)
+                        for parent, role in top_data.get("parents") or ()
+                        if str(role) == "base"
+                    ), None)
+                    top_indices = tuple(
+                        int(parent)
+                        for parent, role in top_data.get("parents") or ()
+                        if str(role) == "index"
+                    )
+                    if top_base is None or len(top_indices) != 1:
+                        break
+                    top_index = (
+                        graph.G.nodes[top_indices[0]].get("attributes") or {}
+                    ).get("value")
+                    if top_index is None:
+                        top_index = graph.G.nodes[top_indices[0]].get(
+                            "constant"
+                        )
+                    if not isinstance(top_index, int) or isinstance(
+                        top_index, bool
+                    ):
+                        break
+                    path.insert(0, int(top_index))
+                    top = top_base
+                if (
+                    leaves
+                    and isinstance(index, int)
+                    and not isinstance(index, bool)
+                    and -len(leaves) <= index < len(leaves)
+                ):
+                    return _tensor_descriptor(
+                        graph, leaves[index % len(leaves)], seen
+                    )
+        if provisional_tensor is not None:
+            tensor = provisional_tensor
+        elif declared_rank > 0:
+            tensor = {
+                "shape": (),
+                "dtype": str(
+                    (data.get("attributes") or {}).get(
+                        "program_abi_dtype", "unknown"
+                    )
+                ),
+                "rank": declared_rank,
+                "metadata_state": "dynamic",
+            }
+        else:
+            return None
+    static_shape = tuple(tensor.get("shape") or ())
+    return {
+        "shape": static_shape,
+        "dtype": str(tensor.get("dtype") or "float64"),
+        "rank": int(tensor.get("rank", len(static_shape))),
+        **(
+            {"metadata_state": str(tensor["metadata_state"])}
+            if tensor.get("metadata_state") is not None else {}
+        ),
+        **(
+            {"device": tensor["device"]}
+            if tensor.get("device") is not None else {}
+        ),
+        # A declared Python type is part of the boundary fact; it rides
+        # along so a callee specialization sees ``builtins.NoneType`` and
+        # not a type re-derived from the dtype.
+        **(
+            {"python_type": str(tensor["python_type"])}
+            if tensor.get("python_type") else {}
+        ),
+    }
+
+
+def _fold_callsite_structural_values(
+    graph: Any, *, _progress: Any = None,
+) -> None:
+    """Fold only whitelisted structural Python identities from graph facts.
+
+    This pass is deliberately smaller than Python evaluation.  It consumes
+    constants and compiler-owned tensor descriptors, and recognizes the
+    structural builtins used to express shapes and source control.  It never
+    invokes a retained Python callable or reads a runtime tensor payload.
+    """
+
+    # Source conditionals are authored control, not disposable dataflow.
+    # Preserve their AST identity and predicate correlation before this pass
+    # folds/removes structural nodes so later region overlay can reconstruct
+    # the exact branch tree in each function shell.
+    _retain_source_control_records(graph.G)
+    _retain_source_sequence_mutation_records(graph.G)
+    # Resolve capability before getattr(..., default) can select its default.
+    _resolve_grounded_method_references(graph)
+
+    unresolved = _UNRESOLVED_STRUCTURAL_VALUE
+    known: dict[int, Any] = {}
+    topology_changed = False
+    mutated_sequence_ids = {
+        int(record["sequence_value_id"])
+        for record in (
+            graph.G.graph.get("source_sequence_mutation_records") or {}
+        ).values()
+    }
+    loop_carried_initial_ids = {
+        int(initial)
+        for _loop_id, data in graph.G.nodes(data=True)
+        for initial, _updated in (
+            (data.get("attributes") or {}).get(
+                "loop_carried_bindings", {}
+            ).values()
+        )
+    }
+
+    def constant(data: Mapping[str, Any]) -> Any:
+        try:
+            return _constant_value(data)
+        except KeyError:
+            return unresolved
+
+    def positional(data: Mapping[str, Any]) -> tuple[int, ...]:
+        indexed = []
+        for parent, role_value in data.get("parents") or ():
+            position = _positional_argument_index(str(role_value))
+            if position is not None:
+                indexed.append((position, int(parent)))
+        return tuple(parent for _position, parent in sorted(indexed))
+
+    def exact_return_formal_actual(
+        node_id: int, data: Mapping[str, Any],
+    ) -> int | None:
+        """Map a one-result call returning a formal to its exact actual.
+
+        Return-slot identity is available before SSA linking.  Reading it here
+        lets structural facts attached to an argument (in particular a
+        ProgramABI record and its declared span fields) cross a source helper
+        which returns that argument unchanged.  The call itself remains in the
+        graph: returning a formal does not prove that the callee has no side
+        effects on the referenced storage.
+        """
+
+        attributes = data.get("attributes") or {}
+        reference = attributes.get("callee_ref", attributes.get("method_ref"))
+        function_table = getattr(graph, "function_table", None)
+        if reference is None or function_table is None:
+            return None
+        try:
+            child = function_table.entry(int(reference)).graph
+        except (KeyError, TypeError, ValueError):
+            return None
+        child_graph = getattr(child, "G", None)
+        if child_graph is None:
+            return None
+        sites = tuple(
+            tuple(slots)
+            for slots in (child_graph.graph.get("return_slot_values") or {}).values()
+        )
+        if (
+            not sites
+            or any(len(slots) != 1 for slots in sites)
+            or any(slots[0] is None for slots in sites)
+            or len({int(slots[0]) for slots in sites}) != 1
+        ):
+            return None
+        formal_id = int(sites[0][0])
+        formal = child_graph.nodes.get(formal_id, {})
+        formal_attributes = formal.get("attributes") or {}
+        formal_name = formal_attributes.get("binding_name")
+        parameters = tuple(map(
+            str, child_graph.graph.get("function_parameters") or (),
+        ))
+        if (
+            formal_attributes.get("binding_kind") != "parameter"
+            or formal_name is None
+            or str(formal_name) not in parameters
+        ):
+            return None
+        parameter_index = parameters.index(str(formal_name))
+        actuals = {
+            str(role): int(parent)
+            for parent, role in data.get("parents") or ()
+        }
+        return actuals.get(
+            f"arg:{parameter_index}", actuals.get(f"kw:{formal_name}"),
+        )
+
+    def structural_call_argument(
+        data: Mapping[str, Any],
+        *,
+        roles: set[str],
+        keywords: set[str],
+        default: Any,
+    ) -> Any:
+        """Read authored call metadata without evaluating a Python callable.
+
+        Dynamic arguments are represented by dependency edges and therefore
+        take precedence.  The graph extractor intentionally does not create a
+        value node for a literal keyword such as ``dim=1``; retain that exact
+        source literal as normalized operation metadata instead of silently
+        substituting the operator's default axis.
+        """
+
+        for parent, role_value in data.get("parents") or ():
+            if str(role_value) not in roles:
+                continue
+            value = known.get(int(parent), unresolved)
+            # ProgramABI facts describe runtime storage/type, not the value of
+            # a structural keyword.  Treat them as unresolved here so a
+            # literal ``dim=``/``axis=`` retained in the authored call can be
+            # recovered below instead of being coerced with ``int(fact)``.
+            if value is not unresolved and not isinstance(
+                value, _ProgramABIValueFact
+            ):
+                return value
+        expression = data.get("expr_obj")
+        if isinstance(expression, ast.Call):
+            for keyword in expression.keywords:
+                if keyword.arg not in keywords:
+                    continue
+                try:
+                    return ast.literal_eval(keyword.value)
+                except (TypeError, ValueError):
+                    return unresolved
+        return default
+
+    def _record_field_descriptor(node_id: int) -> dict[str, Any] | None:
+        """Real shape/dtype for a record-field read, from its bound value.
+
+        A record field (``state.height``) never gets a ``tensor`` fact of
+        its own -- that inference path is for tensor-typed values flowing
+        through tensor ops, and a mutable dataclass field is neither. Its
+        receiver's own bound specialization (a real object, set by
+        ``propagate_bound_planner_specializations`` before this pass runs)
+        still has the real field on it; read it structurally, the same
+        safe, side-effect-free ``getattr`` this module already uses
+        elsewhere for call-argument specialization and region-shape
+        inference (see ``declared()`` in ``_build_shell_hierarchy_plan``,
+        which fixed the analogous gap for whole-array region shapes).
+        Without this, ``state.height.shape[0]`` -- a loop bound -- silently
+        resolves to nothing and the per-cell loop it bounds never runs.
+        """
+
+        node = graph.G.nodes.get(int(node_id), {})
+        if str(node.get("type")) not in {"GetAttr", "Attribute"}:
+            return None
+        field_name = (node.get("attributes") or {}).get("attribute")
+        if field_name is None:
+            return None
+        receiver_id = next((
+            int(candidate)
+            for candidate, role in (node.get("parents") or ())
+            if str(role) in {"value", "base", "object"}
+        ), None)
+        if receiver_id is None:
+            return None
+        receiver_binding = (
+            graph.G.nodes.get(receiver_id, {}).get("attributes") or {}
+        ).get("binding_name")
+        if receiver_binding is None:
+            return None
+        receiver_value = (
+            graph.G.graph.get("planner_specializations") or {}
+        ).get(str(receiver_binding))
+        if receiver_value is None:
+            return None
+        try:
+            field_value = getattr(receiver_value, str(field_name))
+        except AttributeError:
+            return None
+        field_shape = getattr(field_value, "shape", None)
+        if not field_shape:
+            return None
+        field_dtype = getattr(field_value, "dtype", None)
+        return {
+            "shape": tuple(int(dim) for dim in field_shape),
+            "dtype": "float64" if field_dtype is None else str(field_dtype),
+        }
+
+    def _declared_record_span_descriptor(node_id: int) -> dict[str, Any] | None:
+        """Shape/dtype of a record-field read from the ProgramABI declaration.
+
+        The same declared-field lookup ``_tensor_descriptor`` performs for a
+        ``GetAttr`` on a record receiver, restated here so the shape walk can
+        recognise a declared span as a boundary without accepting an
+        inferred (possibly provisional) ``tensor`` fact on the node.
+        """
+
+        node = graph.G.nodes.get(int(node_id), {})
+        if str(node.get("op") or node.get("type") or "").casefold() != "getattr":
+            return None
+        field_name = str((node.get("attributes") or {}).get("attribute") or "")
+        receiver = next((
+            int(parent)
+            for parent, role in node.get("parents") or ()
+            if str(role) in {"value", "base", "object", "receiver"}
+            and int(parent) in graph.G
+        ), None)
+        if receiver is None:
+            return None
+        receiver_binding = str(
+            (graph.G.nodes[receiver].get("attributes") or {}).get("binding_name") or ""
+        )
+        if not receiver_binding:
+            return None
+        record = (graph.G.graph.get("parameter_record_abi") or {}).get(receiver_binding)
+        field = (
+            (record.get("fields") or {}).get(field_name)
+            if isinstance(record, Mapping) else None
+        )
+        if not (isinstance(field, Mapping) and field.get("shape") is not None):
+            return None
+        return {
+            "shape": tuple(map(int, field["shape"])),
+            "dtype": str(field.get("dtype") or "float64"),
+        }
+
+    def descriptor_attribute(parent: int, attribute: str) -> Any:
+        descriptor = _tensor_descriptor(graph, parent)
+        if descriptor is None:
+            descriptor = _record_field_descriptor(parent)
+        if attribute in {"shape", "ndim", "ndims"}:
+            pending_inputs = [int(parent)]
+            seen_inputs = set()
+            while pending_inputs:
+                current = pending_inputs.pop()
+                if current in seen_inputs or current not in graph.G:
+                    continue
+                seen_inputs.add(current)
+                source = graph.G.nodes[current]
+                operation = str(source.get("op") or source.get("type") or "").casefold()
+                if operation == "input":
+                    if _tensor_descriptor(graph, current) is None:
+                        return unresolved
+                    continue
+                # A declared record span supplies its own shape boundary;
+                # the opaque receiver is not an untyped tensor parameter.
+                # That boundary is stated two ways: a bound planner
+                # specialization (a real object supplied at the entry) or
+                # the ProgramABI record declaration itself.  A method on
+                # ``self`` in a contract-only lowering has no bound object,
+                # so only the declaration can answer -- and without it this
+                # walk reached the record receiver, found no tensor
+                # descriptor on it, and returned unresolved for a field whose
+                # shape was declared.  ``self.memory.ndim`` then never
+                # folded, the ingestion expansion of ``self.memory[...]``
+                # (``tuple([slice(None)] * (self.memory.ndim - 0))``) stayed
+                # a live expression, and the store lowered as a
+                # resident-sequence replace with hidden length formals plus
+                # a one-element write (PieceState.restore in the dt system:
+                # 416 storage formals, 104 unnamed).
+                if operation == "getattr" and (
+                    _record_field_descriptor(current) is not None
+                    or _declared_record_span_descriptor(current) is not None
+                ):
+                    continue
+                pending_inputs.extend(
+                    int(value) for value, role in source.get("parents") or ()
+                    if str(role) not in {"callee", "func", "definition"}
+                )
+            planner_descriptors = (
+                graph.G.graph.get("planner_tensor_descriptors") or {}
+            )
+            callsite_descriptor_names = set(map(
+                str,
+                graph.G.graph.get("callsite_tensor_descriptor_names") or (),
+            ))
+            input_bindings = tuple(
+                (data.get("attributes") or {}).get("binding_name")
+                for _node_id, data in graph.G.nodes(data=True)
+                if data.get("type") == "Input"
+            )
+            unsettled_tensor_parameter = (
+                bool(input_bindings) and not planner_descriptors
+            ) or any(
+                bool(data.get("tensor"))
+                and str(binding_name) not in callsite_descriptor_names
+                and not tuple((
+                    planner_descriptors.get(str(binding_name)) or {}
+                ).get("shape") or ())
+                for _node_id, data in graph.G.nodes(data=True)
+                if data.get("type") == "Input"
+                for binding_name in (
+                    (data.get("attributes") or {}).get("binding_name"),
+                )
+            )
+            if descriptor is None and unsettled_tensor_parameter:
+                # Shape-derived constants are irreversible graph rewrites.
+                # Before planner/callsite descriptors arrive, input nodes may
+                # still be untyped while their internal consumers acquire
+                # padded scalar domain defaults such as (1,1,1). Never
+                # fold `.shape` from that provisional graph domain. An exact
+                # descriptor for the queried value is sufficient even when an
+                # unrelated parameter remains unsettled; otherwise parametric
+                # functions could never use a declared peer's shape.
+                return unresolved
+        if descriptor is None:
+            return unresolved
+        if attribute == "shape":
+            return descriptor["shape"]
+        if attribute in {"ndim", "ndims"}:
+            return len(descriptor["shape"])
+        if attribute == "dtype":
+            return descriptor["dtype"]
+        if attribute == "device" and "device" in descriptor:
+            return descriptor["device"]
+        return unresolved
+
+    def safe_types(expression: ast.AST | None):
+        if isinstance(expression, ast.Name):
+            return {
+                "bool": (bool,), "int": (int,), "float": (float,),
+                "str": (str,), "bytes": (bytes,), "tuple": (tuple,),
+                "list": (list,), "dict": (dict,), "set": (set,),
+                "range": (range,),
+            }.get(expression.id)
+        if isinstance(expression, ast.Tuple):
+            result = tuple(
+                item
+                for element in expression.elts
+                for item in (safe_types(element) or ())
+            )
+            return result or None
+        return None
+
+    def type_identities(expression: ast.AST | None) -> tuple[str, ...]:
+        if isinstance(expression, ast.Name):
+            return (str(expression.id),)
+        if isinstance(expression, ast.Attribute):
+            parts = [str(expression.attr)]
+            owner = expression.value
+            while isinstance(owner, ast.Attribute):
+                parts.append(str(owner.attr))
+                owner = owner.value
+            if isinstance(owner, ast.Name):
+                parts.append(str(owner.id))
+                return (".".join(reversed(parts)),)
+            return (str(expression.attr),)
+        if isinstance(expression, ast.Tuple):
+            return tuple(
+                identity
+                for item in expression.elts
+                for identity in type_identities(item)
+            )
+        return ()
+
+    def declared_record_field(
+        owner_fact: Any, attribute: str,
+    ) -> Any:
+        if not (
+            isinstance(owner_fact, _ProgramABIValueFact)
+            and owner_fact.storage == "record"
+        ):
+            return unresolved
+        candidate_records = [
+            *(graph.G.graph.get("parameter_record_abi") or {}).values(),
+            *dict(
+                (graph.G.graph.get("program_abi") or {}).get("records") or {}
+            ).values(),
+        ]
+        matching_records = tuple({
+            str(record.get("identity") or ""): record
+            for record in candidate_records
+            if str(record.get("identity") or "") == owner_fact.python_type
+        }.values())
+        if len(matching_records) != 1:
+            return unresolved
+        field = dict(matching_records[0].get("fields") or {}).get(attribute)
+        if field is None:
+            return unresolved
+        dtype = field.get("dtype")
+        nested_records = dict(
+            (graph.G.graph.get("program_abi") or {}).get("records") or {}
+        )
+        nested_record = nested_records.get(str(field.get("record") or ""))
+        value_record = nested_records.get(
+            str(field.get("value_record") or "")
+        )
+        python_type = (
+            str((nested_record or {}).get("identity") or field["record"])
+            if str(field.get("storage") or "") == "record"
+            else {
+                "bool": "builtins.bool",
+                "int": "builtins.int",
+                "int32": "builtins.int",
+                "int64": "builtins.int",
+                "float": "builtins.float",
+                "float32": "builtins.float",
+                "float64": "builtins.float",
+            }.get(str(dtype), str(dtype or "unknown"))
+        )
+        value_python_type = (
+            str(field.get("value_python_type") or "") or None
+            if field.get("value_tensor")
+            else (
+                None
+                if value_record is None
+                else str(
+                    value_record.get("identity")
+                    or field.get("value_record")
+                )
+            )
+        )
+        return _ProgramABIValueFact(
+            python_type,
+            str(field.get("storage") or "unknown"),
+            None if dtype is None else str(dtype),
+            value_python_type,
+            (
+                "span"
+                if field.get("value_tensor")
+                else "record" if value_record is not None else None
+            ),
+            tuple(map(str, field.get("token_vocabulary") or ())) or None,
+            (
+                None
+                if field.get("shape") is None
+                else tuple(map(int, field["shape"]))
+            ),
+            (
+                None
+                if field.get("rank") is None
+                else int(field["rank"])
+            ),
+            (
+                None
+                if field.get("value_rank") is None
+                else int(field["value_rank"])
+            ),
+        )
+
+    def evaluate(node_id: int, data: Mapping[str, Any]) -> Any:
+        if (data.get("attributes") or {}).get("bound_method_ref") is not None:
+            return unresolved
+        node_type = str(data.get("type") or "")
+        operation = str(data.get("op") or node_type).casefold()
+        expression = data.get("expr_obj")
+        if node_type in {"Constant", "Const", "const"}:
+            return constant(data)
+        if node_type in {"Input", "input"}:
+            binding_name = (data.get("attributes") or {}).get(
+                "binding_name"
+            )
+            if binding_name is None:
+                identities = graph.G.graph.get("identity_table") or {}
+                parameters = set(map(
+                    str, graph.G.graph.get("function_parameters") or ()
+                ))
+                binding_name = next((
+                    str(name)
+                    for name, history in identities.items()
+                    if str(name) in parameters
+                    and int(node_id) in set(map(int, history or ()))
+                ), None)
+            specializations = graph.G.graph.get(
+                "planner_specializations"
+            ) or {}
+            specialized = specializations.get(str(binding_name), unresolved)
+            if specialized is not unresolved:
+                return specialized
+            # A signature default is not a fact about a parametric entrypoint:
+            # callers may still supply this input.  Omitted arguments at real
+            # call sites are copied into ``planner_specializations`` by
+            # _propagate_callsite_planner_specializations, above.  Folding the
+            # bare default here erased public inputs (and left already-carved
+            # deployment regions referring to the erased nodes).
+            value_abi = (
+                graph.G.graph.get("parameter_value_abi") or {}
+            ).get(str(binding_name))
+            if value_abi is not None:
+                linked_abi = (
+                    graph.G.graph.get("linked_value_abi") or {}
+                ).get(int(data.get("value_id", node_id)))
+                effective_abi = {
+                    **dict(value_abi),
+                    **(
+                        dict(linked_abi)
+                        if isinstance(linked_abi, Mapping) else {}
+                    ),
+                }
+                effective_shape = (
+                    None
+                    if effective_abi.get("shape") is None
+                    else tuple(map(int, effective_abi["shape"]))
+                )
+                return _ProgramABIValueFact(
+                    str(value_abi["python_type"]),
+                    str(effective_abi["storage"]),
+                    effective_abi.get("dtype"),
+                    shape=effective_shape,
+                    rank=(
+                        len(effective_shape)
+                        if effective_shape is not None
+                        else (
+                            None
+                            if effective_abi.get("rank") is None
+                            else int(effective_abi["rank"])
+                        )
+                    ),
+                )
+            record_abi = (
+                graph.G.graph.get("parameter_record_abi") or {}
+            ).get(str(binding_name))
+            if record_abi is not None:
+                return _ProgramABIValueFact(
+                    str(record_abi["identity"]), "record", None
+                )
+            descriptor = _tensor_descriptor(graph, int(node_id))
+            if descriptor is not None:
+                dtype = str(descriptor.get("dtype") or "unknown")
+                # A descriptor that carries the declared Python type (a
+                # caller's declared scalar forwarded across the call) is
+                # the fact; the dtype map is only the fallback for
+                # inferred tensor values.
+                python_type = str(descriptor.get("python_type") or "") or {
+                    "bool": "builtins.bool",
+                    "int": "builtins.int",
+                    "int32": "builtins.int",
+                    "int64": "builtins.int",
+                    "float": "builtins.float",
+                    "float32": "builtins.float",
+                    "float64": "builtins.float",
+                }.get(dtype, dtype)
+                return _ProgramABIValueFact(
+                    python_type,
+                    "span" if tuple(descriptor.get("shape") or ()) else "scalar",
+                    dtype,
+                )
+            return unresolved
+        if node_type in {"Slice", "slice"} or isinstance(
+            expression, ast.Slice,
+        ):
+            # A slice is an ordinary structural value, the same currency the
+            # basic-index reader already builds.  Without it a shape tuple
+            # could be indexed (``x.shape[0]``) and concatenated
+            # (``x.shape + (1,)``) but never sliced, so ``x.shape[:2] + (1,)``
+            # left its reshape unresolved: the reshape kept the source extents
+            # and the consuming operation saw incompatible operands.
+            bounds: dict[str, Any] = {}
+            for parent, role in (data.get("parents") or ()):
+                role = str(role)
+                if role not in {"lower", "upper", "step"}:
+                    continue
+                bound = known.get(int(parent), unresolved)
+                if bound is unresolved or isinstance(
+                    bound, _ProgramABIValueFact
+                ):
+                    return unresolved
+                bounds[role] = bound
+            return slice(
+                bounds.get("lower"), bounds.get("upper"), bounds.get("step"),
+            )
+        if node_type in {"Tuple", "List", "Set"} or isinstance(
+            expression, (ast.Tuple, ast.List, ast.Set),
+        ):
+            values = tuple(
+                known.get(int(parent), unresolved)
+                for parent, _role in (data.get("parents") or ())
+            )
+            if any(value is unresolved for value in values):
+                return unresolved
+            if node_type == "List" or isinstance(expression, ast.List):
+                return list(values)
+            if node_type == "Set" or isinstance(expression, ast.Set):
+                return set(values)
+            return tuple(values)
+        if node_type in {"GetAttr", "Attribute"} or isinstance(
+            expression, ast.Attribute,
+        ):
+            parent = next((
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {"value", "base", "operand", "object"}
+            ), None)
+            attribute = str(
+                (data.get("attributes") or {}).get("attribute")
+                or getattr(expression, "attr", "")
+            )
+            if parent is not None:
+                owner_fact = known.get(parent, unresolved)
+                if (
+                    isinstance(owner_fact, _ProgramABIValueFact)
+                    and owner_fact.shape is not None
+                    and attribute in {"shape", "ndim", "ndims"}
+                ):
+                    return (
+                        owner_fact.shape
+                        if attribute == "shape"
+                        else len(owner_fact.shape)
+                    )
+                fixed = descriptor_attribute(parent, attribute)
+                if fixed is not unresolved:
+                    return fixed
+                field_fact = declared_record_field(owner_fact, attribute)
+                if field_fact is not unresolved:
+                    return field_fact
+        if node_type in {"Indexed", "indexed"} or isinstance(
+            expression, ast.Subscript,
+        ):
+            base = next((
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {"value", "base", "operand", "object"}
+            ), None)
+            base_fact = known.get(base, unresolved)
+            if (
+                isinstance(base_fact, _ProgramABIValueFact)
+                and base_fact.storage == "keyed"
+                and base_fact.value_python_type is not None
+            ):
+                return _ProgramABIValueFact(
+                    base_fact.value_python_type,
+                    base_fact.value_storage or "record",
+                    base_fact.dtype,
+                    rank=(
+                        int((data.get("attributes") or {}).get(
+                            "program_abi_rank"
+                        ))
+                        if (data.get("attributes") or {}).get(
+                            "program_abi_rank"
+                        ) is not None
+                        else base_fact.value_rank
+                    ),
+                )
+            if (
+                isinstance(base_fact, _ProgramABIValueFact)
+                and base_fact.storage == "span"
+                and isinstance(expression, ast.Subscript)
+            ):
+                source_rank, result_rank = symbolic_basic_index_ranks(
+                    expression.slice, base_fact.rank
+                )
+                if base is not None and int(base) in graph.G:
+                    base_data = graph.G.nodes[int(base)]
+                    base_attributes = dict(base_data.get("attributes") or {})
+                    base_attributes.update({
+                        "program_abi_storage": "span",
+                        "program_abi_rank": int(source_rank),
+                    })
+                    base_data["attributes"] = base_attributes
+                    base_tensor = dict(base_data.get("tensor") or {})
+                    base_tensor.update({
+                        "shape": tuple(base_fact.shape or ()),
+                        "dtype": str(base_fact.dtype or "unknown"),
+                        "rank": int(source_rank),
+                        "metadata_state": "dynamic",
+                    })
+                    base_data["tensor"] = base_tensor
+                return _ProgramABIValueFact(
+                    base_fact.python_type,
+                    "span",
+                    base_fact.dtype,
+                    shape=None,
+                    rank=int(result_rank),
+                )
+            index_facts = tuple(
+                known.get(int(parent), unresolved)
+                for parent, role in (data.get("parents") or ())
+                if str(role) == "index"
+            )
+            if (
+                base_fact is not unresolved
+                and not isinstance(base_fact, _ProgramABIValueFact)
+                and index_facts
+                and all(index is not unresolved for index in index_facts)
+            ):
+                index = (
+                    index_facts[0]
+                    if len(index_facts) == 1 else tuple(index_facts)
+                )
+                try:
+                    return base_fact[index]
+                except (IndexError, KeyError, TypeError):
+                    return unresolved
+        if operation in {"get_shape", "dim", "numel", "ndim", "ndims"}:
+            parent = next((
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {"operand", "value", "base", "object"}
+            ), None)
+            descriptor = None if parent is None else _tensor_descriptor(
+                graph, parent
+            )
+            if descriptor is not None:
+                # Read the descriptor for what it states.  ``LU.get_shape()``
+                # folded to ``()`` here while LU's descriptor said nothing at
+                # all, and ``shp[-1]`` -- the matrix order every loop in the
+                # substitution helpers counts with -- then became a formal no
+                # caller could fill.
+                if not descriptor_states_a_shape(descriptor):
+                    return unresolved
+                if operation == "get_shape":
+                    if descriptor.get("metadata_state") == "dynamic":
+                        return unresolved
+                    return tuple(descriptor["shape"])
+                if operation == "dim":
+                    if descriptor.get("metadata_state") == "dynamic":
+                        return unresolved
+                    return len(descriptor["shape"])
+                if operation in {"ndim", "ndims"}:
+                    return len(descriptor["shape"])
+                count = 1
+                for extent in descriptor["shape"]:
+                    count *= int(extent)
+                return count
+        if node_type == "Phi" or isinstance(expression, ast.IfExp):
+            parents = {
+                str(role): int(parent)
+                for parent, role in (data.get("parents") or ())
+            }
+            predicate = known.get(parents.get("test"), unresolved)
+            if predicate is unresolved or isinstance(
+                predicate, _ProgramABIValueFact
+            ):
+                return unresolved
+            selected = parents.get("body" if bool(predicate) else "orelse")
+            if selected is None:
+                return unresolved
+            fixed = known.get(selected, unresolved)
+            return (
+                _StructuralValueAlias(selected)
+                if fixed is unresolved
+                or isinstance(fixed, _ProgramABIValueFact)
+                else fixed
+            )
+        if isinstance(expression, ast.UnaryOp):
+            parent = next((
+                int(parent) for parent, role in (data.get("parents") or ())
+                if str(role) in {"operand", "value"}
+            ), None)
+            value = known.get(parent, unresolved)
+            if value is unresolved or isinstance(
+                value, _ProgramABIValueFact
+            ):
+                return unresolved
+            if isinstance(expression.op, ast.USub):
+                return -value
+            if isinstance(expression.op, ast.UAdd):
+                return +value
+            if isinstance(expression.op, ast.Not):
+                return not value
+        if isinstance(expression, ast.BinOp):
+            parents = {
+                str(role): int(parent)
+                for parent, role in (data.get("parents") or ())
+            }
+            left_id = parents.get("lhs", parents.get("left"))
+            right_id = parents.get("rhs", parents.get("right"))
+            left = known.get(left_id, unresolved)
+            right = known.get(right_id, unresolved)
+            if isinstance(expression.op, ast.Add):
+                # Concatenating an EMPTY sequence is an identity on the other
+                # sequence, and it stays an identity when that sequence holds
+                # a runtime member.  Authored ``LU[..., i, i+1:]`` arrives as
+                # ``() + (i, slice(i + 1, None))`` once the ellipsis prefix
+                # proves empty; leaving it unresolved kept a Python
+                # concatenation in the graph that later lowering read as an
+                # arithmetic Add on a float index.
+                # Only for TUPLES: an empty list concatenation produces a
+                # new, separately mutable list, so aliasing it would merge two
+                # storage identities the source keeps apart.
+                for empty, other_id in ((left, right_id), (right, left_id)):
+                    if (
+                        isinstance(empty, tuple)
+                        and not empty
+                        and other_id is not None
+                        and int(other_id) in graph.G
+                        and str((
+                            graph.G.nodes[int(other_id)].get("attributes")
+                            or {}
+                        ).get("aggregate_kind") or "") == "tuple"
+                        # ...and only where the concatenation is READ as a
+                        # subscript.  An index is consumed, never mutated, so
+                        # merging it with the sequence it concatenates cannot
+                        # merge two mutable storage identities.
+                        and bool(data.get("children"))
+                        and all(
+                            str(role) == "index"
+                            for _child, role in data.get("children") or ()
+                        )
+                    ):
+                        other = known.get(int(other_id), unresolved)
+                        return (
+                            _StructuralValueAlias(int(other_id))
+                            if other is unresolved
+                            else other
+                        )
+            if left is unresolved or right is unresolved:
+                return unresolved
+            # A program-ABI fact states the runtime representation/type; it
+            # is not the runtime value.  Dataclass equality against a literal
+            # would otherwise evaluate to False here and erase live compiler
+            # branches merely because their graph-row schema was discovered.
+            if isinstance(left, _ProgramABIValueFact) or isinstance(
+                right, _ProgramABIValueFact
+            ):
+                return unresolved
+            try:
+                return {
+                    ast.Add: operator.add, ast.Sub: operator.sub,
+                    ast.Mult: operator.mul, ast.Div: operator.truediv,
+                    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+                    ast.Pow: operator.pow,
+                }[type(expression.op)](left, right)
+            except (KeyError, ArithmeticError, TypeError, ValueError):
+                return unresolved
+        if isinstance(expression, ast.Compare) and len(expression.ops) == 1:
+            parents = {
+                str(role): int(parent)
+                for parent, role in (data.get("parents") or ())
+            }
+            left = known.get(parents.get("lhs", parents.get("left")), unresolved)
+            right = known.get(parents.get("rhs", parents.get("right")), unresolved)
+            if left is unresolved or right is unresolved:
+                return unresolved
+            comparison_node = expression.ops[0]
+            if isinstance(comparison_node, (ast.Is, ast.IsNot)) and (
+                (isinstance(left, _ProgramABIValueFact) and right is None)
+                or (left is None and isinstance(right, _ProgramABIValueFact))
+            ):
+                # A program-ABI fact does not reveal a runtime numerical value,
+                # but it does prove that physical, nonoptional storage exists.
+                # This compiler has no tagged optional scalar/span/record ABI;
+                # such a value therefore cannot be Python ``None``.  Restrict
+                # the fold to identity-with-None so no equality or truthiness is
+                # inferred from the schema fact itself.
+                #
+                # The one exception is a fact whose declared Python type IS
+                # ``NoneType``: the contract states the value is None (a
+                # ``distribution=None`` forwarded as a declared scalar).  Then
+                # ``is None`` holds and ``is not None`` does not; folding it
+                # the other way selected ``return distribution(...)`` over an
+                # opaque callable and emptied the specialized callee.
+                fact = left if isinstance(left, _ProgramABIValueFact) else right
+                if str(fact.python_type) in {"builtins.NoneType", "NoneType"}:
+                    return isinstance(comparison_node, ast.Is)
+                return isinstance(comparison_node, ast.IsNot)
+            if isinstance(left, _ProgramABIValueFact) or isinstance(
+                right, _ProgramABIValueFact
+            ):
+                return unresolved
+            comparison = {
+                ast.Eq: operator.eq, ast.NotEq: operator.ne,
+                ast.Lt: operator.lt, ast.LtE: operator.le,
+                ast.Gt: operator.gt, ast.GtE: operator.ge,
+                ast.Is: operator.is_, ast.IsNot: operator.is_not,
+            }.get(type(comparison_node))
+            if comparison is None:
+                return unresolved
+            try:
+                return comparison(left, right)
+            except (TypeError, ValueError):
+                return unresolved
+        if isinstance(expression, ast.BoolOp):
+            values = [
+                known.get(int(parent), unresolved)
+                for parent, role in (data.get("parents") or ())
+                if str(role).startswith("value")
+            ]
+            if not values:
+                return unresolved
+            if not any(
+                value is unresolved
+                or isinstance(value, _ProgramABIValueFact)
+                for value in values
+            ):
+                # Python returns the selected operand, including non-Boolean
+                # values. Preserve source order and stop at the first decision.
+                for value in values[:-1]:
+                    if bool(value) != isinstance(expression.op, ast.And):
+                        return value
+                return values[-1]
+            # A later constant can determine the branch but cannot erase
+            # evaluation of an earlier unknown operand (which may mutate or
+            # raise). Fold only a proven constant prefix's selected operand.
+            for value in values[:-1]:
+                if value is unresolved or isinstance(value, _ProgramABIValueFact):
+                    break
+                if bool(value) != isinstance(expression.op, ast.And):
+                    return value
+            return unresolved
+        if not isinstance(expression, ast.Call):
+            return unresolved
+        name = (
+            expression.func.id
+            if isinstance(expression.func, ast.Name)
+            else expression.func.attr
+            if isinstance(expression.func, ast.Attribute)
+            else ""
+        )
+        arguments = positional(data)
+        values = tuple(known.get(argument, unresolved) for argument in arguments)
+        identity_actual = exact_return_formal_actual(node_id, data)
+        if identity_actual is not None:
+            identity_fact = known.get(identity_actual, unresolved)
+            if isinstance(identity_fact, _ProgramABIValueFact):
+                return identity_fact
+        result_class = (data.get("attributes") or {}).get("result_class_ref")
+        if result_class is not None:
+            records = tuple(
+                record
+                for record in dict(
+                    (graph.G.graph.get("program_abi") or {}).get("records") or {}
+                ).values()
+                if str(record.get("identity") or "") == str(result_class)
+                or str(record.get("identity") or "").rsplit(".", 1)[-1]
+                == str(result_class).rsplit(".", 1)[-1]
+            )
+            if len(records) == 1:
+                return _ProgramABIValueFact(
+                    str(records[0]["identity"]), "record", None,
+                )
+        if (name == "callable" and len(arguments) == 1
+                and (data.get("attributes") or {}).get("extraction_identity") == "builtins.callable"
+                and (graph.G.nodes[arguments[0]].get("attributes") or {}).get("bound_method_ref") is not None):
+            return True
+        if (
+            name == "callable"
+            and len(values) == 1
+            and (data.get("attributes") or {}).get("extraction_identity")
+            == "builtins.callable"
+            and values[0] is not unresolved
+            and not isinstance(values[0], _ProgramABIValueFact)
+        ):
+            # Capability of an exact structural constant is known without
+            # invoking it. In particular callable(None) must remove its dead
+            # call arm, not become an unexplained runtime predicate input.
+            return callable(values[0])
+        if name == "hasattr" and len(arguments) == 2:
+            attribute = values[1]
+            if isinstance(attribute, str) and not attribute.startswith("_"):
+                owner_id = int(arguments[0])
+                descriptor = _tensor_descriptor(graph, owner_id)
+                if descriptor is not None and attribute in {
+                    "item", "shape", "dtype", "ndim", "ndims", "numel",
+                }:
+                    # Repository tensors, including rank-zero tensors, expose
+                    # this fixed structural surface. ``item`` on a scalar is
+                    # the native scalar extraction already represented by the
+                    # pursued item node; its presence is not runtime data.
+                    return True
+                if descriptor_attribute(owner_id, attribute) is not unresolved:
+                    return True
+                if declared_record_field(
+                    known.get(owner_id, unresolved), attribute,
+                ) is not unresolved:
+                    return True
+        if name == "get" and values:
+            receiver = next((
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {"operand", "value", "base", "object"}
+            ), None)
+            field_name = values[0]
+            if receiver is not None and isinstance(field_name, str):
+                field_fact = declared_record_field(
+                    known.get(receiver, unresolved), field_name,
+                )
+                if field_fact is not unresolved:
+                    return field_fact
+        if name == "getattr" and len(arguments) >= 2:
+            attribute = values[1]
+            if isinstance(attribute, str) and not attribute.startswith("_"):
+                fixed = descriptor_attribute(arguments[0], attribute)
+                if fixed is not unresolved:
+                    return fixed
+                # `getattr(record, "field", default)` is the same read as
+                # `record.field` (and `record.get("field")` just above): a
+                # field the program ABI declares on the receiver is present,
+                # so the default never applies. Returning the default
+                # unconditionally folded `getattr(targets,
+                # "energy_exchange_fraction", None)` to None -- and every
+                # `x is not None` guard on it to a constant False -- even
+                # when the receiver's record declared the field (verified
+                # with tools/audit_structural_boolop_shapes.py
+                # --declare-optional-targets); it was only correct while the
+                # field happened to be undeclared.
+                field_fact = declared_record_field(
+                    known.get(arguments[0], unresolved), attribute,
+                )
+                if field_fact is not unresolved:
+                    return field_fact
+            if len(values) >= 3 and values[2] is not unresolved:
+                return values[2]
+        if name == "isinstance" and values:
+            if isinstance(values[0], _ProgramABIValueFact):
+                if values[0].token_vocabulary:
+                    # This is a runtime vocabulary token.  The SSA ABI pass
+                    # lowers the accepted source types to positions in the
+                    # same vocabulary; the fact is not one particular member.
+                    return unresolved
+                if (
+                    values[0].storage == "reference"
+                    or values[0].python_type in {"", "unknown"}
+                ):
+                    return unresolved
+                declared = values[0].python_type
+                accepted_identities = type_identities(
+                    expression.args[1] if len(expression.args) > 1 else None
+                )
+                return any(
+                    declared == identity
+                    or declared.endswith("." + identity)
+                    for identity in accepted_identities
+                )
+            accepted = safe_types(
+                expression.args[1] if len(expression.args) > 1 else None
+            )
+            if values[0] is not unresolved and accepted is not None:
+                return isinstance(values[0], accepted)
+        if any(value is unresolved or isinstance(value, _ProgramABIValueFact)
+               for value in values):
+            return unresolved
+        try:
+            if name in {"bool", "int", "float"}:
+                return {"bool": bool, "int": int, "float": float}[name](*values)
+            if name in {"tuple", "list", "set"}:
+                return {"tuple": tuple, "list": list, "set": set}[name](*values)
+            if name == "len":
+                return len(*values)
+            if name == "range":
+                return range(*values)
+            if name == "enumerate":
+                return tuple(enumerate(*values))
+            if name == "zip":
+                return tuple(zip(*values))
+            if name == "sorted":
+                return sorted(*values)
+            if name == "max":
+                return max(*values)
+            if name == "min":
+                return min(*values)
+            if name == "all":
+                return all(*values)
+            if name == "any":
+                return any(*values)
+            if name == "slice":
+                return slice(*values)
+        except (TypeError, ValueError, OverflowError):
+            return unresolved
+        return unresolved
+
+    def replace(node_id: int, value: Any) -> None:
+        nonlocal topology_changed
+        data = graph.G.nodes[int(node_id)]
+        topology_changed |= bool(data.get("parents"))
+        source_attributes = data.get("attributes") or {}
+        if isinstance(data.get("expr_obj"), ast.AST):
+            data.setdefault("authored_expr_obj", data["expr_obj"])
+        for parent, _role in tuple(data.get("parents") or ()):
+            if graph.G.has_edge(int(parent), int(node_id)):
+                graph.G.remove_edge(int(parent), int(node_id))
+            if int(parent) in graph.G:
+                graph.G.nodes[int(parent)]["children"] = [
+                    (child, role)
+                    for child, role in graph.G.nodes[int(parent)].get(
+                        "children", ()
+                    )
+                    if int(child) != int(node_id)
+                ]
+        # A constant fold changes the value-producing operation, not the
+        # structural identity of an authored aggregate.  Retain the compact
+        # aggregate ledger so later sequence lowering can still distinguish
+        # a singleton ``[opcode]`` from an arbitrary scalar-valued constant
+        # and recover its original leaf identity.
+        # ``tensor_output_descriptors`` travels WITH the ledger or the
+        # ledger is unrecoverable.  This fold clears the node's parents and
+        # drops every parent edge just above, so the leaf nodes the ledger
+        # names are stranded and later pruned; the retained leaf ids then
+        # refer to nodes that are no longer resident.
+        #
+        # ``_repair_missing_aggregate_leaf_projections`` exists for exactly
+        # this ("a selected producer can survive while a projection from
+        # the rejected arm is removed, leaving ... a dangling leaf ID"),
+        # and it rebuilds each missing position from the stored output
+        # descriptors -- but it declines when the descriptor count does not
+        # match the leaf count, and dropping them here makes that count 0.
+        # So the repair silently skipped, the consumer silently rejected a
+        # ledger it could not verify as resident, and the members arrived
+        # at the far end of the build as formals with no ABI accounting.
+        #
+        # Measured on the two-piece llvm_dt_system product: the
+        # ``copy_shallow()`` result held 52 leaves with 52 resident, and
+        # the folded ``saved = ... if rollback else None`` node held the
+        # same 52 leaves with 0 resident.  Every writer of this ledger
+        # publishes both keys together; only this fold split them.
+        attributes = {
+            key: copy.deepcopy(source_attributes[key])
+            for key in (
+                "producer_kind",
+                "aggregate_kind",
+                "sequence_key_columns",
+                "sequence_column_count",
+                "sequence_writable",
+                "aggregate_leaf_value_ids",
+                "tensor_output_descriptors",
+            )
+            if key in source_attributes
+        }
+        attributes.update({
+            "value": copy.deepcopy(value),
+            "structural_specialization": True,
+        })
+        data.update({
+            "type": "Constant", "op": "const", "label": repr(value),
+            "parents": [], "attributes": attributes,
+            "constant": copy.deepcopy(value), "expr_obj": None,
+        })
+        # A proven literal belongs to the VALUE, not to the graph instance
+        # that happened to fold it.  Several planned shells share one function
+        # name, each with its own copy, so a fact folded in one is invisible
+        # to a call edge that names another.  The book is keyed by identity,
+        # which is what makes it readable from any of them.
+        try:
+            from .identity_concordance import current_identity_book
+
+            if isinstance(value, (int, float, bool, str, tuple)):
+                literal_page = current_identity_book().page("proven_literal")
+                literal_row = (
+                    str(graph.G.graph.get("function_name")),
+                    int(data.get("value_id", node_id)),
+                )
+                if literal_page.latest(literal_row) != value:
+                    literal_page.set(
+                        literal_row,
+                        len(literal_page.history(literal_row)),
+                        value,
+                    )
+        except Exception:
+            pass
+
+    def remove_node(node_id: int) -> None:
+        nonlocal topology_changed
+        node_id = int(node_id)
+        if node_id not in graph.G:
+            return
+        topology_changed = True
+        for successor in tuple(graph.G.successors(node_id)):
+            successor_data = graph.G.nodes[int(successor)]
+            successor_data["parents"] = [
+                (int(parent), str(role))
+                for parent, role in successor_data.get("parents") or ()
+                if int(parent) != node_id
+            ]
+        for predecessor in tuple(graph.G.predecessors(node_id)):
+            graph.G.nodes[int(predecessor)]["children"] = [
+                (child, role)
+                for child, role in graph.G.nodes[int(predecessor)].get(
+                    "children", ()
+                )
+                if int(child) != node_id
+            ]
+        graph.G.remove_node(node_id)
+        # The identity table must name only values that exist.  A removed
+        # aggregate formal left in a name's history is later seeded as an
+        # untyped function argument by the SSA builder ("preserve the initial
+        # identity"), bound to the caller's tuple node, and reported as a
+        # missing caller value.
+        identities = graph.G.graph.get("identity_table") or {}
+        if any(
+            int(value_id) == node_id
+            for history in identities.values()
+            for value_id in history
+        ):
+            graph.G.graph["identity_table"] = {
+                str(name): tuple(
+                    int(value_id) for value_id in history
+                    if int(value_id) != node_id
+                )
+                for name, history in identities.items()
+            }
+
+    def replace_alias(node_id: int, source_id: int) -> None:
+        node_id = int(node_id)
+        source_id = int(source_id)
+        if node_id == source_id or source_id not in graph.G:
+            return
+        for successor in tuple(graph.G.successors(node_id)):
+            successor_data = graph.G.nodes[int(successor)]
+            replacement = tuple(
+                (
+                    source_id if int(parent) == node_id else int(parent),
+                    str(role),
+                )
+                for parent, role in successor_data.get("parents") or ()
+            )
+            if graph.G.has_edge(node_id, int(successor)):
+                graph.G.remove_edge(node_id, int(successor))
+            successor_data["parents"] = list(replacement)
+            _follow_declared_value_source(successor_data, node_id, source_id)
+            for parent, role in replacement:
+                if not graph.G.has_edge(int(parent), int(successor)):
+                    graph.G.add_edge(int(parent), int(successor), role=str(role))
+                children = graph.G.nodes[int(parent)].setdefault("children", [])
+                if (int(successor), str(role)) not in children:
+                    children.append((int(successor), str(role)))
+        identities = graph.G.graph.get("identity_table") or {}
+        graph.G.graph["identity_table"] = {
+            str(name): tuple(dict.fromkeys(
+                source_id if int(value_id) == node_id else int(value_id)
+                for value_id in history
+            ))
+            for name, history in identities.items()
+        }
+        graph.roots = [
+            source_id if int(root) == node_id else int(root)
+            for root in graph.roots
+        ]
+        if graph.G.graph.get("return_slot_values"):
+            graph.G.graph["return_slot_values"] = {
+                site: tuple(source_id if value is not None and int(value) == node_id else value
+                            for value in slots)
+                for site, slots in graph.G.graph["return_slot_values"].items()
+            }
+        # Cached copies of the aliased id live on nodes that are not its
+        # successors too (a loop node's carried initial, a tuple's leaf
+        # ledger); move every one before the id disappears.
+        _retarget_all_cached_value_ids(graph, node_id, source_id)
+        remove_node(node_id)
+
+    def same_structural_value(left: Any, right: Any) -> bool:
+        if left is right:
+            return True
+        if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+            try:
+                return bool(np.array_equal(left, right))
+            except (TypeError, ValueError):
+                return False
+        try:
+            return bool(left == right)
+        except (TypeError, ValueError):
+            return False
+
+    def tensor_data_descriptors(
+        data: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        """Return numerical operands, expanding authored tensor aggregates."""
+
+        descriptors = []
+        structural_roles = {"dim", "axis", "keepdim", "kw:dim", "kw:axis",
+                            "kw:keepdim", "kw:out", "kw:dtype"}
+        for parent, role in data.get("parents") or ():
+            role = str(role)
+            if role in {"callee", "func", "definition"} or role in (
+                structural_roles
+            ):
+                continue
+            parent_data = graph.G.nodes.get(int(parent), {})
+            attributes = parent_data.get("attributes") or {}
+            leaves = tuple(map(
+                int, attributes.get("aggregate_leaf_value_ids", ()),
+            ))
+            candidate_ids = (
+                leaves
+                if attributes.get("producer_kind") == "aggregate" and leaves
+                else (int(parent),)
+            )
+            for candidate_id in candidate_ids:
+                descriptor = _tensor_descriptor(graph, candidate_id)
+                if descriptor is None:
+                    candidate = graph.G.nodes.get(candidate_id, {})
+                    literal = candidate.get("constant")
+                    if literal is None:
+                        literal = (candidate.get("attributes") or {}).get(
+                            "value"
+                        )
+                    if str(candidate.get("type")) in {
+                        "Constant", "Const", "const",
+                    } and isinstance(literal, (bool, int, float)):
+                        # A scalar literal operand is an exact rank-0 value.
+                        descriptor = {
+                            "shape": (),
+                            "dtype": (
+                                "bool" if isinstance(literal, bool)
+                                else "int64" if isinstance(literal, int)
+                                else "float64"
+                            ),
+                        }
+                if descriptor is None:
+                    # One undescribed numerical operand makes the result
+                    # undescribed.  Broadcasting only the operands that
+                    # happen to be known silently shrinks a (8, 4, 800, ...)
+                    # result to the mask's (8, 4, 1, ...) and every later
+                    # shape is then wrong while looking specialized.
+                    return ()
+                descriptors.append(descriptor)
+        return tuple(descriptors)
+
+    def basic_index(node: ast.AST) -> Any:
+        """Decode only Python's literal basic-index vocabulary."""
+
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Slice):
+            return slice(
+                None if node.lower is None else basic_index(node.lower),
+                None if node.upper is None else basic_index(node.upper),
+                None if node.step is None else basic_index(node.step),
+            )
+        if isinstance(node, ast.Tuple):
+            return tuple(basic_index(item) for item in node.elts)
+        raise ValueError("index is not a basic literal")
+
+    def symbolic_basic_index_ranks(
+        selector: ast.AST, declared_rank: int | None,
+    ) -> tuple[int, int]:
+        """Constrain rank from basic-index syntax without guessing extents."""
+
+        items = tuple(selector.elts) if isinstance(selector, ast.Tuple) else (
+            selector,
+        )
+        consumed = sum(
+            1 for item in items
+            if not (
+                isinstance(item, ast.Constant)
+                and item.value in {None, Ellipsis}
+            )
+        )
+        has_ellipsis = any(
+            isinstance(item, ast.Constant) and item.value is Ellipsis
+            for item in items
+        )
+        source_rank = max(int(declared_rank or 0), consumed)
+        if has_ellipsis and declared_rank is None:
+            # Ellipsis alone does not state how many axes it spans.  Preserve
+            # the minimum proven by explicit selectors; later operations may
+            # strengthen the same graph identity.
+            source_rank = consumed
+        dropped = sum(
+            1 for item in items
+            if not isinstance(item, ast.Slice)
+            and not (
+                isinstance(item, ast.Constant)
+                and item.value in {None, Ellipsis}
+            )
+        )
+        added = sum(
+            1 for item in items
+            if isinstance(item, ast.Constant) and item.value is None
+        )
+        return source_rank, max(0, source_rank - dropped + added)
+
+    def retained_basic_index(data, expression):
+        # Structural reduction may fold an authored ndim-driven index while
+        # retaining the original AST. Consume that exact graph constant first.
+        indices = [int(parent) for parent, role in data.get("parents", ())
+                   if str(role) == "index" and int(parent) in graph.G]
+        if len(indices) == 1:
+            index = graph.G.nodes[indices[0]]
+            if str(index.get("type")) in {"Constant", "Const", "const"}:
+                return _constant_value(index)
+        return basic_index(expression.slice)
+
+    fixed_point_iteration = 0
+    seen_fixed_point_states: dict[str, int] = {}
+    changed = True
+    while changed:
+        fixed_point_iteration += 1
+        iteration_mutations: list[Any] = []
+        tensor_state_before = {
+            int(node_id): copy.deepcopy(data.get("tensor"))
+            for node_id, data in graph.G.nodes(data=True)
+        }
+        changed = False
+        for node_id in _dependency_order(graph):
+            node_id = int(node_id)
+            data = graph.G.nodes[node_id]
+            operation = str(data.get("op") or data.get("type") or "").casefold()
+            # ``history[0]`` over an authored aggregate with an exact leaf
+            # ledger IS that leaf.  Keeping the projection as a separate
+            # value leaves a consumer reading an operator whose base is a
+            # structural tuple; region planning then treats it as an
+            # undeclared input of the enclosing function.  The alias is exact
+            # (ledger position by literal index), so it is an identity, not
+            # a shape inference.
+            if operation in {"indexed", "getitem", "subscript"}:
+                base_ids = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) in {"base", "value", "object"}
+                )
+                index_ids = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) in {"index", "slice", "subscript"}
+                )
+                if (
+                    len(base_ids) == 1 and len(index_ids) == 1
+                    and base_ids[0] in graph.G and index_ids[0] in graph.G
+                ):
+                    base_attributes = (
+                        graph.G.nodes[base_ids[0]].get("attributes") or {}
+                    )
+                    leaves = tuple(map(int, base_attributes.get(
+                        "aggregate_leaf_value_ids", ()
+                    )))
+                    index_value = constant(graph.G.nodes[index_ids[0]])
+                    if (
+                        base_attributes.get("producer_kind") == "aggregate"
+                        and leaves
+                        and all(int(leaf) in graph.G for leaf in leaves)
+                        and isinstance(index_value, int)
+                        and not isinstance(index_value, bool)
+                        and -len(leaves) <= index_value < len(leaves)
+                        and int(node_id) != leaves[index_value % len(leaves)]
+                    ):
+                        replace_alias(
+                            node_id, leaves[index_value % len(leaves)]
+                        )
+                        known.pop(node_id, None)
+                        iteration_mutations.append((
+                            "aggregate-alias", int(node_id),
+                            int(leaves[index_value % len(leaves)]),
+                        ))
+                        changed = True
+                        break
+            inherited_descriptor = _tensor_descriptor(graph, node_id)
+            if (
+                inherited_descriptor is not None
+                and "shape" not in (data.get("tensor") or {})
+                and (
+                    operation in {
+                        "neg", "abs", "sin", "cos", "tan", "exp", "log",
+                        "sqrt", "tanh", "clone", "copy", "identity", "indexedstore",
+                        "index_set", "setitem", "indexed", "getitem",
+                        "subscript", "real", "imag", "conj",
+                    }
+                    or (
+                        operation == "getattr"
+                        and str((data.get("attributes") or {}).get(
+                            "attribute", ""
+                        )) in {"real", "imag"}
+                    )
+                    or operation in _DTYPE_CAST_OPERATIONS
+                )
+            ):
+                # These nodes preserve or alias a tensor descriptor.  Store
+                # the proven fact on the producer as well as returning it
+                # through _tensor_descriptor so later region cuts retain it.
+                data["tensor"] = copy.deepcopy(inherited_descriptor)
+            # The semantic operator name is the authored tensor operation
+            # (``greater_equal`` for ``>=``), not only the AST spelling.
+            semantic_operation = str(
+                (data.get("attributes") or {}).get("tensor_operation")
+                or (data.get("attributes") or {}).get("tensor_candidate")
+                or operation
+            ).casefold()
+            comparison_operations = {
+                "equal", "eq", "not_equal", "ne", "lt", "le", "gt", "ge",
+                "less", "less_equal", "greater", "greater_equal",
+                "lte", "gte",
+            }
+            if (
+                operation in {
+                    "add", "sub", "mult", "mul", "div", "truediv",
+                    "floordiv", "mod", "pow", "maximum", "minimum",
+                    "max", "min",
+                } | comparison_operations
+                or semantic_operation in comparison_operations
+            ) and not (
+                operation in {"max", "min"}
+                and isinstance(data.get("expr_obj"), ast.Call)
+                and isinstance(data["expr_obj"].func, ast.Attribute)
+            ):
+                # Every numerical operand must be described; a scalar
+                # literal is an exact rank-0 operand.  Broadcasting only the
+                # known operands is the partial-shape hazard fixed for
+                # ``where`` above.
+                numerical_parents = tuple(
+                    int(parent)
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) not in {"callee", "func", "definition"}
+                )
+                parent_descriptors = tuple(
+                    descriptor
+                    for parent in numerical_parents
+                    if (
+                        descriptor := _operand_descriptor(graph, parent)
+                    ) is not None
+                )
+                if len(parent_descriptors) != len(numerical_parents):
+                    parent_descriptors = ()
+                if parent_descriptors:
+                    try:
+                        shape = tuple(np.broadcast_shapes(*(
+                            descriptor["shape"]
+                            for descriptor in parent_descriptors
+                        )))
+                    except ValueError:
+                        shape = None
+                    if shape is not None:
+                        data["tensor"] = {
+                            "shape": shape,
+                            "dtype": (
+                                "bool" if (
+                                    operation in comparison_operations
+                                    or semantic_operation
+                                    in comparison_operations
+                                ) else next((
+                                    descriptor["dtype"]
+                                    for descriptor in parent_descriptors
+                                    if tuple(descriptor["shape"])
+                                ), parent_descriptors[0]["dtype"])
+                            ),
+                        }
+            if operation in {"indexed", "getitem", "subscript"}:
+                expression = data.get("expr_obj")
+                source_descriptor = None
+                index_values: list[Any] = []
+                for parent, role in data.get("parents") or ():
+                    if str(role) == "base":
+                        source_descriptor = _tensor_descriptor(
+                            graph, int(parent)
+                        )
+                    elif str(role) == "index":
+                        index_values.append(
+                            known.get(int(parent), unresolved)
+                        )
+
+                if source_descriptor is not None and isinstance(
+                    expression, ast.Subscript
+                ):
+                    try:
+                        from ..common.tensors.abstraction_methods.indexing import (
+                            normalize_basic_index,
+                        )
+
+                        # Tensor topology expansion makes an ellipsis explicit
+                        # as a structural tuple dependency (using the source
+                        # rank).  That parent is the canonical index value;
+                        # the surface AST is only a fallback for indexes that
+                        # remained literal through reduction.
+                        if index_values and all(
+                            value is not unresolved for value in index_values
+                        ):
+                            normalized_index = (
+                                index_values[0]
+                                if len(index_values) == 1 else tuple(index_values)
+                            )
+                        else:
+                            normalized_index = retained_basic_index(data, expression)
+                        _axes, result_shape = normalize_basic_index(
+                            normalized_index,
+                            tuple(source_descriptor["shape"]),
+                        )
+                    except (IndexError, TypeError, ValueError, NotImplementedError):
+                        result_shape = None
+                    if result_shape is not None:
+                        attributes = dict(data.get("attributes") or {})
+                        attributes["basic_index_axes"] = tuple(
+                            (tuple(map(int, indices)), bool(drop_axis))
+                            for indices, drop_axis in _axes
+                        )
+                        attributes["basic_index_source_shape"] = tuple(
+                            source_descriptor["shape"]
+                        )
+                        data["attributes"] = attributes
+                        data["tensor"] = {
+                            "shape": tuple(result_shape),
+                            "dtype": source_descriptor["dtype"],
+                        }
+            if (
+                operation in {"indexedstore", "index_set", "setitem"}
+                and not (data.get("attributes") or {}).get(
+                    "basic_index_axes"
+                )
+            ):
+                expression = data.get("expr_obj")
+                base = next((
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) == "base"
+                ), None)
+                source_descriptor = (
+                    None if base is None
+                    else _tensor_descriptor(graph, base)
+                )
+                if (
+                    source_descriptor is not None
+                    and isinstance(expression, ast.Subscript)
+                ):
+                    try:
+                        from ..common.tensors.abstraction_methods.indexing import (
+                            normalize_basic_index,
+                        )
+
+                        axes, _selection_shape = normalize_basic_index(
+                            retained_basic_index(data, expression),
+                            tuple(source_descriptor["shape"]),
+                        )
+                    except (
+                        IndexError, TypeError, ValueError,
+                        NotImplementedError,
+                    ):
+                        axes = None
+                    if axes is not None:
+                        attributes = dict(data.get("attributes") or {})
+                        attributes["basic_index_axes"] = tuple(
+                            (tuple(map(int, indices)), bool(drop_axis))
+                            for indices, drop_axis in axes
+                        )
+                        attributes["basic_index_source_shape"] = tuple(
+                            source_descriptor["shape"]
+                        )
+                        data["attributes"] = attributes
+                        data["tensor"] = copy.deepcopy(source_descriptor)
+            attributes = data.get("attributes") or {}
+            tensor_candidate = str(
+                attributes.get("tensor_candidate") or operation
+            ).casefold()
+            if tensor_candidate == "arange":
+                positional_values = []
+                for position, parent in enumerate(positional(data)):
+                    value = known.get(int(parent), unresolved)
+                    if value is unresolved:
+                        # Unresolved HERE only means this copy was not told.
+                        # The bound is a formal whose callsites may all have
+                        # proved the same literal, and that is a fact about
+                        # the formal.
+                        try:
+                            value = _source_static_literal(graph, int(parent))
+                        except (ValueError, KeyError, TypeError):
+                            value = unresolved
+                    if value is unresolved:
+                        positional_values = []
+                        break
+                    positional_values.append(value)
+                expression = data.get("expr_obj")
+                if not positional_values and isinstance(expression, ast.Call):
+                    try:
+                        positional_values = [
+                            ast.literal_eval(argument)
+                            for argument in expression.args[:3]
+                        ]
+                    except (TypeError, ValueError):
+                        positional_values = []
+                if positional_values:
+                    if len(positional_values) == 1:
+                        start, stop, step = 0, positional_values[0], 1
+                    else:
+                        start, stop = positional_values[:2]
+                        step = (
+                            positional_values[2]
+                            if len(positional_values) >= 3 else 1
+                        )
+                    if stop is None:
+                        start, stop = 0, start
+                    try:
+                        count = len(range(int(start), int(stop), int(step)))
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        count = 0
+                    if count > 0:
+                        data["tensor"] = {
+                            "shape": (count,), "dtype": "float64",
+                        }
+                        normalized = dict(data.get("attributes") or {})
+                        normalized.update({
+                            "arange_start": float(start),
+                            "arange_step": float(step),
+                            "arange_count": count,
+                        })
+                        data["attributes"] = normalized
+            if tensor_candidate in {
+                "zeros_like", "empty_like", "ones_like", "full_like",
+            }:
+                source_descriptor = next((
+                    _tensor_descriptor(graph, int(parent))
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) not in {
+                        "callee", "func", "function", "definition",
+                    }
+                    and _tensor_descriptor(graph, int(parent)) is not None
+                ), None)
+                if source_descriptor is not None:
+                    data["tensor"] = copy.deepcopy(source_descriptor)
+            if (
+                tensor_candidate in {
+                    "stack", "cat", "concat", "concatenate", "where",
+                }
+            ):
+                operand_descriptors = tensor_data_descriptors(data)
+                if tensor_candidate == "stack" and operand_descriptors:
+                    operand_shape = tuple(operand_descriptors[0]["shape"])
+                    if all(
+                        tuple(descriptor["shape"]) == operand_shape
+                        for descriptor in operand_descriptors
+                    ):
+                        axis = structural_call_argument(
+                            data,
+                            roles={
+                                "dim", "axis", "kw:dim", "kw:axis",
+                                "arg:1",
+                            },
+                            keywords={"dim", "axis"},
+                            default=0,
+                        )
+                        position = int(axis) % (len(operand_shape) + 1)
+                        data["tensor"] = {
+                            "shape": (
+                                *operand_shape[:position],
+                                len(operand_descriptors),
+                                *operand_shape[position:],
+                            ),
+                            "dtype": operand_descriptors[0]["dtype"],
+                        }
+                elif tensor_candidate in {
+                    "cat", "concat", "concatenate",
+                } and operand_descriptors:
+                    shapes = tuple(
+                        tuple(descriptor["shape"])
+                        for descriptor in operand_descriptors
+                    )
+                    rank = len(shapes[0])
+                    axis = structural_call_argument(
+                        data,
+                        roles={
+                            "dim", "axis", "kw:dim", "kw:axis", "arg:1",
+                        },
+                        keywords={"dim", "axis"},
+                        default=0,
+                    )
+                    position = int(axis) % rank if rank else 0
+                    if rank and all(
+                        len(shape) == rank and all(
+                            index == position or extent == shapes[0][index]
+                            for index, extent in enumerate(shape)
+                        )
+                        for shape in shapes
+                    ):
+                        result_shape = list(shapes[0])
+                        result_shape[position] = sum(
+                            shape[position] for shape in shapes
+                        )
+                        data["tensor"] = {
+                            "shape": tuple(result_shape),
+                            "dtype": operand_descriptors[0]["dtype"],
+                        }
+                elif tensor_candidate == "where" and operand_descriptors:
+                    try:
+                        result_shape = tuple(np.broadcast_shapes(*(
+                            descriptor["shape"]
+                            for descriptor in operand_descriptors
+                        )))
+                    except ValueError:
+                        result_shape = None
+                    if result_shape is not None:
+                        data["tensor"] = {
+                            "shape": result_shape,
+                            "dtype": next((
+                                descriptor["dtype"]
+                                for descriptor in operand_descriptors
+                                if descriptor["dtype"] != "bool"
+                            ), operand_descriptors[0]["dtype"]),
+                        }
+            if tensor_candidate in {"gather", "index_select"}:
+                source_descriptor = next((
+                    _tensor_descriptor(graph, int(parent))
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"operand", "value", "base"}
+                    and _tensor_descriptor(graph, int(parent)) is not None
+                ), None)
+                index_descriptor = next((
+                    _tensor_descriptor(graph, int(parent))
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"indices", "index", "arg:0", "arg:1"}
+                    and _tensor_descriptor(graph, int(parent)) is not None
+                ), None)
+                axis = structural_call_argument(
+                    data,
+                    roles={
+                        "dim", "axis", "kw:dim", "kw:axis", "arg:1",
+                    },
+                    keywords={"dim", "axis"},
+                    default=0,
+                )
+                if source_descriptor is not None and index_descriptor is not None:
+                    source_shape = tuple(source_descriptor["shape"])
+                    position = int(axis) % len(source_shape)
+                    attributes = dict(data.get("attributes") or {})
+                    attributes.setdefault("dim", position)
+                    data["attributes"] = attributes
+                    data["tensor"] = {
+                        "shape": (
+                            *source_shape[:position],
+                            *tuple(index_descriptor["shape"]),
+                            *source_shape[position + 1:],
+                        ),
+                        "dtype": source_descriptor["dtype"],
+                    }
+            if tensor_candidate in {
+                    "transpose", "swapaxes", "transpose_last2", "t"
+                }:
+                source_descriptor = next((
+                    _tensor_descriptor(graph, int(parent))
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"operand", "arg:0", "value"}
+                    and _tensor_descriptor(graph, int(parent)) is not None
+                ), None)
+                if source_descriptor is not None:
+                    source_shape = tuple(source_descriptor["shape"])
+                    result_shape = (
+                        (*source_shape[:-2], source_shape[-1], source_shape[-2])
+                        if len(source_shape) >= 2 else source_shape
+                    )
+                    data["tensor"] = {
+                        "shape": result_shape,
+                        "dtype": source_descriptor["dtype"],
+                    }
+            if tensor_candidate in {"matmul", "mm"}:
+                operand_descriptors = tuple(
+                    descriptor
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) not in {"callee", "func", "definition"}
+                    and (
+                        descriptor := _tensor_descriptor(graph, int(parent))
+                    ) is not None
+                )
+                if len(operand_descriptors) >= 2:
+                    left_shape = tuple(operand_descriptors[0]["shape"])
+                    right_shape = tuple(operand_descriptors[1]["shape"])
+                    result_shape = None
+                    if len(left_shape) == 1 and len(right_shape) == 1:
+                        result_shape = ()
+                    elif len(left_shape) == 1 and len(right_shape) >= 2:
+                        result_shape = (*right_shape[:-2], right_shape[-1])
+                    elif len(left_shape) >= 2 and len(right_shape) == 1:
+                        result_shape = (*left_shape[:-2], left_shape[-2])
+                    elif len(left_shape) >= 2 and len(right_shape) >= 2:
+                        try:
+                            batch_shape = tuple(np.broadcast_shapes(
+                                left_shape[:-2], right_shape[:-2],
+                            ))
+                        except ValueError:
+                            batch_shape = None
+                        if batch_shape is not None:
+                            result_shape = (
+                                *batch_shape, left_shape[-2], right_shape[-1],
+                            )
+                    if result_shape is not None:
+                        data["tensor"] = {
+                            "shape": tuple(result_shape),
+                            "dtype": operand_descriptors[0]["dtype"],
+                        }
+            if tensor_candidate in {"reshape", "view"}:
+                source_descriptor = next((
+                    _tensor_descriptor(graph, int(parent))
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"operand", "value"}
+                    and _tensor_descriptor(graph, int(parent)) is not None
+                ), None)
+                shape_arguments = sorted(
+                    (
+                        int(position),
+                        known.get(int(parent), unresolved),
+                    )
+                    for parent, role in (data.get("parents") or ())
+                    for position in (_positional_argument_index(str(role)),)
+                    if position is not None
+                    and known.get(int(parent), unresolved) is not unresolved
+                )
+                named_shape = next((
+                    known.get(int(parent), unresolved)
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"shape", "new_shape"}
+                    and known.get(int(parent), unresolved) is not unresolved
+                ), unresolved)
+                result_shape = (
+                    named_shape
+                    if named_shape is not unresolved
+                    else tuple(value for _position, value in shape_arguments)
+                )
+                if (
+                    isinstance(result_shape, tuple)
+                    and len(result_shape) == 1
+                    and isinstance(result_shape[0], (tuple, list))
+                ):
+                    result_shape = result_shape[0]
+                if source_descriptor is not None:
+                    if isinstance(result_shape, (tuple, list)) and all(
+                        isinstance(extent, int) and not isinstance(extent, bool)
+                        for extent in result_shape
+                    ):
+                        resolved_shape = [int(extent) for extent in result_shape]
+                        inferred = [
+                            index for index, extent in enumerate(resolved_shape)
+                            if extent == -1
+                        ]
+                        if len(inferred) <= 1 and all(
+                            extent > 0 or extent == -1
+                            for extent in resolved_shape
+                        ):
+                            source_count = int(np.prod(
+                                tuple(source_descriptor["shape"]), dtype=np.int64
+                            ))
+                            known_count = int(np.prod(
+                                tuple(
+                                    extent for extent in resolved_shape
+                                    if extent != -1
+                                ),
+                                dtype=np.int64,
+                            ))
+                            if inferred and known_count and source_count % known_count == 0:
+                                resolved_shape[inferred[0]] = source_count // known_count
+                            if not inferred or -1 not in resolved_shape:
+                                data["tensor"] = {
+                                    "shape": tuple(resolved_shape),
+                                    "dtype": source_descriptor["dtype"],
+                                }
+            if (
+                tensor_candidate in {
+                    "sum", "mean", "prod", "min", "max", "any", "all"
+                }
+            ):
+                method_style = any(
+                    str(role) in {"operand", "value", "self", "receiver"}
+                    for _parent, role in (data.get("parents") or ())
+                )
+                source_descriptor = next((
+                    _tensor_descriptor(graph, int(parent))
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in (
+                        {"operand", "value", "self", "receiver"}
+                        if method_style else {"arg:0"}
+                    )
+                    and _tensor_descriptor(graph, int(parent)) is not None
+                ), None)
+                axis = structural_call_argument(
+                    data,
+                    roles={
+                        "dim", "axis", "kw:dim", "kw:axis",
+                        "arg:0" if method_style else "arg:1",
+                    },
+                    keywords={"dim", "axis"},
+                    default=unresolved,
+                )
+                keepdim = structural_call_argument(
+                    data,
+                    roles={
+                        "keepdim", "kw:keepdim",
+                        "arg:1" if method_style else "arg:2",
+                    },
+                    keywords={"keepdim"},
+                    default=False,
+                )
+                if source_descriptor is not None and axis is not unresolved:
+                    source_shape = tuple(source_descriptor["shape"])
+                    raw_axes = (
+                        tuple(axis) if isinstance(axis, (tuple, list))
+                        else (int(axis),)
+                    )
+                    axes = tuple(sorted({
+                        int(item) % len(source_shape) for item in raw_axes
+                    })) if source_shape else ()
+                    if bool(keepdim):
+                        result_shape = tuple(
+                            1 if index in axes else extent
+                            for index, extent in enumerate(source_shape)
+                        )
+                    else:
+                        result_shape = tuple(
+                            extent for index, extent in enumerate(source_shape)
+                            if index not in axes
+                        )
+                    data["tensor"] = {
+                        "shape": result_shape,
+                        "dtype": source_descriptor["dtype"],
+                    }
+                    attributes = dict(data.get("attributes") or {})
+                    attributes.setdefault("dim", axis)
+                    attributes.setdefault("keepdim", bool(keepdim))
+                    data["attributes"] = attributes
+            if str(data.get("type")) in {"Constant", "Const", "const"}:
+                value = constant(data)
+            else:
+                value = evaluate(node_id, data)
+            if value is unresolved:
+                continue
+            if (
+                isinstance(value, _ProgramABIValueFact)
+                and value.storage == "span"
+            ):
+                # The Program ABI has already proved this value is a tensor
+                # span. A keyed Tensor lookup has runtime extents, so its
+                # static shape is empty while its physical rank remains one.
+                # Publish that exact distinction on the graph node before the
+                # hierarchy freezes region values; otherwise the empty shape
+                # is interpreted as a scalar and tensor operators are split
+                # away from the lookup that produced their storage.
+                rank = (
+                    len(value.shape)
+                    if value.shape is not None
+                    else int(value.rank or 1)
+                )
+                attributes = dict(data.get("attributes") or {})
+                attributes.update({
+                    "program_abi_storage": "span",
+                    "program_abi_rank": int(rank),
+                    "program_abi_dtype": str(value.dtype or "unknown"),
+                })
+                data["attributes"] = attributes
+                binding_name = str(attributes.get("binding_name") or "")
+                callsite_descriptor = (
+                    graph.G.graph.get("planner_tensor_descriptors") or {}
+                ).get(binding_name)
+                if isinstance(callsite_descriptor, Mapping) and (
+                    callsite_descriptor.get("shape") is not None
+                ):
+                    # The rank-only ProgramABI fact is the fallback boundary;
+                    # it cannot overwrite the exact descriptor already bound
+                    # by this callsite.  Doing so changed ``mask: (2,)`` back
+                    # into a dynamic empty shape while leaving the planner
+                    # ledger itself correct, splitting one formal identity
+                    # into two incompatible facts.
+                    data["tensor"] = copy.deepcopy(dict(callsite_descriptor))
+                    from .identity_concordance import record_proven_shape
+
+                    record_proven_shape(
+                        graph.G.graph.get("function_name"),
+                        int(data.get("value_id", node_id)),
+                        tuple(callsite_descriptor.get("shape") or ()),
+                        callsite_descriptor.get("dtype"),
+                        int(_dependency_levels(graph).get(int(node_id), 0)),
+                    )
+                else:
+                    data["tensor"] = {
+                        "shape": tuple(value.shape or ()),
+                        "dtype": str(value.dtype or "unknown"),
+                        "rank": int(rank),
+                        **(
+                            {"metadata_state": "dynamic"}
+                            if value.shape is None else {}
+                        ),
+                    }
+            if (
+                node_id in loop_carried_initial_ids
+                and not isinstance(value, _ProgramABIValueFact)
+            ) or (
+                node_id in mutated_sequence_ids
+                and isinstance(value, (
+                    list, tuple, set, frozenset, dict, bytes, bytearray,
+                ))
+            ):
+                # A mutated collection's initializer is not its runtime
+                # contents. In particular, sorting a list populated by a
+                # retained append loop must not sort its initial empty list.
+                # A specialization that is NOT a collection (``None`` for a
+                # parameter the caller left at its default) protects nothing:
+                # the name never holds contents, the mutation guarded by
+                # ``name is not None`` is dead, and folding that guard is what
+                # removes the dead rows.
+                # Likewise, this literal may be the entry arm of a Phi, not an invariant
+                # fact for the loop's condition/body.  Keeping it out of the
+                # structural-known table prevents the fixed point from
+                # replacing expressions such as ``iters < max_iters`` with
+                # their iteration-zero value.  A ProgramABI type/storage fact
+                # is different: the native loop cannot change a physical
+                # scalar/span/record slot into Python None, so that fact stays
+                # invariant even when the value in the slot is loop-carried.
+                continue
+            if isinstance(value, _StructuralValueAlias):
+                replace_alias(node_id, value.source_id)
+                known.pop(node_id, None)
+                iteration_mutations.append((
+                    "structural-alias", int(node_id), int(value.source_id),
+                ))
+                changed = True
+                break
+            if (
+                node_id not in known
+                or not same_structural_value(known[node_id], value)
+            ):
+                known[node_id] = value
+                iteration_mutations.append((
+                    "known", int(node_id), str(operation), repr(value)[:160],
+                ))
+                changed = True
+            # ABI facts prove source type and physical presence; they are not
+            # runtime literals.  Keep the authored SSA producer intact so a
+            # record field remains a normal dataflow value while comparisons
+            # such as ``field is not None`` can still be decided here.
+            if isinstance(value, _ProgramABIValueFact):
+                continue
+            # The same rule holds for an authored aggregate of facts.  Folding
+            # ``(hub, angle)`` into a Constant severs the Tuple from its leaf
+            # producers, the now-unconsumed span parameters are dropped as
+            # unused, and every later call boundary sees a ledger whose leaf
+            # identities no longer exist.  The tuple stays a known structural
+            # value for projection/isinstance decisions; its producer stays.
+            if _contains_program_abi_fact(value):
+                continue
+            if str(data.get("type")) not in {"Constant", "Const", "const"}:
+                replace(node_id, value)
+
+        # Descriptor propagation and structural folding are one fixed-point
+        # problem, but progress is a fact about a COMPLETED round.  An indexed
+        # Program-ABI span can acquire a provisional tensor descriptor above
+        # and then be restored to its authoritative callsite/ABI descriptor
+        # later in the same node visit.  Treating that transient intermediate
+        # value as progress made an otherwise settled graph repeat forever.
+        # Compare the round boundaries, and record only the net descriptor
+        # transitions in both the trace and concordance.
+        net_tensor_mutations = []
+        for changed_node_id, changed_data in graph.G.nodes(data=True):
+            changed_node_id = int(changed_node_id)
+            before = tensor_state_before.get(changed_node_id)
+            after = changed_data.get("tensor")
+            if before == after:
+                continue
+            net_tensor_mutations.append((
+                "tensor", changed_node_id,
+                str(changed_data.get("op") or changed_data.get("type") or ""),
+                _callsite_descriptor_receipt(before),
+                _callsite_descriptor_receipt(after),
+            ))
+        if net_tensor_mutations:
+            iteration_mutations.extend(net_tensor_mutations)
+            changed = True
+
+        fixed_point_facts = tuple(
+            (
+                int(node_id),
+                str(data.get("type") or ""),
+                repr(_callsite_descriptor_receipt(data.get("tensor"))),
+                repr(known.get(int(node_id), unresolved))[:240],
+            )
+            for node_id, data in sorted(graph.G.nodes(data=True))
+        )
+        fixed_point_digest = hashlib.sha256(
+            repr(fixed_point_facts).encode("utf-8")
+        ).hexdigest()[:16]
+        repeated_iteration = seen_fixed_point_states.get(fixed_point_digest)
+        seen_fixed_point_states.setdefault(
+            fixed_point_digest, fixed_point_iteration
+        )
+        from .identity_concordance import current_identity_book
+
+        fixed_point_page = current_identity_book().page(
+            "structural_specialization_fixed_point"
+        )
+        fixed_point_row = str(graph.G.graph.get("function_name") or "")
+        fixed_point_page.set(
+            fixed_point_row,
+            len(fixed_point_page.history(fixed_point_row)),
+            (
+                fixed_point_digest,
+                bool(changed),
+                tuple(net_tensor_mutations),
+            ),
+        )
+        if _progress is not None and (
+            fixed_point_iteration <= 3
+            or repeated_iteration is not None
+            or not changed
+        ):
+            _progress({
+                "fold_state": "fixed-point-iteration",
+                "fold_iteration": fixed_point_iteration,
+                "changed": bool(changed),
+                "state_digest": fixed_point_digest,
+                "repeats_iteration": repeated_iteration,
+                "mutation_count": len(iteration_mutations),
+                "mutations": tuple(iteration_mutations[:8]),
+            })
+        if changed and repeated_iteration is not None:
+            raise RuntimeError(
+                "structural specialization fixed point repeated a prior "
+                "state while still claiming progress: "
+                f"function={graph.G.graph.get('function_name')!r}, "
+                f"iteration={fixed_point_iteration}, "
+                f"repeats_iteration={repeated_iteration}, "
+                f"digest={fixed_point_digest}, "
+                f"mutations={tuple(iteration_mutations[:8])!r}"
+            )
+
+    # A callsite specialization may make source control decidable even when
+    # the selected value remains runtime numerical data.  Remove only the
+    # unselected lexical compartment and replace its merge Phi with an alias
+    # to the selected producer.  The proof is the graph constant above; no
+    # runtime tensor value or Python callable participates.
+    branch_memberships = _branch_compartments(graph)
+    pruned = True
+    while pruned:
+        pruned = False
+        for control_id, control_data in tuple(graph.G.nodes(data=True)):
+            expression = control_data.get("expr_obj")
+            if not isinstance(expression, ast.If):
+                continue
+            predicate_id = next((
+                int(parent)
+                for parent, role in control_data.get("parents") or ()
+                if str(role) == "test"
+            ), None)
+            if predicate_id is None or predicate_id not in graph.G:
+                continue
+            predicate = constant(graph.G.nodes[predicate_id])
+            if predicate is unresolved:
+                continue
+            selected_role = "body" if bool(predicate) else "orelse"
+            rejected_role = "orelse" if bool(predicate) else "body"
+            for phi_id, phi_data in tuple(graph.G.nodes(data=True)):
+                if str(phi_data.get("type")) != "Phi":
+                    continue
+                phi_parents = {
+                    str(role): int(parent)
+                    for parent, role in phi_data.get("parents") or ()
+                }
+                source_conditional_id = (
+                    phi_data.get("attributes") or {}
+                ).get("source_conditional_id")
+                if (
+                    phi_parents.get("test") != predicate_id
+                    and (
+                        source_conditional_id is None
+                        or int(source_conditional_id) != int(control_id)
+                    )
+                ):
+                    continue
+                selected = phi_parents.get(selected_role)
+                if selected is not None:
+                    replace_alias(int(phi_id), int(selected))
+            rejected_statements = (
+                expression.orelse if rejected_role == "orelse"
+                else expression.body
+            )
+            rejected_ast_ids = {
+                id(member)
+                for statement in rejected_statements
+                for member in ast.walk(statement)
+            }
+            rejected_signatures = {
+                _ast_source_signature(member)
+                for statement in rejected_statements
+                for member in ast.walk(statement)
+            }
+            # ``if predicate: return value`` guards the lexical tail even
+            # though Python spells no explicit ``else``.  Function ingestion
+            # retains the exact top-level statement list; when the selected
+            # arm is terminal, include every following statement in the
+            # rejected compartment.  This is source control, not a heuristic
+            # over node numbering, and it survives clean-graph AST copies via
+            # source signatures.
+            function_body = tuple(
+                graph.G.graph.get("function_body") or ()
+            )
+            source_index = next((
+                index
+                for index, statement in enumerate(function_body)
+                if isinstance(statement, ast.If)
+                and _ast_source_signature(statement)
+                == _ast_source_signature(expression)
+            ), None)
+            selected_statements = (
+                tuple(expression.body)
+                if selected_role == "body"
+                else tuple(expression.orelse)
+            )
+            if (
+                source_index is not None
+                and selected_statements
+                and isinstance(selected_statements[-1], (ast.Return, ast.Raise))
+            ):
+                rejected_signatures.update(
+                    _ast_source_signature(member)
+                    for statement in function_body[source_index + 1:]
+                    for member in ast.walk(statement)
+                )
+            selected_return_id = None
+            if (
+                selected_statements
+                and isinstance(selected_statements[-1], ast.Return)
+                and selected_statements[-1].value is not None
+            ):
+                returned_expression = selected_statements[-1].value
+                if isinstance(returned_expression, ast.Name):
+                    history = tuple(map(
+                        int,
+                        (graph.G.graph.get("identity_table") or {}).get(
+                            returned_expression.id, ()
+                        ),
+                    ))
+                    selected_return_id = next((
+                        value_id for value_id in reversed(history)
+                        if value_id in graph.G
+                    ), None)
+                if selected_return_id is None:
+                    returned_signature = _ast_source_signature(
+                        returned_expression
+                    )
+                    matches = tuple(
+                        int(node_id)
+                        for node_id, data in graph.G.nodes(data=True)
+                        if isinstance(data.get("authored_expr_obj", data.get("expr_obj")), ast.AST)
+                        and _ast_source_signature(data.get("authored_expr_obj", data["expr_obj"]))
+                        == returned_signature
+                    )
+                    if len(matches) == 1:
+                        selected_return_id = matches[0]
+            control_signature = _ast_source_signature(expression)
+            retained_control_id = next((
+                int(source_id)
+                for source_id, record in _source_control_records(
+                    graph.G
+                ).items()
+                if isinstance(record.get("expression"), ast.If)
+                and _ast_source_signature(record["expression"])
+                == control_signature
+            ), int(control_id))
+            # The reducer represents a value assigned in only one arm and used
+            # later as an external Input placeholder, retaining the real arm
+            # producer immediately before it in that name's identity history.
+            # Once this exact conditional is structurally selected, that
+            # placeholder is no longer external: collapse it only when one
+            # surviving predecessor belongs to the selected compartment.  The
+            # branch-membership receipt prevents this from guessing across
+            # loops, unrelated assignments, or an undecided conditional.
+            identities = graph.G.graph.get("identity_table") or {}
+            for _name, history in tuple(identities.items()):
+                ordered = tuple(map(int, history or ()))
+                if len(ordered) < 2:
+                    continue
+                placeholder_id = ordered[-1]
+                placeholder = graph.G.nodes.get(placeholder_id, {})
+                if not (
+                    placeholder.get("type") == "Input"
+                    and (placeholder.get("attributes") or {}).get(
+                        "binding_kind"
+                    ) == "external"
+                ):
+                    continue
+                selected_candidates = tuple(dict.fromkeys(
+                    value_id
+                    for value_id in ordered[:-1]
+                    if value_id in graph.G
+                    and (int(retained_control_id), str(selected_role))
+                    in branch_memberships.get(
+                        int(value_id), frozenset()
+                    )
+                ))
+                if len(selected_candidates) == 1:
+                    replace_alias(
+                        int(placeholder_id), int(selected_candidates[0])
+                    )
+            rejected_nodes = {
+                int(node_id)
+                for node_id, data in graph.G.nodes(data=True)
+                if id(data.get("expr_obj")) in rejected_ast_ids
+                or isinstance(data.get("expr_obj"), ast.AST)
+                and _ast_source_signature(data["expr_obj"])
+                in rejected_signatures
+                or (int(retained_control_id), str(rejected_role)) in (
+                    branch_memberships.get(int(node_id), frozenset())
+                )
+            }
+            specialized = list(
+                graph.G.graph.get(
+                    "structurally_specialized_conditional_node_ids", ()
+                )
+            )
+            specialized.append(int(control_id))
+            graph.G.graph[
+                "structurally_specialized_conditional_node_ids"
+            ] = tuple(dict.fromkeys(map(int, specialized)))
+            for node_id in sorted(rejected_nodes, reverse=True):
+                remove_node(node_id)
+            remove_node(int(control_id))
+            identities = graph.G.graph.get("identity_table") or {}
+            if selected_return_id is not None:
+                graph.roots = [int(selected_return_id)]
+                # ``selected_return_id`` is the return STATEMENT's value: for
+                # ``return a, b, c`` that is the Tuple node, not any slot.
+                # The per-slot values of every return site are recorded by
+                # the reducer in ``return_slot_values``, keyed by the source
+                # span of the returned expression; that ledger is the
+                # authority for what each output slot carries at this site.
+                # The reducer's own convention (its Return handling) is that
+                # a positional slot's identity history lists the return-site
+                # values, while a name-spelled slot IS a variable whose own
+                # binding history already holds the returned value.  Writing
+                # the whole Tuple under every output name -- including a
+                # variable's name such as ``metrics`` -- rebinds that variable
+                # to the 3-tuple in the identity table; the planner's
+                # name-history repair then feeds the tuple to
+                # ``_propose_dt_pen(metrics, ...)`` and refuses the call with
+                # ``aggregate call binding for 'metrics' ... 3 != 0``.
+                returned_expression = selected_statements[-1].value
+                selected_span = (
+                    int(returned_expression.lineno),
+                    int(getattr(returned_expression, "col_offset", -1)),
+                    int(getattr(returned_expression, "end_lineno", -1)),
+                    int(getattr(returned_expression, "end_col_offset", -1)),
+                ) if getattr(returned_expression, "lineno", None) is not None else None
+                return_slots = dict(graph.G.graph.get("return_slot_values") or {})
+                selected_slot_values = tuple(
+                    return_slots.get(selected_span, ())
+                ) if selected_span is not None else ()
+                output_names = tuple(
+                    graph.G.graph.get("function_outputs") or ()
+                )
+                positional_names = set(map(
+                    str, graph.G.graph.get("positional_output_names") or ()
+                ))
+                for index, output_name in enumerate(output_names):
+                    if str(output_name) not in positional_names:
+                        continue
+                    slot_value = (
+                        selected_slot_values[index]
+                        if index < len(selected_slot_values)
+                        else None
+                    )
+                    if slot_value is None and len(output_names) == 1:
+                        # A single-slot return has no container: the
+                        # statement's value is the slot's value.
+                        slot_value = int(selected_return_id)
+                    if slot_value is not None and int(slot_value) in graph.G:
+                        identities[str(output_name)] = (int(slot_value),)
+                if source_index is not None:
+                    # The source return ledger is also an output authority.
+                    # A proven top-level terminal arm makes later return
+                    # sites unreachable; retaining their slots can otherwise
+                    # restore the rejected fallback during SSA publication.
+                    # The selected site is identified by its span (the
+                    # ledger's own key); comparing slot tuples against the
+                    # statement's value id only ever matched single-slot
+                    # returns.
+                    selected_sites = {
+                        site: slots for site, slots in return_slots.items()
+                        if site == selected_span
+                        or tuple(slots) == (int(selected_return_id),)
+                    }
+                    if selected_sites:
+                        graph.G.graph["return_slot_values"] = selected_sites
+            graph.G.graph["identity_table"] = {
+                str(name): tuple(
+                    int(value_id) for value_id in history
+                    if int(value_id) in graph.G
+                )
+                for name, history in identities.items()
+            }
+            pruned = True
+            break
+
+    identities = graph.G.graph.get("identity_table") or {}
+    protected_values = {
+        int(value_id)
+        for name in graph.G.graph.get("function_outputs") or ()
+        for value_id in identities.get(str(name), ())
+        if int(value_id) in graph.G
+    } | {
+        int(root) for root in graph.roots if int(root) in graph.G
+    } | {
+        int(value_id)
+        for _node_id, node_data in graph.G.nodes(data=True)
+        for value_id in (
+            (node_data.get("attributes") or {}).get(
+                "aggregate_leaf_value_ids", ()
+            )
+        )
+        if int(value_id) in graph.G
+    }
+    dead_metadata = True
+    while dead_metadata:
+        dead_metadata = False
+        for node_id, data in tuple(graph.G.nodes(data=True)):
+            attributes = data.get("attributes") or {}
+            dead_pure_tensor_call = bool(
+                attributes.get("tensor_candidate") is not None
+                or str(attributes.get("static_python_reference") or "").startswith(
+                    "AbstractTensor."
+                )
+            )
+            # A structurally folded constant is a PROVEN literal standing in
+            # for an authored producer, and other layers still name that value
+            # identity -- a loop's bound expression renders each leaf as the
+            # leaf's literal when it is resident and as a uniform reference
+            # when it is not.  Pruning it because its only consumer folded too
+            # is what made ``n`` (the matrix order) a formal that no caller
+            # could fill inside the substitution helpers, while the same fold
+            # in _masked_pivot_rows -- whose constant kept a consumer -- read
+            # as the literal 2.  An unconsumed Const costs one instruction the
+            # backend drops.
+            if (
+                int(node_id) not in protected_values
+                and graph.G.out_degree(int(node_id)) == 0
+                and not (
+                    str(data.get("type")) in {"Constant", "Const", "const"}
+                    and attributes.get("structural_specialization")
+                )
+                and (
+                    str(data.get("type")) in {
+                        "GetAttr", "Attribute", "StaticReference",
+                        "Constant", "Const", "const",
+                        "Tuple", "List", "Set",
+                    }
+                    or dead_pure_tensor_call
+                )
+            ):
+                remove_node(int(node_id))
+                dead_metadata = True
+                break
+
+    unused_parameters = {
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_kind") == "parameter"
+        and graph.G.out_degree(int(node_id)) == 0
+        and int(node_id) not in set(map(int, graph.roots))
+    }
+    for node_id in sorted(unused_parameters, reverse=True):
+        remove_node(node_id)
+    if unused_parameters:
+        identities = graph.G.graph.get("identity_table") or {}
+        graph.G.graph["identity_table"] = {
+            str(name): tuple(
+                int(value_id) for value_id in history
+                if int(value_id) in graph.G
+            )
+            for name, history in identities.items()
+        }
+
+
+    # A fold is not complete while a surviving aggregate producer names
+    # projections removed with a rejected arm.  Enforce the ledger invariant
+    # here so every caller of this fixed-point pass, including recursive
+    # callsite specialization, returns a self-contained graph.
+    topology_changed |= bool(
+        _repair_missing_aggregate_leaf_projections(graph)
+    )
+
+    if topology_changed:
+        # Folding can run again when hierarchy construction freezes shapes,
+        # after retained-loop planning has already computed condensation
+        # levels. Publish ordering and recursion metadata for the new graph.
+        from .loop_composer import _rebuild_graph_edges
+        _rebuild_graph_edges(graph)
+
+
+def _apply_callsite_tensor_descriptors(
+    graph: Any,
+    descriptors: Mapping[str, Mapping[str, Any]],
+) -> None:
+    graph.G.graph["callsite_tensor_descriptor_names"] = tuple(sorted({
+        *map(
+            str,
+            graph.G.graph.get("callsite_tensor_descriptor_names") or (),
+        ),
+        *map(str, descriptors),
+    }))
+    authoritative = dict(
+        graph.G.graph.get("planner_tensor_descriptors") or {}
+    )
+    authoritative.update({
+        str(name): copy.deepcopy(dict(descriptor))
+        for name, descriptor in descriptors.items()
+    })
+    graph.G.graph["planner_tensor_descriptors"] = authoritative
+    identities = graph.G.graph.get("identity_table") or {}
+    changed_inputs = set()
+    for name, descriptor in descriptors.items():
+        candidates = tuple(dict.fromkeys((
+            *tuple(identities.get(str(name), ())),
+            *(
+                int(node_id)
+                for node_id, data in graph.G.nodes(data=True)
+                if data.get("type") == "Input"
+                and (data.get("attributes") or {}).get("binding_name") == name
+            ),
+        )))
+        for node_id in candidates:
+            if int(node_id) not in graph.G:
+                continue
+            data = graph.G.nodes[int(node_id)]
+            if data.get("type") != "Input":
+                continue
+            if data.get("tensor") != dict(descriptor):
+                changed_inputs.add(int(node_id))
+            data["tensor"] = copy.deepcopy(dict(descriptor))
+
+    # Cached intermediate shapes were derived before these exact argument
+    # descriptors arrived. Invalidate their dependency closure, including the
+    # concordance proof that would otherwise immediately repopulate the cache.
+    _invalidate_tensor_descriptor_dependents(
+        graph, changed_inputs, "callsite-input-specialization-changed",
+    )
+
+
+def _follow_declared_value_source(
+    node_data: Any, replaced_id: int, source_id: int,
+) -> None:
+    """Keep a port's declared value source equal to its semantic edge.
+
+    Retained-loop ports record ``value_source_id`` as an explicit identity
+    check against their ``value`` edge.  Aliasing the edge's producer without
+    moving the declaration turns every later descriptor query into an
+    identity-conflict error, so the declaration follows the alias exactly.
+    """
+
+    # `value_source_id` is one of several cached copies of an id that must
+    # follow an alias: the leaf ledgers (`aggregate_leaf_value_ids`,
+    # `materialized_source_value_ids`, `materialized_value_ids`) and a loop
+    # node's own carried/initial/state-effect records are the same kind of
+    # copy, read in preference to the edge by region capture expansion,
+    # iterable trip counts and the retained-loop port builder. One helper,
+    # shared with loop_composer's edge rewriters, moves all of them.
+    attributes = node_data.get("attributes")
+    if isinstance(attributes, dict):
+        node_data["attributes"] = dict(attributes)
+    _retarget_cached_value_ids(node_data, int(replaced_id), (int(source_id),))
+
+
+def _retarget_all_cached_value_ids(
+    graph: Any, replaced_id: int, source_id: int,
+) -> None:
+    """Move every cached copy of ``replaced_id`` graph-wide, not just successors.
+
+    A loop node caches a carried binding's initial value (a tuple-unpacking
+    projection, say) without being that projection's successor, so an alias
+    that only visits successors leaves the loop attribute naming a node the
+    alias just removed; the evaporator then seeds clones from a dead id.
+    """
+
+    if graph.G.graph.get("return_record_field_states"):
+        graph.G.graph["return_record_field_states"] = {
+            span: tuple(
+                (
+                    int(source_id) if int(receiver) == int(replaced_id) else receiver,
+                    field,
+                    int(source_id) if int(value) == int(replaced_id) else value,
+                )
+                for receiver, field, value in states
+            )
+            for span, states in graph.G.graph["return_record_field_states"].items()
+        }
+    for _node_id, data in graph.G.nodes(data=True):
+        attributes = data.get("attributes")
+        if not isinstance(attributes, dict):
+            continue
+        if not any(
+            key in attributes
+            for key in (
+                "value_source_id", "aggregate_leaf_value_ids",
+                "materialized_source_value_ids", "materialized_value_ids",
+                "loop_carried_bindings", "loop_target_initials",
+                "loop_state_effects", "loop_iteration_outputs",
+            )
+        ):
+            continue
+        data["attributes"] = dict(attributes)
+        _retarget_cached_value_ids(data, int(replaced_id), (int(source_id),))
+
+
+def _alias_projection_to_member(
+    graph: Any, projection: int, leaf_id: int,
+) -> None:
+    """Give one authored ``name[index]`` projection its member's identity."""
+
+    projection = int(projection)
+    leaf_id = int(leaf_id)
+    if projection not in graph.G or leaf_id not in graph.G:
+        return
+    projection_data = graph.G.nodes[projection]
+    for successor in tuple(graph.G.successors(projection)):
+        successor_data = graph.G.nodes[int(successor)]
+        successor_data["parents"] = [
+            (
+                leaf_id if int(parent) == projection else int(parent),
+                str(role),
+            )
+            for parent, role in successor_data.get("parents") or ()
+        ]
+        _follow_declared_value_source(successor_data, projection, leaf_id)
+        for parent, role in successor_data["parents"]:
+            if int(parent) == leaf_id:
+                graph.G.nodes[leaf_id].setdefault("children", []).append(
+                    (int(successor), str(role))
+                )
+        graph.G.remove_edge(projection, int(successor))
+        graph.G.add_edge(leaf_id, int(successor))
+    index_ids = tuple(
+        int(parent)
+        for parent, role in projection_data.get("parents") or ()
+        if str(role) in {"index", "slice", "subscript"}
+    )
+    for parent in tuple(graph.G.predecessors(projection)):
+        graph.G.nodes[int(parent)]["children"] = [
+            (child, role)
+            for child, role in graph.G.nodes[int(parent)].get("children", ())
+            if int(child) != projection
+        ]
+    # A loop that carries this projection (``a, b = history`` bound as its
+    # initial) caches the projection id without being its successor; move
+    # every cached copy before the node is gone.
+    _retarget_all_cached_value_ids(graph, projection, leaf_id)
+    graph.roots = [leaf_id if int(root) == projection else int(root)
+                   for root in graph.roots]
+    graph.G.graph["return_value_nodes"] = {
+        site: leaf_id if value == projection else value
+        for site, value in (graph.G.graph.get("return_value_nodes") or {}).items()
+    }
+    graph.G.graph["return_slot_values"] = {
+        site: tuple(leaf_id if value == projection else value for value in values)
+        for site, values in (graph.G.graph.get("return_slot_values") or {}).items()
+    }
+    graph.G.remove_node(projection)
+    for index_id in index_ids:
+        if (
+            index_id in graph.G
+            and graph.G.out_degree(index_id) == 0
+            and graph.G.nodes[index_id].get("type") in {
+                "Constant", "Const", "const",
+            }
+        ):
+            graph.G.remove_node(index_id)
+    identities = graph.G.graph.get("identity_table") or {}
+    graph.G.graph["identity_table"] = {
+        str(key): tuple(
+            leaf_id if int(value_id) == projection else int(value_id)
+            for value_id in history
+        )
+        for key, history in identities.items()
+    }
+
+
+def _apply_callsite_aggregate_descriptors(
+    graph: Any,
+    descriptors: Mapping[str, tuple[Any, ...]],
+) -> None:
+    """Bind an aggregate formal to its exact authored projection identities."""
+
+    identities = graph.G.graph.get("identity_table") or {}
+    for name, root_members in descriptors.items():
+        inputs = tuple(dict.fromkeys((
+            *tuple(identities.get(str(name), ())),
+            *(
+                int(node_id)
+                for node_id, data in graph.G.nodes(data=True)
+                if data.get("type") == "Input"
+                and (data.get("attributes") or {}).get("binding_name") == name
+            ),
+        )))
+        inputs = tuple(
+            int(node_id) for node_id in inputs
+            if int(node_id) in graph.G
+            and graph.G.nodes[int(node_id)].get("type") == "Input"
+        )
+        if len(inputs) != 1:
+            raise ValueError(
+                f"aggregate parameter {name!r} does not have one input identity: "
+                f"{inputs!r}"
+            )
+        def materialize(
+            input_id: int,
+            binding_path: str,
+            members: tuple[Any, ...],
+            *,
+            root_binding: str,
+            aggregate_path: tuple[int, ...] = (),
+        ) -> None:
+            """Materialize one level, retaining nested member ledgers."""
+
+            projections: dict[int, list[int]] = {}
+            for node_id, data in tuple(graph.G.nodes(data=True)):
+                if str(
+                    data.get("op") or data.get("type") or ""
+                ).casefold() not in {"indexed", "getitem", "subscript"}:
+                    continue
+                base = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) in {"base", "value", "object"}
+                )
+                if base != (int(input_id),):
+                    continue
+                index_ids = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) in {"index", "slice", "subscript"}
+                )
+                if len(index_ids) != 1 or index_ids[0] not in graph.G:
+                    continue
+                index_data = graph.G.nodes[index_ids[0]]
+                index = index_data.get("constant")
+                if index is None:
+                    index = (index_data.get("attributes") or {}).get("value")
+                if (
+                    not isinstance(index, int) or isinstance(index, bool)
+                    or not members
+                ):
+                    continue
+                normalized = int(index) % len(members)
+                projections.setdefault(normalized, []).append(int(node_id))
+
+            leaves = []
+            nested = []
+            for index, descriptor in enumerate(members):
+                leaf_id = next_process_value_id(graph)
+                member_path = f"{binding_path}[{index}]"
+                full_path = (*aggregate_path, int(index))
+                is_nested = isinstance(descriptor, tuple)
+                graph.G.add_node(
+                    leaf_id,
+                    type="Input", op="input", label=member_path,
+                    expr_obj=None, value_id=leaf_id,
+                    parents=[], children=[],
+                    attributes={
+                        "binding_name": member_path,
+                        "binding_kind": "parameter",
+                        "aggregate_parent_binding": str(root_binding),
+                        "aggregate_path": tuple(full_path),
+                        "aggregate_index": int(index),
+                    },
+                    tensor=(
+                        copy.deepcopy(dict(descriptor))
+                        if isinstance(descriptor, Mapping) else {}
+                    ),
+                )
+                leaves.append(leaf_id)
+                for projection in projections.get(index, ()):
+                    _alias_projection_to_member(graph, projection, leaf_id)
+                if is_nested:
+                    nested.append((
+                        leaf_id, member_path, tuple(descriptor), full_path,
+                    ))
+
+            leaves = tuple(leaves)
+            input_attributes = dict(
+                graph.G.nodes[input_id].get("attributes") or {}
+            )
+            input_attributes.update({
+                "producer_kind": "aggregate",
+                "aggregate_kind": "tuple",
+                "aggregate_leaf_value_ids": leaves,
+                "tensor_output_descriptors": copy.deepcopy(tuple(members)),
+                "sequence_key_columns": (),
+                "sequence_column_count": 1,
+                "sequence_writable": False,
+            })
+            formal = graph.G.nodes[input_id]
+            formal["attributes"] = input_attributes
+            formal["type"] = "Tuple"
+            formal["op"] = None
+            formal["tensor"] = {}
+            formal["parents"] = [(int(leaf), "elts") for leaf in leaves]
+            for leaf in leaves:
+                graph.G.add_edge(int(leaf), int(input_id), role="elts")
+                graph.G.nodes[int(leaf)].setdefault("children", []).append(
+                    (int(input_id), "elts")
+                )
+            for leaf_id, member_path, nested_members, nested_path in nested:
+                materialize(
+                    leaf_id,
+                    member_path,
+                    nested_members,
+                    root_binding=root_binding,
+                    aggregate_path=tuple(nested_path),
+                )
+
+        materialize(
+            int(inputs[0]),
+            str(name),
+            tuple(root_members),
+            root_binding=str(name),
+        )
+
+
+def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
+    """Lower the authored ``unbroadcast`` helper to canonical tensor nodes.
+
+    The helper's Python loop is only structural shape logic.  Once a callsite
+    supplies both shapes, retain its exact BACKWARD_RULES meaning as a finite
+    sequence of existing ``sum`` and ``reshape`` operators instead of asking
+    the control planner to carry a tensor through a Python ``for`` loop.
+    """
+
+    if str(graph.G.graph.get("function_name") or "") != "unbroadcast":
+        return False
+    descriptors = graph.G.graph.get("planner_tensor_descriptors") or {}
+    specializations = graph.G.graph.get("planner_specializations") or {}
+    source_descriptor = descriptors.get("G")
+    target_shape = specializations.get("target_shape")
+    if source_descriptor is None or not isinstance(target_shape, (tuple, list)):
+        return False
+    source_shape = tuple(map(int, source_descriptor.get("shape") or ()))
+    target_shape = tuple(map(int, target_shape))
+    input_id = next((
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "G"
+    ), None)
+    if input_id is None:
+        return False
+    metadata = copy.deepcopy(dict(graph.G.graph))
+    input_data = copy.deepcopy(dict(graph.G.nodes[input_id]))
+    graph.G.clear()
+    graph.G.graph.update(metadata)
+    input_data["parents"] = []
+    input_data["children"] = []
+    input_data["tensor"] = copy.deepcopy(dict(source_descriptor))
+    graph.G.add_node(input_id, **input_data)
+    next_id = input_id + 1
+    current = input_id
+    current_shape = list(source_shape)
+
+    def append(op: str, attributes: Mapping[str, Any], shape: tuple[int, ...]):
+        nonlocal next_id, current
+        node_id = next_id
+        next_id += 1
+        role = "operand"
+        graph.G.add_node(
+            node_id, op=op, type=op, label=op,
+            parents=[(current, role)], children=[],
+            attributes={
+                **dict(attributes),
+                "tensor_candidate": op,
+                "authored_identity": "backward_registry.unbroadcast",
+            },
+            extra_args=dict(attributes),
+            tensor={
+                "shape": tuple(shape),
+                "dtype": str(source_descriptor.get("dtype") or "float64"),
+            },
+            control={}, constant=None, expr_obj=None, store_id=None,
+        )
+        graph.G.add_edge(current, node_id, role=role)
+        graph.G.nodes[current]["children"].append((node_id, role))
+        current = node_id
+
+    while len(current_shape) > len(target_shape):
+        current_shape.pop(0)
+        append(
+            "sum", {"dim": 0, "keepdim": False}, tuple(current_shape),
+        )
+    for axis, (actual, target) in enumerate(zip(current_shape, target_shape)):
+        if target == 1 and actual != 1:
+            current_shape[axis] = 1
+            append(
+                "sum", {"dim": axis, "keepdim": True},
+                tuple(current_shape),
+            )
+    append("reshape", {"shape": target_shape}, target_shape)
+    graph.roots = [current]
+    identities = copy.deepcopy(metadata.get("identity_table") or {})
+    identities["G"] = (input_id,)
+    identities["result_0"] = (current,)
+    graph.G.graph.update({
+        "identity_table": identities,
+        "function_outputs": ("result_0",),
+        "function_parameters": ("G",),
+        "positional_parameters": ("G",),
+        "keyword_only_parameters": (),
+        "authored_identity_expansion": "backward_registry.unbroadcast",
+    })
+    return True
 
 
 def _callsite_specialized_shell_type(
@@ -8389,8 +21755,49 @@ def _callsite_specialized_shell_type(
         return fallback
     _receiver, positional, _all = _method_parameter_layout(original.G)
     specializations = {}
+    tensor_descriptors: dict[str, dict[str, Any]] = {}
+    aggregate_descriptors: dict[str, tuple[Any, ...]] = {}
+    record_descriptors: dict[str, dict[str, Any]] = {}
+    # What each argument is, as the caller's concordance states it.  The
+    # specialization's parameters are exactly these values.
+    parameter_classes: dict[str, tuple[str, int]] = {}
+    from ..common.tensors.topological_reducer import _source_numeric_scope
+    from .identity_concordance import current_identity_book
+
+    caller_scope = _source_numeric_scope(caller.G)
+    caller_class_page = current_identity_book().page(
+        "source_value_class_concordance"
+    )
+    bound_parameters: set[str] = set()
     data = caller.G.nodes[int(node_id)]
-    for parent, role_value in data.get("parents") or ():
+    caller_record_abi = dict(
+        caller.G.graph.get("parameter_record_abi") or {}
+    )
+    caller_identities = caller.G.graph.get("identity_table") or {}
+
+    def caller_record_for_value(value_id: int) -> dict[str, Any] | None:
+        """Resolve a concrete caller record from its exact parameter value."""
+
+        value_id = int(value_id)
+        matches = [
+            dict(record)
+            for parameter_name, record in caller_record_abi.items()
+            if value_id in set(map(
+                int, caller_identities.get(str(parameter_name), ())
+            ))
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        node = caller.G.nodes.get(value_id, {})
+        binding_name = str(
+            (node.get("attributes") or {}).get("binding_name") or ""
+        )
+        record = caller_record_abi.get(binding_name)
+        return None if record is None else dict(record)
+
+    for parent, role_value in _expanded_callsite_argument_edges(
+        caller, int(node_id),
+    ):
         role = str(role_value)
         position = _positional_argument_index(role)
         parameter = (
@@ -8400,17 +21807,137 @@ def _callsite_specialized_shell_type(
             if role.startswith("kw:")
             else None
         )
-        if parameter is None or not _source_static_value(
-            caller, int(parent)
-        ):
+        if parameter is None:
             continue
-        try:
-            specializations[str(parameter)] = _source_static_literal(
-                caller, int(parent)
+        parameter = str(parameter)
+        bound_parameters.add(parameter)
+        class_fact = caller_class_page.latest((caller_scope, int(parent)))
+        if isinstance(class_fact, tuple) and len(class_fact) >= 2:
+            parameter_classes[parameter] = (
+                str(class_fact[0]), max(int(class_fact[1]), 1),
             )
-        except ValueError:
+        declared_record_abi = dict(
+            original.G.graph.get("parameter_record_abi") or {}
+        ).get(parameter)
+        callsite_record_abi = caller_record_for_value(int(parent))
+        record_abi = (
+            callsite_record_abi
+            if callsite_record_abi is not None
+            else declared_record_abi
+        )
+        if record_abi is not None and record_abi.get("identity") is not None:
+            # A declared record identity is a structural type fact even when
+            # the callsite carries no scalar literal or tensor descriptor.
+            # Replanning the clean callee lets isinstance(record, Schema)
+            # fold from that contract before regions/branches are carved.
+            record_descriptors[parameter] = copy.deepcopy(dict(record_abi))
+        descriptor = _tensor_descriptor(caller, int(parent))
+        if descriptor is not None:
+            tensor_descriptors[parameter] = descriptor
+        static_argument = _source_static_value(caller, int(parent))
+        leaves = _authored_aggregate_leaves(caller, int(parent))
+        if leaves and not static_argument:
+            # Every authored member is a scoped callee identity whether or
+            # not its tensor contract is already known.  A member without a
+            # descriptor is materialized undescribed and fails loudly where a
+            # shape is needed; it must not erase the whole aggregate contract
+            # and leave the callee formal with zero members.
+            missing = tuple(
+                int(leaf) for leaf in leaves if int(leaf) not in caller.G
+            )
+            if missing:
+                raise ValueError(
+                    f"aggregate argument {parameter!r} names leaf identities "
+                    f"{missing!r} that no longer exist in "
+                    f"{caller.G.graph.get('function_name')!r}"
+                )
+            aggregate_descriptors[parameter] = tuple(
+                _authored_aggregate_descriptor_tree(caller, int(leaf))
+                for leaf in leaves
+            )
+        if static_argument:
+            try:
+                specializations[parameter] = _source_static_literal(
+                    caller, int(parent)
+                )
+            except ValueError:
+                pass
+            else:
+                _publish_formal_literal(
+                    str(original.G.graph.get("function_name")),
+                    parameter,
+                    specializations[parameter],
+                    str(caller.G.graph.get("function_name")),
+                )
+        proven_descriptor = tensor_descriptors.get(parameter)
+        if proven_descriptor is not None and tuple(
+            proven_descriptor.get("shape") or ()
+        ):
+            _publish_formal_shape(
+                str(original.G.graph.get("function_name")),
+                parameter,
+                proven_descriptor,
+                str(caller.G.graph.get("function_name")),
+            )
+
+    # Nested functions receive enclosing values through closure identities,
+    # not through the Call node's positional edges.  They are nevertheless
+    # exact callsite inputs and must carry the same recursive aggregate
+    # ledger.  Without this, ``selected`` saw ``left_limbs`` as an opaque
+    # zero-member input even though its caller had two concorded limb leaves.
+    for _capture_id, capture in original.G.nodes(data=True):
+        capture_attributes = capture.get("attributes") or {}
+        if str(capture.get("type") or "") != "Input" or str(
+            capture_attributes.get("binding_kind") or ""
+        ) not in {"closure", "external"}:
             continue
-    if not specializations:
+        capture_name = str(capture_attributes.get("binding_name") or "")
+        if not capture_name or capture_name in bound_parameters:
+            continue
+        capture_values = tuple(dict.fromkeys(
+            int(value_id)
+            for value_id in caller_identities.get(capture_name, ())
+            if int(value_id) in caller.G
+        ))
+        if len(capture_values) != 1:
+            continue
+        capture_value = int(capture_values[0])
+        capture_leaves = _authored_aggregate_leaves(
+            caller, capture_value,
+        )
+        if capture_leaves:
+            aggregate_descriptors[capture_name] = tuple(
+                _authored_aggregate_descriptor_tree(caller, int(leaf))
+                for leaf in capture_leaves
+            )
+            bound_parameters.add(capture_name)
+            continue
+        capture_descriptor = _tensor_descriptor(caller, capture_value)
+        if capture_descriptor is not None:
+            tensor_descriptors[capture_name] = capture_descriptor
+            bound_parameters.add(capture_name)
+    for parameter, default in (
+        original.G.graph.get("parameter_defaults") or {}
+    ).items():
+        parameter = str(parameter)
+        if parameter in bound_parameters:
+            continue
+        if default is None or isinstance(
+            default, (bool, int, float, str, bytes)
+        ) or (
+            isinstance(default, tuple)
+            and all(
+                item is None or isinstance(
+                    item, (bool, int, float, str, bytes)
+                )
+                for item in default
+            )
+        ):
+            specializations[parameter] = copy.deepcopy(default)
+    if not (
+        specializations or tensor_descriptors
+        or aggregate_descriptors or record_descriptors
+    ):
         return fallback
 
     def stable(value: Any) -> object:
@@ -8434,49 +21961,368 @@ def _callsite_specialized_shell_type(
             (name, stable(value))
             for name, value in specializations.items()
         )),
+        tuple(sorted(
+            (name, stable(value))
+            for name, value in tensor_descriptors.items()
+        )),
+        tuple(sorted(
+            (name, stable(value))
+            for name, value in aggregate_descriptors.items()
+        )),
+        tuple(sorted(
+            (name, stable(value))
+            for name, value in record_descriptors.items()
+        )),
+        tuple(sorted(parameter_classes.items())),
         int(max_nodes_per_dispatch),
     )
+    def publish_call_result_shape(specialized_graph: Any) -> None:
+        """Join an exact specialized return to its caller value identity."""
+
+        outputs = tuple(
+            specialized_graph.G.graph.get("function_outputs") or ()
+        )
+        if len(outputs) != 1:
+            return
+        identities = specialized_graph.G.graph.get("identity_table") or {}
+        output_ids = tuple(identities.get(str(outputs[0]), ()))
+        descriptor = None
+        inspected = []
+        for candidate in reversed(output_ids):
+            if int(candidate) not in specialized_graph.G:
+                continue
+            inferred = _structured_output_descriptor(
+                specialized_graph, int(candidate),
+            )
+            inspected.append((int(candidate), copy.deepcopy(inferred)))
+            if isinstance(inferred, Mapping) and (
+                descriptor_states_a_shape(inferred)
+            ):
+                descriptor = inferred
+                break
+        if os.environ.get("TURING_DEBUG_CALL_RESULT_SHAPE"):
+            print(
+                "CALL-RESULT-SHAPE "
+                f"caller={caller.G.graph.get('function_name')!r} "
+                f"callee={specialized_graph.G.graph.get('function_name')!r} "
+                f"outputs={outputs!r} output_ids={output_ids!r} "
+                "planner="
+                f"{specialized_graph.G.graph.get('planner_tensor_descriptors')!r} "
+                f"inspected={inspected!r}",
+                file=sys.stderr, flush=True,
+            )
+        if descriptor is None:
+            return
+        extents = tuple(descriptor.get("shape") or ())
+        if not extents:
+            return
+        from .identity_concordance import record_proven_shape
+
+        record_proven_shape(
+            str(caller.G.graph.get("function_name")),
+            int(data.get("value_id", node_id)),
+            extents,
+            descriptor.get("dtype"),
+            int(_dependency_levels(caller).get(int(node_id), 0)),
+        )
+        # A Precision operation may have been identified before this callee's
+        # exact return extents existed.  The concordance publication above is
+        # the causal event that makes its tensor identity complete; refresh
+        # the caller from that fact now, so the later SSA copy does not retain
+        # the provisional rank-zero descriptor.
+        from ..common.tensors.topological_reducer import (
+            specialize_python_precision_widths,
+        )
+
+        specialize_python_precision_widths(caller)
+
     cached = _CALLSITE_SHELL_TYPE_CACHE.get(key)
     if cached is not None:
+        publish_call_result_shape(cached.process_graph)
         return cached
     specialized = extract_clean_process_subgraph(
         original,
         original.G,
     )
-    specialized.G.graph.setdefault(
-        "planner_specializations", {}
-    ).update(specializations)
-    planned = strategize_glsl_deployment(
+    # These are callsite facts, not accumulators.  A shared function-table
+    # graph may already carry metadata from an earlier specialization; using
+    # ``setdefault().update()`` allowed a scalar literal from one occurrence
+    # to survive into a later tensor-valued occurrence of the same parameter.
+    specialized.G.graph["planner_specializations"] = copy.deepcopy(
+        specializations
+    )
+    specialized.G.graph["planner_parameter_classes"] = dict(
+        parameter_classes
+    )
+    specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
+        tensor_descriptors
+    )
+    if record_descriptors:
+        parameter_records = copy.deepcopy(dict(
+            specialized.G.graph.get("parameter_record_abi") or {}
+        ))
+        parameter_records.update(copy.deepcopy(record_descriptors))
+        specialized.G.graph["parameter_record_abi"] = parameter_records
+    _apply_callsite_tensor_descriptors(specialized, tensor_descriptors)
+    _apply_callsite_aggregate_descriptors(
+        specialized, aggregate_descriptors,
+    )
+    if not _expand_specialized_unbroadcast_identity(specialized):
+        _fold_callsite_structural_values(specialized)
+    planned = strategize_shell_deployment(
         specialized,
         max_nodes_per_dispatch=int(max_nodes_per_dispatch),
         _function_table_stack=(id(function_table),),
     )
+    # Recursive planning above specializes the callee's own calls first.  At
+    # this point its return descriptor is therefore the exact callsite
+    # contract, including facts that did not exist during the earlier global
+    # catalogue fixed point.  Publish it to the caller's authored value row;
+    # every later graph copy and SSA object asks that row instead of relying
+    # on mutation of this one specialized graph.
+    publish_call_result_shape(specialized)
     _CALLSITE_SHELL_TYPE_CACHE[key] = planned
     return planned
 
 
-def _resolve_unambiguous_method_references(graph: Any) -> None:
-    """Attach a method-table reference when the retained name is unique."""
+def _resolve_grounded_method_references(graph: Any) -> None:
+    """Attach internal methods only through a proven receiver class.
 
-    references_by_name: dict[str, set[int]] = {}
-    for descriptor in (
-        graph.G.graph.get("class_table") or {}
-    ).values():
-        for name, reference in (
-            descriptor.get("methods") or {}
-        ).items():
-            references_by_name.setdefault(str(name), set()).add(
-                int(reference)
+    A method name being unique in the ingested class catalogue says nothing
+    about an unrelated receiver.  In particular, ``os.environ.get`` must not
+    become ``_RandomFloatQueue.get`` merely because that is the sole authored
+    class method named ``get``.  Follow explicit value producers to a
+    ``class_ref`` instead; ambiguity or absence leaves the call external/static
+    and fully visible rather than fabricating an internal topology edge.
+    """
+
+    class_table = graph.G.graph.get("class_table") or {}
+    specializations = graph.G.graph.get("planner_specializations") or {}
+    parameter_records = dict(
+        graph.G.graph.get("parameter_record_abi") or {}
+    )
+
+    def source_expression_identity(expression: ast.AST) -> tuple[Any, ...]:
+        """Identify one authored expression across copied AST instances."""
+
+        return (
+            type(expression).__name__,
+            getattr(expression, "lineno", None),
+            getattr(expression, "col_offset", None),
+            getattr(expression, "end_lineno", None),
+            getattr(expression, "end_col_offset", None),
+            ast.dump(expression, include_attributes=False),
+        )
+
+    precision_boundary_selectors = {
+        source_expression_identity(expression.func)
+        for _node_id, data in graph.G.nodes(data=True)
+        for expression in (data.get("expr_obj"),)
+        if (
+            (data.get("attributes") or {}).get("python_precision_boundary")
+            or (data.get("attributes") or {}).get(
+                "python_precision_operator"
             )
-    unique = {
-        name: next(iter(references))
-        for name, references in references_by_name.items()
-        if len(references) == 1
+        )
+        and isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
     }
+
+    def declared_parameter_class(binding_name: str | None) -> str | None:
+        """Resolve a receiver from its explicit program-ABI record identity."""
+
+        if binding_name is None:
+            return None
+        record = parameter_records.get(str(binding_name))
+        if not isinstance(record, dict):
+            return None
+        identity = record.get("identity")
+        if identity is None:
+            return None
+        text = str(identity)
+        matches = {
+            str(candidate)
+            for candidate in class_table
+            if str(candidate) == text
+            or str(candidate).rsplit(".", 1)[-1]
+            == text.rsplit(".", 1)[-1]
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    def specialized_class(binding_name: str | None) -> str | None:
+        if binding_name is None or str(binding_name) not in specializations:
+            return None
+        receiver_type = type(specializations[str(binding_name)])
+        identities = {
+            receiver_type.__name__,
+            receiver_type.__qualname__,
+            f"{receiver_type.__module__}.{receiver_type.__qualname__}",
+        }
+        matches = {
+            str(identity)
+            for identity in class_table
+            if str(identity) in identities
+            or str(identity).rsplit(".", 1)[-1] == receiver_type.__name__
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    def specialized_method_reference(
+        binding_name: str | None,
+        method_name: str,
+    ) -> int | None:
+        if binding_name is None or str(binding_name) not in specializations:
+            return None
+        receiver_type = type(specializations[str(binding_name)])
+        owner_names = {
+            receiver_type.__name__,
+            receiver_type.__qualname__,
+            f"{receiver_type.__module__}.{receiver_type.__qualname__}",
+        }
+        table = getattr(graph, "function_table", None)
+        if table is None:
+            return None
+        matches = {
+            int(entry.reference.address)
+            for entry in table
+            if str(entry.name) == str(method_name)
+            and entry.graph is not None
+            and str(entry.graph.G.graph.get("method_owner")) in owner_names
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    def receiver_class(value_id: int) -> str | None:
+        pending = [int(value_id)]
+        visited = set()
+        candidates = set()
+        while pending:
+            current = pending.pop()
+            if current in visited or current not in graph.G:
+                continue
+            visited.add(current)
+            node = graph.G.nodes[current]
+            attributes = node.get("attributes") or {}
+            # ``class_ref`` marks a construction; ``result_class_ref`` a
+            # value that IS an instance of the class -- a call returning
+            # one, or a field read of a field that holds one. The reducer
+            # resolves receivers through both; so does this.
+            class_ref = attributes.get("class_ref")
+            if class_ref is None:
+                class_ref = attributes.get("result_class_ref")
+            if class_ref is not None:
+                candidates.add(str(class_ref))
+                continue
+            if str(node.get("type")) in {"Input", "input"}:
+                class_ref = declared_parameter_class(
+                    attributes.get("binding_name")
+                ) or specialized_class(attributes.get("binding_name"))
+                if class_ref is not None:
+                    candidates.add(class_ref)
+                    continue
+            # Only identity-routing nodes may transmit a receiver class. An
+            # arbitrary operation consuming an object does not return it.
+            if str(node.get("type")) not in {
+                "Input", "Phi", "LoopResult", "LoopExit", "Identity",
+            }:
+                continue
+            pending.extend(
+                int(parent)
+                for parent, role in (node.get("parents") or ())
+                if str(role) in {
+                    "value", "body", "orelse", "initial", "updated",
+                    "result", "operand",
+                }
+            )
+        return next(iter(candidates)) if len(candidates) == 1 else None
+
+    bound_selectors = {}
+    for node_id, data in graph.G.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        expression = data.get("expr_obj")
+        if (
+            attributes.get("python_precision_boundary")
+            or attributes.get("python_precision_operator")
+            or isinstance(expression, ast.Attribute)
+            and source_expression_identity(expression)
+            in precision_boundary_selectors
+        ):
+            for key in ("bound_method_ref", "method_ref", "callee_ref"):
+                attributes.pop(key, None)
+            continue
+        roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+        receiver_id, method_name, receiver_expression = None, None, None
+        if isinstance(expression, ast.Attribute):
+            receiver_id = roles.get("value", roles.get("operand"))
+            method_name, receiver_expression = expression.attr, expression.value
+        elif (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name)
+              and expression.func.id == "getattr" and len(expression.args) >= 2
+              and isinstance(expression.args[1], ast.Constant)
+              and isinstance(expression.args[1].value, str)
+              and (data.get("attributes") or {}).get("extraction_identity") == "builtins.getattr"):
+            receiver_id = roles.get("arg:0")
+            method_name, receiver_expression = expression.args[1].value, expression.args[0]
+        if receiver_id is None or method_name is None:
+            continue
+        class_identity = receiver_class(receiver_id)
+        reference = (class_table.get(class_identity, {}).get("methods", {}).get(method_name)
+                     if class_identity is not None else None)
+        binding_name = (graph.G.nodes[receiver_id].get("attributes") or {}).get("binding_name")
+        if method_name in (parameter_records.get(str(binding_name), {}).get("fields") or {}):
+            continue  # An instance field can shadow a method.
+        if reference is None:
+            continue
+        data.setdefault("attributes", {}).update({
+            "bound_method_ref": int(reference), "bound_receiver_id": int(receiver_id),
+            "receiver_class_ref": class_identity,
+        })
+        bound_selectors[int(node_id)] = (int(reference), int(receiver_id), method_name, receiver_expression)
+
+    for node_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name)):
+            continue
+        selectors = {int(parent) for parent, role in data.get("parents") or ()
+                     if str(role) in {"callee", "func", "function"} and int(parent) in bound_selectors}
+        if not selectors:
+            # Source linking may already have consumed the callee edge. A
+            # single retained lexical binding still proves the saved selector.
+            history = tuple((graph.G.graph.get("identity_table") or {}).get(expression.func.id, ()))
+            if len(history) == 1 and int(history[0]) in bound_selectors:
+                selectors.add(int(history[0]))
+        if len(selectors) != 1:
+            continue
+        selector = next(iter(selectors))
+        reference, receiver_id, method_name, receiver_expression = bound_selectors[selector]
+        rewritten = copy.deepcopy(expression)
+        rewritten.func = ast.copy_location(ast.Attribute(
+            value=copy.deepcopy(receiver_expression), attr=method_name, ctx=ast.Load()), expression.func)
+        data.setdefault("authored_expr_obj", expression)
+        data["expr_obj"] = rewritten
+        data["type"], data["op"] = "Call", "call"
+        attrs = dict(data.get("attributes") or {})
+        for key in ("callee_ref", "external_ref", "extraction_identity", "intrinsic_identity",
+                    "extraction_contract", "extraction_action", "extraction_rule", "extraction_classification",
+                    "backend_intrinsic_candidate", "static_python_reference"):
+            attrs.pop(key, None)
+        attrs.update({"method_ref": reference, "bound_selector_id": selector,
+                      "method_resolution": "bound-receiver-class-ref"})
+        data["attributes"] = attrs
+        parents = [(int(parent), str(role)) for parent, role in data.get("parents") or ()
+                   if str(role) not in {"callee", "func", "function", "operand", "receiver"}]
+        parents.append((receiver_id, "operand"))
+        data["parents"] = parents
+        if graph.G.has_edge(selector, node_id):
+            graph.G.remove_edge(selector, node_id)
+        graph.G.add_edge(receiver_id, node_id)
+        graph.G.nodes[selector]["children"] = [(child, role) for child, role in graph.G.nodes[selector].get("children") or ()
+                                                 if int(child) != int(node_id)]
+        graph.G.nodes[receiver_id].setdefault("children", []).append((int(node_id), "operand"))
+
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}
         if (
-            attributes.get("callee_ref") is not None
+            attributes.get("python_precision_boundary")
+            or attributes.get("python_precision_operator")
+            or attributes.get("callee_ref") is not None
             or attributes.get("method_ref") is not None
         ):
             continue
@@ -8486,13 +22332,151 @@ def _resolve_unambiguous_method_references(graph: Any) -> None:
             and isinstance(expression.func, ast.Attribute)
         ):
             continue
-        reference = unique.get(str(expression.func.attr))
+        receiver_id = next((
+            int(parent)
+            for parent, role in (data.get("parents") or ())
+            if str(role) in {"operand", "receiver"}
+        ), None)
+        if receiver_id is None:
+            continue
+        class_identity = receiver_class(receiver_id)
+        reference = None
+        if class_identity is not None:
+            reference = (
+                class_table.get(class_identity, {}).get("methods", {})
+                .get(str(expression.func.attr))
+            )
+        if (
+            reference is None
+            and isinstance(expression.func.value, ast.Name)
+        ):
+            reference = specialized_method_reference(
+                expression.func.value.id,
+                expression.func.attr,
+            )
         if reference is None:
             continue
         attributes = dict(attributes)
         attributes["method_ref"] = int(reference)
-        attributes["method_resolution"] = "unique-class-table-name"
+        attributes["method_resolution"] = "receiver-class-ref"
+        if class_identity is not None:
+            attributes["receiver_class_ref"] = class_identity
         data["attributes"] = attributes
+
+    # Lexical loop effects are recorded before receiver classes necessarily
+    # resolve. Apply the reducer's source-linked-call rule again now: the
+    # resolved callee owns its effects, rather than a second opaque mutation
+    # at the callsite. Unresolved external calls keep their original effects.
+    linked_calls = {
+        int(node_id) for node_id, data in graph.G.nodes(data=True)
+        if any((data.get("attributes") or {}).get(key) is not None
+               for key in (
+                   "method_ref", "callee_ref", "resolved_ast_parent",
+                   "indirect_callable_id",
+               ))
+    }
+    for _node_id, data in graph.G.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        effects = attributes.get("loop_state_effects")
+        if not effects:
+            continue
+        retained = tuple(
+            effect for effect in effects
+            if not (
+                effect.get("effect_mode", "opaque") == "opaque"
+                and int(effect["effect_node_id"]) in linked_calls
+            )
+        )
+        if len(retained) != len(effects):
+            data["attributes"] = {**attributes, "loop_state_effects": retained}
+
+
+def _resolve_grounded_tensor_operations(graph: Any) -> None:
+    """Promote method-name candidates only along tensor-valued SSA edges."""
+
+    specializations = graph.G.graph.get("planner_specializations") or {}
+
+    def is_tensor_value(value: Any) -> bool:
+        return (
+            not isinstance(value, (str, bytes, bytearray, list, tuple, dict, set))
+            and hasattr(value, "shape")
+            and hasattr(value, "dtype")
+        )
+
+    tensor_values = {
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if data.get("tensor") is not None
+        or (data.get("attributes") or {}).get("tensor") is not None
+        or (
+            data.get("type") == "Input"
+            and is_tensor_value(specializations.get(str(
+                (data.get("attributes") or {}).get("binding_name", "")
+            )))
+        )
+    }
+    # These ordinary ProcessGraph operators preserve tensor-valuedness when
+    # at least one data operand is a tensor.  Keep this as provenance only:
+    # the later SSA shape pass and tensor repository lowering still decide
+    # the concrete result layout and implementation.
+    tensor_value_operators = {
+        "Add", "Sub", "Mult", "Mul", "Div", "FloorDiv", "Mod", "Pow",
+    }
+    changed = True
+    while changed:
+        changed = False
+        for node_id, data in graph.G.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            candidate = attributes.get("tensor_candidate")
+            if (
+                int(node_id) in tensor_values
+                and (
+                    candidate is None
+                    or attributes.get("tensor") is not None
+                )
+            ):
+                continue
+            if (
+                str(data.get("type") or data.get("op"))
+                in tensor_value_operators
+                and any(
+                    int(parent) in tensor_values
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) not in {"callee", "func"}
+                )
+            ):
+                tensor_values.add(int(node_id))
+                changed = True
+                continue
+            if candidate is None:
+                continue
+            expression = data.get("expr_obj")
+            property_access = (
+                isinstance(expression, ast.Attribute)
+                or str(data.get("op") or data.get("type") or "").casefold()
+                == "getattr"
+            )
+            method_call = (
+                isinstance(expression, ast.Call)
+                and isinstance(expression.func, ast.Attribute)
+            )
+            if not (property_access or method_call):
+                continue
+            receiver = next((
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {
+                    "operand", "receiver", "value", "base", "object",
+                }
+            ), None)
+            if receiver not in tensor_values:
+                continue
+            attributes = dict(attributes)
+            attributes["tensor"] = str(candidate)
+            attributes["tensor_resolution"] = "receiver-tensor-value"
+            data["attributes"] = attributes
+            tensor_values.add(int(node_id))
+            changed = True
 
 
 # Above this an unroll is refused rather than attempted. It is a guard
@@ -8502,269 +22486,37 @@ def _resolve_unambiguous_method_references(graph: Any) -> None:
 MAX_UNROLL_LIMIT = 4096
 
 
-def strategize_glsl_deployment(
-    graph: Any,
-    *,
-    # Was 256, which was a GLSL dispatch-sizing constraint: a shader had to
-    # be split into chunks a driver would accept. That is no longer what the
-    # number means now that emission goes SPIR-V -> GLSL, and for a target
-    # that wants one flat program it was actively harmful -- a program past
-    # the bound was split into regions, so a caller asking for a flat
-    # unrolled loop silently got a retained one instead.
-    max_nodes_per_dispatch: int = 65536,
-    backend: str | None = None,
-    remove_loops: bool | None = None,
-    unroll_limit: int | None = None,
-    schedule_preference: str | None = None,
-    _function_table_stack: tuple[int, ...] = (),
-) -> type:
-    """Build a stateful shell around the graph's flat dispatch schedule.
-
-    ``backend`` only tags the loop-composition capability profile below --
-    it does not change GLSL emission, which stays gated behind
-    ``capture_fused_programs(precompile_only=...)`` regardless of this
-    argument. Callers that only want the FusedProgram/ControlProgram/SSA
-    stages (any backend) should pass ``precompile_only=True`` there and
-    never reach GLSL-specific emission at all.
-
-    ``remove_loops`` disables native loop retention, so
-    ``evaporate_unrolled_loops`` unrolls every discovered loop into a flat
-    instruction sequence instead of a real ``LoopBlock``.
-
-    ``unroll_limit`` is the largest trip count that may be unrolled. It was
-    fixed at 8, which is not a property of any backend -- a target that
-    wants a flat program wants *its* loops flat, whatever their length. A
-    loop above the limit is silently retained instead, which for a caller
-    that needed a flat program means a shorter program that still compiles
-    and quietly computes fewer iterations. Raise it to whatever the target
-    can actually take.
-    """
-
-    # Inherit whatever the compilation asked for, then record it so the
-    # function shells planned from subgraphs of this one see the same thing.
-    # Without this a nested function -- which is where a loop usually lives,
-    # since the entrypoint is a thin wrapper -- silently planned with the
-    # defaults, and a caller asking for a flat program got a retained loop.
-    inherited = dict(graph.G.graph.get("loop_settings") or {})
-    backend = inherited.get("backend", "glsl") if backend is None else backend
-    remove_loops = (
-        inherited.get("remove_loops", False) if remove_loops is None
-        else remove_loops
-    )
-    unroll_limit = (
-        inherited.get("unroll_limit", 8) if unroll_limit is None
-        else unroll_limit
-    )
-    schedule_preference = (
-        inherited.get("schedule_preference", "alap")
-        if schedule_preference is None else schedule_preference
-    )
-    schedule_preference = str(schedule_preference).lower()
-    if schedule_preference not in {"asap", "alap"}:
-        raise ValueError(
-            "deployment schedule preference must be 'asap' or 'alap'"
-        )
-    unroll_limit = max(1, min(int(unroll_limit), MAX_UNROLL_LIMIT))
-    graph.G.graph["loop_settings"] = {
-        "backend": backend,
-        "remove_loops": bool(remove_loops),
-        "unroll_limit": int(unroll_limit),
-        "schedule_preference": schedule_preference,
-    }
-    graph.G.graph["deployment_schedule_preference"] = schedule_preference
-
-    _propagate_callsite_planner_specializations(graph)
-    canonical_value_ids = bool(
-        graph.G.graph.get("canonical_value_ids")
-    )
-    loop_composer = LoopComposer(
-        LoopBackendCapabilities(
-            backend=backend,
-            native_for=not remove_loops,
-            native_while=not remove_loops,
-            dynamic_bounds=not remove_loops,
-            kpn=False,
-            unroll_limit=int(unroll_limit),
-        )
-    )
-    discovered_loop_plans = (
-        loop_composer.discover(graph)
-        if canonical_value_ids
-        else ()
-    )
-    evaporated_loop_plans = (
-        evaporate_unrolled_loops(graph, discovered_loop_plans)
-        if discovered_loop_plans
-        else ()
-    )
-    evaporated_loop_ids = {
-        int(plan.loop.node_id) for plan in evaporated_loop_plans
-    }
-    retained_loop_plans = tuple(
-        plan
-        for plan in discovered_loop_plans
-        if int(plan.loop.node_id) not in evaporated_loop_ids
-        and int(plan.loop.node_id) in graph.G
-    )
-    semantic_loop_plans = (
-        loop_composer.materialize_semantic_ir(
-            graph,
-            retained_loop_plans,
-        )
-        if retained_loop_plans
-        else ()
-    )
-    loop_plans = (
-        materialize_retained_loop_ports(graph, semantic_loop_plans)
-        if semantic_loop_plans
-        else ()
-    )
-    function_entry = None
-    function_reference = graph.G.graph.get("function_ref")
-    function_table = getattr(graph, "function_table", None)
-    if function_reference is not None and function_table is not None:
-        function_entry = function_table.entry(function_reference)
-    process_graph_boundary = (
-        None
-        if function_entry is None
-        else function_entry.metadata.get("process_graph_boundary")
-    )
-    python_callable = (
-        None if function_entry is None else function_entry.python_callable
-    )
-    _resolve_unambiguous_method_references(graph)
-    reference_tables = build_shell_reference_tables(graph)
-    ordered_executable_nodes = _dependency_order(graph)
-    executable_nodes = tuple(
-        node_id
-        for node_id in ordered_executable_nodes
-        if not _is_dispatch_metadata_node(graph, node_id)
-    )
-    # Control membership is a semantic partition: numerical work may be
-    # reduced freely inside one planner-owned loop body or conditional branch,
-    # but never fused across that control boundary.  All other dispatch
-    # boundaries are produced by the fixed-point shader-region identities
-    # rather than inherited from schedule levels or operator spelling.
-    partition_keys = _control_partition_keys(
-        graph,
-        loop_plans,
-        executable_nodes,
-    )
-    inert_nodes = _inert_routing_nodes(graph)
-    closure_edges, closure_outputs = _closure_routing_dependencies(graph)
-    recursion_control_nodes = frozenset(
-        int(node_id)
-        for record in (
-            graph.G.graph.get("recursion_table") or {}
-        ).values()
-        if record.get("control_ir", True)
-        for node_id in record.get("control_members", ())
-    )
-    dispatch_plan = reduce_scheduled_shader_regions(
-        graph,
-        executable_nodes,
-        max_nodes_per_region=max_nodes_per_dispatch,
-        partition_keys=partition_keys,
-        extra_dependency_edges=closure_edges,
-        control_node_ids=recursion_control_nodes,
-    )
-    executable_dispatch_nodes = tuple(
-        dispatch.node_ids
-        for dispatch in dispatch_plan.dispatches
-    )
-    control_deployment_regions = bind_control_deployments_to_regions(
-        graph.G.graph.get("control_deployment_regions", ()),
-        executable_dispatch_nodes,
-    )
-    deployment_region_preferences: dict[int, str] = {}
-    for deployment in control_deployment_regions:
-        for lane in deployment.lanes:
-            for region_index in lane.region_indices:
-                previous = deployment_region_preferences.setdefault(
-                    int(region_index), deployment.schedule_preference
-                )
-                if previous != deployment.schedule_preference:
-                    raise ValueError(
-                        "scheduled region has conflicting deployment "
-                        f"preferences: region={region_index}, "
-                        f"preferences={(previous, deployment.schedule_preference)!r}"
-                    )
-    dispatch_subgraphs = tuple(
-        _dispatch_subgraph(
-            graph,
-            node_ids,
-            required_outputs=closure_outputs,
-            inert_nodes=inert_nodes,
-            schedule_preference=deployment_region_preferences.get(
-                region_index, "asap"
-            ),
-        )
-        for region_index, node_ids in enumerate(executable_dispatch_nodes)
-        if node_ids
-    )
-    for subgraph, dispatch in zip(
-        dispatch_subgraphs,
-        dispatch_plan.dispatches,
-    ):
-        subgraph.G.graph["rewrite_history"] = dispatch.rewrite_history
-    loop_region_indices = {
-        plan.loop.node_id: tuple(
-            region_index
-            for region_index, subgraph in enumerate(dispatch_subgraphs)
-            if set(
-                subgraph.G.graph.get("deployment_nodes", ())
-            ).intersection(plan.loop.body_nodes)
-        )
-        for plan in loop_plans
-    }
-    loop_shader_reductions = analyze_shader_loop_reductions(
-        graph,
-        loop_plans,
-        executable_dispatch_nodes,
-    )
-    deep_compilers = tuple(
-        GraphDeepCompiler(
-            subgraph,
-            dict(abstract_tensor_funcs),
-            abstract_tensor_sigs,
-            node_observer=_observe_process_graph_node,
-        )
-        for subgraph in dispatch_subgraphs
-    )
-    ephemeral_callables = tuple(
-        EphemeralProcessGraphCallable(
-            subgraph,
-            compiler=compiler,
-            eager=False,
-        )
-        for subgraph, compiler in zip(
-            dispatch_subgraphs,
-            deep_compilers,
-        )
-    )
-
-    class_ast = ast.parse(
-        """
 class ProcessGraphGLSLDeployment:
-    process_graph = __process_graph__
-    external_function_table = __external_function_table__
-    static_python_bindings = __static_python_bindings__
-    dispatch_plan = __dispatch_plan__
-    loop_plans = __loop_plans__
-    loop_region_indices = __loop_region_indices__
-    loop_shader_reductions = __loop_shader_reductions__
-    control_deployment_regions = __control_deployment_regions__
-    process_graph_boundary = __process_graph_boundary__
-    python_callable = staticmethod(__python_callable__)
-    dispatch_subgraphs = __dispatch_subgraphs__
-    deep_compilers = __deep_compilers__
-    ephemeral_callables = __ephemeral_callables__
-    reference_table_template = __reference_tables__
+    # Per-compile values. A fresh subclass is created for each compiled
+    # ProcessGraph (see strategize_shell_deployment) with these overridden
+    # via ordinary class-attribute assignment -- no source-text templating.
+    process_graph = None
+    external_function_table = None
+    static_python_bindings = None
+    dispatch_plan = None
+    loop_plans = None
+    loop_region_indices = None
+    loop_shader_reductions = None
+    control_deployment_regions = None
+    process_graph_boundary = None
+    python_callable = None
+    dispatch_subgraphs = None
+    deep_compilers = None
+    ephemeral_callables = None
+    reference_table_template = None
     function_shell_types = {}
-    source_node_count = __source_node_count__
-    primitive_count = __primitive_count__
-    loop_count = __loop_count__
-    dispatch_count = __dispatch_count__
+    runtime_closure_only = False
+    planned_function_references = ()
+    activation_root_references = ()
+    catalogued_function_references = ()
+    catalogue_only_function_references = ()
+    source_node_count = None
+    primitive_count = None
+    loop_count = None
+    dispatch_count = None
+    deployment_batches = None
+    max_nodes_per_dispatch = None
+    selection_progress = None
 
     def __init__(
         self,
@@ -8776,6 +22528,7 @@ class ProcessGraphGLSLDeployment:
         output_slots=64,
         legacy_fused_network=False,
         shell_language="glsl",
+        _defer_callsite_planning=False,
         **tuning,
     ):
         tuning = dict(tuning)
@@ -8795,7 +22548,7 @@ class ProcessGraphGLSLDeployment:
             else "composed_control"
         )
         self.batch_size = dict(
-            __deployment_batches__
+            self.deployment_batches
             if batch_size is None
             else batch_size
         )
@@ -8816,25 +22569,206 @@ class ProcessGraphGLSLDeployment:
         self.memory_references = self.reference_tables.memory
         self.recursion_references = self.reference_tables.recursion
         self.reference_correlations = self.reference_tables.correlations
-        self.function_shells = {
-            reference: shell_type(**tuning)
-            for reference, shell_type in self.function_shell_types.items()
-        }
+        # Specialization can prove additional method callees. Keep the
+        # growing registry on this deployment, not on its cached class.
+        self.function_shell_types = dict(self.function_shell_types)
+        self.specialized_dependency_extensions = []
+        self._callsite_planning_deferred = bool(
+            _defer_callsite_planning
+        )
+        # Only the outer deployment owns and instantiates the function
+        # catalogue.  Catalogue members and literal-callsite shells are
+        # constructed shallowly, attached to that one shared catalogue, and
+        # then traversed by ``plan_callsites`` with its active reference
+        # chain intact.  Eagerly constructing a catalogue from one of those
+        # children re-entered this constructor before the chain could be
+        # passed down, making recursive call topologies expand forever.
+        self.function_shells = (
+            {}
+            if self._callsite_planning_deferred
+            else {
+                reference: shell_type(
+                    **tuning,
+                    _defer_callsite_planning=True,
+                )
+                for reference, shell_type in self.function_shell_types.items()
+            }
+        )
         self._owns_function_shells = bool(self.function_shells)
         for function_shell in self.function_shells.values():
             function_shell.function_shells = self.function_shells
             function_shell._owns_function_shells = False
+        compilation_unit_receipt = dict(
+            self.process_graph.G.graph.get("compilation_unit_plan") or {}
+        )
+        callsite_unit_by_reference = {
+            int(reference): int(unit_index)
+            for reference, unit_index in (
+                compilation_unit_receipt.get("reference_to_unit") or {}
+            ).items()
+        }
+        recursive_callsite_units = {
+            int(unit_index)
+            for unit_index, unit in enumerate(
+                compilation_unit_receipt.get("units") or ()
+            )
+            if bool(unit.get("recursive"))
+        }
+        callsite_planning_started = time.monotonic()
+        callsite_planning_visits: dict[
+            tuple[str, int, int], int
+        ] = {}
+        planned_callsite_shells: dict[
+            tuple[type, int, int, type], Any
+        ] = {}
+        callsite_planning_total = 0
+
+        def recursive_unit_backedge(owner, reference):
+            owner_reference = owner.process_graph.G.graph.get("function_ref")
+            if owner_reference is None:
+                return None
+            owner_unit = callsite_unit_by_reference.get(int(owner_reference))
+            callee_unit = callsite_unit_by_reference.get(int(reference))
+            if (
+                owner_unit is None
+                or owner_unit != callee_unit
+                or owner_unit not in recursive_callsite_units
+            ):
+                return None
+            return int(owner_unit)
+
         def plan_callsites(owner, active_references=()):
+            nonlocal callsite_planning_total
             owner.callsite_function_shells = {}
             for node_id, data in owner.process_graph.G.nodes(data=True):
                 attributes = data.get("attributes") or {}
                 reference = attributes.get("callee_ref")
                 if reference is None:
                     reference = attributes.get("method_ref")
+                if reference is None and attributes.get("class_ref") is not None:
+                    class_record = (
+                        owner.process_graph.G.graph.get("class_table") or {}
+                    ).get(str(attributes["class_ref"]), {})
+                    methods = class_record.get("methods") or {}
+                    reference = methods.get(
+                        "__new__", methods.get("__init__")
+                    )
+                    if reference is not None:
+                        attributes = dict(attributes)
+                        attributes["constructor_ref"] = int(reference)
+                        data["attributes"] = attributes
                 if reference is None:
                     continue
                 reference = int(reference)
+                recursive_unit = recursive_unit_backedge(owner, reference)
+                activation_mode = (
+                    "recursive_scc_backedge"
+                    if recursive_unit is not None else "callsite_shell"
+                )
+                from .identity_concordance import current_identity_book
+
+                callsite_identity = current_identity_book().page(
+                    "source_callsite_activation_concordance"
+                )
+                caller_metadata = owner.process_graph.G.graph
+                caller_name = str(
+                    caller_metadata.get("function_name") or "<module>"
+                )
+                method_owner = caller_metadata.get("method_owner")
+                caller_identity = str(
+                    caller_metadata.get("qualified_name")
+                    or (
+                        f"{method_owner}.{caller_name}"
+                        if method_owner else caller_name
+                    )
+                )
+                planning_key = (
+                    caller_identity, int(node_id), reference,
+                )
+                planning_visit = int(
+                    callsite_planning_visits.get(planning_key, 0)
+                ) + 1
+                callsite_planning_visits[planning_key] = planning_visit
+                callsite_planning_total += 1
+                if (
+                    self.selection_progress is not None
+                    and (
+                        callsite_planning_total <= 16
+                        or callsite_planning_total % 64 == 0
+                    )
+                ):
+                    self.selection_progress(
+                        "callsite-plan: "
+                        f"total={callsite_planning_total} "
+                        f"elapsed_seconds={round(time.monotonic() - callsite_planning_started, 6)} "
+                        f"depth={len(active_references)} "
+                        f"owner={caller_identity} node={int(node_id)} "
+                        f"callee_ref={reference} visit={planning_visit} "
+                        f"owner_ref={owner.process_graph.G.graph.get('function_ref')} "
+                        f"unit={recursive_unit} mode={activation_mode}"
+                    )
+                identity_row = (caller_identity, int(node_id))
+                activation_fact = (
+                    reference,
+                    activation_mode,
+                    recursive_unit,
+                )
+                incumbent_reference = callsite_identity.latest(identity_row)
+                if (
+                    incumbent_reference is not None
+                    and tuple(incumbent_reference) != activation_fact
+                ):
+                    raise ValueError(
+                        "source callsite activation concordance "
+                        f"disagreement for {identity_row!r}: "
+                        f"recorded={incumbent_reference!r}, "
+                        f"resolved={activation_fact!r}"
+                    )
+                if incumbent_reference is None:
+                    callsite_identity.set(identity_row, 0, activation_fact)
+                if recursive_unit is not None:
+                    # The compilation-unit planner has already proven this
+                    # edge belongs to one recursive SCC.  Its call remains in
+                    # the owner's ProcessGraph and function-reference table;
+                    # expanding it into another shell would enumerate every
+                    # simple path around the SCC instead of representing the
+                    # one authored backedge.
+                    continue
                 shell_type = self.function_shell_types.get(reference)
+                if shell_type is None and self._owns_function_shells:
+                    # A receiver class can first become known at this exact
+                    # callsite. The initial catalogue closure cannot include
+                    # that method yet; extend it once by function identity.
+                    table = owner.process_graph.function_table
+                    entry = table.entry(reference)
+                    if (entry.graph is not None
+                            and entry.metadata.get("host_ssa_module") is None
+                            and entry.metadata.get("implementation_kind") != "authored-source-fallback"):
+                        function_graph = extract_clean_process_subgraph(entry.graph, entry.graph.G)
+                        function_graph.G.graph.setdefault("loop_settings", dict(
+                            owner.process_graph.G.graph.get("loop_settings") or {}))
+                        shell_type = strategize_shell_deployment(
+                            function_graph,
+                            max_nodes_per_dispatch=self.max_nodes_per_dispatch,
+                            _function_table_stack=(id(table),),
+                        )
+                        self.function_shell_types[reference] = shell_type
+                        shared = shell_type(
+                            **tuning,
+                            _defer_callsite_planning=True,
+                        )
+                        shared.function_shells = self.function_shells
+                        shared._owns_function_shells = False
+                        self.function_shells[reference] = shared
+                        self.planned_function_references = tuple(sorted({
+                            *self.planned_function_references, reference}))
+                        self.specialized_dependency_extensions.append({
+                            "caller": owner.process_graph.G.graph.get("qualified_name")
+                                      or owner.process_graph.G.graph.get("function_name"),
+                            "callsite_id": int(node_id),
+                            "callee_reference": reference,
+                            "provenance": "callsite_specialization",
+                        })
                 if shell_type is None or reference in active_references:
                     continue
                 shell_type = _callsite_specialized_shell_type(
@@ -8842,25 +22776,64 @@ class ProcessGraphGLSLDeployment:
                     node_id,
                     reference,
                     shell_type,
-                    __max_nodes_per_dispatch__,
+                    self.max_nodes_per_dispatch,
                 )
-                planned = shell_type(**tuning)
+                planned_identity = (
+                    type(owner), int(node_id), reference, shell_type,
+                )
+                incumbent_planned = planned_callsite_shells.get(
+                    planned_identity
+                )
+                if incumbent_planned is not None:
+                    owner.callsite_function_shells[node_id] = (
+                        incumbent_planned
+                    )
+                    continue
+                planned = shell_type(
+                    **tuning,
+                    _defer_callsite_planning=True,
+                )
                 planned.function_shells = self.function_shells
                 planned._owns_function_shells = False
+                # Publish before descending.  The active-reference rule owns
+                # recursive backedges, while this table turns repeated
+                # arrivals at one exact specialized callsite into a DAG node
+                # instead of unfolding the same subtree once per path.
+                planned_callsite_shells[planned_identity] = planned
                 owner.callsite_function_shells[node_id] = planned
                 plan_callsites(
                     planned,
                     (*active_references, reference),
                 )
-        for function_shell in self.function_shells.values():
-            plan_callsites(function_shell)
+        activation_roots = (
+            tuple(self.activation_root_references)
+            if self.runtime_closure_only
+            else tuple(self.function_shells)
+        )
+        for reference in activation_roots:
+            function_shell = self.function_shells.get(int(reference))
+            if function_shell is None:
+                continue
+            # Seed the active chain with the activation root itself.  A
+            # direct recursive call is therefore a backedge, not one more
+            # shell instance; mutual recursion terminates on the first
+            # already-active function identity for the same reason.
+            plan_callsites(function_shell, (int(reference),))
             (
                 function_shell.hierarchy_plan,
                 function_shell.hierarchy_value_table,
             ) = assign_hierarchy_ids(
                 _build_shell_hierarchy_plan(function_shell)
             )
-        plan_callsites(self)
+        if self._callsite_planning_deferred:
+            self.callsite_function_shells = {}
+        elif self.runtime_closure_only:
+            # The module shell owns the definition catalogue, not another
+            # execution of every function body in the source file.  Submitted
+            # target shells above are the activation roots in this mode.
+            self.callsite_function_shells = {}
+        else:
+            plan_callsites(self)
         (
             self.hierarchy_plan,
             self.hierarchy_value_table,
@@ -8889,11 +22862,53 @@ class ProcessGraphGLSLDeployment:
         self.forward_region_planned_capture_ids = ()
         self.forward_region_planned_input_ids = ()
         self.forward_planned_collection_materializations = {}
-        self.compiled_process_graph_aliases = {}
+        # ``Precision.of(tensor, n)`` introduces no independent high-limb
+        # storage: its high limb is exactly the authored tensor and the
+        # precision pass supplies the remaining zero limbs.  Source
+        # specialization records that identity on the concordance.  Install
+        # it in the ordinary capture alias table so a region feed is wired to
+        # the authored producer instead of escaping as compiler-owned frame
+        # storage.
+        from .identity_concordance import current_identity_book
+
+        numeric_scope = str(
+            self.process_graph.G.graph.get("source_numeric_scope")
+            or self.process_graph.G.graph.get("function_name")
+            or self.process_graph.G.graph.get("qualified_name")
+            or "<module>"
+        )
+        boundary_page = current_identity_book().page(
+            "source_precision_boundary_concordance"
+        )
+        self.compiled_process_graph_aliases = {
+            int(row[1]): int(fact[1])
+            for row in boundary_page.rows()
+            for fact in (boundary_page.latest(row),)
+            if (
+                isinstance(row, tuple)
+                and len(row) == 2
+                and str(row[0]) == numeric_scope
+                and int(row[1]) in self.process_graph.G
+                and isinstance(fact, tuple)
+                and len(fact) == 3
+                and str(fact[0]) == "promote"
+                and int(fact[1]) in self.process_graph.G
+            )
+        }
         self.compiled_tapes = ()
         self.compiled_shell_program = None
         self.compiled_region_indices = ()
         self.captured_region_programs = {}
+        self.planned_operator_implementations = {}
+        # A reference operator (SetAttr/GetAttr) has an unambiguous identity
+        # from its own graph node id -- no tensor primitive to correlate,
+        # no ambiguity the tape machinery above exists to resolve.  Recorded
+        # here, in exact execution order, as each one runs: not a strategy,
+        # not a region to score for launch profitability, just what happened,
+        # in the order it happened -- the sequential memory operations this
+        # represents have real causality that reordering or fusing would
+        # break.
+        self.reference_operator_sequence = []
         self._capture_invocations = 0
         # Which source parameter each captured input tensor came from, by
         # object identity. Feeds are identified downstream by id(), and
@@ -8904,6 +22919,16 @@ class ProcessGraphGLSLDeployment:
         # The same names, keyed by the resident range instead of by object
         # identity, so a value that was rewrapped can still be recognised.
         self._capture_input_storage = {}
+        # Scalar configuration fields carried by structural input objects are
+        # compile-time control facts.  Their scoped field paths let hierarchy
+        # composition resolve predicates such as ``ctrl.dt_min is not None``
+        # without retaining or inspecting the object later.
+        self._capture_input_static_fields = {}
+        self._captured_return_value_ids = set()
+        self._capture_input_type_names = {}
+        self._capture_tensor_input_names = set()
+        self._captured_source_branches = []
+        self._captured_loop_iterations = {}
         self._execute_invocations = 0
         self._discovery_tape_creations = 0
         self._discovery_tape_lowerings = 0
@@ -8939,10 +22964,13 @@ class ProcessGraphGLSLDeployment:
         self.hierarchical_composed_closure_iterable_bindings = ()
         self.hierarchical_region_correlations = ()
         self.hierarchical_endpoint_details = {}
+        self.hierarchical_value_aliases = {}
         self.hierarchical_root_field_value_ids = {}
         self.hierarchical_effective_value_table = None
         self.hierarchical_compose_failure = None
         self.hierarchical_public_output_ids = set()
+        self.hierarchical_terminal_outputs = {}
+        self.hierarchical_specialized_values = {}
         self.hierarchy_identity_collapses = ()
         self.hierarchy_identity_rounds = 0
         self.hierarchy_remaining_callsite_ids = None
@@ -9111,6 +23139,455 @@ class ProcessGraphGLSLDeployment:
         ) = assign_hierarchy_ids(_build_shell_hierarchy_plan(self))
         return self.hierarchy_plan
 
+    def prepare_graph_precompile(
+        self, *, device=None, reduction_cache=None, progress=None,
+        structural_ssa_only: bool = False,
+    ):
+        # Prepare graph/control IR without observing runtime parameter values.
+        #
+        # ``reduction_cache`` (a ``ReductionArtifactStore``), when given,
+        # persists each region program under its own content key as it is
+        # lowered -- an incremental backup of this portion, so an interrupted
+        # prepare reloads the regions it already built instead of redoing all
+        # of them, and each region becomes an independently addressable
+        # catalogue entry. ``progress``, if given, is called with a message
+        # string per shell and per region so this otherwise-silent phase is
+        # visible.
+
+        def _note(message):
+            if progress is not None:
+                progress(message)
+
+        hierarchy_started = time.perf_counter()
+        _note(
+            "aot: refreshing root hierarchy before structural precompile"
+        )
+        self.refresh_hierarchy_plan()
+        _note(
+            "aot: refreshed root hierarchy before structural precompile "
+            f"in {time.perf_counter() - hierarchy_started:.3f}s"
+        )
+        if not self.whole_program_compiled:
+            self.compile_process_graph(device=device)
+        # A selected-entrypoint compile prepares only its proven activation
+        # tree.  The canonical whole-source caller explicitly requests the
+        # complete definition catalogue: class identity is retained by
+        # ClassNavigationTable, while every constructor/method shell supplies
+        # the executable contents of that one class record.  Do not infer this
+        # from ``runtime_closure_only``: older selected-entrypoint adapters also
+        # use broad planning but still have one executable activation tree.
+        planned_shells = tuple(_walk_planned_shells(
+            self,
+            include_function_registry=bool(getattr(
+                self, "prepare_complete_catalogue", False
+            )),
+        ))
+        _note(
+            f"aot: preparing {len(planned_shells)} planned shell(s)"
+        )
+        for shell_index, target in enumerate(planned_shells, 1):
+            shell_started = time.perf_counter()
+            shell_name = str(
+                target.process_graph.G.graph.get("function_name") or "?"
+            )
+            _note(
+                f"aot: shell {shell_index}/{len(planned_shells)} "
+                f"{shell_name} structural preparation begin"
+            )
+            # A callsite-specialized shell (below, in
+            # ``_specialized_shell_type``) already gets this fold; a
+            # top-level planned shell like the one this loop walks never
+            # did. That left ``state.height.shape[0]`` -- an ordinary
+            # record-field read feeding a loop bound -- structurally
+            # unresolved for exactly the whole-program compile path this
+            # loop drives, with no error: the loop bound silently reads as
+            # 0 and the loop it bounds never runs. Fold it here too, before
+            # the hierarchy plan (and the region shapes/order derived from
+            # it) gets built from this graph.
+            # The module graph retains the definition catalogue with AST
+            # identities. It is not a function activation: folding expressions
+            # inside those definitions here invalidates its carved regions.
+            # Match hierarchy freezing, which folds only function graphs.
+            if target.process_graph.G.graph.get("function_name"):
+                _fold_callsite_structural_values(target.process_graph)
+            target.refresh_hierarchy_plan()
+            _note(
+                f"aot: shell {shell_index}/{len(planned_shells)} "
+                f"{shell_name} hierarchy ready in "
+                f"{time.perf_counter() - shell_started:.3f}s"
+            )
+            complete_regions, region_dependencies = _topological_region_schedule(
+                target, range(len(target.dispatch_subgraphs))
+            )
+            retained_value_ids = {
+                int(value_id)
+                for item in target.hierarchy_plan.items
+                if isinstance(item, PlanClosure)
+                and item.name.startswith("region_")
+                for line in item.items
+                if isinstance(line, PlanLine)
+                for value_id in (*line.inputs, *line.outputs)
+            }
+            considered_reductions = tuple(
+                reduction
+                for reduction in target.loop_shader_reductions
+                if reduction.control_program is not None
+            )
+            structurally_owned_regions = frozenset(
+                int(region)
+                for reduction in considered_reductions
+                for region in reduction.structurally_owned_region_indices
+            ) | frozenset(
+                int(region)
+                for reduction in target.loop_shader_reductions
+                for region in reduction.domain_region_indices
+            )
+            runtime_regions = tuple(
+                int(region) for region in complete_regions
+                if int(region) not in structurally_owned_regions
+            )
+            # A blocked loop (real blockers, e.g. an authored ``raise``) has
+            # no control_program and is silently excluded above. Its BODY
+            # REGIONS were still compiled as ordinary numerical work and
+            # remain in complete_regions -- unless something refuses here,
+            # they get scheduled FLAT with no loop wrapping them at all,
+            # which does not fail: it silently runs the loop's body exactly
+            # once, dropping both the iteration count and the raise
+            # statement itself. Measured: a two-line authored program with
+            # `if cond: ... else: raise` inside a `for` loop compiled with
+            # `complete: True`, no shortfall, no materializer refusal, and
+            # ran to a plausible but wrong answer. Refuse instead: a region
+            # scheduled without its owning loop is exactly the "lowering
+            # must not fabricate control" case the conditional overlay's own
+            # duplicate-region guard already refuses for a different cause.
+            complete_region_set = frozenset(int(index) for index in complete_regions)
+            orphaned = tuple(
+                reduction
+                for reduction in target.loop_shader_reductions
+                if reduction.control_program is None
+                and complete_region_set.intersection(
+                    map(int, reduction.region_indices)
+                )
+            )
+            if orphaned:
+                loop_descriptors = {
+                    int(plan.loop.node_id): plan.loop
+                    for plan in target.loop_plans
+                }
+
+                def opaque_effects(reduction):
+                    descriptor = loop_descriptors.get(int(reduction.loop_node_id))
+                    if descriptor is None:
+                        return ()
+                    details = []
+                    for effect in descriptor.state_effects:
+                        if effect.mode is not LoopStateEffectMode.OPAQUE:
+                            continue
+                        data = target.process_graph.G.nodes.get(
+                            int(effect.effect_node_id), {}
+                        )
+                        expression = data.get("expr_obj")
+                        # SAY WHY THIS ONE IS OPAQUE.
+                        # `opaque` is the DEFAULT mode, not a detection:
+                        # the classifier recognises a loop-body mutation
+                        # only when the state's aggregate_kind is a known
+                        # container AND the operator is one of a short
+                        # fixed vocabulary. Everything else -- every
+                        # `.step()` ever written -- falls through to it.
+                        # Reporting the bare word sends a reader looking
+                        # for what was detected, when the fact is that
+                        # nothing was.
+                        attributes = data.get("attributes") or {}
+                        receiver_class = (
+                            attributes.get("result_class_ref")
+                            or attributes.get("class_ref")
+                        )
+                        operator = str(effect.operator)
+                        modelled = operator in _MODELLED_STATE_OPERATORS
+                        # THE CALL MAY HAVE RESOLVED AND BEEN REFUSED.  Source
+                        # pursuit follows ``self.<field>.<method>`` to the
+                        # real method; the extraction contract then decides
+                        # whether that method's origin may be ingested.  A
+                        # file under no declared root is ``unknown`` and
+                        # rejected as ``provenance_not_declared`` -- the call
+                        # node carries that exact decision.  Reporting only
+                        # "class unresolved" sent readers into the resolver
+                        # when the missing fact was a root in the contract.
+                        boundary = attributes.get("extraction_contract")
+                        boundary = (
+                            dict(boundary)
+                            if isinstance(boundary, Mapping)
+                            and str(boundary.get("action") or "")
+                            not in {"ingest_python", ""}
+                            else None
+                        )
+                        if boundary is not None:
+                            parameters = dict(
+                                boundary.get("parameters") or {}
+                            )
+                            why = (
+                                "the receiver resolved: this call is "
+                                f"{boundary.get('identity')!r} defined in "
+                                f"{boundary.get('origin')!r}, but the "
+                                "extraction contract classified that "
+                                f"origin {boundary.get('classification')!r} "
+                                f"and chose {boundary.get('action')!r} "
+                                f"(rule {boundary.get('rule_id')!r}"
+                                + (
+                                    f", reason {parameters['reason']!r}"
+                                    if parameters.get("reason") else ""
+                                )
+                                + "), so its source was not pursued and no "
+                                "transition can be modelled. Declare that "
+                                "one file by module name and path "
+                                "(`ExtractionContract.with_sources([(name, "
+                                "path)])`) if the program is meant to use "
+                                "it; if it is not, the program is using "
+                                "something it should not"
+                            )
+                        elif not modelled and receiver_class is None:
+                            why = (
+                                "the receiver's class is unresolved AND "
+                                f"{operator!r} is outside the modelled "
+                                "operator vocabulary, so no state "
+                                "transition could be formed"
+                            )
+                        elif not modelled:
+                            why = (
+                                f"{operator!r} is outside the modelled "
+                                "operator vocabulary "
+                                f"({sorted(_MODELLED_STATE_OPERATORS)})"
+                            )
+                        elif receiver_class is None:
+                            why = (
+                                f"{operator!r} is modellable, but the "
+                                "receiver's class is unresolved so its "
+                                "aggregate_kind is unknown"
+                            )
+                        else:
+                            why = (
+                                "operator and receiver are both known; the "
+                                "mode was not upgraded from the default"
+                            )
+                        details.append({
+                            "effect_node_id": int(effect.effect_node_id),
+                            "state_name": str(effect.state_name),
+                            "operator": operator,
+                            "source": (
+                                ast.unparse(expression)
+                                if isinstance(expression, ast.AST) else None
+                            ),
+                            "method_ref": attributes.get("method_ref"),
+                            "receiver_class": (
+                                None if receiver_class is None
+                                else str(receiver_class)
+                            ),
+                            "why_opaque": why,
+                            "has_state_output": (
+                                effect.state_output_id is not None
+                            ),
+                            **(
+                                {"extraction_contract": boundary}
+                                if boundary is not None else {}
+                            ),
+                        })
+                    return tuple(details)
+
+                owner_reference = target.process_graph.G.graph.get(
+                    "function_ref"
+                )
+                owner_qualified_name = None
+                owner_table = getattr(
+                    target.process_graph, "function_table", None,
+                )
+                if owner_reference is not None and owner_table is not None:
+                    try:
+                        owner_qualified_name = str(
+                            owner_table.entry(
+                                int(owner_reference)
+                            ).qualified_name
+                        )
+                    except (IndexError, KeyError, TypeError, ValueError):
+                        owner_qualified_name = None
+                boundaries = tuple({
+                    "kind": "loop-control-owner",
+                    "loop_node_id": int(reduction.loop_node_id),
+                    "region_indices": list(map(
+                        int, sorted(reduction.region_indices),
+                    )),
+                    "blockers": list(map(str, reduction.blockers)),
+                    "opaque_effects": list(opaque_effects(reduction)),
+                    **({
+                        "function_reference": int(owner_reference),
+                    } if owner_reference is not None else {}),
+                    **({
+                        "qualified_name": owner_qualified_name,
+                    } if owner_qualified_name is not None else {}),
+                } for reduction in orphaned)
+                raise CompilationSubdivisionRequired(
+                    "a loop's body regions are scheduled but the loop "
+                    "itself could not compile, which would otherwise "
+                    "silently run the body once with no iteration and no "
+                    "effect from its blockers. Note that 'opaque-state-"
+                    "effect' is the DEFAULT classification, not a "
+                    "detection, and that an opaque effect normally still "
+                    "HAS a state output -- what is missing is a model of "
+                    "the transition, not a value. Each effect below says "
+                    "why it stayed at the default: "
+                    + "; ".join(
+                        f"loop_node={reduction.loop_node_id} "
+                        f"regions={tuple(sorted(reduction.region_indices))} "
+                        f"blockers={reduction.blockers} "
+                        f"opaque_effects={opaque_effects(reduction)!r}"
+                        for reduction in orphaned
+                    ),
+                    boundaries=boundaries,
+                )
+            loop_controls = tuple(
+                project_control_regions(
+                    reduction.control_program,
+                    runtime_regions,
+                    retained_value_ids=retained_value_ids,
+                    preserve_source_loop_carries=True,
+                )
+                for reduction in considered_reductions
+            )
+            conditional_controls = _ordinary_conditional_control_programs(
+                target.process_graph,
+                runtime_regions,
+                target.dispatch_subgraphs,
+            )
+            validations = _validation_control_blocks(target)
+            if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
+                from .control_source import ConditionalBlock as _DebugConditional
+                _debug_conditionals = [
+                    (
+                        next((
+                            int(block.source_node_id)
+                            for block in control.root.blocks
+                            if isinstance(block, _DebugConditional)
+                            and block.source_node_id is not None
+                        ), None),
+                        control.region_indices,
+                    )
+                    for control in conditional_controls
+                ]
+                print(
+                    "DEBUGCONTROL "
+                    f"fn={target.process_graph.G.graph.get('function_name')} "
+                    f"regions={complete_regions} "
+                    f"loops={[control.region_indices for control in loop_controls]} "
+                    f"conditionals={_debug_conditionals} "
+                    f"validations={len(validations)} "
+                    f"if_nodes={sum(isinstance(data.get('expr_obj'), ast.If) for _node, data in target.process_graph.G.nodes(data=True))} "
+                    f"source_conditional_ids={sorted({int((data.get('attributes') or {}).get('source_conditional_id')) for _node, data in target.process_graph.G.nodes(data=True) if (data.get('attributes') or {}).get('source_conditional_id') is not None})}",
+                    file=sys.stderr,
+                )
+            nesting = _source_control_nesting_hints(
+                considered_reductions,
+                conditional_controls,
+                target.loop_plans,
+                target.process_graph,
+            )
+            shell_control = _overlay_control_or_require_subdivision(
+                target.process_graph,
+                runtime_regions,
+                considered_reductions,
+                loop_controls,
+                conditional_controls,
+                nesting,
+                region_dependencies=region_dependencies,
+            )
+            shell_control = _place_validation_blocks(
+                shell_control,
+                validations,
+                runtime_regions,
+                target.dispatch_subgraphs,
+            )
+            target.shell_control_program = replace(
+                shell_control,
+                deployment_regions=tuple(dict.fromkeys((
+                    *shell_control.deployment_regions,
+                    *target.control_deployment_regions,
+                ))),
+            )
+            # The complete-source SSA path consumes ``hierarchy_plan`` and
+            # ``shell_control_program`` directly.  It must not manufacture a
+            # nominal FusedProgram merely to satisfy the older dual-IR shape:
+            # doing so makes a non-projecting compile indistinguishable from
+            # numerical capture.  Keep the legacy sentinel only for callers
+            # that explicitly request the dual-IR precompile product.
+            target.compiled_shell_program = (
+                None
+                if structural_ssa_only
+                else CapturedFusedProgram(
+                    FusedProgram(
+                        version=1,
+                        feeds=set(),
+                        steps=[],
+                        outputs={},
+                        meta={},
+                        extras={"kernel_kind": "graph-precompile"},
+                    ),
+                    {},
+                )
+            )
+            target.compiled_tapes = ()
+            target.compiled_region_indices = ()
+            # An unfed mutable parameter is left a symbolic SSA input; its
+            # region programs come from the planner-isolated dispatch subgraphs
+            # via the same structural builder the tape path uses, not from a
+            # bespoke plan transcription. Layout/cast ops ride through under
+            # their own names for each backend to lower.
+            subgraphs = tuple(enumerate(target.dispatch_subgraphs))
+            _note(
+                f"aot: lowering {len(subgraphs)} region(s) for shell "
+                f"{shell_name}"
+            )
+            # NOTE: regions are NOT deduplicated by sharing program objects
+            # here. Structurally-identical regions are distinct *invocations*
+            # with their own value-ids and field bindings; sharing one object
+            # collides their value-ids and destroys the coordinator's per-region
+            # wiring (producer[value_id] would overwrite). The correct IR-level
+            # reduction is the kernel/invocation split -- one shared kernel
+            # structure plus a per-region binding table -- not object sharing.
+            # Byte-identical *kernel files* are still deduped later in the bake.
+            region_programs = (
+                {}
+                if structural_ssa_only
+                else {
+                    region_index: _structural_region_program_from_subgraph(
+                        subgraph
+                    )
+                    for region_index, subgraph in subgraphs
+                }
+            )
+            target.captured_region_programs = region_programs
+            target.compile_time_region_indices = set()
+            target.planned_operator_implementations = (
+                _build_planned_operator_implementations(
+                    target.hierarchy_plan,
+                    {},
+                    (),
+                )
+            )
+            _note(
+                f"aot: shell {shell_index}/{len(planned_shells)} "
+                f"{shell_name} structural preparation end in "
+                f"{time.perf_counter() - shell_started:.3f}s"
+            )
+        (
+            self.hierarchy_plan,
+            self.hierarchy_value_table,
+        ) = assign_hierarchy_ids(
+            _refresh_hierarchy_control_captures(
+                self.hierarchy_plan,
+                self,
+            ),
+            self.hierarchy_value_table,
+        )
+        return self
+
     def capture_fused_programs(
         self,
         initial_values,
@@ -9138,14 +23615,18 @@ class ProcessGraphGLSLDeployment:
             )
         targets = []
         seen = set()
-        for target in _walk_planned_shells(self):
+        for target in _walk_planned_shells(
+            self, include_function_registry=False
+        ):
             identity = id(target)
             if identity in seen or target._discovery_tape is None:
                 continue
             seen.add(identity)
             targets.append(target)
         observed_target_ids = {id(target) for target in targets}
-        for target in _walk_planned_shells(self):
+        for target in _walk_planned_shells(
+            self, include_function_registry=False
+        ):
             if id(target) in observed_target_ids:
                 continue
             # The program's one discovery sequence did not enter this
@@ -9200,7 +23681,9 @@ class ProcessGraphGLSLDeployment:
                         storage_value
                     )
 
-        for target in _walk_planned_shells(self):
+        for target in _walk_planned_shells(
+            self, include_function_registry=False
+        ):
             collect_discovery_capture_objects(
                 getattr(target, "captured_values", {})
             )
@@ -9316,7 +23799,10 @@ class ProcessGraphGLSLDeployment:
             missing = (
                 set(range(len(target.ephemeral_callables))) - captured
             )
-            for region_index in missing:
+            unexplained_missing = missing - set(
+                target.coordinator_region_indices
+            )
+            for region_index in unexplained_missing:
                 subgraph = target.dispatch_subgraphs[region_index]
                 tensor_outputs = [
                     output_id
@@ -9348,6 +23834,111 @@ class ProcessGraphGLSLDeployment:
                 target.compiled_region_indices,
                 target.compiled_tapes,
             ))
+            target.planned_operator_implementations = (
+                _build_planned_operator_implementations(
+                    target.hierarchy_plan,
+                    target.captured_region_programs,
+                    target.reference_operator_sequence,
+                )
+            )
+            if target.reference_operator_sequence and not precompile_only:
+                # Observation classifies the lowering selected at runtime;
+                # it does not define segment membership or order.  Those are
+                # already fixed by the ProcessGraph hierarchy plan.
+                observed_node_ids = set(
+                    map(int, target.reference_operator_sequence)
+                )
+                ordered_node_ids = [
+                    node_id
+                    for node_id in _planned_operator_node_ids(
+                        target.hierarchy_plan
+                    )
+                    if node_id in observed_node_ids
+                    if node_id in target.process_graph.G
+                ]
+                missing_planned_nodes = observed_node_ids - set(
+                    ordered_node_ids
+                )
+                if missing_planned_nodes:
+                    raise RuntimeError(
+                        "observed plain operators are absent from the "
+                        "ProcessGraph segment plan: "
+                        f"{tuple(sorted(missing_planned_nodes))!r}"
+                    )
+                def _reference_step_input_ids(node_id: int) -> list[int]:
+                    # A field's real identity is ``attribute_slot`` (see
+                    # ``bind_target``/``resolve_expression``) -- a
+                    # (class_identity, slot) pair grounded in the class's
+                    # own declared layout, not a node id.  It carries
+                    # through automatically via ``attrs`` below (a full copy
+                    # of this node's attributes), so nothing needs pulling in
+                    # here beyond the ordinary ``parents`` wiring.
+                    node_data = target.process_graph.G.nodes[node_id]
+                    return [
+                        int(parent)
+                        for parent, _role in (node_data.get("parents") or ())
+                    ]
+
+                reference_steps = [
+                    OpStep(
+                        step_id=index,
+                        op_name=str(
+                            target.process_graph.G.nodes[node_id].get("op")
+                            or target.process_graph.G.nodes[node_id].get(
+                                "type"
+                            )
+                        ),
+                        input_ids=_reference_step_input_ids(node_id),
+                        attrs=dict(
+                            target.process_graph.G.nodes[node_id].get(
+                                "attributes"
+                            )
+                            or {}
+                        ),
+                        result_id=int(node_id),
+                    )
+                    for index, node_id in enumerate(ordered_node_ids)
+                ]
+                reference_result_ids = {
+                    step.result_id for step in reference_steps
+                }
+                reference_feeds = {
+                    input_id
+                    for step in reference_steps
+                    for input_id in step.input_ids
+                    if input_id not in reference_result_ids
+                }
+                reference_feed_origins = {
+                    feed_id: {"binding_name": binding_name}
+                    for feed_id in reference_feeds
+                    if (
+                        binding_name := (
+                            target.process_graph.G.nodes.get(feed_id, {})
+                            .get("attributes", {})
+                            .get("binding_name")
+                        )
+                    )
+                    is not None
+                }
+                reference_program = FusedProgram(
+                    version=1,
+                    feeds=reference_feeds,
+                    steps=reference_steps,
+                    outputs={},
+                    extras={"capture_feed_origins": reference_feed_origins},
+                )
+                next_index = (
+                    max(target.compiled_region_indices, default=-1) + 1
+                )
+                target.captured_region_programs[next_index] = (
+                    CapturedFusedProgram(
+                        program=reference_program,
+                        feeds={},
+                    )
+                )
+                target.compiled_region_indices = (
+                    *target.compiled_region_indices, next_index,
+                )
             if target is self and precompile_only:
                 # SSA and other IR consumers stop at the Turing precompile
                 # boundary.  They need the complete numerical manifest,
@@ -9754,7 +24345,9 @@ class ProcessGraphGLSLDeployment:
         # the one discovery execution and must lose their tape here.  Runtime
         # ownership begins only after every function shell's discovery object
         # has been destroyed.
-        for target in _walk_planned_shells(self):
+        for target in _walk_planned_shells(
+            self, include_function_registry=False
+        ):
             if target._discovery_tape_creations:
                 target._discovery_tape = None
                 target._discovery_tape_complete = True
@@ -9794,9 +24387,11 @@ class ProcessGraphGLSLDeployment:
             raise error
         return None
 
-    def compile_process_graph(self, *, device=None):
+    def compile_process_graph(self, *, device=None, prepare_ephemerals=False):
         try:
-            return _compile_whole_process_graph(self, device=device)
+            return _compile_whole_process_graph(
+                self, device=device, prepare_ephemerals=prepare_ephemerals
+            )
         except Exception as error:
             self._profiler.record_exception(
                 error,
@@ -10099,7 +24694,9 @@ class ProcessGraphGLSLDeployment:
             else self._discovery_session.get("owner")
         )
         if discovery_owner is not None:
-            for planned_shell in _walk_planned_shells(discovery_owner):
+            for planned_shell in _walk_planned_shells(
+                discovery_owner, include_function_registry=False
+            ):
                 collect_capture_objects(
                     getattr(planned_shell, "captured_values", {})
                 )
@@ -10301,8 +24898,22 @@ class ProcessGraphGLSLDeployment:
             # their ProcessGraph IDs as external shell inputs.
             planned_region_id_map: dict[int, int] = {}
 
+            def compiled_alias_identity(graph_id: int) -> int:
+                current = int(graph_id)
+                seen = set()
+                while (
+                    current not in seen
+                    and current in self.compiled_process_graph_aliases
+                ):
+                    seen.add(current)
+                    current = int(
+                        self.compiled_process_graph_aliases[current]
+                    )
+                return current
+
             def add_planned_id(primitive_id: int, graph_id: int) -> None:
                 primitive_id = int(primitive_id)
+                graph_id = compiled_alias_identity(graph_id)
                 graph_id = endpoint_identity.get(
                     int(graph_id), int(graph_id)
                 )
@@ -10316,6 +24927,9 @@ class ProcessGraphGLSLDeployment:
                         f"{region_index}: primitive={primitive_id}, "
                         f"first={previous}, second={graph_id}, "
                         f"function={self.process_graph.G.graph.get('function_name', '?')!r}, "
+                        f"primitive_node={tape._nodes.get(primitive_id)!r}, "
+                        f"capture_rows={region_planned_capture_ids!r}, "
+                        f"input_rows={region_planned_input_ids!r}, "
                         f"first_node={dict(self.process_graph.G.nodes[previous]) if previous in self.process_graph.G else None!r}, "
                         f"second_node={dict(self.process_graph.G.nodes[graph_id]) if graph_id in self.process_graph.G else None!r}"
                     )
@@ -10328,6 +24942,31 @@ class ProcessGraphGLSLDeployment:
                 region_planned_input_ids
             ):
                 for primitive_id, graph_id in positional_inputs:
+                    previous = planned_region_id_map.get(int(primitive_id))
+                    previous_node = (
+                        self.process_graph.G.nodes[int(previous)]
+                        if previous is not None
+                        and int(previous) in self.process_graph.G
+                        else {}
+                    )
+                    if (
+                        int(primitive_id) == int(_result_capture_id)
+                        and previous is not None
+                        and int(previous) != int(graph_id)
+                        and previous_node.get("type")
+                        not in {"Store", "IndexedStore"}
+                    ):
+                        # Object-keyed capture represents an identity adapter
+                        # with the same transient ID at its input and result.
+                        # Keep that transient ID wired to the real input and
+                        # publish the planned result endpoint as an SSA alias.
+                        self.compiled_process_graph_aliases[
+                            int(previous)
+                        ] = int(graph_id)
+                        planned_region_id_map[int(primitive_id)] = int(
+                            graph_id
+                        )
+                        continue
                     add_planned_id(primitive_id, graph_id)
             live_result_ids = tuple(
                 value_id
@@ -10589,10 +25228,13 @@ class ProcessGraphGLSLDeployment:
         # capture_fused_programs completeness audit below independently rejects
         # any omitted region that actually has a tensor output, so this cannot
         # hide failed numerical lowering.
-        complete_regions = tuple(
-            region_index
-            for region_index in range(len(self.dispatch_subgraphs))
-            if region_index in by_region
+        complete_regions, region_dependencies = _topological_region_schedule(
+            self,
+            (
+                region_index
+                for region_index in range(len(self.dispatch_subgraphs))
+                if region_index in by_region
+            ),
         )
         self.compile_time_region_indices = (
             set(range(len(self.dispatch_subgraphs))) - set(complete_regions)
@@ -10632,21 +25274,56 @@ class ProcessGraphGLSLDeployment:
                     "loops": len(self.loop_shader_reductions),
                 },
             )
-            shell_control = overlay_scheduled_control(
-                complete_regions,
-                tuple(
-                    project_control_regions(
-                        reduction.control_program,
-                        complete_regions,
-                        retained_value_ids=retained_value_ids,
-                    )
-                    for reduction in self.loop_shader_reductions
-                    if reduction.control_program is not None
-                    and (
-                        not emit_glsl
-                        or reduction.collapsible
-                    )
-                ),
+            considered_reductions = tuple(
+                reduction
+                for reduction in self.loop_shader_reductions
+                if reduction.control_program is not None
+                and (
+                    not emit_glsl
+                    or reduction.collapsible
+                )
+            )
+            structurally_owned_regions = frozenset(
+                int(region)
+                for reduction in considered_reductions
+                for region in reduction.structurally_owned_region_indices
+            ) | frozenset(
+                int(region)
+                for reduction in self.loop_shader_reductions
+                for region in reduction.domain_region_indices
+            )
+            runtime_regions = tuple(
+                int(region) for region in complete_regions
+                if int(region) not in structurally_owned_regions
+            )
+            conditional_controls = _ordinary_conditional_control_programs(
+                self.process_graph,
+                runtime_regions,
+                self.dispatch_subgraphs,
+            )
+            loop_controls = tuple(
+                project_control_regions(
+                    reduction.control_program,
+                    runtime_regions,
+                    retained_value_ids=retained_value_ids,
+                    preserve_source_loop_carries=True,
+                )
+                for reduction in considered_reductions
+            )
+            nesting = _source_control_nesting_hints(
+                considered_reductions,
+                conditional_controls,
+                self.loop_plans,
+                self.process_graph,
+            )
+            shell_control = _overlay_control_or_require_subdivision(
+                self.process_graph,
+                runtime_regions,
+                considered_reductions,
+                loop_controls,
+                conditional_controls,
+                nesting,
+                region_dependencies=region_dependencies,
             )
             shell_control = replace(
                 shell_control,
@@ -10656,17 +25333,15 @@ class ProcessGraphGLSLDeployment:
                 ))),
             )
             validations = _validation_control_blocks(self)
-            if validations:
-                shell_control = replace(
-                    shell_control,
-                    root=SequenceBlock((
-                        shell_control.root,
-                        *validations,
-                    )),
-                )
+            shell_control = _place_validation_blocks(
+                shell_control,
+                validations,
+                runtime_regions,
+                self.dispatch_subgraphs,
+            )
             shell_control = project_control_regions(
                 shell_control,
-                complete_regions,
+                runtime_regions,
                 retained_value_ids=retained_value_ids,
             )
             if self.compiled_process_graph_aliases:
@@ -11389,8 +26064,586 @@ class ProcessGraphGLSLDeployment:
     def __exit__(self, exc_type, exc, traceback):
         self.release()
         return False
-"""
+
+
+def _is_runtime_value_id(value_id: Any) -> bool:
+    """Whether ``value_id`` names a runtime value node (an integer id or its
+    digit spelling). A compile-time reference (a resolved type/module left as a
+    _StaticPythonReference) is not a runtime value id -- it is a compile-time
+    constant, and must be excluded from runtime value-id sets rather than forced
+    through ``int()``."""
+
+    if isinstance(value_id, bool):
+        return False
+    if isinstance(value_id, int):
+        return True
+    if isinstance(value_id, str):
+        return value_id.lstrip("-").isdigit()
+    return False
+
+
+def strategize_shell_deployment(
+    graph: Any,
+    *,
+    # Was 256, which was a GLSL dispatch-sizing constraint: a shader had to
+    # be split into chunks a driver would accept. That is no longer what the
+    # number means now that emission goes SPIR-V -> GLSL, and for a target
+    # that wants one flat program it was actively harmful -- a program past
+    # the bound was split into regions, so a caller asking for a flat
+    # unrolled loop silently got a retained one instead.
+    max_nodes_per_dispatch: int = 65536,
+    backend: str | None = None,
+    remove_loops: bool | None = None,
+    unroll_limit: int | None = None,
+    schedule_preference: str | None = None,
+    runtime_closure_only: bool = False,
+    _function_table_stack: tuple[int, ...] = (),
+    _selection_progress: Any = None,
+    _selection_trace: dict[str, Any] | None = None,
+) -> type:
+    """Build a stateful shell around the graph's flat dispatch schedule.
+
+    This is the compilation choke point: every backend -- c, python, glsl,
+    fortran, webgl, webgpu -- funnels its ProcessGraph through this one
+    control-planning stage before any backend-specific emission happens.
+    The name is generic on purpose; nothing below is GLSL-specific.
+
+    ``backend`` only tags the loop-composition capability profile below --
+    it does not change GLSL emission, which stays gated behind
+    ``capture_fused_programs(precompile_only=...)`` regardless of this
+    argument. Callers that only want the FusedProgram/ControlProgram/SSA
+    stages (any backend) should pass ``precompile_only=True`` there and
+    never reach GLSL-specific emission at all.
+
+    ``remove_loops`` disables native loop retention, so
+    ``evaporate_unrolled_loops`` unrolls every discovered loop into a flat
+    instruction sequence instead of a real ``LoopBlock``.
+
+    ``unroll_limit`` is the largest trip count that may be unrolled.  It is a
+    representation-choice threshold, never an execution bound.  A loop above
+    the threshold is retained with its complete source domain; if a target
+    cannot lower retained control, compilation must fail visibly rather than
+    dropping iterations.
+    """
+
+    if _selection_trace is None:
+        _selection_trace = {
+            "started_at": time.monotonic(),
+            "sequence": 0,
+            "dropped_events": 0,
+            "visits": {},
+            "events": [],
+        }
+    trace = _selection_trace
+    graph_metadata = graph.G.graph
+    function_identity = str(
+        graph_metadata.get("qualified_name")
+        or graph_metadata.get("function_name")
+        or graph_metadata.get("function_ref")
+        or "<source-catalogue>"
     )
+    visit_key = "|".join((
+        function_identity,
+        str(graph.G.number_of_nodes()),
+        str(graph.G.number_of_edges()),
+    ))
+    visits = trace.setdefault("visits", {})
+    visits[visit_key] = int(visits.get(visit_key, 0)) + 1
+
+    def selection_event(stage: str, state: str, **facts: Any) -> None:
+        trace["sequence"] = int(trace.get("sequence", 0)) + 1
+        event = {
+            "sequence": int(trace["sequence"]),
+            "elapsed_seconds": round(
+                time.monotonic() - float(trace["started_at"]), 6
+            ),
+            "function": function_identity,
+            "function_depth": len(_function_table_stack),
+            "visit": int(visits[visit_key]),
+            "stage": str(stage),
+            "state": str(state),
+            "nodes": int(graph.G.number_of_nodes()),
+            "edges": int(graph.G.number_of_edges()),
+            **facts,
+        }
+        events = trace.setdefault("events", [])
+        events.append(event)
+        if len(events) > 512:
+            del events[: len(events) - 512]
+            trace["dropped_events"] = int(
+                trace.get("dropped_events", 0)
+            ) + 1
+        # Keep the evidence on every graph which participates in selection.
+        # The shared object means the root and extracted function graphs expose
+        # one ordered account rather than unrelated print-only diagnostics.
+        graph_metadata["deployment_selection_trace"] = trace
+        if _selection_progress is not None:
+            detail = " ".join(
+                f"{name}={value}"
+                for name, value in facts.items()
+            )
+            _selection_progress(
+                "deployment-select: "
+                f"function={function_identity} "
+                f"depth={len(_function_table_stack)} "
+                f"visit={visits[visit_key]} "
+                f"stage={stage} state={state} "
+                f"nodes={event['nodes']} edges={event['edges']}"
+                + (f" {detail}" if detail else "")
+            )
+
+    def selection_phase(name: str, action: Any) -> Any:
+        phase_started = time.monotonic()
+        selection_event(name, "begin")
+        try:
+            result = action()
+        except BaseException as exc:
+            selection_event(
+                name,
+                "failed",
+                duration_seconds=round(time.monotonic() - phase_started, 6),
+                exception=type(exc).__name__,
+            )
+            raise
+        selection_event(
+            name,
+            "end",
+            duration_seconds=round(time.monotonic() - phase_started, 6),
+        )
+        return result
+
+    selection_event("deployment", "begin", repeated_visit=visits[visit_key] > 1)
+    selection_phase(
+        "lower-python-scalar-intrinsics",
+        lambda: _lower_python_scalar_intrinsics(graph),
+    )
+
+    # Region planning may legitimately erase structural AST nodes after their
+    # dataflow has been reduced.  Capture authored branch/guard identity before
+    # any such planning so every extracted function shell retains the control
+    # catalogue needed for later SSA overlay.
+    selection_phase(
+        "retain-source-control-records",
+        lambda: _retain_source_control_records(graph.G),
+    )
+    selection_phase(
+        "retain-source-sequence-mutation-records",
+        lambda: _retain_source_sequence_mutation_records(graph.G),
+    )
+
+    # Inherit whatever the compilation asked for, then record it so the
+    # function shells planned from subgraphs of this one see the same thing.
+    # Without this a nested function -- which is where a loop usually lives,
+    # since the entrypoint is a thin wrapper -- silently planned with the
+    # defaults, and a caller asking for a flat program got a retained loop.
+    inherited = dict(graph.G.graph.get("loop_settings") or {})
+    backend = inherited.get("backend", "glsl") if backend is None else backend
+    remove_loops = (
+        inherited.get("remove_loops", False) if remove_loops is None
+        else remove_loops
+    )
+    if unroll_limit is None:
+        from .work_contract import active_contract
+
+        unroll_limit = inherited.get(
+            "unroll_limit", active_contract().loops.unroll_limit,
+        )
+    schedule_preference = (
+        inherited.get("schedule_preference", "alap")
+        if schedule_preference is None else schedule_preference
+    )
+    schedule_preference = str(schedule_preference).lower()
+    if schedule_preference not in {"asap", "alap"}:
+        raise ValueError(
+            "deployment schedule preference must be 'asap' or 'alap'"
+        )
+    unroll_limit = max(1, min(int(unroll_limit), MAX_UNROLL_LIMIT))
+    graph.G.graph["loop_settings"] = {
+        "backend": backend,
+        "remove_loops": bool(remove_loops),
+        "unroll_limit": int(unroll_limit),
+        "schedule_preference": schedule_preference,
+    }
+    graph.G.graph["deployment_schedule_preference"] = schedule_preference
+    runtime_catalogue = bool(
+        runtime_closure_only
+        and not graph.G.graph.get("function_name")
+    )
+    specialization_dependency_regions = (
+        (graph.G.graph.get("map_ir") or {}).get("dependency_regions") or {}
+    )
+    runtime_specialization_references = (
+        frozenset(map(int, specialization_dependency_regions["runtime"]))
+        if runtime_closure_only
+        and "runtime" in specialization_dependency_regions
+        else None
+    )
+
+    selection_phase(
+        "resolve-bound-function-references",
+        lambda: _resolve_bound_function_references(graph),
+    )
+    selection_phase(
+        "propagate-callsite-planner-specializations",
+        lambda: _propagate_callsite_planner_specializations(graph),
+    )
+    # A concrete function graph always has literal structural facts that can
+    # remove or alias nodes even when there is no callsite-specific scalar
+    # specialization. Perform that fixed point before its dispatch regions are
+    # carved. The file/module catalogue graph has no ``function_name`` and is
+    # intentionally excluded: folding that shared discovery graph mutates the
+    # function-table sources before their individual specialization facts are
+    # applied. ``prepare_graph_precompile`` repeats the fold defensively after
+    # callsite shells are attached; by then it must be idempotent.
+    if graph.G.graph.get("function_name"):
+        selection_phase(
+            "fold-callsite-structural-values-before-tensors",
+            lambda: _fold_callsite_structural_values(graph),
+        )
+    if not _function_table_stack:
+        selection_phase(
+            "propagate-callsite-tensor-specializations",
+            lambda: _propagate_callsite_tensor_specializations(
+                graph,
+                runtime_references=runtime_specialization_references,
+                _progress=lambda facts: selection_event(
+                    "callsite-tensor-specialization",
+                    "progress",
+                    **facts,
+                ),
+            ),
+        )
+    else:
+        # The root pass settled the entire proven runtime closure directly on
+        # the shared function-table entries before any clean function graph is
+        # extracted. Re-running that whole-table fixed point from every child
+        # shell is redundant and can let one child mutate sibling catalogue
+        # graphs after their shells have already been planned.
+        selection_event(
+            "propagate-callsite-tensor-specializations",
+            "inherited",
+        )
+    if graph.G.graph.get("function_name"):
+        # Tensor descriptors learned across call edges can make another local
+        # shape-only expression decidable.  The structural fixed point is
+        # idempotent and still executes no numerical source code.
+        selection_phase(
+            "fold-callsite-structural-values-after-tensors",
+            lambda: _fold_callsite_structural_values(graph),
+        )
+        # Branch folding can remove synthesized call-result projections while
+        # retaining the aggregate producer selected by the surviving arm.
+        # The fold itself now repairs that ledger invariant before returning,
+        # including for recursive callsite specializations.
+        selection_phase(
+            "refresh-specialized-python-precision",
+            lambda: _refresh_specialized_python_precision(graph),
+        )
+    # Loop discovery snapshots state effects into immutable descriptors. Link
+    # methods before that snapshot so an authored record mutation is owned by
+    # its compiled callee instead of remaining a second opaque callsite effect.
+    selection_phase(
+        "resolve-grounded-method-references-before-loops",
+        lambda: _resolve_grounded_method_references(graph),
+    )
+    canonical_value_ids = bool(
+        graph.G.graph.get("canonical_value_ids")
+    )
+    loop_composer = LoopComposer(
+        LoopBackendCapabilities(
+            backend=backend,
+            native_for=not remove_loops,
+            native_while=not remove_loops,
+            dynamic_bounds=not remove_loops,
+            kpn=False,
+            unroll_limit=int(unroll_limit),
+        )
+    )
+    discovered_loop_plans = selection_phase(
+        "discover-loops",
+        lambda: (
+            loop_composer.discover(graph)
+            if canonical_value_ids and not runtime_catalogue
+            else ()
+        ),
+    )
+    evaporated_loop_plans = selection_phase(
+        "evaporate-unrolled-loops",
+        lambda: (
+            evaporate_unrolled_loops(graph, discovered_loop_plans)
+            if discovered_loop_plans else ()
+        ),
+    )
+    if evaporated_loop_plans and (
+        graph.G.graph.get("planner_specializations")
+        or graph.G.graph.get("planner_tensor_descriptors")
+    ):
+        # Unrolling turns each induction/tuple component into a literal node.
+        # Re-run callsite specialization before the local structural fixed
+        # point. A cloned call consumes the fresh literal induction value and
+        # owns a fresh callsite id; retaining the pre-unroll dynamic callee
+        # would replace an exact aggregate member with private frame storage.
+        selection_phase(
+            "propagate-callsite-planner-specializations-after-unroll",
+            lambda: _propagate_callsite_planner_specializations(graph),
+        )
+        selection_phase(
+            "fold-callsite-structural-values-after-unroll",
+            lambda: _fold_callsite_structural_values(graph),
+        )
+    evaporated_loop_ids = {
+        int(plan.loop.node_id) for plan in evaporated_loop_plans
+    }
+    retained_loop_plans = tuple(
+        (
+            replace(
+                plan,
+                strategy=LoopStrategy.NATIVE_SOURCE,
+                reason=(
+                    "resident sequence mutation requires iterative SSA "
+                    "memory effects"
+                ),
+            )
+            if (
+                plan.strategy in {LoopStrategy.UNROLL, LoopStrategy.CONSTANT}
+                and (
+                    bool(plan.loop.control_sites)
+                    or any(
+                        effect.mode in {LoopStateEffectMode.SEQUENCE_MUTATION,
+                                        LoopStateEffectMode.MAPPING_MUTATION}
+                        for effect in plan.loop.state_effects
+                    )
+                    or any(
+                        any((graph.G.nodes[node_id].get("attributes") or {}).get(key) is not None
+                            for key in ("callee_ref", "method_ref", "constructor_ref"))
+                        for node_id in plan.loop.body_nodes if node_id in graph.G
+                    )
+                )
+            )
+            else plan
+        )
+        for plan in discovered_loop_plans
+        if int(plan.loop.node_id) not in evaporated_loop_ids
+        and int(plan.loop.node_id) in graph.G
+    )
+    semantic_loop_plans = selection_phase(
+        "materialize-loop-semantic-ir",
+        lambda: (
+            loop_composer.materialize_semantic_ir(
+                graph,
+                retained_loop_plans,
+            )
+            if retained_loop_plans else ()
+        ),
+    )
+    loop_plans = selection_phase(
+        "materialize-retained-loop-ports",
+        lambda: (
+            materialize_retained_loop_ports(graph, semantic_loop_plans)
+            if semantic_loop_plans else ()
+        ),
+    )
+    function_entry = None
+    function_reference = graph.G.graph.get("function_ref")
+    function_table = getattr(graph, "function_table", None)
+    if function_reference is not None and function_table is not None:
+        function_entry = function_table.entry(function_reference)
+    process_graph_boundary = (
+        None
+        if function_entry is None
+        else function_entry.metadata.get("process_graph_boundary")
+    )
+    python_callable = (
+        None if function_entry is None else function_entry.python_callable
+    )
+    selection_phase(
+        "resolve-grounded-method-references-after-loops",
+        lambda: _resolve_grounded_method_references(graph),
+    )
+    selection_phase(
+        "resolve-grounded-tensor-operations",
+        lambda: _resolve_grounded_tensor_operations(graph),
+    )
+    reference_tables = selection_phase(
+        "build-shell-reference-tables",
+        lambda: build_shell_reference_tables(graph),
+    )
+    ordered_executable_nodes = selection_phase(
+        "dependency-order",
+        lambda: _dependency_order(graph),
+    )
+    is_dispatch_metadata = _dispatch_metadata_node_classifier(graph)
+    executable_nodes = tuple(
+        node_id
+        for node_id in ordered_executable_nodes
+        if not is_dispatch_metadata(node_id)
+    )
+    if runtime_catalogue:
+        # The runtime root is the source catalogue and map owner. Execution
+        # starts at ``activation_root_references`` in its function shells;
+        # _compile_whole_process_graph already treats this shell as a catalogue
+        # rather than a second execution of the module. Keep the same boundary
+        # here during region selection: planning catalogue syntax as numerical
+        # work created hundreds of dispatch subgraphs which no runtime could
+        # ever execute.
+        selection_event(
+            "runtime-catalogue-boundary",
+            "applied",
+            excluded_executable_nodes=len(executable_nodes),
+        )
+        executable_nodes = ()
+    # Control membership is a semantic partition: numerical work may be
+    # reduced freely inside one planner-owned loop body or conditional branch,
+    # but never fused across that control boundary.  All other dispatch
+    # boundaries are produced by the fixed-point shader-region identities
+    # rather than inherited from schedule levels or operator spelling.
+    partition_keys = selection_phase(
+        "control-partition-keys",
+        lambda: _control_partition_keys(
+            graph,
+            loop_plans,
+            executable_nodes,
+        ),
+    )
+    inert_nodes = selection_phase(
+        "inert-routing-nodes",
+        lambda: _inert_routing_nodes(graph),
+    )
+    closure_edges, closure_outputs = selection_phase(
+        "closure-routing-dependencies",
+        lambda: _closure_routing_dependencies(graph),
+    )
+    # A method may ``return`` a compile-time reference (a type or module, e.g.
+    # ``return torch.float32``). That resolves to a _StaticPythonReference, not a
+    # runtime value node id -- it is a compile-time constant, not a runtime
+    # output -- so it is excluded from the runtime return-liveness set here
+    # (int() would fail on it), the same way compile-time references are not
+    # runtime roots.
+    return_outputs = frozenset(
+        int(value_id)
+        for value_id in (
+            *(
+                parent
+                for _node_id, data in graph.G.nodes(data=True)
+                if isinstance(data.get("expr_obj"), ast.Return)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {"result", "value", "operand"}
+            ),
+            *(graph.G.graph.get("return_value_nodes", {}) or {}).values(),
+        )
+        if _is_runtime_value_id(value_id) and int(value_id) in graph.G
+    )
+    recursion_control_nodes = frozenset(
+        int(node_id)
+        for record in (
+            graph.G.graph.get("recursion_table") or {}
+        ).values()
+        if record.get("control_ir", True)
+        for node_id in record.get("control_members", ())
+    )
+    dispatch_plan = selection_phase(
+        "reduce-scheduled-shader-regions",
+        lambda: reduce_scheduled_shader_regions(
+            graph,
+            executable_nodes,
+            max_nodes_per_region=max_nodes_per_dispatch,
+            partition_keys=partition_keys,
+            extra_dependency_edges=closure_edges,
+            fusible_node_ids=_shader_fusible_node_ids(
+                graph, executable_nodes,
+            ),
+            indivisible_node_groups=_precision_indivisible_node_groups(
+                graph, executable_nodes,
+            ),
+            control_node_ids=recursion_control_nodes,
+            _progress=lambda facts: selection_event(
+                "shader-region-fixed-point",
+                "progress",
+                **facts,
+            ),
+        ),
+    )
+    executable_dispatch_nodes = tuple(
+        dispatch.node_ids
+        for dispatch in dispatch_plan.dispatches
+    )
+    control_deployment_regions = bind_control_deployments_to_regions(
+        graph.G.graph.get("control_deployment_regions", ()),
+        executable_dispatch_nodes,
+    )
+    deployment_region_preferences: dict[int, str] = {}
+    for deployment in control_deployment_regions:
+        for lane in deployment.lanes:
+            for region_index in lane.region_indices:
+                previous = deployment_region_preferences.setdefault(
+                    int(region_index), deployment.schedule_preference
+                )
+                if previous != deployment.schedule_preference:
+                    raise ValueError(
+                        "scheduled region has conflicting deployment "
+                        f"preferences: region={region_index}, "
+                        f"preferences={(previous, deployment.schedule_preference)!r}"
+                    )
+    dispatch_subgraphs = selection_phase(
+        "extract-dispatch-subgraphs",
+        lambda: tuple(
+            _dispatch_subgraph(
+                graph,
+                node_ids,
+                required_outputs=frozenset((*closure_outputs, *return_outputs)),
+                inert_nodes=inert_nodes,
+                schedule_preference=deployment_region_preferences.get(
+                    region_index, "asap"
+                ),
+            )
+            for region_index, node_ids in enumerate(executable_dispatch_nodes)
+            if node_ids
+        ),
+    )
+    for subgraph, dispatch in zip(
+        dispatch_subgraphs,
+        dispatch_plan.dispatches,
+    ):
+        subgraph.G.graph["rewrite_history"] = dispatch.rewrite_history
+    loop_region_indices = {
+        plan.loop.node_id: tuple(
+            region_index
+            for region_index, subgraph in enumerate(dispatch_subgraphs)
+            if set(
+                subgraph.G.graph.get("deployment_nodes", ())
+            ).intersection(plan.loop.body_nodes)
+        )
+        for plan in loop_plans
+    }
+    loop_shader_reductions = selection_phase(
+        "analyze-shader-loop-reductions",
+        lambda: analyze_shader_loop_reductions(
+            graph,
+            loop_plans,
+            executable_dispatch_nodes,
+        ),
+    )
+    deep_compilers = tuple(
+        GraphDeepCompiler(
+            subgraph,
+            dict(abstract_tensor_funcs),
+            abstract_tensor_sigs,
+            node_observer=_observe_process_graph_node,
+        )
+        for subgraph in dispatch_subgraphs
+    )
+    ephemeral_callables = tuple(
+        EphemeralProcessGraphCallable(
+            subgraph,
+            compiler=compiler,
+            eager=False,
+        )
+        for subgraph, compiler in zip(
+            dispatch_subgraphs,
+            deep_compilers,
+        )
+    )
+
     executable_node_ids = {
         node_id
         for node_ids in executable_dispatch_nodes
@@ -11401,136 +26654,98 @@ class ProcessGraphGLSLDeployment:
         for node_id, location in dispatch_plan.node_locations.items()
         if node_id in executable_node_ids
     }
-    namespace = {
-        "replace": replace,
-        "__process_graph__": graph,
-        "__external_function_table__": getattr(
-            graph,
-            "external_function_table",
-            None,
-        ),
-        "__static_python_bindings__": dict(
-            getattr(graph, "python_bindings", {}) or {}
-        ),
-        "__dispatch_plan__": dispatch_plan,
-        "__loop_plans__": loop_plans,
-        "__loop_shader_reductions__": loop_shader_reductions,
-        "__control_deployment_regions__": control_deployment_regions,
-        "__loop_region_indices__": loop_region_indices,
-        "__process_graph_boundary__": process_graph_boundary,
-        "__python_callable__": python_callable,
-        "__dispatch_subgraphs__": dispatch_subgraphs,
-        "__deep_compilers__": deep_compilers,
-        "__ephemeral_callables__": ephemeral_callables,
-        "__reference_tables__": reference_tables,
-        "__source_node_count__": graph.G.number_of_nodes(),
-        "__primitive_count__": sum(
-            len(node_ids)
-            for node_ids in executable_dispatch_nodes
-        ),
-        "__loop_count__": sum(
-            1
-            for _node_id, data in graph.G.nodes(data=True)
-            if str(data.get("type")) in {"For", "AsyncFor", "While"}
-        ),
-        "__dispatch_count__": len(dispatch_subgraphs),
-        "__max_nodes_per_dispatch__": int(max_nodes_per_dispatch),
-        "__deployment_batches__": node_locations,
-        "DeploymentFIFO": DeploymentFIFO,
-        "DeploymentProfiler": DeploymentProfiler,
-        "time": time,
-        "gc": gc,
-        "GLSLFusedProgramNetwork": GLSLFusedProgramNetwork,
-        "PrecompileObserverTensorOperations": (
-            PrecompileObserverTensorOperations
-        ),
-        "CapturedFusedProgram": CapturedFusedProgram,
-        "FusedProgram": FusedProgram,
-        "Meta": Meta,
-        "compile_recorded_fused_tape": (
-            compile_recorded_fused_tape
-        ),
-        "emit_multi_output_program_source": (
-            emit_multi_output_program_source
-        ),
-        "compose_control_shader": compose_control_shader,
-        "build_control_shader_artifact": build_control_shader_artifact,
-        "InstalledGLSLControlShell": InstalledGLSLControlShell,
-        "ControlProgram": ControlProgram,
-        "SequenceBlock": SequenceBlock,
-        "overlay_scheduled_control": overlay_scheduled_control,
-        "project_control_regions": project_control_regions,
-        "ordered_feed_ids": ordered_feed_ids,
-        "_compiler_input_name": _compiler_input_name,
-        "_bind_capture_tape": _bind_capture_tape,
-        "_capture_storage_identity": _capture_storage_identity,
-        "_remap_captured_program": _remap_captured_program,
-        "_remap_captured_all_ids": _remap_captured_all_ids,
-        "_project_captured_program": _project_captured_program,
-        "_capture_feed_aliases": _capture_feed_aliases,
-        "_wire_planned_step_inputs": _wire_planned_step_inputs,
-        "_collapse_planned_collection_materializations": (
-            _collapse_planned_collection_materializations
-        ),
-        "_unique_runtime_feed_aliases": _unique_runtime_feed_aliases,
-        "_coordinate_scheduled_capture": _coordinate_scheduled_capture,
-        "_use_scheduled_capture_backend": _use_scheduled_capture_backend,
-        "_compile_whole_process_graph": _compile_whole_process_graph,
-        "_source_static_value": _source_static_value,
-        "_callsite_specialized_shell_type": (
-            _callsite_specialized_shell_type
-        ),
-        "_constant_value": _constant_value,
-        "_attach_profiler": _attach_profiler,
-        "_walk_planned_shells": _walk_planned_shells,
-        "_deployment_program_table_lines": _deployment_program_table_lines,
-        "_build_shell_hierarchy_plan": _build_shell_hierarchy_plan,
-        "_refresh_hierarchy_control_captures": (
-            _refresh_hierarchy_control_captures
-        ),
-        "_declared_output_terminals": _declared_output_terminals,
-        "_validation_control_blocks": _validation_control_blocks,
-        "_build_hierarchical_glsl_artifact": (
-            _build_hierarchical_glsl_artifact
-        ),
-        "assign_hierarchy_ids": assign_hierarchy_ids,
-        "_diagnostic_value_summary": _diagnostic_value_summary,
-        "_captured_storage_meta": _captured_storage_meta,
-        "_shell_profile_name": _shell_profile_name,
-        # The generated class runs in this namespace only, so anything it
-        # calls has to be handed in explicitly.
-        "_resolve_binding_name": _resolve_binding_name,
-        "execute_captured_fused_program": execute_captured_fused_program,
-        "compile_captured_fused_program": compile_captured_fused_program,
-        "GLSLTensorOperations": GLSLTensorOperations,
-        "AbstractTensor": AbstractTensor,
-        "autograd": autograd,
-        "np": np,
-    }
-    exec(
-        compile(
-            class_ast,
-            filename="<glsl-deployment-strategy>",
-            mode="exec",
-        ),
-        namespace,
+    deployment_class = type(
+        "ProcessGraphGLSLDeployment",
+        (ProcessGraphGLSLDeployment,),
+        {
+            "process_graph": graph,
+            "external_function_table": getattr(
+                graph, "external_function_table", None
+            ),
+            "static_python_bindings": dict(
+                getattr(graph, "python_bindings", {}) or {}
+            ),
+            "dispatch_plan": dispatch_plan,
+            "loop_plans": loop_plans,
+            "loop_shader_reductions": loop_shader_reductions,
+            "control_deployment_regions": control_deployment_regions,
+            "loop_region_indices": loop_region_indices,
+            "process_graph_boundary": process_graph_boundary,
+            "python_callable": staticmethod(python_callable),
+            "dispatch_subgraphs": dispatch_subgraphs,
+            "deep_compilers": deep_compilers,
+            "ephemeral_callables": ephemeral_callables,
+            "reference_table_template": reference_tables,
+            "source_node_count": graph.G.number_of_nodes(),
+            "primitive_count": sum(
+                len(node_ids) for node_ids in executable_dispatch_nodes
+            ),
+            "loop_count": sum(
+                1
+                for _node_id, data in graph.G.nodes(data=True)
+                if str(data.get("type")) in {"For", "AsyncFor", "While"}
+            ),
+            "dispatch_count": len(dispatch_subgraphs),
+            "max_nodes_per_dispatch": int(max_nodes_per_dispatch),
+            "selection_progress": (
+                None if _selection_progress is None
+                else staticmethod(_selection_progress)
+            ),
+            "deployment_batches": node_locations,
+        },
     )
-    deployment_class = namespace["ProcessGraphGLSLDeployment"]
-    deployment_class.generated_ast = class_ast
     function_shell_types = {}
     function_table = getattr(graph, "function_table", None)
     table_identity = id(function_table)
+    dependency_regions = (
+        (graph.G.graph.get("map_ir") or {}).get("dependency_regions") or {}
+    )
+    runtime_references = (
+        frozenset(map(int, dependency_regions["runtime"]))
+        if runtime_closure_only and "runtime" in dependency_regions
+        else None
+    )
     if (
         function_table is not None
         and table_identity not in _function_table_stack
     ):
         nested_stack = (*_function_table_stack, table_identity)
-        for entry in function_table:
+        for function_index, entry in enumerate(function_table):
             if entry.graph is None:
                 continue
-            function_graph = extract_clean_process_subgraph(
-                entry.graph,
-                entry.graph.G,
+            reference = int(entry.reference.address)
+            if (
+                runtime_references is not None
+                and reference not in runtime_references
+            ):
+                # ``build_map_dependency_regions`` has already proved the
+                # strict call closure of every submitted compile target.
+                # Map-only definitions stay in FunctionTable/map/class
+                # navigation records, but they are not executable members of
+                # this program and must not receive deployment shells.  The
+                # old all-table expansion turned a 27-function program into
+                # 103 function types and thousands of callsite activations,
+                # lowering unrelated class methods as though they ran.
+                continue
+            child_identity = str(
+                getattr(entry, "qualified_name", None)
+                or getattr(entry, "name", None)
+                or reference
+            )
+            function_started = time.monotonic()
+            selection_event(
+                "function-shell",
+                "begin",
+                child_function=child_identity,
+                child_reference=reference,
+                function_index=int(function_index),
+            )
+            function_graph = selection_phase(
+                "extract-function-subgraph",
+                lambda entry=entry: extract_clean_process_subgraph(
+                    entry.graph,
+                    entry.graph.G,
+                ),
             )
             # A function's graph is built independently, not carved out of
             # the caller's, so it does not inherit the compilation's loop
@@ -11543,20 +26758,71 @@ class ProcessGraphGLSLDeployment:
                 dict(graph.G.graph.get("loop_settings") or {}),
             )
             function_shell_types[entry.reference.address] = (
-                strategize_glsl_deployment(
+                strategize_shell_deployment(
                     function_graph,
                     max_nodes_per_dispatch=max_nodes_per_dispatch,
                     _function_table_stack=nested_stack,
+                    _selection_progress=_selection_progress,
+                    _selection_trace=trace,
                 )
             )
+            selection_event(
+                "function-shell",
+                "end",
+                child_function=child_identity,
+                child_reference=reference,
+                function_index=int(function_index),
+                duration_seconds=round(
+                    time.monotonic() - function_started, 6
+                ),
+            )
+    activation_root_references = []
+    if runtime_closure_only and function_table is not None:
+        for target in graph.G.graph.get("compile_targets", ()):
+            try:
+                reference = int(
+                    function_table.entry(str(target)).reference.address
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if reference in function_shell_types:
+                activation_root_references.append(reference)
+        if not activation_root_references:
+            # A caller may provide a precomputed runtime closure without the
+            # source-level target names (for example an older checkpoint).
+            # In that case retain the complete proven runtime set rather than
+            # guessing one privileged root.
+            activation_root_references.extend(sorted(function_shell_types))
     deployment_class.function_shell_types = function_shell_types
+    deployment_class.runtime_closure_only = bool(runtime_closure_only)
+    deployment_class.planned_function_references = tuple(sorted(
+        function_shell_types
+    ))
+    deployment_class.activation_root_references = tuple(dict.fromkeys(
+        activation_root_references
+    ))
+    deployment_class.catalogued_function_references = tuple(sorted(
+        int(entry.reference.address)
+        for entry in function_table or ()
+        if entry.graph is not None
+    ))
+    deployment_class.catalogue_only_function_references = tuple(sorted(
+        set(deployment_class.catalogued_function_references)
+        - set(deployment_class.planned_function_references)
+    ))
+    selection_event(
+        "deployment",
+        "end",
+        dispatches=len(dispatch_subgraphs),
+        planned_functions=len(function_shell_types),
+    )
     return deployment_class
 
 
 __all__ = [
     "DeploymentErrorBuffer",
     "DeploymentProfiler",
-    "strategize_glsl_deployment",
+    "strategize_shell_deployment",
 ]
 class _CompiledStructuralObject:
     """Shell-owned state whose methods are compiled function subgraphs."""
@@ -11602,6 +26868,15 @@ class _CompiledStructuralMethod:
     def __init__(self, receiver, method_ref):
         self.receiver = receiver
         self.method_ref = int(method_ref)
+
+
+class _CompiledStructuralFunction:
+    """First-class edge to a source function already in the function table."""
+
+    __slots__ = ("function_ref",)
+
+    def __init__(self, function_ref):
+        self.function_ref = int(function_ref)
 
 
 class _CompiledStructuralClass:

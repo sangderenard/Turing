@@ -1,0 +1,33 @@
+<!doctype html><meta charset="utf-8"><pre id="out">starting</pre><iframe id="source" hidden src="abstract_ui_object_map.html"></iframe><script>
+(async()=>{
+  const out=document.querySelector('#out'), log=s=>out.textContent+='\n'+s;
+  try{
+    const html=await (await fetch('abstract_ui_object_map.html')).text();
+    const doc=new DOMParser().parseFromString(html,'text/html');
+    const p=JSON.parse(doc.querySelector('#abstract-ui-model').textContent).vehicle_slot.programs[0];
+    const entries=[
+      ['compiled-contact',p.kernel],
+      ['terrain-wall-radial-gather',p.terrain_contact_geometry.kernel],
+      ['backend-gemm-reduction',p.wrench_reduction.kernel],
+      ['vehicle-graph-assembly',p.graph_adapters.assembly],
+      ['compiled-vehicle-transition',p.vehicle_integration.kernel],
+      ['vehicle-state-commit',p.graph_adapters.commit],
+    ];
+    const adapter=await navigator.gpu.requestAdapter();
+    if(!adapter)throw Error('no adapter');
+    const device=await adapter.requestDevice();out.textContent='adapter ready';
+    for(const [label,kernel] of entries){
+      const module=device.createShaderModule({label,code:kernel.source});
+      const info=await module.getCompilationInfo();
+      const errors=info.messages.filter(m=>m.type==='error');
+      if(errors.length){
+        log(label+' ERROR');
+        for(const m of errors)log(`${m.lineNum}:${m.linePos} ${m.message}`);
+        continue;
+      }
+      try{await device.createComputePipelineAsync({label,layout:'auto',compute:{module,entryPoint:kernel.entrypoint}});log(label+' OK');}
+      catch(error){log(label+' PIPELINE '+error.message);}
+    }
+  }catch(error){log('HARNESS '+(error.stack||error));}
+})();
+</script>

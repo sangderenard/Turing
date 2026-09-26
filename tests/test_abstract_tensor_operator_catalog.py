@@ -16,6 +16,37 @@ from src.transmogrifier.operator_defs import (
 )
 
 
+def test_tensor_constructor_spelling_is_canonicalized_during_ast_ingestion():
+    import ast
+
+    from src.transmogrifier.graph.node_special_cases import tensor_operation_name
+
+    for spelling in ("Tensor([1.0])", "torch.Tensor([1.0])"):
+        call = ast.parse(spelling, mode="eval").body
+        assert tensor_operation_name(call) == "tensor"
+        assert ast.unparse(call) == "tensor([1.0])"
+
+
+def test_frontend_qualified_tensor_call_is_abstracted_during_ast_ingestion():
+    import ast
+
+    from src.transmogrifier.graph.node_special_cases import tensor_operation_name
+
+    for spelling in (
+        "torch.real(value)",
+        "numpy.repeat(value, 2)",
+        "np.linalg.solve(matrix, rhs)",
+    ):
+        call = ast.parse(spelling, mode="eval").body
+        expected = call.func.attr
+        assert tensor_operation_name(call) == expected
+        # The concrete namespace is excluded from lexical resolution, while
+        # the original call spelling remains available for candidate-only
+        # tensor proof. Only Tensor(...) itself is rewritten to tensor(...).
+        assert isinstance(call.func, ast.Attribute)
+        assert call._abstract_tensor_frontend_reference == expected
+
+
 def test_public_abstract_tensor_api_is_explicitly_classified():
     public = {
         name for name in dir(AbstractTensor)

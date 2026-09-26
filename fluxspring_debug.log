@@ -1,5 +1,0 @@
-2025-09-15 22:00:16,422 DEBUG __main__: demo_spectral_routing: starting main(), logging to fluxspring_debug.log
-2025-09-15 22:00:16,490 DEBUG __main__: Spec built: layers=6 bands=8 nodes=56 edges=104
-2025-09-15 22:00:16,826 DEBUG src.common.tensors.autoautograd.fluxspring: register_param_wheels: created 584 wheels slots=40 spectral=True
-2025-09-15 22:00:16,827 DEBUG __main__: vectorize_wheel: wheel=0 param=0 before shape=(40, 1)
-2025-09-15 22:00:16,828 DEBUG __main__: vectorize_wheel: wheel=0 param=0 after shape=(40,)

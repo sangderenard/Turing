@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from src.common.tensors import AbstractTensor
+
 import math
 
 import pytest
@@ -37,7 +39,8 @@ def test_scientific_graph_rolls_back_named_error_and_lands_on_event():
                 max_flux=0.0,
                 div_inf=0.0,
                 mass_err=0.0,
-                error_channels={"phase_error": float(dt)},
+                error_channels=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, float(dt), 0.0]),
+                error_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
             ),
             state,
         )
@@ -54,7 +57,8 @@ def test_scientific_graph_rolls_back_named_error_and_lands_on_event():
             cfl=1.0,
             div_max=1.0,
             mass_max=1.0,
-            error_limits={"phase_error": 0.1},
+            error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0]),
+            error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
         ),
         dx=1.0,
     )
@@ -91,7 +95,8 @@ def test_parallel_children_conservatively_combine_scientific_errors():
                 0.0,
                 0.0,
                 0.0,
-                error_channels={name: error},
+                error_channels=AbstractTensor.tensor([0.0] * 15 + [error if name == "phase" else 0.0, 0.0, error if name == "power" else 0.0]),
+                error_present=AbstractTensor.tensor([0.0] * 15 + [float(name == "phase"), 0.0, float(name == "power")]),
             ), value
 
         return advance
@@ -104,7 +109,8 @@ def test_parallel_children_conservatively_combine_scientific_errors():
                 cfl=1.0,
                 div_max=1.0,
                 mass_max=1.0,
-                error_limits={"phase": 1.0, "power": 1.0},
+                error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0]),
+                error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0]),
             ),
             1.0,
         ),
@@ -119,7 +125,8 @@ def test_parallel_children_conservatively_combine_scientific_errors():
 
     result = MetaLoopRunner(state_table=root.state_table).run_round(root)
 
-    assert result.metrics.error_channels == {"phase": 0.2, "power": 0.3}
+    assert result.metrics.error_channels.tolist()[15:] == [0.2, 0.0, 0.3]
+    assert result.metrics.error_present.tolist()[15:] == [1.0, 0.0, 1.0]
 
 
 def test_scientific_graph_rolls_back_entire_failed_window():

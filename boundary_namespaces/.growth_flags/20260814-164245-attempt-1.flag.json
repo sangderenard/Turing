@@ -1,0 +1,18 @@
+{
+  "attempt": 1,
+  "boundary_fingerprint": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "boundary_hint": "python/train",
+  "current_boundary_fingerprint": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "depth": 513,
+  "height": 513,
+  "message": "translation growth emergency clamp tripped for scope train: nodes=638/50000, depth=513/512, height=513/512; stages=[compiler-run:514, process-graph:124]. Raise the limits only with the explicit CLI growth-limit boost after inspecting this branch. Suggested boundary directory: python/train.",
+  "node_count": 638,
+  "owner": "scope train",
+  "stages": {
+    "compiler-run": 514,
+    "process-graph": 124
+  },
+  "state": "wait-expired",
+  "suggested_directory": "C:\\dev\\Powershell\\turing\\boundary_namespaces\\python\\train",
+  "version": 1
+}

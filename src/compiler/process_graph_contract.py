@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 # These edges preserve program structure and whole-entrypoint reachability.
 # They must never be interpreted as numerical operands by SSA or backend
 # region compilers.

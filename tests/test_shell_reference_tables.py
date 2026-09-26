@@ -8,8 +8,12 @@ from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )
 from src.compiler.glsl_deployment_strategy import (
-    strategize_glsl_deployment,
+    _is_dispatch_metadata_node,
+    _walk_planned_shells,
+    strategize_shell_deployment,
 )
+from src.compiler.identity_concordance import current_identity_book
+from src.compiler.compilation_units import record_compilation_unit_plan
 from src.compiler.shell_reference_tables import (
     build_class_navigation_table,
     build_map_dependency_regions,
@@ -130,7 +134,7 @@ def affine(value):
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
-    shell_type = strategize_glsl_deployment(graph)
+    shell_type = strategize_shell_deployment(graph)
     first = shell_type()
     second = shell_type()
     try:
@@ -218,6 +222,304 @@ class Archive:
     )
 
 
+def test_deployment_shells_follow_proven_runtime_closure_not_map_only_catalogue():
+    module = ast.parse(
+        '''
+class Archive:
+    def read(self, index):
+        return helper(index)
+
+    def compact(self):
+        return dead_helper()
+
+def helper(index):
+    return index + 1
+
+def dead_helper():
+    return 0
+'''
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    regions = build_map_dependency_regions(graph, "Archive.read")
+    graph.G.graph["compile_targets"] = ("Archive.read",)
+    map_ir = dict(graph.G.graph.get("map_ir") or {})
+    map_ir["dependency_regions"] = {
+        "runtime": regions.runtime,
+        "mapped": regions.mapped,
+        "retained": regions.retained,
+        "map_only": regions.map_only,
+        "bindings": regions.bindings,
+    }
+    graph.G.graph["map_ir"] = map_ir
+
+    deployment_type = strategize_shell_deployment(
+        graph, runtime_closure_only=True
+    )
+    planned = set(deployment_type.function_shell_types)
+    references = {
+        entry.qualified_name: int(entry.reference.address)
+        for entry in graph.function_table
+    }
+
+    assert planned == set(regions.runtime)
+    assert references["Archive.read"] in planned
+    assert references["helper"] in planned
+    assert references["Archive.compact"] not in planned
+    assert references["dead_helper"] not in planned
+    assert deployment_type.activation_root_references == (
+        references["Archive.read"],
+    )
+    assert set(deployment_type.catalogue_only_function_references) == (
+        set(references.values()) - planned
+    )
+    # Liveness reduction does not erase the catalogue or its map-only class
+    # records; it changes only which definitions become executable shells.
+    assert graph.function_table.entry("Archive.compact").graph is not None
+    assert references["Archive.compact"] in regions.map_only
+
+    deployment = deployment_type()
+    try:
+        assert deployment.callsite_function_shells == {}
+        read_shell = deployment.function_shells[references["Archive.read"]]
+        activation_shells = tuple(_walk_planned_shells(
+            read_shell, include_function_registry=False
+        ))
+        activated_names = {
+            shell.process_graph.G.graph.get("function_name")
+            for shell in activation_shells
+        }
+        assert "read" in activated_names
+        assert "helper" in activated_names
+        assert "Archive.compact" not in activated_names
+        assert "dead_helper" not in activated_names
+        # One selected root plus its one callsite activation. The helper's
+        # catalogue definition remains separate, so the administrative walk
+        # contains root deployment + two definitions + one activation. This
+        # bound catches a return to expanding a suffix tree from every
+        # catalogue definition.
+        assert len(activation_shells) == 2
+        assert len(tuple(_walk_planned_shells(deployment))) == 4
+        execution_shells = tuple(_walk_planned_shells(
+            deployment, include_function_registry=False
+        ))
+        assert len(execution_shells) == 3
+        assert {
+            shell.process_graph.G.graph.get("function_name")
+            for shell in execution_shells
+        } >= {"read", "helper"}
+        for shell in activation_shells:
+            expected_callsites = {
+                int(node_id)
+                for node_id, data in shell.process_graph.G.nodes(data=True)
+                if any(
+                    reference is not None and int(reference) in planned
+                    for reference in (
+                        (data.get("attributes") or {}).get("callee_ref"),
+                        (data.get("attributes") or {}).get("method_ref"),
+                    )
+                )
+            }
+            assert set(shell.callsite_function_shells) == expected_callsites
+        deployment.compile_process_graph()
+        assert deployment.whole_program_compiled
+        assert all(shell.whole_program_compiled for shell in activation_shells)
+    finally:
+        deployment.release()
+
+    complete_catalogue = strategize_shell_deployment(
+        graph, runtime_closure_only=False
+    )
+    assert references["Archive.compact"] in (
+        complete_catalogue.function_shell_types
+    )
+    assert references["dead_helper"] in complete_catalogue.function_shell_types
+
+
+def test_recursive_callsite_is_a_finite_backedge_not_a_new_catalogue_owner():
+    module = ast.parse(
+        '''
+def countdown(value):
+    if value <= 0:
+        return 0
+    return countdown(value - 1)
+'''
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    record_compilation_unit_plan(graph)
+
+    deployment = strategize_shell_deployment(graph)()
+    try:
+        reference = int(
+            graph.function_table.entry("countdown").reference.address
+        )
+        countdown = deployment.function_shells[reference]
+
+        assert countdown.function_shells is deployment.function_shells
+        assert countdown.callsite_function_shells == {}
+        # Module owner + one catalogue definition + one module activation.
+        # The recursive edge inside the activation is represented by the
+        # function reference and does not mint another shell.
+        assert len(tuple(_walk_planned_shells(deployment))) == 3
+        activation_page = current_identity_book().page(
+            "source_callsite_activation_concordance"
+        )
+        assert any(
+            str(row[0]).endswith("countdown")
+            and int(tuple(fact)[0]) == reference
+            and tuple(fact)[1] == "recursive_scc_backedge"
+            for row in activation_page.rows()
+            for _column, fact in activation_page.history(row)
+        )
+    finally:
+        deployment.release()
+
+
+def test_repeated_specialized_callsite_plans_one_shared_dag_node():
+    module = ast.parse(
+        '''
+def leaf(value):
+    return value + 1
+
+def helper(value):
+    return leaf(value)
+
+def root(value):
+    return helper(value) + helper(value)
+'''
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    record_compilation_unit_plan(graph)
+
+    deployment = strategize_shell_deployment(graph)()
+    try:
+        root_reference = int(
+            graph.function_table.entry("root").reference.address
+        )
+        root = deployment.function_shells[root_reference]
+        helpers = tuple(root.callsite_function_shells.values())
+        assert len(helpers) == 2
+        first_leaf = next(iter(helpers[0].callsite_function_shells.values()))
+        second_leaf = next(iter(helpers[1].callsite_function_shells.values()))
+        assert first_leaf is second_leaf
+    finally:
+        deployment.release()
+
+
+def test_method_reference_requires_receiver_class_identity():
+    module = ast.parse(
+        '''
+class Queue:
+    def get(self, key):
+        return key
+
+def external_get(mapping):
+    return mapping.get("value")
+
+class Box:
+    def read(self):
+        return 1
+
+def internal_read():
+    box = Box()
+    return box.read()
+'''
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    deployment_type = strategize_shell_deployment(graph)
+    external = deployment_type.function_shell_types[
+        graph.function_table.entry("external_get").reference.address
+    ].process_graph
+    external_call = next(
+        data
+        for _, data in external.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "get"
+    )
+    assert (external_call.get("attributes") or {}).get("method_ref") is None
+
+    internal = deployment_type.function_shell_types[
+        graph.function_table.entry("internal_read").reference.address
+    ].process_graph
+    internal_call = next(
+        data
+        for _, data in internal.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "read"
+    )
+    assert (internal_call.get("attributes") or {})["method_ref"] == (
+        graph.function_table.entry("Box.read").reference.address
+    )
+
+
+def test_tensor_method_candidate_requires_tensor_receiver_value():
+    module = ast.parse(
+        '''
+def split_text(value):
+    return value.split(".")
+
+def negate_tensor(value):
+    return value.neg()
+'''
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    class TensorValue:
+        shape = (2,)
+        dtype = "float64"
+
+    graph.function_table.entry(
+        "negate_tensor"
+    ).graph.G.graph["planner_specializations"] = {"value": TensorValue()}
+    deployment_type = strategize_shell_deployment(graph)
+
+    split_graph = deployment_type.function_shell_types[
+        graph.function_table.entry("split_text").reference.address
+    ].process_graph
+    split_call = next(
+        data for _, data in split_graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("tensor_candidate") == "split"
+    )
+    assert (split_call.get("attributes") or {}).get("tensor") is None
+    split_node = next(
+        node_id for node_id, data in split_graph.G.nodes(data=True)
+        if data is split_call
+    )
+    assert _is_dispatch_metadata_node(split_graph, split_node)
+
+    tensor_graph = deployment_type.function_shell_types[
+        graph.function_table.entry("negate_tensor").reference.address
+    ].process_graph
+    neg_call = next(
+        data for _, data in tensor_graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("tensor_candidate") == "neg"
+    )
+    assert (neg_call.get("attributes") or {})["tensor"] == "neg"
+    neg_node = next(
+        node_id for node_id, data in tensor_graph.G.nodes(data=True)
+        if data is neg_call
+    )
+    assert not _is_dispatch_metadata_node(tensor_graph, neg_node)
+
+
 def test_class_navigation_lut_resolves_instantiation_and_dot_through_permissions():
     module = ast.parse(
         '''
@@ -281,3 +583,57 @@ class Vault:
         table.resolve_dot(
             "Vault", "erase", evaluator({"vault:enter", "vault:read"})
         )
+
+
+def test_instance_field_shadows_same_named_non_data_method():
+    module = ast.parse(
+        '''
+class Adapter:
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def nodes(self):
+        return ()
+'''
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    table = build_class_navigation_table(graph)
+    allow = lambda _identity, _permissions: True
+
+    instance_member = table.resolve_dot("Adapter", "nodes", allow)
+    class_member = table.resolve_dot(
+        "Adapter", "nodes", allow, receiver_kind="class"
+    )
+
+    assert instance_member.kind == "attribute"
+    assert instance_member.storage == "instance"
+    assert class_member.kind == "method"
+    assert class_member.function_reference is not None
+
+
+def test_same_named_classes_use_discovered_module_qualified_identity():
+    first = ast.parse("class Edge:\n    left = 1\n").body[0]
+    second = ast.parse("class Edge:\n    right = 2\n").body[0]
+    first._python_source_identity = ("package.solver", "Edge")
+    second._python_source_identity = ("package.renderer", "Edge")
+    module = ast.Module(body=[first, second], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    assert {
+        item["class_identity"]
+        for item in graph.G.graph["map_ir"]["objects"]
+    } == {"package.solver.Edge", "package.renderer.Edge"}
+    table = build_class_navigation_table(graph)
+    assert {record.identity for record in table.classes} == {
+        "package.solver.Edge",
+        "package.renderer.Edge",
+    }

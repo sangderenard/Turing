@@ -18,9 +18,12 @@
  primitive call the `Turing` instance performed.
 
  • Each *primitive* invocation becomes a node.
- • Edges record data‑flow ("x feeds into op #7" etc.).
+ • Edges record carrier data‑flow ("x feeds into op #7" etc.).
+ • Scalar structural arguments (slice bounds, motion distances, zero counts)
+   are retained as literals.  They must not be linked by `id()`: Python interns
+   small integers, so identity linking can otherwise invent data dependencies.
  • The scheme is backend‑agnostic: opaque carrier objects are accepted; only
-   their `id()` is used for linkage so no heavy copies occur.
+   their `id()` is used for carrier linkage so no heavy copies occur.
 
  This file is purely infrastructural: **no concrete backend, no tests**.
 """
@@ -109,6 +112,17 @@ class ProvenanceGraph:
 
         return self._producer.get(id(value))
 
+    _CARRIER_ARGUMENT_POSITIONS = {
+        "nand": frozenset({0, 1}),
+        "sigma_L": frozenset({0}),
+        "sigma_R": frozenset({0}),
+        "concat": frozenset({0, 1}),
+        "slice": frozenset({0}),
+        "mu": frozenset({0, 1, 2}),
+        "length": frozenset({0}),
+        "zeros": frozenset(),
+    }
+
     def add_call(self, op: str, args: Tuple[Any, ...], kwargs: Dict[str, Any], result: Any):
         idx = self._next_idx()
         arg_ids = tuple(id(a) for a in args)
@@ -118,6 +132,16 @@ class ProvenanceGraph:
             metadata["result_length"] = len(result)
         except (TypeError, AttributeError):
             pass
+        carrier_positions = self._CARRIER_ARGUMENT_POSITIONS.get(
+            op, frozenset(range(len(args)))
+        )
+        literal_args = {
+            pos: value
+            for pos, value in enumerate(args)
+            if pos not in carrier_positions
+        }
+        if literal_args:
+            metadata["literal_args"] = literal_args
         node    = ProvNode(idx, op, arg_ids, kwargs, out_id, metadata)
         self._nodes.append(node)
         if self.nx is not None:
@@ -132,6 +156,8 @@ class ProvenanceGraph:
 
         # build edges arg -> this node
         for pos, a in enumerate(args):
+            if pos not in carrier_positions:
+                continue
             src = self._producer.get(id(a))
             if src is not None:
                 edge = ProvEdge(src, idx, pos)
@@ -139,7 +165,11 @@ class ProvenanceGraph:
                 if self.nx is not None:
                     self.nx.add_edge(src, idx, arg_pos=pos)
         # mark result as produced by this node
-        self._producer[out_id] = idx
+        # `length` is a compile-time scalar in this calculus.  Registering its
+        # integer result as a carrier would collide with Python's interned
+        # integers and create spurious edges from unrelated literal arguments.
+        if op != "length":
+            self._producer[out_id] = idx
         return result  # pass through
 
 # ──────────────────────────────────────────────────────────────────────────────

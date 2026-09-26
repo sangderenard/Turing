@@ -55,25 +55,15 @@ SYMPY_PROCESS_GRAPH_TRANSLATIONS: Mapping[object, SympyProcessGraphRule] = (
         sympy.exp: SympyProcessGraphRule("Exp"),
         sympy.log: SympyProcessGraphRule("Log"),
         sympy.floor: SympyProcessGraphRule("Floor"),
-        sympy.ceiling: SympyProcessGraphRule("Ceiling"),
+        sympy.ceiling: SympyProcessGraphRule("Ceil"),
         sympy.Min: SympyProcessGraphRule("Min"),
         sympy.Max: SympyProcessGraphRule("Max"),
-        sympy.Equality: SympyProcessGraphRule("Equality", ("left", "right")),
-        sympy.Unequality: SympyProcessGraphRule(
-            "Unequality", ("left", "right")
-        ),
-        sympy.StrictLessThan: SympyProcessGraphRule(
-            "StrictLessThan", ("left", "right")
-        ),
-        sympy.LessThan: SympyProcessGraphRule(
-            "LessThanOrEqual", ("left", "right")
-        ),
-        sympy.StrictGreaterThan: SympyProcessGraphRule(
-            "StrictGreaterThan", ("left", "right")
-        ),
-        sympy.GreaterThan: SympyProcessGraphRule(
-            "GreaterThanOrEqual", ("left", "right")
-        ),
+        sympy.Equality: SympyProcessGraphRule("Eq", ("left", "right")),
+        sympy.Unequality: SympyProcessGraphRule("Ne", ("left", "right")),
+        sympy.StrictLessThan: SympyProcessGraphRule("Lt", ("left", "right")),
+        sympy.LessThan: SympyProcessGraphRule("Le", ("left", "right")),
+        sympy.StrictGreaterThan: SympyProcessGraphRule("Gt", ("left", "right")),
+        sympy.GreaterThan: SympyProcessGraphRule("Ge", ("left", "right")),
         sympy.And: SympyProcessGraphRule("LAnd"),
         sympy.Or: SympyProcessGraphRule("LOr"),
         sympy.Not: SympyProcessGraphRule("LNot", ("operand",)),
@@ -482,6 +472,208 @@ def _sympy_process_graph_rule(
     return None
 
 
+def _exact_respelling(value):
+    """An exact identity into constructs this ingestion already lowers, or None.
+
+    Every entry is an identity, never an approximation: no smoothing width,
+    no tolerance.  A construct that needs a declared meaning (a domain
+    integral, an operator on a field) is refused by name instead of guessed.
+    Sum and Product are not respelled here: they are declared reductions,
+    lowered through ``bitops.declare`` (see ``lower_sum_declaration``).
+    """
+    if isinstance(value, sympy.Subs):
+        return value.doit()
+    if isinstance(value, sympy.sign):
+        (arg,) = value.args
+        return sympy.Piecewise((1, arg > 0), (-1, arg < 0), (0, True))
+    if isinstance(value, sympy.Heaviside):
+        arg = value.args[0]
+        at_zero = value.args[1] if len(value.args) > 1 else sympy.Rational(1, 2)
+        return sympy.Piecewise((1, arg > 0), (0, arg < 0), (at_zero, True))
+    if isinstance(value, sympy.coth):
+        return sympy.cosh(value.args[0]) / sympy.sinh(value.args[0])
+    if isinstance(value, sympy.cot):
+        return sympy.cos(value.args[0]) / sympy.sin(value.args[0])
+    if isinstance(value, sympy.sec):
+        return 1 / sympy.cos(value.args[0])
+    if isinstance(value, sympy.csc):
+        return 1 / sympy.sin(value.args[0])
+    return None
+
+
+#: Gauss-Legendre points used when an Integral survives symbolic
+#: integration (see ingest_sympy_expression).  Five matches the reduced tire
+#: contact law's verified quadrature: exact through degree 9.
+INTEGRAL_QUADRATURE_POINTS = 5
+
+
+def _gauss_legendre_rule(points: int = INTEGRAL_QUADRATURE_POINTS):
+    """(node, weight) pairs on [-1, 1], as exact SymPy Floats (17 digits)."""
+    from sympy.integrals.quadrature import gauss_legendre
+
+    nodes, weights = gauss_legendre(points, 17)
+    return tuple(zip(nodes, weights))
+
+
+def _split_reduction(value):
+    """Exact identities that split a one-axis Sum/Product, or ``value`` itself.
+
+    Only identities, never approximations:
+
+    * linearity           Sum(f + g) = Sum(f) + Sum(g)
+    * index-free factor   Sum(c * f) = c * Sum(f)        Prod(c * f) = c**n * Prod(f)
+    * index-free body     Sum(c) = n * c                 Prod(c) = c**n
+    * factors of a product  Prod(f * g) = Prod(f) * Prod(g)
+
+    where ``n = hi - lo + 1``.  Each piece is then offered to SymPy again
+    (a piece may close where the whole did not); what is left is a pure
+    numeric reduction.
+    """
+
+    if len(value.limits) != 1 or len(value.limits[0]) != 3:
+        return value
+    limit = value.limits[0]
+    var, lower, upper = limit
+    body = value.function
+    count = upper - lower + 1
+    if isinstance(value, sympy.Sum):
+        if isinstance(body, sympy.Add):
+            return sympy.Add(*(sympy.Sum(term, limit) for term in body.args))
+        independent, dependent = body.as_independent(var, as_Add=False)
+        if dependent == 1:
+            return count * body
+        if independent != 1:
+            return independent * sympy.Sum(dependent, limit)
+        return value
+    independent, dependent = body.as_independent(var, as_Add=False)
+    if dependent == 1:
+        return body ** count
+    if independent != 1:
+        return independent ** count * sympy.Product(dependent, limit)
+    if isinstance(body, sympy.Mul):
+        return sympy.Mul(*(sympy.Product(factor, limit) for factor in body.args))
+    return value
+
+
+def _place_axis(ingest, node_id: int, position: int, rank: int) -> int:
+    """A 1-D axis tensor reshaped to ``rank + 1`` dims, its extent at ``position``.
+
+    The trailing dimension is left for the batch the law runs over, so every
+    ordinary law value (shape ``(batch,)``) broadcasts against every axis.
+    """
+
+    minus_one = ingest.add_node(sympy.Integer(-1))
+    zero = ingest.add_node(sympy.Integer(0))
+    for _ in range(position):
+        node_id = ingest.op("unsqueeze", (node_id, zero))
+    for _ in range(rank - position):
+        node_id = ingest.op("unsqueeze", (node_id, minus_one))
+    return node_id
+
+
+def _reduce_axes(ingest, term: int, rank: int, reduction: str) -> int:
+    zero = ingest.add_node(sympy.Integer(0))
+    for _ in range(rank):
+        term = ingest.op("prod" if reduction == "product" else "sum", (term, zero))
+    return term
+
+
+def lower_sum_declaration(declaration, graph, ingest) -> int:
+    """A declared Sum/Product as one vectorized reduction over its Domain.
+
+    Each index axis is ``lo + arange(n)``; the Domain states its own size at
+    run time (``n = max(hi - lo) + 1`` over whatever the bounds are), so no
+    extent is declared ahead.  The body is evaluated once over every axis
+    together, entries past each axis's own bound are masked to the
+    reduction's neutral element, and one reduction per axis collapses them.
+    Bounds may reference outer indices (a triangular sum): they are ingested
+    with those indices bound to their axes.
+    """
+
+    reduction = declaration.fields["reduction"]
+    neutral = sympy.Integer(1 if reduction == "product" else 0)
+    ordered = tuple(zip(declaration.domain.axes, declaration.domain.limits))[::-1]
+    rank = len(ordered)
+    bindings: dict = {}
+    masks = []
+    for position, (var, limit) in enumerate(ordered):
+        if limit is None:
+            raise TypeError(
+                f"{declaration.sympy!r}: index {var} has no bounds; a reduction "
+                "needs a Domain that states its range")
+        span = limit.upper - limit.lower
+        if span.is_number:
+            count = ingest.add_node(sympy.Integer(int(span) + 1))
+            span_id = ingest.add_node(span)
+        else:
+            span_id = ingest.bound(span, bindings)
+            extent = ingest.op("max", (span_id,))
+            step = sympy.Dummy("extent")
+            count = ingest.bound(step + 1, {step: extent})
+        offset = sympy.Dummy("k")
+        axis = _place_axis(ingest, ingest.op("arange", (count,)), position, rank)
+        spanned = sympy.Dummy("span")
+        masks.append(ingest.bound(sympy.Le(offset, spanned), {offset: axis, spanned: span_id}))
+        bindings[var] = ingest.bound(offset + limit.lower, {**bindings, offset: axis})
+    term = ingest.bound(declaration.fields["body"], bindings)
+    neutral_id = ingest.add_node(neutral)
+    for mask in masks:
+        term = ingest.op("where", (mask, term, neutral_id))
+    return _reduce_axes(ingest, term, rank, reduction)
+
+
+def lower_integral_declaration(declaration, graph, ingest) -> int:
+    """An Integral is a Sum: weights times the integrand at the rule's nodes.
+
+    Each finite axis gets the quadrature rule's nodes mapped onto its bounds
+    (``mid + half * node``) and its weights times ``half``; the weighted
+    integrand is then reduced exactly as a declared Sum is.  The node count is
+    the rule's, so no mask is needed.
+    """
+
+    if "parametric" in declaration.fields:
+        return ingest.add_node(declaration.fields["parametric"])
+    ordered = tuple(zip(declaration.domain.axes, declaration.domain.limits))[::-1]
+    rank = len(ordered)
+    rule = _gauss_legendre_rule()
+    bindings: dict = {}
+    weighted = sympy.Integer(1)
+    weight_bindings: dict = {}
+    for position, (var, limit) in enumerate(ordered):
+        if limit is None:
+            raise TypeError(
+                "Integral survived symbolic integration over a bare domain "
+                f"{var}; a quadrature needs finite bounds or a declared Domain: "
+                f"{declaration.sympy!r}")
+        if limit.linfinity or limit.rinfinity:
+            raise TypeError(
+                "Integral survived symbolic integration with an infinite bound; "
+                f"declare a mapped Domain before quadrature: {declaration.sympy!r}")
+        half = (limit.upper - limit.lower) / 2
+        mid = (limit.upper + limit.lower) / 2
+        nodes = _place_axis(ingest, ingest.op("get_tensor", (
+            ingest.literal(tuple(float(node) for node, _weight in rule)),)), position, rank)
+        weights = _place_axis(ingest, ingest.op("get_tensor", (
+            ingest.literal(tuple(float(weight) for _node, weight in rule)),)), position, rank)
+        node_symbol, weight_symbol = sympy.Dummy("node"), sympy.Dummy("weight")
+        bindings[var] = ingest.bound(mid + half * node_symbol, {**bindings, node_symbol: nodes})
+        weight_bindings[weight_symbol] = weights
+        weighted = weighted * weight_symbol * half
+    term = ingest.bound(weighted * declaration.fields["integrand"],
+                        {**bindings, **weight_bindings})
+    return _reduce_axes(ingest, term, rank, "sum")
+
+
+def _plug_reductions() -> None:
+    from . import bitops
+
+    bitops.plug(bitops.Sum, lower_sum_declaration)
+    bitops.plug(bitops.Integral, lower_integral_declaration)
+
+
+_plug_reductions()
+
+
 def ingest_sympy_expression(
     graph: Any,
     expression: sympy.Basic,
@@ -548,6 +740,65 @@ def ingest_sympy_expression(
             )
         return node_id
 
+    _unbound = object()
+
+    def bound(value: sympy.Basic, bindings: Mapping[sympy.Basic, int]) -> int:
+        """Ingest ``value`` with some symbols standing for existing nodes.
+
+        Memo entries made while a symbol is bound -- the bound symbol and
+        every subexpression containing it -- are dropped afterwards, so the
+        same index symbol in another reduction starts clean.
+        """
+        saved = {symbol: memo.pop(symbol, _unbound) for symbol in bindings}
+        before = set(memo)
+        memo.update(bindings)
+        try:
+            return add_node(value)
+        finally:
+            for key in set(memo) - before:
+                if key in bindings or (
+                    isinstance(key, sympy.Basic) and key.has(*bindings)
+                ):
+                    del memo[key]
+            for symbol, previous in saved.items():
+                if previous is _unbound:
+                    memo.pop(symbol, None)
+                else:
+                    memo[symbol] = previous
+
+    def tensor_operation(name: str, parent_ids: Sequence[int]) -> int:
+        return make_node(
+            sympy.Dummy(name), SympyProcessGraphRule(name), tuple(parent_ids),
+            tuple(f"arg:{index}" for index in range(len(parent_ids))),
+            {"tensor_operation": name},
+        )
+
+    def literal(value: Any) -> int:
+        return make_node(
+            sympy.Dummy("literal"),
+            SympyProcessGraphRule("const", node_type="Constant"),
+            (), (), {"value": value},
+        )
+
+    class _Ingest:
+        pass
+
+    ingest = _Ingest()
+    ingest.add_node = lambda value: add_node(value)
+    ingest.bound = bound
+    ingest.op = tensor_operation
+    ingest.literal = literal
+
+    def lower_declared(value: sympy.Basic) -> int:
+        from . import bitops
+
+        declaration = bitops.declare(value)
+        if declaration is None or not declaration.complete or declaration.lowering is None:
+            raise TypeError(
+                f"{type(value).__name__} has no complete declaration to lower "
+                f"({declaration!r}): {value!r}")
+        return declaration.lowering(declaration, graph, ingest)
+
     def add_node(value: sympy.Basic) -> int:
         value = sympy.sympify(value)
         if value in memo:
@@ -571,8 +822,39 @@ def ingest_sympy_expression(
             return node_id
 
         function_name = getattr(getattr(value, "func", None), "__name__", "")
-        if value is sympy.true or value is sympy.false:
-            literal: Any = bool(value)
+        # Classify numeric atoms by their SymPy domain before singleton-like
+        # literals.  Python considers bool a subclass of int and symbolic
+        # runtimes can normalize singleton identity tests; the mathematical
+        # type is the durable distinction.  In particular ``One`` must remain
+        # integer 1 while BooleanTrue remains a Boolean atom.
+        if value == sympy.pi:
+            # Pi remains a semantic operation until backend lowering.  This
+            # lets a caller choose a native literal, a bounded construction,
+            # or rejection without changing the authored SymPy expression.
+            rule = SympyProcessGraphRule("Pi", node_type="Constant")
+            node_id = make_node(
+                value, rule, (), (), {"constant_identity": "pi"}
+            )
+            graph.G.nodes[node_id]["tensor"] = {
+                "dtype": "float64", "shape": (),
+            }
+            memo[value] = node_id
+            return node_id
+
+        if value.is_Number:
+            if value.is_Integer:
+                literal: Any = int(value)
+            elif isinstance(value, sympy.Float):
+                literal = float(value)
+            else:
+                literal = value
+        elif isinstance(value, sympy.NumberSymbol):
+            # Exact named constants such as pi and E are symbolic atoms, not
+            # calls or uninterpreted operators. Retain the exact SymPy value
+            # as a canonical ProcessGraph constant.
+            literal = value
+        elif value is sympy.true or value is sympy.false:
+            literal = bool(value)
         elif function_name == "Bytes":
             literal = bytes(int(item) for item in value.args)
         elif function_name == "String":
@@ -581,13 +863,6 @@ def ingest_sympy_expression(
             literal = None
         elif function_name == "EllipsisValue" and not value.args:
             literal = Ellipsis
-        elif value.is_Number:
-            if value.is_Integer:
-                literal = int(value)
-            elif isinstance(value, sympy.Float):
-                literal = float(value)
-            else:
-                literal = value
         else:
             literal = no_literal
         if literal is not no_literal:
@@ -597,6 +872,190 @@ def ingest_sympy_expression(
             )
             memo[value] = node_id
             return node_id
+
+        if isinstance(value, sympy.Derivative):
+            # SymPy first.  sympy.diff is the exact closed-form derivative
+            # whenever the interior is explicit SymPy, and its result ingests
+            # through the ordinary add_node path like any other expression.
+            derivative = sympy.diff(value.expr, *value.variables)
+            if not derivative.has(sympy.Derivative):
+                result_id = add_node(derivative)
+                memo[value] = result_id
+                return result_id
+            # SymPy could not reduce the interior: it holds content SymPy
+            # cannot see into (an applied undefined function, a bound table
+            # or callee whose body exists only once ingested), so diff hands
+            # back an unevaluated Derivative.  Only then turn to the process
+            # graph itself: ingest the interior as ordinary nodes and invert
+            # that subgraph with the existing graph reversal, one order at a
+            # time (the nesting below).  No SymPy content survives ingestion,
+            # so this is the only place such a derivative can be taken.
+            from .process_graph_autograd import obtain_graph_reverse
+
+            inner_id = add_node(value.expr)
+            # sympy.Derivative.variables repeats a symbol for higher orders
+            # (e.g. (x, x) for d^2/dx^2); this excises one order at a time by
+            # reversing w.r.t. the first variable and recursing on the rest.
+            wrt_symbol = value.variables[0]
+            wrt_id = add_node(wrt_symbol)
+            product = obtain_graph_reverse(graph, outputs=[inner_id], wrt=[wrt_id])
+            backward = product.graph
+            adjoint = product.adjoint
+
+            # `backward` is a genuinely separate ProcessGraph with its own
+            # 0-based id numbering (_AdjointBuilder.__init__ starts
+            # next_id at 0) -- it is NOT a subgraph sharing ids with `graph`.
+            # Any of its "input" nodes standing in for an already-built
+            # forward value carries that value's id as
+            # attributes['source_forward_id'] (_AdjointBuilder.input /
+            # saved_value); those redirect straight to the existing forward
+            # node instead of being duplicated. Every other backward node is
+            # a genuinely new computation and gets folded in via make_node,
+            # which already owns this graph's id counter and edge
+            # bookkeeping -- no hand-rolled id allocation here.
+            #
+            # `source_forward_id` is provenance metadata _AdjointBuilder.add
+            # attaches to nearly every backward node (which forward node a
+            # gradient contribution is FOR); it is not a redirect signal --
+            # every node carries it. Only two `binding_kind`s from
+            # _AdjointBuilder.input are real stand-ins:
+            #   "saved_forward"  -- reuses an already-computed forward value:
+            #                       redirect straight to that forward node.
+            #   "gradient_seed"  -- the incoming cotangent for one output;
+            #                       under unit_output_seed=True (the default
+            #                       obtain_graph_reverse uses) this is the
+            #                       constant 1.0, not a forward-graph alias.
+            remap: dict[int, int] = {}
+            for node_id, data in backward.G.nodes(data=True):
+                attrs = data.get("attributes") or {}
+                kind = attrs.get("binding_kind")
+                source_forward_id = attrs.get("source_forward_id")
+                if kind == "saved_forward" and source_forward_id is not None \
+                        and int(source_forward_id) in graph.G:
+                    remap[node_id] = int(source_forward_id)
+                elif kind == "gradient_seed":
+                    remap[node_id] = make_node(
+                        sympy.Integer(1),
+                        SympyProcessGraphRule("const", node_type="Constant"),
+                        (), (), {"value": 1},
+                    )
+
+            import networkx as nx
+
+            def _rehomed_callee_ref(old_ref: int) -> int:
+                """Copy one backward-rule function-table entry from
+                `backward` into `graph`'s own table (declare() itself
+                dedupes by qualified name, so shared rules like bw_mul/
+                bw_sin across several derivatives in one equation collapse
+                to one entry), and return the address to use in `graph`.
+                """
+                old_entry = backward.function_table.entry(old_ref)
+                new_ref = graph.function_table.declare(
+                    old_entry.name,
+                    qualified_name=old_entry.qualified_name,
+                    external=(old_entry.state.name == "EXTERNAL"),
+                    metadata=dict(old_entry.metadata),
+                    parameter_contracts=old_entry.parameter_contracts,
+                )
+                new_entry = graph.function_table.entry(new_ref)
+                if old_entry.graph is not None and new_entry.graph is None:
+                    graph.function_table.resolve_graph(new_ref, old_entry.graph)
+                if old_entry.python_callable is not None:
+                    graph.function_table.resolve_callable(
+                        new_ref, old_entry.python_callable)
+                for target, impl in old_entry.implementations.items():
+                    graph.function_table.install_implementation(new_ref, target, impl)
+                return int(new_ref.address) if hasattr(new_ref, "address") else int(new_ref)
+
+            for node_id in nx.topological_sort(backward.G):
+                if node_id in remap:
+                    continue
+                data = backward.G.nodes[node_id]
+                parent_ids = tuple(remap[p] for p, _role in data.get("parents", ()))
+                roles = tuple(role for _p, role in data.get("parents", ()))
+                rule = SympyProcessGraphRule(
+                    data.get("op") or "grad", node_type=data.get("type"))
+                attributes = dict(data.get("attributes") or {})
+                if attributes.get("callee_ref") is not None:
+                    attributes["callee_ref"] = _rehomed_callee_ref(attributes["callee_ref"])
+                placeholder = sympy.Symbol(f"_adjoint_{node_id}_{data.get('label', 'grad')}")
+                new_id = make_node(placeholder, rule, parent_ids, roles, attributes)
+                if data.get("tensor"):
+                    graph.G.nodes[new_id]["tensor"] = dict(data["tensor"])
+                remap[node_id] = new_id
+
+            grad_backward_id = adjoint.gradient_value_ids[wrt_id]
+            grad_id = remap[grad_backward_id]
+            remaining_variables = value.variables[1:]
+            if remaining_variables:
+                result_id = add_node(
+                    sympy.Derivative(graph.node_map.get(grad_id, sympy.Symbol(f"_grad_{grad_id}")),
+                                      *remaining_variables)
+                )
+            else:
+                result_id = grad_id
+            memo[value] = result_id
+            return result_id
+
+        respelled = _exact_respelling(value)
+        if respelled is not None:
+            result_id = add_node(respelled)
+            memo[value] = result_id
+            return result_id
+
+        if isinstance(value, (sympy.Sum, sympy.Product)):
+            # SymPy first (a closed form, or a finite expansion); then the
+            # exact identities, whose pieces are each offered to SymPy again;
+            # what survives both is a numeric reduction over its Domain.
+            try:
+                reduced = value.doit()
+            except (NotImplementedError, TypeError, ValueError, ArithmeticError,
+                    sympy.PolynomialError):
+                reduced = value
+            if reduced != value:
+                result_id = add_node(reduced)
+            else:
+                split = _split_reduction(value)
+                result_id = add_node(split) if split != value else lower_declared(value)
+            memo[value] = result_id
+            return result_id
+
+        if isinstance(value, sympy.Integral):
+            # An unbounded limit whose symbol does not appear in the
+            # integrand is a DOMAIN MEASURE (the catalogue's
+            # Integral(f, A) = integral of f over surface/volume A), not an
+            # antiderivative -- SymPy would silently return f*A, which is
+            # only right for an integrand uniform over the domain.  Refuse it
+            # before SymPy can guess.
+            for limit in value.limits:
+                if len(limit) == 1 and limit[0] not in value.function.free_symbols:
+                    raise TypeError(
+                        f"Integral over a bare domain {limit[0]} (a measure, not an "
+                        "antiderivative variable) needs a declared Domain: "
+                        f"{value!r}")
+            # SymPy first: a closed-form antiderivative ingests like any
+            # other expression.  SymPy may also RAISE instead of returning
+            # the Integral unevaluated (piecewise/inequality reduction on
+            # |.| integrands does); that is the same answer -- it could not
+            # integrate it -- so it falls through to quadrature.
+            try:
+                integrated = value.doit()
+            except (NotImplementedError, TypeError, ValueError, ArithmeticError,
+                    sympy.PolynomialError):
+                integrated = value
+            if not integrated.has(sympy.Integral):
+                result_id = add_node(integrated)
+                memo[value] = result_id
+                return result_id
+            # SymPy could not integrate it.  An integral IS a sum over a
+            # continuous domain (bitops.Integral subclasses bitops.Sum): the
+            # declared Integral lowers as the Sum of the quadrature weights
+            # times the integrand at the rule's nodes
+            # (``lower_integral_declaration``).  A bare-domain or infinite
+            # bound is refused there by name.
+            result_id = lower_declared(value)
+            memo[value] = result_id
+            return result_id
 
         rule = _sympy_process_graph_rule(value)
         if rule is None:
@@ -608,6 +1067,18 @@ def ingest_sympy_expression(
                 )
             fallbacks.append(fallback_name)
             rule = SympyProcessGraphRule(fallback_name)
+
+        # SymPy's canonical representation of ``sqrt(x)`` is
+        # ``Pow(x, Rational(1, 2))``.  That is not an optimization of a
+        # general real power: it is the source operation's exact identity.
+        # Preserve it before the generic Pow translation so precision
+        # planning and every backend receive Sqrt rather than having to infer
+        # the authored operation later from a floating exponent.
+        if (
+            isinstance(value, sympy.Pow)
+            and value.exp == sympy.Rational(1, 2)
+        ):
+            rule = SympyProcessGraphRule("Sqrt", ("operand",))
 
         if isinstance(value, sympy.Piecewise):
             # Lower N arms into nested three-input Select nodes. The final
@@ -635,7 +1106,32 @@ def ingest_sympy_expression(
             memo[value] = selected_id
             return selected_id
 
-        arguments = tuple(value.args)
+        arguments = (
+            (value.base,)
+            if rule.operation == "Sqrt" and isinstance(value, sympy.Pow)
+            else tuple(value.args)
+        )
+        # SymPy represents associative arithmetic as variadic nodes, while
+        # repository SSA and every scalar backend give Add/Mul/Min/Max an
+        # exact binary arity.  Preserve the authored expression as a stable
+        # left-associated ProcessGraph chain instead of asking each backend to
+        # invent its own n-ary convention.
+        if rule.operation in {"Add", "Mul", "Min", "Max"} and len(arguments) > 2:
+            left = add_node(arguments[0])
+            accumulated = arguments[0]
+            for index, argument in enumerate(arguments[1:], start=1):
+                right = add_node(argument)
+                accumulated = value if index == len(arguments) - 1 else value.func(
+                    accumulated, argument, evaluate=False,
+                )
+                left = make_node(
+                    accumulated,
+                    rule,
+                    (left, right),
+                    ("arg:0", "arg:1"),
+                )
+            memo[value] = left
+            return left
         parent_ids = tuple(add_node(argument) for argument in arguments)
         if isinstance(value, sympy.Indexed) or function_name == "getitem":
             roles = ("base", *("index" for _ in arguments[1:]))
@@ -670,6 +1166,65 @@ def ingest_sympy_expression(
     )
     graph.G.graph["sympy_translation_fallbacks"] = tuple(fallbacks)
     return root
+
+
+def ingest_sympy_expressions(
+    graph: Any,
+    expressions: Sequence[sympy.Basic],
+    *,
+    output_names: Sequence[str] | None = None,
+    strict: bool = False,
+) -> tuple[int, ...]:
+    """Ingest a named expression set as one shared canonical ProcessGraph.
+
+    A temporary SymPy ``Tuple`` gives :func:`ingest_sympy_expression` one tree
+    in which its existing memo can retain common subexpressions across every
+    result.  The tuple is only a construction envelope: it is removed again,
+    and its operands become the graph's actual deployment roots.  Thus no
+    invented tuple operation reaches repository SSA or a backend.
+    """
+
+    authored = tuple(sympy.sympify(expression) for expression in expressions)
+    if not authored:
+        raise ValueError("SymPy expression set must contain at least one output")
+    names = (
+        tuple(str(name) for name in output_names)
+        if output_names is not None
+        else tuple(f"result_{index}" for index in range(len(authored)))
+    )
+    if len(names) != len(authored):
+        raise ValueError("SymPy output names must match the expression count")
+    if len(names) != len(set(names)):
+        raise ValueError("SymPy output names must be unique")
+
+    tuple_root = ingest_sympy_expression(
+        graph, sympy.Tuple(*authored), strict=strict,
+    )
+    tuple_data = graph.G.nodes[tuple_root]
+    if tuple_data.get("op") != "Tuple":
+        raise RuntimeError("SymPy expression-set envelope did not lower to Tuple")
+    roots = tuple(int(parent) for parent, _role in tuple_data.get("parents", ()))
+    if len(roots) != len(authored):
+        raise RuntimeError("SymPy expression-set envelope lost an output")
+
+    for root in roots:
+        children = graph.G.nodes[root].get("children") or []
+        graph.G.nodes[root]["children"] = [
+            child for child in children if int(child[0]) != int(tuple_root)
+        ]
+    graph.G.remove_node(tuple_root)
+    graph.node_map.pop(tuple_root, None)
+    graph.roots = list(roots)
+    graph.G.graph.update(
+        function_outputs=names,
+        deployment_outputs=roots,
+        deployment_inputs=tuple(
+            int(node_id)
+            for node_id, data in graph.G.nodes(data=True)
+            if data.get("op") in {"input", "Input", "Symbol"}
+        ),
+    )
+    return roots
 
 
 def process_graph_to_sympy_expressions(
@@ -1388,6 +1943,7 @@ __all__ = [
     "SymbolicProcessNode",
     "SymbolicProcessModel",
     "ingest_sympy_expression",
+    "ingest_sympy_expressions",
     "process_graph_to_sympy_expressions",
     "process_graph_to_sympy_relations",
     "ingest_sympy_process_model",

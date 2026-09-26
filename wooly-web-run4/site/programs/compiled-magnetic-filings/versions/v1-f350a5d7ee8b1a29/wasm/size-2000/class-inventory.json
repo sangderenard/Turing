@@ -1,0 +1,1732 @@
+{
+  "abi": "turing.class-memory-inventory.v1",
+  "field_slots": [
+    {
+      "index": 0,
+      "key": "out::wooly_willy_tick_region_25::value_521",
+      "extent": 8
+    },
+    {
+      "index": 1,
+      "key": "out::wooly_willy_tick_region_25::value_522",
+      "extent": 8
+    },
+    {
+      "index": 2,
+      "key": "in::pointer_buttons",
+      "extent": 8
+    },
+    {
+      "index": 3,
+      "key": "in::pointer_x",
+      "extent": 8
+    },
+    {
+      "index": 4,
+      "key": "in::input_828",
+      "extent": 729
+    },
+    {
+      "index": 5,
+      "key": "in::input_831",
+      "extent": 729
+    },
+    {
+      "index": 6,
+      "key": "in::input_711",
+      "extent": 1
+    },
+    {
+      "index": 7,
+      "key": "in::input_712",
+      "extent": 1
+    },
+    {
+      "index": 8,
+      "key": "in::input_713",
+      "extent": 1
+    },
+    {
+      "index": 9,
+      "key": "in::input_749",
+      "extent": 729
+    },
+    {
+      "index": 10,
+      "key": "in::input_756",
+      "extent": 729
+    },
+    {
+      "index": 11,
+      "key": "in::input_747",
+      "extent": 729
+    },
+    {
+      "index": 12,
+      "key": "in::input_751",
+      "extent": 729
+    },
+    {
+      "index": 13,
+      "key": "in::input_753",
+      "extent": 729
+    },
+    {
+      "index": 14,
+      "key": "in::input_754",
+      "extent": 729
+    },
+    {
+      "index": 15,
+      "key": "in::input_755",
+      "extent": 729
+    },
+    {
+      "index": 16,
+      "key": "in::input_786",
+      "extent": 729
+    },
+    {
+      "index": 17,
+      "key": "in::input_788",
+      "extent": 729
+    },
+    {
+      "index": 18,
+      "key": "in::input_834"
+    },
+    {
+      "index": 19,
+      "key": "in::input_836"
+    },
+    {
+      "index": 20,
+      "key": "in::input_839"
+    },
+    {
+      "index": 21,
+      "key": "out::wooly_willy_tick_region_22::value_200",
+      "extent": 64
+    },
+    {
+      "index": 22,
+      "key": "in::input_854"
+    },
+    {
+      "index": 23,
+      "key": "in::pointer_y",
+      "extent": 8
+    },
+    {
+      "index": 24,
+      "key": "out::wooly_willy_tick_region_48::value_647",
+      "extent": 8
+    },
+    {
+      "index": 25,
+      "key": "out::wooly_willy_tick_region_38::value_649",
+      "extent": 8
+    },
+    {
+      "index": 26,
+      "key": "in::input_952"
+    },
+    {
+      "index": 27,
+      "key": "in::input_954"
+    },
+    {
+      "index": 28,
+      "key": "in::input_956"
+    },
+    {
+      "index": 29,
+      "key": "out::wooly_willy_tick_region_45::value_637",
+      "extent": 8
+    },
+    {
+      "index": 30,
+      "key": "out::wooly_willy_tick_region_45::value_641",
+      "extent": 8
+    },
+    {
+      "index": 31,
+      "key": "in::input_1016"
+    },
+    {
+      "index": 32,
+      "key": "in::input_1017"
+    },
+    {
+      "index": 33,
+      "key": "out::wooly_willy_tick_region_48::value_644",
+      "extent": 8
+    },
+    {
+      "index": 34,
+      "key": "out::wooly_willy_tick_region_0::value_77",
+      "extent": 8
+    },
+    {
+      "index": 35,
+      "key": "out::wooly_willy_tick_region_0::value_80",
+      "extent": 8
+    },
+    {
+      "index": 36,
+      "key": "out::wooly_willy_tick_region_1::value_102",
+      "extent": 8
+    },
+    {
+      "index": 37,
+      "key": "out::wooly_willy_tick_region_2::value_105",
+      "extent": 8
+    },
+    {
+      "index": 38,
+      "key": "out::wooly_willy_tick_region_3::value_108",
+      "extent": 8
+    },
+    {
+      "index": 39,
+      "key": "out::wooly_willy_tick_region_4::value_111",
+      "extent": 8
+    },
+    {
+      "index": 40,
+      "key": "out::wooly_willy_tick_region_5::value_128",
+      "extent": 8
+    },
+    {
+      "index": 41,
+      "key": "out::wooly_willy_tick_region_6::value_131",
+      "extent": 8
+    },
+    {
+      "index": 42,
+      "key": "out::wooly_willy_tick_region_7::value_135",
+      "extent": 8
+    },
+    {
+      "index": 43,
+      "key": "out::wooly_willy_tick_region_8::value_138",
+      "extent": 8
+    },
+    {
+      "index": 44,
+      "key": "out::wooly_willy_tick_region_9::value_229",
+      "extent": 729
+    },
+    {
+      "index": 45,
+      "key": "out::wooly_willy_tick_region_10::value_236",
+      "extent": 729
+    },
+    {
+      "index": 46,
+      "key": "out::wooly_willy_tick_region_11::value_38",
+      "extent": 1
+    },
+    {
+      "index": 47,
+      "key": "out::wooly_willy_tick_region_11::value_44",
+      "extent": 1
+    },
+    {
+      "index": 48,
+      "key": "out::wooly_willy_tick_region_11::value_46",
+      "extent": 1
+    },
+    {
+      "index": 49,
+      "key": "out::wooly_willy_tick_region_11::value_49",
+      "extent": 1
+    },
+    {
+      "index": 50,
+      "key": "out::wooly_willy_tick_region_11::value_56",
+      "extent": 8
+    },
+    {
+      "index": 51,
+      "key": "out::wooly_willy_tick_region_11::value_57",
+      "extent": 8
+    },
+    {
+      "index": 52,
+      "key": "out::wooly_willy_tick_region_11::value_65",
+      "extent": 8
+    },
+    {
+      "index": 53,
+      "key": "out::wooly_willy_tick_region_11::value_84",
+      "extent": 1
+    },
+    {
+      "index": 54,
+      "key": "out::wooly_willy_tick_region_11::value_86",
+      "extent": 1
+    },
+    {
+      "index": 55,
+      "key": "out::wooly_willy_tick_region_11::value_118",
+      "extent": 64
+    },
+    {
+      "index": 56,
+      "key": "out::wooly_willy_tick_region_11::value_122",
+      "extent": 64
+    },
+    {
+      "index": 57,
+      "key": "out::wooly_willy_tick_region_11::value_123",
+      "extent": 64
+    },
+    {
+      "index": 58,
+      "key": "out::wooly_willy_tick_region_11::value_124",
+      "extent": 64
+    },
+    {
+      "index": 59,
+      "key": "out::wooly_willy_tick_region_11::value_141",
+      "extent": 64
+    },
+    {
+      "index": 60,
+      "key": "out::wooly_willy_tick_region_11::value_145",
+      "extent": 64
+    },
+    {
+      "index": 61,
+      "key": "out::wooly_willy_tick_region_11::value_169",
+      "extent": 64
+    },
+    {
+      "index": 62,
+      "key": "out::wooly_willy_tick_region_11::value_329",
+      "extent": 729
+    },
+    {
+      "index": 63,
+      "key": "out::wooly_willy_tick_region_11::value_375",
+      "extent": 729
+    },
+    {
+      "index": 64,
+      "key": "out::wooly_willy_tick_region_11::value_377",
+      "extent": 729
+    },
+    {
+      "index": 65,
+      "key": "out::wooly_willy_tick_region_11::value_379",
+      "extent": 729
+    },
+    {
+      "index": 66,
+      "key": "out::wooly_willy_tick_region_11::value_381",
+      "extent": 729
+    },
+    {
+      "index": 67,
+      "key": "out::wooly_willy_tick_region_11::value_383",
+      "extent": 729
+    },
+    {
+      "index": 68,
+      "key": "out::wooly_willy_tick_region_11::value_385",
+      "extent": 729
+    },
+    {
+      "index": 69,
+      "key": "out::wooly_willy_tick_region_11::value_457",
+      "extent": 729
+    },
+    {
+      "index": 70,
+      "key": "out::wooly_willy_tick_region_11::value_461",
+      "extent": 729
+    },
+    {
+      "index": 71,
+      "key": "out::wooly_willy_tick_region_11::value_465",
+      "extent": 729
+    },
+    {
+      "index": 72,
+      "key": "out::wooly_willy_tick_region_11::value_469",
+      "extent": 729
+    },
+    {
+      "index": 73,
+      "key": "out::wooly_willy_tick_region_52::value_41",
+      "extent": 8
+    },
+    {
+      "index": 74,
+      "key": "out::wooly_willy_tick_region_52::value_42",
+      "extent": 8
+    },
+    {
+      "index": 75,
+      "key": "out::wooly_willy_tick_region_52::value_43",
+      "extent": 8
+    },
+    {
+      "index": 76,
+      "key": "out::wooly_willy_tick_region_12::value_146",
+      "extent": 64
+    },
+    {
+      "index": 77,
+      "key": "out::wooly_willy_tick_region_12::value_175",
+      "extent": 64
+    },
+    {
+      "index": 78,
+      "key": "out::wooly_willy_tick_region_12::value_179",
+      "extent": 64
+    },
+    {
+      "index": 79,
+      "key": "out::wooly_willy_tick_region_12::value_181",
+      "extent": 64
+    },
+    {
+      "index": 80,
+      "key": "out::wooly_willy_tick_region_12::value_414",
+      "extent": 729
+    },
+    {
+      "index": 81,
+      "key": "out::wooly_willy_tick_region_12::value_416",
+      "extent": 729
+    },
+    {
+      "index": 82,
+      "key": "out::wooly_willy_tick_region_12::value_418",
+      "extent": 729
+    },
+    {
+      "index": 83,
+      "key": "out::wooly_willy_tick_region_12::value_420",
+      "extent": 729
+    },
+    {
+      "index": 84,
+      "key": "out::wooly_willy_tick_region_12::value_422",
+      "extent": 729
+    },
+    {
+      "index": 85,
+      "key": "out::wooly_willy_tick_region_12::value_424",
+      "extent": 729
+    },
+    {
+      "index": 86,
+      "key": "out::wooly_willy_tick_region_12::value_482",
+      "extent": 729
+    },
+    {
+      "index": 87,
+      "key": "out::wooly_willy_tick_region_12::value_486",
+      "extent": 729
+    },
+    {
+      "index": 88,
+      "key": "out::wooly_willy_tick_region_12::value_490",
+      "extent": 729
+    },
+    {
+      "index": 89,
+      "key": "out::wooly_willy_tick_region_13::value_433",
+      "extent": 8
+    },
+    {
+      "index": 90,
+      "key": "out::wooly_willy_tick_region_14::value_437",
+      "extent": 8
+    },
+    {
+      "index": 91,
+      "key": "out::wooly_willy_tick_region_15::value_440",
+      "extent": 8
+    },
+    {
+      "index": 92,
+      "key": "out::wooly_willy_tick_region_16::value_185",
+      "extent": 64
+    },
+    {
+      "index": 93,
+      "key": "out::wooly_willy_tick_region_16::value_438",
+      "extent": 8
+    },
+    {
+      "index": 94,
+      "key": "out::wooly_willy_tick_region_16::value_441",
+      "extent": 8
+    },
+    {
+      "index": 95,
+      "key": "out::wooly_willy_tick_region_17::value_186",
+      "extent": 64
+    },
+    {
+      "index": 96,
+      "key": "out::wooly_willy_tick_region_18::value_190",
+      "extent": 64
+    },
+    {
+      "index": 97,
+      "key": "out::wooly_willy_tick_region_19::value_191",
+      "extent": 64
+    },
+    {
+      "index": 98,
+      "key": "out::wooly_willy_tick_region_20::value_195",
+      "extent": 64
+    },
+    {
+      "index": 99,
+      "key": "out::wooly_willy_tick_region_21::value_196",
+      "extent": 64
+    },
+    {
+      "index": 100,
+      "key": "out::wooly_willy_tick_region_23::value_443",
+      "extent": 8
+    },
+    {
+      "index": 101,
+      "key": "out::wooly_willy_tick_region_24::value_445",
+      "extent": 8
+    },
+    {
+      "index": 102,
+      "key": "out::wooly_willy_tick_region_25::value_533",
+      "extent": 8
+    },
+    {
+      "index": 103,
+      "key": "out::wooly_willy_tick_region_25::value_539",
+      "extent": 8
+    },
+    {
+      "index": 104,
+      "key": "out::wooly_willy_tick_region_25::value_544",
+      "extent": 8
+    },
+    {
+      "index": 105,
+      "key": "out::wooly_willy_tick_region_25::value_546",
+      "extent": 8
+    },
+    {
+      "index": 106,
+      "key": "out::wooly_willy_tick_region_25::value_549",
+      "extent": 8
+    },
+    {
+      "index": 107,
+      "key": "out::wooly_willy_tick_region_26::value_524",
+      "extent": 8
+    },
+    {
+      "index": 108,
+      "key": "out::wooly_willy_tick_region_27::value_526",
+      "extent": 8
+    },
+    {
+      "index": 109,
+      "key": "out::wooly_willy_tick_region_53::value_12",
+      "extent": 8
+    },
+    {
+      "index": 110,
+      "key": "out::wooly_willy_tick_region_28::value_554",
+      "extent": 8
+    },
+    {
+      "index": 111,
+      "key": "out::wooly_willy_tick_region_28::value_558",
+      "extent": 8
+    },
+    {
+      "index": 112,
+      "key": "out::wooly_willy_tick_region_28::value_648",
+      "extent": 8
+    },
+    {
+      "index": 113,
+      "key": "out::wooly_willy_tick_region_29::value_562",
+      "extent": 8
+    },
+    {
+      "index": 114,
+      "key": "out::wooly_willy_tick_region_30::value_564",
+      "extent": 8
+    },
+    {
+      "index": 115,
+      "key": "out::wooly_willy_tick_region_31::value_566",
+      "extent": 8
+    },
+    {
+      "index": 116,
+      "key": "out::wooly_willy_tick_region_32::value_568",
+      "extent": 8
+    },
+    {
+      "index": 117,
+      "key": "out::wooly_willy_tick_region_33::value_578",
+      "extent": 64
+    },
+    {
+      "index": 118,
+      "key": "out::wooly_willy_tick_region_33::value_581",
+      "extent": 64
+    },
+    {
+      "index": 119,
+      "key": "out::wooly_willy_tick_region_33::value_584",
+      "extent": 64
+    },
+    {
+      "index": 120,
+      "key": "out::wooly_willy_tick_region_33::value_587",
+      "extent": 64
+    },
+    {
+      "index": 121,
+      "key": "out::wooly_willy_tick_region_33::value_591",
+      "extent": 64
+    },
+    {
+      "index": 122,
+      "key": "out::wooly_willy_tick_region_33::value_597",
+      "extent": 64
+    },
+    {
+      "index": 123,
+      "key": "out::wooly_willy_tick_region_54::value_12",
+      "extent": 64
+    },
+    {
+      "index": 124,
+      "key": "out::wooly_willy_tick_region_34::value_593",
+      "extent": 64
+    },
+    {
+      "index": 125,
+      "key": "out::wooly_willy_tick_region_34::value_599",
+      "extent": 64
+    },
+    {
+      "index": 126,
+      "key": "out::wooly_willy_tick_region_34::value_606",
+      "extent": 64
+    },
+    {
+      "index": 127,
+      "key": "out::wooly_willy_tick_region_35::value_595",
+      "extent": 8
+    },
+    {
+      "index": 128,
+      "key": "out::wooly_willy_tick_region_36::value_601",
+      "extent": 8
+    },
+    {
+      "index": 129,
+      "key": "out::wooly_willy_tick_region_37::value_608",
+      "extent": 8
+    },
+    {
+      "index": 130,
+      "key": "out::wooly_willy_tick_region_38::value_603",
+      "extent": 8
+    },
+    {
+      "index": 131,
+      "key": "out::wooly_willy_tick_region_38::value_604",
+      "extent": 8
+    },
+    {
+      "index": 132,
+      "key": "out::wooly_willy_tick_region_39::value_611",
+      "extent": 8
+    },
+    {
+      "index": 133,
+      "key": "out::wooly_willy_tick_region_40::value_612",
+      "extent": 8
+    },
+    {
+      "index": 134,
+      "key": "out::wooly_willy_tick_region_41::value_614",
+      "extent": 8
+    },
+    {
+      "index": 135,
+      "key": "out::wooly_willy_tick_region_42::value_617",
+      "extent": 8
+    },
+    {
+      "index": 136,
+      "key": "out::wooly_willy_tick_region_43::value_618",
+      "extent": 8
+    },
+    {
+      "index": 137,
+      "key": "out::wooly_willy_tick_region_44::value_620",
+      "extent": 8
+    },
+    {
+      "index": 138,
+      "key": "out::wooly_willy_tick_region_45::value_615",
+      "extent": 8
+    },
+    {
+      "index": 139,
+      "key": "out::wooly_willy_tick_region_45::value_621",
+      "extent": 8
+    },
+    {
+      "index": 140,
+      "key": "out::wooly_willy_tick_region_45::value_643",
+      "extent": 8
+    },
+    {
+      "index": 141,
+      "key": "out::wooly_willy_tick_region_45::value_646",
+      "extent": 8
+    },
+    {
+      "index": 142,
+      "key": "out::wooly_willy_tick_region_46::value_651",
+      "extent": 8
+    },
+    {
+      "index": 143,
+      "key": "out::wooly_willy_tick_region_47::value_653",
+      "extent": 8
+    },
+    {
+      "index": 144,
+      "key": "out::wooly_willy_tick_region_48::value_667",
+      "extent": 5832
+    },
+    {
+      "index": 145,
+      "key": "out::wooly_willy_tick_region_49::value_669",
+      "extent": 729
+    },
+    {
+      "index": 146,
+      "key": "out::wooly_willy_tick_region_50::value_671",
+      "extent": 729
+    },
+    {
+      "index": 147,
+      "key": "out::wooly_willy_tick_region_51::value_687",
+      "extent": 729
+    },
+    {
+      "index": 148,
+      "key": "out::wooly_willy_tick_region_51::value_689",
+      "extent": 729
+    },
+    {
+      "index": 149,
+      "key": "out::wooly_willy_tick_region_51::value_691",
+      "extent": 729
+    }
+  ],
+  "container_fields": [],
+  "storage_redirects": [
+    {
+      "identity": "in::direction_x",
+      "storage": "out::wooly_willy_tick_region_25::value_521"
+    },
+    {
+      "identity": "in::direction_y",
+      "storage": "out::wooly_willy_tick_region_25::value_522"
+    },
+    {
+      "identity": "in::bond",
+      "storage": "out::wooly_willy_tick_region_22::value_200"
+    },
+    {
+      "identity": "in::velocity_y",
+      "storage": "out::wooly_willy_tick_region_48::value_647"
+    },
+    {
+      "identity": "in::friction_work",
+      "storage": "out::wooly_willy_tick_region_38::value_649"
+    },
+    {
+      "identity": "in::position_x",
+      "storage": "out::wooly_willy_tick_region_45::value_637"
+    },
+    {
+      "identity": "in::position_y",
+      "storage": "out::wooly_willy_tick_region_45::value_641"
+    },
+    {
+      "identity": "in::velocity_x",
+      "storage": "out::wooly_willy_tick_region_48::value_644"
+    }
+  ],
+  "methods": [
+    {
+      "index": 0,
+      "module": "wooly_willy_tick_region_0",
+      "kernel": "wooly_willy_tick_k8eb66162dc10",
+      "entry": "run",
+      "input_slots": [
+        0,
+        1
+      ],
+      "output_slots": [
+        34,
+        35
+      ],
+      "parameter_count": 5,
+      "invocation_extent": 8
+    },
+    {
+      "index": 1,
+      "module": "wooly_willy_tick_region_1",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        2
+      ],
+      "output_slots": [
+        36
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 2,
+      "module": "wooly_willy_tick_region_2",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        3
+      ],
+      "output_slots": [
+        37
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 3,
+      "module": "wooly_willy_tick_region_3",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        2
+      ],
+      "output_slots": [
+        38
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 4,
+      "module": "wooly_willy_tick_region_4",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        3
+      ],
+      "output_slots": [
+        39
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 5,
+      "module": "wooly_willy_tick_region_5",
+      "kernel": "wooly_willy_tick_k645622137213",
+      "entry": "run",
+      "input_slots": [],
+      "output_slots": [
+        40
+      ],
+      "parameter_count": 2,
+      "invocation_extent": 8
+    },
+    {
+      "index": 6,
+      "module": "wooly_willy_tick_region_6",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        40
+      ],
+      "output_slots": [
+        41
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 7,
+      "module": "wooly_willy_tick_region_7",
+      "kernel": "wooly_willy_tick_kc1e9ec6d0fb0",
+      "entry": "run",
+      "input_slots": [],
+      "output_slots": [
+        42
+      ],
+      "parameter_count": 2,
+      "invocation_extent": 8
+    },
+    {
+      "index": 8,
+      "module": "wooly_willy_tick_region_8",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        42
+      ],
+      "output_slots": [
+        43
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 9,
+      "module": "wooly_willy_tick_region_9",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        4
+      ],
+      "output_slots": [
+        44
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 729
+    },
+    {
+      "index": 10,
+      "module": "wooly_willy_tick_region_10",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        5
+      ],
+      "output_slots": [
+        45
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 729
+    },
+    {
+      "index": 11,
+      "module": "wooly_willy_tick_region_11",
+      "kernel": "wooly_willy_tick_ke43b93f96371",
+      "entry": "run",
+      "input_slots": [
+        6,
+        7,
+        8,
+        2,
+        3,
+        36,
+        38,
+        37,
+        39,
+        41,
+        43,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "output_slots": [
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72
+      ],
+      "parameter_count": 46
+    },
+    {
+      "index": 12,
+      "module": "wooly_willy_tick_region_52",
+      "kernel": "wooly_willy_tick_k2b8e07699958",
+      "entry": "run",
+      "input_slots": [
+        50,
+        51,
+        52
+      ],
+      "output_slots": [
+        73,
+        74,
+        75
+      ],
+      "parameter_count": 7,
+      "invocation_extent": 8
+    },
+    {
+      "index": 13,
+      "module": "wooly_willy_tick_region_12",
+      "kernel": "wooly_willy_tick_kcc165facdf07",
+      "entry": "run",
+      "input_slots": [
+        55,
+        60,
+        61,
+        56,
+        57,
+        49,
+        16,
+        17,
+        48,
+        70,
+        63,
+        64,
+        71,
+        65,
+        66,
+        72,
+        67,
+        68,
+        62,
+        69
+      ],
+      "output_slots": [
+        76,
+        77,
+        78,
+        79,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        86,
+        87,
+        88
+      ],
+      "parameter_count": 34
+    },
+    {
+      "index": 14,
+      "module": "wooly_willy_tick_region_13",
+      "kernel": "wooly_willy_tick_kc5b634bcc46a",
+      "entry": "run",
+      "input_slots": [
+        76,
+        18
+      ],
+      "output_slots": [
+        89
+      ],
+      "parameter_count": 4,
+      "invocation_extent": 8
+    },
+    {
+      "index": 15,
+      "module": "wooly_willy_tick_region_14",
+      "kernel": "wooly_willy_tick_kc5b634bcc46a",
+      "entry": "run",
+      "input_slots": [
+        77,
+        19
+      ],
+      "output_slots": [
+        90
+      ],
+      "parameter_count": 4,
+      "invocation_extent": 8
+    },
+    {
+      "index": 16,
+      "module": "wooly_willy_tick_region_15",
+      "kernel": "wooly_willy_tick_kc5b634bcc46a",
+      "entry": "run",
+      "input_slots": [
+        78,
+        20
+      ],
+      "output_slots": [
+        91
+      ],
+      "parameter_count": 4,
+      "invocation_extent": 8
+    },
+    {
+      "index": 17,
+      "module": "wooly_willy_tick_region_16",
+      "kernel": "wooly_willy_tick_k8f832c8ce826",
+      "entry": "run",
+      "input_slots": [
+        21,
+        79,
+        59,
+        89,
+        90,
+        91
+      ],
+      "output_slots": [
+        92,
+        93,
+        94
+      ],
+      "parameter_count": 10
+    },
+    {
+      "index": 18,
+      "module": "wooly_willy_tick_region_17",
+      "kernel": "wooly_willy_tick_k755eec06cb1b",
+      "entry": "run",
+      "input_slots": [
+        92
+      ],
+      "output_slots": [
+        95
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 64
+    },
+    {
+      "index": 19,
+      "module": "wooly_willy_tick_region_18",
+      "kernel": "wooly_willy_tick_k7cead56a4a5c",
+      "entry": "run",
+      "input_slots": [
+        95
+      ],
+      "output_slots": [
+        96
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 64
+    },
+    {
+      "index": 20,
+      "module": "wooly_willy_tick_region_19",
+      "kernel": "wooly_willy_tick_k755eec06cb1b",
+      "entry": "run",
+      "input_slots": [
+        96
+      ],
+      "output_slots": [
+        97
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 64
+    },
+    {
+      "index": 21,
+      "module": "wooly_willy_tick_region_20",
+      "kernel": "wooly_willy_tick_k7cead56a4a5c",
+      "entry": "run",
+      "input_slots": [
+        97
+      ],
+      "output_slots": [
+        98
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 64
+    },
+    {
+      "index": 22,
+      "module": "wooly_willy_tick_region_21",
+      "kernel": "wooly_willy_tick_k755eec06cb1b",
+      "entry": "run",
+      "input_slots": [
+        98
+      ],
+      "output_slots": [
+        99
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 64
+    },
+    {
+      "index": 23,
+      "module": "wooly_willy_tick_region_22",
+      "kernel": "wooly_willy_tick_k7cead56a4a5c",
+      "entry": "run",
+      "input_slots": [
+        99
+      ],
+      "output_slots": [
+        21
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 64
+    },
+    {
+      "index": 24,
+      "module": "wooly_willy_tick_region_23",
+      "kernel": "wooly_willy_tick_kc5b634bcc46a",
+      "entry": "run",
+      "input_slots": [
+        21,
+        22
+      ],
+      "output_slots": [
+        100
+      ],
+      "parameter_count": 4,
+      "invocation_extent": 8
+    },
+    {
+      "index": 25,
+      "module": "wooly_willy_tick_region_24",
+      "kernel": "wooly_willy_tick_k654ecbad828e",
+      "entry": "run",
+      "input_slots": [
+        100
+      ],
+      "output_slots": [
+        101
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 26,
+      "module": "wooly_willy_tick_region_25",
+      "kernel": "wooly_willy_tick_k99f8e2af6625",
+      "entry": "run",
+      "input_slots": [
+        75,
+        73,
+        0,
+        1,
+        34,
+        35,
+        74,
+        53,
+        50,
+        52,
+        23,
+        54,
+        51,
+        24
+      ],
+      "output_slots": [
+        0,
+        1,
+        102,
+        103,
+        104,
+        105,
+        106
+      ],
+      "parameter_count": 22,
+      "invocation_extent": 8
+    },
+    {
+      "index": 27,
+      "module": "wooly_willy_tick_region_26",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        0
+      ],
+      "output_slots": [
+        107
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 28,
+      "module": "wooly_willy_tick_region_27",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        1
+      ],
+      "output_slots": [
+        108
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 29,
+      "module": "wooly_willy_tick_region_53",
+      "kernel": "wooly_willy_tick_kf15142da20e4",
+      "entry": "run",
+      "input_slots": [
+        105
+      ],
+      "output_slots": [
+        109
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 30,
+      "module": "wooly_willy_tick_region_28",
+      "kernel": "wooly_willy_tick_k2c5694e4396e",
+      "entry": "run",
+      "input_slots": [
+        109,
+        106,
+        102,
+        105,
+        103,
+        104,
+        25
+      ],
+      "output_slots": [
+        110,
+        111,
+        112
+      ],
+      "parameter_count": 11,
+      "invocation_extent": 8
+    },
+    {
+      "index": 31,
+      "module": "wooly_willy_tick_region_29",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        110
+      ],
+      "output_slots": [
+        113
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 32,
+      "module": "wooly_willy_tick_region_30",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        111
+      ],
+      "output_slots": [
+        114
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 33,
+      "module": "wooly_willy_tick_region_31",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        110
+      ],
+      "output_slots": [
+        115
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 34,
+      "module": "wooly_willy_tick_region_32",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        111
+      ],
+      "output_slots": [
+        116
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 35,
+      "module": "wooly_willy_tick_region_33",
+      "kernel": "wooly_willy_tick_k18a84647a6e9",
+      "entry": "run",
+      "input_slots": [
+        113,
+        115,
+        114,
+        116,
+        56,
+        57,
+        76,
+        58
+      ],
+      "output_slots": [
+        117,
+        118,
+        119,
+        120,
+        121,
+        122
+      ],
+      "parameter_count": 15,
+      "invocation_extent": 64
+    },
+    {
+      "index": 36,
+      "module": "wooly_willy_tick_region_54",
+      "kernel": "wooly_willy_tick_k225568ec9fe4",
+      "entry": "run",
+      "input_slots": [
+        117,
+        120
+      ],
+      "output_slots": [
+        123
+      ],
+      "parameter_count": 4,
+      "invocation_extent": 64
+    },
+    {
+      "index": 37,
+      "module": "wooly_willy_tick_region_34",
+      "kernel": "wooly_willy_tick_k21f5af324056",
+      "entry": "run",
+      "input_slots": [
+        123,
+        76,
+        119,
+        58,
+        121,
+        56,
+        122,
+        118
+      ],
+      "output_slots": [
+        124,
+        125,
+        126
+      ],
+      "parameter_count": 12,
+      "invocation_extent": 64
+    },
+    {
+      "index": 38,
+      "module": "wooly_willy_tick_region_35",
+      "kernel": "wooly_willy_tick_kc5b634bcc46a",
+      "entry": "run",
+      "input_slots": [
+        124,
+        26
+      ],
+      "output_slots": [
+        127
+      ],
+      "parameter_count": 4,
+      "invocation_extent": 8
+    },
+    {
+      "index": 39,
+      "module": "wooly_willy_tick_region_36",
+      "kernel": "wooly_willy_tick_kc5b634bcc46a",
+      "entry": "run",
+      "input_slots": [
+        125,
+        27
+      ],
+      "output_slots": [
+        128
+      ],
+      "parameter_count": 4,
+      "invocation_extent": 8
+    },
+    {
+      "index": 40,
+      "module": "wooly_willy_tick_region_37",
+      "kernel": "wooly_willy_tick_kc5b634bcc46a",
+      "entry": "run",
+      "input_slots": [
+        126,
+        28
+      ],
+      "output_slots": [
+        129
+      ],
+      "parameter_count": 4,
+      "invocation_extent": 8
+    },
+    {
+      "index": 41,
+      "module": "wooly_willy_tick_region_38",
+      "kernel": "wooly_willy_tick_k9d3604467a63",
+      "entry": "run",
+      "input_slots": [
+        127,
+        128,
+        110,
+        111,
+        129,
+        112
+      ],
+      "output_slots": [
+        130,
+        131,
+        25
+      ],
+      "parameter_count": 10,
+      "invocation_extent": 8
+    },
+    {
+      "index": 42,
+      "module": "wooly_willy_tick_region_39",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        130
+      ],
+      "output_slots": [
+        132
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 43,
+      "module": "wooly_willy_tick_region_40",
+      "kernel": "wooly_willy_tick_kd4363ea3bdc4",
+      "entry": "run",
+      "input_slots": [
+        21,
+        132
+      ],
+      "output_slots": [
+        133
+      ],
+      "parameter_count": 4,
+      "invocation_extent": 8
+    },
+    {
+      "index": 44,
+      "module": "wooly_willy_tick_region_41",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        133
+      ],
+      "output_slots": [
+        134
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 45,
+      "module": "wooly_willy_tick_region_42",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        131
+      ],
+      "output_slots": [
+        135
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 46,
+      "module": "wooly_willy_tick_region_43",
+      "kernel": "wooly_willy_tick_kd4363ea3bdc4",
+      "entry": "run",
+      "input_slots": [
+        21,
+        135
+      ],
+      "output_slots": [
+        136
+      ],
+      "parameter_count": 4,
+      "invocation_extent": 8
+    },
+    {
+      "index": 47,
+      "module": "wooly_willy_tick_region_44",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        136
+      ],
+      "output_slots": [
+        137
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 48,
+      "module": "wooly_willy_tick_region_45",
+      "kernel": "wooly_willy_tick_k0c0ccc60ffcf",
+      "entry": "run",
+      "input_slots": [
+        134,
+        101,
+        137,
+        2,
+        93,
+        3,
+        94
+      ],
+      "output_slots": [
+        138,
+        139,
+        29,
+        30,
+        140,
+        141
+      ],
+      "parameter_count": 14,
+      "invocation_extent": 8
+    },
+    {
+      "index": 49,
+      "module": "wooly_willy_tick_region_46",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        29
+      ],
+      "output_slots": [
+        142
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 50,
+      "module": "wooly_willy_tick_region_47",
+      "kernel": "wooly_willy_tick_kda4c04fa12a3",
+      "entry": "run",
+      "input_slots": [
+        30
+      ],
+      "output_slots": [
+        143
+      ],
+      "parameter_count": 3,
+      "invocation_extent": 8
+    },
+    {
+      "index": 51,
+      "module": "wooly_willy_tick_region_48",
+      "kernel": "wooly_willy_tick_ka47ad8a66cf9",
+      "entry": "run",
+      "input_slots": [
+        138,
+        140,
+        139,
+        141,
+        44,
+        142,
+        45,
+        143,
+        107,
+        108
+      ],
+      "output_slots": [
+        33,
+        24,
+        144
+      ],
+      "parameter_count": 14
+    },
+    {
+      "index": 52,
+      "module": "wooly_willy_tick_region_49",
+      "kernel": "wooly_willy_tick_kc5b634bcc46a",
+      "entry": "run",
+      "input_slots": [
+        144,
+        31
+      ],
+      "output_slots": [
+        145
+      ],
+      "parameter_count": 4,
+      "invocation_extent": 729
+    },
+    {
+      "index": 53,
+      "module": "wooly_willy_tick_region_50",
+      "kernel": "wooly_willy_tick_ke601f39319a2",
+      "entry": "run",
+      "input_slots": [
+        145,
+        32
+      ],
+      "output_slots": [
+        146
+      ],
+      "parameter_count": 4,
+      "invocation_extent": 729
+    },
+    {
+      "index": 54,
+      "module": "wooly_willy_tick_region_51",
+      "kernel": "wooly_willy_tick_k3c69f62b37df",
+      "entry": "run",
+      "input_slots": [
+        146,
+        86,
+        87,
+        88,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85
+      ],
+      "output_slots": [
+        147,
+        148,
+        149
+      ],
+      "parameter_count": 14,
+      "invocation_extent": 729
+    }
+  ]
+}

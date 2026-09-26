@@ -1,3 +1,4 @@
+import builtins
 import math
 import operator
 
@@ -107,6 +108,18 @@ array_sig = {
 # Operation name -> signature mapping
 # -------------------------------------------------
 operator_signatures = {
+    # Structural concurrency framing. Deploy and Join do not perform numeric
+    # work; a Join reduction names an existing operator in its metadata.
+    'Deploy': {
+        'min_inputs': 0, 'max_inputs': None,
+        'min_outputs': 0, 'max_outputs': None,
+        'concurrency': None, 'allows_inplace': False,
+    },
+    'Join': {
+        'min_inputs': 0, 'max_inputs': None,
+        'min_outputs': 0, 'max_outputs': None,
+        'concurrency': None, 'allows_inplace': False,
+    },
     'Add': sig_binary_elementwise,
     'Mul': sig_binary_elementwise,
     'Pow': sig_binary_elementwise,
@@ -128,13 +141,13 @@ operator_signatures = {
     'Log': sig_unary_elementwise,
     'Sqrt': sig_unary_elementwise,
 
-    'Equality': sig_equality,
+    'Eq': sig_equality,
 
     'Pi': sig_constant,
     'Half': sig_constant,
     'ImaginaryUnit': sig_constant,
     'E': sig_constant,
-    'StrictGreaterThan': sig_binary_elementwise,
+    'Gt': sig_binary_elementwise,
 }
 
 array_sigs_overrides = {
@@ -346,6 +359,8 @@ def matrixelement_op(role_map):
 default_funcs['MatrixElement'] = matrixelement_op
 # --- role schemas -----------------------------------------------------------
 role_schemas = {
+            'Deploy': {'up': {'domain': 'many'}, 'down': {'lanes': 'many'}},
+            'Join': {'up': {'lanes': 'many'}, 'down': {'result': 'many'}},
             'IndexedBase': {'up':{'shape':1}, 'down':{}},
             'Indexed': {'up':{'base':1, 'index':'many'},'down':{}},
             'Idx': {'up':{'limits': 'many'}, 'down':{}},
@@ -514,7 +529,7 @@ numpy_funcs['Equality'] = lambda role_map: role_map['lhs'][0] == role_map['rhs']
 
 import math
 ultra_basic_funcs = {
-    'Equality': lambda x: x == x,
+    'Eq': lambda x: x == x,
     'Store': lambda x: x,  # Store just returns its input
     'MatrixSymbol': matrixsymbol_op,  # from above
     'MatrixElement': matrixelement_op,  # from above
@@ -546,7 +561,7 @@ math_funcs = {
 math_funcs.update(ultra_basic_funcs)
 torch_funcs = ultra_basic_funcs.copy()
 torch_funcs.update({
-    'Equality': lambda x: torch.equal(x[0], x[1]),
+    'Eq': lambda x: torch.equal(x[0], x[1]),
     'Store': lambda x: x[0],  # Store just returns its input
     'MatrixSymbol': matrixsymbol_op,  # from above
     'MatrixElement': matrixelement_op,  # from above
@@ -568,7 +583,7 @@ torch_funcs.update({
     'Min': lambda x: torch.min(x[0]) if len(x) == 1 else torch.min(torch.stack(x)),
     'Max': lambda x: torch.max(x[0]) if len(x) == 1 else torch.max(torch.stack(x)),
     'Tuple': lambda *x: tuple(x),  # simply return the tuple of inputs
-    'StrictGreaterThan': lambda x, y: torch.gt(x, y) if len(x) == 2 else torch.gt(torch.stack(x[:-1]), x[-1]),
+    'Gt': lambda x, y: torch.gt(x, y) if len(x) == 2 else torch.gt(torch.stack(x[:-1]), x[-1]),
     'BooleanTrue': lambda: torch.tensor(True, dtype=torch.bool),
     'BooleanFalse': lambda: torch.tensor(False, dtype=torch.bool),
     'Half': lambda: torch.tensor(0.5, dtype=torch.float32),  # half precision
@@ -615,8 +630,21 @@ def _abstract_tensor_method(name):
         if not operands:
             raise ValueError(f"AbstractTensor.{name} requires an operand")
         if not hasattr(operands[0], name):
+            # ``math`` covers the transcendentals, but a conversion like
+            # ``float`` or ``int`` is a builtin and has no ``math`` entry, so
+            # the lookup fell through to ``getattr(operands[0], name)`` and
+            # raised there instead.
             scalar_function = getattr(math, name, None)
+            if not callable(scalar_function):
+                scalar_function = getattr(builtins, name, None)
             if callable(scalar_function):
+                # A statically-referenced conversion arrives with the callable
+                # itself as the leading operand -- ``float(i + 1)`` binds the
+                # ``float`` type and then the value. That first entry is the
+                # operator, not something to convert, so applying the function
+                # to the whole list would pass it itself.
+                if operands[0] is scalar_function:
+                    return scalar_function(*operands[1:], **kwargs)
                 return scalar_function(*operands, **kwargs)
         return getattr(operands[0], name)(*operands[1:], **kwargs)
     return apply
@@ -665,6 +693,13 @@ def _abstract_tensor_static(name):
     return apply
 
 
+def _abstract_tensor_random_source(*values):
+    from ..common.tensors.abstraction import AbstractTensor
+
+    shape = tuple(int(value) for value in values) or (1,)
+    return AbstractTensor.random_tensor(shape)
+
+
 def _abstract_tensor_constant(value):
     def build(*_values):
         from ..common.tensors.abstraction import AbstractTensor
@@ -695,6 +730,40 @@ def _abstract_tensor_index(*values):
     return operands[0][index]
 
 
+def _abstract_tensor_index_store(*values):
+    operands = _abstract_tensor_values(*values)
+    if len(operands) < 3:
+        raise ValueError(
+            "AbstractTensor indexed assignment requires tensor, index, and value"
+        )
+    tensor = operands[0]
+    value = operands[-1]
+    indices = tuple(operands[1:-1])
+    index = indices[0] if len(indices) == 1 else indices
+    if len(indices) == 1:
+        index_storage = getattr(index, "data", index)
+        index_dtype = getattr(index_storage, "dtype", getattr(index, "dtype", None))
+        if str(index_dtype).casefold().endswith("bool"):
+            from ..common.tensors.abstraction import AbstractTensor
+            return AbstractTensor.where(index, value, tensor)
+        if hasattr(index, "shape") and str(index_dtype).casefold().endswith(
+            ("float", "float32", "float64", "double")
+        ):
+            raise TypeError(
+                "indexed assignment received a floating tensor index from "
+                f"ProcessGraph: shape={tuple(index.shape)!r}, "
+                f"dtype={index_dtype!s}, tensor_shape={tuple(tensor.shape)!r}"
+            )
+    from ..common.tensors.abstraction import AbstractTensor
+    finalize = AbstractTensor._pre_autograd(
+        "index_set", [tensor, value], params={"idx": index}
+    )
+    with AbstractTensor.autograd.no_grad():
+        result = tensor.clone()
+        result[index] = value
+    return finalize(result)
+
+
 def _abstract_tensor_sum(*values, **kwargs):
     operands = _abstract_tensor_values(*values)
     if not operands:
@@ -706,8 +775,18 @@ def _abstract_tensor_maximum(*values):
     operands = _abstract_tensor_values(*values)
     if not operands:
         raise ValueError("AbstractTensor maximum requires an operand")
-    result = operands[0]
-    for operand in operands[1:]:
+    tensor_index = next(
+        (
+            index
+            for index, operand in enumerate(operands)
+            if callable(getattr(operand, "maximum", None))
+        ),
+        None,
+    )
+    if tensor_index is None:
+        return max(operands)
+    result = operands.pop(tensor_index)
+    for operand in operands:
         result = result.maximum(operand)
     return result
 
@@ -716,14 +795,26 @@ def _abstract_tensor_minimum(*values):
     operands = _abstract_tensor_values(*values)
     if not operands:
         raise ValueError("AbstractTensor minimum requires an operand")
-    result = operands[0]
-    for operand in operands[1:]:
+    tensor_index = next(
+        (
+            index
+            for index, operand in enumerate(operands)
+            if callable(getattr(operand, "minimum", None))
+        ),
+        None,
+    )
+    if tensor_index is None:
+        return min(operands)
+    result = operands.pop(tensor_index)
+    for operand in operands:
         result = result.minimum(operand)
     return result
 
 
-def _abstract_tensor_stack(*values, dim=0):
+def _abstract_tensor_stack(*values, dim=0, axis=None):
     from ..common.tensors.abstraction import AbstractTensor
+    if axis is not None:
+        dim = axis
     operands = _abstract_tensor_values(*values)
     if operands and isinstance(operands[-1], int):
         dim = operands.pop()
@@ -732,8 +823,10 @@ def _abstract_tensor_stack(*values, dim=0):
     return AbstractTensor.stack(operands, dim=dim)
 
 
-def _abstract_tensor_cat(*values, dim=0):
+def _abstract_tensor_cat(*values, dim=0, axis=None):
     from ..common.tensors.abstraction import AbstractTensor
+    if axis is not None:
+        dim = axis
     operands = _abstract_tensor_values(*values)
     if operands and isinstance(operands[-1], int):
         dim = operands.pop()
@@ -792,6 +885,11 @@ _at_matmul = _abstract_tensor_reduce(lambda left, right: left @ right)
 _at_and = _abstract_tensor_reduce(lambda left, right: left & right)
 _at_or = _abstract_tensor_reduce(lambda left, right: left | right)
 _at_xor = _abstract_tensor_reduce(lambda left, right: left ^ right)
+# ``<<``/``>>`` resolve their result type through AbstractTensor's own
+# operators (``__lshift__``/``__rshift__``), exactly as the bitwise ops above
+# do -- no forced integer cast here.
+_at_shl = _abstract_tensor_reduce(lambda left, right: left << right)
+_at_shr = _abstract_tensor_reduce(lambda left, right: left >> right)
 
 abstract_tensor_funcs = {
     # SymPy/ProcessGraph spellings.
@@ -808,13 +906,15 @@ abstract_tensor_funcs = {
     "MatMult": _at_matmul,
     "And": _at_and,
     "Or": _at_or,
+    "LShift": _at_shl,
+    "RShift": _at_shr,
     "Not": _abstract_tensor_method("logical_not"),
-    "Equality": _abstract_tensor_reduce(lambda left, right: left == right),
-    "Unequality": _abstract_tensor_reduce(lambda left, right: left != right),
-    "StrictLessThan": _abstract_tensor_reduce(lambda left, right: left < right),
-    "LessThanOrEqual": _abstract_tensor_reduce(lambda left, right: left <= right),
-    "StrictGreaterThan": _abstract_tensor_reduce(lambda left, right: left > right),
-    "GreaterThanOrEqual": _abstract_tensor_reduce(lambda left, right: left >= right),
+    "Eq": _abstract_tensor_reduce(lambda left, right: left == right),
+    "Ne": _abstract_tensor_reduce(lambda left, right: left != right),
+    "Lt": _abstract_tensor_reduce(lambda left, right: left < right),
+    "Le": _abstract_tensor_reduce(lambda left, right: left <= right),
+    "Gt": _abstract_tensor_reduce(lambda left, right: left > right),
+    "Ge": _abstract_tensor_reduce(lambda left, right: left >= right),
     "Sin": _abstract_tensor_method("sin"),
     "Cos": _abstract_tensor_method("cos"),
     "Tan": _abstract_tensor_method("tan"),
@@ -826,6 +926,7 @@ abstract_tensor_funcs = {
     "Max": _abstract_tensor_maximum,
     "Min": _abstract_tensor_minimum,
     "Indexed": _abstract_tensor_index,
+    "IndexedStore": _abstract_tensor_index_store,
     "IndexedBase": _abstract_tensor_identity,
     "Idx": _abstract_tensor_index,
     "MatrixElement": _abstract_tensor_index,
@@ -857,9 +958,12 @@ abstract_tensor_funcs = {
     "mod": _at_mod,
     "pow": _at_pow,
     "matmul": _at_matmul,
+    "random_source": _abstract_tensor_random_source,
     "bitand": _at_and,
     "bitor": _at_or,
     "bitxor": _at_xor,
+    "shl": _at_shl,
+    "shr": _at_shr,
     "logical_and": _at_and,
     "logical_or": _at_or,
     "logical_not": _abstract_tensor_method("logical_not"),
@@ -956,6 +1060,7 @@ abstract_tensor_funcs = {
     "concat": _abstract_tensor_cat,
     "concatenate": _abstract_tensor_cat,
     "where": _abstract_tensor_where,
+    "nan_to_num": _abstract_tensor_static("nan_to_num"),
     "dot": _abstract_tensor_static("dot"),
     "norm": _abstract_tensor_static("norm"),
     "cross": _abstract_tensor_static("cross"),
@@ -1006,10 +1111,7 @@ for _name in sorted(CANONICAL_ABSTRACT_TENSOR_OPERATORS):
     abstract_tensor_funcs[_name] = _handler
 
 for _alias, _canonical in OPERATOR_ALIASES.items():
-    abstract_tensor_funcs.setdefault(
-        _alias,
-        abstract_tensor_funcs[_canonical],
-    )
+    abstract_tensor_funcs[_alias] = abstract_tensor_funcs[_canonical]
 
 _abstract_tensor_unary_names = {
     "Sin", "Cos", "Tan", "Exp", "Log", "Sqrt", "Abs", "Not",
@@ -1025,12 +1127,13 @@ _abstract_tensor_unary_names = {
 _abstract_tensor_binary_names = {
     "Add", "Sub", "Mul", "Div", "Mod", "Pow", "Rational", "MatMult",
     "FloorDiv",
-    "And", "Or", "Equality", "Unequality", "StrictLessThan",
-    "LessThanOrEqual", "StrictGreaterThan", "GreaterThanOrEqual",
+    "And", "Or", "Eq", "Ne", "Lt", "Le", "Gt", "Ge",
     "add", "sub", "mul", "div", "truediv", "mod", "pow", "matmul",
-    "bitand", "bitor", "bitxor", "logical_and", "logical_or", "equal",
+    "bitand", "bitor", "bitxor", "shl", "shr", "logical_and", "logical_or",
+    "equal",
     "not_equal", "less", "less_equal", "greater", "greater_equal",
     "maximum", "minimum", "allclose", "dot", "cross", "solve",
+    "LShift", "RShift",
 }
 _abstract_tensor_constant_names = {
     "BooleanTrue", "BooleanFalse", "Half", "Pi", "E", "ImaginaryUnit",
