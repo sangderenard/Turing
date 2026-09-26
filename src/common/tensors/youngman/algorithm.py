@@ -177,6 +177,38 @@ def tetrahedra_from_grid_domain(domain) -> np.ndarray:
     return compile_grid_domain(domain).embedded
 
 
+def tetrahedra_from_axes(x, y, z) -> np.ndarray:
+    """Compile three rectilinear sample axes into YoungMan tetrahedra.
+
+    This is the topology-only entry point for systems whose authoritative
+    state already owns physical coordinates and should not be wrapped in a
+    second ``GridDomain``. All cubes are assembled in one NumPy operation;
+    YoungMan continues to perform field evaluation and edge interpolation in
+    bulk through ``AbstractTensor``.
+    """
+
+    axes = tuple(np.asarray(axis, dtype=np.float64) for axis in (x, y, z))
+    if any(axis.ndim != 1 or len(axis) < 2 for axis in axes):
+        raise ValueError("YoungMan axes must be one-dimensional with two samples")
+    if any(np.any(np.diff(axis) <= 0.0) for axis in axes):
+        raise ValueError("YoungMan axes must be strictly increasing")
+    grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1)
+    cubes = np.stack(
+        (
+            grid[:-1, :-1, :-1],
+            grid[1:, :-1, :-1],
+            grid[1:, 1:, :-1],
+            grid[:-1, 1:, :-1],
+            grid[:-1, :-1, 1:],
+            grid[1:, :-1, 1:],
+            grid[1:, 1:, 1:],
+            grid[:-1, 1:, 1:],
+        ),
+        axis=-2,
+    ).reshape(-1, 8, 3)
+    return cubes[:, _CUBE_TETRAHEDRA].reshape(-1, 4, 3)
+
+
 def sphere_field(
     points: AbstractTensor, radius: float = 0.8, center: float = 0.0
 ) -> AbstractTensor:

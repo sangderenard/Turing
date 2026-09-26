@@ -43,7 +43,13 @@ LOG = "log"
 ERROR = "error"
 PROFILE = "profile"
 PROGRESS = "progress"
-KINDS = (LOG, ERROR, PROFILE, PROGRESS)
+# What executed, when. A ``trace`` record says a region of the compiled
+# artifact entered or left, carrying the identity that survives recomposition,
+# so a consumer can follow the running program rather than replay its
+# structure on a clock of its own. Distinct from ``profile``, which reports
+# how long something took after the fact -- a trace is the event itself.
+TRACE = "trace"
+KINDS = (LOG, ERROR, PROFILE, PROGRESS, TRACE)
 
 
 @dataclass(frozen=True)
@@ -72,12 +78,38 @@ class Record:
 class TelemetryChannel:
     """An ordered record stream with optional live subscribers."""
 
-    def __init__(self, *, capacity: int = 4096, name: str = "shell"):
+    def __init__(
+        self,
+        *,
+        capacity: int = 4096,
+        name: str = "shell",
+        kinds: Iterable[str] | None = None,
+    ):
         self.name = str(name)
         self.records: deque[Record] = deque(maxlen=max(1, int(capacity)))
         self._sequence = 0
         self._started_ns = time.perf_counter_ns()
         self._subscribers: list[Callable[[Record], None]] = []
+        # Which kinds this channel actually carries. ``None`` keeps every kind,
+        # which is what an ordinary build wants; naming a subset makes the rest
+        # cost nothing at all -- a disabled kind is rejected before its record
+        # is constructed, so an instrumented call site left in the source does
+        # not allocate, timestamp, or notify when nobody asked for it.
+        if kinds is None:
+            self._enabled = frozenset(KINDS)
+        else:
+            requested = frozenset(str(kind) for kind in kinds)
+            unknown = sorted(requested - set(KINDS))
+            if unknown:
+                raise ValueError(
+                    f"unknown record kinds {unknown}; one of {KINDS}"
+                )
+            self._enabled = requested
+
+    def carries(self, kind: str) -> bool:
+        """Whether this channel is configured to carry ``kind`` at all."""
+
+        return kind in self._enabled
 
     # -- production --------------------------------------------------------
 
@@ -88,9 +120,14 @@ class TelemetryChannel:
         *,
         path: str = "",
         **detail: Any,
-    ) -> Record:
+    ) -> Record | None:
         if kind not in KINDS:
             raise ValueError(f"unknown record kind {kind!r}; one of {KINDS}")
+        if kind not in self._enabled:
+            # Nothing is built: no record, no sequence number, no subscriber
+            # notification. The caller gets ``None`` rather than a record it
+            # would have to check anyway.
+            return None
         self._sequence += 1
         record = Record(
             sequence=self._sequence,
@@ -111,25 +148,50 @@ class TelemetryChannel:
                 pass
         return record
 
-    def log(self, message: str, **detail: Any) -> Record:
+    def log(self, message: str, **detail: Any) -> Record | None:
         return self.emit(LOG, message, **detail)
 
-    def error(self, message: str, **detail: Any) -> Record:
+    def error(self, message: str, **detail: Any) -> Record | None:
         return self.emit(ERROR, message, **detail)
 
-    def profile(self, message: str, *, nanoseconds: int = 0, **detail: Any) -> Record:
+    def profile(self, message: str, *, nanoseconds: int = 0, **detail: Any) -> Record | None:
         return self.emit(PROFILE, message, nanoseconds=int(nanoseconds), **detail)
 
     def progress(
         self, message: str, *, done: int, total: int, **detail: Any
-    ) -> Record:
+    ) -> Record | None:
         return self.emit(
             PROGRESS, message, done=int(done), total=int(total), **detail
         )
 
+    def trace(
+        self,
+        message: str,
+        *,
+        region: int,
+        phase: str = "enter",
+        path: str = "",
+        **detail: Any,
+    ) -> Record | None:
+        """Record that a region of the running artifact entered or left.
+
+        ``region`` is the identity that survives recomposition -- the same
+        index the control shell dispatches through -- so a consumer can attach
+        to it without knowing how the planner grouped or nested anything.
+        """
+
+        return self.emit(
+            TRACE,
+            message,
+            path=path,
+            region=int(region),
+            phase=str(phase),
+            **detail,
+        )
+
     def exception(
         self, error: BaseException, *, path: str = "", phase: str = ""
-    ) -> Record:
+    ) -> Record | None:
         return self.emit(
             ERROR,
             f"{type(error).__name__}: {error}",

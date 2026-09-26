@@ -45,7 +45,7 @@ all edges share a common operation sequence, as do all nodes. Because of this, e
 ONE TICK = ONE BATCH
 ((alpha * activation(in) + (1-alpha) * in) * weight + bias)
 in[0:feats]   in[feats:feats2]   in[feats2:feats3]   in[feats3:feats4]   in[feats4:feats5]
-]
+
 in feat.      premix feat.       # of fft target bins feat.  postmix feat.     out feat.
 -params0.6-   -params1.5-        -params2.4-                 -params3.3-       -params4.2-
 

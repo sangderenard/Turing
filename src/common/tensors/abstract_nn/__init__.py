@@ -2,6 +2,8 @@ from .core import Linear, Sequential, Model, RectConv2d, RectConv3d, MaxPool2d, 
 from .activations import ReLU, Sigmoid, Tanh, Identity
 from .losses import MSELoss, CrossEntropyLoss, BCEWithLogitsLoss
 from .optimizer import Adam
+from .perforated import PerforatedLinear
+from .perforated_recurrent import PerforatedRecurrentTransition
 from .train import train_step, train_loop
 from .utils import set_seed
 
@@ -17,10 +19,44 @@ _LAZY_EXPORTS = {
     "capture_backward_program": (".fused_program", "capture_backward_program"),
     "BackwardProgramCapture": (".fused_program", "BackwardProgramCapture"),
     "ProgramRunner": (".fused_program", "ProgramRunner"),
+    "ReverseProgramCapture": (".reverse_program", "ReverseProgramCapture"),
+    "ReverseProgramResult": (".reverse_program", "ReverseProgramResult"),
+    "capture_reverse_fused_program": (".reverse_program", "capture_reverse_fused_program"),
+    "retain_uncaptured_outputs": (".reverse_program", "retain_uncaptured_outputs"),
+    "CallableCorrection": (".forward_reverse_cycle", "CallableCorrection"),
+    "ClippedCorrection": (".forward_reverse_cycle", "ClippedCorrection"),
+    "FixedTargets": (".forward_reverse_cycle", "FixedTargets"),
+    "FortranCycleArtifact": (".forward_reverse_cycle", "FortranCycleArtifact"),
+    "FortranCycleExecutable": (".forward_reverse_cycle", "FortranCycleExecutable"),
+    "ForwardReverseCycleCapture": (".forward_reverse_cycle", "ForwardReverseCycleCapture"),
+    "ForwardReverseCycleResult": (".forward_reverse_cycle", "ForwardReverseCycleResult"),
+    "ForwardReverseSolver": (".forward_reverse_cycle", "ForwardReverseSolver"),
+    "GradientCorrection": (".forward_reverse_cycle", "GradientCorrection"),
+    "InterpolatedTargets": (".forward_reverse_cycle", "InterpolatedTargets"),
+    "capture_forward_reverse_cycle": (".forward_reverse_cycle", "capture_forward_reverse_cycle"),
+    "fuse_forward_reverse_program": (".forward_reverse_cycle", "fuse_forward_reverse_program"),
     "CompletionTrainer": (".completion_training", "CompletionTrainer"),
     "sample_document_pairs": (".completion_training", "sample_document_pairs"),
     "encode_text": (".completion_training", "encode_text"),
     "decode_text": (".completion_training", "decode_text"),
+    "CompilerTrainingDatabase": (
+        ".training_data_store", "CompilerTrainingDatabase",
+    ),
+    "put_reduced_graph_view": (
+        ".training_data_store", "put_reduced_graph_view",
+    ),
+    "GraphTranslationNetwork": (
+        ".graph_translation_network", "GraphTranslationNetwork",
+    ),
+    "TransformationWeightMatrix": (
+        ".graph_translation_network", "TransformationWeightMatrix",
+    ),
+    "TransformerCellSpec": (
+        ".graph_translation_network", "TransformerCellSpec",
+    ),
+    "TransformerUnavailableError": (
+        ".graph_translation_network", "TransformerUnavailableError",
+    ),
 }
 
 
@@ -39,5 +75,6 @@ __all__ = [
     "Linear", "Sequential", "Model", "RectConv2d", "RectConv3d",
     "MaxPool2d", "Flatten", "wrap_module", "ReLU", "Sigmoid", "Tanh",
     "Identity", "MSELoss", "CrossEntropyLoss", "BCEWithLogitsLoss", "Adam",
+    "PerforatedLinear", "PerforatedRecurrentTransition",
     "train_step", "train_loop", "set_seed", *_LAZY_EXPORTS,
 ]

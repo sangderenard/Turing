@@ -176,8 +176,9 @@ def lower_basic_index(
 def unravel_index(indices: Any, shape: Tuple[int, ...]):
     """Map flat ``indices`` into coordinates for a tensor of ``shape``.
 
-    Delegates to the backend-specific implementation ``unravel_index_`` after
-    converting ``indices`` to an ``AbstractTensor`` instance.
+    Returns one tensor per axis, row-major, for scalar or array ``indices``.
+    The default ``unravel_index_`` is built from ``%`` and ``//`` alone, so
+    this works on every backend; a backend only overrides it to go faster.
     """
     from ..abstraction import AbstractTensor
     if not isinstance(indices, AbstractTensor):
@@ -185,8 +186,9 @@ def unravel_index(indices: Any, shape: Tuple[int, ...]):
             AbstractTensor.long_dtype_
         )
     return indices.unravel_index_(shape)
-    
-    
+
+
+
 def gather(x: Any, index: Any, dim: int = 0):
     """Gather elements from x along axis dim using integer indices."""
     # build index tuple
@@ -201,20 +203,144 @@ def gather(x: Any, index: Any, dim: int = 0):
     finalize = AbstractTensor._pre_autograd('gather', [x, index], params={'dim': dim})
     return finalize(out)
    
-def scatter(x: Any, index: Any, src: Any, dim: int = 0):
-    """Scatter-add src into x along axis dim at positions given by index."""
-    # build index tuple
+def _integer_positions(index: Any):
+    """``index`` as a flat list of ints, or ``None`` if it is not one.
+
+    Slices, boolean masks and anything else a caller may legitimately
+    hand to fancy indexing come back as ``None`` so they keep taking the
+    single-pass path they always took.
+    """
+    if isinstance(index, slice):
+        return None
+    raw = index.tolist() if hasattr(index, "tolist") else index
+    if not isinstance(raw, (list, tuple)):
+        return None
+    positions = []
+    for value in raw:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if isinstance(value, float) and value != int(value):
+            return None
+        positions.append(int(value))
+    return positions
+
+
+def _rounds_without_repeats(positions):
+    """Group positions so that no round names the same destination twice.
+
+    Round ``r`` holds the ``r``-th occurrence of each destination, so
+    every round can be applied in one vectorised pass and the number of
+    rounds is the largest multiplicity present -- a vertex's degree, for
+    the graph and mesh cases this exists to serve.
+    """
+    seen = {}
+    rounds = []
+    for position, destination in enumerate(positions):
+        rank = seen.get(destination, 0)
+        seen[destination] = rank + 1
+        if rank == len(rounds):
+            rounds.append([])
+        rounds[rank].append(position)
+    return rounds
+
+
+#: The aggregation vocabulary is not invented here.  ``SegmentReduce`` in
+#: ``abstract_graph_core`` already declares exactly these four for the
+#: graph tier's ``coalesce_edges``; this is the same policy applied to a
+#: dense scatter, spelled the same way so there is one word per policy in
+#: the tree rather than two.
+SCATTER_REDUCTIONS = ("sum", "mean", "max", "min")
+
+
+def scatter(x: Any, index: Any, src: Any, dim: int = 0, *, reduce: str = "sum"):
+    """Scatter ``src`` into ``x`` along ``dim`` at positions ``index``.
+
+    ``reduce`` says what happens where several sources name one
+    destination, using the ``SegmentReduce`` vocabulary declared in
+    ``abstract_graph_core``: ``"sum"`` (the default), ``"mean"``,
+    ``"max"`` or ``"min"``.  Every policy INCLUDES the value already in
+    ``x`` as one of the values being combined, so ``"sum"`` is
+    ``x_i + sum(src)``, ``"max"`` is ``max(x_i, src...)``, and ``"mean"``
+    averages ``x_i`` together with the contributions.
+
+    Repeated destinations therefore ACCUMULATE under the default, which
+    is what the name has always promised, what this module's backward
+    rule in ``backward_registry`` was already written for
+    (``y_i = x_i + src_j``, adjoint ``gsrc = g[index]``), and what the
+    GLSL backend's ``scatter_snippet`` has always done on the GPU.  Plain
+    fancy-index assignment cannot do it -- ``a[idx] = v`` keeps only the
+    last write -- so destinations are grouped into rounds that each name
+    every destination at most once, and each round is one vectorised
+    pass.  The number of rounds is the largest multiplicity present: a
+    vertex's degree, for the graph and mesh cases this exists to serve.
+
+    With ``reduce="sum"`` and no repeated destination there is exactly
+    one round and the result is identical, entry for entry, to the single
+    assignment this used to perform; the same holds when ``index`` is a
+    slice or a mask rather than a list of positions.  So only genuinely
+    repeated destinations change, and for those the previous answer
+    silently dropped every contribution but one.
+    """
+    if reduce not in SCATTER_REDUCTIONS:
+        raise ValueError(
+            f"scatter reduce={reduce!r} is not one of {SCATTER_REDUCTIONS}")
     nd = x.ndims()
     axis = dim if dim >= 0 else nd + dim
-    indexer = [slice(None)] * nd
-    indexer[axis] = index
-    # perform in-place scatter-add
-    # record autograd before update
     from ..abstraction import AbstractTensor
     finalize = AbstractTensor._pre_autograd('scatter', [x, index, src], params={'dim': dim})
     result = x.clone()
-    # fetch existing values and add
-    old = x[tuple(indexer)]
-    result[tuple(indexer)] = old + src
+
+    positions = _integer_positions(index)
+    if reduce == "sum" and (positions is None
+                            or len(set(positions)) == len(positions)):
+        indexer = [slice(None)] * nd
+        indexer[axis] = index
+        result[tuple(indexer)] = x[tuple(indexer)] + src
+        return finalize(result)
+    if positions is None:
+        raise ValueError(
+            f"scatter reduce={reduce!r} needs an integer index, "
+            f"not {type(index).__name__}")
+
+    # ``src`` normally carries one entry per destination along ``axis``;
+    # anything else is a broadcast value that every round reuses whole.
+    src_tensor = src if isinstance(src, AbstractTensor) else AbstractTensor.get_tensor(src)
+    shape = tuple(src_tensor.get_shape())
+    per_destination = len(shape) == nd and shape[axis] == len(positions)
+
+    for group in _rounds_without_repeats(positions):
+        indexer = [slice(None)] * nd
+        indexer[axis] = [positions[position] for position in group]
+        if per_destination:
+            picker = [slice(None)] * nd
+            picker[axis] = group
+            piece = src_tensor[tuple(picker)]
+        else:
+            piece = src_tensor
+        # Read from ``result``, not ``x``: later rounds must land on top
+        # of what earlier rounds already combined.
+        standing = result[tuple(indexer)]
+        if reduce == "max":
+            result[tuple(indexer)] = standing.maximum(piece)
+        elif reduce == "min":
+            result[tuple(indexer)] = standing.minimum(piece)
+        else:
+            result[tuple(indexer)] = standing + piece
+
+    if reduce == "mean":
+        multiplicity = {}
+        for destination in positions:
+            multiplicity[destination] = multiplicity.get(destination, 0) + 1
+        targets = sorted(multiplicity)
+        # ``x``'s own value is one of the values being averaged, so the
+        # divisor is one more than the number of contributions.
+        divisor = AbstractTensor.get_tensor(
+            [float(1 + multiplicity[target]) for target in targets])
+        spread = [1] * nd
+        spread[axis] = len(targets)
+        indexer = [slice(None)] * nd
+        indexer[axis] = targets
+        result[tuple(indexer)] = (
+            result[tuple(indexer)] / divisor.reshape(tuple(spread)))
     return finalize(result)
 

@@ -47,14 +47,17 @@ def main() -> None:
     translator = BitOpsTranslator(bit_width=BIT_WIDTH)
     translator.bit_mul(5, 3)
     compiler = TapeCompiler(translator.graph, BIT_WIDTH)
-    tape_map, instructions = compiler.compile()
+    tape_map, instructions, _pcm = compiler.compile()
     frames = TapeCompiler.binarize_instructions(instructions)
 
     pygame.init()
     screen = pygame.display.set_mode((640, 480))
     shell = ReelDemoShell(screen.get_rect())
 
-    cassette = CassetteTapeBackend(tape_length=TAPE_LEN, status_callback=shell.update_status)
+    cassette = CassetteTapeBackend(
+        tape_length=TAPE_LEN,
+        activity_callback=shell.update_status,
+    )
     shell.reel_graphics.total_tape = cassette.total_bits
 
     if not run_with_visual(prime_tape_with_program, shell, screen, cassette, tape_map, frames):

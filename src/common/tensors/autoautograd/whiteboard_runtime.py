@@ -459,6 +459,10 @@ def run_batched_vjp(
     with scope, _tape():
         view = NodeAttrView(sys.nodes, union_schema, indices=union_ids).build()
         x_all = view.tensor
+        print("x_all:", x_all)
+        print("node_attrs:", node_attrs)
+        print("indices:", union_ids)
+
         if hasattr(x_all, "requires_grad_"):
             # Node attributes may belong to the caller's older tape.  This VJP
             # owns a fresh local tape, so its packed batch must be a local leaf.

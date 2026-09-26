@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Iterable, List, Tuple
 
-from ..tensors.abstraction import AbstractTensor
+import numpy as np
 
 # Minimum number of history samples required before performing any FFT based
 # analysis.  Below this threshold the routine returns a zero response so callers
@@ -26,7 +26,7 @@ from ..tensors.abstraction import AbstractTensor
 _MIN_FFT_WINDOW = 32
 
 
-def spectral_inertia(history: Iterable[AbstractTensor], dt: float) -> Tuple[AbstractTensor, AbstractTensor, List[Tuple[float, float, float]]]:
+def spectral_inertia(history: Iterable[np.ndarray], dt: float) -> Tuple[np.ndarray, np.ndarray, List[Tuple[float, float, float]]]:
     """Estimate a spectral inertia response from ``history``.
 
     Parameters
@@ -45,41 +45,45 @@ def spectral_inertia(history: Iterable[AbstractTensor], dt: float) -> Tuple[Abst
     bands:
         Metadata describing analysed frequency bands ``(w_lo, w_hi, power)``.
     """
-    hist = list(history)
+    # This is integrator-local physics over NumPy position histories. Routing
+    # it through AbstractTensor made an unrelated globally selected compiler
+    # backend responsible for FFT complex values (Nodus cannot store them),
+    # allowing compilation policy to crash the visualization physics.
+    hist = [np.asarray(value, dtype=float) for value in history]
     H = len(hist)
     if H < _MIN_FFT_WINDOW:
         D = hist[-1].shape[0] if H else 0
         return (
-            AbstractTensor.zeros(D, float),
-            AbstractTensor.zeros((D, D), float),
+            np.zeros(D, dtype=float),
+            np.zeros((D, D), dtype=float),
             [],
         )
 
     W = min(H, 128)
-    xs = AbstractTensor.stack(hist[-W:])  # (W, D)
-    if not AbstractTensor.isfinite(xs).all():
+    xs = np.stack(hist[-W:])  # (W, D)
+    if not np.isfinite(xs).all():
         D = xs.shape[1]
         return (
-            AbstractTensor.zeros(D, float),
-            AbstractTensor.zeros((D, D), float),
+            np.zeros(D, dtype=float),
+            np.zeros((D, D), dtype=float),
             [],
         )
 
-    xs = xs - xs.mean(dim=0, keepdim=True)
-    scale = max(1.0, float(AbstractTensor.linalg.norm(xs, ord=AbstractTensor.inf)))
+    xs = xs - xs.mean(axis=0, keepdims=True)
+    scale = max(1.0, float(np.linalg.norm(xs, ord=np.inf)))
     xs = xs / scale
 
     D = xs.shape[1]
-    w = AbstractTensor.hanning(W) if W > 1 else AbstractTensor.ones(W)
+    w = np.hanning(W) if W > 1 else np.ones(W)
     xw = w[:, None] * xs
 
-    C0 = xw.rfft(axis=0)  # (F0, D)
-    w0 = 2.0 * AbstractTensor.pi() * AbstractTensor.rfftfreq(int(W), d=dt, like=xs)
-    P0 = AbstractTensor.sum(AbstractTensor.abs(C0) ** 2, dim=1)
+    C0 = np.fft.rfft(xw, axis=0)  # (F0, D)
+    w0 = 2.0 * np.pi * np.fft.rfftfreq(int(W), d=dt)
+    P0 = np.sum(np.abs(C0) ** 2, axis=1)
     if P0.sum() <= 1e-12 or len(P0) <= 2:
         return (
-            AbstractTensor.zeros(D, float),
-            AbstractTensor.zeros((D, D), float),
+            np.zeros(D, dtype=float),
+            np.zeros((D, D), dtype=float),
             [],
         )
 
@@ -103,26 +107,26 @@ def spectral_inertia(history: Iterable[AbstractTensor], dt: float) -> Tuple[Abst
             i += 1
     if not bands_idx:
         return (
-            AbstractTensor.zeros(D, float),
-            AbstractTensor.zeros((D, D), float),
+            np.zeros(D, dtype=float),
+            np.zeros((D, D), dtype=float),
             [],
         )
 
     Z = 8
     Wz = W * Z
-    xpad = AbstractTensor.pad(xw, (0, 0, 0, Wz - W))
-    Cz = xpad.rfft(axis=0)
-    wz = 2.0 * AbstractTensor.pi() * AbstractTensor.rfftfreq(Wz, d=dt, like=xs)
+    xpad = np.pad(xw, ((0, Wz - W), (0, 0)))
+    Cz = np.fft.rfft(xpad, axis=0)
+    wz = 2.0 * np.pi * np.fft.rfftfreq(Wz, d=dt)
 
     def coarse_band_to_w(b_lo, b_hi):
         return w0[b_lo], w0[min(b_hi, len(w0) - 1)]
 
     def w_to_hi_idx(wlo, whi):
-        i0 = AbstractTensor.get_tensor(AbstractTensor.searchsorted(wz, wlo, side="left")).clip(0, len(wz) - 1)
-        i1 = AbstractTensor.get_tensor(AbstractTensor.searchsorted(wz, whi, side="right")).clip(0, len(wz))
+        i0 = int(np.clip(np.searchsorted(wz, wlo, side="left"), 0, len(wz) - 1))
+        i1 = int(np.clip(np.searchsorted(wz, whi, side="right"), 0, len(wz)))
         return i0, max(i1, i0 + 1)
 
-    J = AbstractTensor.zeros((D, D), float)
+    J = np.zeros((D, D), dtype=float)
     bands_meta: List[Tuple[float, float, float]] = []
     total_power = 0.0
 
@@ -132,23 +136,23 @@ def spectral_inertia(history: Iterable[AbstractTensor], dt: float) -> Tuple[Abst
         Cz_band = Cz[hi_lo:hi_hi, :]
         if Cz_band.shape[0] < 1:
             continue
-        Pw = AbstractTensor.sum(AbstractTensor.abs(Cz_band) ** 2, dim=1) + 1e-12
-        if not AbstractTensor.isfinite(Pw).all() or Pw.sum() <= 1e-12:
+        Pw = np.sum(np.abs(Cz_band) ** 2, axis=1) + 1e-12
+        if not np.isfinite(Pw).all() or Pw.sum() <= 1e-12:
             continue
         Ww = Pw / Pw.sum()
         wgrid = wz[hi_lo:hi_hi]
         for c, wght, omg in zip(Cz_band, Ww, wgrid):
-            a = AbstractTensor.real(c)
-            b = AbstractTensor.imag(c)
-            J += wght * omg * (AbstractTensor.outer(a, b) - AbstractTensor.outer(b, a))
+            a = np.real(c)
+            b = np.imag(c)
+            J += wght * omg * (np.outer(a, b) - np.outer(b, a))
         band_power = float(Pw.sum())
         total_power += band_power
         bands_meta.append((w_lo, w_hi, band_power))
 
     if total_power <= 1e-12:
         return (
-            AbstractTensor.zeros(D, float),
-            AbstractTensor.zeros((D, D), float),
+            np.zeros(D, dtype=float),
+            np.zeros((D, D), dtype=float),
             [],
         )
 

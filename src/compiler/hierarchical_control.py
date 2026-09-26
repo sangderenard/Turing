@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from typing import Mapping
 
 from .control_source import (
     CallBlock,
     ControlBlock,
+    ControlExpression,
     ControlProgram,
     ControlUniform,
+    LoopControlBlock,
     LoopBlock,
     ParallelDeployment,
     RecursionRegion,
@@ -19,6 +21,7 @@ from .control_source import (
     StatementBlock,
     StreamPublishBlock,
     ValidationBlock,
+    WhileBlock,
 )
 from .hierarchical_plan import (
     HierarchyValueTable,
@@ -37,6 +40,53 @@ def _region_marker(block: StatementBlock) -> int | None:
     return int(line[len(prefix):-2])
 
 
+def _present_loop_ids(block: ControlBlock) -> "frozenset[int]":
+    """Node ids of every ``LoopBlock`` actually present in ``block``.
+
+    A loop scheduled by ``glsl_deployment_strategy`` can be fused away
+    (its iteration space folded into a surviving outer loop) without being
+    marked in the evaporated-loop bookkeeping the hierarchy plan consulted
+    when it recorded a call's ``enclosing_loop_ids``. That id then names a
+    loop this closure's own control program never materializes. Parsing
+    the ``iteration_{node_id}`` induction convention out of the tree that
+    actually exists is the only way to tell which of a call's recorded
+    enclosing loops survived scheduling.
+    """
+
+    found: set[int] = set()
+
+    def walk(b: ControlBlock) -> None:
+        if isinstance(b, LoopBlock):
+            name = str(b.induction)
+            if name.startswith("iteration_"):
+                try:
+                    found.add(int(name[len("iteration_"):]))
+                except ValueError:
+                    pass
+            walk(b.body)
+        elif isinstance(b, WhileBlock):
+            if b.source_loop_node_id is not None:
+                found.add(int(b.source_loop_node_id))
+            walk(b.condition)
+            walk(b.body)
+        elif isinstance(b, SequenceBlock):
+            for child in b.blocks:
+                walk(child)
+        elif isinstance(b, StateMachineTick):
+            for _value, body in b.cases:
+                walk(body)
+            if b.default is not None:
+                walk(b.default)
+        elif isinstance(b, ParallelDeployment):
+            for lane in b.lanes:
+                walk(lane)
+        elif isinstance(b, CallBlock):
+            walk(b.callee)
+
+    walk(block)
+    return frozenset(found)
+
+
 @dataclass(frozen=True)
 class HierarchicalControl:
     program: ControlProgram
@@ -53,6 +103,36 @@ def compose_hierarchical_control(
 
     region_correlations: list[tuple[int, int, int]] = []
     next_region = 0
+    # ``assign_hierarchy_ids`` only harvests (closure, local) keys from
+    # PlanLine/PlanCall value ids -- the tensor dataflow surface known at
+    # plan time. Control-flow-only endpoints (a loop induction/predicate,
+    # a recursion-region member, a value alias) are discovered later, while
+    # composing the control program itself, so they can reference a local id
+    # the value table never assigned a global identity to. That is a real
+    # gap in the table's harvest, not a stray or corrupted value -- give it
+    # a stable per-endpoint identity here rather than raising past this
+    # otherwise-complete composition.
+    next_synthetic_value = 1 + max(
+        (global_id for _, _, global_id in values.correlations),
+        default=-1,
+    )
+    synthetic_value_ids: dict[tuple[int, int], int] = {}
+
+    def value_in(closure_id: int, local_id: int) -> int:
+        closure_id = int(closure_id)
+        local_id = int(local_id)
+        try:
+            return values.global_id(closure_id, local_id)
+        except KeyError:
+            nonlocal next_synthetic_value
+            endpoint = (closure_id, local_id)
+            synthetic = synthetic_value_ids.get(endpoint)
+            if synthetic is None:
+                synthetic = next_synthetic_value
+                next_synthetic_value += 1
+                synthetic_value_ids[endpoint] = synthetic
+            return synthetic
+
     all_uniforms: list[ControlUniform] = []
     all_aliases: list[tuple[int, int]] = []
     all_iterables: list[tuple[int, int, str]] = []
@@ -63,11 +143,15 @@ def compose_hierarchical_control(
     all_closure_iterables: list[
         tuple[int, int, str, tuple[int, ...]]
     ] = []
+    all_projected_iterables: list[tuple[int, int, str, object]] = []
     all_recursion_regions: list[RecursionRegion] = []
+    all_deployment_regions = []
     next_recursion_region = 0
+    next_deployment_region = 0
 
     def compose(closure: PlanClosure) -> ControlProgram:
         nonlocal next_region, next_recursion_region
+        nonlocal next_deployment_region
         closure_id = int(closure.closure_id)
         local = controls[closure_id]
         region_map = {}
@@ -79,7 +163,7 @@ def compose_hierarchical_control(
             next_region += 1
 
         def value(local_id: int) -> int:
-            return values.global_id(closure_id, int(local_id))
+            return value_in(closure_id, local_id)
 
         recursion_region_map = {}
         for region in local.recursion_regions:
@@ -99,6 +183,35 @@ def compose_hierarchical_control(
                 incoming=tuple(edge(item) for item in region.incoming),
                 outgoing=tuple(edge(item) for item in region.outgoing),
                 feedback=tuple(edge(item) for item in region.feedback),
+            ))
+
+        for deployment in local.deployment_regions:
+            global_deployment_id = next_deployment_region
+            next_deployment_region += 1
+            all_deployment_regions.append(replace(
+                deployment,
+                region_id=global_deployment_id,
+                lanes=tuple(
+                    replace(
+                        lane,
+                        region_indices=tuple(
+                            region_map[int(region_index)]
+                            for region_index in lane.region_indices
+                            if int(region_index) in region_map
+                        ),
+                        value_ids=tuple(
+                            value(value_id) for value_id in lane.value_ids
+                        ),
+                    )
+                    for lane in deployment.lanes
+                ),
+                recursion_region_id=(
+                    None
+                    if deployment.recursion_region_id is None
+                    else recursion_region_map[
+                        int(deployment.recursion_region_id)
+                    ]
+                ),
             ))
 
         induction_names: dict[str, str] = {}
@@ -162,6 +275,11 @@ def compose_hierarchical_control(
                 for iterable, _target, _induction, _sources
                 in local.closure_iterable_bindings
             )
+            local_iterable_ids.update(
+                int(iterable)
+                for iterable, _target, _induction, _projection
+                in local.projected_iterable_bindings
+            )
             for local_iterable_id in local_iterable_ids:
                 local_marker = (
                     f"__iterable_extent_{local_iterable_id}__"
@@ -218,6 +336,16 @@ def compose_hierarchical_control(
             for iterable, target, induction, sources
             in local.closure_iterable_bindings
         )
+        all_projected_iterables.extend(
+            (
+                value(iterable),
+                value(target),
+                global_induction(induction),
+                projection,
+            )
+            for iterable, target, induction, projection
+            in local.projected_iterable_bindings
+        )
 
         calls_before: dict[int, list[CallBlock]] = {}
         calls_after: list[CallBlock] = []
@@ -232,7 +360,7 @@ def compose_hierarchical_control(
                         tuple(
                             (
                                 value(caller),
-                                values.global_id(
+                                value_in(
                                     item.callee.closure_id, callee
                                 ),
                             )
@@ -240,7 +368,7 @@ def compose_hierarchical_control(
                         ),
                         tuple(
                             (
-                                values.global_id(
+                                value_in(
                                     item.callee.closure_id, callee
                                 ),
                                 value(caller),
@@ -268,15 +396,61 @@ def compose_hierarchical_control(
                     )
                     pending = []
         calls_at_loop_end: dict[int, list[CallBlock]] = {}
+        surviving_loop_ids = _present_loop_ids(local.root)
         for call, loop_ids in pending:
-            if loop_ids:
-                calls_at_loop_end.setdefault(loop_ids[-1], []).append(call)
+            # ``loop_ids`` is outermost-first; a loop can be fused into a
+            # surviving enclosing loop during GLSL scheduling without being
+            # marked evaporated, so the innermost id the plan recorded may
+            # name a LoopBlock this closure's control program no longer has.
+            # Anchor to the innermost enclosing loop that actually survived;
+            # only fall back to the closure boundary (like the no-loop case
+            # above) if none of them did.
+            target_loop_id = next(
+                (
+                    loop_id
+                    for loop_id in reversed(loop_ids)
+                    if loop_id in surviving_loop_ids
+                ),
+                None,
+            )
+            if target_loop_id is not None:
+                calls_at_loop_end.setdefault(target_loop_id, []).append(call)
             else:
                 calls_after.append(call)
         remaining_calls_after = list(calls_after)
 
         def rewrite(block: ControlBlock) -> ControlBlock:
             nonlocal remaining_calls_after
+            def rewrite_expression(expression):
+                if expression is None:
+                    return None
+                return ControlExpression(
+                    expression.op,
+                    tuple(
+                        rewrite_expression(operand)
+                        for operand in expression.operands
+                    ),
+                    None if expression.value_id is None
+                    else value(expression.value_id),
+                    expression.literal,
+                )
+            def rewrite_mutation(mutation):
+                return replace(
+                    mutation,
+                    sequence_value_id=value(mutation.sequence_value_id),
+                    argument_value_ids=tuple(
+                        value(value_id)
+                        for value_id in mutation.argument_value_ids
+                    ),
+                    effect_node_id=value(mutation.effect_node_id),
+                    predicate_expression=rewrite_expression(
+                        mutation.predicate_expression
+                    ),
+                    argument_expressions=tuple(
+                        rewrite_expression(expression)
+                        for expression in mutation.argument_expressions
+                    ),
+                )
             if isinstance(block, StatementBlock):
                 local_region = _region_marker(block)
                 if local_region is None:
@@ -314,19 +488,87 @@ def compose_hierarchical_control(
                     rename_control_text(block.stop),
                     rename_control_text(block.step),
                     body,
-                    tuple(
+                    carried_aliases=tuple(
                         (value(updated), value(initial))
                         for updated, initial in block.carried_aliases
                     ),
-                    block.parallel_iterations,
-                    block.dispatch_shell,
-                    (
+                    result_ports=tuple(
+                        (value(port), value(initial), value(updated))
+                        for port, initial, updated in block.result_ports
+                    ),
+                    carried_seeds=tuple(
+                        (value(initial), literal)
+                        for initial, literal in block.carried_seeds
+                    ),
+                    parallel_iterations=block.parallel_iterations,
+                    dispatch_shell=block.dispatch_shell,
+                    recursion_region_id=(
                         None
                         if block.recursion_region_id is None
                         else recursion_region_map[
                             int(block.recursion_region_id)
                         ]
                     ),
+                    schedule_preference=block.schedule_preference,
+                    sequence_mutations=tuple(
+                        rewrite_mutation(mutation)
+                        for mutation in block.sequence_mutations
+                    ),
+                    comparison=block.comparison,
+                    terminal_controls=tuple(
+                        rewrite(terminal)
+                        for terminal in block.terminal_controls
+                    ),
+                )
+            if isinstance(block, WhileBlock):
+                body = rewrite(block.body)
+                loop_id = block.source_loop_node_id
+                if loop_id is not None and int(loop_id) in calls_at_loop_end:
+                    body = SequenceBlock((
+                        body,
+                        *calls_at_loop_end.pop(int(loop_id)),
+                    ))
+                return WhileBlock(
+                    value(block.predicate_value_id),
+                    rewrite(block.condition),
+                    body,
+                    carried_aliases=tuple(
+                        (value(updated), value(initial))
+                        for updated, initial in block.carried_aliases
+                    ),
+                    result_ports=tuple(
+                        (value(port), value(initial), value(updated))
+                        for port, initial, updated in block.result_ports
+                    ),
+                    carried_seeds=tuple(
+                        (value(initial), literal)
+                        for initial, literal in block.carried_seeds
+                    ),
+                    recursion_region_id=(
+                        None if block.recursion_region_id is None
+                        else recursion_region_map[int(block.recursion_region_id)]
+                    ),
+                    predicate_expression=rewrite_expression(
+                        block.predicate_expression
+                    ),
+                    sequence_mutations=tuple(
+                        rewrite_mutation(mutation)
+                        for mutation in block.sequence_mutations
+                    ),
+                    source_loop_node_id=block.source_loop_node_id,
+                    terminal_controls=tuple(
+                        rewrite(terminal)
+                        for terminal in block.terminal_controls
+                    ),
+                )
+            if isinstance(block, LoopControlBlock):
+                return LoopControlBlock(
+                    block.action,
+                    None if block.predicate_value_id is None
+                    else value(block.predicate_value_id),
+                    block.expect_true,
+                    rewrite_expression(block.predicate_expression),
+                    block.source_action,
                 )
             if isinstance(block, StateMachineTick):
                 return StateMachineTick(
@@ -335,11 +577,13 @@ def compose_hierarchical_control(
                         (rename_control_text(case), rewrite(body))
                         for case, body in block.cases
                     ),
+                    None if block.default is None else rewrite(block.default),
                 )
             if isinstance(block, ParallelDeployment):
-                return ParallelDeployment(tuple(
-                    rewrite(lane) for lane in block.lanes
-                ))
+                return ParallelDeployment(
+                    tuple(rewrite(lane) for lane in block.lanes),
+                    block.schedule_preference,
+                )
             if isinstance(block, CallBlock):
                 return CallBlock(
                     block.callsite_id,
@@ -352,6 +596,8 @@ def compose_hierarchical_control(
                     value(block.predicate_value_id),
                     block.error_code,
                     block.expect_true,
+                    rewrite_expression(block.predicate_expression),
+                    block.extraction_identity,
                 )
             if isinstance(block, StreamPublishBlock):
                 publication = StreamPublishBlock(
@@ -424,9 +670,17 @@ def compose_hierarchical_control(
         if isinstance(block, LoopBlock):
             collect_regions(block.body)
             return
+        if isinstance(block, WhileBlock):
+            collect_regions(block.condition)
+            collect_regions(block.body)
+            return
+        if isinstance(block, LoopControlBlock):
+            return
         if isinstance(block, StateMachineTick):
             for _case, body in block.cases:
                 collect_regions(body)
+            if block.default is not None:
+                collect_regions(block.default)
             return
         if isinstance(block, ParallelDeployment):
             for lane in block.lanes:
@@ -442,16 +696,24 @@ def compose_hierarchical_control(
         raise TypeError(type(block).__name__)
 
     collect_regions(program.root)
-    program = ControlProgram(
-        program.root,
-        tuple(ordered_regions),
-        tuple(dict.fromkeys(all_uniforms)),
-        tuple(dict.fromkeys(all_aliases)),
-        tuple(dict.fromkeys(all_iterables)),
-        tuple(dict.fromkeys(all_static_iterables)),
-        tuple(dict.fromkeys(all_collections)),
-        tuple(dict.fromkeys(all_closure_iterables)),
-        tuple(dict.fromkeys(all_recursion_regions)),
+    program = replace(
+        program,
+        region_indices=tuple(ordered_regions),
+        uniforms=tuple(dict.fromkeys(all_uniforms)),
+        value_aliases=tuple(dict.fromkeys(all_aliases)),
+        iterable_bindings=tuple(dict.fromkeys(all_iterables)),
+        static_iterable_bindings=tuple(
+            dict.fromkeys(all_static_iterables)
+        ),
+        collection_bindings=tuple(dict.fromkeys(all_collections)),
+        closure_iterable_bindings=tuple(
+            dict.fromkeys(all_closure_iterables)
+        ),
+        projected_iterable_bindings=tuple(
+            dict.fromkeys(all_projected_iterables)
+        ),
+        recursion_regions=tuple(dict.fromkeys(all_recursion_regions)),
+        deployment_regions=tuple(all_deployment_regions),
     )
     return HierarchicalControl(program, tuple(region_correlations))
 

@@ -58,7 +58,7 @@ import threading
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -85,6 +85,7 @@ __all__ = [
     "GLSLUnsupportedOp",
     "GLComputeLimits",
     "GLLaunchPlan",
+    "plan_gemm_matrix_deployment",
     "require_gl_context",
     "gl_context_info",
     "register_context_provider",
@@ -109,6 +110,10 @@ __all__ = [
     "emit_index_select_source",
     "emit_slice_axis_source",
     "emit_matmul_source",
+    "emit_source_matmul_source",
+    "glsl_blas_shader_identity",
+    "glslblas_gemm",
+    "execute_backend_intrinsic",
     "emit_permute_source",
     "emit_repeat_source",
     "emit_reduce_source",
@@ -1211,6 +1216,7 @@ class ComposedGLSLControlArtifact:
     value_aliases: Mapping[int, int]
     contiguous_plan: Any = None
     phase_sources: tuple[str, ...] = ()
+    shader_region_links: Mapping[int, Any] = field(default_factory=dict)
     specialized_values: Mapping[int, Any] = field(default_factory=dict)
     instrumentation: bool = False
     debug_capacity: int = 65536
@@ -1546,6 +1552,10 @@ def compose_control_shader(
             return False
         return False
 
+    captured_regions = {
+        int(index): getattr(value, "captured_program", value)
+        for index, value in captured_regions.items()
+    }
     stream_publications = _control_stream_publications(
         control_program.root
     )
@@ -1745,6 +1755,27 @@ def compose_control_shader(
         if int(iterable_id) not in all_slot_ids:
             all_slot_ids.append(int(iterable_id))
             all_slot_meta.append(None)
+            base += 1
+    for iterable_id, target_id, _induction, _projection in (
+        control_program.projected_iterable_bindings
+    ):
+        for value_id in (int(iterable_id), int(target_id)):
+            if value_id in all_slot_ids:
+                continue
+            all_slot_ids.append(value_id)
+            value_meta = next(
+                (
+                    (program.meta or {}).get(value_id)
+                    for captured in captured_regions.values()
+                    for program in (
+                        tuple(getattr(captured, "stages", ()) or ())
+                        or (captured.program,)
+                    )
+                    if (program.meta or {}).get(value_id) is not None
+                ),
+                None,
+            )
+            all_slot_meta.append(value_meta)
             base += 1
     for _iterable_id, target_id, _induction, values in (
         control_program.static_iterable_bindings
@@ -2114,6 +2145,7 @@ def compose_control_shader(
             stop = block.stop
             static_bindings = []
             closure_bindings = []
+            projected_inductions = []
             for iterable_id, target_id, induction in (
                 control_program.iterable_bindings
             ):
@@ -2164,6 +2196,86 @@ def compose_control_shader(
                     return child
 
                 body = bind_iterable(body)
+            projected_rows = {
+                int(iterable_id): 1 + max(
+                    int(projection)
+                    for candidate_iterable, _target, candidate_induction, projection
+                    in control_program.projected_iterable_bindings
+                    if int(candidate_iterable) == int(iterable_id)
+                    and candidate_induction == block.induction
+                    and isinstance(projection, int)
+                )
+                for iterable_id, _target, induction, _projection
+                in control_program.projected_iterable_bindings
+                if induction == block.induction
+                and any(
+                    int(candidate_iterable) == int(iterable_id)
+                    and candidate_induction == block.induction
+                    and isinstance(projection, int)
+                    for candidate_iterable, _candidate_target,
+                    candidate_induction, projection
+                    in control_program.projected_iterable_bindings
+                )
+            }
+            for iterable_id, target_id, induction, projection in (
+                control_program.projected_iterable_bindings
+            ):
+                if induction != block.induction:
+                    continue
+                iterable_slot = all_slot_ids.index(int(iterable_id))
+                stop = stop.replace(
+                    f"__iterable_extent_{int(iterable_id)}__",
+                    (
+                        f"int(u_extent_control[{iterable_slot}])"
+                        if int(iterable_id) not in projected_rows
+                        else f"int(u_extent_control[{iterable_slot}]) / "
+                        f"{projected_rows[int(iterable_id)]}"
+                    ),
+                )
+                target_slots = tuple(
+                    index
+                    for index, value_id in enumerate(all_slot_ids)
+                    if int(value_id) == int(target_id)
+                )
+                if projection == "induction":
+                    projected_inductions.extend(target_slots)
+                    continue
+                row_width = projected_rows.get(int(iterable_id), 1)
+                field_offset = 0 if projection is None else int(projection)
+                replacement = (
+                    f"arena[u_slot[{iterable_slot}] + "
+                    f"uint({block.induction}) * {row_width}u + "
+                    f"{field_offset}u]"
+                )
+
+                def bind_projected(child):
+                    if isinstance(child, StatementBlock):
+                        lines = []
+                        for line in child.lines:
+                            for target_slot in target_slots:
+                                line = line.replace(
+                                    f"arena[u_slot[{target_slot}] + (gid)]",
+                                    replacement,
+                                ).replace(
+                                    f"arena[u_slot[{target_slot}] + (0)]",
+                                    replacement,
+                                )
+                            lines.append(line)
+                        return StatementBlock(tuple(lines))
+                    if isinstance(child, SequenceBlock):
+                        return SequenceBlock(tuple(
+                            bind_projected(item) for item in child.blocks
+                        ))
+                    if isinstance(child, CallBlock):
+                        return CallBlock(
+                            child.callsite_id,
+                            bind_projected(child.callee),
+                            child.argument_bindings,
+                            child.result_bindings,
+                        )
+                    return child
+
+                body = bind_projected(body)
             for _iterable_id, target_id, induction, values in (
                 control_program.static_iterable_bindings
             ):
@@ -2211,6 +2323,13 @@ def compose_control_shader(
                     "iteration counts"
                 )
             commits = []
+            for target_slot in projected_inductions:
+                commits.append(
+                    f"arena[u_slot[{target_slot}]] = "
+                    f"uint(int({block.induction}));"
+                )
+            if projected_inductions:
+                commits.append("memoryBarrierBuffer();")
             for updated, initial in block.carried_aliases:
                 try:
                     initial_slot = all_slot_ids.index(int(initial))
@@ -2425,19 +2544,16 @@ def compose_control_shader(
                     body,
                 ))
                 stop = str(next(iter(source_counts)))
-            lowered_loop = LoopBlock(
-                block.induction,
-                block.start,
-                stop,
-                block.step,
-                body,
-                block.carried_aliases,
-                bool(
+            lowered_loop = replace(
+                block,
+                stop=stop,
+                body=body,
+                parallel_iterations=bool(
                     block.parallel_iterations
                     and str(block.induction)
                     == selected_workgroup_induction
                 ),
-                (
+                dispatch_shell=(
                     "c"
                     if str(block.induction)
                     == selected_c_dispatch_induction
@@ -2464,9 +2580,13 @@ def compose_control_shader(
                 ),
             )
         if isinstance(block, ParallelDeployment):
-            return ParallelDeployment(tuple(
-                substitute(lane, parallel_scope) for lane in block.lanes
-            ))
+            return ParallelDeployment(
+                tuple(
+                    substitute(lane, parallel_scope)
+                    for lane in block.lanes
+                ),
+                block.schedule_preference,
+            )
         if isinstance(block, CallBlock):
             return CallBlock(
                 block.callsite_id,
@@ -2920,8 +3040,44 @@ def build_control_shader_artifact(
     stream_outputs: Mapping[str, int] | None = None,
     specialized_values: Mapping[int, Any] | None = None,
     device_resident: bool = False,
+    shader_region_cuts: Mapping[int, Any] | None = None,
+    work_contract: Any | None = None,
 ) -> ComposedGLSLControlArtifact:
-    """Build source and the value-routing plan required to execute it."""
+    """Build and link the sealed shader interiors required by outer control."""
+
+    shader_region_artifacts = {}
+    from src.compiler.shader_region_pipeline import (
+        cut_shader_regions,
+        link_shader_regions,
+    )
+
+    if shader_region_cuts is None:
+        shader_region_cuts = cut_shader_regions(
+            captured_regions, control_program.region_indices,
+        )
+    if shader_region_cuts:
+
+        captured_regions, shader_region_artifacts = link_shader_regions(
+            control_program,
+            captured_regions,
+            shader_region_cuts,
+            contract=work_contract,
+            local_size=local_size,
+        )
+    else:
+        shader_region_artifacts = {
+            int(index): value
+            for index, value in captured_regions.items()
+            if hasattr(value, "artifact_digest") and hasattr(value, "cut")
+        }
+    shader_region_links = {
+        int(index): artifact.as_record()
+        for index, artifact in sorted(shader_region_artifacts.items())
+    }
+    captured_regions = {
+        int(index): getattr(value, "captured_program", value)
+        for index, value in captured_regions.items()
+    }
 
     source = compose_control_shader(
         control_program,
@@ -3302,6 +3458,13 @@ def build_control_shader_artifact(
         if iterable_id not in slot_value_ids:
             slot_value_ids.append(iterable_id)
 
+    for iterable_id, target_id, _induction, _projection in (
+        control_program.projected_iterable_bindings
+    ):
+        for value_id in (int(iterable_id), int(target_id)):
+            if value_id not in slot_value_ids:
+                slot_value_ids.append(value_id)
+
     for _iterable_id, target_id, _induction, _values in (
         control_program.static_iterable_bindings
     ):
@@ -3370,6 +3533,16 @@ def build_control_shader_artifact(
         for iterable_id, _target_id, _induction, _sources
         in control_program.closure_iterable_bindings
     }
+    projected_targets = {
+        int(target_id)
+        for _iterable_id, target_id, _induction, _projection
+        in control_program.projected_iterable_bindings
+    }
+    projected_aggregates = {
+        int(iterable_id)
+        for iterable_id, _target_id, _induction, _projection
+        in control_program.projected_iterable_bindings
+    }
     external = tuple(dict.fromkeys(
         int(value_id)
         for program in programs
@@ -3380,6 +3553,8 @@ def build_control_shader_artifact(
         and int(value_id) not in collection_targets
         and int(value_id) not in closure_targets
         and int(value_id) not in closure_aggregates
+        and int(value_id) not in projected_targets
+        and int(value_id) not in projected_aggregates
         and int(value_id) not in aliases
     ))
     if terminal_outputs is not None:
@@ -3465,6 +3640,18 @@ def build_control_shader_artifact(
             ),
         }
         for value_id in (int(target_id), *map(int, source_ids)):
+            slot_contract_diagnostics.setdefault(value_id, []).append(row)
+    for iterable_id, target_id, induction, projection in (
+        control_program.projected_iterable_bindings
+    ):
+        row = {
+            "kind": "projected-iterable",
+            "iterable": int(iterable_id),
+            "target": int(target_id),
+            "induction": str(induction),
+            "projection": projection,
+        }
+        for value_id in (int(iterable_id), int(target_id)):
             slot_contract_diagnostics.setdefault(value_id, []).append(row)
     for publication in _control_stream_publications(control_program.root):
         row = {
@@ -3592,6 +3779,13 @@ def build_control_shader_artifact(
         "workgroup_loop_bounds": workgroup_loop_bounds,
         "c_dispatch_loop_bounds": c_dispatch_loop_bounds,
         "private_value_capacities": private_value_capacities,
+        "shader_region_links": {
+            int(index): {
+                "capsule_digest": artifact.cut.capsule.capsule_digest,
+                "artifact_digest": artifact.artifact_digest,
+            }
+            for index, artifact in sorted(shader_region_artifacts.items())
+        },
     }
     semantic_base = _semantic_cache_digest(semantic_cache_record)
     phase_cache_identities = tuple(
@@ -3640,6 +3834,7 @@ def build_control_shader_artifact(
         value_aliases=aliases,
         contiguous_plan=contiguous_plan,
         phase_sources=phase_sources,
+        shader_region_links=shader_region_links,
         specialized_values={
             int(value_id): value
             for value_id, value in (specialized_values or {}).items()
@@ -5074,6 +5269,81 @@ def matmul_snippet(
     )
 
 
+def source_matmul_snippet(
+    left_shape: Sequence[int],
+    right_shape: Sequence[int],
+    *,
+    left_dtype: Any = np.float32,
+    right_dtype: Any = np.float32,
+    output_dtype: Any | None = None,
+    base: int = 0,
+) -> ShaderSnippet:
+    """Lower the canonical GEMM loops directly, without a backend identity.
+
+    One invocation owns one output element and preserves the authored ``p``
+    reduction order. Batch broadcasting changes address calculation only; it
+    does not introduce an alternative mathematical algorithm.
+    """
+
+    left_shape, right_shape, batch_shape, output_shape = _matmul_layout(
+        left_shape, right_shape
+    )
+    left_dtype = _normalize_dtype(left_dtype)
+    right_dtype = _normalize_dtype(right_dtype)
+    output_dtype = (
+        _promote_dtype(left_dtype, right_dtype)
+        if output_dtype is None
+        else _normalize_dtype(output_dtype)
+    )
+    if output_dtype.kind == "b":
+        raise TypeError("matmul does not support boolean output")
+
+    rows, inner = left_shape[-2:]
+    columns = right_shape[-1]
+    left_strides = _row_major_strides(left_shape)
+    right_strides = _row_major_strides(right_shape)
+    batch_strides = _row_major_strides(batch_shape)
+    output_type = _glsl_type(output_dtype)
+    lines = [
+        f"uint batch_index = gid / uint({rows * columns});",
+        f"uint matrix_index = gid % uint({rows * columns});",
+        f"uint row = matrix_index / uint({columns});",
+        f"uint column = matrix_index % uint({columns});",
+        "uint batch_remaining = batch_index;",
+        "uint left_offset = uint(0);",
+        "uint right_offset = uint(0);",
+    ]
+    for axis, batch_stride in enumerate(batch_strides):
+        lines.extend([
+            f"uint batch_coord{axis} = batch_remaining / uint({batch_stride});",
+            f"batch_remaining %= uint({batch_stride});",
+        ])
+        if left_shape[axis] != 1:
+            lines.append(
+                f"left_offset += batch_coord{axis} * uint({left_strides[axis]});"
+            )
+        if right_shape[axis] != 1:
+            lines.append(
+                f"right_offset += batch_coord{axis} * uint({right_strides[axis]});"
+            )
+    lines.extend([
+        f"{output_type} total = {output_type}(0);",
+        f"for (uint p = 0u; p < uint({inner}); ++p) {{",
+        "    total += "
+        + _arena_read(
+            left_dtype, 0, f"left_offset + row * uint({inner}) + p", base,
+        )
+        + " * "
+        + _arena_read(
+            right_dtype, 1, f"right_offset + p * uint({columns}) + column", base,
+        )
+        + ";",
+        "}",
+        _arena_write(output_dtype, 2, "gid", "total", base) + ";",
+    ])
+    return ShaderSnippet(lines=tuple(lines), slots=3)
+
+
 def emit_matmul_source(
     left_shape: Sequence[int],
     right_shape: Sequence[int],
@@ -5093,6 +5363,70 @@ def emit_matmul_source(
         )],
         local_size=local_size,
     )
+
+
+def emit_source_matmul_source(
+    left_shape: Sequence[int],
+    right_shape: Sequence[int],
+    *,
+    left_dtype: Any = np.float32,
+    right_dtype: Any = np.float32,
+    output_dtype: Any | None = None,
+    local_size: int = _LOCAL_SIZE,
+) -> str:
+    """Finish the direct source-order lowering of canonical ``blas.gemm``."""
+
+    return compose_shader(
+        [source_matmul_snippet(
+            left_shape,
+            right_shape,
+            left_dtype=left_dtype,
+            right_dtype=right_dtype,
+            output_dtype=output_dtype,
+        )],
+        local_size=local_size,
+    )
+
+
+def glsl_blas_shader_identity(
+    *,
+    role_source: str,
+    variant: str,
+    left_shape: Sequence[int],
+    right_shape: Sequence[int],
+    left_dtype: Any,
+    right_dtype: Any,
+    output_dtype: Any,
+    local_size: int,
+    shader_source: str,
+) -> str:
+    """Name a shader by semantics, source provenance, and specialization.
+
+    Driver-produced program bytes are necessarily device-specific. Their
+    cache address is not: identical humble source, identity choice, types,
+    shapes, and launch specialization always produce this same key.
+    """
+
+    record = {
+        "schema": "turing.glsl-blas-plan.v1",
+        "role": "blas.gemm",
+        "role_source_sha256": hashlib.sha256(
+            role_source.encode("utf-8")
+        ).hexdigest(),
+        "variant": str(variant),
+        "left_shape": list(map(int, left_shape)),
+        "right_shape": list(map(int, right_shape)),
+        "left_dtype": _normalize_dtype(left_dtype).str,
+        "right_dtype": _normalize_dtype(right_dtype).str,
+        "output_dtype": _normalize_dtype(output_dtype).str,
+        "local_size": int(local_size),
+        "shader_sha256": hashlib.sha256(
+            shader_source.encode("utf-8")
+        ).hexdigest(),
+    }
+    return hashlib.sha256(json.dumps(
+        record, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
 
 
 def _resolve_repeat_layout(
@@ -6422,6 +6756,7 @@ class GLLaunchPlan:
     local_size: int
     groups: tuple[int, int, int]
     limits: GLComputeLimits
+    deployment: Any = None
 
     @property
     def skipped(self) -> bool:
@@ -6482,12 +6817,6 @@ def _compute_limits() -> GLComputeLimits:
     return limits
 
 
-def _power_of_two_at_most(value: int) -> int:
-    if value < 1:
-        raise ValueError("value must be positive")
-    return 1 << (int(value).bit_length() - 1)
-
-
 def plan_launch(
     count: int,
     *,
@@ -6510,8 +6839,6 @@ def plan_launch(
             "launch count exceeds the uint u_count contract; use a tiled "
             "base-offset launch"
         )
-    if preferred_local_size <= 0:
-        raise ValueError("preferred local size must be positive")
     if binding_count < 0:
         raise ValueError("binding count cannot be negative")
 
@@ -6523,42 +6850,50 @@ def plan_launch(
             f"{limits.max_dispatch_ssbo_blocks}"
         )
 
-    local_cap = min(
-        int(preferred_local_size),
-        limits.max_group_size[0],
-        limits.max_invocations,
+    from src.compiler.deployment_lowering import (
+        ComputeDispatchLimits,
+        select_deployment_strategy,
     )
-    local_size = _power_of_two_at_most(local_cap)
-    if count:
-        small_target = max(1, 1 << (count - 1).bit_length())
-        minimum_group = min(32, local_size)
-        local_size = min(local_size, max(minimum_group, small_target))
-
-    if count == 0:
-        return GLLaunchPlan(count, local_size, (0, 0, 0), limits)
-
-    groups_needed = (count + local_size - 1) // local_size
-    group_x = min(groups_needed, limits.max_group_count[0])
-    remaining = (groups_needed + group_x - 1) // group_x
-    group_y = min(remaining, limits.max_group_count[1])
-    remaining = (remaining + group_y - 1) // group_y
-    group_z = remaining
-    if group_z > limits.max_group_count[2]:
-        capacity = (
-            limits.max_group_count[0]
-            * limits.max_group_count[1]
-            * limits.max_group_count[2]
-            * local_size
-        )
-        raise ValueError(
-            f"launch count {count} exceeds one-dispatch capacity {capacity}; "
-            "the caller must use a base-offset tiled launch"
-        )
+    choice = select_deployment_strategy(
+        backend="glsl",
+        execution_class="shader-compute",
+        work=count,
+        preferred_local_size=preferred_local_size,
+        compute_limits=ComputeDispatchLimits(
+            max_group_count=limits.max_group_count,
+            max_group_size=limits.max_group_size,
+            max_invocations=limits.max_invocations,
+        ),
+    )
+    if choice.compute is None:  # profile regression, never a silent fallback
+        raise RuntimeError("GLSL deployment did not produce compute geometry")
     return GLLaunchPlan(
-        count,
-        local_size,
-        (int(group_x), int(group_y), int(group_z)),
+        choice.compute.count,
+        choice.compute.workgroup_size[0],
+        choice.compute.groups,
         limits,
+        choice,
+    )
+
+
+def plan_gemm_matrix_deployment(
+    matrix: Mapping[str, Any], *, preferred_local_size: int = _LOCAL_SIZE,
+):
+    """Read the universal GEMM matrix through active GLSL device limits."""
+
+    from src.compiler.deployment_lowering import ComputeDispatchLimits
+    from src.compiler.tiling_strategy import interpret_gemm_compute_matrix
+
+    limits = _compute_limits()
+    return interpret_gemm_compute_matrix(
+        matrix,
+        backend="glsl",
+        preferred_local_size=preferred_local_size,
+        limits=ComputeDispatchLimits(
+            max_group_count=limits.max_group_count,
+            max_group_size=limits.max_group_size,
+            max_invocations=limits.max_invocations,
+        ),
     )
 
 
@@ -8200,8 +8535,9 @@ def matmul_chunks(
     right: Any,
     *,
     reverse: bool = False,
+    variant: str | None = None,
 ) -> GLChunk:
-    """Execute one native 2-D or broadcasted batched matrix multiplication."""
+    """Execute GEMM using the active contract's GLSL identity policy."""
     left = left if isinstance(left, GLChunk) else GLChunk.from_numpy(left)
     right = right if isinstance(right, GLChunk) else GLChunk.from_numpy(right)
     if reverse:
@@ -8217,34 +8553,129 @@ def matmul_chunks(
 
     out = GLChunk(output_shape, dtype=output_dtype)
     limits = _compute_limits()
-    tile_cap = min(
-        16,
-        int(math.isqrt(limits.max_invocations)),
-        int(math.isqrt(limits.max_group_size[0])),
+    from src.compiler.deployment_lowering import ComputeDispatchLimits
+    from src.compiler.tiling_strategy import select_gemm_shader_dispatch
+
+    dispatch = select_gemm_shader_dispatch(
+        output_shape[-2],
+        output_shape[-1],
+        left_shape[-1],
+        backend="glsl",
+        limits=ComputeDispatchLimits(
+            max_group_count=limits.max_group_count,
+            max_group_size=limits.max_group_size,
+            max_invocations=limits.max_invocations,
+        ),
+        batch_count=_shape_product(output_shape[:-2]),
+        variant=variant,
     )
-    tile = 1 << max(0, tile_cap.bit_length() - 1)
-    thread_count = tile * tile
-    rows, columns = output_shape[-2:]
-    group_count = (
-        _shape_product(output_shape[:-2])
-        * ((rows + tile - 1) // tile)
-        * ((columns + tile - 1) // tile)
+    variant = dispatch.variant
+    local_size = dispatch.choice.compute.workgroup_size[0]
+    emitter = (
+        emit_matmul_source
+        if variant == "glslblas_gemm"
+        else emit_source_matmul_source
     )
-    plan = plan_launch(
-        group_count * thread_count,
-        preferred_local_size=thread_count,
-        binding_count=3,
+    compute = dispatch.choice.compute
+    plan = GLLaunchPlan(
+        compute.count,
+        compute.workgroup_size[0],
+        compute.groups,
+        limits,
+        dispatch.choice,
     )
-    source = emit_matmul_source(
+    source = emitter(
         left_shape,
         right_shape,
         left_dtype=left.dtype,
         right_dtype=right.dtype,
         output_dtype=output_dtype,
-        local_size=thread_count,
+        local_size=local_size,
     )
-    _dispatch(_compile(source), [left, right], out, plan)
+    from src.common.tensors.blas import GEMM_SOURCE
+
+    cache_identity = glsl_blas_shader_identity(
+        role_source=GEMM_SOURCE,
+        variant=variant,
+        left_shape=left_shape,
+        right_shape=right_shape,
+        left_dtype=left.dtype,
+        right_dtype=right.dtype,
+        output_dtype=output_dtype,
+        local_size=local_size,
+        shader_source=source,
+    )
+    _dispatch(
+        _compile(source, cache_identity=cache_identity),
+        [left, right],
+        out,
+        plan,
+    )
     return out
+
+
+def glslblas_gemm(left: Any, right: Any, *, reverse: bool = False) -> GLChunk:
+    """GLSL intrinsic candidate for canonical ``blas.gemm`` semantics.
+
+    The name is intentionally explicit: ingestion and repository SSA retain
+    canonical ``matmul``; the GLSL backend identity library may swap that
+    semantic operation to this implementation.  It is not a second GEMM and
+    does not participate in universal identity decisions.
+    """
+
+    return matmul_chunks(left, right, reverse=reverse)
+
+
+def execute_backend_intrinsic(
+    instruction: Any,
+    values: Mapping[int, Any],
+    *,
+    gestalt_overrides: Mapping[str, Any] | None = None,
+) -> Any:
+    """Consume one GLSL-qualified repository-SSA intrinsic boundary.
+
+    ``values`` is keyed by deterministic SSA value id.  A deployment gestalt
+    may replace a qualified location with its own callable explicitly; absent
+    that override, only backend locations owned by this module are accepted.
+    """
+
+    if str(getattr(instruction, "op", "")) != "BackendIntrinsic":
+        raise ValueError("GLSL intrinsic execution requires BackendIntrinsic SSA")
+    record = dict(getattr(instruction, "attributes", {}).get(
+        "backend_intrinsic"
+    ) or {})
+    if record.get("backend") != "glsl":
+        raise ValueError(
+            f"GLSL cannot consume intrinsic for backend {record.get('backend')!r}"
+        )
+    location = str(record.get("location") or "")
+    builtin_location = (
+        "src.common.tensors.accelerator_backends.glsl_backend:"
+        "glslblas_gemm"
+    )
+    handlers = {builtin_location: glslblas_gemm}
+    handlers.update(dict(gestalt_overrides or {}))
+    handler = handlers.get(location)
+    if handler is None:
+        raise KeyError(f"no GLSL deployment intrinsic is installed at {location!r}")
+    positions = tuple(map(int, record.get("operand_positions") or ()))
+    arguments = []
+    for position in positions:
+        try:
+            value_id = int(instruction.args[position].id)
+        except (IndexError, AttributeError) as error:
+            raise ValueError(
+                f"intrinsic operand position {position} is absent"
+            ) from error
+        if value_id not in values:
+            raise KeyError(f"missing GLSL intrinsic operand value {value_id}")
+        arguments.append(values[value_id])
+    if location == builtin_location and handler is glslblas_gemm:
+        return matmul_chunks(
+            *arguments,
+            variant=record.get("shader_variant"),
+        )
+    return handler(*arguments)
 
 
 def repeat_chunk(
@@ -8617,7 +9048,11 @@ def execute_captured_fused_program(
             int(step.attrs.get("dim", 0)),
         )
     elif kind == "matmul":
-        result = matmul_chunks(input_chunks[0], input_chunks[1])
+        # The captured ProcessGraph is the orchestration gestalt.  Its
+        # canonical matmul boundary resolves to the same named intrinsic as
+        # the repository-SSA backend identity library, rather than bypassing
+        # that identity by calling the implementation helper directly.
+        result = glslblas_gemm(input_chunks[0], input_chunks[1])
     elif kind == "index_select":
         result = index_select_chunk(
             input_chunks[0],
@@ -8790,6 +9225,15 @@ def _emit_captured_fused_program_source(
         )
     if kind == "matmul":
         right_meta = metadata[step.input_ids[1]]
+        if step.attrs.get("shader_identity") == "source_algorithm":
+            return emit_source_matmul_source(
+                tuple(source_meta.shape or ()),
+                tuple(right_meta.shape or ()),
+                left_dtype=source_meta.dtype,
+                right_dtype=right_meta.dtype,
+                output_dtype=output_meta.dtype,
+                local_size=local_size,
+            )
         return emit_matmul_source(
             tuple(source_meta.shape or ()),
             tuple(right_meta.shape or ()),
@@ -8984,6 +9428,15 @@ def captured_program_snippet(
         )
     if kind == "matmul":
         right_meta = metadata[step.input_ids[1]]
+        if step.attrs.get("shader_identity") == "source_algorithm":
+            return source_matmul_snippet(
+                tuple(source_meta.shape or ()),
+                tuple(right_meta.shape or ()),
+                left_dtype=source_meta.dtype,
+                right_dtype=right_meta.dtype,
+                output_dtype=output_meta.dtype,
+                base=base,
+            )
         return matmul_snippet(
             tuple(source_meta.shape or ()),
             tuple(right_meta.shape or ()),
@@ -9064,14 +9517,25 @@ def captured_program_snippet(
     raise ValueError(f"unsupported captured GLSL kernel kind {kind!r}")
 
 
-def compile_captured_fused_program(captured) -> str:
-    """Compile and cache the shader for one captured numerical region."""
+def compile_captured_fused_program(captured, *, _sealed: bool = False) -> str:
+    """Compile one captured region through the sealed shader second pass."""
+
+    if not _sealed:
+        from src.compiler.shader_region_pipeline import (
+            compile_shader_region,
+            cut_shader_region,
+        )
+
+        artifact = compile_shader_region(cut_shader_region(-1, captured))
+        captured = artifact.captured_program
 
     stages = tuple(getattr(captured, "stages", ()) or ())
     if stages:
         return "\n".join(
             f"// captured stage {index}\n"
-            + compile_captured_fused_program(type(captured)(stage, {}))
+            + compile_captured_fused_program(
+                type(captured)(stage, {}), _sealed=True,
+            )
             for index, stage in enumerate(stages)
         )
     program = captured.program

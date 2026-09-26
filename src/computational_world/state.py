@@ -48,6 +48,9 @@ class ComputationalWorldState:
     provenance_cursor: AbstractTensor
     managed_time: AbstractTensor
     phase: AbstractTensor
+    spring_node_count: AbstractTensor
+    spring_edge_count: AbstractTensor
+    spring_group_count: AbstractTensor
     spring_position: AbstractTensor
     spring_velocity: AbstractTensor
     spring_edge_index: AbstractTensor
@@ -98,6 +101,9 @@ class ComputationalWorldState:
             provenance_cursor=_tensor([-1], dtype="int64"),
             managed_time=_tensor([0.0], dtype="float64"),
             phase=_tensor([0], dtype="int32"),
+            spring_node_count=_tensor([0], dtype="int64"),
+            spring_edge_count=_tensor([0], dtype="int64"),
+            spring_group_count=_tensor([0], dtype="int64"),
             spring_position=_tensor([], dtype="float32").reshape((0, 3)),
             spring_velocity=_tensor([], dtype="float32").reshape((0, 3)),
             spring_edge_index=_tensor([[], []], dtype="int64"),
@@ -203,6 +209,9 @@ class ComputationalWorldState:
         if tuple(self.occupied_block_coord.shape[1:]) != (3,):
             raise ValueError("occupied voxel coordinates must have shape (K, 3)")
         spring_nodes = int(self.spring_position.shape[0])
+        active_spring_nodes = int(self.spring_node_count.item())
+        if not 0 <= active_spring_nodes <= spring_nodes:
+            raise ValueError("spring active node count exceeds resident capacity")
         for name in (
             "spring_velocity", "spring_mass", "spring_glow_alpha",
             "spring_glow_radius", "spring_node_network",
@@ -214,6 +223,9 @@ class ComputationalWorldState:
         if tuple(self.spring_edge_index.shape[:1]) != (2,):
             raise ValueError("spring edge_index must have shape (2, SE)")
         spring_edges = int(self.spring_edge_index.shape[1])
+        active_spring_edges = int(self.spring_edge_count.item())
+        if not 0 <= active_spring_edges <= spring_edges:
+            raise ValueError("spring active edge count exceeds resident capacity")
         for name in (
             "spring_rest_length", "spring_base_length",
             "spring_natural_rest_length", "spring_done_growing",
@@ -232,12 +244,18 @@ class ComputationalWorldState:
             self.spring_node_role_mask,
         )
         groups = int(edge_masks[0].shape[0]) if edge_masks else 0
+        active_groups = int(self.spring_group_count.item())
+        if not 0 <= active_groups <= groups:
+            raise ValueError("spring active group count exceeds resident capacity")
         if any(tuple(mask.shape) != (groups, spring_edges) for mask in edge_masks):
             raise ValueError("spring edge activation masks are misaligned")
         if any(tuple(mask.shape) != (groups, spring_nodes) for mask in node_masks):
             raise ValueError("spring node activation masks are misaligned")
         network_count = max(
-            (int(value) for value in self.spring_node_network.tolist()),
+            (
+                int(value)
+                for value in self.spring_node_network[:active_spring_nodes].tolist()
+            ),
             default=-1,
         ) + 1
         if tuple(self.spring_boundary_center.shape) != (network_count, 3):

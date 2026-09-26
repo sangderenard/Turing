@@ -109,3 +109,76 @@ def test_unsupported_op_raises_a_named_shortfall_not_a_kwyerror():
     )
     with pytest.raises(PythonLoweringShortfall):
         compile_single_region_python(program, {1: "value"}, dialect="numpy")
+
+
+def test_numpy_dialect_materializes_captured_tensor_constants():
+    program = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[
+            OpStep(
+                step_id=0,
+                op_name="tensor_from_list",
+                input_ids=[],
+                attrs={"values": (2.5,)},
+                result_id=2,
+            ),
+            OpStep(
+                step_id=1,
+                op_name="add",
+                input_ids=[1, 2],
+                attrs={},
+                result_id=3,
+            ),
+        ],
+        outputs={"result": 3},
+    )
+    compiled = compile_single_region_python(program, {1: "value"}, dialect="numpy")
+
+    assert "np.asarray((2.5,))" in compiled.source
+    assert np.allclose(compiled.callable(np.asarray([1.0, 3.0])), [3.5, 5.5])
+
+
+def test_numpy_dialect_evaluates_captured_whole_field_sum():
+    program = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[
+            OpStep(
+                step_id=0,
+                op_name="sum",
+                input_ids=[1],
+                attrs={"axis": None, "keepdim": False},
+                result_id=2,
+            ),
+        ],
+        outputs={"result": 2},
+    )
+    compiled = compile_single_region_python(program, {1: "field"}, dialect="numpy")
+
+    assert "np.sum(field, axis=None, keepdims=False)" in compiled.source
+    assert compiled.callable(np.asarray([1.0, 2.0, 3.5])) == pytest.approx(6.5)
+
+
+def test_numpy_dialect_uses_existing_floor_operator_spelling():
+    program = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[
+            OpStep(
+                step_id=0,
+                op_name="floor",
+                input_ids=[1],
+                attrs={},
+                result_id=2,
+            ),
+        ],
+        outputs={"result": 2},
+    )
+    compiled = compile_single_region_python(program, {1: "field"}, dialect="numpy")
+
+    assert "np.floor(field)" in compiled.source
+    assert np.allclose(
+        compiled.callable(np.asarray([-1.2, 0.0, 2.8])),
+        [-2.0, 0.0, 2.0],
+    )

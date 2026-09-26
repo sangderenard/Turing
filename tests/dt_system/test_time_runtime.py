@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from src.common.tensors import AbstractTensor
+
 import math
 
 import pytest
@@ -33,7 +35,8 @@ def test_managed_runtime_maps_absolute_events_and_reports_reruns():
             0.0,
             0.0,
             0.0,
-            error_channels={"field_residual": float(dt)},
+            error_channels=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, float(dt)]),
+            error_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
         )
 
     runtime = ManagedTimeRuntime(
@@ -44,7 +47,8 @@ def test_managed_runtime_maps_absolute_events_and_reports_reruns():
             1.0,
             1.0,
             1.0,
-            error_limits={"field_residual": 0.1},
+            error_limits=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]),
+            error_limits_present=AbstractTensor.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
         ),
         controller=STController(dt_min=1.0e-9),
         generation=4,

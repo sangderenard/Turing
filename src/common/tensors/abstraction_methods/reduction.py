@@ -12,13 +12,25 @@ def _wrap_scalar(result):
 
 
 
-def max(self, dim=None, keepdim: bool = False):
+def max(
+    self,
+    dim=None,
+    keepdim: bool = False,
+    *,
+    axis=None,
+    dtype=None,
+    out=None,
+    keepdims=None,
+):
     """Return the maximum of the tensor along the specified dimension(s)."""
-    finalize = AbstractTensor._pre_autograd(
-        "max", [self], params={"axis": dim, "keepdim": keepdim}
+    source, dim, keepdim = self._normalize_reduction_call(
+        "max", dim, keepdim, axis=axis, dtype=dtype, out=out, keepdims=keepdims
     )
-    result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-    result.data = self.max_(dim=dim, keepdim=keepdim)
+    finalize = AbstractTensor._pre_autograd(
+        "max", [source], params={"axis": dim, "keepdim": keepdim}
+    )
+    result = type(source)(track_time=source.track_time, tape=getattr(source, "_tape", None))
+    result.data = source.max_(dim=dim, keepdim=keepdim)
     result = finalize(result)
     return _wrap_scalar(result)
 
@@ -45,12 +57,24 @@ def argmin(self, dim: Optional[int] = None, keepdim: bool = False):
     return _wrap_scalar(result)
 
 
-def prod(self, dim=None, keepdim: bool = False):
+def prod(
+    self,
+    dim=None,
+    keepdim: bool = False,
+    *,
+    axis=None,
+    dtype=None,
+    out=None,
+    keepdims=None,
+):
     """Return the product of tensor elements along a dimension."""
-    finalize = AbstractTensor._pre_autograd(
-        "prod", [self], params={"axis": dim, "keepdim": keepdim}
+    source, dim, keepdim = self._normalize_reduction_call(
+        "prod", dim, keepdim, axis=axis, dtype=dtype, out=out, keepdims=keepdims
     )
-    result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-    result.data = self.prod_(dim=dim, keepdim=keepdim)
+    finalize = AbstractTensor._pre_autograd(
+        "prod", [source], params={"axis": dim, "keepdim": keepdim}
+    )
+    result = type(source)(track_time=source.track_time, tape=getattr(source, "_tape", None))
+    result.data = source.prod_(dim=dim, keepdim=keepdim)
     result = finalize(result)
     return _wrap_scalar(result)

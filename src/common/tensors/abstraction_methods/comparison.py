@@ -26,7 +26,15 @@ def argwhere(self) -> "AbstractTensor":
     result.data = self.argwhere_()
     return result
 
-def all(self, dim=None) -> Any:
+def all(
+    self,
+    axis=None,
+    out=None,
+    keepdims=False,
+    *,
+    where=None,
+    dim=None,
+) -> Any:
     """Return True if all elements of the tensor are True."""
     from ..abstraction import AbstractTensor
     if not isinstance(self, AbstractTensor):
@@ -35,10 +43,33 @@ def all(self, dim=None) -> Any:
         track_time=self.track_time,
         tape=getattr(self, "_tape", None),
     )
-    result.data = self.all_(dim)
+    if out is not None:
+        raise NotImplementedError("AbstractTensor.all does not support out=")
+    if where is not None:
+        raise NotImplementedError("AbstractTensor.all does not support where=")
+    reduction_axis = dim if dim is not None else axis
+    result.data = self.all_(reduction_axis)
+    if keepdims and reduction_axis is not None:
+        axes = (
+            (reduction_axis,)
+            if isinstance(reduction_axis, int)
+            else tuple(reduction_axis)
+        )
+        shape = list(self.shape)
+        for reduced_axis in axes:
+            shape[int(reduced_axis) % len(shape)] = 1
+        result = result.reshape(tuple(shape))
     return result
 
-def any(self, dim=None) -> Any:
+def any(
+    self,
+    axis=None,
+    out=None,
+    keepdims=False,
+    *,
+    where=None,
+    dim=None,
+) -> Any:
     """Return True if any element of the tensor is True."""
     from ..abstraction import AbstractTensor
     if not isinstance(self, AbstractTensor):
@@ -47,7 +78,22 @@ def any(self, dim=None) -> Any:
         track_time=self.track_time,
         tape=getattr(self, "_tape", None),
     )
-    result.data = self.any_(dim)
+    if out is not None:
+        raise NotImplementedError("AbstractTensor.any does not support out=")
+    if where is not None:
+        raise NotImplementedError("AbstractTensor.any does not support where=")
+    reduction_axis = dim if dim is not None else axis
+    result.data = self.any_(reduction_axis)
+    if keepdims and reduction_axis is not None:
+        axes = (
+            (reduction_axis,)
+            if isinstance(reduction_axis, int)
+            else tuple(reduction_axis)
+        )
+        shape = list(self.shape)
+        for reduced_axis in axes:
+            shape[int(reduced_axis) % len(shape)] = 1
+        result = result.reshape(tuple(shape))
     return result
 
 def isnan(self) -> "AbstractTensor":

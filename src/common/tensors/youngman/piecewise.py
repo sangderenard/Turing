@@ -490,3 +490,189 @@ class StreamingPiecewiseSplineEngine:
         with self._generation_lock:
             self._latest = generation
         return generation
+
+
+# ---------------------------------------------------------------------------
+# Destreamed construction: a function -> an adaptively subdivided polyspline
+# ---------------------------------------------------------------------------
+# The streaming engine above fits patches to samples as they arrive.  The
+# same patches can be built directly from a FUNCTION: each simplex samples
+# the function at its own Bezier domain points (the principal lattice,
+# unisolvent for the degree), fits exactly, and integrates exactly -- every
+# degree-n Bernstein basis polynomial on a d-simplex T integrates to
+# |T| / C(n + d, d).  Subdividing where a patch disagrees with its children
+# gives an arbitrarily refined polyspline and a measured error, returned as
+# one object: the generation (callable) plus its integral.
+
+
+def simplex_volume(vertices: np.ndarray) -> float:
+    """|T| of a d-simplex given its d+1 vertices."""
+    vertices = np.asarray(vertices, dtype=np.float64)
+    edges = vertices[1:] - vertices[0]
+    return float(abs(np.linalg.det(edges)) / factorial(vertices.shape[1]))
+
+
+def domain_points(vertices: np.ndarray, degree: int) -> np.ndarray:
+    """The Bezier domain points sum_i (alpha_i / n) v_i for |alpha| = n."""
+    vertices = np.asarray(vertices, dtype=np.float64)
+    indices = simplex_multi_indices(vertices.shape[1], degree)
+    return (indices / float(degree)) @ vertices
+
+
+def patch_integral(patch: SimplexBezierPatch) -> np.ndarray:
+    """Exact integral of a patch over its simplex, one value per channel."""
+    d, n = patch.intrinsic_dimension, patch.degree
+    binomial = factorial(n + d) / (factorial(n) * factorial(d))
+    return simplex_volume(patch.domain_vertices) * patch.coefficients.sum(axis=0) / binomial
+
+
+def fit_function_patch(function, vertices: np.ndarray, degree: int,
+                       patch_id: int = 0) -> SimplexBezierPatch:
+    """Interpolate ``function`` on one simplex at its own domain points."""
+    points = domain_points(vertices, degree)
+    values = np.asarray(function(points), dtype=np.float64)
+    if values.ndim == 1:
+        values = values[:, None]
+    return SimplexBezierFactory.fit(patch_id, vertices, points, values,
+                                    degree=degree, ridge=0.0)
+
+
+def bisect_simplex(vertices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Split a simplex in two across the midpoint of its longest edge."""
+    vertices = np.asarray(vertices, dtype=np.float64)
+    count = len(vertices)
+    best, pair = -1.0, (0, 1)
+    for i in range(count):
+        for j in range(i + 1, count):
+            length = float(np.sum((vertices[i] - vertices[j]) ** 2))
+            if length > best:
+                best, pair = length, (i, j)
+    i, j = pair
+    middle = 0.5 * (vertices[i] + vertices[j])
+    left, right = vertices.copy(), vertices.copy()
+    left[j] = middle
+    right[i] = middle
+    return left, right
+
+
+def kuhn_simplices(lower, upper) -> list[np.ndarray]:
+    """The d! Kuhn simplices tiling the box [lower, upper]."""
+    from itertools import permutations
+
+    lower = np.asarray(lower, dtype=np.float64)
+    upper = np.asarray(upper, dtype=np.float64)
+    d = len(lower)
+    out = []
+    for order in permutations(range(d)):
+        corner = lower.copy()
+        vertices = [corner.copy()]
+        for axis in order:
+            corner[axis] = upper[axis]
+            vertices.append(corner.copy())
+        out.append(np.asarray(vertices))
+    return out
+
+
+def box_cells(lower, upper, breakpoints=None) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Split a box at declared breakpoints (kinks, singular values) per axis."""
+    from itertools import product
+
+    lower = np.asarray(lower, dtype=np.float64)
+    upper = np.asarray(upper, dtype=np.float64)
+    breakpoints = breakpoints or {}
+    edges = []
+    for axis in range(len(lower)):
+        cuts = sorted(float(c) for c in breakpoints.get(axis, ())
+                      if lower[axis] < float(c) < upper[axis])
+        edges.append([lower[axis], *cuts, upper[axis]])
+    cells = []
+    for index in product(*(range(len(e) - 1) for e in edges)):
+        lo = np.asarray([edges[a][k] for a, k in enumerate(index)])
+        hi = np.asarray([edges[a][k + 1] for a, k in enumerate(index)])
+        cells.append((lo, hi))
+    return cells
+
+
+@dataclass(frozen=True)
+class AdaptivePolyspline:
+    """An adaptively subdivided polyspline of a function, and its integral.
+
+    ``generation`` is callable (evaluate / jacobian / metric_tensor) over the
+    whole domain; ``integral`` is the exact integral of the polyspline;
+    ``error_estimate`` is the sum over leaves of |parent - children|, the
+    measured disagreement at the last refinement of each leaf.
+    """
+
+    generation: PiecewiseSplineGeneration
+    integral: np.ndarray
+    error_estimate: float
+    degree: int
+
+    def __call__(self, parameters: np.ndarray) -> np.ndarray:
+        return self.generation.evaluate(parameters)
+
+
+def adaptive_polyspline(function, lower, upper, *, degree: int = 4,
+                        epsilon: float = 1e-12, relative: float = 1e-12,
+                        breakpoints=None, max_patches: int = 20000) -> AdaptivePolyspline:
+    """Fit and integrate ``function`` over the box [lower, upper].
+
+    ``function`` takes points of shape (N, d) and returns (N,) or (N, m).
+    Declared ``breakpoints`` ({axis: [values]}) split the box before any
+    fitting, so a kink never sits inside a patch.  Refinement bisects the
+    leaf whose own integral disagrees most with its two children's, until
+    the total disagreement is under max(epsilon, relative * |integral|).
+    """
+    import heapq
+
+    leaves = []                     # heap of (-error, id, vertices, patch, children)
+    counter = [0]
+
+    def evaluate_leaf(vertices):
+        patch = fit_function_patch(function, vertices, degree, counter[0])
+        counter[0] += 1
+        left, right = bisect_simplex(vertices)
+        children = (fit_function_patch(function, left, degree, counter[0]),
+                    fit_function_patch(function, right, degree, counter[0] + 1))
+        counter[0] += 2
+        whole = patch_integral(patch)
+        split = patch_integral(children[0]) + patch_integral(children[1])
+        # Two independent indicators, and a leaf is only as settled as the
+        # worse of them: h (the parent against its bisected children) and p
+        # (degree n against degree n+1 on the same simplex, which samples
+        # different points).  The h indicator alone is fooled when parent and
+        # children agree by coincidence -- a separable periodic integrand on
+        # symmetric Kuhn cells does exactly that, leaving a coarse leaf
+        # "converged" with the total off by 1e-3 against an estimate of 1e-7.
+        richer = patch_integral(fit_function_patch(function, vertices, degree + 1, counter[0]))
+        counter[0] += 1
+        error = float(max(np.max(np.abs(whole - split)), np.max(np.abs(richer - split))))
+        return error, children, split
+
+    for lo, hi in box_cells(lower, upper, breakpoints):
+        for simplex in kuhn_simplices(lo, hi):
+            error, children, split = evaluate_leaf(simplex)
+            heapq.heappush(leaves, (-error, counter[0], children, split))
+
+    def totals():
+        integral = sum(item[3] for item in leaves)
+        error = sum(-item[0] for item in leaves)
+        return integral, error
+
+    integral, error = totals()
+    while error > max(epsilon, relative * float(np.max(np.abs(integral)))):
+        if 2 * len(leaves) > max_patches:
+            break
+        _, _, children, _ = heapq.heappop(leaves)
+        for child in children:
+            child_error, grandchildren, split = evaluate_leaf(child.domain_vertices)
+            heapq.heappush(leaves, (-child_error, counter[0], grandchildren, split))
+        integral, error = totals()
+
+    patches = {}
+    for item in leaves:
+        for child in item[2]:
+            patches[len(patches)] = child
+    generation = PiecewiseSplineGeneration(generation=0, patches=patches)
+    return AdaptivePolyspline(generation=generation, integral=np.asarray(integral),
+                              error_estimate=float(error), degree=int(degree))

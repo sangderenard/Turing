@@ -42,6 +42,33 @@ class LoopStateEffectMode(str, Enum):
 
     OPAQUE = "opaque"
     INDEXED_PUBLICATION = "indexed_publication"
+    SEQUENCE_MUTATION = "sequence_mutation"
+    MAPPING_MUTATION = "mapping_mutation"
+
+
+#: THE WHOLE MODELLED VOCABULARY, as data rather than as literals inline
+#: in the classifier.
+#:
+#: A loop-body mutation is classified only when the state's aggregate kind
+#: is a known container AND its operator appears here. Everything else --
+#: every `.step()` ever written, every domain method a program of its own
+#: defines -- falls through to ``OPAQUE``, which is therefore the DEFAULT
+#: and not a detection. Reporting that as though something were detected
+#: sends a reader hunting for the thing that was found.
+#:
+#: Kept here, next to the mode it decides, so the classifier and every
+#: diagnostic that explains a refusal read the same list. A second copy
+#: spelled out in a message is a copy that drifts, and a message that
+#: lists the wrong vocabulary is worse than one that lists none.
+SEQUENCE_MUTATION_OPERATORS = frozenset({
+    "add", "append", "clear", "extend", "pop", "remove",
+})
+MAPPING_MUTATION_OPERATORS = frozenset({
+    "update", "pop", "setdefault",
+})
+MODELLED_STATE_OPERATORS = (
+    SEQUENCE_MUTATION_OPERATORS | MAPPING_MUTATION_OPERATORS
+)
 
 
 @dataclass(frozen=True)
@@ -104,6 +131,15 @@ class LoopStateEffect:
     loop_result_id: int | None = None
     argument_value_ids: tuple[int, ...] = ()
     mode: LoopStateEffectMode = LoopStateEffectMode.OPAQUE
+    # Compile-time row policy. ``unique`` means set/dict-style key dedup,
+    # ``duplicates`` means list-style insertion, and ``None`` remains an
+    # explicit lowering shortfall until source storage establishes the policy.
+    sequence_policy: str | None = None
+    argument_kind: str = "value"
+
+    def __post_init__(self) -> None:
+        if self.sequence_policy not in {None, "unique", "duplicates"}:
+            raise ValueError("unknown SSA sequence mutation policy")
 
 
 @dataclass(frozen=True)

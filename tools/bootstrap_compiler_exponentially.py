@@ -1,0 +1,1293 @@
+"""Bootstrap the compiler through joined, fresh-process generations.
+
+Each generation compiles one automatically selected compiler source catalogue.
+Its bounded workers all terminate before the generation publishes a result.
+The supervisor then starts a fresh Python process, which loads the newly
+published verified-product registry before compiling the next catalogue. A
+timed-out unit is not immediately repeated by the subdivision crawler.  Once
+the bounded wave has done the configured minimum amount of work, that unit is
+retried alone, without a time ceiling but with the same memory ceiling, in the
+next fresh process.  It is retried again only after the registry advances.  A
+complete deterministic sweep with no registry, verified-region, or normalized
+frontier change is the terminal fixed point.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import traceback
+from typing import Any, Sequence
+
+from src.compiler.project_compilation_product import (
+    DEFAULT_PROJECT_EXTRACTION_CONTRACT,
+    NativeInstallationRequiredError,
+    compile_project_bootstrap_creep,
+    discover_authored_calls,
+    authored_call_dependencies,
+)
+
+
+STATE_SCHEMA = "turing.exponential-compiler-bootstrap-state.v2"
+LEGACY_STATE_SCHEMA = "turing.exponential-compiler-bootstrap-state.v1"
+WAVE_SCHEMA = "turing.exponential-compiler-bootstrap-wave.v1"
+COMPILER_USAGE_TRACE_ROOT_ENV = "TURING_COMPILER_USAGE_TRACE_ROOT"
+
+
+def _compiler_implementation_sha256() -> str:
+    """Fingerprint the implementation which decided a compiler-unit result."""
+
+    repository = Path(__file__).resolve().parents[1]
+    paths = [
+        *sorted((repository / "src" / "compiler").rglob("*.py")),
+        # Source graph construction and lexical reduction are part of the
+        # compiler implementation even though they live below ``common``.
+        *sorted((repository / "src" / "common" / "tensors").rglob("*.py")),
+        *sorted((repository / "src" / "transmogrifier").rglob("*.py")),
+        repository / "tools" / "compile_project_catalogue.py",
+        Path(__file__).resolve(),
+    ]
+    digest = hashlib.sha256()
+    for path in paths:
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        digest.update(path.relative_to(repository).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True),
+        encoding="utf-8", newline="\n",
+    )
+    os.replace(temporary, path)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _unused_wave_root(root: Path, generation: int) -> Path:
+    """Preserve an interrupted generation and select a fresh attempt path."""
+
+    base = root / "waves" / f"generation_{generation:05d}"
+    if not base.exists():
+        return base
+    attempt = 1
+    while True:
+        candidate = root / "waves" / (
+            f"generation_{generation:05d}_attempt_{attempt:03d}"
+        )
+        if not candidate.exists():
+            return candidate
+        attempt += 1
+
+
+def _compiler_usage_records(root: Path) -> list[dict[str, Any]]:
+    """Merge per-process usage traces without confusing parallel workers."""
+
+    merged: dict[tuple[str, str], list[float]] = {}
+    for path in sorted(root.rglob("compiler-usage.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            continue
+        if payload.get("schema") != "turing.compiler-usage-trace.v1":
+            continue
+        for record in payload.get("records") or ():
+            key = (
+                str(record.get("source") or ""),
+                str(record.get("qualified_name") or ""),
+            )
+            if not all(key):
+                continue
+            target = merged.setdefault(key, [0.0, 0.0])
+            target[0] += int(record.get("call_count") or 0)
+            target[1] += float(record.get("inclusive_seconds") or 0.0)
+    return [{
+        "source": key[0],
+        "qualified_name": key[1],
+        "call_count": int(values[0]),
+        "inclusive_seconds": float(values[1]),
+    } for key, values in sorted(merged.items())]
+
+
+def _deepest_first_failure(
+    result_path: Path,
+    result: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Select the deepest dependency failure, then its first unit order."""
+
+    candidates = []
+    product = Path(str(result.get("product") or ""))
+    if not product.is_absolute():
+        product = (result_path.parent / product).resolve()
+    if product.is_dir():
+        for path in sorted(product.rglob("failure.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError):
+                continue
+            if payload.get("status") != "failed":
+                continue
+            names = tuple(map(str,
+                payload.get("qualified_names")
+                or ([payload["qualified_name"]] if payload.get("qualified_name") else [])
+            ))
+            candidates.append({
+                "qualified_names": list(names),
+                "error_type": str(payload.get("error_type") or "Failure"),
+                "error": str(payload.get("error") or "compiler unit failed"),
+                "unit_index": int(payload.get("unit_index") or 0),
+                "artifact": path.resolve().as_posix(),
+                "artifact_depth": len(path.relative_to(product).parts),
+            })
+    candidates.sort(key=lambda record: (
+        -int(record["artifact_depth"]),
+        int(record["unit_index"]),
+        str(record["artifact"]),
+    ))
+    surface = [dict(record) for record in result.get("failures") or ()]
+    if candidates:
+        return candidates[0], [*candidates, *surface]
+    if surface:
+        first = dict(surface[0])
+        names = (
+            list(map(str, first.get("qualified_names") or ()))
+            or ([str(first["qualified_name"])] if first.get("qualified_name") else [])
+        )
+        chief = {
+            "qualified_names": names,
+            "error_type": str(first.get("error_type") or "Failure"),
+            "error": str(first.get("reason") or first.get("error") or "compiler unit failed"),
+            "artifact": result_path.resolve().as_posix(),
+            "artifact_depth": 0,
+        }
+        return chief, surface
+    return None, []
+
+
+def prioritize_compiler_work_batches(
+    records: Sequence[dict[str, Any]],
+    usage_records: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Order hot observed work first behind only its real prerequisites."""
+
+    usage = {
+        (str(item["source"]), str(item["qualified_name"])): (
+            float(item.get("inclusive_seconds") or 0.0),
+            int(item.get("call_count") or 0),
+        )
+        for item in usage_records
+    }
+    by_identity = {
+        (str(record["source"]), int(record.get("batch_index") or 0)): record
+        for record in records
+    }
+    dependencies = {}
+    for identity, record in by_identity.items():
+        declared = record.get("dependency_batch_indices")
+        indices = (
+            tuple(range(identity[1]))
+            if declared is None else tuple(map(int, declared))
+        )
+        dependencies[identity] = {
+            (identity[0], index)
+            for index in indices
+            if (identity[0], index) in by_identity
+        }
+    dependents = {identity: set() for identity in by_identity}
+    for identity, required in dependencies.items():
+        for prerequisite in required:
+            dependents[prerequisite].add(identity)
+    direct_usage = {}
+    for identity, record in by_identity.items():
+        observed = [
+            usage.get((str(record["source"]), str(name)), (0.0, 0))
+            for name in record.get("entries") or ()
+        ]
+        direct_usage[identity] = (
+            sum(item[0] for item in observed),
+            sum(item[1] for item in observed),
+        )
+
+    downstream_cache = {}
+
+    def downstream_usage(identity):
+        cached = downstream_cache.get(identity)
+        if cached is not None:
+            return cached
+        descendants = {identity}
+        pending = list(dependents[identity])
+        while pending:
+            candidate = pending.pop()
+            if candidate in descendants:
+                continue
+            descendants.add(candidate)
+            pending.extend(dependents[candidate])
+        result = (
+            sum(direct_usage[item][0] for item in descendants),
+            sum(direct_usage[item][1] for item in descendants),
+        )
+        downstream_cache[identity] = result
+        return result
+
+    ordered = []
+    emitted = set()
+    pending = set(by_identity)
+    while pending:
+        ready = [
+            identity for identity in pending
+            if dependencies[identity] <= emitted
+        ]
+        candidates = ready or list(pending)
+
+        def priority(identity):
+            record = by_identity[identity]
+            seconds, calls = downstream_usage(identity)
+            return (
+                0 if calls else 1,
+                -seconds,
+                -calls,
+                int(record.get("estimated_authored_bytes") or 0),
+                int(record.get("estimated_ast_nodes") or 0),
+                str(record["source"]),
+                int(record.get("batch_index") or 0),
+            )
+
+        selected = min(candidates, key=priority)
+        ordered.append(by_identity[selected])
+        pending.remove(selected)
+        emitted.add(selected)
+    return ordered
+
+
+def discover_compiler_catalogues(source_root: str | Path) -> list[dict[str, Any]]:
+    """Discover nonempty authored-call catalogues in deterministic cheap-first order."""
+
+    root = Path(source_root).resolve()
+    records = []
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+            calls = discover_authored_calls(source)
+        except (OSError, SyntaxError, UnicodeError):
+            continue
+        if not calls:
+            continue
+        records.append({
+            "source": path.as_posix(),
+            "source_sha256": _sha256(path),
+            "source_bytes": len(source.encode("utf-8")),
+            "authored_call_count": len(calls),
+            "attempts": 0,
+            "last_outcome_sha256": None,
+            "last_outcomes": {},
+            "seed_product": None,
+            "pending_deep_retry": [],
+            "deep_retry_attempted": False,
+            "last_deep_retry_registry_sha256": None,
+        })
+    records.sort(key=lambda record: (
+        int(record["source_bytes"]),
+        int(record["authored_call_count"]),
+        str(record["source"]),
+    ))
+    return records
+
+
+def _authored_call_weights(source: str) -> dict[str, tuple[int, int]]:
+    """Estimate exact authored-body size without compiling or partitioning it."""
+
+    indexed: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+
+    def add_function(node, qualified_name: str) -> None:
+        indexed[qualified_name] = node
+        for statement in node.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                add_function(
+                    statement,
+                    f"{qualified_name}.<locals>.{statement.name}",
+                )
+
+    for statement in ast.parse(source).body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            add_function(statement, statement.name)
+        elif isinstance(statement, ast.ClassDef):
+            for member in statement.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    add_function(member, f"{statement.name}.{member.name}")
+    lines = source.splitlines(keepends=True)
+    return {
+        name: (
+            sum(len(line.encode("utf-8")) for line in lines[
+                int(node.lineno) - 1:int(node.end_lineno)
+            ]),
+            sum(1 for _child in ast.walk(node)),
+        )
+        for name, node in indexed.items()
+    }
+
+
+def discover_compiler_work_batches(
+    source_root: str | Path, *, batch_size: int,
+) -> list[dict[str, Any]]:
+    """Build deterministic dependency-first, smallest-ready compiler batches."""
+
+    width = int(batch_size)
+    if width < 1:
+        raise ValueError("compiler work batch size must be positive")
+    per_source = []
+    root = Path(source_root).resolve()
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+            calls = discover_authored_calls(source)
+            if not calls:
+                continue
+            weights = _authored_call_weights(source)
+            names = tuple(call.qualified_name for call in calls)
+            dependencies = authored_call_dependencies(source, names)
+        except (OSError, SyntaxError, UnicodeError):
+            continue
+        remaining = set(names)
+        emitted: set[str] = set()
+        ordered = []
+        while remaining:
+            ready = [
+                name for name in remaining
+                if set(dependencies.get(name, ())) <= emitted
+            ]
+            # A recursive SCC has no ready member; the project worker retains
+            # the exact authored cycle, so select its smallest stable member.
+            candidates = ready or list(remaining)
+            selected = min(candidates, key=lambda name: (
+                *weights.get(name, (len(source.encode("utf-8")), 0)), name,
+            ))
+            ordered.append(selected)
+            emitted.add(selected)
+            remaining.remove(selected)
+        batches = [
+            tuple(ordered[offset:offset + width])
+            for offset in range(0, len(ordered), width)
+        ]
+        batch_index_by_name = {
+            name: batch_index
+            for batch_index, entries in enumerate(batches)
+            for name in entries
+        }
+        per_source.append((
+            min(weights.get(name, (len(source.encode("utf-8")), 0)) for name in names),
+            path,
+            source,
+            weights,
+            batches,
+        ))
+    source_batches = []
+    for _minimum, path, source, weights, batches in per_source:
+        source_digest = _sha256(path)
+        batch_records = []
+        for batch_index, entries in enumerate(batches):
+            batch_records.append({
+                "source": path.as_posix(),
+                "source_sha256": source_digest,
+                "source_bytes": len(source.encode("utf-8")),
+                "entries": list(entries),
+                "batch_index": batch_index,
+                "dependency_batch_indices": sorted({
+                    batch_index_by_name[dependency]
+                    for name in entries
+                    for dependency in dependencies.get(name, ())
+                    if batch_index_by_name[dependency] != batch_index
+                }),
+                "authored_call_count": len(entries),
+                "estimated_authored_bytes": sum(weights[name][0] for name in entries),
+                "estimated_ast_nodes": sum(weights[name][1] for name in entries),
+                "attempts": 0,
+                "last_outcome_sha256": None,
+                "last_outcomes": {},
+                "seed_product": None,
+                "pending_deep_retry": [],
+                "deep_retry_attempted": False,
+                "last_deep_retry_registry_sha256": None,
+            })
+        source_batches.append(batch_records)
+    return prioritize_compiler_work_batches(
+        [record for batch_records in source_batches for record in batch_records],
+        (),
+    )
+
+
+def _normalized_outcome(manifest: dict[str, Any]) -> dict[str, Any]:
+    rounds = list(manifest.get("rounds") or ())
+    final = dict(rounds[-1]) if rounds else {}
+    frontier = []
+    for raw in final.get("creep_frontier") or ():
+        record = dict(raw)
+        frontier.append({
+            key: record.get(key)
+            for key in (
+                "qualified_name", "status", "action", "error_type",
+                "control_frontier_action", "unresolved_call_count",
+                "unmaterialized_extraction_boundaries",
+            )
+            if key in record
+        })
+    native_frontier = [{
+        "qualified_name": str(record.get("qualified_name") or ""),
+        "status": str(record.get("status") or ""),
+        "reason": str(record.get("reason") or ""),
+    } for record in final.get("native_verification_frontier") or ()]
+    subdivisions = [{
+        "qualified_name": str(record.get("qualified_name") or ""),
+        "status": str(record.get("status") or ""),
+        "verified_product_count": int(
+            record.get("verified_product_count") or 0
+        ),
+        "fixed_point_count": int(record.get("fixed_point_count") or 0),
+    } for record in final.get("process_graph_creeps") or ()]
+    return {
+        "status": str(manifest.get("status") or ""),
+        "installed_qualified_names": sorted(map(
+            str, manifest.get("installed_qualified_names") or (),
+        )),
+        "installed_source_regions": sorted(
+            tuple(map(str, chain))
+            for chain in manifest.get("installed_source_regions") or ()
+        ),
+        "unit_counts": dict(sorted(
+            dict(final.get("unit_counts") or {}).items()
+        )),
+        "creep_frontier": frontier,
+        "native_verification_frontier": native_frontier,
+        "process_graph_creeps": subdivisions,
+    }
+
+
+def _outcome_sha256(manifest: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(
+        _normalized_outcome(manifest),
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _wave_worker(arguments: argparse.Namespace) -> int:
+    from src.compiler.compiler_bootstrap_runtime import (
+        activate_registered_compiler_bootstraps,
+        compiler_bootstrap_registry_path,
+    )
+
+    wave_root = arguments.output.resolve()
+    wave_root.mkdir(parents=True, exist_ok=True)
+    registry = compiler_bootstrap_registry_path()
+    registry_before = _sha256(registry) if registry.is_file() else None
+    activations = activate_registered_compiler_bootstraps()
+    active_products = tuple(dict.fromkeys(
+        Path(activation.product).resolve() for activation in activations
+    ))
+    started = time.perf_counter()
+    try:
+        manifest = compile_project_bootstrap_creep(
+            arguments.source,
+            wave_root / "product",
+            entries=arguments.entry or None,
+            expand_entry_dependencies=False,
+            jobs=arguments.jobs,
+            max_total_resident_bytes=(
+                None if arguments.max_total_gb is None
+                else int(arguments.max_total_gb * 1024 ** 3)
+            ),
+            worker_resident_reservation_bytes=int(
+                arguments.worker_reserve_gb * 1024 ** 3
+            ),
+            max_worker_memory_bytes=(
+                None if arguments.max_worker_gb == 0
+                else int(arguments.max_worker_gb * 1024 ** 3)
+            ),
+            unit_timeout_seconds=(
+                None if arguments.unit_timeout_seconds == 0
+                else arguments.unit_timeout_seconds
+            ),
+            extraction_contract=arguments.extraction_contract,
+            bootstrap_products=active_products,
+            seed_product=arguments.seed_product,
+            crawl_timed_out_units=False,
+            max_rounds=1,
+            progress=lambda event: print(
+                json.dumps(event, sort_keys=True), flush=True,
+            ),
+        )
+        registry_after = _sha256(registry) if registry.is_file() else None
+        round_manifest_path = (
+            wave_root / "product" / "round_000" / "manifest.json"
+        )
+        round_manifest = (
+            json.loads(round_manifest_path.read_text(encoding="utf-8"))
+            if round_manifest_path.is_file() else {}
+        )
+        timed_out_entries = sorted({
+            str(unit.get("qualified_name") or "")
+            for unit in round_manifest.get("units") or ()
+            if unit.get("error_type") == "ResourceLimitExceeded"
+            and "elapsed time" in str(unit.get("error") or "")
+            and unit.get("qualified_name")
+        })
+        terminal_timed_out_entries = sorted({
+            str(record.get("qualified_name") or "")
+            for round_record in manifest.get("rounds") or ()
+            for record in round_record.get("process_graph_creeps") or ()
+            if record.get("status") == "deferred-timeout-retry"
+            and record.get("qualified_name")
+        })
+        result = {
+            "schema": WAVE_SCHEMA,
+            "status": "complete",
+            "generation": int(arguments.generation),
+            "process_id": os.getpid(),
+            "source": arguments.source.resolve().as_posix(),
+            "source_sha256": _sha256(arguments.source.resolve()),
+            "compiler_implementation_sha256": _compiler_implementation_sha256(),
+            "entries": list(arguments.entry),
+            "workers_joined": True,
+            "mode": "deep-retry" if arguments.deep_retry else "bounded",
+            "elapsed_seconds": time.perf_counter() - started,
+            "registry_before_sha256": registry_before,
+            "registry_after_sha256": registry_after,
+            "registry_changed": registry_before != registry_after,
+            "active_products": [path.as_posix() for path in active_products],
+            "product": (wave_root / "product").as_posix(),
+            "seed_product": (
+                wave_root / "product" / "round_000"
+            ).as_posix(),
+            "timed_out_entries": timed_out_entries,
+            "terminal_timed_out_entries": terminal_timed_out_entries,
+            "outcome": _normalized_outcome(manifest),
+            "outcome_sha256": _outcome_sha256(manifest),
+        }
+    except Exception as error:
+        result = {
+            "schema": WAVE_SCHEMA,
+            "status": "failed",
+            "generation": int(arguments.generation),
+            "process_id": os.getpid(),
+            "source": arguments.source.resolve().as_posix(),
+            "source_sha256": _sha256(arguments.source.resolve()),
+            "compiler_implementation_sha256": _compiler_implementation_sha256(),
+            "entries": list(arguments.entry),
+            "workers_joined": True,
+            "mode": "deep-retry" if arguments.deep_retry else "bounded",
+            "elapsed_seconds": time.perf_counter() - started,
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "traceback": traceback.format_exc(),
+            "registry_before_sha256": registry_before,
+            # A failed wave is terminal.  Recoverable subdivision and resource
+            # deferral must be represented explicitly as partial/deferred
+            # outcomes, never smuggled through a generic failure receipt.
+            "hard_failure": True,
+            **({
+                "failures": [dict(failure) for failure in error.failures],
+            } if isinstance(error, NativeInstallationRequiredError) else {}),
+        }
+        chief_failure, failure_chain = _deepest_first_failure(
+            wave_root / "wave-result.json", result,
+        )
+        if chief_failure is not None:
+            result["chief_failure"] = chief_failure
+            result["failure_chain"] = failure_chain
+    usage_records = _compiler_usage_records(wave_root)
+    if usage_records:
+        result["compiler_usage"] = usage_records
+    _atomic_json(wave_root / "wave-result.json", result)
+    if result.get("chief_failure"):
+        print(json.dumps({
+            "stage": "chief_failure",
+            **dict(result["chief_failure"]),
+            "enclosing_failure_count": max(
+                0, len(result.get("failure_chain") or ()) - 1,
+            ),
+        }, sort_keys=True), flush=True)
+    print(json.dumps({
+        "stage": "generation_exit",
+        **{key: result.get(key) for key in (
+            "generation", "process_id", "source", "status",
+            "workers_joined", "registry_changed", "outcome_sha256", "mode",
+        )},
+    }, sort_keys=True), flush=True)
+    return 0 if result["status"] == "complete" else 1
+
+
+def _initial_state(arguments: argparse.Namespace) -> dict[str, Any]:
+    sources = discover_compiler_work_batches(
+        arguments.source_root, batch_size=arguments.jobs,
+    )
+    if not sources:
+        raise ValueError(
+            f"no authored compiler catalogues beneath {arguments.source_root}"
+        )
+    return {
+        "schema": STATE_SCHEMA,
+        "status": "running",
+        "source_root": arguments.source_root.resolve().as_posix(),
+        "generation": 0,
+        "sweep": 0,
+        "cursor": 0,
+        "batch_size": int(arguments.jobs),
+        "sweep_progress": False,
+        "sources": sources,
+        "waves": [],
+    }
+
+
+def _migrate_legacy_state(
+    state: dict[str, Any], arguments: argparse.Namespace,
+) -> dict[str, Any]:
+    """Expand v1 file-wide work into v2 call batches without losing evidence."""
+
+    legacy_by_source = {
+        str(record.get("source") or ""): dict(record)
+        for record in state.get("sources") or ()
+    }
+    sources = discover_compiler_work_batches(
+        arguments.source_root, batch_size=arguments.jobs,
+    )
+    for record in sources:
+        legacy = legacy_by_source.get(str(record["source"]))
+        if legacy is not None and legacy.get("seed_product"):
+            record["seed_product"] = str(legacy["seed_product"])
+    return {
+        **state,
+        "schema": STATE_SCHEMA,
+        "status": "running",
+        "cursor": 0,
+        "batch_size": int(arguments.jobs),
+        "sweep_progress": False,
+        "sources": sources,
+        "migration": {
+            "from": LEGACY_STATE_SCHEMA,
+            "kind": "deterministic-authored-call-batches",
+            "preserved_wave_count": len(state.get("waves") or ()),
+        },
+    }
+
+
+def _changed_catalogue_source(state: dict[str, Any]) -> Path | None:
+    """Return the first deterministically ordered source changed on disk."""
+
+    expected = {}
+    for record in state.get("sources") or ():
+        expected.setdefault(
+            str(record.get("source") or ""),
+            str(record.get("source_sha256") or ""),
+        )
+    for raw_path, expected_digest in sorted(expected.items()):
+        path = Path(raw_path).resolve()
+        if not path.is_file() or _sha256(path) != expected_digest:
+            return path
+    return None
+
+
+def _retire_usage_priority(
+    state: dict[str, Any], *, changed_source: Path, generation: int,
+) -> None:
+    usage = state.pop("compiler_usage", None)
+    if usage is not None:
+        state.setdefault("compiler_usage_history", []).append({
+            **dict(usage),
+            "retired_generation": int(generation),
+            "changed_source": changed_source.as_posix(),
+        })
+
+
+def _prioritize_failed_work(
+    records: Sequence[dict[str, Any]], failure: dict[str, Any],
+) -> list[dict[str, Any]]:
+    source = str(failure.get("source") or "")
+    entries = tuple(map(str, failure.get("entries") or ()))
+    if not source or not entries:
+        return list(records)
+    # Feed the failed batch through the ordinary dependency-aware scheduler.
+    # Its real prerequisites stay ahead of it; unrelated work moves behind it.
+    return prioritize_compiler_work_batches(records, [{
+        "source": source,
+        "qualified_name": name,
+        "call_count": 10 ** 18,
+        "inclusive_seconds": 10 ** 18,
+    } for name in entries])
+
+
+def _archived_failed_wave(
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the oldest unresolved archive carrying explicit failure."""
+
+    archives = []
+    for wave in sorted(
+        state.get("waves") or (),
+        key=lambda item: int(item.get("generation") or 0),
+    ):
+        source = Path(str(wave.get("source") or "")).resolve()
+        result_path = Path(str(wave.get("result") or "")).resolve()
+        result = (
+            json.loads(result_path.read_text(encoding="utf-8"))
+            if result_path.is_file() else {}
+        )
+        archived_digest = str(result.get("source_sha256") or "")
+        archived_implementation = str(
+            result.get("compiler_implementation_sha256") or ""
+        )
+        if (
+            not source.is_file()
+            or (archived_digest and _sha256(source) != archived_digest)
+            # A legacy receipt has no compiler provenance, so it cannot prove
+            # a lowering failure still applies after compiler code changed.
+            or not archived_implementation
+            or archived_implementation != _compiler_implementation_sha256()
+        ):
+            # A source revision supersedes that archived outcome.  The normal
+            # catalogue refresh will schedule the revised work independently.
+            continue
+        outcome = dict(result.get("outcome") or {})
+        explicit_records = tuple(
+            dict(record) for record in (
+                *(outcome.get("creep_frontier") or ()),
+                *(outcome.get("native_verification_frontier") or ()),
+                *(result.get("failures") or ()),
+            )
+            if str(record.get("status") or "") in {"failed", "unsupported"}
+        )
+        explicit_entries = tuple(dict.fromkeys(
+            str(record.get("qualified_name") or "")
+            for record in explicit_records
+            if record.get("qualified_name")
+        ))
+        entries = explicit_entries or tuple(
+            map(str, result.get("entries") or ())
+        )
+        installed = set(map(
+            str, outcome.get("installed_qualified_names") or (),
+        ))
+        unit_counts = dict(outcome.get("unit_counts") or {})
+        explicitly_failed = bool(
+            result.get("status") == "failed"
+            or wave.get("status") in {"failed", "hard-failed"}
+            or int(unit_counts.get("failed") or 0)
+            or explicit_records
+        )
+        succeeded = bool(
+            result.get("status") == "complete"
+            and outcome.get("status") == "sealed"
+            and not outcome.get("creep_frontier")
+            and not outcome.get("native_verification_frontier")
+            and not int(unit_counts.get("failed") or 0)
+            and not int(unit_counts.get("partial") or 0)
+            and set(entries) <= installed
+        )
+        failures = list(explicit_records)
+        if explicitly_failed and not failures:
+            failures = [{
+                "qualified_name": name,
+                "status": "failed",
+                "reason": str(
+                    result.get("error") or "archived compiler item failed"
+                ),
+            } for name in entries]
+        chief_failure, failure_chain = _deepest_first_failure(
+            result_path, {**result, "failures": failures},
+        )
+        if chief_failure is not None and chief_failure.get("qualified_names"):
+            entries = tuple(map(str, chief_failure["qualified_names"]))
+        archives.append({
+            "source": source.as_posix(),
+            "entries": list(entries),
+            "installed": sorted(installed),
+            "succeeded": succeeded,
+            "explicitly_failed": explicitly_failed,
+            "error_type": "ArchivedBootstrapItemFailure",
+            "error": (
+                "oldest current-source archived compiler item explicitly failed"
+            ),
+            "failures": failures,
+            "chief_failure": chief_failure,
+            "failure_chain": failure_chain,
+            "archive_generation": int(wave.get("generation") or 0),
+            "result": result_path.as_posix(),
+        })
+    for position, archive in enumerate(archives):
+        if not archive["explicitly_failed"]:
+            continue
+        required = set(archive["entries"])
+        superseded = any(
+            later["succeeded"]
+            and later["source"] == archive["source"]
+            and required <= set(later["installed"])
+            for later in archives[position + 1:]
+        )
+        if superseded:
+            continue
+        return {
+            key: value for key, value in archive.items()
+            if key not in {"installed", "succeeded", "explicitly_failed"}
+        }
+    return None
+
+
+def _supervise(arguments: argparse.Namespace) -> int:
+    root = arguments.output.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    state_path = root / "bootstrap-state.json"
+    lock_path = root / "supervisor.lock"
+    try:
+        descriptor = os.open(
+            lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        )
+    except FileExistsError as error:
+        raise RuntimeError(
+            f"another exponential bootstrap owns {lock_path}"
+        ) from error
+    os.close(descriptor)
+    try:
+        state = (
+            json.loads(state_path.read_text(encoding="utf-8"))
+            if state_path.is_file() else _initial_state(arguments)
+        )
+        if state.get("schema") == LEGACY_STATE_SCHEMA:
+            state = _migrate_legacy_state(state, arguments)
+            _atomic_json(state_path, state)
+        if state.get("schema") != STATE_SCHEMA:
+            raise ValueError("unsupported exponential bootstrap state schema")
+        archived_failure = _archived_failed_wave(state)
+        if state.get("status") != "hard-failed":
+            if archived_failure is not None:
+                state["sources"] = _prioritize_failed_work(
+                    state["sources"], archived_failure,
+                )
+                state["cursor"] = 0
+                state["status"] = "hard-failed"
+                state["hard_failure"] = archived_failure
+                _atomic_json(state_path, state)
+                if archived_failure.get("chief_failure"):
+                    print(json.dumps({
+                        "stage": "chief_failure",
+                        **dict(archived_failure["chief_failure"]),
+                        "archive_generation": archived_failure[
+                            "archive_generation"
+                        ],
+                        "enclosing_failure_count": max(
+                            0,
+                            len(archived_failure.get("failure_chain") or ()) - 1,
+                        ),
+                    }, sort_keys=True), flush=True)
+                print(json.dumps({
+                    "stage": "archived_failure_detected",
+                    **archived_failure,
+                    "priority_entries": [
+                        list(record.get("entries") or ())
+                        for record in state["sources"][:3]
+                    ],
+                }, sort_keys=True), flush=True)
+        elif archived_failure is None:
+            # The archived cause belonged to a different compiler revision
+            # (or predates compiler provenance).  It must be retried, not held
+            # forever as a failure of unchanged authored source.
+            prior_failure = dict(state.get("hard_failure") or {})
+            state.setdefault("resolved_hard_failures", []).append({
+                **prior_failure,
+                "resolved_by_compiler_revision": _compiler_implementation_sha256(),
+                "resume_generation": int(state["generation"]),
+            })
+            state.pop("hard_failure", None)
+            state["status"] = "running"
+            state["cursor"] = 0
+            state["sweep_progress"] = True
+            state["catalogue_refresh"] = {
+                "generation": int(state["generation"]),
+                "reason": "hard-failure-compiler-revised",
+            }
+            _atomic_json(state_path, state)
+            print(json.dumps({
+                "stage": "hard_failure_resume",
+                **state["catalogue_refresh"],
+                "batch_count": len(state["sources"]),
+            }, sort_keys=True), flush=True)
+        if state.get("status") == "hard-failed":
+            changed_source = _changed_catalogue_source(state)
+            if changed_source is not None:
+                _retire_usage_priority(
+                    state,
+                    changed_source=changed_source,
+                    generation=int(state["generation"]),
+                )
+                prior_failure = dict(state.get("hard_failure") or {})
+                state.setdefault("resolved_hard_failures", []).append({
+                    **prior_failure,
+                    "resolved_by_source_change": changed_source.as_posix(),
+                    "resume_generation": int(state["generation"]),
+                })
+                state.pop("hard_failure", None)
+                state["sources"] = _prioritize_failed_work(
+                    discover_compiler_work_batches(
+                        arguments.source_root, batch_size=arguments.jobs,
+                    ), prior_failure,
+                )
+                state["status"] = "running"
+                state["cursor"] = 0
+                state["batch_size"] = int(arguments.jobs)
+                state["sweep_progress"] = True
+                state["catalogue_refresh"] = {
+                    "generation": int(state["generation"]),
+                    "changed_source": changed_source.as_posix(),
+                    "reason": "hard-failure-source-revised",
+                }
+                _atomic_json(state_path, state)
+                print(json.dumps({
+                    "stage": "hard_failure_resume",
+                    **state["catalogue_refresh"],
+                    "batch_count": len(state["sources"]),
+                }, sort_keys=True), flush=True)
+        while (
+            state["status"] == "running"
+            and int(state["generation"]) < int(arguments.max_generations)
+            and int(state["sweep"]) < int(arguments.max_sweeps)
+        ):
+            changed_source = _changed_catalogue_source(state)
+            if changed_source is not None:
+                _retire_usage_priority(
+                    state,
+                    changed_source=changed_source,
+                    generation=int(state["generation"]),
+                )
+                state["sources"] = discover_compiler_work_batches(
+                    arguments.source_root, batch_size=arguments.jobs,
+                )
+                state["cursor"] = 0
+                state["batch_size"] = int(arguments.jobs)
+                state["sweep_progress"] = True
+                state["catalogue_refresh"] = {
+                    "generation": int(state["generation"]),
+                    "changed_source": changed_source.as_posix(),
+                    "reason": "authored-source-sha256-changed",
+                }
+                _atomic_json(state_path, state)
+                print(json.dumps({
+                    "stage": "catalogue_refresh",
+                    **state["catalogue_refresh"],
+                    "batch_count": len(state["sources"]),
+                }, sort_keys=True), flush=True)
+                continue
+            sources = state["sources"]
+            cursor = int(state["cursor"])
+            source_record = sources[cursor]
+            source = Path(str(source_record["source"])).resolve()
+            current_source_hash = _sha256(source)
+            if current_source_hash != str(source_record["source_sha256"]):
+                raise RuntimeError(
+                    "compiler catalogue changed after its generation-boundary "
+                    f"revision check: {source}"
+                )
+            generation = int(state["generation"])
+            wave_root = _unused_wave_root(root, generation)
+            command = [
+                str(sys.executable), "-m",
+                "tools.bootstrap_compiler_exponentially",
+                "--wave-worker",
+                "--generation", str(generation),
+                "--source", str(source),
+                "--output", str(wave_root),
+                "--jobs", str(arguments.jobs),
+                "--worker-reserve-gb", str(arguments.worker_reserve_gb),
+                "--max-worker-gb", str(arguments.max_worker_gb),
+                "--unit-timeout-seconds", str(arguments.unit_timeout_seconds),
+                "--extraction-contract", str(arguments.extraction_contract),
+            ]
+            if arguments.max_total_gb is not None:
+                command.extend(("--max-total-gb", str(arguments.max_total_gb)))
+            if source_record.get("seed_product"):
+                command.extend((
+                    "--seed-product", str(source_record["seed_product"]),
+                ))
+            pending_deep_retry = tuple(map(
+                str, source_record.get("pending_deep_retry") or (),
+            ))
+            mode = "deep-retry" if pending_deep_retry else "bounded"
+            selected_entries = (
+                pending_deep_retry if pending_deep_retry else
+                tuple(map(str, source_record.get("entries") or ()))
+            )
+            if pending_deep_retry:
+                timeout_index = command.index("--unit-timeout-seconds") + 1
+                command[timeout_index] = "0"
+                command.append("--deep-retry")
+            for qualified_name in selected_entries:
+                command.extend(("--entry", qualified_name))
+            print(json.dumps({
+                "stage": "generation_start",
+                "generation": generation,
+                "sweep": int(state["sweep"]),
+                "source_index": cursor,
+                "source_count": len(sources),
+                "source": source.as_posix(),
+                "entries": list(selected_entries),
+                "mode": mode,
+            }, sort_keys=True), flush=True)
+            completed = subprocess.run(
+                command,
+                cwd=Path(__file__).resolve().parents[1],
+                check=False,
+                env={
+                    **os.environ,
+                    **({
+                        COMPILER_USAGE_TRACE_ROOT_ENV: str(
+                            arguments.source_root.resolve()
+                        ),
+                    } if not state.get("compiler_usage") else {}),
+                },
+            )
+            result_path = wave_root / "wave-result.json"
+            result = (
+                json.loads(result_path.read_text(encoding="utf-8"))
+                if result_path.is_file() else {
+                    "schema": WAVE_SCHEMA,
+                    "status": "failed",
+                    "generation": generation,
+                    "source": source.as_posix(),
+                    "workers_joined": True,
+                    "error_type": "WorkerExit",
+                    "error": f"generation exited with {completed.returncode}",
+                }
+            )
+            if (
+                result.get("hard_failure")
+                or result.get("status") != "complete"
+            ):
+                state["waves"].append({
+                    "generation": generation,
+                    "source": source.as_posix(),
+                    "status": "hard-failed",
+                    "process_id": result.get("process_id"),
+                    "workers_joined": bool(result.get("workers_joined")),
+                    "progressed": False,
+                    "registry_changed": False,
+                    "outcome_sha256": None,
+                    "mode": mode,
+                    "scheduled_deep_retry": False,
+                    "result": result_path.as_posix(),
+                })
+                state["generation"] = generation + 1
+                state["status"] = "hard-failed"
+                state["hard_failure"] = {
+                    "source": source.as_posix(),
+                    "entries": list(selected_entries),
+                    "error_type": result.get("error_type"),
+                    "error": result.get("error"),
+                    "failures": list(result.get("failures") or ()),
+                    "chief_failure": result.get("chief_failure"),
+                    "failure_chain": list(result.get("failure_chain") or ()),
+                    "result": result_path.as_posix(),
+                }
+                _atomic_json(state_path, state)
+                break
+            usage_records = list(result.get("compiler_usage") or ())
+            if usage_records and not state.get("compiler_usage"):
+                state["compiler_usage"] = {
+                    "schema": "turing.compiler-bootstrap-usage-priority.v1",
+                    "generation": generation,
+                    "records": usage_records,
+                }
+                completed_prefix = list(state["sources"][:cursor + 1])
+                pending = prioritize_compiler_work_batches(
+                    state["sources"][cursor + 1:], usage_records,
+                )
+                state["sources"] = [*completed_prefix, *pending]
+                sources = state["sources"]
+                source_record = sources[cursor]
+                _atomic_json(state_path, state)
+                print(json.dumps({
+                    "stage": "compiler_usage_priority",
+                    "generation": generation,
+                    "observed_callables": len(usage_records),
+                    "pending_batches": len(pending),
+                    "next_entries": (
+                        list(pending[0].get("entries") or ()) if pending else []
+                    ),
+                }, sort_keys=True), flush=True)
+            last_outcomes = dict(source_record.get("last_outcomes") or {})
+            previous_outcome = last_outcomes.get(mode)
+            current_outcome = result.get("outcome_sha256")
+            progressed = bool(
+                result.get("registry_changed")
+                or (
+                    current_outcome is not None
+                    and current_outcome != previous_outcome
+                )
+            )
+            state["sweep_progress"] = bool(
+                state.get("sweep_progress") or progressed
+            )
+            source_record["attempts"] = int(source_record.get("attempts") or 0) + 1
+            if current_outcome is not None:
+                source_record["last_outcome_sha256"] = str(current_outcome)
+                last_outcomes[mode] = str(current_outcome)
+                source_record["last_outcomes"] = last_outcomes
+            if result.get("seed_product"):
+                source_record["seed_product"] = str(result["seed_product"])
+            scheduled_deep_retry = False
+            if mode == "deep-retry":
+                source_record["pending_deep_retry"] = []
+                source_record["deep_retry_attempted"] = True
+                source_record["last_deep_retry_registry_sha256"] = (
+                    result.get("registry_before_sha256")
+                )
+            else:
+                timed_out_entries = list(
+                    result.get("timed_out_entries") or ()
+                )
+                terminal_timed_out_entries = set(map(
+                    str, result.get("terminal_timed_out_entries") or (),
+                ))
+                registry_revision = result.get("registry_after_sha256")
+                minimum_reached = (
+                    float(result.get("elapsed_seconds") or 0.0)
+                    >= float(arguments.minimum_compile_seconds_before_widening)
+                )
+                retry_entries = (
+                    timed_out_entries if minimum_reached else
+                    sorted(terminal_timed_out_entries)
+                )
+                if (
+                    retry_entries
+                    and (
+                        not source_record.get("deep_retry_attempted")
+                        or registry_revision
+                        != source_record.get(
+                            "last_deep_retry_registry_sha256"
+                        )
+                    )
+                ):
+                    source_record["pending_deep_retry"] = retry_entries
+                    scheduled_deep_retry = True
+            state["waves"].append({
+                "generation": generation,
+                "source": source.as_posix(),
+                "status": str(result.get("status") or "failed"),
+                "process_id": result.get("process_id"),
+                "workers_joined": bool(result.get("workers_joined")),
+                "progressed": progressed,
+                "registry_changed": bool(result.get("registry_changed")),
+                "outcome_sha256": current_outcome,
+                "mode": mode,
+                "scheduled_deep_retry": scheduled_deep_retry,
+                "result": result_path.as_posix(),
+            })
+            state["generation"] = generation + 1
+            if not scheduled_deep_retry:
+                cursor += 1
+            if cursor == len(sources):
+                if not state.get("sweep_progress"):
+                    state["status"] = "fixed-point"
+                    state["fixed_point"] = {
+                        "kind": "complete-sweep-without-progress",
+                        "sweep": int(state["sweep"]),
+                    }
+                else:
+                    state["sweep"] = int(state["sweep"]) + 1
+                    state["sweep_progress"] = False
+                cursor = 0
+            state["cursor"] = cursor
+            _atomic_json(state_path, state)
+        if state["status"] == "running":
+            state["status"] = "frontier"
+            state["fixed_point"] = {
+                "kind": (
+                    "maximum-generations"
+                    if int(state["generation"]) >= int(arguments.max_generations)
+                    else "maximum-sweeps"
+                ),
+            }
+            _atomic_json(state_path, state)
+        print(json.dumps({
+            "stage": "supervisor_exit",
+            "status": state["status"],
+            "generations": int(state["generation"]),
+            "sweeps": int(state["sweep"]),
+            "state": state_path.as_posix(),
+        }, sort_keys=True), flush=True)
+        return 0 if state["status"] == "fixed-point" else 1
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--source-root", type=Path,
+        default=Path("src/compiler"),
+        help="compiler package to discover automatically (default: src/compiler)",
+    )
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
+    parser.add_argument("--max-total-gb", type=float, default=None)
+    parser.add_argument("--worker-reserve-gb", type=float, default=4.0)
+    parser.add_argument("--max-worker-gb", type=float, default=4.0)
+    parser.add_argument(
+        "--unit-timeout-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "terminate a compilation unit after this many seconds "
+            "(default: disabled; use a positive value to opt in)"
+        ),
+    )
+    parser.add_argument("--max-generations", type=int, default=32768)
+    parser.add_argument("--max-sweeps", type=int, default=8)
+    parser.add_argument(
+        "--minimum-compile-seconds-before-widening",
+        type=float,
+        default=30.0,
+        help=(
+            "minimum completed bounded work before scheduling an unlimited-"
+            "time parent retry (default: 30 seconds)"
+        ),
+    )
+    parser.add_argument(
+        "--extraction-contract", type=Path,
+        default=DEFAULT_PROJECT_EXTRACTION_CONTRACT,
+    )
+    parser.add_argument("--wave-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--generation", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--source", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--seed-product", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--entry", action="append", default=[], help=argparse.SUPPRESS)
+    parser.add_argument("--deep-retry", action="store_true", help=argparse.SUPPRESS)
+    arguments = parser.parse_args(argv)
+    if arguments.jobs < 1:
+        parser.error("--jobs must be positive")
+    if arguments.minimum_compile_seconds_before_widening < 0:
+        parser.error(
+            "--minimum-compile-seconds-before-widening cannot be negative"
+        )
+    if arguments.wave_worker:
+        if arguments.source is None:
+            parser.error("wave worker requires --source")
+        return _wave_worker(arguments)
+    return _supervise(arguments)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

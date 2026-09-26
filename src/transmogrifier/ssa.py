@@ -30,7 +30,9 @@
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Dict, Callable, Union
 from enum import Enum
+from collections.abc import Mapping
 from .function_table import FunctionTable
+from ..compiler.deployment_frame import DeploymentFrame, DeploymentJoin
 
 # -----------------------------------------------------------------------------
 # Core SSA Data Structures
@@ -94,14 +96,1416 @@ class Function:
     blocks: Dict[str, BasicBlock]
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+
+@dataclass(frozen=True)
+class SSAClassMethod:
+    """One method of a class as the SSA layer holds it: its dot-name, the
+    function-table reference to its body, and -- once that body is lowered into
+    the module -- the SSA function that implements it."""
+
+    name: str
+    function_reference: int
+    function_name: str | None = None
+
+
+@dataclass(frozen=True)
+class SSAClassField:
+    """One instance field's addressable slot in a class's layout."""
+
+    name: str
+    slot: int
+
+
+@dataclass(frozen=True)
+class SSAClassDefinition:
+    """A class definition the SSA module holds: its identity, its instance-field
+    layout, and its methods (each pointing at the function that implements it)."""
+
+    identity: str
+    fields: tuple[SSAClassField, ...] = ()
+    methods: tuple[SSAClassMethod, ...] = ()
+
+    def method(self, name: str) -> "SSAClassMethod | None":
+        for member in self.methods:
+            if member.name == name:
+                return member
+        return None
+
+
+@dataclass(frozen=True)
+class SSAClassTable:
+    """Every class definition carried into the SSA module -- the SSA-level
+    counterpart of the frontend ``ClassNavigationTable``. Holding the definitions
+    (not only reference LUTs) is what lets a backend emit a class's methods as
+    real, individually linkable functions."""
+
+    classes: tuple[SSAClassDefinition, ...] = ()
+
+    def by_identity(self, identity: str) -> "SSAClassDefinition | None":
+        for record in self.classes:
+            if record.identity == identity:
+                return record
+        return None
+
+
+class SSAReferenceKind(str, Enum):
+    """Identity domain carried by an opaque SSA reference handle.
+
+    A reference is deliberately distinct from ``ptr``.  ``ptr`` addresses
+    repository-owned memory and is valid for Load/Store; an opaque reference
+    identifies a program object whose storage or implementation may remain on
+    the Python host.  Backends may copy and compare its fixed-width handle but
+    must not pretend that the handle is a dereferenceable target pointer.
+    """
+
+    STATIC_PYTHON = "static-python"
+    FUNCTION = "function"
+    OBJECT = "object"
+
+
+@dataclass(frozen=True)
+class SSAReferenceDescriptor:
+    """One stable, backend-neutral opaque reference identity."""
+
+    handle: int
+    identity: str
+    kind: SSAReferenceKind = SSAReferenceKind.OBJECT
+    host_resident: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "handle", int(self.handle))
+        object.__setattr__(self, "identity", str(self.identity))
+        object.__setattr__(self, "kind", SSAReferenceKind(self.kind))
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "handle": self.handle,
+            "identity": self.identity,
+            "kind": self.kind.value,
+            "host_resident": bool(self.host_resident),
+        }
+
+
+@dataclass
+class SSAReferenceTable:
+    """Opaque handles retained by one SSA function/module surface."""
+
+    references: Dict[int, SSAReferenceDescriptor] = field(default_factory=dict)
+
+    def register(
+        self, descriptor: SSAReferenceDescriptor
+    ) -> SSAReferenceDescriptor:
+        existing = self.references.get(descriptor.handle)
+        if existing is not None and existing != descriptor:
+            raise ValueError(
+                f"conflicting SSA reference handle {descriptor.handle}: "
+                f"{existing.identity!r} != {descriptor.identity!r}"
+            )
+        self.references[descriptor.handle] = descriptor
+        return descriptor
+
+
+class SSARecordFieldStorage(str, Enum):
+    """Physical SSA storage named by one record field."""
+
+    SCALAR = "scalar"
+    SPAN = "span"
+    SEQUENCE = "sequence"
+    RECORD = "record"
+    REFERENCE = "reference"
+    FUNCTION_TABLE = "function_table"
+    CLASS_TABLE = "class_table"
+
+
+@dataclass(frozen=True)
+class SSARecordFieldDescriptor:
+    """One typed field correlation inside a raw SSA record.
+
+    This is not an object or a dispatch hook. ``value_ids`` point at ordinary
+    SSA arguments/arenas; ``sequence_id`` points at an
+    :class:`SSASequenceDescriptor` in the same function-scoped module table.
+    """
+
+    name: str
+    storage: SSARecordFieldStorage
+    storage_identity: str | None = None
+    value_ids: tuple[int, ...] = ()
+    sequence_id: int | None = None
+    record_id: int | None = None
+    offset: int | None = None
+    dtype: str | None = None
+    writable: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", str(self.name))
+        object.__setattr__(self, "storage", SSARecordFieldStorage(self.storage))
+        if self.storage_identity is not None:
+            object.__setattr__(
+                self, "storage_identity", str(self.storage_identity)
+            )
+        object.__setattr__(
+            self, "value_ids", tuple(map(int, self.value_ids))
+        )
+        if self.sequence_id is not None:
+            object.__setattr__(self, "sequence_id", int(self.sequence_id))
+        if self.record_id is not None:
+            object.__setattr__(self, "record_id", int(self.record_id))
+        if self.offset is not None:
+            object.__setattr__(self, "offset", int(self.offset))
+        if self.storage is SSARecordFieldStorage.SEQUENCE and self.sequence_id is None:
+            raise ValueError("sequence record field requires sequence_id")
+        if self.storage is SSARecordFieldStorage.RECORD and self.record_id is None:
+            raise ValueError("nested record field requires record_id")
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "storage": self.storage.value,
+            "storage_identity": self.storage_identity,
+            "value_ids": list(self.value_ids),
+            "sequence_id": self.sequence_id,
+            "record_id": self.record_id,
+            "offset": self.offset,
+            "dtype": self.dtype,
+            "writable": bool(self.writable),
+        }
+
+
+@dataclass(frozen=True)
+class SSARecordDescriptor:
+    """A typed grouping of independently stored SSA fields."""
+
+    record_id: int
+    identity: str
+    fields: tuple[SSARecordFieldDescriptor, ...] = ()
+    instance_pool: "SSARecordInstancePoolDescriptor | None" = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "record_id", int(self.record_id))
+        object.__setattr__(self, "identity", str(self.identity))
+        names = tuple(field.name for field in self.fields)
+        if len(names) != len(set(names)):
+            raise ValueError("SSA record field names must be unique")
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "record_id": self.record_id,
+            "identity": self.identity,
+            "fields": [field.to_mapping() for field in self.fields],
+            "instance_pool": (
+                None
+                if self.instance_pool is None
+                else self.instance_pool.to_mapping()
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class SSARecordInstancePoolField:
+    """One physical field layout selected by a shared record handle."""
+
+    storage_identity: str
+    storage: SSARecordFieldStorage
+    sequence_pool: "SSAChildTablePoolDescriptor | None" = None
+    scalar_value_id: int | None = None
+    scalar_stride_value_id: int | None = None
+    scalar_offset: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "storage_identity", str(self.storage_identity))
+        object.__setattr__(self, "storage", SSARecordFieldStorage(self.storage))
+        if self.storage is SSARecordFieldStorage.SEQUENCE:
+            if self.sequence_pool is None:
+                raise ValueError("pooled sequence field requires a child pool")
+        elif self.storage is SSARecordFieldStorage.SCALAR:
+            if self.scalar_value_id is None or self.scalar_stride_value_id is None:
+                raise ValueError("pooled scalar field requires arena and stride")
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "storage_identity": self.storage_identity,
+            "storage": self.storage.value,
+            "sequence_pool": (
+                None if self.sequence_pool is None
+                else self.sequence_pool.to_mapping()
+            ),
+            "scalar_value_id": self.scalar_value_id,
+            "scalar_stride_value_id": self.scalar_stride_value_id,
+            "scalar_offset": self.scalar_offset,
+        }
+
+
+@dataclass(frozen=True)
+class SSARecordInstancePoolDescriptor:
+    """Several field layouts addressed by one containing-sequence handle."""
+
+    handle_sequence_id: int
+    fields: tuple[SSARecordInstancePoolField, ...]
+
+    def __post_init__(self) -> None:
+        identities = tuple(field.storage_identity for field in self.fields)
+        if len(identities) != len(set(identities)):
+            raise ValueError("record instance-pool field identities must be unique")
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "handle_sequence_id": int(self.handle_sequence_id),
+            "fields": [field.to_mapping() for field in self.fields],
+        }
+
+
+def _mint_table_owner(book: Any, label: Any) -> tuple[str, int]:
+    """The book scope one SSA table's rows live under.
+
+    Value ids are not frame-unique (``id_space.SHARED``), and one function's
+    ids reappear in helper tables and copies, so every table is its own
+    scope, minted by the book.  ``label`` names the function the table was
+    built for, for a reader of the book.
+    """
+
+    return book.mint_scope(label or "table")
+
+
+class _BookRows(__import__("collections.abc").abc.MutableMapping):
+    """One SSA table's id -> descriptor storage, as rows of a book page.
+
+    Row ``(owner, id)`` holds the descriptor; every write is a revision and a
+    removal is a ``None`` revision, so the page is the storage and its whole
+    history.  ``on_change(old, new)`` keeps the member page in step.
+    """
+
+    def __init__(self, book: Any, page: str, owner: Any, on_change: Callable):
+        self._book = book
+        self._page = book.page(page)
+        self._owner = owner
+        self._on_change = on_change
+
+    def __getitem__(self, key: Any) -> Any:
+        # Rows are keyed by value ids; anything else (``None`` from an
+        # unbound lookup) names no row, exactly as a dict miss did.
+        try:
+            key = __import__("operator").index(key)
+        except TypeError:
+            raise KeyError(key) from None
+        fact = self._page.latest((self._owner, int(key)))
+        if fact is None:
+            raise KeyError(key)
+        return fact
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        row = (self._owner, int(key))
+        old = self._page.latest(row)
+        self._page.revise(row, value)
+        self._on_change(old, value)
+
+    def __delitem__(self, key: Any) -> None:
+        row = (self._owner, int(key))
+        old = self._page.latest(row)
+        if old is None:
+            raise KeyError(key)
+        self._page.revise(row, None)
+        self._on_change(old, None)
+
+    def __iter__(self):
+        for row in self._page.scope_rows(self._owner):
+            if self._page.latest(row) is not None:
+                yield row[1]
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    def __repr__(self) -> str:
+        return repr(dict(self))
+
+
+def _revise_member_claims(
+    page: Any, owner: Any, old: dict[int, set], new: dict[int, set],
+) -> None:
+    """Move one descriptor's member claims from ``old`` to ``new``.
+
+    Row ``(owner, member id)`` holds every claim live descriptors make on
+    that value; a value can be a member of several records (record SSA
+    versions share unchanged field storage).
+    """
+
+    for member in set(old) | set(new):
+        before = old.get(member, set())
+        after = new.get(member, set())
+        if before == after:
+            continue
+        row = (owner, int(member))
+        claims = (set(page.latest(row) or ()) - before) | after
+        page.revise(row, tuple(sorted(claims, key=repr)))
+
+
+def record_member_claims(
+    descriptor: "SSARecordDescriptor | None",
+) -> dict[int, set]:
+    """member id -> {(record id, field name, storage identity, role)}.
+
+    A SCALAR field's value ids are SSA versions of one slot (role
+    ``("slot",)``); any other field's value ids are positional members
+    (``("value", index)``).  A sequence field's descriptor handle is role
+    ``("sequence",)`` and a nested record field's record id ``("record",)``.
+    """
+
+    claims: dict[int, set] = {}
+    if descriptor is None:
+        return claims
+    record_id = int(descriptor.record_id)
+    for field_ in descriptor.fields:
+        base = (record_id, field_.name, field_.storage_identity)
+        scalar = field_.storage is SSARecordFieldStorage.SCALAR
+        for index, value_id in enumerate(field_.value_ids):
+            role = ("slot",) if scalar else ("value", index)
+            claims.setdefault(int(value_id), set()).add((*base, role))
+        if field_.sequence_id is not None:
+            claims.setdefault(int(field_.sequence_id), set()).add(
+                (*base, ("sequence",))
+            )
+        if field_.record_id is not None:
+            claims.setdefault(int(field_.record_id), set()).add(
+                (*base, ("record",))
+            )
+    return claims
+
+
+class SSARecordTable:
+    """Function-scoped record descriptors, stored on the identity book.
+
+    Page ``record_descriptor`` holds each descriptor at ``(owner, record
+    id)``; page ``record_member`` holds, at ``(owner, value id)``, every claim
+    a live descriptor makes on that value.  Nothing is kept beside the book.
+    """
+
+    def __init__(
+        self,
+        records: Dict[int, SSARecordDescriptor] | None = None,
+        *,
+        owner: Any = None,
+        book: Any = None,
+    ) -> None:
+        from ..compiler.identity_concordance import current_identity_book
+
+        self.book = current_identity_book() if book is None else book
+        self.owner = (
+            owner if isinstance(owner, tuple)
+            else _mint_table_owner(self.book, owner)
+        )
+        member_page = self.book.page("record_member")
+        self.records = _BookRows(
+            self.book, "record_descriptor", self.owner,
+            lambda old, new: _revise_member_claims(
+                member_page, self.owner,
+                record_member_claims(old), record_member_claims(new),
+            ),
+        )
+        for record_id, descriptor in dict(records or {}).items():
+            self.records[int(record_id)] = descriptor
+
+    def member_claims(self, value_id: int) -> tuple:
+        """Every (record id, field name, storage identity, role) naming
+        ``value_id`` in this table, read from the book."""
+
+        return tuple(
+            self.book.page("record_member").latest((self.owner, int(value_id)))
+            or ()
+        )
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, SSARecordTable) and dict(self.records) == dict(
+            other.records
+        )
+
+    def __repr__(self) -> str:
+        return f"SSARecordTable(owner={self.owner!r}, records={self.records!r})"
+
+    def __deepcopy__(self, memo: dict) -> "SSARecordTable":
+        return SSARecordTable(
+            dict(self.records), owner=self.owner[0], book=self.book,
+        )
+
+    def __reduce__(self):
+        # The book scope's serial is not content; a pickle carries the label
+        # and the descriptors and is rebuilt on the book current at load.
+        return (SSARecordTable, (dict(self.records),), {"owner": self.owner[0]})
+
+    def __setstate__(self, state: dict) -> None:
+        self.__init__(dict(self.records), owner=state.get("owner"))
+
+    def register(self, descriptor: SSARecordDescriptor) -> SSARecordDescriptor:
+        existing = self.records.get(descriptor.record_id)
+        if existing is not None and existing != descriptor:
+            compatible_identity = existing.identity == descriptor.identity
+            existing_fields = {field.name: field for field in existing.fields}
+            incoming_fields = {field.name: field for field in descriptor.fields}
+            def same_physical_field(left, right):
+                return (
+                    left.name == right.name
+                    and left.storage == right.storage
+                    and left.storage_identity == right.storage_identity
+                    and left.value_ids == right.value_ids
+                    and left.sequence_id == right.sequence_id
+                    and left.record_id == right.record_id
+                    and left.offset == right.offset
+                    and left.dtype == right.dtype
+                )
+
+            compatible_overlap = all(
+                same_physical_field(
+                    existing_fields[name], incoming_fields[name]
+                )
+                for name in existing_fields.keys() & incoming_fields.keys()
+            )
+            compatible_pool = (
+                existing.instance_pool is None
+                or descriptor.instance_pool is None
+                or existing.instance_pool == descriptor.instance_pool
+            )
+            if compatible_identity and compatible_overlap and compatible_pool:
+                # One caller record is observed through several pursued
+                # callees, each of which legitimately projects only the
+                # fields it touches. Merge those complementary views under
+                # the already-correlated record id; this is not an id
+                # collision and no field spelling is reinterpreted.
+                merged_fields = tuple(
+                    SSARecordFieldDescriptor(
+                        name=resident.name,
+                        storage=resident.storage,
+                        storage_identity=resident.storage_identity,
+                        value_ids=resident.value_ids,
+                        sequence_id=resident.sequence_id,
+                        record_id=resident.record_id,
+                        offset=resident.offset,
+                        dtype=resident.dtype,
+                        writable=(
+                            bool(resident.writable)
+                            or bool(incoming_fields[resident.name].writable)
+                            if resident.name in incoming_fields
+                            else bool(resident.writable)
+                        ),
+                    )
+                    for resident in existing.fields
+                )
+                descriptor = SSARecordDescriptor(
+                    descriptor.record_id,
+                    descriptor.identity,
+                    (
+                        *merged_fields,
+                        *(
+                            field for field in descriptor.fields
+                            if field.name not in existing_fields
+                        ),
+                    ),
+                    existing.instance_pool or descriptor.instance_pool,
+                )
+            else:
+                overlap_diagnostics = {
+                    name: {
+                        "existing": existing_fields[name].to_mapping(),
+                        "incoming": incoming_fields[name].to_mapping(),
+                    }
+                    for name in existing_fields.keys() & incoming_fields.keys()
+                    if not same_physical_field(
+                        existing_fields[name], incoming_fields[name]
+                    )
+                }
+                raise ValueError(
+                    f"conflicting SSA record descriptor {descriptor.record_id}: "
+                    f"existing_identity={existing.identity!r} "
+                    f"existing_fields={tuple(field.name for field in existing.fields)!r} "
+                    f"incoming_identity={descriptor.identity!r} "
+                    f"incoming_fields={tuple(field.name for field in descriptor.fields)!r} "
+                    f"overlap_mismatches={overlap_diagnostics!r} "
+                    f"existing_instance_pool={existing.instance_pool!r} "
+                    f"incoming_instance_pool={descriptor.instance_pool!r}"
+                )
+        self.records[descriptor.record_id] = descriptor
+        return descriptor
+
+
+@dataclass(frozen=True)
+class SSATensorDescriptor:
+    """Compile-time identity and ABI facts for one logical SSA tensor.
+
+    ``data_value_id`` names ordinary SSA storage. Shape/stride information is
+    either static (the tuples) or itself ordinary SSA (the optional value ids).
+    Nothing here is a backend object or runtime dispatch handle.
+    """
+
+    tensor_id: int
+    data_value_id: int
+    dtype: str = "float64"
+    shape: tuple[int, ...] = ()
+    strides: tuple[int, ...] = ()
+    shape_value_id: int | None = None
+    strides_value_id: int | None = None
+    rank_value_id: int | None = None
+    element_count_value_id: int | None = None
+    layout: str = "dense-row-major"
+    storage: str = "temporary"
+    metadata_state: str = "static"
+    arena_id: int | None = None
+    allocation_owner: int | None = None
+    owns_allocation: bool = True
+    element_offset: int = 0
+    byte_offset: int = 0
+    byte_size: int | None = None
+    alias_of: int | None = None
+    writable: bool = True
+
+    def __post_init__(self) -> None:
+        if self.layout not in {"dense-row-major", "strided"}:
+            raise ValueError(f"unsupported SSA tensor layout {self.layout!r}")
+        if self.storage not in {
+            "input", "constant", "temporary", "output", "view"
+        }:
+            raise ValueError(f"unsupported SSA tensor storage {self.storage!r}")
+        if self.metadata_state not in {"static", "dynamic", "unresolved"}:
+            raise ValueError(
+                f"unsupported SSA tensor metadata state {self.metadata_state!r}"
+            )
+        if any(int(extent) < 0 for extent in self.shape):
+            raise ValueError("static SSA tensor extents must be non-negative")
+        if self.strides and len(self.strides) != len(self.shape):
+            raise ValueError("SSA tensor strides must match static rank")
+        if self.element_offset < 0 or self.byte_offset < 0:
+            raise ValueError("SSA tensor arena offsets must be non-negative")
+        if self.byte_size is not None and self.byte_size < 0:
+            raise ValueError("SSA tensor byte size must be non-negative")
+        if not self.owns_allocation and self.allocation_owner is None:
+            raise ValueError("an SSA tensor view requires an allocation owner")
+        if self.metadata_state == "dynamic" and (
+            self.shape_value_id is None
+            or self.rank_value_id is None
+            or self.element_count_value_id is None
+        ):
+            raise ValueError(
+                "dynamic SSA tensors require shape, rank, and element-count values"
+            )
+        if not self.shape and self.shape_value_id is not None and self.rank_value_id is None:
+            raise ValueError("a dynamic SSA tensor shape requires a rank value")
+
+    @property
+    def static_rank(self) -> int | None:
+        return len(self.shape) if self.metadata_state == "static" else None
+
+    @property
+    def static_element_count(self) -> int | None:
+        if self.metadata_state != "static":
+            return None
+        count = 1
+        for extent in self.shape:
+            count *= int(extent)
+        return count
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "tensor_id": int(self.tensor_id),
+            "data_value_id": int(self.data_value_id),
+            "dtype": self.dtype,
+            "shape": list(self.shape),
+            "strides": list(self.strides),
+            "shape_value_id": self.shape_value_id,
+            "strides_value_id": self.strides_value_id,
+            "rank_value_id": self.rank_value_id,
+            "element_count_value_id": self.element_count_value_id,
+            "layout": self.layout,
+            "storage": self.storage,
+            "metadata_state": self.metadata_state,
+            "arena_id": self.arena_id,
+            "allocation_owner": self.allocation_owner,
+            "owns_allocation": bool(self.owns_allocation),
+            "element_offset": int(self.element_offset),
+            "byte_offset": int(self.byte_offset),
+            "byte_size": self.byte_size,
+            "alias_of": self.alias_of,
+            "writable": bool(self.writable),
+        }
+
+
+@dataclass
+class SSATensorTable:
+    """First-class tensor identities owned by one SSA function scope."""
+
+    tensors: Dict[int, SSATensorDescriptor] = field(default_factory=dict)
+
+    def register(self, descriptor: SSATensorDescriptor) -> SSATensorDescriptor:
+        tensor_id = int(descriptor.tensor_id)
+        existing = self.tensors.get(tensor_id)
+        if existing is not None and existing != descriptor:
+            raise ValueError(f"conflicting SSA tensor descriptor {tensor_id}")
+        self.tensors[tensor_id] = descriptor
+        return descriptor
+
+    def by_id(self, tensor_id: int) -> SSATensorDescriptor | None:
+        return self.tensors.get(int(tensor_id))
+
+    def by_data_value(self, value_id: int) -> tuple[SSATensorDescriptor, ...]:
+        value_id = int(value_id)
+        return tuple(
+            descriptor
+            for descriptor in self.tensors.values()
+            if int(descriptor.data_value_id) == value_id
+        )
+
+
+class SSASequenceCapacityPolicy(str, Enum):
+    """How a row arena responds when its declared capacity is exhausted."""
+
+    FIXED = "fixed"
+    DYNAMIC = "dynamic"
+
+
+@dataclass(frozen=True)
+class SSASequenceDescriptor:
+    """Raw SSA storage facts for a variable-length sequence or row table.
+
+    The descriptor is compile-time information, not a runtime container or an
+    object model.  ``column_value_ids`` name ordinary SSA arena pointers,
+    ``length_address_id`` names the mutable length cell, and
+    ``capacity_value_id`` names the available row count.  Empty
+    ``key_columns`` means duplicates are allowed; populated key columns make
+    insertion unique on those columns.  A live-flags arena is optional so row
+    deletion can retain stable indices without mandatory compaction.
+    """
+
+    sequence_id: int
+    column_value_ids: tuple[int, ...]
+    length_address_id: int
+    capacity_value_id: int
+    status_address_id: int | None = None
+    column_dtypes: tuple[str, ...] = ()
+    key_columns: tuple[int, ...] = ()
+    live_flags_value_id: int | None = None
+    capacity_policy: SSASequenceCapacityPolicy = SSASequenceCapacityPolicy.FIXED
+    writable: bool = True
+    child_table_pool: "SSAChildTablePoolDescriptor | None" = None
+
+    def __post_init__(self) -> None:
+        storage_ids = (
+            int(self.sequence_id),
+            int(self.length_address_id),
+            int(self.capacity_value_id),
+            *(int(value_id) for value_id in self.column_value_ids),
+        )
+        if any(value_id < 0 for value_id in storage_ids):
+            raise ValueError("SSA sequence value ids must be non-negative")
+        if not self.column_value_ids:
+            raise ValueError("an SSA sequence requires at least one data column")
+        if self.column_dtypes and len(self.column_dtypes) != len(
+            self.column_value_ids
+        ):
+            raise ValueError("SSA sequence dtypes must match its data columns")
+        if len(set(self.key_columns)) != len(self.key_columns):
+            raise ValueError("SSA sequence key columns must be unique")
+        if any(
+            int(column) < 0 or int(column) >= len(self.column_value_ids)
+            for column in self.key_columns
+        ):
+            raise ValueError("SSA sequence key column is outside the row layout")
+        if self.live_flags_value_id is not None and int(
+            self.live_flags_value_id
+        ) < 0:
+            raise ValueError("SSA sequence live-flags id must be non-negative")
+        if self.status_address_id is not None and int(
+            self.status_address_id
+        ) < 0:
+            raise ValueError("SSA sequence status-cell id must be non-negative")
+        if not isinstance(self.capacity_policy, SSASequenceCapacityPolicy):
+            object.__setattr__(
+                self,
+                "capacity_policy",
+                SSASequenceCapacityPolicy(str(self.capacity_policy)),
+            )
+        if self.child_table_pool is not None:
+            if self.child_table_pool.handle_column < 0 or (
+                self.child_table_pool.handle_column >= len(self.column_value_ids)
+            ):
+                raise ValueError(
+                    "nested-table handle column is outside the outer row layout"
+                )
+
+    @property
+    def allows_duplicates(self) -> bool:
+        return not self.key_columns
+
+    @property
+    def retains_deleted_rows(self) -> bool:
+        return self.live_flags_value_id is not None
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "sequence_id": int(self.sequence_id),
+            "column_value_ids": [int(item) for item in self.column_value_ids],
+            "length_address_id": int(self.length_address_id),
+            "capacity_value_id": int(self.capacity_value_id),
+            "status_address_id": self.status_address_id,
+            "column_dtypes": list(self.column_dtypes),
+            "key_columns": [int(item) for item in self.key_columns],
+            "live_flags_value_id": self.live_flags_value_id,
+            "capacity_policy": self.capacity_policy.value,
+            "writable": bool(self.writable),
+            "child_table_pool": (
+                None
+                if self.child_table_pool is None
+                else self.child_table_pool.to_mapping()
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class SSAChildTablePoolDescriptor:
+    """Caller-owned arenas addressed by handles stored in an outer table.
+
+    A handle is an integer child-table row. Child ``h`` owns the slice
+    ``h * row_stride : (h + 1) * row_stride`` of every child data/live arena;
+    its mutable length/status cells live at index ``h``. This is a raw memory
+    contract only—no runtime collection object or dispatch is introduced.
+    """
+
+    handle_column: int
+    column_value_ids: tuple[int, ...]
+    length_value_id: int
+    capacity_value_id: int
+    row_stride_value_id: int
+    # A nested Tensor row carries the same three ordinary-SSA extent facts as
+    # every other dynamic tensor. ``shape_value_id`` is a flattened shape
+    # arena, ``rank_value_id`` is indexed by child handle, and
+    # ``shape_stride_value_id`` gives the shape-arena row width.  Non-tensor
+    # child tables leave all three absent.
+    shape_value_id: int | None = None
+    rank_value_id: int | None = None
+    shape_stride_value_id: int | None = None
+    status_value_id: int | None = None
+    live_flags_value_id: int | None = None
+    column_dtypes: tuple[str, ...] = ()
+    key_columns: tuple[int, ...] = (0,)
+    writable: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.column_value_ids:
+            raise ValueError("a child-table pool requires a data column")
+        ids = (
+            *self.column_value_ids,
+            self.length_value_id,
+            self.capacity_value_id,
+            self.row_stride_value_id,
+            *((self.shape_value_id,) if self.shape_value_id is not None else ()),
+            *((self.rank_value_id,) if self.rank_value_id is not None else ()),
+            *((self.shape_stride_value_id,) if self.shape_stride_value_id is not None else ()),
+            *((self.status_value_id,) if self.status_value_id is not None else ()),
+            *((self.live_flags_value_id,) if self.live_flags_value_id is not None else ()),
+        )
+        if any(int(value_id) < 0 for value_id in ids):
+            raise ValueError("child-table pool value ids must be non-negative")
+        extent_members = (
+            self.shape_value_id,
+            self.rank_value_id,
+            self.shape_stride_value_id,
+        )
+        if any(value is not None for value in extent_members) and not all(
+            value is not None for value in extent_members
+        ):
+            raise ValueError(
+                "nested tensor child pool requires shape, rank, and shape-stride identities"
+            )
+        if self.column_dtypes and len(self.column_dtypes) != len(
+            self.column_value_ids
+        ):
+            raise ValueError("child-table pool dtypes must match data columns")
+        if any(
+            int(column) < 0 or int(column) >= len(self.column_value_ids)
+            for column in self.key_columns
+        ):
+            raise ValueError("child-table key column is outside its row layout")
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "handle_column": int(self.handle_column),
+            "column_value_ids": list(map(int, self.column_value_ids)),
+            "length_value_id": int(self.length_value_id),
+            "capacity_value_id": int(self.capacity_value_id),
+            "row_stride_value_id": int(self.row_stride_value_id),
+            "shape_value_id": self.shape_value_id,
+            "rank_value_id": self.rank_value_id,
+            "shape_stride_value_id": self.shape_stride_value_id,
+            "status_value_id": self.status_value_id,
+            "live_flags_value_id": self.live_flags_value_id,
+            "column_dtypes": list(self.column_dtypes),
+            "key_columns": list(map(int, self.key_columns)),
+            "writable": bool(self.writable),
+        }
+
+
+def sequence_member_roles(
+    descriptor: "SSASequenceDescriptor | None",
+) -> dict[int, set]:
+    """member id -> {(sequence id, role)} for one sequence descriptor.
+
+    Roles: ``("handle",)``, ``("column", position)`` and one per extent or
+    status cell (``length_address_id``, ``capacity_value_id``,
+    ``status_address_id``, ``live_flags_value_id``).
+    """
+
+    claims: dict[int, set] = {}
+    if descriptor is None:
+        return claims
+    sequence_id = int(descriptor.sequence_id)
+
+    def claim(value_id: Any, role: tuple) -> None:
+        if value_id is not None:
+            claims.setdefault(int(value_id), set()).add((sequence_id, role))
+
+    claim(sequence_id, ("handle",))
+    for position, column in enumerate(descriptor.column_value_ids):
+        claim(column, ("column", position))
+    for attribute in (
+        "length_address_id", "capacity_value_id",
+        "status_address_id", "live_flags_value_id",
+    ):
+        claim(getattr(descriptor, attribute, None), (attribute,))
+    return claims
+
+
+class SSASequenceTable:
+    """Function-scoped sequence/table storage descriptions, on the book.
+
+    Page ``sequence_descriptor`` holds each descriptor at ``(owner, sequence
+    id)``; page ``sequence_member`` holds, at ``(owner, value id)``, every
+    ``(sequence id, role)`` a live descriptor gives that value; page
+    ``sequence_column_claims`` holds every column typing ever offered.
+    """
+
+    def __init__(
+        self,
+        sequences: Dict[int, SSASequenceDescriptor] | None = None,
+        *,
+        owner: Any = None,
+        book: Any = None,
+    ) -> None:
+        from ..compiler.identity_concordance import current_identity_book
+
+        self.book = current_identity_book() if book is None else book
+        self.owner = (
+            owner if isinstance(owner, tuple)
+            else _mint_table_owner(self.book, owner)
+        )
+        member_page = self.book.page("sequence_member")
+        self.sequences = _BookRows(
+            self.book, "sequence_descriptor", self.owner,
+            lambda old, new: _revise_member_claims(
+                member_page, self.owner,
+                sequence_member_roles(old), sequence_member_roles(new),
+            ),
+        )
+        for sequence_id, descriptor in dict(sequences or {}).items():
+            self.sequences[int(sequence_id)] = descriptor
+
+    def member_claims(self, value_id: int) -> tuple:
+        """Every (sequence id, role) naming ``value_id``, read from the book."""
+
+        return tuple(
+            self.book.page("sequence_member").latest(
+                (self.owner, int(value_id))
+            ) or ()
+        )
+
+    def offered_column_dtypes(self, sequence_id: int) -> list:
+        """Every column-dtype tuple offered for ``sequence_id``, in order."""
+
+        page = self.book.page("sequence_column_claims")
+        return [
+            fact[0] for _column, fact in page.history(
+                (self.owner, int(sequence_id), "column_dtypes")
+            )
+        ]
+
+    def register(self, descriptor: SSASequenceDescriptor) -> SSASequenceDescriptor:
+        sequence_id = int(descriptor.sequence_id)
+        existing = self.sequences.get(sequence_id)
+        # Every attempt, not just the winner: a conflict report that shows
+        # only incumbent-vs-newcomer cannot distinguish two sites that
+        # stably disagree from a sequence of sites that flip a value back
+        # and forth, and those need opposite fixes.
+        self.book.page("sequence_column_claims").revise(
+            (self.owner, sequence_id, "column_dtypes"),
+            (
+                tuple(descriptor.column_dtypes),
+                tuple(descriptor.key_columns),
+            ),
+        )
+        if existing is not None and existing != descriptor:
+            # Name the id the way a reader can act on -- ``minted#1000013548``
+            # rather than 2305843010213707500 -- and say WHICH fields the two
+            # registrations disagree about, since "conflicting" alone sends
+            # the reader back to re-derive that by hand from a build log.
+            from ..compiler.id_space import label as _id_label
+
+            differing = tuple(sorted(
+                name for name in vars(descriptor)
+                if getattr(existing, name, None) != getattr(descriptor, name)
+            ))
+            detail = "; ".join(
+                f"{name}: incumbent={getattr(existing, name, None)!r} "
+                f"vs new={getattr(descriptor, name)!r}"
+                for name in differing
+            )
+            offered = self.offered_column_dtypes(sequence_id)
+            raise ValueError(
+                f"conflicting SSA sequence descriptor {_id_label(sequence_id)}"
+                f" (differs in: {', '.join(differing) or 'identity only'})"
+                + (f" [{detail}]" if detail else "")
+                + f" dtypes offered in order: {offered}"
+            )
+        self.sequences[sequence_id] = descriptor
+        return descriptor
+
+    def by_id(self, sequence_id: int) -> SSASequenceDescriptor | None:
+        return self.sequences.get(int(sequence_id))
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, SSASequenceTable) and dict(
+            self.sequences
+        ) == dict(other.sequences)
+
+    def __repr__(self) -> str:
+        return (
+            f"SSASequenceTable(owner={self.owner!r}, "
+            f"sequences={self.sequences!r})"
+        )
+
+    def __deepcopy__(self, memo: dict) -> "SSASequenceTable":
+        return SSASequenceTable(
+            dict(self.sequences), owner=self.owner[0], book=self.book,
+        )
+
+    def __reduce__(self):
+        return (
+            SSASequenceTable, (dict(self.sequences),),
+            {"owner": self.owner[0]},
+        )
+
+    def __setstate__(self, state: dict) -> None:
+        self.__init__(dict(self.sequences), owner=state.get("owner"))
+
+
+@dataclass(frozen=True)
+class SSADeploymentLane:
+    """One independently schedulable lane retained after SSA lowering."""
+
+    index: int
+    instruction_sites: tuple[tuple[str, int], ...] = ()
+    callees: tuple[str, ...] = ()
+    source_region_indices: tuple[int, ...] = ()
+    source_value_ids: tuple[int, ...] = ()
+    source_node_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class SSADeploymentRegion:
+    """Backend-neutral proof that an SSA subgraph may deploy in parallel.
+
+    This is a scheduling permission, not a selected GPU/API backend.  A later
+    deployment pass can bind the region to GLSL, CUDA, SIMD, threads, or keep
+    the recorded linear schedule without changing program semantics.
+    """
+
+    region_id: int
+    function: str
+    kind: str
+    schedule: str
+    schedule_preference: str = "alap"
+    lanes: tuple[SSADeploymentLane, ...] = ()
+    iteration_space: tuple[str, str, str] | None = None
+    carried_aliases: tuple[tuple[int, int], ...] = ()
+    recursion_region_id: int | None = None
+    origin: str = "control_ir"
+    source_loop_node_id: int | None = None
+    scale: int = 1
+    join: DeploymentJoin = DeploymentJoin()
+    deploy_site: tuple[str, int] | None = None
+    join_site: tuple[str, int] | None = None
+
+    def __post_init__(self) -> None:
+        preference = str(self.schedule_preference).lower()
+        if preference not in {"asap", "alap"}:
+            raise ValueError(
+                "deployment schedule preference must be 'asap' or 'alap'"
+            )
+        object.__setattr__(self, "schedule_preference", preference)
+        DeploymentFrame(self.region_id, self.scale, self.join)
+
+    @property
+    def frame(self) -> DeploymentFrame:
+        return DeploymentFrame(self.region_id, self.scale, self.join)
+
+
+@dataclass(frozen=True)
+class SSACallRecord:
+    """One source call occurrence and its complete repository-SSA status.
+
+    A callee definition merely existing in ``functions`` is not execution.
+    This record preserves the planner-owned argument/result edges and the
+    callee-local storage values its call frame must supply.  ``resolution`` is
+    deliberately explicit so a target cannot mistake an omitted call for a
+    complete program.
+    """
+
+    caller: str
+    callsite_id: int
+    callee_reference: int | None
+    callee_name: str
+    callee_symbol: str | None
+    argument_bindings: tuple[tuple[int, int], ...] = ()
+    result_bindings: tuple[tuple[int, int], ...] = ()
+    enclosing_loop_ids: tuple[int, ...] = ()
+    callee_storage_value_ids: tuple[int, ...] = ()
+    # Callee argument id -> source kind -> source value.  ``caller_value`` is
+    # an exact PlanCall binding, ``caller_alias`` is the same binding through
+    # the callee identity ledger, and ``default_literal`` is an authored
+    # signature default.  Any callee argument absent here is deliberately
+    # listed in ``unresolved_frame_value_ids`` and forbids native emission.
+    frame_bindings: tuple[tuple[int, str, object], ...] = ()
+    unresolved_frame_value_ids: tuple[int, ...] = ()
+    resolution: str = "unresolved"
+    decomposition: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.resolution not in {"unresolved", "native_call", "decomposed"}:
+            raise ValueError(f"unknown SSA call resolution {self.resolution!r}")
+
+
+class _BookCallList(__import__("collections.abc").abc.MutableSequence):
+    """One caller's call records as a mutable list whose storage is a book
+    row: every mutation revises the row to the whole new tuple."""
+
+    def __init__(self, page: Any, row: Any) -> None:
+        self._page = page
+        self._row = row
+
+    def _records(self) -> tuple:
+        return tuple(self._page.latest(self._row) or ())
+
+    def _commit(self, records: Any) -> None:
+        self._page.revise(self._row, tuple(records))
+
+    def __getitem__(self, index: Any) -> Any:
+        records = self._records()
+        return list(records[index]) if isinstance(index, slice) else records[index]
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        records = list(self._records())
+        records[index] = value
+        self._commit(records)
+
+    def __delitem__(self, index: Any) -> None:
+        records = list(self._records())
+        del records[index]
+        self._commit(records)
+
+    def __len__(self) -> int:
+        return len(self._records())
+
+    def insert(self, index: int, value: Any) -> None:
+        records = list(self._records())
+        records.insert(index, value)
+        self._commit(records)
+
+    def sort(self, *, key: Any = None, reverse: bool = False) -> None:
+        self._commit(sorted(self._records(), key=key, reverse=reverse))
+
+    def copy(self) -> list:
+        return list(self._records())
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(
+            other, (list, tuple, _BookCallList)
+        ) and self._records() == tuple(other)
+
+    def __repr__(self) -> str:
+        return repr(list(self._records()))
+
+    def __reduce__(self):
+        return (list, (list(self._records()),))
+
+
+class SSACallTable(__import__("collections.abc").abc.MutableMapping):
+    """caller symbol -> that caller's SSACallRecords, stored on the book.
+
+    Page ``call_record`` holds each caller's records at ``(owner, caller)``;
+    every change is a revision.  ``mutable`` tables (the linker's working
+    table) hand out list views whose in-place edits are revisions; module
+    tables hand out tuples.
+    """
+
+    def __init__(
+        self,
+        records: Any = None,
+        *,
+        owner: Any = None,
+        mutable: bool = False,
+        book: Any = None,
+    ) -> None:
+        from ..compiler.identity_concordance import current_identity_book
+
+        self.book = current_identity_book() if book is None else book
+        self.owner = (
+            owner if isinstance(owner, tuple)
+            else _mint_table_owner(self.book, owner)
+        )
+        self.mutable = bool(mutable)
+        self._page = self.book.page("call_record")
+        for caller, caller_records in dict(records or {}).items():
+            self[caller] = caller_records
+
+    def __getitem__(self, caller: Any) -> Any:
+        row = (self.owner, str(caller))
+        records = self._page.latest(row)
+        if records is None:
+            raise KeyError(caller)
+        return _BookCallList(self._page, row) if self.mutable else records
+
+    def __setitem__(self, caller: Any, records: Any) -> None:
+        row = (self.owner, str(caller))
+        records = tuple(records)
+        if self._page.latest(row) != records:
+            self._page.revise(row, records)
+
+    def __delitem__(self, caller: Any) -> None:
+        row = (self.owner, str(caller))
+        if self._page.latest(row) is None:
+            raise KeyError(caller)
+        self._page.revise(row, None)
+
+    def __iter__(self):
+        for row in self._page.scope_rows(self.owner):
+            if self._page.latest(row) is not None:
+                yield row[1]
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    def setdefault(self, caller: Any, default: Any = ()) -> Any:
+        # The stored view, never ``default`` itself: an append to the
+        # returned list must land on the book.
+        if caller not in self:
+            self[caller] = default
+        return self[caller]
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Mapping):
+            return False
+        return {k: tuple(v) for k, v in self.items()} == {
+            k: tuple(v) for k, v in other.items()
+        }
+
+    def __repr__(self) -> str:
+        return f"SSACallTable(owner={self.owner!r}, {dict(self.items())!r})"
+
+    def __reduce__(self):
+        return (
+            _rebuild_call_table,
+            (
+                {k: tuple(v) for k, v in self.items()},
+                self.owner[0], self.mutable,
+            ),
+        )
+
+    def __deepcopy__(self, memo: dict) -> "SSACallTable":
+        return SSACallTable(
+            {k: tuple(v) for k, v in self.items()},
+            owner=self.owner[0], mutable=self.mutable, book=self.book,
+        )
+
+
+def _rebuild_call_table(records: Any, label: Any, mutable: bool) -> SSACallTable:
+    return SSACallTable(records, owner=label, mutable=mutable)
+
+
+@dataclass(frozen=True)
+class SSAMachineControlLink:
+    """One exact machine-state transfer between separately owned CFG regions.
+
+    This is not a source-language call. ``target_function`` names the owning
+    repository function or machine funclet, while ``target_address`` preserves
+    the architectural destination even when it is an interior PE address.
+    """
+
+    source_function: str
+    source_block: str
+    source_address: int
+    edge_role: str
+    target_address: int
+    target_function: str | None = None
+    target_block: str | None = None
+    target_kind: str = "unresolved"
+
+    def __post_init__(self) -> None:
+        if self.edge_role not in {"true", "false", "direct"}:
+            raise ValueError(f"unknown machine control edge role {self.edge_role!r}")
+        if self.target_kind not in {
+            "runtime-function-entry", "runtime-function-interior",
+            "outside-image", "unresolved",
+        }:
+            raise ValueError(f"unknown machine control target kind {self.target_kind!r}")
+        if self.target_kind.startswith("runtime-function") and not self.target_function:
+            raise ValueError("resolved machine control link requires target_function")
+
+
+@dataclass
+class SSAMachineControlTable:
+    links: tuple[SSAMachineControlLink, ...] = ()
+
+    def from_source(self, function_name: str) -> tuple[SSAMachineControlLink, ...]:
+        return tuple(
+            link for link in self.links if link.source_function == function_name
+        )
+
+    def to_address(self, address: int) -> tuple[SSAMachineControlLink, ...]:
+        return tuple(
+            link for link in self.links if link.target_address == int(address)
+        )
+
+
+@dataclass(frozen=True)
+class SSAMachineIndirectLink:
+    """One indirect machine transfer with its strongest proved identity."""
+
+    source_function: str
+    source_address: int
+    edge_kind: str
+    operand_kind: str
+    slot_address: int | None = None
+    target_kind: str = "dynamic-state"
+    target_address: int | None = None
+    target_function: str | None = None
+    external_identity: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.edge_kind not in {"call", "jump"}:
+            raise ValueError(f"unknown indirect edge kind {self.edge_kind!r}")
+        if self.target_kind not in {
+            "internal-function", "pe-import", "unresolved-slot", "dynamic-state",
+        }:
+            raise ValueError(f"unknown indirect target kind {self.target_kind!r}")
+        if self.target_kind == "internal-function" and not self.target_function:
+            raise ValueError("internal indirect link requires target_function")
+        if self.target_kind == "pe-import" and not self.external_identity:
+            raise ValueError("PE import link requires external_identity")
+
+
+@dataclass
+class SSAMachineIndirectTable:
+    links: tuple[SSAMachineIndirectLink, ...] = ()
+
+    def from_source(self, function_name: str) -> tuple[SSAMachineIndirectLink, ...]:
+        return tuple(
+            link for link in self.links if link.source_function == function_name
+        )
+
+
 @dataclass
 class IRModule:
     functions: Dict[str, Function]
     function_table: FunctionTable = field(default_factory=FunctionTable)
+    # Class definitions the module holds (identity -> fields + methods). Empty
+    # for a plain function module; populated when a class navigation table is
+    # lowered, so a backend can emit each method as its own function.
+    class_table: SSAClassTable = field(default_factory=SSAClassTable)
     # Backend-neutral cache of CFG recursion regions.  Keys are function
     # names; region records identify loop headers, latches, Phi values, and
     # the ProcessGraph SCC from which each loop was lowered.
     recursion_table: Dict[str, Dict[int, Any]] = field(default_factory=dict)
+    # Parallel-candidate regions survive lowering beside the ordinary CFG.
+    # The SSA instruction stream remains a valid serial fallback.
+    deployment_table: Dict[str, tuple[SSADeploymentRegion, ...]] = field(
+        default_factory=dict
+    )
+    # Function-scoped logical tensors. Value ids are only unique within a
+    # function, so each function owns its own descriptor table.
+    tensor_tables: Dict[str, SSATensorTable] = field(default_factory=dict)
+    # Raw variable-length row arenas used by lists, sets, dictionaries, and
+    # graph tables.  Policy stays in these compile-time records; emitted SSA
+    # contains only addresses, values, comparisons, branches, loads and stores.
+    sequence_tables: Dict[str, SSASequenceTable] = field(default_factory=dict)
+    # Function-scoped typed record correlations. Record fields point only to
+    # ordinary SSA values or other published descriptor tables.
+    record_tables: Dict[str, SSARecordTable] = field(default_factory=dict)
+    # Opaque program-object identities. Their signed i64 handles can be
+    # copied, compared, and stored by native backends; ``host_resident``
+    # records the explicit boundary at which dereference remains Python-owned.
+    reference_tables: Dict[str, SSAReferenceTable] = field(default_factory=dict)
+    # Every pursued source call occurrence, including those not yet supplied
+    # with a complete call-frame storage ABI.  Targets must not silently omit
+    # records whose resolution remains ``unresolved``.
+    call_table: Dict[str, tuple[SSACallRecord, ...]] = field(default_factory=dict)
+    # Exact cross-region machine control transfers. These carry full machine
+    # state and must never be rewritten as source calls merely because their
+    # destination happens to coincide with a function entry.
+    machine_control_table: SSAMachineControlTable = field(
+        default_factory=SSAMachineControlTable
+    )
+    machine_indirect_table: SSAMachineIndirectTable = field(
+        default_factory=SSAMachineIndirectTable
+    )
+    # Compiler-wide receipts that describe source-to-module decisions.  This
+    # is distinct from Function.metadata: a source transform can affect the
+    # relationship among several lowered functions and must remain observable
+    # even when a backend selects only one function for emission.
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # The module's call table is stored on the identity book whatever a
+        # caller assigns to it.
+        if name == "call_table" and not isinstance(value, SSACallTable):
+            value = SSACallTable(value, owner="module")
+        object.__setattr__(self, name, value)
+
+    def __post_init__(self) -> None:
+        if not self.deployment_table:
+            self.deployment_table = {
+                name: tuple(function.metadata.get("deployment_regions", ()))
+                for name, function in self.functions.items()
+                if function.metadata.get("deployment_regions")
+            }
+
+    def reachable_functions(
+        self,
+        *roots: str,
+        follow_call: "Callable[[Instr], str | None] | None" = None,
+    ) -> tuple[str, ...]:
+        """Function names reachable from ``roots``, in this module's order.
+
+        Reachability is MEMBERSHIP; ORDER belongs to the module.  The walk
+        follows each instruction's ``callee`` attribute -- a backend narrows
+        which calls are edges by passing ``follow_call``, returning the
+        callee name to follow or ``None`` -- and the result is reported in
+        ``functions`` insertion order.  Handing consumers a set here made
+        every one of them invent an ordering, and one of them iterated the
+        set itself: a per-process-random function order in emitted code.
+        """
+
+        def default_follow(instruction: "Instr") -> str | None:
+            callee = instruction.attributes.get("callee")
+            if callee is not None and str(callee) in self.functions:
+                return str(callee)
+            return None
+
+        follow = follow_call or default_follow
+        members: set[str] = set()
+        pending = [str(root) for root in roots]
+        while pending:
+            name = pending.pop()
+            if name in members or name not in self.functions:
+                continue
+            members.add(name)
+            for block in self.functions[name].blocks.values():
+                for instruction in block.instrs:
+                    followed = follow(instruction)
+                    if followed is not None:
+                        pending.append(str(followed))
+        return tuple(name for name in self.functions if name in members)
 
 # -----------------------------------------------------------------------------
 # Correlator for Language <-> SSA Operation Mappings

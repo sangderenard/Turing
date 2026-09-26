@@ -41,11 +41,12 @@ def test_contiguate_exposes_stack_as_a_real_dispatch_phase():
         _program("mul", (6, 7), 8, {6: (128, 3), 7: (1,), 8: (128, 3)}),
     )
     plan = contiguate(programs)
-    assert plan.dispatch_count == 2
+    assert plan.dispatch_count == 3
     assert plan.phases[1].operations[0].relation is (
         IndexRelation.CROSS_INVOCATION
     )
-    assert "other invocations" in plan.phases[1].barrier_before
+    assert "other invocations" in plan.phases[1].barrier_after
+    assert "other invocations" in plan.phases[2].barrier_before
 
 
 def test_contiguate_exposes_computed_scalar_before_wide_broadcast():

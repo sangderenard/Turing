@@ -1,6 +1,17 @@
 import numpy as np
+import pytest
 from src.common.tensors.numpy_backend import NumPyTensorOperations  # noqa: F401
 from src.common.tensors import AbstractTensor
+
+
+def test_cross_accepts_bare_three_vectors():
+    a = AbstractTensor.tensor([1.0, 0.0, 0.0])
+    b = AbstractTensor.tensor([0.0, 1.0, 0.0])
+
+    result = AbstractTensor.cross(a, b)
+
+    assert tuple(result.shape) == (3,)
+    assert np.asarray(result.tolist()) == pytest.approx([0.0, 0.0, 1.0])
 
 
 def test_autograd_identity_normals():

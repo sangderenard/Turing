@@ -97,6 +97,12 @@ FUNCTIONS: dict[str, MathFunction] = {
     # what to do near the pole.
     "tanh": MathFunction("tanh", math.tanh, -8.0, 8.0,
                          note="saturates; |x| > 8 is 1 to within 3e-7"),
+    # Saturating like tanh, but approaching its limits half as fast, so the
+    # domain is twice as wide: exp(-16) is 1.1e-7, under the table's own
+    # epsilon, whereas clamping at 8 would already be 3.4e-4 short.
+    "sigmoid": MathFunction("sigmoid", lambda x: 0.5 * (1.0 + math.tanh(0.5 * x)),
+                            -16.0, 16.0,
+                            note="saturates; |x| > 16 is 0 or 1 to within 1.2e-7"),
     "sinh": MathFunction("sinh", math.sinh, -6.0, 6.0,
                          note="clamped at |x| = 6; grows without bound beyond"),
     "cosh": MathFunction("cosh", math.cosh, -6.0, 6.0,

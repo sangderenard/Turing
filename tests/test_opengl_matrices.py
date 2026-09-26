@@ -100,6 +100,27 @@ def test_draw_layers_tolerates_an_initially_empty_point_graph():
     assert renderer.viewport == (640, 480)
 
 
+def test_draw_layers_merges_rainbow_ghosts_with_matching_point_sizes():
+    live = gl_api.PointLayer(
+        positions=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+        colors=np.array([[0.2, 0.4, 1.0, 1.0]], dtype=np.float32),
+        sizes_px=np.array([14.0], dtype=np.float32),
+        size_px_default=14.0,
+    )
+    ghost = gl_api.rainbow_history_points((
+        np.array([[-0.2, 0.0, 0.0]], dtype=np.float32),
+        np.array([[-0.1, 0.0, 0.0]], dtype=np.float32),
+    ))
+    renderer = _StubRenderer()
+
+    draw_layers(renderer, {"points": live, "ghost": ghost}, (640, 480))
+
+    assert renderer.points.positions.shape == (3, 3)
+    assert renderer.points.colors.shape == (3, 4)
+    assert renderer.points.sizes_px.shape == (3,)
+    assert renderer.points.colors[-1, 3] > renderer.points.colors[-2, 3]
+
+
 def test_draw_layers_can_use_an_oblique_perspective_view():
     V, F = icosahedron()
     mesh = MeshLayer(V.astype(np.float32), F.astype(np.uint32))
@@ -142,3 +163,33 @@ def test_second_order_autofit_double_smooths_bounds_changes():
 
     assert 0.0 < state.center_2[0] < state.center_1[0] < 10.0
     assert 1.0 < state.radius_2 < state.radius_1 < 10.0
+
+
+def test_second_order_autofit_rejects_one_frame_camera_freakouts():
+    state = SecondOrderAutoFitState(
+        center_1=np.zeros(3, dtype=np.float32),
+        center_2=np.zeros(3, dtype=np.float32),
+        radius_1=10.0,
+        radius_2=10.0,
+        updated_at=0.0,
+    )
+    state = advance_second_order_autofit(
+        state,
+        np.array([1.0e9, -1.0e9, 1.0e9], dtype=np.float32),
+        1.0e12,
+        now=1.0 / 120.0,
+    )
+
+    assert np.linalg.norm(state.center_2) < 0.1
+    assert state.radius_2 < 10.1
+
+    previous_center = state.center_2.copy()
+    previous_radius = state.radius_2
+    state = advance_second_order_autofit(
+        state,
+        np.array([np.nan, 0.0, 0.0], dtype=np.float32),
+        np.inf,
+        now=2.0 / 120.0,
+    )
+    assert np.array_equal(state.center_2, previous_center)
+    assert state.radius_2 == previous_radius

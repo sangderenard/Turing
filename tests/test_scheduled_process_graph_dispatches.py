@@ -10,6 +10,7 @@ from src.compiler.process_graph_fusion import (
 from src.compiler.glsl_deployment_strategy import (
     _control_partition_keys,
     _dispatch_subgraph,
+    _dispatch_metadata_node_classifier,
     _is_dispatch_metadata_node,
     _inert_routing_nodes,
 )
@@ -81,6 +82,32 @@ def test_canonical_static_tensor_operator_remains_numerical_dispatch():
     })
 
     assert not _is_dispatch_metadata_node(graph, 1)
+
+
+def test_dispatch_classification_counts_edges_once_per_stable_pass(monkeypatch):
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "input")
+    for node_id in range(2, 66):
+        _add(graph, node_id, "add", (node_id - 1,))
+    count_edges = graph.G.number_of_edges
+    calls = []
+
+    def counted_edges():
+        calls.append(True)
+        return count_edges()
+
+    monkeypatch.setattr(graph.G, "number_of_edges", counted_edges)
+    classify = _dispatch_metadata_node_classifier(graph)
+    for _ in range(2):
+        assert [node for node in graph.G if classify(node)] == [1]
+    assert len(calls) == 1
+
+    previous_cache = graph.G.graph["_dispatch_metadata_cache"]
+    _add(graph, 66, "return", (65,))
+    classify = _dispatch_metadata_node_classifier(graph)
+    assert graph.G.graph["_dispatch_metadata_cache"] is not previous_cache
+    assert [node for node in graph.G if classify(node)] == [1, 66]
+    assert len(calls) == 2
 
 
 def test_schedule_batches_isolated_dependency_columns_as_forward_records():
@@ -195,6 +222,76 @@ def test_shader_region_reducer_preserves_hidden_structural_dependency():
     assert [dispatch.node_ids for dispatch in plan.dispatches] == [(1,), (3,)]
 
 
+def test_direct_edge_does_not_hide_a_parallel_coordinator_dependency():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "coordinator", (1,))
+    _add(graph, 3, "Mul", (1, 2))
+
+    plan = reduce_scheduled_shader_regions(graph, executable_node_ids=(1, 3))
+
+    assert [dispatch.node_ids for dispatch in plan.dispatches] == [(1,), (3,)]
+    from src.compiler.glsl_deployment_strategy import _atomic_region_node_order
+    region_by_node = {node: region for region, dispatch in enumerate(plan.dispatches)
+                      for node in dispatch.node_ids}
+    assert _atomic_region_node_order(graph, (0, 1, 2, 3), region_by_node) == (0, 1, 2, 3)
+
+
+def test_tensor_reshape_shape_path_remains_outside_the_producer_region():
+    # balloon_tire_vector_step: predicted feeds reshape directly and also
+    # supplies predicted.shape[2] through a structural reshape-shape tuple.
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "GetAttr", (1,))
+    graph.G.nodes[2]["attributes"]["attribute"] = "shape"
+    _add(graph, 3, "Indexed", (2,))
+    _add(graph, 4, "Tuple", (3,))
+    _add(graph, 5, "Reshape", (1, 4))
+
+    plan = reduce_scheduled_shader_regions(graph, executable_node_ids=(1, 5))
+
+    assert [dispatch.node_ids for dispatch in plan.dispatches] == [(1,), (5,)]
+    from src.compiler.glsl_deployment_strategy import _atomic_region_node_order
+    owners = {node: index for index, dispatch in enumerate(plan.dispatches)
+              for node in dispatch.node_ids}
+    assert _atomic_region_node_order(graph, tuple(range(6)), owners) == tuple(range(6))
+
+
+def test_typed_call_result_projection_is_routing_but_its_tensor_index_is_numeric():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Call", (0,))
+    graph.G.nodes[1]["attributes"].update(callee_ref=7, aggregate_kind="tuple",
+                                          aggregate_leaf_value_ids=(3,))
+    _add(graph, 2, "Constant")
+    graph.G.nodes[2]["constant"] = 0
+    _add(graph, 3, "Indexed", (1, 2))
+    graph.G.nodes[3]["parents"] = [(1, "base"), (2, "index")]
+    graph.G.nodes[3]["attributes"]["authored_call_result_projection"] = True
+    graph.G.nodes[3]["tensor"] = {"shape": (8, 4, 14), "dtype": "float64"}
+    _add(graph, 4, "Indexed", (3, 2))
+    graph.G.nodes[4]["parents"] = [(3, "base"), (2, "index")]
+    graph.G.nodes[4]["tensor"] = {"shape": (4, 14), "dtype": "float64"}
+
+    assert _is_dispatch_metadata_node(graph, 3)
+    assert not _is_dispatch_metadata_node(graph, 4)
+    assert graph.G.has_edge(1, 3) and graph.G.has_edge(3, 4)
+
+
+def test_old_serialized_dispatch_classification_is_recomputed():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "Indexed")
+    graph.G.nodes[1]["attributes"]["authored_call_result_projection"] = True
+    old_cache = {"__fingerprint__": (graph.G.number_of_nodes(), graph.G.number_of_edges()),
+                 "__carried_initials__": frozenset(), 1: False}
+    graph.G.graph["_dispatch_metadata_cache"] = old_cache
+
+    assert _is_dispatch_metadata_node(graph, 1)
+    assert graph.G.graph["_dispatch_metadata_cache"] is not old_cache
+
+
 def test_tensor_accessor_and_its_scalar_comparison_stay_with_coordinator():
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 0, "Input")
@@ -226,6 +323,24 @@ def test_clean_subgraph_drops_obligations_to_excluded_parents():
     assert extracted.levels == {2: 1, 3: 2}
     assert extracted.roots == [3]
     assert graph.G.nodes[2]["parents"] == [(1, "arg0")]
+
+
+def test_clean_subgraph_preserves_cyclic_metadata_identity_without_aliasing_source():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "input")
+    shared = {"label": "shared"}
+    shared["backedge"] = shared
+    graph.G.graph["cyclic_metadata"] = shared
+    graph.G.nodes[1]["attributes"]["shared_metadata"] = shared
+
+    extracted = extract_clean_process_subgraph(graph, (1,))
+    copied = extracted.G.graph["cyclic_metadata"]
+
+    assert copied is not shared
+    assert copied["backedge"] is copied
+    assert extracted.G.nodes[1]["attributes"]["shared_metadata"] is copied
+    copied["label"] = "isolated"
+    assert shared["label"] == "shared"
 
 
 def test_shader_reducer_consumes_existing_process_graph_schedule():
@@ -265,6 +380,23 @@ def test_shader_region_reducer_leaves_an_unfusible_operation_alone():
         (2,),
         (3,),
     ]
+
+
+def test_shader_fusibility_reserves_shape_and_reduction_regions():
+    from src.compiler.glsl_deployment_strategy import (
+        _shader_fusible_node_ids,
+    )
+
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "reshape", (1,))
+    _add(graph, 3, "Mul", (2,))
+    _add(graph, 4, "sum", (3,))
+    _add(graph, 5, "Call", (3,))
+    graph.G.nodes[5]["attributes"] = {"tensor": "abs"}
+
+    assert _shader_fusible_node_ids(graph, (1, 2, 3, 4, 5)) == (1, 3, 5)
 
 
 def test_shader_region_reducer_keeps_multiple_published_values_fused():

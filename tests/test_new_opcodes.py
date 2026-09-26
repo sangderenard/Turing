@@ -9,21 +9,41 @@ pytestmark = pytest.mark.operators
 
 from src.hardware.analog_spec import (
     BiosHeader,
+    InstructionWord,
     Opcode,
     generate_bit_wave,
     header_frames,
     dominant_tone,
+    pack_instruction_word,
+    unpack_instruction_word,
 )
+from src.compiler.tape_compiler import TapeCompiler
 from src.hardware.cassette_tape import CassetteTapeBackend
 from src.turing_machine.tape_machine import TapeMachine
 from src.turing_machine.tape_map import TapeMap
 
 
 def make_machine():
-    tape = CassetteTapeBackend(tape_length=128)
+    tape = CassetteTapeBackend(
+        tape_length=128,
+        time_scale_factor=0.0,
+        play_audio=False,
+    )
     machine = TapeMachine(tape, bit_width=1)
     machine.data_registers = {0: 0, 1: 10, 2: 20, 3: 30}
     return machine, tape
+
+
+def test_instruction_codec_preserves_registers_and_parameter():
+    instruction = InstructionWord(
+        Opcode.MU, reg_a=1, reg_b=2, dest=3, param=63,
+    )
+
+    word = pack_instruction_word(instruction)
+    frame, = TapeCompiler.binarize_instructions([instruction])
+
+    assert sum(bit << (15 - index) for index, bit in enumerate(frame)) == word
+    assert unpack_instruction_word(word) == instruction
 
 
 def test_seek_opcode_moves_head_and_register():
@@ -56,6 +76,24 @@ def test_write_opcode_copies_from_reg_b():
     tape.close()
 
 
+def test_load_store_use_fixed_width_spill_slots_after_registers():
+    tape = CassetteTapeBackend(tape_length=128, time_scale_factor=0.0)
+    machine = TapeMachine(tape, bit_width=4)
+    machine.tape_map = TapeMap(bios=None, instruction_frames=0)
+    machine.data_registers = {0: 0, 1: 4, 2: 8}
+    source = [generate_bit_wave(1, 0) for _ in range(4)]
+    machine.transport[0:4] = source
+
+    machine._execute(Opcode.STORE, dest=0, reg_a=0, reg_b=0, param=2)
+    machine._execute(Opcode.LOAD, dest=1, reg_a=0, reg_b=0, param=2)
+
+    out = machine.transport[4:8]
+    assert all(dominant_tone(frame).amp > 0.0 for frame in out)
+    spill_start = (3 + 2) * 4
+    assert all((0, 0, spill_start + index) in tape._tape_frames for index in range(4))
+    tape.close()
+
+
 def encode_instruction(word: int, frame_idx: int, tape: CassetteTapeBackend) -> None:
     for lane in range(16):
         bit = (word >> (15 - lane)) & 1
@@ -63,7 +101,11 @@ def encode_instruction(word: int, frame_idx: int, tape: CassetteTapeBackend) -> 
 
 
 def test_run_halts_on_halt_opcode():
-    tape = CassetteTapeBackend(tape_length=256)
+    tape = CassetteTapeBackend(
+        tape_length=256,
+        time_scale_factor=0.0,
+        play_audio=False,
+    )
     machine = TapeMachine(tape, bit_width=1)
 
     bios = BiosHeader(1.0, 1.0, 0.0, [], [], 0)

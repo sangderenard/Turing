@@ -27,7 +27,7 @@ from src.common.double_buffer import DoubleBuffer
 # ---------------------------------------------------------------------------
 
 try:  # pragma: no cover - tolerate missing OpenGL libs
-    from .renderer import MeshLayer, LineLayer, PointLayer, GLRenderer
+    from .renderer import CudaGraphLayer, MeshLayer, LineLayer, PointLayer, GLRenderer
 except Exception:  # noqa: BLE001
     from dataclasses import dataclass
     import numpy as _np
@@ -43,6 +43,10 @@ except Exception:  # noqa: BLE001
         positions: _np.ndarray
         colors: _np.ndarray | None = None
         width: float = 2.0
+        active: _np.ndarray | None = None
+        pulse: float = 0.0
+        topology_revision: int = -1
+        activation_revision: object = None
 
     @dataclass
     class PointLayer:
@@ -50,6 +54,28 @@ except Exception:  # noqa: BLE001
         colors: _np.ndarray | None = None
         sizes_px: _np.ndarray | None = None
         size_px_default: float = 6.0
+        active: _np.ndarray | None = None
+        pulse: float = 0.0
+        topology_revision: int = -1
+        activation_revision: object = None
+
+    @dataclass
+    class CudaGraphLayer:
+        positions: object
+        node_count: int
+        edge_indices: _np.ndarray
+        node_colors: _np.ndarray
+        node_sizes: _np.ndarray
+        edge_colors: _np.ndarray
+        node_active: _np.ndarray
+        edge_active: _np.ndarray
+        pulse: float = 0.0
+        width: float = 1.5
+        topology_revision: int = -1
+        activation_revision: object = None
+        camera_center: _np.ndarray | None = None
+        camera_radius: float = 8.0
+        release: object | None = None
 
     class GLRenderer:  # type: ignore[empty-body]
         pass
@@ -77,17 +103,48 @@ def advance_second_order_autofit(
     target_radius: float,
     *,
     now: float,
-    time_constant: float = 3.5,
+    time_constant: float = 0.35,
 ) -> SecondOrderAutoFitState:
-    """Advance a double-smoothed center/radius without overshoot."""
+    """Advance a responsive double-smoothed center/radius without overshoot."""
 
     center = np.asarray(target_center, dtype=np.float32)
-    radius = max(1.0, float(target_radius))
+    radius = float(target_radius)
+    valid_target = bool(
+        center.shape == (3,)
+        and np.isfinite(center).all()
+        and math.isfinite(radius)
+        and radius > 0.0
+    )
     if state is None:
+        if not valid_target:
+            center = np.zeros(3, dtype=np.float32)
+            radius = 8.0
+        radius = max(1.0, radius)
         return SecondOrderAutoFitState(
             center.copy(), center.copy(), radius, radius, float(now)
         )
     dt = min(0.1, max(0.0, float(now) - state.updated_at))
+    if not valid_target:
+        # A non-finite physics observation must never poison the persistent
+        # view matrices. Keep the last valid fit and advance its timestamp.
+        state.updated_at = float(now)
+        return state
+    radius = max(1.0, radius)
+    # An AABB is deliberately cheap on the GPU, but a single transient node
+    # can be a very distant outlier for one observation. Bound the innovation
+    # entering the two-pole filter; persistent expansion still gets followed,
+    # while a one-frame outlier cannot cause a perspective flash.
+    center_delta = center - state.center_1
+    center_distance = float(np.linalg.norm(center_delta))
+    maximum_center_innovation = max(2.0, state.radius_2 * 2.0)
+    if center_distance > maximum_center_innovation:
+        center = state.center_1 + center_delta * (
+            maximum_center_innovation / center_distance
+        )
+    radius = min(
+        max(radius, max(1.0, state.radius_2 * 0.5)),
+        max(2.0, state.radius_2 * 2.0),
+    )
     alpha = 1.0 - math.exp(-dt / max(1e-4, float(time_constant)))
     state.center_1 += alpha * (center - state.center_1)
     state.center_2 += alpha * (state.center_1 - state.center_2)
@@ -135,7 +192,9 @@ def rainbow_history_points(history: Iterable[np.ndarray]) -> PointLayer:
     pos_acc: list[np.ndarray] = []
     col_acc: list[np.ndarray] = []
     for i, (pos, (r, g, b)) in enumerate(zip(frames, rgb)):
-        alpha = 1.0 - (i / n)
+        # ``history`` is oldest -> newest, so the recent ghosts should be the
+        # strongest and the remote tail should actually fade away.
+        alpha = (i + 1) / n
         col = np.tile(np.array([r, g, b, alpha * 0.6], dtype=np.float32), (pos.shape[0], 1))
         pos_acc.append(pos)
         col_acc.append(col)
@@ -342,8 +401,12 @@ def draw_layers(
     if isinstance(mesh, MeshLayer):
         renderer.set_mesh(mesh)
 
+    cuda_graph = layers.get("cuda_graph")
+    if isinstance(cuda_graph, CudaGraphLayer):
+        renderer.set_cuda_graph(cuda_graph)
+
     lines = layers.get("lines")
-    if isinstance(lines, LineLayer):
+    if not isinstance(cuda_graph, CudaGraphLayer) and isinstance(lines, LineLayer):
         renderer.set_lines(lines)
 
     # Prefer fluid points if available, fall back to generic points.
@@ -351,7 +414,9 @@ def draw_layers(
     pts = layers.get("fluid") or layers.get("points")
     ghost = layers.get("ghost")
 
-    if isinstance(pts, PointLayer) and isinstance(ghost, PointLayer):
+    if isinstance(cuda_graph, CudaGraphLayer):
+        active_pts = None
+    elif isinstance(pts, PointLayer) and isinstance(ghost, PointLayer):
         pos = np.concatenate([pts.positions, ghost.positions], axis=0)
 
         def _as_colors(pl: PointLayer, n: int) -> np.ndarray:
@@ -365,13 +430,30 @@ def draw_layers(
             _as_colors(ghost, ghost.positions.shape[0]),
         ], axis=0)
 
+        live_sizes = (
+            np.full((pts.positions.shape[0],), pts.size_px_default, np.float32)
+            if pts.sizes_px is None
+            else np.asarray(pts.sizes_px, dtype=np.float32).reshape(-1)
+        )
+        # Ghosts intentionally stay smaller than their live nodes so motion
+        # reads as a trail rather than a stack of opaque copies.
+        ghost_sizes = (
+            np.full(
+                (ghost.positions.shape[0],),
+                max(2.0, pts.size_px_default * 0.48),
+                np.float32,
+            )
+            if ghost.sizes_px is None
+            else np.asarray(ghost.sizes_px, dtype=np.float32).reshape(-1)
+        )
         merged = PointLayer(
             positions=pos,
             colors=col,
-            sizes_px=getattr(pts, "sizes_px", None),
+            sizes_px=np.concatenate([live_sizes, ghost_sizes]),
             size_px_default=getattr(pts, "size_px_default", 6.0),
         )
         renderer.set_points(merged)
+        active_pts = merged
     elif isinstance(pts, PointLayer):
         renderer.set_points(pts)
         active_pts = pts
@@ -381,27 +463,53 @@ def draw_layers(
     else:
         active_pts = None
 
-    # Auto-fit view to the supplied geometry if the renderer supports it.
+    # Auto-fit is an observational camera controller, not part of physics.
+    # Sampling every rendered frame performs two full-graph CPU reductions and
+    # duplicates edge geometry for no visible benefit. Sample the authoritative
+    # point set at low frequency and advance the tiny second-order filter each
+    # frame from that cached target.
     if hasattr(renderer, "set_mvp"):
-        pos_list: list[np.ndarray] = []
-        if isinstance(mesh, MeshLayer):
-            pos_list.append(mesh.positions)
-        if isinstance(lines, LineLayer):
-            pos_list.append(lines.positions)
-        if isinstance(active_pts, PointLayer):
-            pos_list.append(active_pts.positions)
-        pos_list = [positions for positions in pos_list if positions.size]
-        if pos_list:
-            pts_all = np.concatenate(pos_list, axis=0)
-            target_center = pts_all.mean(axis=0)
-            target_radius = float(
-                np.linalg.norm(pts_all - target_center, axis=1).max()
+        now = time.perf_counter()
+        next_sample = float(getattr(renderer, "_autofit_sample_at", 0.0))
+        target = getattr(renderer, "_autofit_target", None)
+        if isinstance(cuda_graph, CudaGraphLayer):
+            target = (
+                np.asarray(
+                    cuda_graph.camera_center
+                    if cuda_graph.camera_center is not None
+                    else (0.0, 0.0, 0.0),
+                    dtype=np.float32,
+                ),
+                max(1.0, float(cuda_graph.camera_radius)),
             )
+            renderer._autofit_target = target
+            renderer._autofit_sample_at = now + 0.5
+        if now >= next_sample or target is None:
+            if isinstance(active_pts, PointLayer) and active_pts.positions.size:
+                sample_positions = active_pts.positions
+            elif isinstance(mesh, MeshLayer) and mesh.positions.size:
+                sample_positions = mesh.positions
+            elif isinstance(lines, LineLayer) and lines.positions.size:
+                sample_positions = lines.positions
+            else:
+                sample_positions = None
+            if sample_positions is not None:
+                target_center = sample_positions.mean(axis=0)
+                target_radius = float(
+                    np.linalg.norm(
+                        sample_positions - target_center, axis=1
+                    ).max()
+                )
+                target = (target_center, target_radius)
+                renderer._autofit_target = target
+                renderer._autofit_sample_at = now + 0.5
+        if target is not None:
+            target_center, target_radius = target
             auto_fit = advance_second_order_autofit(
                 getattr(renderer, "_second_order_autofit", None),
                 target_center,
                 target_radius,
-                now=time.perf_counter(),
+                now=now,
             )
             renderer._second_order_autofit = auto_fit
             center = auto_fit.center_2
@@ -556,9 +664,10 @@ def make_threaded_draw_hook(
     """Return a thread-backed draw hook and its controller.
 
     The returned tuple ``(hook, thread)`` provides a callable ``hook`` that
-    enqueues layer mappings to be drawn on a dedicated thread.  ``thread`` is the
-    :class:`~opengl_render.threaded.GLRenderThread` instance managing the queue
-    and history. ``loop_mode`` determines behaviour when no new frames arrive:
+    publishes the newest layer mapping to a dedicated thread without waiting.
+    Superseded, not-yet-rendered frames are dropped. ``thread`` is the
+    :class:`~opengl_render.threaded.GLRenderThread` instance managing the latest
+    frame mailbox and rendered history. ``loop_mode`` determines behaviour when no new frames arrive:
     ``"idle"`` redraws the last frame, while ``"loop"`` and ``"bounce"`` replay
     the stored history. The thread **must** construct the GL context inside
     itself by calling the provided ``renderer_factory``.

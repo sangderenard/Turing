@@ -7,6 +7,13 @@ GLSL, as WebAssembly, and as plain NumPy or PyTorch -- all from the same
 compilation, not from six re-implementations that have to be kept in step by
 hand.
 
+The per-backend artifacts handled here are internal projections of a Python
+compilation that has already passed through AST and ProcessGraph ingestion.
+This module is not a collection of compiler entrypoints.  In particular, a
+backend accepting a normalized numerical ``FusedProgram`` does not mean the
+Python recompiler accepts only numerical functions; it means this late stage
+is emitting the numerical regions selected by the complete compilation.
+
 Everything here starts from the AOT compilation
 (``aot_compile.compile_ast_aot`` -> ``lower_precompile_and_control_to_ssa``).
 That is the shared stage: the SSA module is what the language backends
@@ -41,6 +48,10 @@ class BackendSource:
     # serialized into the page; the bundle builder uses it to compile and
     # verify the exact source that it publishes.
     artifact: Any = field(default=None, repr=False, compare=False)
+    # Deployment role is separate from source language.  A browser shader is
+    # only allowed to take over the generated page when the bundle explicitly
+    # publishes it as the shader surface.
+    role: str = ""
 
     @property
     def lines(self) -> int:
@@ -65,6 +76,7 @@ class BackendSourceSet:
                     "reason": s.reason,
                     "highlight": s.highlight,
                     "lines": s.lines,
+                    **({"role": s.role} if s.role else {}),
                 }
                 for s in self.sources
             ]
@@ -134,9 +146,11 @@ def normalized_program(program: Any) -> Any:
         normalized_meta = {}
         for value_id, entry in meta.items():
             dtype = getattr(entry, "dtype", None)
-            if isinstance(dtype, str) and "." in dtype:
+            dtype_name = None if dtype is None else str(dtype)
+            if dtype_name is not None and "." in dtype_name:
                 entry = type(entry)(
-                    shape=entry.shape, dtype=dtype.rsplit(".", 1)[-1],
+                    shape=entry.shape,
+                    dtype=dtype_name.rsplit(".", 1)[-1],
                     device=entry.device,
                 )
             normalized_meta[value_id] = entry
@@ -150,10 +164,25 @@ def normalized_program(program: Any) -> Any:
     from .fused_program_wasm_backend import required_steps
 
     live = required_steps(folded)
+    live_value_ids = set(folded.feeds) | {
+        int(step.result_id) for step in live
+    }
     return FusedProgram(
         version=folded.version, feeds=set(folded.feeds), steps=live,
         outputs=dict(folded.outputs), state_in=folded.state_in,
-        meta=folded.meta, extras=folded.extras,
+        # Dead-step pruning must prune its type records too.  Keeping metadata
+        # for removed values makes an otherwise valid public projection fail
+        # the shared precompile validator as an orphaned-value artifact.
+        meta=(
+            None
+            if folded.meta is None
+            else {
+                value_id: entry
+                for value_id, entry in folded.meta.items()
+                if int(value_id) in live_value_ids
+            }
+        ),
+        extras=folded.extras,
     )
 
 
@@ -197,11 +226,15 @@ def collect_backend_sources(
     wasm_source: str = "",
     program: Any = None,
 ) -> BackendSourceSet:
-    """Emit ``aot`` through every backend that will take it.
+    """Emit internal products of ``aot`` through every backend that takes them.
 
     ``aot`` is an ``AOTCompilation`` from a ``precompile_only=True`` run, so
     the numeric and control IR are backend-agnostic at this point and no
     backend has been privileged by getting there first.
+
+    This function is downstream of the Python compiler frontend.  The local
+    ``program`` variable below is only its normalized numerical member, not a
+    replacement input language and not the application's compilation path.
     """
 
     def note(message: str, **detail: Any) -> None:
@@ -217,6 +250,9 @@ def collect_backend_sources(
     # ones nothing reads. Dead-step pruning cannot remove those -- they are
     # outputs -- so a caller that knows which result it actually wants says
     # so, and the rest becomes prunable.
+    # INTERNAL NUMERICAL MEMBER: Python AST ingestion and control/map planning
+    # have already happened.  Do not move this extraction outward into an
+    # application entrypoint or describe it as the Python compiler's scope.
     raw = program if program is not None else getattr(
         aot.compiled_shell_program, "program", aot.compiled_shell_program
     )
@@ -230,10 +266,16 @@ def collect_backend_sources(
     try:
         from .precompile_to_ssa import lower_precompile_and_control_to_ssa
 
+        # ``program`` may be the public projection selected by the bundle
+        # (rather than every value observed during capture).  Lower that
+        # exact compiled tick projection so SSA-backed targets publish the same ABI
+        # as Wasm and the Python reference.  The control and region programs
+        # remain those planned by the original AOT compilation below.
         lowering = lower_precompile_and_control_to_ssa(
-            aot.compiled_shell_program,
+            program,
             aot.shell_control_program,
             region_programs=aot.region_programs,
+            hierarchy_plan=getattr(aot, "hierarchy_plan", None),
             numerical_name=numerical_name,
             control_name=control_name,
             identity_table=getattr(aot, "identity_table", {}),
@@ -382,17 +424,27 @@ def collect_backend_sources(
             reason=f"{type(error).__name__}: {error}",
         ))
 
-    # --- WebGL 2 --------------------------------------------------------
+    # --- WebGL 2 (deprecated -- see machine_targets._WebGLTarget) -------
     # WebGL shares GLSL scalar expressions, not desktop compute storage.
     # Its fragment-raster adapter therefore gets its own source tab and an
     # honest shortfall when the program needs a non-browser-native layout.
+    #
+    # machine_targets.get_target("webgl") redirects new Python callers to
+    # "webgpu" (deprecated=True, redirect_to="webgpu"). This bundle builder
+    # is a deliberate exception -- it keeps emitting real WebGL 2 with
+    # role="shader-surface" alongside webgpu's, because published pages need
+    # a working fallback for browsers without WebGPU support. The published
+    # JS runtime picks whichever candidate its own feature detection
+    # supports (see wasm_html_shell.py's priority order: webgpu -> webgl ->
+    # plain canvas), so both stay real, not just one placeholder plus a
+    # deprecated afterthought.
     try:
         from .fused_program_webgl_backend import emit_webgl_fragment_module
 
         emitted = emit_webgl_fragment_module(program, name=numerical_name)
         collected.append(BackendSource(
             language="webgl",
-            title="WebGL 2",
+            title="WebGL 2 (deprecated)",
             source=emitted.source,
             available=emitted.complete,
             reason=(
@@ -400,11 +452,72 @@ def collect_backend_sources(
                 else emitted.shortfalls[0].format()
             ),
             highlight="c",
+            role="shader-surface",
         ))
         note("WebGL emitted", complete=emitted.complete)
     except Exception as error:
         collected.append(BackendSource(
-            language="webgl", title="WebGL 2", available=False,
+            language="webgl", title="WebGL 2 (deprecated)", available=False,
+            reason=f"{type(error).__name__}: {error}",
+        ))
+
+    # --- WebGPU (compute) ------------------------------------------------
+    # Registered in machine_targets as webgl's replacement
+    # (machine_targets._WebGPUTarget, backed by ssa_webgpu_backend.py).
+    # Carries role="shader-surface" alongside webgl's: site_bundle.py's
+    # _shader_execution_descriptor tries candidates in priority order
+    # (webgpu -> webgl -> canvas), so both are legitimate shader-surface
+    # candidates here; which one a published page actually runs is a
+    # runtime feature-detection choice made in the browser, not a
+    # build-time one made here.
+    try:
+        from .precompile_to_ssa import lower_fused_program_to_ssa
+        from .ssa_webgpu_backend import emit_module as emit_webgpu_module
+        from ..transmogrifier.ssa import IRModule
+
+        function, lowering_shortfalls = lower_fused_program_to_ssa(
+            program, function_name=numerical_name,
+        )
+        returned = next(
+            (
+                instruction.args
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Ret", "ret", "Return", "return"}
+            ),
+            (),
+        )
+        count = max(
+            (int(size) for value in function.args for size in value.shape),
+            default=1,
+        )
+        emitted = emit_webgpu_module(
+            IRModule({numerical_name: function}),
+            name=numerical_name,
+            outputs={numerical_name: returned},
+            count=count,
+        )
+        complete = not lowering_shortfalls and emitted.complete
+        reason = ""
+        if lowering_shortfalls:
+            item = lowering_shortfalls[0]
+            reason = f"{item.domain}:{item.name} at {item.location}: {item.reason}"
+        elif not emitted.complete:
+            reason = emitted.shortfalls[0].format()
+        collected.append(BackendSource(
+            language="webgpu",
+            title="WebGPU (compute)",
+            source=emitted.source,
+            available=complete,
+            reason=reason,
+            highlight="rust",
+            role="shader-surface",
+            artifact=emitted,
+        ))
+        note("WebGPU emitted", complete=complete)
+    except Exception as error:
+        collected.append(BackendSource(
+            language="webgpu", title="WebGPU (compute)", available=False,
             reason=f"{type(error).__name__}: {error}",
         ))
 

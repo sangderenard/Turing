@@ -7,6 +7,16 @@ from typing import Tuple, Optional
 import math
 
 
+# Build-time channel declarations and the explicit shared dt layout.
+from .error_channels import (
+    channel_name, declare_channel, declared_channels, packed_channel_names,
+    unpack_channel_name, empty_channels,
+)
+from ..tensors import AbstractTensor
+from .control_diagnostics import empty_control
+from .participants import empty_publication
+
+
 @dataclass
 class Metrics:
     """Simulation diagnostics collected during a micro-step.
@@ -34,32 +44,59 @@ class Metrics:
     dt_limit: float | None = None
     # Named scientific error channels. Controllers compare these against
     # Targets.error_limits without forcing every engine into fluid terminology.
-    error_channels: dict[str, float] = field(default_factory=dict)
+    error_channels: AbstractTensor = field(default_factory=empty_channels)
+    error_present: AbstractTensor = field(default_factory=empty_channels)
+    # Controller-owned diagnostics have fixed columns, separate from measures.
+    control_values: AbstractTensor = field(default_factory=empty_control)
+    control_present: AbstractTensor = field(default_factory=empty_control)
+    # Participant rows forwarded from the producer's declared storage.
+    pub_exchange_time: AbstractTensor = field(default_factory=empty_publication)
+    pub_exchange_time_present: AbstractTensor = field(default_factory=empty_publication)
+    pub_contract: AbstractTensor = field(default_factory=empty_publication)
+    pub_dt_limit: AbstractTensor = field(default_factory=empty_publication)
+    pub_dt_limit_present: AbstractTensor = field(default_factory=empty_publication)
+    pub_values: AbstractTensor = field(default_factory=empty_publication)
+    pub_present: AbstractTensor = field(default_factory=empty_publication)
+    pub_limits: AbstractTensor = field(default_factory=empty_publication)
+    pub_limits_present: AbstractTensor = field(default_factory=empty_publication)
     hard_failure: bool = False
     advanced_dt: float | None = None
+    # Stable diagnostic tokens attached by the controller when it proceeds
+    # unresolved.  This is a total record field: ordinary and hard-failure
+    # metrics carry the empty report, so native record state never has to
+    # encode Python's dynamic-attribute absence as an anonymous input.
+    unresolved_report: list[str] = field(default_factory=list)
+
+
+def _scalar(value, default: float = 0.0) -> float:
+    """A Python float from a number or a 0-d tensor, never truncated.
+
+    ``float(tensor)`` on an AbstractTensor falls through ``__index__`` and
+    TRUNCATES (0.51 -> 0.0), which silently zeroed every sub-metre-per-second
+    velocity a tensor-publishing core reported and left the CFL proposal
+    unbounded.  ``.item()`` is the exact conversion.
+    """
+
+    if value is None:
+        return float(default)
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return float(item())
+        except (TypeError, ValueError):
+            pass
+    return float(value)
 
 
 def coerce_metrics(value) -> Metrics:
-    """Normalize legacy metric-shaped records into the canonical contract."""
+    """Return the canonical tensorized Metrics record without conversion.
 
-    if isinstance(value, Metrics):
-        return value
-    if value is None:
-        raise TypeError("simulation advance returned no metrics")
-    return Metrics(
-        max_vel=float(getattr(value, "max_vel", 0.0)),
-        max_flux=float(getattr(value, "max_flux", 0.0)),
-        div_inf=float(getattr(value, "div_inf", 0.0)),
-        mass_err=float(getattr(value, "mass_err", 0.0)),
-        osc_flag=bool(getattr(value, "osc_flag", False)),
-        stiff_flag=bool(getattr(value, "stiff_flag", False)),
-        sim_frame=int(getattr(value, "sim_frame", 0)),
-        proc_ms=float(getattr(value, "proc_ms", 0.0)),
-        dt_limit=getattr(value, "dt_limit", None),
-        error_channels=dict(getattr(value, "error_channels", {}) or {}),
-        hard_failure=bool(getattr(value, "hard_failure", False)),
-        advanced_dt=getattr(value, "advanced_dt", None),
-    )
+    The name remains as a compatibility boundary for existing dt callers.
+    Producers own the Metrics ABI and its declared spans; this function does
+    not construct a second record or extract tensor scalars.
+    """
+
+    return value
 
 
 class ScalerControl:

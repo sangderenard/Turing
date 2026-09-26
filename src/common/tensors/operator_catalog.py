@@ -32,6 +32,7 @@ CREATION_OPERATORS = frozenset(
         "randint",
         "randint_like",
         "randn",
+        "random_source",
         "random_tensor",
         "randoms",
         "range",
@@ -129,6 +130,8 @@ COMPOSITE_MATH_OPERATORS = frozenset(
         "bitand",
         "bitor",
         "bitxor",
+        "shl",
+        "shr",
         "cbrt",
         "clamp",
         "clamp_max",
@@ -176,6 +179,7 @@ TYPE_AND_DEVICE_OPERATORS = frozenset(
     {
         "astype",
         "bool",
+        "cast_like",
         "cpu",
         "cuda",
         "double",
@@ -261,6 +265,10 @@ HOST_BOUNDARY_OPERATORS = frozenset(
 # Public compatibility spellings are retained at graph boundaries and resolve
 # to one canonical operation before backend planning.
 OPERATOR_ALIASES = {
+    # Frontend tensor constructors lose their library qualifier at AST
+    # ingestion.  ``Tensor(...)`` is the public constructor spelling left by
+    # that step; repository IR owns the canonical ``tensor(...)`` operation.
+    "Tensor": "tensor",
     "abs_": "abs",
     "argmax_": "argmax",
     "argmin_": "argmin",
@@ -299,6 +307,12 @@ OPERATOR_ALIASES = {
     "not_equal_": "not_equal",
     "ones_": "ones",
     "ones_like_": "ones_like",
+    "rand_like": "random_source",
+    "randint": "random_source",
+    "randint_like": "random_source",
+    "randn": "random_source",
+    "random_tensor": "random_source",
+    "randoms": "random_source",
     "pad2d_": "pad2d",
     "real_": "real",
     "repeat_interleave_": "repeat_interleave",
@@ -348,6 +362,7 @@ NON_OPERATOR_PUBLIC_API = frozenset(
         "autograd",
         "backward",
         "benchmark",
+        "blas",
         "bool_dtype",
         "bool_dtype_",
         "check_or_build_registry",
@@ -359,10 +374,13 @@ NON_OPERATOR_PUBLIC_API = frozenset(
         "grad",
         "grad_fn",
         "inf",
+        "install_mathematical_library",
         "is_leaf",
         "linalg",
         "long_dtype",
         "long_dtype_",
+        "math",
+        "compiled_math",
         "nan",
         "ninf",
         "random",
@@ -372,6 +390,7 @@ NON_OPERATOR_PUBLIC_API = frozenset(
         "retain_grad",
         "set_default_backend",
         "use_backend",
+        "use_semantic_mathematical_library",
         "use_tape",
         "zero_grad",
     }
@@ -382,6 +401,20 @@ def canonical_operator_name(name: str) -> str:
     """Resolve a public compatibility spelling to the canonical vocabulary."""
 
     return OPERATOR_ALIASES.get(name, name)
+
+
+def compositional_tensor_source_references():
+    """Canonical operations whose implementation is authored from other ops.
+
+    These callables are compiler source, never runtime callbacks.  They are
+    supplied only for operations that have no repository kernel of their own,
+    so source pursuit exposes the existing AbstractTensor construction without
+    replacing a working primitive lowering.
+    """
+
+    from .linalg import solve
+
+    return {"solve": solve}
 
 
 def include_ast_parent_outside_abstract_tensor(value) -> bool:

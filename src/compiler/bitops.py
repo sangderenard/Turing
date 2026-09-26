@@ -174,6 +174,14 @@ class Limit(BitStruct):
         self.rinc = rinc
         self.fromtheleft = fromtheleft
 
+    @property
+    def lower(self):
+        return self.integer_pieces[1]
+
+    @property
+    def upper(self):
+        return self.integer_pieces[2]
+
 class Tensor(Domain):
     CONTINUOUS = auto()
     SPARSE = auto()
@@ -409,6 +417,294 @@ class FunctionCall(Goto, Struct):
         self.is_function_call = True  # flag for FunctionCall property
         self.schema = Schema(fields, types, widths, encodings)
         self.args = args
+
+
+
+# =====================================================================
+# SYMPY MEANINGS: what each mathematical construct above declares
+# =====================================================================
+# (2026-09-22)  The classes above name the mathematical constructs a
+# program is made of -- Sum, Integral, Derivative, TaylorSeries, Table,
+# Function, Manifold over a Domain of Limits with Boundaries -- but never
+# said what they MEAN.  This section finishes that half: each construct
+# states which SymPy construct it is the meaning of, and ``declare`` turns
+# a SymPy node that survived symbolic reduction (see
+# symbolic_process_graph.ingest_sympy_expression: SymPy reduces first,
+# always) into the declaration of its meaning.
+#
+# The PROGRAMMATIC half is a slot, not an implementation: ``lowering`` is
+# the subgraph that realises a declaration inside a ProcessGraph, plugged
+# per construct with ``plug`` (quadrature for an Integral, graph reversal
+# for a Derivative, a tensor reduction for a Sum, a DEC operator for a
+# Manifold, a table lookup for a Table, a bound callee for a Function).
+# Nothing here evaluates anything.
+
+Sum.SYMPY_MEANING = ("Sum",)
+Integral.SYMPY_MEANING = ("Integral",)          # an Integral IS a Sum over a continuous Domain
+Derivative.SYMPY_MEANING = ("Derivative",)
+TaylorSeries.SYMPY_MEANING = ("series", "Order")
+Table.SYMPY_MEANING = ("AppliedUndef",)         # a field sampled on a Domain
+Function.SYMPY_MEANING = ("AppliedUndef",)      # a field that is a bound callee
+Manifold.SYMPY_MEANING = ("nabla", "nabla_k", "nabla_R", "nabla_v", "nabla_mu", "nabla_nu")  # a differential operator over a Domain
+Tensor.SYMPY_MEANING = ("cross", "transpose", "tr", "det", "outer", "Matrix", "MatMul",
+                        "KroneckerDelta", "Identity")
+
+#: Differential operators a Manifold declaration may name, and the discrete
+#: exterior calculus operator each is (DECSystem, abstract_convolution).
+MANIFOLD_OPERATORS = {
+    "grad": "d0", "curl": "d1", "div": "-delta1",
+    "laplacian_0": "laplace0", "laplacian_1": "laplace1",
+    # not DEC complex operators: u . grad (advection of a vector field) and
+    # the metric connection's covariant derivative (spacetime/curved domain)
+    "advective": "u.d0", "covariant": "connection",
+}
+#: Boundary kinds, by name (the ``Boundary`` flag attributes above are bare
+#: ``auto()`` objects on a non-Enum class and carry no usable value).
+BOUNDARY_KINDS = ("dirichlet", "neumann", "periodic", "function", "constant")
+
+#: construct class -> callable(declaration, graph, add_node) -> node id.
+#: Empty until the programmatic lowerings are plugged in.
+PROGRAMMATIC_LOWERINGS = {}
+
+
+class Declaration:
+    """The declared meaning of one SymPy node that SymPy could not reduce.
+
+    ``construct``  the bitops class it means (Sum, Integral, ...), or None
+                   when the meaning is ambiguous and must be declared
+    ``domain``     a Domain of Limits (per index / integration axis)
+    ``fields``     construct-specific: variables and order, operator kind,
+                   arguments, boundary kinds
+    ``missing``    what still has to be declared before it can lower
+    """
+
+    def __init__(self, construct, sympy_node, domain=None, fields=None, missing=()):
+        self.construct = construct
+        self.sympy = sympy_node
+        self.domain = domain
+        self.fields = dict(fields or {})
+        self.missing = tuple(missing)
+
+    @property
+    def lowering(self):
+        return PROGRAMMATIC_LOWERINGS.get(self.construct)
+
+    @property
+    def complete(self):
+        return self.construct is not None and not self.missing
+
+    def __repr__(self):
+        name = self.construct.__name__ if self.construct else "undeclared"
+        missing = f", missing={list(self.missing)}" if self.missing else ""
+        return f"Declaration({name}, {self.sympy!r}{missing})"
+
+
+def plug(construct, lowering):
+    """Attach the programmatic subgraph that realises ``construct``."""
+    PROGRAMMATIC_LOWERINGS[construct] = lowering
+
+
+def _limit_of(bound_lo, bound_hi):
+    import sympy
+
+    lo_inf = bool(bound_lo is not None and bound_lo.has(sympy.oo, -sympy.oo))
+    hi_inf = bool(bound_hi is not None and bound_hi.has(sympy.oo, -sympy.oo))
+    return Limit(bound_lo, bound_hi, linfinity=lo_inf, rinfinity=hi_inf)
+
+
+def _domain_of(sympy_limits):
+    """One Limit per (var, lo, hi); a bare (var,) is an unbounded axis."""
+    limits, axes = [], []
+    for entry in sympy_limits:
+        axes.append(entry[0])
+        if len(entry) == 3:
+            limits.append(_limit_of(entry[1], entry[2]))
+        else:
+            limits.append(None)          # a domain measure: bounds not given
+    domain = Domain(limits)
+    domain.axes = tuple(axes)
+    return domain
+
+
+
+class ParametricDomain(Domain):
+    """A Domain over symbolically defined geometry: parameters, their Limits,
+    and a parametric map x(u) into the embedding space.
+
+    Everything geometric is DERIVED from the map, exactly and on demand --
+    nothing is sampled, so nothing is lost:
+
+    * ``jacobian``  J_ai = d x_a / d u_i
+    * ``metric``    g = J^T J (the induced metric)
+    * ``measure``   sqrt(det g): the area/volume element in parameter space
+    * ``integral``  the integral of a field over the domain, written as a
+                    parameter-space Integral with the measure folded in, so it
+                    goes through the ingestion's SymPy-first / quadrature path
+    * ``grad`` / ``div`` / ``laplacian``  in the domain's own coordinates
+                    (contravariant gradient, divergence and Laplace-Beltrami)
+    * ``singular_set``  where det g = 0 (sphere poles, cone apex): declared,
+                    never clamped away
+
+    ``periodic`` names the parameters whose Limit wraps (their extent is the
+    exact period, not a sum of steps).
+
+    ``orientation`` is DECLARED, never guessed: ``+1`` states the map is
+    regular and positively oriented on the interior (the singular set aside),
+    so sqrt(det g) is taken as its positive branch.  Left as ``None`` the
+    measure keeps its exact |.| -- correct everywhere, but piecewise under
+    differentiation and harder for SymPy to integrate.
+    """
+
+    def __init__(self, parameters, limits, transform, periodic=(), boundaries=None,
+                 orientation=None):
+        import sympy
+
+        parameters = tuple(parameters)
+        if len(parameters) != len(limits):
+            raise ValueError("one (lower, upper) limit per parameter")
+        built = [lim if isinstance(lim, Limit) else _limit_of(sympy.sympify(lim[0]), sympy.sympify(lim[1]))
+                 for lim in limits]
+        super().__init__(built, boundaries)
+        self.parameters = parameters
+        self.axes = parameters
+        self.bounds = tuple((lim.integer_pieces[1], lim.integer_pieces[2]) for lim in built)
+        self.transform = tuple(sympy.sympify(component) for component in transform)
+        self.periodic = tuple(periodic)
+        if orientation not in (None, 1):
+            raise ValueError("orientation is None (undeclared) or +1 (declared positive)")
+        self.orientation = orientation
+        unknown = set(self.periodic) - set(parameters)
+        if unknown:
+            raise ValueError(f"periodic names unknown parameters {unknown}")
+
+    # -- geometry, exact ------------------------------------------------
+    def jacobian(self):
+        import sympy
+
+        return sympy.Matrix([[sympy.diff(x_a, u) for u in self.parameters] for x_a in self.transform])
+
+    def metric(self):
+        import sympy
+
+        J = self.jacobian()
+        return sympy.simplify(J.T * J)
+
+    def measure(self):
+        """sqrt(det g), simplified with the parameters' own ranges in mind."""
+        import sympy
+
+        det = sympy.factor(sympy.simplify(self.metric().det()))
+        root = sympy.simplify(sympy.sqrt(det))
+        if self.orientation == 1:
+            root = root.replace(sympy.Abs, lambda arg: arg)
+        return root
+
+    def period(self, parameter):
+        index = self.parameters.index(parameter)
+        lower, upper = self.bounds[index]
+        return upper - lower
+
+    def singular_set(self):
+        """Parameter values where the map degenerates (det g = 0)."""
+        import sympy
+
+        det = sympy.factor(sympy.simplify(self.metric().det()))
+        out = {}
+        for u, (lower, upper) in zip(self.parameters, self.bounds):
+            roots = sympy.solveset(det, u, domain=sympy.Interval(lower, upper))
+            if roots is not sympy.S.EmptySet:
+                out[u] = roots
+        return out
+
+    # -- calculus on the domain ----------------------------------------
+    def integral(self, field):
+        """The integral of ``field`` (a function of the parameters) over the
+        domain, measure included, as a parameter-space sympy.Integral."""
+        import sympy
+
+        limits = [(u, lower, upper) for u, (lower, upper) in zip(self.parameters, self.bounds)]
+        return sympy.Integral(field * self.measure(), *limits)
+
+    def grad(self, field):
+        """Contravariant gradient components g^ij d_j f."""
+        import sympy
+
+        g_inv = self.metric().inv()
+        partials = sympy.Matrix([sympy.diff(field, u) for u in self.parameters])
+        return sympy.simplify(g_inv * partials)
+
+    def div(self, components):
+        """Divergence of a vector field given by contravariant components V^i:
+        (1/sqrt g) d_i (sqrt g V^i)."""
+        import sympy
+
+        root = self.measure()
+        return sympy.simplify(sum(sympy.diff(root * v_i, u)
+                                  for v_i, u in zip(components, self.parameters)) / root)
+
+    def laplacian(self, field):
+        """Laplace-Beltrami: (1/sqrt g) d_i (sqrt g g^ij d_j f)."""
+        return self.div(tuple(self.grad(field)))
+
+
+def declare(expr, bindings=None):
+    """The declaration of what a surviving SymPy node means, or None if the
+    node is not one of the constructs above.
+
+    ``bindings`` supplies what SymPy's spelling cannot say, keyed by name:
+    ``{"f": Table}`` / ``{"f": Function}`` for a field, ``{"nabla": "grad"}``
+    (or ``curl``/``div``/``laplacian_0``/``laplacian_1``) for the operator
+    placeholder, ``{"boundary": "periodic"}`` for a Manifold's domain edge.
+    """
+    import sympy
+    from sympy.core.function import AppliedUndef
+
+    bindings = dict(bindings or {})
+    if isinstance(expr, sympy.Integral):
+        declared = [bindings.get(str(entry[0])) for entry in expr.limits if len(entry) == 1]
+        if declared and all(isinstance(d, ParametricDomain) for d in declared) and len(declared) == 1:
+            geometry = declared[0]
+            return Declaration(Integral, expr, geometry,
+                               {"integrand": expr.function,
+                                "parametric": geometry.integral(expr.function)})
+        domain = _domain_of(expr.limits)
+        missing = tuple(f"bounds of {axis}" for axis, lim in zip(domain.axes, domain.limits)
+                        if lim is None and axis not in expr.function.free_symbols)
+        return Declaration(Integral, expr, domain, {"integrand": expr.function}, missing)
+    if isinstance(expr, (sympy.Sum, sympy.Product)):
+        domain = _domain_of(expr.limits)
+        kind = "product" if isinstance(expr, sympy.Product) else "sum"
+        return Declaration(Sum, expr, domain, {"body": expr.function, "reduction": kind})
+    if isinstance(expr, sympy.Derivative):
+        order = {}
+        for variable in expr.variables:
+            order[variable] = order.get(variable, 0) + 1
+        return Declaration(Derivative, expr, None, {"of": expr.expr, "order": order})
+    if isinstance(expr, AppliedUndef):
+        name = str(expr.func)
+        if name == "nabla" or name.startswith("nabla_"):
+            # nabla: position space; nabla_k: wavevector space; nabla_R:
+            # nuclear coordinates; nabla_v: velocity space; nabla_mu/nu:
+            # spacetime covariant derivative.
+            operator = bindings.get(name)
+            missing = () if operator in MANIFOLD_OPERATORS else (
+                "operator kind (" + "/".join(MANIFOLD_OPERATORS) + ")",)
+            boundary = bindings.get("boundary")
+            if boundary is not None and boundary not in BOUNDARY_KINDS:
+                raise ValueError(f"unknown boundary kind {boundary!r}; one of {BOUNDARY_KINDS}")
+            fields = {"operand": expr.args, "operator": operator, "space": name,
+                      "dec": MANIFOLD_OPERATORS.get(operator), "boundary": boundary}
+            return Declaration(Manifold, expr, None, fields, missing)
+        if name in {"cross", "transpose", "tr", "det", "outer"}:
+            return Declaration(Tensor, expr, None, {"operation": name, "operands": expr.args})
+        bound = bindings.get(name)
+        if bound in (Table, Function):
+            return Declaration(bound, expr, None, {"name": name, "arguments": expr.args})
+        return Declaration(None, expr, None, {"name": name, "arguments": expr.args},
+                           (f"whether {name} is a Table (sampled) or a Function (bound callee)",))
+    if isinstance(expr, (sympy.KroneckerDelta, sympy.MatrixBase, sympy.MatrixExpr)):
+        return Declaration(Tensor, expr, None, {"operation": type(expr).__name__})
+    return None
 
 
 class BitOps:

@@ -24,7 +24,7 @@ class VoxelFluidEngine(DtCompatibleEngine):
         return uuids
     def get_state(self, state=None):
         out = state if isinstance(state, dict) else {}
-        for k in ("u", "v", "w", "rho", "p"):
+        for k in ("u", "v", "w", "pr", "T", "S"):
             if hasattr(self.sim, k):
                 out[k] = getattr(self.sim, k)
         return out
@@ -45,16 +45,10 @@ class VoxelFluidEngine(DtCompatibleEngine):
     def step(self, dt: float, state=None, state_table=None):
         if is_enabled():
             dbg("eng.bath").debug(f"voxel step: dt={float(dt):.6g} name={self.name}")
-        # Track momentum magnitude as a proxy for velocity metrics
-        try:
-            u, v, w = self.sim.u, self.sim.v, self.sim.w
-            vmax0 = float(max(np.max(np.abs(u)), np.max(np.abs(v)), np.max(np.abs(w))))
-        except Exception:
-            vmax0 = 0.0
         try:
             # Optionally update sim state from state dict
             if isinstance(state, dict):
-                for k in ("u", "v", "w", "rho", "p"):
+                for k in ("u", "v", "w", "pr", "T", "S"):
                     if k in state and hasattr(self.sim, k):
                         setattr(self.sim, k, state[k])
             self.sim.step(float(dt))
@@ -74,32 +68,26 @@ class VoxelFluidEngine(DtCompatibleEngine):
                 dt_hint = float(self.sim._stable_dt())  # type: ignore[attr-defined]
         except Exception:
             dt_hint = None
-        metrics = Metrics(max_vel=vmax, max_flux=vmax, div_inf=0.0, mass_err=0.0, dt_limit=dt_hint)
+        div_inf = 0.0
+        try:
+            div = (
+                (self.sim.u[1:, :, :] - self.sim.u[:-1, :, :])
+                + (self.sim.v[:, 1:, :] - self.sim.v[:, :-1, :])
+                + (self.sim.w[:, :, 1:] - self.sim.w[:, :, :-1])
+            ) / float(self.sim.dx)
+            if hasattr(self.sim, "solid"):
+                div = np.where(self.sim.solid, 0.0, div)
+            div_inf = float(np.max(np.abs(div))) if div.size else 0.0
+        except Exception:
+            div_inf = 0.0
+        metrics = Metrics(max_vel=vmax, max_flux=vmax, div_inf=div_inf, mass_err=0.0, dt_limit=dt_hint)
         self._last_metrics = metrics
         if is_enabled():
             dbg("eng.bath").debug(f"voxel done: {pretty_metrics(metrics)}")
         return True, metrics, self.get_state()
 
     def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - light bridge
-        try:
-            if isinstance(state, dict):
-                for k in ("u", "v", "w", "rho", "p"):
-                    if k in state and hasattr(self.sim, k):
-                        setattr(self.sim, k, state[k])
-        except Exception:
-            pass
-        ok, m = self.step(float(dt))
-        new_state = state
-        try:
-            if isinstance(state, dict):
-                out = {}
-                for k in ("u", "v", "w", "rho", "p"):
-                    if hasattr(self.sim, k):
-                        out[k] = getattr(self.sim, k)
-                new_state = out
-        except Exception:
-            new_state = state
-        return ok, m, new_state
+        return self.step(float(dt), state=state)
 
     def preferred_dt(self) -> Optional[float]:  # pragma: no cover
         dt0 = getattr(self.sim, "_stable_dt", None)

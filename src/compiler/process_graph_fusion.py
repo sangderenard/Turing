@@ -17,12 +17,17 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 import networkx as nx
+import numpy as np
 
 from ..common.tensors.fused_ir import (
+    AXIS_REDUCTION_FOLDS,
+    ELEMENTWISE_BINARY,
+    ELEMENTWISE_UNARY,
     FusedProgram,
     Meta,
     OpStep,
     canonical_elementwise_op,
+    flatten_tensor_constant,
     ordered_feed_ids,
     uniform_tensor_constant,
 )
@@ -113,11 +118,67 @@ def extract_clean_process_subgraph(
 ) -> ProcessGraph:
     """Copy an induced subgraph without obligations to excluded nodes."""
 
-    included = set(node_ids)
+    metadata_memo: dict[int, object] = {}
+
+    def isolate_metadata(value):
+        """Copy metadata containers while preserving their identity graph.
+
+        ProcessGraph metadata can intentionally share containers and can
+        contain backreferences.  This copier keeps semantic leaf objects in
+        place, but it must treat container identity exactly as ``deepcopy``
+        does: one source container becomes one isolated container and a
+        backedge remains a backedge.  Recursing without that identity memo
+        made callsite specialization nonterminating on cyclic metadata.
+        """
+
+        identity = id(value)
+        if identity in metadata_memo:
+            return metadata_memo[identity]
+        if isinstance(value, dict):
+            isolated = {}
+            metadata_memo[identity] = isolated
+            isolated.update(
+                (isolate_metadata(key), isolate_metadata(item))
+                for key, item in value.items()
+            )
+            return isolated
+        if isinstance(value, list):
+            isolated = []
+            metadata_memo[identity] = isolated
+            isolated.extend(isolate_metadata(item) for item in value)
+            return isolated
+        if isinstance(value, tuple):
+            isolated = tuple(isolate_metadata(item) for item in value)
+            # Immutable containers cannot directly contain themselves.  A
+            # cycle through a mutable container is broken by that container's
+            # memo entry before control returns here.
+            incumbent = metadata_memo.get(identity)
+            if incumbent is not None:
+                return incumbent
+            metadata_memo[identity] = isolated
+            return isolated
+        if isinstance(value, set):
+            isolated = set()
+            metadata_memo[identity] = isolated
+            isolated.update(isolate_metadata(item) for item in value)
+            return isolated
+        if isinstance(value, frozenset):
+            isolated = frozenset(isolate_metadata(item) for item in value)
+            metadata_memo[identity] = isolated
+            return isolated
+        return value
+
+    included = {
+        int(node_id) for node_id in node_ids if int(node_id) in graph.G
+    }
     extracted = copy.copy(graph)
     extracted.G = graph.G.subgraph(included).copy()
+    extracted.G.graph = isolate_metadata(dict(graph.G.graph))
     for node_id in extracted.G:
         data = extracted.G.nodes[node_id]
+        for key, value in tuple(data.items()):
+            if key != "expr_obj":
+                data[key] = isolate_metadata(value)
         data["parents"] = [
             (parent, role)
             for parent, role in data.get("parents", ())
@@ -392,8 +453,10 @@ def reduce_scheduled_shader_regions(
     partition_keys: Mapping[int, Any] | None = None,
     extra_dependency_edges: Iterable[tuple[int, int]] = (),
     fusible_node_ids: Iterable[int] | None = None,
+    indivisible_node_groups: Iterable[Iterable[int]] = (),
     control_node_ids: Iterable[int] = (),
     schedule: str = "asap",
+    _progress: Any = None,
 ) -> ScheduledProcessGraphDispatchPlan:
     """Reduce executable nodes to maximal shader regions by fixed point.
 
@@ -415,6 +478,13 @@ def reduce_scheduled_shader_regions(
     inside one shader body.  An operation outside that set is a real dispatch
     boundary rather than a planning preference, so it stays alone in its own
     region; the default admits every executable node.
+
+    ``indivisible_node_groups`` are compiler-owned regions whose membership
+    was settled before ordinary fusion. They enter the quotient as one vertex
+    and are never split or enlarged by the opportunistic shader rewrites
+    below. This is the region reducer's reservation mechanism for a semantic
+    section whose interior operations are meaningful only when lowered
+    together.
 
     ``control_node_ids`` are cached recursion/loop-IR nodes.  Fusion removes
     only edges incident to those nodes from its scheduling projection.  The
@@ -502,6 +572,11 @@ def reduce_scheduled_shader_regions(
         for left, right in semantic_edges
         if left in executable and right in executable
     }
+    # Keep the path's boundary provenance separately from its endpoints.
+    # A -> B and A -> coordinator -> B can coexist. The direct edge does
+    # not license swallowing the second path into a region: the coordinator
+    # still needs A's publication before B can execute.
+    coordinator_execution_edges = projected_execution_edges - direct_execution_edges
     for source in executable:
         pending = [
             child
@@ -517,8 +592,16 @@ def reduce_scheduled_shader_regions(
             for child in semantic_successors[current]:
                 if child in executable:
                     projected_execution_edges.add((source, child))
+                    coordinator_execution_edges.add((source, child))
                 else:
                     pending.append(child)
+
+    # Index the coordinator-crossing edges by source so a merge candidate
+    # is checked in time proportional to its members' degrees, not to the
+    # size of the whole projected edge set.
+    coordinator_successors: dict[int, set[int]] = {}
+    for left, right in coordinator_execution_edges:
+        coordinator_successors.setdefault(left, set()).add(right)
 
     level_nodes: dict[int, list[int]] = {}
     for node_id in topological:
@@ -540,16 +623,61 @@ def reduce_scheduled_shader_regions(
                 batch_count=1,
             ))
 
+    reserved_groups = []
+    reserved_members: set[int] = set()
+    for supplied_group in indivisible_node_groups:
+        group = {
+            int(node_id) for node_id in supplied_group
+            if int(node_id) in executable
+        }
+        if len(group) < 2:
+            continue
+        overlap = group.intersection(reserved_members)
+        if overlap:
+            raise ValueError(
+                "indivisible dispatch regions overlap: "
+                f"members={tuple(sorted(overlap))!r}"
+            )
+        member_keys = {keys.get(node_id) for node_id in group}
+        if len(member_keys) > 1:
+            raise ValueError(
+                "indivisible dispatch region crosses a control partition: "
+                f"members={tuple(sorted(group))!r}"
+            )
+        reserved_groups.append(group)
+        reserved_members.update(group)
+
+    initial_groups = [
+        *reserved_groups,
+        *(
+            {node_id} for node_id in topological
+            if node_id in executable and node_id not in reserved_members
+        ),
+    ]
     regions: dict[int, set[int]] = {
-        index: {node_id}
-        for index, node_id in enumerate(
-            node_id for node_id in topological if node_id in executable
-        )
+        index: set(group) for index, group in enumerate(initial_groups)
     }
+    reserved_region_ids = set(range(len(reserved_groups)))
     histories: dict[int, list[str]] = {
-        region_id: [] for region_id in regions
+        region_id: (
+            ["indivisible-reservation"]
+            if region_id in reserved_region_ids else []
+        )
+        for region_id in regions
     }
     next_region_id = len(regions)
+    merge_count = 0
+    fixed_point_iteration = 0
+
+    def report_reduction(state: str, **facts: Any) -> None:
+        if _progress is not None:
+            _progress({
+                "reduction_state": str(state),
+                "iteration": int(fixed_point_iteration),
+                "merges": int(merge_count),
+                "regions": len(regions),
+                **facts,
+            })
 
     def region_key(members):
         member_keys = {keys.get(node_id) for node_id in members}
@@ -601,6 +729,8 @@ def reduce_scheduled_shader_regions(
         region_ids = tuple(dict.fromkeys(region_ids))
         if len(region_ids) < 2:
             return False
+        if any(region_id in reserved_region_ids for region_id in region_ids):
+            return False
         members = set().union(*(regions[item] for item in region_ids))
         if len(members) > cap:
             return False
@@ -610,10 +740,9 @@ def reduce_scheduled_shader_regions(
             # lowerer can accept, which is worse than not fusing at all.
             return False
         if any(
-            left in members
-            and right in members
-            and (left, right) not in direct_execution_edges
-            for left, right in projected_execution_edges
+            right in members
+            for left in members
+            for right in coordinator_successors.get(left, ())
         ):
             # The dependency between these numerical endpoints crosses at
             # least one structural/coordinator node.  Internalizing both ends
@@ -658,7 +787,7 @@ def reduce_scheduled_shader_regions(
         return True
 
     def merge(region_ids, identity):
-        nonlocal next_region_id
+        nonlocal next_region_id, merge_count
         region_ids = tuple(dict.fromkeys(region_ids))
         members = set().union(*(regions.pop(item) for item in region_ids))
         history = [
@@ -671,10 +800,16 @@ def reduce_scheduled_shader_regions(
         next_region_id += 1
         regions[merged_id] = members
         histories[merged_id] = history
+        merge_count += 1
+        if merge_count == 1 or merge_count % 128 == 0:
+            report_reduction("merge-progress", identity=str(identity))
         return merged_id
 
     changed = True
+    report_reduction("fixed-point-begin")
     while changed:
+        fixed_point_iteration += 1
+        regions_before_iteration = len(regions)
         changed = False
 
         # Identity 1: same-level calls of the same operator and execution
@@ -720,19 +855,31 @@ def reduce_scheduled_shader_regions(
         while True:
             quotient_graph = quotient()
             merged_vertical = False
+            # One owner map per quotient: the direct-edge test and the
+            # ordering key are then constant-time per quotient edge.  The
+            # previous per-edge scans of every direct edge and every member
+            # made this pass superlinear enough to stall a 64-step unrolled
+            # recurrent training graph indefinitely.
+            owner = {
+                node_id: region_id
+                for region_id, members in regions.items()
+                for node_id in members
+            }
+            direct_region_pairs = {
+                (owner[source], owner[target])
+                for source, target in direct_execution_edges
+                if owner[source] != owner[target]
+            }
+            region_start = {
+                region_id: min(order_index[node] for node in members)
+                for region_id, members in regions.items()
+            }
             for left, right in sorted(
                 quotient_graph.edges,
-                key=lambda edge: (
-                    min(order_index[node] for node in regions[edge[0]]),
-                    min(order_index[node] for node in regions[edge[1]]),
-                ),
+                key=lambda edge: (region_start[edge[0]], region_start[edge[1]]),
             ):
                 if (
-                    any(
-                        source in regions[left]
-                        and target in regions[right]
-                        for source, target in direct_execution_edges
-                    )
+                    (left, right) in direct_region_pairs
                     and can_merge((left, right), quotient_graph)
                 ):
                     merge((left, right), "vertical-fusion")
@@ -766,8 +913,56 @@ def reduce_scheduled_shader_regions(
                 candidates[:len(group)] = [merged]
                 changed = True
 
+        report_reduction(
+            "fixed-point-iteration",
+            regions_before=int(regions_before_iteration),
+            regions_after=len(regions),
+            changed=bool(changed),
+        )
+
+    report_reduction("fixed-point-end")
+
+    # Regions execute in the order they are listed, so that order must respect
+    # the quotient graph, not the position of each region's earliest member.
+    # Fusing a node with a consumer that depends on a later region moved the
+    # whole region ahead of its own producer: the consumer then read the
+    # producer's pre-loop value while the real result was versioned into a
+    # value nothing read -- a use before definition that emitted cleanly.
+    # Every accepted merge keeps the quotient acyclic, so a topological order
+    # always exists; the earliest-member index remains the tie-break, which
+    # leaves every already-legal listing exactly as it was.
+    # Projected edges through structural nodes can put two regions in an
+    # apparent mutual dependency the merge legality never examined, so the
+    # quotient is not guaranteed acyclic.  Order through the condensation:
+    # strongly-connected regions share a rank (their internal order falls to
+    # the earliest-member tie-break) while every true dependency still holds.
+    quotient_graph = quotient()
+    condensed = nx.condensation(quotient_graph)
+    component_rank = {
+        member: position
+        for position, component in enumerate(
+            nx.lexicographical_topological_sort(
+                condensed,
+                key=lambda component: min(
+                    order_index[node_id]
+                    for member in condensed.nodes[component]["members"]
+                    for node_id in regions[member]
+                ),
+            )
+        )
+        for member in condensed.nodes[component]["members"]
+    }
+    region_order = {
+        region_id: (
+            component_rank[region_id],
+            min(order_index[node_id] for node_id in regions[region_id]),
+        )
+        for region_id in regions
+    }
     dispatches = []
-    for region_id, members in regions.items():
+    for region_id, members in sorted(
+        regions.items(), key=lambda item: region_order[item[0]]
+    ):
         ordered = tuple(sorted(members, key=order_index.__getitem__))
         dispatches.append(FlatComputeDispatch(
             kind="shader_region",
@@ -776,11 +971,6 @@ def reduce_scheduled_shader_regions(
             operator_pattern=tuple(_operation(graph, node) for node in ordered),
             rewrite_history=tuple(histories[region_id]),
         ))
-    dispatches.sort(
-        key=lambda dispatch: min(
-            order_index[node_id] for node_id in dispatch.node_ids
-        )
-    )
     node_locations = {
         node_id: (dispatch_index, lane_index)
         for dispatch_index, dispatch in enumerate(dispatches)
@@ -811,7 +1001,10 @@ def _node_payload(
     tensor = {}
     if meta is not None:
         tensor = {
-            "shape": tuple(meta.shape or ()),
+            # ``None`` is unknown; ``()`` is a proven scalar.  Collapsing the
+            # former into the latter makes every later backend broadcast a
+            # genuinely tensor-valued feed from lane zero.
+            "shape": tuple(meta.shape) if meta.shape is not None else None,
             "dtype": meta.dtype,
             "device": meta.device,
         }
@@ -906,6 +1099,49 @@ def fused_program_to_process_graph(program: FusedProgram) -> ProcessGraph:
                 ),
             )
             continue
+        if step.op_name in AXIS_REDUCTION_FOLDS:
+            add_node(
+                step.result_id,
+                _node_payload(
+                    step.op_name,
+                    parents=tuple(
+                        (value_id, "operand") for value_id in step.input_ids
+                    ),
+                    attributes=copy.deepcopy(dict(step.attrs)),
+                    meta=metadata.get(step.result_id),
+                ),
+            )
+            continue
+        if step.op_name in {"reshape", "broadcast_to"}:
+            add_node(
+                step.result_id,
+                _node_payload(
+                    step.op_name,
+                    parents=tuple(
+                        (value_id, "operand") for value_id in step.input_ids
+                    ),
+                    attributes=copy.deepcopy(dict(step.attrs)),
+                    meta=metadata.get(step.result_id),
+                ),
+            )
+            continue
+        if step.op_name == "where":
+            if len(step.input_ids) != 3:
+                raise ValueError(
+                    f"where step {step.step_id} needs condition, true, and false inputs"
+                )
+            add_node(
+                step.result_id,
+                _node_payload(
+                    "where",
+                    parents=tuple(zip(
+                        step.input_ids, ("condition", "true", "false")
+                    )),
+                    attributes=copy.deepcopy(dict(step.attrs)),
+                    meta=metadata.get(step.result_id),
+                ),
+            )
+            continue
         op, prefix_reverse = canonical_elementwise_op(step.op_name)
         attrs = dict(step.attrs)
         reverse = prefix_reverse ^ bool(attrs.pop("reverse", False))
@@ -965,7 +1201,19 @@ def fused_program_to_process_graph(program: FusedProgram) -> ProcessGraph:
 
 def _operation(graph: ProcessGraph, node_id: int) -> str:
     data = graph.G.nodes[node_id]
-    raw = str(data.get("op") or data.get("type") or data.get("label"))
+    attributes = data.get("attributes") or {}
+    # Tensor resolution is a ProcessGraph provenance receipt.  The syntactic
+    # node can still be a generic ``Call`` after resolution, while the receipt
+    # states the exact numerical operator (for example builtins ``abs`` over a
+    # tensor).  Transcribing the syntax instead discards that settled identity
+    # and hands backends a fictitious opaque call.
+    raw = str(
+        attributes.get("tensor")
+        or attributes.get("tensor_operation")
+        or data.get("op")
+        or data.get("type")
+        or data.get("label")
+    )
     # A ProcessGraph built from a SymPy expression carries SSA-Handler-style
     # capitalized spellings ("Add", "Mul", "Pow", ...; see
     # symbolic_process_graph.py's _SYMPY_TO_CANONICAL) rather than this
@@ -998,10 +1246,23 @@ def plan_process_graph_dispatches(
         raise ValueError(
             "fusion planning requires loop structure to be normalized first"
         )
+    def has_only_numeric_constant_operands(node_id: int) -> bool:
+        for parent_id, _role in graph.G.nodes[node_id].get("parents") or ():
+            if _operation(graph, int(parent_id)) != "const":
+                continue
+            try:
+                flatten_tensor_constant(
+                    graph.G.nodes[int(parent_id)].get("constant")
+                )
+            except (TypeError, ValueError):
+                return False
+        return True
+
     fusible = {
         node_id
         for node_id in graph.G
         if _operation(graph, node_id) in profile.fusible_ops
+        and has_only_numeric_constant_operands(int(node_id))
     }
     induced = graph.G.subgraph(fusible)
     components = list(nx.weakly_connected_components(induced))
@@ -1094,13 +1355,15 @@ def dispatch_region_to_fused_program(
     metadata: dict[int, Meta] = {}
     for value_id in (*region.input_ids, *region.node_ids):
         tensor = graph.G.nodes[value_id].get("tensor") or {}
+        shape = tensor.get("shape")
         metadata[value_id] = Meta(
-            shape=tuple(tensor.get("shape") or ()),
+            shape=tuple(shape) if shape is not None else None,
             dtype=tensor.get("dtype"),
             device=tensor.get("device"),
         )
 
     emitted_tensor_constants: set[int] = set()
+    descriptor_derivations: dict[int, dict[str, Any]] = {}
 
     def append_tensor_constant(
         parent_id: int,
@@ -1109,17 +1372,35 @@ def dispatch_region_to_fused_program(
         if parent_id in emitted_tensor_constants:
             return
         tensor = parent_data.get("tensor") or {}
-        metadata[parent_id] = Meta(
-            shape=tuple(tensor.get("shape") or ()),
-            dtype=tensor.get("dtype"),
-            device=tensor.get("device"),
-        )
+        shape = tensor.get("shape")
         attrs = {
             key: copy.deepcopy(value)
             for key, value in (parent_data.get("attributes") or {}).items()
             if key != "creation_op"
         }
-        attrs["values"] = copy.deepcopy(parent_data.get("constant"))
+        constant = parent_data.get("constant")
+        # Structural constants can retain their payload in the provenance
+        # attributes while the syntax-level ``constant`` slot is merely the
+        # placeholder ``None`` from the authored AST.  Do not erase a known
+        # payload during ProcessGraph -> FusedProgram transcription.
+        if constant is not None or "values" not in attrs:
+            attrs["values"] = copy.deepcopy(constant)
+        if shape is None and attrs.get("shape") is not None:
+            shape = tuple(attrs["shape"])
+        dtype = tensor.get("dtype")
+        if shape is None and attrs.get("values") is not None:
+            try:
+                literal = np.asarray(attrs["values"])
+            except (TypeError, ValueError):
+                literal = None
+            if literal is not None and literal.dtype.kind in "biufc":
+                shape = tuple(map(int, literal.shape))
+                dtype = dtype or str(literal.dtype)
+        metadata[parent_id] = Meta(
+            shape=tuple(shape) if shape is not None else None,
+            dtype=dtype,
+            device=tensor.get("device"),
+        )
         steps.append(
             OpStep(
                 step_id=len(steps),
@@ -1133,8 +1414,77 @@ def dispatch_region_to_fused_program(
 
     for node_id in region.node_ids:
         data = graph.G.nodes[node_id]
-        op, _ = canonical_elementwise_op(_operation(graph, node_id))
-        parents = list(data.get("parents") or ())
+        raw_op = _operation(graph, node_id)
+        parents = [
+            (int(parent_id), role)
+            for parent_id, role in (data.get("parents") or ())
+            if str(role).casefold() not in {
+                "callee", "func", "function", "definition", "operator",
+                "operator_reference",
+            }
+        ]
+        # ``max``/``min`` name both Python's binary scalar operations and
+        # tensor axis reductions.  Arity disambiguates them at this semantic
+        # boundary: a reduction consumes one tensor; a two-parent node is the
+        # ordinary elementwise binary operation and may legitimately carry a
+        # scalar constant operand (for example ``max(speed, 1e-30)`` in the
+        # managed-dt controller).
+        node_attributes = dict(data.get("attributes") or {})
+        reduction = raw_op in AXIS_REDUCTION_FOLDS and (
+            len(parents) == 1
+            or "axis" in node_attributes
+            or "dim" in node_attributes
+        )
+        if reduction and len(parents) > 1:
+            tensor_parents = [
+                parent
+                for parent in parents
+                if _operation(graph, parent[0]) != "const"
+            ]
+            if len(tensor_parents) == 1:
+                # The dimension/keepdim literals remain in the ProcessGraph
+                # provenance, while the numeric reduction consumes only its
+                # tensor receiver.  Their values are already recorded in the
+                # operation attributes by the concordance.
+                parents = tensor_parents
+        # The builder is a faithful transcriber, not a translator: an op that is
+        # neither a fused-elementwise op nor an axis reduction (a reshape/view/
+        # cast/native kernel) is emitted under its own name with its operands
+        # and attributes intact, exactly as reductions are. Its *semantics* --
+        # a reshape being a view, say -- are the SSA-stage translator's job, not
+        # this adapter's. Only genuine elementwise ops are canonicalized (and
+        # only they carry the right_scalar operand form).
+        if reduction:
+            elementwise = False
+            op = raw_op
+        elif raw_op in {"min", "max"} and len(parents) == 2:
+            elementwise = True
+            op = {"min": "minimum", "max": "maximum"}[raw_op]
+        else:
+            try:
+                op = canonical_elementwise_op(raw_op)[0]
+                elementwise = True
+            except KeyError:
+                op = raw_op
+                elementwise = False
+        if elementwise:
+            expected_arity = 1 if op in ELEMENTWISE_UNARY else 2
+            # A resolved Python call keeps its callable/name parent in the
+            # ProcessGraph for provenance.  Some graph normalizations label
+            # that edge ``operand`` rather than ``callee``; numeric IR arity is
+            # the reliable semantic boundary.  Remove only surplus Load/Name
+            # references, never an Input or computed value.
+            while len(parents) > expected_arity:
+                callable_position = next((
+                    index
+                    for index, (parent_id, _role) in enumerate(parents)
+                    if str(_operation(graph, parent_id)).casefold()
+                    in {"load", "name"}
+                ), None)
+                if callable_position is None:
+                    break
+                parents.pop(callable_position)
+        structural = not reduction and not elementwise
         value_parents: list[int] = []
         scalar_parent: tuple[int, Any] | None = None
         for parent_id, _role in parents:
@@ -1142,7 +1492,11 @@ def dispatch_region_to_fused_program(
             if _operation(graph, parent_id) == "const":
                 constant = parent_data.get("constant")
                 scalar = uniform_tensor_constant(constant)
-                if scalar is not None:
+                # A non-elementwise op has no right_scalar operand slot; keep
+                # every constant parent as a plain constant input so the op's
+                # arguments (a reshape's target extent, a pad's width) survive
+                # verbatim for the translator to interpret.
+                if scalar is not None and not structural:
                     if scalar_parent is not None:
                         # FusedProgram represents a binary scalar operand in
                         # right_scalar, so two constant operands cannot both
@@ -1162,13 +1516,30 @@ def dispatch_region_to_fused_program(
                     value_parents.append(parent_id)
             else:
                 value_parents.append(parent_id)
-        attrs: dict[str, Any] = {}
+        attrs: dict[str, Any] = (
+            copy.deepcopy(dict(data.get("attributes") or {}))
+            if reduction or structural else {}
+        )
+        if reduction and "axis" not in attrs and "dim" in attrs:
+            attrs["axis"] = attrs["dim"]
         if scalar_parent is not None:
-            if len(value_parents) != 1:
+            if reduction:
+                raise ValueError(f"{op} cannot consume a scalar constant operand")
+            if len(value_parents) == 0:
+                # A unary op whose only operand is a constant (log(const)) has a
+                # tensor value operand, not the right-hand scalar of a binary
+                # a-OP-scalar form. Keep the constant as an ordinary tensor
+                # constant input rather than forcing it into the scalar slot.
+                append_tensor_constant(
+                    scalar_parent[0], graph.G.nodes[scalar_parent[0]]
+                )
+                value_parents.append(scalar_parent[0])
+            elif len(value_parents) != 1:
                 raise ValueError(f"{op} has an invalid scalar operand layout")
-            attrs["right_scalar"] = scalar_parent[1]
-            if parents[0][0] == scalar_parent[0]:
-                attrs["reverse"] = True
+            else:
+                attrs["right_scalar"] = scalar_parent[1]
+                if parents[0][0] == scalar_parent[0]:
+                    attrs["reverse"] = True
         steps.append(
             OpStep(
                 step_id=len(steps),
@@ -1178,13 +1549,119 @@ def dispatch_region_to_fused_program(
                 result_id=node_id,
             )
         )
+        current = metadata.get(node_id)
+        exact_shape = None
+        exact_dtype = None
+        exact_source = None
+        if op in {"unsqueeze", "squeeze"} and value_parents:
+            source_id = int(value_parents[0])
+            source_meta = metadata.get(source_id)
+            if source_meta is not None and source_meta.shape is not None:
+                axis = None
+                if len(value_parents) > 1:
+                    axis_data = graph.G.nodes[value_parents[1]]
+                    axis_value = axis_data.get("constant")
+                    if axis_value is None:
+                        axis_value = (
+                            axis_data.get("attributes") or {}
+                        ).get("values")
+                    uniform_axis = uniform_tensor_constant(axis_value)
+                    if uniform_axis is not None and float(uniform_axis).is_integer():
+                        axis = int(uniform_axis)
+                source_shape = list(map(int, source_meta.shape))
+                if op == "unsqueeze" and axis is not None:
+                    normalized = axis if axis >= 0 else axis + len(source_shape) + 1
+                    if 0 <= normalized <= len(source_shape):
+                        source_shape.insert(normalized, 1)
+                        exact_shape = tuple(source_shape)
+                elif op == "squeeze":
+                    if axis is None:
+                        exact_shape = tuple(dim for dim in source_shape if dim != 1)
+                    else:
+                        normalized = axis if axis >= 0 else axis + len(source_shape)
+                        if (
+                            0 <= normalized < len(source_shape)
+                            and source_shape[normalized] == 1
+                        ):
+                            del source_shape[normalized]
+                            exact_shape = tuple(source_shape)
+                if exact_shape is not None:
+                    exact_dtype = source_meta.dtype
+                    exact_source = source_id
+                    descriptor_derivations[int(node_id)] = {
+                        "operation": op,
+                        "source_id": source_id,
+                        "shape": exact_shape,
+                        "dtype": exact_dtype,
+                    }
+        if (
+            exact_shape is not None
+            or current is None
+            or current.shape is None
+            or current.dtype is None
+        ):
+            known = [
+                metadata[parent_id]
+                for parent_id in value_parents
+                if parent_id in metadata
+                and metadata[parent_id].shape is not None
+            ]
+            inferred_shape = None
+            if known and elementwise:
+                try:
+                    inferred_shape = tuple(np.broadcast_shapes(*(
+                        tuple(item.shape) for item in known
+                    )))
+                except ValueError:
+                    inferred_shape = None
+            inferred_dtype = next(
+                (item.dtype for item in known if item.dtype is not None), None
+            )
+            if exact_shape is not None:
+                inferred_shape = exact_shape
+                inferred_dtype = exact_dtype
+            if op in {
+                "less", "less_equal", "greater", "greater_equal", "equal",
+                "not_equal", "logical_and", "logical_or", "logical_not",
+                "isfinite", "isinf", "isnan",
+            }:
+                inferred_dtype = "bool"
+            if inferred_shape is not None or inferred_dtype is not None:
+                metadata[node_id] = Meta(
+                    shape=(
+                        inferred_shape
+                        if inferred_shape is not None
+                        else (current.shape if current is not None else None)
+                    ),
+                    dtype=(
+                        inferred_dtype
+                        if inferred_dtype is not None
+                        else (current.dtype if current is not None else None)
+                    ),
+                    device=(current.device if current is not None else None),
+                    source_id=exact_source,
+                )
 
+    produced_ids = {int(step.result_id) for step in steps}
+    consumed_ids = {
+        int(value_id) for step in steps for value_id in step.input_ids
+    }
+    live_feeds = (
+        consumed_ids | set(map(int, dict(region.outputs).values()))
+    ) & set(map(int, region.input_ids)) - produced_ids
     return FusedProgram(
         version=1,
-        feeds=set(region.input_ids),
+        # Callable/name references removed from numeric op arity must not
+        # survive as phantom buffer parameters merely because the structural
+        # deployment boundary listed them before transcription.
+        feeds=live_feeds,
         steps=steps,
         outputs=dict(region.outputs),
         meta=metadata,
+        extras=(
+            {"descriptor_derivations": descriptor_derivations}
+            if descriptor_derivations else {}
+        ),
     )
 
 
