@@ -3296,6 +3296,19 @@ class _ControlSSABuilder:
             initial_id, {str(binding)}, f"result port {port_id}",
         )
 
+    def _aliases_resolving_to(self, value_id: int) -> tuple[int, ...]:
+        """Every value whose alias chain resolves to ``value_id``."""
+
+        found = []
+        for alias in self.value_aliases:
+            current, seen = int(alias), set()
+            while current in self.value_aliases and current not in seen:
+                seen.add(current)
+                current = int(self.value_aliases[current])
+            if current == int(value_id) and int(alias) != int(value_id):
+                found.append(int(alias))
+        return tuple(found)
+
     def _region_feed(self, region_index: int, value_id: int) -> Any:
         """A region feed, read by the bindings of the operands it serves."""
 
@@ -3328,6 +3341,17 @@ class _ControlSSABuilder:
             positions = operand_page.latest(
                 (self.lexical_read_scope, int(consumer), int(value_id))
             )
+            if not positions:
+                # The consumer's operand is a version that resolves to this
+                # feed (an in-place store chain resolving to its arena): its
+                # row is keyed by that version.
+                positions = tuple(
+                    position
+                    for alias in self._aliases_resolving_to(int(value_id))
+                    for position in (operand_page.latest(
+                        (self.lexical_read_scope, int(consumer), alias)
+                    ) or ())
+                )
             if not positions:
                 operands.append((int(consumer), None, 0))
                 continue
@@ -7066,7 +7090,15 @@ class _ControlSSABuilder:
             # remain distinct: the preheader must read the value that exists
             # before the loop, not its result port after the loop.
             initial_value = self.external_value(
-                initial_id, follow_aliases=False,
+                initial_id,
+                # An initial with no binding of its own that the alias record
+                # resolves (an in-place arena after an earlier loop's stores)
+                # is that storage; not following it minted a second,
+                # unconnected formal for the same array.
+                follow_aliases=(
+                    int(initial_id) not in self.external_values
+                    and int(initial_id) in self.value_aliases
+                ),
             )
             updated_value = SSAValue(
                 updated_id,
@@ -7889,7 +7921,15 @@ class _ControlSSABuilder:
             # Storage concordance does not erase the temporal distinction
             # between the preheader seed and the loop backedge value.
             initial_value = self.external_value(
-                initial_id, follow_aliases=False,
+                initial_id,
+                # An initial with no binding of its own that the alias record
+                # resolves (an in-place arena after an earlier loop's stores)
+                # is that storage; not following it minted a second,
+                # unconnected formal for the same array.
+                follow_aliases=(
+                    int(initial_id) not in self.external_values
+                    and int(initial_id) in self.value_aliases
+                ),
             )
             updated_value = SSAValue(
                 updated_id,
@@ -11774,6 +11814,20 @@ def lower_control_sections_to_ssa(
     tensor_shape_concordance_scope = (
         f"{control_name}@control:{id(control):x}"
     )
+    # Row ``(control scope, value id)`` -> the dtype the control program
+    # declares for a uniform it reads (loop-bound leaves are ints).  One
+    # fact, read by region formal typing and by the control's own argument.
+    from .identity_concordance import current_identity_book as _book
+
+    uniform_dtype_page = _book().page("control_uniform_dtype")
+    # Row ``(control scope, value id)`` -> the scalar dtype the producing
+    # region computes for that value.
+    region_dtype_page = _book().page("region_value_dtype")
+    for uniform in getattr(control, "uniforms", ()) or ():
+        uniform_dtype_page.concord(
+            (str(tensor_shape_concordance_scope), int(uniform.value_id)),
+            str(uniform.dtype),
+        )
     alias_neighbors: dict[int, set[int]] = {}
     for left, right in control.value_aliases:
         left, right = int(left), int(right)
@@ -12700,6 +12754,33 @@ def lower_control_sections_to_ssa(
             # Physical parameter/field ABI applies inside numerical callees
             # too. Applying this only when constructing the coordinator let
             # its byte-valued bool field be read as a double by a region.
+            # A control uniform's dtype is a contract of the control program
+            # (a ``range`` bound leaf is an int); the book row committed at
+            # entry is read here so the region formal and the control caller
+            # agree.  A declared physical ABI dtype below still wins.
+            for value_id in instruction_values:
+                uniform_dtype = uniform_dtype_page.latest(
+                    (str(tensor_shape_concordance_scope), int(value_id))
+                )
+                if uniform_dtype is not None:
+                    previous = region_value_meta.get(int(value_id))
+                    region_value_meta[int(value_id)] = Meta(
+                        () if previous is None else tuple(previous.shape),
+                        str(uniform_dtype),
+                    )
+            # A value an earlier region produced has the dtype that region
+            # typed it with (``region_value_dtype``); the planner's generic
+            # capture guess must not retype it at this formal.
+            for value_id in instruction_values:
+                produced_dtype = region_dtype_page.latest(
+                    (str(tensor_shape_concordance_scope), int(value_id))
+                )
+                if produced_dtype is not None:
+                    previous = region_value_meta.get(int(value_id))
+                    region_value_meta[int(value_id)] = Meta(
+                        () if previous is None else tuple(previous.shape),
+                        str(produced_dtype),
+                    )
             for value_id, dtype in (value_dtypes or {}).items():
                 if int(value_id) in instruction_values:
                     previous = region_value_meta.get(int(value_id))
@@ -12964,6 +13045,69 @@ def lower_control_sections_to_ssa(
                     return occurrences[0]
                 return canonical
 
+            # Python integer arithmetic stays integer: a scalar result whose
+            # operands are all integers and whose dtype is only the planner's
+            # generic guess is an integer, decided here, once, before the
+            # control caller and later regions read it (``n + k`` indexing
+            # an array; its caller once loaded the int result as a double).
+            integer_dtypes = {"int", "int64", "int32", "int16", "int8"}
+            integer_ops = {
+                "add", "sub", "mul", "floordiv", "mod", "neg",
+                "min", "max", "abs",
+            }
+            declared_ids = {int(value_id) for value_id in (value_dtypes or {})}
+            integer_results: dict[int, str] = {}
+            for instruction in instructions:
+                result = instruction.res
+                if (
+                    result is None
+                    or str(instruction.op).casefold() not in integer_ops
+                    or not instruction.args
+                    or tuple(result.shape or ())
+                    or int(result.id) in declared_ids
+                    or str(result.dtype or "") in integer_dtypes
+                ):
+                    continue
+                operand_dtypes = [
+                    integer_results.get(int(argument.id), str(argument.dtype or ""))
+                    for argument in instruction.args
+                ]
+                if all(
+                    dtype in integer_dtypes and not tuple(argument.shape or ())
+                    for dtype, argument in zip(operand_dtypes, instruction.args)
+                ):
+                    integer_results[int(result.id)] = "int64"
+            if integer_results:
+                for instruction in instructions:
+                    values = [*instruction.args]
+                    if instruction.res is not None:
+                        values.append(instruction.res)
+                    for value in values:
+                        dtype = integer_results.get(int(value.id))
+                        if dtype is not None:
+                            value.dtype = dtype
+                for value_id, dtype in integer_results.items():
+                    if value_id in region_values:
+                        region_values[value_id].dtype = dtype
+                    previous = region_value_meta.get(value_id)
+                    region_value_meta[value_id] = Meta(
+                        () if previous is None else tuple(previous.shape),
+                        dtype,
+                    )
+            # Each scalar result's dtype as this region computes it is the
+            # fact later regions read for the same value.
+            for instruction in instructions:
+                result = instruction.res
+                if (
+                    result is None
+                    or result.dtype is None
+                    or tuple(result.shape or ())
+                    or str(result.dtype) in {"ptr", "unknown"}
+                ):
+                    continue
+                row = (str(tensor_shape_concordance_scope), int(result.id))
+                if region_dtype_page.latest(row) != str(result.dtype):
+                    region_dtype_page.revise(row, str(result.dtype))
             effective_captures = _split_region_captures_by_binding(
                 lexical_read_scope, tensor_shape_concordance_scope,
                 region_index, instructions, effective_captures,
@@ -13311,6 +13455,7 @@ def lower_control_sections_to_ssa(
         # been merged with and resolved through planning_value_concordance;
         # schedule by that identity instead of comparing stage-local ids.
         value_aliases=final_value_aliases,
+        lexical_read_scope=lexical_read_scope,
     )
     # A keyed Tensor lookup is materialized by the control function while its
     # numerical uses live in planned regions.  Commit the region's logical

@@ -4498,6 +4498,18 @@ def analyze_shader_loop_reductions(
             *condition_region_indices,
             *body_region_indices,
         )))
+        # Which planned regions this loop owns, on the book: row ``(read
+        # scope, loop node)`` -> region indices.  Later placement reads it
+        # instead of inferring ownership from storage identities, which two
+        # versions of one in-place arena share.
+        membership_scope = graph.G.graph.get("lexical_read_scope")
+        if membership_scope is not None:
+            from .identity_concordance import current_identity_book
+
+            current_identity_book().page("loop_region_membership").revise(
+                (tuple(membership_scope), int(loop.node_id)),
+                tuple(sorted(map(int, region_indices))),
+            )
         sequence_mutations = []
         expression_nodes = {
             id(data.get("expr_obj")): int(node_id)

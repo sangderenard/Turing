@@ -1290,6 +1290,7 @@ def place_loop_carried_region_producers(
     program: "ControlProgram",
     region_outputs: Mapping[int, Iterable[int]],
     value_aliases: Mapping[int, int] | None = None,
+    lexical_read_scope: Any = None,
 ) -> "ControlProgram":
     """Put an exact loop-carried producer in the loop that carries it.
 
@@ -1355,6 +1356,23 @@ def place_loop_carried_region_producers(
             return frozenset(found)
         return frozenset()
 
+    membership_page = None
+    if lexical_read_scope is not None:
+        from .identity_concordance import current_identity_book
+
+        membership_page = current_identity_book().page("loop_region_membership")
+
+    def owned_regions(block: ControlBlock) -> frozenset[int] | None:
+        """The regions the composer recorded for this loop, if any."""
+
+        loop_node = getattr(block, "source_loop_node_id", None)
+        if membership_page is None or loop_node is None:
+            return None
+        owned = membership_page.latest(
+            (tuple(lexical_read_scope), int(loop_node))
+        )
+        return None if owned is None else frozenset(map(int, owned))
+
     def append_to_body(block: ControlBlock, additions: tuple[ControlBlock, ...]):
         body = block.body
         body_blocks = body.blocks if isinstance(body, SequenceBlock) else (body,)
@@ -1369,11 +1387,17 @@ def place_loop_carried_region_producers(
                 updates = carried_updates(owner)
                 if not updates:
                     continue
+                owned = owned_regions(owner)
                 for candidate_index, candidate in enumerate(children):
                     if candidate_index == owner_index or candidate_index in claimed:
                         continue
                     regions = marker_regions(candidate)
                     if not regions:
+                        continue
+                    if owned is not None and not regions <= owned:
+                        # The book says this loop does not own the region;
+                        # a shared arena (``v`` written inside the inner
+                        # loop and again after it) is not ownership.
                         continue
                     if any(outputs.get(region, frozenset()) & updates
                            for region in regions):
