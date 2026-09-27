@@ -639,12 +639,13 @@ def test_identity_audit_reads_callable_identity_history():
 def test_output_alias_publication_uses_distinct_concordance_from_storage():
     from src.compiler.identity_concordance import (
         begin_identity_book,
+        concordance_report,
         current_identity_book,
         end_identity_book,
     )
 
     function = Function(
-        "step", [], {"entry": BasicBlock("entry", [])},
+        "step", [SSAValue(375)], {"entry": BasicBlock("entry", [])},
         metadata={"value_aliases": {376: 375}},
     )
     _book, token = begin_identity_book()
@@ -662,6 +663,11 @@ def test_output_alias_publication_uses_distinct_concordance_from_storage():
         assert current_identity_book().page(
             "output_identity_concordance"
         ).latest(("step", 376)) == 2305843010213698294
+        module = IRModule({"step": function})
+        module.metadata["identity_book"] = _book
+        report = concordance_report(module)
+        assert "alias-target-missing" not in report
+        assert "alias-not-concorded" not in report
     finally:
         end_identity_book(token)
 
@@ -2176,6 +2182,8 @@ def test_record_parameter_call_uses_fields_without_python_receiver_handle():
 
 
 def test_late_record_result_rebinds_aliased_fields_in_following_call_frame():
+    from src.compiler.identity_concordance import concordance_report
+
     module, _outputs, _exports = lower_ast_source_to_ssa(
         "def make_metrics(value):\n"
         "    return Metrics(max_vel=value, max_flux=value, div_inf=0.0, "
@@ -2251,6 +2259,7 @@ def test_late_record_result_rebinds_aliased_fields_in_following_call_frame():
         if instruction.op == "Call"
         for argument in instruction.args
     )
+    assert "alias-target-missing" not in concordance_report(module)
     assert max(
         int(value.id)
         for function in module.functions.values()

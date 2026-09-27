@@ -221,7 +221,14 @@ class CorrelationTable:
                 alias, target = pair
             except (TypeError, ValueError):
                 continue
-            self.claim(name, alias, "alias-of", int(target),
+            # Output identity is semantic history, not substitutable physical
+            # storage.  The target can be an edge occurrence retired after
+            # its merged output is published, so applying the physical-alias
+            # existence rule here reports a missing storage definition that
+            # this record never claimed.  Keep the relation visible to the
+            # table under its own exact kind; agreement with the authoritative
+            # output page is checked separately below.
+            self.claim(name, alias, "output-identity-of", int(target),
                        "metadata.output_identity_aliases")
         for block_name, block in function.blocks.items():
             for index, instruction in enumerate(block.instrs):
@@ -1873,6 +1880,7 @@ class IdentityPage:
                 isinstance(row, tuple)
                 and len(row) == 2
                 and row[0] == scope
+                and self.latest(row) is not None
             )
         }
 

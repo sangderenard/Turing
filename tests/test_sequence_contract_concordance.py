@@ -17,6 +17,9 @@ from src.compiler.fortran_c_shell import (
     _concordant_function_resident,
     _field_slot_ops,
     _publish_concordant_function_aliases,
+    _retire_concordant_sequence_aliases,
+    _retire_concorded_record_identity_aliases,
+    _retire_dead_planning_aliases,
     lower_ast_source_to_ssa,
 )
 from src.compiler.identity_concordance import (
@@ -31,7 +34,15 @@ from src.compiler.identity_concordance import (
 )
 from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
-from src.transmogrifier.ssa import Function
+from src.transmogrifier.ssa import (
+    Function,
+    SSARecordDescriptor,
+    SSARecordFieldDescriptor,
+    SSARecordFieldStorage,
+    SSARecordTable,
+    SSASequenceDescriptor,
+    SSASequenceTable,
+)
 
 
 def test_sequence_contract_concordance_keeps_one_physical_row_contract():
@@ -154,6 +165,83 @@ def test_function_alias_publication_commits_transitive_terminal_resident():
         assert published == {64: 58, 69: 58, 71: 86}
         assert function.metadata["value_aliases"] == published
         assert page.latest(("solve", 69)) == 58
+    finally:
+        end_identity_book(token)
+
+
+def test_concordant_sequence_descriptor_alias_retires_duplicate_members():
+    book, token = begin_identity_book()
+    try:
+        function = Function("solve", [], {})
+        sequences = SSASequenceTable(owner="solve", book=book)
+        resident = SSASequenceDescriptor(10, (11,), 12, 13)
+        duplicate = SSASequenceDescriptor(20, (21,), 22, 23)
+        sequences.register(resident)
+        sequences.register(duplicate)
+        records = SSARecordTable(owner="solve", book=book)
+        records.register(SSARecordDescriptor(30, "State", (
+            SSARecordFieldDescriptor(
+                "items", SSARecordFieldStorage.SEQUENCE,
+                storage_identity="State.items", sequence_id=20,
+            ),
+        )))
+        _publish_concordant_function_aliases(
+            function, {20: 10, 21: 11, 22: 12, 23: 13},
+            provenance="exact_sequence_argument",
+        )
+
+        assert _retire_concordant_sequence_aliases(
+            {"solve": function}, {"solve": sequences}, {"solve": records},
+        ) == 1
+        assert sequences.by_id(20) is None
+        assert sequences.by_id(10) == resident
+        assert sequences.member_claims(11) == ((10, ("column", 0)),)
+        field = records.records[30].fields[0]
+        assert field.sequence_id == 10
+    finally:
+        end_identity_book(token)
+
+
+def test_output_concordance_closes_nonphysical_record_planning_alias():
+    book, token = begin_identity_book()
+    try:
+        function = Function("solve", [], {})
+        records = SSARecordTable(owner="solve", book=book)
+        for record_id in (1, 2, 3):
+            records.register(SSARecordDescriptor(record_id, "State"))
+        _publish_concordant_function_aliases(
+            function, {2: 1}, provenance="linked_record_projection",
+        )
+        output_page = book.page("output_identity_concordance")
+        output_page.bind_alias("solve", 1, 3)
+        output_page.bind_alias("solve", 2, 3)
+
+        assert _retire_concorded_record_identity_aliases(
+            {"solve": function}, {"solve": records}, book,
+        ) == 1
+        assert function.metadata["value_aliases"] == {}
+        planning = book.page("planning_value_concordance")
+        assert planning.latest(("solve", 2)) is None
+        assert planning.alias_bindings("solve") == {}
+    finally:
+        end_identity_book(token)
+
+
+def test_finalization_closes_terminal_alias_with_no_surviving_identity():
+    book, token = begin_identity_book()
+    try:
+        function = Function("solve", [], {})
+        _publish_concordant_function_aliases(
+            function, {20: 21}, provenance="provisional_aggregate_slot",
+        )
+
+        assert _retire_dead_planning_aliases(
+            {"solve": function}, {}, {}, {}, book,
+        ) == 1
+        assert function.metadata["value_aliases"] == {}
+        planning = book.page("planning_value_concordance")
+        assert planning.latest(("solve", 20)) is None
+        assert planning.alias_bindings("solve") == {}
     finally:
         end_identity_book(token)
 
