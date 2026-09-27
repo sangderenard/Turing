@@ -3907,6 +3907,10 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
             and attributes.get("value", data.get("constant")) is None
         )
 
+    from ..common.tensors.topological_reducer import _set_operands
+
+    view = SimpleNamespace(G=graph)
+
     def detach_inputs(node_id: Any) -> None:
         data = graph.nodes[node_id]
         for parent, role in tuple(data.get("parents") or ()):
@@ -3917,17 +3921,17 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
                 ]
                 if graph.has_edge(parent, node_id):
                     graph.remove_edge(parent, node_id)
-        data["parents"] = []
+        _set_operands(view, node_id, [], cause="optional_presence_detach")
 
     def replace_uses(old_id: Any, new_id: Any) -> None:
         for child in tuple(graph.successors(old_id)):
             edge = dict(graph.get_edge_data(old_id, child) or {})
             role = edge.get("role")
             child_data = graph.nodes[child]
-            child_data["parents"] = [
+            _set_operands(view, child, [
                 (new_id if parent == old_id else parent, held_role)
                 for parent, held_role in child_data.get("parents") or ()
-            ]
+            ], cause="optional_presence_replace", same={old_id: new_id})
             graph.add_edge(new_id, child, **edge)
             children = graph.nodes[new_id].setdefault("children", [])
             if (child, role) not in children:
@@ -3994,12 +3998,12 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
             else:
                 detach_inputs(positive)
             positive_data = graph.nodes[positive]
+            _set_operands(view, positive, [], cause="optional_presence_input")
             positive_data.update({
                 "label": f"{parameter}.{field_name}.__present",
                 "type": "Input",
                 "op": "input",
                 "expr_obj": None,
-                "parents": [],
                 "constant": None,
                 "tensor": {"shape": (), "dtype": "bool"},
                 "attributes": {
@@ -4021,12 +4025,18 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
                     continue
                 detach_inputs(compare_id)
                 compare = graph.nodes[compare_id]
+                # ``x is None`` becomes ``not presence``: the test no longer
+                # reads ``x``; its operand position is retired and the
+                # presence operand recorded (``identity_transition``).
+                _set_operands(
+                    view, compare_id, [(positive, "operand")],
+                    cause="optional_presence_negation",
+                )
                 compare.update({
                     "label": "logical_not",
                     "type": "logical_not",
                     "op": "logical_not",
                     "expr_obj": None,
-                    "parents": [(positive, "operand")],
                     "constant": None,
                     "tensor": {"shape": (), "dtype": "bool"},
                     "attributes": {

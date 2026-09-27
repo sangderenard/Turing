@@ -33,8 +33,15 @@ class _BookEventLog(Sequence):
     def __getitem__(self, index):
         return self._events()[index]
 
+    def __iter__(self):
+        # ``Sequence.__iter__`` indexes one item at a time, and each index
+        # rebuilt every event from the book: one scan was quadratic.
+        return iter(self._events())
+
     def __len__(self) -> int:
-        return len(self._page.scope_rows(self._scope))
+        # Every event's serial is ``len(events)``; counting by materializing
+        # every row made recording quadratic.
+        return self._page.scope_row_count(self._scope)
 
     def __eq__(self, other) -> bool:
         return isinstance(other, (list, tuple, _BookEventLog)) and self._events() == tuple(other)
@@ -52,7 +59,10 @@ class TransformationLedger:
     Page ``transformation_decision`` holds each identity's retained
     ``(rule, proof, target)`` at ``(scope, identity)``, revised on every
     accepted proposal; page ``transformation_event`` holds every accepted
-    and rejected proposal in order at ``(scope, serial)``.
+    and rejected proposal in order at ``(scope, serial)``; page
+    ``transformation_rejection`` holds, at ``(scope, identity, rule, proof,
+    retained rule, retained proof)``, the serial of the event that recorded
+    that exact rejection -- a rejection is recorded once, found by its key.
     """
 
     def __init__(self, rules: tuple[TransformationRule, ...],
@@ -75,6 +85,7 @@ class TransformationLedger:
         self.scope = self.book.mint_scope(scope or "transformation_ledger")
         self._decision_page = self.book.page("transformation_decision")
         self._event_page = self.book.page("transformation_event")
+        self._rejection_page = self.book.page("transformation_rejection")
         self.events = _BookEventLog(self._event_page, self.scope)
 
     def _decision(self, identity: Hashable):
@@ -95,14 +106,16 @@ class TransformationLedger:
             if previous == (rule, proof) and after == decision[2]:
                 return True
             if rank <= old_rank:
-                rejected = any(
-                    not event.get("accepted")
-                    and (event.get("identity"), event.get("rule"),
-                         event.get("proof"), *event.get("retained"))
-                    == (identity, rule, proof, old_rule, old_proof)
-                    for event in self.events
+                # Whether this exact rejection is already recorded is a keyed
+                # fact, not a scan of every event: the scan made each
+                # rejected proposal O(events^2) and stalled the woodshop
+                # dt system's call-result settlement (3892 call operands) in
+                # its first round.
+                rejection = (
+                    self.scope, identity, rule, proof, old_rule, old_proof,
                 )
-                if not rejected:
+                if self._rejection_page.latest(rejection) is None:
+                    self._rejection_page.concord(rejection, len(self.events))
                     self._record_event(dict(identity=identity, rule=rule,
                         proof=proof, accepted=False, retained=previous,
                         priority=rank, retained_priority=old_rank,

@@ -17,6 +17,12 @@ identity book by the binding they read:
   body.  The test was treated as overwritten-before-read and the latch
   re-ran the pre-loop condition region, testing the initial ``go`` forever
   (non-terminating native code).
+* ``call-argument-carried`` -- a carried binding read directly as a call
+  argument (``AbstractTensor.minimum(cap, ...)`` in a while body).  The
+  read was committed at the call's ingestion operand position ``('args',
+  0)``; the reducer then rebuilt the call's operands as ``arg:0`` and the
+  control lowering found no binding for the carried value (refused).  The
+  result returns ``cap`` so a stale pre-loop ``cap`` changes the answer.
 
 The Python materializer reconstructs only the five-block counted loop, so
 these run through the C backend; execution is in a subprocess under a time
@@ -92,6 +98,20 @@ _PROGRAMS = {
         "        go = second < limit\n"
         "    return second\n",
         ((1.0, 4.0), (5.0, 2.0), (0.5, 3.0)),
+    ),
+    "call-argument-carried": (
+        "from src.common.tensors.abstraction import AbstractTensor\n\n"
+        "def helper(a):\n"
+        "    return a\n\n"
+        "def train(value, limit):\n"
+        "    cap = AbstractTensor.tensor(value)\n"
+        "    total = AbstractTensor.tensor(0.0)\n"
+        "    while (limit - total).item() > 0.0:\n"
+        "        step = AbstractTensor.minimum(cap, limit - total)\n"
+        "        total = total + step\n"
+        "        cap = cap * 2.0\n"
+        "    return total + cap\n",
+        ((0.3, 2.9), (1.0, 5.0), (2.0, 0.5)),
     ),
 }
 

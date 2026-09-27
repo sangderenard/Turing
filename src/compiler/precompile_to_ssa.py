@@ -3329,6 +3329,32 @@ class _ControlSSABuilder:
                 int(source_id), {str(binding)},
                 f"region {region_index} formal {value_id}",
             )
+        item = None if book is None else book.page("item_operand").latest(
+            (self.lexical_read_scope, int(value_id))
+        )
+        if item is not None:
+            # A captured ``item()`` (planner page ``item_operand``): read its
+            # operand by the binding at the item's operand position, in this
+            # site's loop generation.  A rank-0 operand IS the item's value;
+            # that merge is decided here, on the value read, and recorded.
+            operand_id, role, ordinal = item
+            source = (
+                self._read(
+                    int(operand_id),
+                    self._operand_bindings(
+                        ((int(value_id), role, int(ordinal)),)
+                    ),
+                    f"region {region_index} item {value_id}",
+                )
+                if self.enclosing_loop_states
+                else self.external_value(int(operand_id))
+            )
+            if not tuple(source.shape or ()):
+                book.page("identity_transition").revise(
+                    (str(self.tensor_shape_concordance_scope), int(value_id)),
+                    ("merge", int(source.id), "scalar_item"),
+                )
+                return source
         if self.lexical_read_scope is None or not self.enclosing_loop_states:
             return self.external_value(int(value_id))
         consumers = book.page("region_feed_consumer").latest((
@@ -6632,7 +6658,18 @@ class _ControlSSABuilder:
                 },
                 claim_provisional_definition=True,
             )
+        # An arm that leaves through its own edge (``continue``/``break``
+        # placed in the arm) never reaches the merge: nothing it binds may
+        # reach the continuation.  The snapshot above covers only merged
+        # identities; a non-falling-through arm restores every binding.
+        # (``if retries < 2: dt = dt * 0.5; continue`` -- the arm published
+        # ``dt`` = ``dt * 0.5`` and the fall-through call read it.)
+        values_before_body = dict(self.external_values)
         self.lower(conditional.body, path=f"{path}.body")
+        body_falls_through = (
+            not self.current.successors
+            or merge_block.name in self.current.successors
+        )
         true_carried = {
             int(initial_id): self.external_values.get(
                 int(true_id), carried_snapshots[int(initial_id)],
@@ -6658,6 +6695,9 @@ class _ControlSSABuilder:
         true_exit = self.current
         if not true_exit.successors:
             self.branch(merge_block)
+        if not body_falls_through:
+            self.external_values.clear()
+            self.external_values.update(values_before_body)
 
         # Each arm starts with the same incumbent versions.  Retain the true
         # arm's exact values above, then restore these identities before
@@ -6665,8 +6705,14 @@ class _ControlSSABuilder:
         # the branch boundary.
         self.external_values.update(carried_snapshots)
         self.current = false_block
+        values_before_orelse = dict(self.external_values)
         if conditional.orelse is not None:
             self.lower(conditional.orelse, path=f"{path}.orelse")
+        if self.current.successors and (
+            merge_block.name not in self.current.successors
+        ):
+            self.external_values.clear()
+            self.external_values.update(values_before_orelse)
         false_results = {
             int(result_id): self.external_value(int(false_id))
             for _true_id, false_id, result_id in conditional.result_aliases
@@ -13280,6 +13326,11 @@ def lower_control_sections_to_ssa(
     # and publishes.  Reading arbitrary integer leaves out of operation tuples
     # would conflate IDs with widths, slots, literals, and callsite numbers.
     region_dependency_signatures = {}
+    item_operand_page = None
+    if lexical_read_scope is not None:
+        from .identity_concordance import current_identity_book
+
+        item_operand_page = current_identity_book().page("item_operand")
     for region_index, instructions in planned_region_instructions.items():
         produced = tuple(dict.fromkeys(
             int(instruction.res.id)
@@ -13293,6 +13344,23 @@ def lower_control_sections_to_ssa(
             for argument in instruction.args
             if int(argument.id) not in produced_set
         ))
+        # A captured ``item()`` IS its operand's read (``item_operand``):
+        # the region consumes the operand's producer too.  Matched by id
+        # alone, ``float(x.item())`` had no dependency on the region
+        # producing ``x`` and was scheduled before it
+        # (``_propose_dt_pen``: ``float(maximum(ratios.max(), 1.0).item())``).
+        if item_operand_page is not None:
+            consumed = tuple(dict.fromkeys((
+                *consumed,
+                *(
+                    int(item[0])
+                    for value_id in consumed
+                    for item in (item_operand_page.latest(
+                        (tuple(lexical_read_scope), int(value_id))
+                    ),)
+                    if item is not None
+                ),
+            )))
         region_dependency_signatures[int(region_index)] = (consumed, produced)
 
     def retained_lookup_ids(block):

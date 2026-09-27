@@ -108,6 +108,13 @@ class ConditionalBlock:
     # (true-arm value, false-arm value, expression result). Unlike a carried
     # assignment, an expression has no pre-branch value to snapshot or rebind.
     result_aliases: tuple[tuple[int, int, int], ...] = ()
+    # Scheduled regions that produce the predicate value: prerequisites of
+    # this block wherever the flat schedule places them.  A conditional's
+    # membership is its arm regions; without this, ordering placed the
+    # ``if`` before the region computing its own predicate's input
+    # (``exchange_time_bound``: ``binding.any()`` scheduled after the ``if``
+    # whose test reads it).
+    predicate_region_indices: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -695,6 +702,12 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
             if block.predicate_value_id is not None:
                 values.add(int(block.predicate_value_id))
             expression_values(block.predicate_expression)
+            # The value each rebound name holds at the site is what the
+            # break/continue edge carries: a consumer of planned control.
+            # (``if dt > 0.2: dt = dt * 0.5; continue`` -- once no
+            # conditional merge consumed ``dt * 0.5``, its region was
+            # dropped and the continue edge carried the header value.)
+            values.update(int(value) for _initial, value in block.site_values)
         elif isinstance(block, StateMachineTick):
             for _case, body in block.cases:
                 visit(body)
@@ -1122,6 +1135,24 @@ def _region_marker(block: StatementBlock) -> int | None:
     return int(marker[len(prefix):-2])
 
 
+def _declared_predicate_regions(block: "ControlBlock") -> tuple[int, ...]:
+    """Every predicate-producing region a block's conditionals declare."""
+
+    if isinstance(block, ConditionalBlock):
+        return (
+            *block.predicate_region_indices,
+            *_declared_predicate_regions(block.body),
+            *(() if block.orelse is None
+              else _declared_predicate_regions(block.orelse)),
+        )
+    if isinstance(block, SequenceBlock):
+        return tuple(
+            region for child in block.blocks
+            for region in _declared_predicate_regions(child)
+        )
+    return ()
+
+
 def order_control_region_dependencies(
     program: "ControlProgram", dependencies: Iterable[tuple[int, int]],
 ) -> "ControlProgram":
@@ -1213,6 +1244,11 @@ def order_control_region_dependencies(
                 left, right = owners.get(producer), owners.get(consumer)
                 if left is not None and right is not None and left != right:
                     prerequisites[right].add(left)
+            for index, child in enumerate(children):
+                for region in _declared_predicate_regions(child):
+                    owner = owners.get(int(region))
+                    if owner is not None and owner != index:
+                        prerequisites[index].add(owner)
 
             # Collapsing a lexical loop to one child can create a cycle in
             # this quotient even when the underlying region graph is acyclic:
@@ -2230,6 +2266,7 @@ def project_control_regions(
                 body_callsite_ids=block.body_callsite_ids,
                 orelse_callsite_ids=block.orelse_callsite_ids,
                 result_aliases=block.result_aliases,
+                predicate_region_indices=block.predicate_region_indices,
             )
         if isinstance(block, LoopBlock):
             body = project(block.body)

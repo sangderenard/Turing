@@ -173,7 +173,14 @@ def test_phi_initial_repair_updates_already_planned_control_identity():
     assert repaired.root.carried_aliases == ((261, 298, 256, 262),)
 
 
-def test_alias_assignment_missing_from_history_synthesizes_conditional_merge():
+def test_conditional_without_reducer_phi_gets_no_invented_merge():
+    """Merges are the reducer's Phis; none is synthesized from name history.
+
+    This graph has no reducer Phi for ``dt_cap``.  The planner used to invent
+    one from the name's identity history, the rule that bound a continue
+    arm's fall-through update as an if-merge (``if dt > 0.2: dt = dt * 0.5;
+    continue`` then ``dt = dt * 1.5``) and lost the loop update.
+    """
     conditional = ast.parse(
         "if ready:\n"
         "    dt_cap = lattice_value\n"
@@ -214,18 +221,8 @@ def test_alias_assignment_missing_from_history_synthesizes_conditional_merge():
         for block in programs[0].root.blocks
         if isinstance(block, ConditionalBlock)
     )
-    assert carried == ((3, 2, 2, 3),)
-    assert graph.graph["synthesized_conditional_merge_receipts"] == ({
-        "source_conditional_id": 10,
-        "binding_name": "dt_cap",
-        "body_value_id": 3,
-        "orelse_value_id": 2,
-        "initial_value_id": 2,
-        "merge_spelling_value_id": 3,
-        "dataflow_rank": (1, 1),
-        "priority": "exact_nearest_dataflow_ancestor",
-        "tie_policy": "incumbent",
-    },)
+    assert carried == ()
+    assert "synthesized_conditional_merge_receipts" not in graph.graph
 
 
 def test_represented_loop_conditional_gains_missing_alias_and_keeps_incumbent():
@@ -496,14 +493,3 @@ def test_exact_field_state_phi_suppresses_later_flat_setattr_history():
         if isinstance(block, ConditionalBlock)
     )
     assert carried == ()
-    assert graph.graph[
-        "suppressed_flat_record_field_alias_receipts"
-    ] == ({
-        "source_conditional_id": 10,
-        "binding_name": "ctrl.flag",
-        "candidate_value_ids": (40, 42),
-        "record_field_keys": ((7, "flag"),),
-        "outcome": "exact_field_state_phi_retained",
-        "priority": "exact_reducer_record_field_state",
-        "tie_policy": "incumbent",
-    },)

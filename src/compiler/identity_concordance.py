@@ -313,7 +313,36 @@ class CorrelationTable:
         found.extend(self._callable_identity_findings(module))
         found.extend(self._post_ssa_numeric_identity_findings(module))
         found.extend(self._table_member_findings(module))
+        found.extend(self._operand_position_orphan_findings(module))
         return found
+
+    @staticmethod
+    def _operand_position_orphan_findings(module: Any) -> list[Finding]:
+        """Read bindings orphaned by an operand rewrite off the book.
+
+        Page ``lexical_read_binding`` keys the binding one operand read by
+        its position ``(consumer, role, ordinal)``.  ``_set_operands`` is the
+        one writer of operand lists and moves those rows with the operand;
+        a rewrite that bypasses it leaves the row at a position the consumer
+        no longer has.  The planner records each such row on page
+        ``operand_position_orphan`` when it reads the consumer's operands.
+        """
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        page = (getattr(book, "pages", {}) or {}).get("operand_position_orphan")
+        if page is None:
+            return []
+        return [
+            Finding(
+                "operand-position-orphan",
+                str(row[0]),
+                int(row[1]) if isinstance(row[1], int) else None,
+                f"binding {page.latest(row)!r} read at operand position "
+                f"{row[2:]!r} of consumer {row[1]!r}, which that consumer "
+                "no longer has -- an operand rewrite bypassed _set_operands",
+            )
+            for row in page.rows()
+            if isinstance(row, tuple) and len(row) == 4
+        ]
 
     @staticmethod
     def _table_member_findings(module: Any) -> list[Finding]:
@@ -1777,6 +1806,10 @@ class IdentityPage:
         """Every row whose first element is ``scope``, in recorded order."""
         return tuple(self.scopes.get(scope, ()))
 
+    def scope_row_count(self, scope: Any) -> int:
+        """How many rows ``scope`` owns, without materializing them."""
+        return len(self.scopes.get(scope, ()))
+
     def revise(self, row: Any, fact: Any) -> Any:
         """Append ``fact`` as ``row``'s next revision and return it.
 
@@ -1997,7 +2030,7 @@ class IdentityBook:
         """
         page = self.page("scope_registry")
         label = str(label)
-        scope = (label, len(page.scope_rows(label)))
+        scope = (label, page.scope_row_count(label))
         page.concord(scope, True)
         return scope
 

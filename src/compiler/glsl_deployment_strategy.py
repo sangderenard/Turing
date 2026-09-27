@@ -83,6 +83,11 @@ from .hierarchical_plan import (
     assign_hierarchy_ids,
     reduce_hierarchy_identities,
 )
+
+from ..common.tensors.topological_reducer import (
+    _append_operand,
+    _set_operands,
+)
 from .loop_composer import (
     LoopBackendCapabilities,
     LoopComposer,
@@ -263,7 +268,16 @@ def _lower_python_scalar_intrinsics(graph: Any) -> None:
                 for child, role in G.nodes[int(parent)].get("children", ())
                 if int(child) != int(node_id)
             ]
-        data["parents"] = [(int(receiver_id), "operand")]
+        # The receiver was read by the attribute load; the rewritten call
+        # takes that read as its ``operand`` (a fork of the read position).
+        _set_operands(
+            SimpleNamespace(G=G), int(node_id), [(int(receiver_id), "operand")],
+            cause="scalar_intrinsic_receiver",
+            fork_from=(
+                {("operand", 0): (int(attribute_id), "value", 0)}
+                if attribute_id is not None else None
+            ),
+        )
         G.add_edge(int(receiver_id), int(node_id), role="operand")
         receiver_children = list(G.nodes[int(receiver_id)].get("children", ()))
         if not any(int(child) == int(node_id) for child, _ in receiver_children):
@@ -2224,20 +2238,88 @@ def _concord_consumer_operands(
     if scope is None:
         return
     wanted = set(map(int, values))
-    page = current_identity_book().page("consumer_operand")
+    book = current_identity_book()
+    page = book.page("consumer_operand")
+    # A read row naming a position its consumer no longer has was orphaned
+    # by an operand rewrite that bypassed ``_set_operands``: the binding the
+    # operand read is lost.  Record it where the live graph and the rows
+    # meet; ``CorrelationTable`` reports page ``operand_position_orphan``.
+    read_page = book.page("lexical_read_binding")
+    orphan_page = book.page("operand_position_orphan")
+    read_rows: dict[int, list[tuple[Any, int]]] = {}
+    for row in read_page.scope_rows(tuple(scope)):
+        if (
+            len(row) == 4 and isinstance(row[1], int)
+            and read_page.latest(row) is not None
+        ):
+            read_rows.setdefault(int(row[1]), []).append((row[2], row[3]))
     for node_id in consumer_nodes:
         if int(node_id) not in graph.G:
             continue
         positions: dict[int, list[tuple[Any, int]]] = {}
+        present: set[tuple[Any, int]] = set()
         for role, ordinal, parent in _operand_positions(
             graph.G.nodes[int(node_id)].get("parents") or ()
         ):
+            present.add((role, ordinal))
             if int(parent) in wanted:
                 positions.setdefault(int(parent), []).append((role, ordinal))
+        for position in read_rows.get(int(node_id), ()):
+            if position not in present:
+                orphan_page.concord(
+                    (tuple(scope), int(node_id), *position),
+                    read_page.latest((tuple(scope), int(node_id), *position)),
+                )
         for parent, operand_positions in positions.items():
             page.concord(
                 (tuple(scope), int(node_id), parent), tuple(operand_positions),
             )
+
+
+def _concord_item_operands(graph: Any, captures: Any) -> None:
+    """Record, per captured ``item()`` node, the operand position it reads.
+
+    ``float(total.item())`` in a loop body: no region computes the ``item``,
+    so the region captures the item's id.  The loop carries ``total``, not
+    the item id; a later id-keyed identity rewrite
+    (``_rebind_recorded_scalar_identities``) replaced the capture with
+    ``total``'s only definition -- the pre-loop one -- and ``total_value``
+    froze at its first value (silent wrong answer).
+
+    Page ``item_operand`` row ``(read scope, item id)`` holds ``(operand id,
+    role, ordinal)``: structure only.  The control lowering reads the
+    operand by the binding at that position (``lexical_read_binding``) in
+    each read site's loop generation, and decides the rank-0 identity from
+    the value it reads.
+    """
+
+    from ..common.tensors.topological_reducer import _operand_positions
+    from .identity_concordance import current_identity_book
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is None:
+        return
+    page = current_identity_book().page("item_operand")
+    for value_id in captures:
+        if int(value_id) not in graph.G:
+            continue
+        data = graph.G.nodes[int(value_id)]
+        if str(data.get("op") or data.get("type") or "").casefold() != "item":
+            continue
+        operands = [
+            (role, ordinal, parent)
+            for role, ordinal, parent in _operand_positions(
+                data.get("parents") or ()
+            )
+            if str(role) in {"operand", "arg:0", "value"}
+        ]
+        if len(operands) != 1:
+            continue
+        role, ordinal, operand = operands[0]
+        page.concord(
+            (tuple(scope), int(value_id)),
+            (int(operand), str(role), int(ordinal)),
+        )
 
 
 def _concord_call_argument_operands(
@@ -2483,96 +2565,10 @@ def _build_shell_hierarchy_plan(
 
             for parent, role in attributed_call_parents():
                 position = _positional_argument_index(role)
-                call_expression = graph.G.nodes[node_id].get("expr_obj")
-                argument_expression = None
-                if isinstance(call_expression, ast.Call):
-                    if (
-                        position is not None
-                        and position < len(call_expression.args)
-                    ):
-                        argument_expression = call_expression.args[position]
-                    elif role.startswith("kw:"):
-                        keyword_name = role.split(":", 1)[1]
-                        argument_expression = next((
-                            keyword.value
-                            for keyword in call_expression.keywords
-                            if keyword.arg == keyword_name
-                        ), None)
-                # The ProcessGraph edge for a mutable aggregate may retain
-                # its construction producer (``types = []``) even after the
-                # lexical spelling denotes the resident mutation result.
-                # A Name argument has an exact source-time identity: choose
-                # the latest deterministic definition preceding this call.
-                # This is SSA correlation, not name-based backend recovery.
-                # Retained-loop materialization has already rewired a use
-                # after the loop onto its LoopResult/LoopExit port.  That
-                # edge is the control-aware current definition.  Replacing it
-                # with the latest source-coordinate candidate can select an
-                # assignment inside the loop body instead, moving a call
-                # behind the consumer of its own result.  Name-history repair
-                # is only for stale ordinary producer edges; never override a
-                # planner-owned loop exit correlation.
-                parent_operation = str(
-                    graph.G.nodes.get(int(parent), {}).get("op")
-                    or graph.G.nodes.get(int(parent), {}).get("type")
-                    or ""
-                ).casefold()
-                # The same holds for a conditional merge: a ``Phi`` is the
-                # reducer's exact, control-aware definition of the name after
-                # an ``if`` (``dt_next = minimum(...)`` in one arm, the
-                # pi_update value otherwise).  A Phi has no source position,
-                # so the source-ordered candidate scan below can never select
-                # it and instead picks the arm-local producer, which does not
-                # dominate the call (step_with_dt_control_used:
-                # ``_apply_energy_sidechain(dt_next, ...)`` was bound to the
-                # ``minimum`` inside ``if metrics.dt_limit is not None`` and
-                # refused as an undefined operand).  Never override a merge.
-                if (
-                    isinstance(argument_expression, ast.Name)
-                    and parent_operation not in {"loopresult", "loopexit", "phi"}
-                ):
-                    call_position = source_position(int(node_id))
-                    # ``state, out = f(state)`` spells its targets left of
-                    # the call.  A definition that consumes this call's
-                    # result is a successor of the call, so it can never be
-                    # a preceding definition regardless of its column; using
-                    # it feeds the call its own result and leaves the loop
-                    # carry without a producer.
-                    candidates = [
-                        int(definition)
-                        for definition in caller_identities.get(
-                            argument_expression.id, ()
-                        )
-                        if (
-                            int(definition) in order_index
-                            and not nx.has_path(
-                                graph.G, int(node_id), int(definition)
-                            )
-                            and (
-                                call_position is not None
-                                and source_position(int(definition)) is not None
-                                and source_position(int(definition))
-                                < call_position
-                                or (
-                                    (
-                                        call_position is None
-                                        or source_position(int(definition))
-                                        is None
-                                    )
-                                    and order_index[int(definition)]
-                                    < order_index[int(node_id)]
-                                )
-                            )
-                        )
-                    ]
-                    if candidates:
-                        parent = max(
-                            candidates,
-                            key=lambda definition: (
-                                source_position(definition)
-                                or (-1, order_index[definition])
-                            ),
-                        )
+                # The call's edge is the argument's identity.  (A former
+                # name-history override replaced it with the source-latest
+                # definition of the argument's name, which chose a continue
+                # arm's value over the edge to the pre-branch value.)
                 if position is not None:
                     name = (
                         positional_parameters[position]
@@ -3549,6 +3545,7 @@ def _build_shell_hierarchy_plan(
             if descriptor is not None
         )
         _concord_consumer_operands(graph, region_nodes, region_captures)
+        _concord_item_operands(graph, region_captures)
         items.append(PlanClosure(
             name=f"region_{region_index}",
             captures=region_captures,
@@ -7510,7 +7507,7 @@ def _dispatch_subgraph(
             data["attributes"].pop("value", None)
         data["op"] = "input"
         data["label"] = f"value_{node_id}"
-        data["parents"] = []
+        _set_operands(subgraph, node_id, [], cause="region_boundary_input")
         for parent in tuple(subgraph.G.predecessors(node_id)):
             subgraph.G.remove_edge(parent, node_id)
 
@@ -8460,347 +8457,13 @@ def _ordinary_conditional_control_programs(
                     graph.G, node_by_value, (merged_id,),
                 )
             )
-        positional_output_names = set(
-            graph.G.graph.get("positional_output_names") or ()
-        )
-        for name, history in (
-            graph.G.graph.get("identity_table") or {}
-        ).items():
-            if str(name) in positional_output_names:
-                # A positional output slot's history lists one value PER
-                # RETURN SITE; it is not a variable rebound in these arms.
-                # Merging it here manufactured degenerate `Phi [v, v]`
-                # aliases between return sites and rebound each earlier
-                # return's value onto the next one ("last return wins").
-                # Return sites merge at the function exit instead
-                # (control-aware result merging).
-                continue
-            if str(name) in direct_phi_bindings:
-                continue
-            ordered = tuple(
-                int(value_id) for value_id in history
-                if int(value_id) in node_by_value
-            )
-            if not ordered:
-                continue
-            # The reducer's record-field Phi is the exact state transition for
-            # this receiver slot.  A dotted attribute identity history also
-            # contains its SetAttr event ids; reconstructing that flat history
-            # creates a second carried chain whose pre-branch "value" is an
-            # effect node with no definition.  The exact field-state Phi wins.
-            ordered_record_fields = _record_field_state_keys(
-                graph.G, node_by_value, ordered,
-            )
-            authoritative_record_fields = (
-                direct_phi_record_fields | reducer_phi_record_fields
-            ).intersection(ordered_record_fields)
-            if authoritative_record_fields:
-                receipt = {
-                    "source_conditional_id": int(control_id),
-                    "binding_name": str(name),
-                    "candidate_value_ids": ordered,
-                    "record_field_keys": tuple(sorted(
-                        authoritative_record_fields
-                    )),
-                    "outcome": "exact_field_state_phi_retained",
-                    "priority": "exact_reducer_record_field_state",
-                    "tie_policy": "incumbent",
-                }
-                receipts = list(graph.G.graph.get(
-                    "suppressed_flat_record_field_alias_receipts", ()
-                ))
-                if receipt not in receipts:
-                    receipts.append(receipt)
-                    graph.G.graph[
-                        "suppressed_flat_record_field_alias_receipts"
-                    ] = tuple(receipts)
-                continue
-            # An arm that ends in return/break/continue never reaches the
-            # merge point: the values it binds leave through its own edge
-            # (return merge, break edge) and are not this conditional's
-            # carried aliases.  Merging them here manufactured a Phi with an
-            # unreachable incoming edge and rebound the fall-through value.
-            body_values = tuple(
-                value_id for value_id in ordered
-                if body_return_control is None
-                and (int(control_id), "body") in memberships.get(
-                    node_by_value[value_id], ()
-                )
-            )
-            else_values = tuple(
-                value_id for value_id in ordered
-                if else_return_control is None
-                and (int(control_id), "orelse") in memberships.get(
-                    node_by_value[value_id], ()
-                )
-            )
-            if not body_values and not else_values:
-                continue
-            branch_positions = tuple(
-                ordered.index(value_id)
-                for value_id in (*body_values, *else_values)
-            )
-            first_branch = min(branch_positions)
-            last_branch = max(branch_positions)
-            initial_candidate = next((
-                ordered[position]
-                for position in range(first_branch - 1, -1, -1)
-                if ordered[position] not in {*body_values, *else_values}
-            ), None)
-            initial = (
-                ordered[0]
-                if initial_candidate is None
-                else int(initial_candidate)
-            )
-            # Deterministic identity order is the authoritative Phi
-            # correlation.  Nested conditionals are completed inside-out by
-            # the frontend, and older ``source_conditional_id`` annotations
-            # can consequently name the enclosing/inner merge in the reverse
-            # order.  The first version after this conditional's lexical arm
-            # values is its merge by SSA construction.  Retain the annotation
-            # only as a compatibility fallback for graphs without complete
-            # ordered histories.
-            # A loop port (LoopResult/LoopExit) is the value AFTER an
-            # enclosing loop, never a conditional's own merge.
-            merged = next((
-                ordered[position]
-                for position in range(last_branch + 1, len(ordered))
-                if ordered[position] not in {*body_values, *else_values}
-                and str(graph.G.nodes[node_by_value[ordered[position]]].get(
-                    "type"
-                ) or "") not in {"LoopResult", "LoopExit"}
-            ), None)
-            if merged is None:
-                merged = next((
-                    value_id for value_id in ordered
-                    if int((graph.G.nodes[node_by_value[value_id]].get(
-                        "attributes"
-                    ) or {}).get("source_conditional_id", -1))
-                    == int(control_id)
-                ), None)
-            if (
-                merged is None
-                and initial_candidate is not None
-                and (body_values or else_values)
-            ):
-                # A source alias assignment can replace a local name without
-                # creating a separately numbered reducer Phi.  The identity
-                # history then ends at the branch-local value even though the
-                # untouched arm must retain the pre-branch incumbent.  Use
-                # the authored arm value as the merge spelling; conditional
-                # SSA lowering sees that it is already defined in an arm and
-                # allocates a fresh join version.  This is finite (one choice
-                # from the ordered history), and an equal-priority untouched
-                # arm keeps its incumbent.
-                merged = int(
-                    body_values[-1] if body_values else else_values[-1]
-                )
-                receipt = {
-                    "source_conditional_id": int(control_id),
-                    "binding_name": str(name),
-                    "body_value_id": int(
-                        body_values[-1] if body_values else initial
-                    ),
-                    "orelse_value_id": int(
-                        else_values[-1] if else_values else initial
-                    ),
-                    "initial_value_id": int(initial),
-                    "merge_spelling_value_id": int(merged),
-                    "priority": "exact_ordered_identity_history",
-                    "tie_policy": "incumbent",
-                }
-                receipts = list(graph.G.graph.get(
-                    "synthesized_conditional_merge_receipts", ()
-                ))
-                if receipt not in receipts:
-                    receipts.append(receipt)
-                    graph.G.graph[
-                        "synthesized_conditional_merge_receipts"
-                    ] = tuple(receipts)
-            if merged is None:
-                continue
-            carried.append((
-                body_values[-1] if body_values else initial,
-                else_values[-1] if else_values else initial,
-                initial,
-                merged,
-            ))
-        represented_binding_names = {
-            str(binding) for binding in direct_phi_bindings
-        }
-        represented_binding_names.update(
-            str(receipt["binding_name"])
-            for receipt in graph.G.graph.get(
-                "synthesized_conditional_merge_receipts", ()
-            )
-            if int(receipt.get("source_conditional_id", -1))
-            == int(control_id)
-            and receipt.get("binding_name") is not None
-        )
-
-        def direct_name_assignments(
-            statements: Iterable[ast.stmt],
-        ) -> dict[str, int]:
-            """Return exact retained RHS values for direct alias assignments."""
-
-            assignments: dict[str, int] = {}
-            for statement in statements:
-                targets: tuple[ast.expr, ...]
-                if isinstance(statement, ast.Assign):
-                    targets = tuple(statement.targets)
-                    value_expression = statement.value
-                elif isinstance(statement, ast.AnnAssign):
-                    targets = (statement.target,)
-                    value_expression = statement.value
-                else:
-                    continue
-                if value_expression is None:
-                    continue
-                rhs_node_id = _retained_control_value_id(
-                    graph.G, None, value_expression,
-                )
-                if rhs_node_id is not None and rhs_node_id in graph.G:
-                    rhs_value_id = int(graph.G.nodes[rhs_node_id].get(
-                        "value_id", rhs_node_id,
-                    ))
-                elif isinstance(value_expression, ast.Name):
-                    # Reduction can remove the load syntax for a direct alias
-                    # while retaining the bound producer under its exact
-                    # source name. Resolve only one resident identity; equal
-                    # candidates are deliberately left to the incumbent.
-                    resident = tuple(dict.fromkeys(
-                        int(value_id)
-                        for value_id in (
-                            (graph.G.graph.get("identity_table") or {}).get(
-                                str(value_expression.id), ()
-                            )
-                        )
-                        if int(value_id) in node_by_value
-                    ))
-                    if len(resident) != 1:
-                        continue
-                    rhs_value_id = int(resident[0])
-                else:
-                    continue
-                for target in targets:
-                    if isinstance(target, ast.Name):
-                        assignments[str(target.id)] = rhs_value_id
-            return assignments
-
-        direct_body_assignments = direct_name_assignments(body_statements)
-        direct_else_assignments = direct_name_assignments(else_statements)
-        for binding_name in dict.fromkeys((
-            *direct_body_assignments,
-            *direct_else_assignments,
-        )):
-            if (
-                binding_name in represented_binding_names
-                or binding_name in positional_output_names
-            ):
-                continue
-            body_value = direct_body_assignments.get(binding_name)
-            else_value = direct_else_assignments.get(binding_name)
-            authored_values = tuple(dict.fromkeys(
-                int(value)
-                for value in (body_value, else_value)
-                if value is not None
-            ))
-            history = tuple(dict.fromkeys(
-                int(value_id)
-                for value_id in (
-                    (graph.G.graph.get("identity_table") or {}).get(
-                        binding_name, ()
-                    )
-                )
-                if int(value_id) in node_by_value
-                and int(value_id) not in authored_values
-            ))
-            if not history or not authored_values:
-                continue
-            rhs_nodes = tuple(
-                int(node_by_value[value_id])
-                for value_id in authored_values
-                if value_id in node_by_value
-            )
-            if len(rhs_nodes) != len(authored_values):
-                continue
-            ranked_incumbents = []
-            for candidate_value_id in history:
-                candidate_node_id = int(node_by_value[candidate_value_id])
-                if not all(
-                    nx.has_path(graph.G, candidate_node_id, rhs_node_id)
-                    for rhs_node_id in rhs_nodes
-                ):
-                    continue
-                distances = tuple(
-                    int(nx.shortest_path_length(
-                        graph.G, candidate_node_id, rhs_node_id,
-                    ))
-                    for rhs_node_id in rhs_nodes
-                )
-                ranked_incumbents.append((
-                    max(distances), sum(distances),
-                    int(candidate_value_id),
-                ))
-            if not ranked_incumbents:
-                continue
-            ranked_incumbents.sort()
-            best_rank = ranked_incumbents[0][:2]
-            best = tuple(
-                candidate
-                for maximum, total, candidate in ranked_incumbents
-                if (maximum, total) == best_rank
-            )
-            if len(best) != 1:
-                unresolved = {
-                    "source_conditional_id": int(control_id),
-                    "binding_name": str(binding_name),
-                    "candidate_value_ids": best,
-                    "reason": "equal_priority_incumbents",
-                    "tie_policy": "incumbent",
-                }
-                unresolved_receipts = list(graph.G.graph.get(
-                    "unresolved_conditional_alias_assignments", ()
-                ))
-                if unresolved not in unresolved_receipts:
-                    unresolved_receipts.append(unresolved)
-                    graph.G.graph[
-                        "unresolved_conditional_alias_assignments"
-                    ] = tuple(unresolved_receipts)
-                continue
-            initial = int(best[0])
-            true_value = int(
-                body_value if body_value is not None else initial
-            )
-            false_value = int(
-                else_value if else_value is not None else initial
-            )
-            merge_spelling = int(
-                body_value if body_value is not None else else_value
-            )
-            carried.append((
-                true_value, false_value, initial, merge_spelling,
-            ))
-            represented_binding_names.add(str(binding_name))
-            receipt = {
-                "source_conditional_id": int(control_id),
-                "binding_name": str(binding_name),
-                "body_value_id": true_value,
-                "orelse_value_id": false_value,
-                "initial_value_id": initial,
-                "merge_spelling_value_id": merge_spelling,
-                "dataflow_rank": best_rank,
-                "priority": "exact_nearest_dataflow_ancestor",
-                "tie_policy": "incumbent",
-            }
-            receipts = list(graph.G.graph.get(
-                "synthesized_conditional_merge_receipts", ()
-            ))
-            if receipt not in receipts:
-                receipts.append(receipt)
-                graph.G.graph[
-                    "synthesized_conditional_merge_receipts"
-                ] = tuple(receipts)
+        # Merges are the reducer's Phis (above), which it creates for every
+        # runtime conditional whose arms bind a name differently and never
+        # for an arm that leaves by return/raise/continue/break.  Merges were
+        # also synthesized here from a name's identity history ("the first
+        # version after the arms"); for a continue arm that version is the
+        # loop's fall-through update, which was then bound as the if-merge
+        # and the loop lost the update.
         body = SequenceBlock((
             *(
                 StatementBlock((f"__scheduled_region_{index}__",))
@@ -8861,6 +8524,9 @@ def _ordinary_conditional_control_programs(
                 body_callsite_ids=body_callsites,
                 orelse_callsite_ids=else_callsites,
                 result_aliases=result_aliases,
+                predicate_region_indices=tuple(
+                    int(region) for region in predicate_terminal_regions
+                ),
             ),
         ))
         anchor_region = None
@@ -16412,7 +16078,7 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
                 graph.G.nodes[parent].setdefault("children", []).append((member, role))
             graph.G.add_edge(member, int(node_id), role="elts")
             graph.G.nodes[member]["children"].append((int(node_id), "elts"))
-            data.setdefault("parents", []).append((member, "elts"))
+            _append_operand(graph, int(node_id), member, "elts")
             bindings.append((int(left), int(right), member))
         attributes.update({
             "producer_kind": "aggregate", "aggregate_kind": "tuple",
@@ -19915,11 +19581,11 @@ def _fold_callsite_structural_values(
         topology_changed = True
         for successor in tuple(graph.G.successors(node_id)):
             successor_data = graph.G.nodes[int(successor)]
-            successor_data["parents"] = [
+            _set_operands(graph, int(successor), [
                 (int(parent), str(role))
                 for parent, role in successor_data.get("parents") or ()
                 if int(parent) != node_id
-            ]
+            ], cause="callsite_fold_remove_node")
         for predecessor in tuple(graph.G.predecessors(node_id)):
             graph.G.nodes[int(predecessor)]["children"] = [
                 (child, role)
@@ -19964,7 +19630,10 @@ def _fold_callsite_structural_values(
             )
             if graph.G.has_edge(node_id, int(successor)):
                 graph.G.remove_edge(node_id, int(successor))
-            successor_data["parents"] = list(replacement)
+            _set_operands(
+                graph, int(successor), list(replacement),
+                cause="callsite_fold_replace_alias", same={node_id: source_id},
+            )
             _follow_declared_value_source(successor_data, node_id, source_id)
             for parent, role in replacement:
                 if not graph.G.has_edge(int(parent), int(successor)):
@@ -21439,13 +21108,13 @@ def _alias_projection_to_member(
     projection_data = graph.G.nodes[projection]
     for successor in tuple(graph.G.successors(projection)):
         successor_data = graph.G.nodes[int(successor)]
-        successor_data["parents"] = [
+        _set_operands(graph, int(successor), [
             (
                 leaf_id if int(parent) == projection else int(parent),
                 str(role),
             )
             for parent, role in successor_data.get("parents") or ()
-        ]
+        ], cause="projection_to_leaf", same={projection: leaf_id})
         _follow_declared_value_source(successor_data, projection, leaf_id)
         for parent, role in successor_data["parents"]:
             if int(parent) == leaf_id:
@@ -21618,7 +21287,9 @@ def _apply_callsite_aggregate_descriptors(
             formal["type"] = "Tuple"
             formal["op"] = None
             formal["tensor"] = {}
-            formal["parents"] = [(int(leaf), "elts") for leaf in leaves]
+            _set_operands(graph, int(input_id), [
+                (int(leaf), "elts") for leaf in leaves
+            ], cause="aggregate_formal_members")
             for leaf in leaves:
                 graph.G.add_edge(int(leaf), int(input_id), role="elts")
                 graph.G.nodes[int(leaf)].setdefault("children", []).append(
@@ -22309,7 +21980,7 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         parents = [(int(parent), str(role)) for parent, role in data.get("parents") or ()
                    if str(role) not in {"callee", "func", "function", "operand", "receiver"}]
         parents.append((receiver_id, "operand"))
-        data["parents"] = parents
+        _set_operands(graph, int(node_id), parents, cause="bound_receiver")
         if graph.G.has_edge(selector, node_id):
             graph.G.remove_edge(selector, node_id)
         graph.G.add_edge(receiver_id, node_id)

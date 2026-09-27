@@ -2030,10 +2030,216 @@ def record_translation_shortfall(
     )
 
 
+#: Book pages whose facts name an operand position ``(role, ordinal)`` of a
+#: consumer node.  A position is an identity: when a node's operand list is
+#: rewritten, every one of these follows the operand to its new position.
+#: ``lexical_read_binding`` rows are ``(scope, consumer, role, ordinal) ->
+#: binding``; ``consumer_operand`` rows are ``(scope, consumer, value) ->
+#: ((role, ordinal), ...)``.
+_OPERAND_POSITION_ROW_PAGES = ("lexical_read_binding",)
+_OPERAND_POSITION_FACT_PAGES = ("consumer_operand",)
+
+
+def _operand_position_scope(graph: Any) -> Any:
+    """The book scope this graph's operand-position rows are keyed in."""
+
+    graph_data = getattr(getattr(graph, "G", None), "graph", None) or {}
+    scope = graph_data.get("operand_position_scope")
+    if scope is None:
+        scope = graph_data.get("lexical_read_scope")
+    return None if scope is None else tuple(scope)
+
+
+def _set_operands(
+    graph: Any,
+    node_id: Any,
+    parents: Any,
+    *,
+    cause: str,
+    same: Mapping[Any, Any] | None = None,
+    fork_from: Mapping[tuple[Any, int], tuple[Any, ...]] | None = None,
+) -> None:
+    """The one writer of a node's operand list, recorded on the book.
+
+    Facts keyed by an operand position (the binding one operand read, see
+    ``_OPERAND_POSITION_ROW_PAGES``) must name the same operand after any
+    rewrite.  A rewrite that renames roles (a call rebuilt from ``args`` to
+    ``arg:0``), drops an operand (shifting later ordinals of its role) or
+    swaps the operand's id (``same``: old parent id -> new parent id) moves
+    positions.  Old and new positions are paired by operand identity, in
+    order, so one value read at two positions pairs position by position.
+
+    Every change is one operator on page ``identity_transition``, row
+    ``(scope, consumer, role, ordinal)`` of the position it acts on:
+    ``("move", consumer, new role, new ordinal, cause)``, ``("retire",
+    None, None, None, cause)`` when the operand left the list, and at the
+    new position ``("fork", source node, source role, source ordinal,
+    cause)`` for ``fork_from`` -- a new position fed by an occurrence whose
+    read was committed at another node's position (a method call's
+    receiver, read first by its attribute load).  Every position-keyed page
+    follows.  A vacated position with no successor is revised to None, so a
+    later operand that shifts into it never inherits another's fact.
+
+    Found by: ``AbstractTensor.minimum(dt_cap, remainder)`` inside
+    ``run_superstep``'s while loop.  The read of ``dt_cap`` was committed at
+    ``(call, 'args', 0)``; ``_replace_inputs`` then rebuilt the call's
+    operands as ``arg:0``/``arg:1`` and the control lowering, reading
+    ``(call, 'arg:0', 0)``, found no binding for a carried value.
+    """
+
+    if node_id not in graph.G:
+        return
+    data = graph.G.nodes[node_id]
+    old = list(_operand_positions(data.get("parents") or ()))
+    parents = list(parents)
+    data["parents"] = parents
+    scope = _operand_position_scope(graph)
+    if scope is None:
+        return
+    new = list(_operand_positions(parents))
+    renamed = dict(same or {})
+    taken: set[int] = set()
+    moves: dict[tuple[Any, int], tuple[Any, int] | None] = {}
+    for role, ordinal, parent in old:
+        target = renamed.get(parent, parent)
+        match = None
+        # The same role first: an unmoved operand keeps its position even
+        # when its value also appears at another position.
+        for index, (new_role, _new_ordinal, new_parent) in enumerate(new):
+            if index not in taken and new_parent == target and new_role == role:
+                match = index
+                break
+        if match is None:
+            for index, (_new_role, _new_ordinal, new_parent) in enumerate(new):
+                if index not in taken and new_parent == target:
+                    match = index
+                    break
+        if match is None:
+            moves[(role, ordinal)] = None
+            continue
+        taken.add(match)
+        moves[(role, ordinal)] = (new[match][0], new[match][1])
+    forks = {
+        (role, ordinal): source
+        for (role, ordinal), source in dict(fork_from or {}).items()
+        if any(
+            (new_role, new_ordinal) == (role, ordinal)
+            for new_role, new_ordinal, _parent in new
+        )
+    }
+    if not forks and all(
+        source == target for source, target in moves.items()
+    ):
+        return
+    book = current_identity_book()
+    transition_page = book.page("identity_transition")
+    for (role, ordinal), target in moves.items():
+        if target == (role, ordinal):
+            continue
+        transition_page.revise(
+            (scope, node_id, role, ordinal),
+            ("retire", None, None, None, cause) if target is None
+            else ("move", node_id, *target, cause),
+        )
+    for (role, ordinal), source in forks.items():
+        transition_page.revise(
+            (scope, node_id, role, ordinal), ("fork", *source, cause),
+        )
+    for name in _OPERAND_POSITION_ROW_PAGES:
+        page = book.page(name)
+        facts = {
+            source: page.latest((scope, node_id, *source))
+            for source in moves
+        }
+        arriving = {
+            target: facts[source]
+            for source, target in moves.items()
+            if target is not None and facts[source] is not None
+        }
+        for target, source in forks.items():
+            fact = page.latest((scope, *source))
+            if fact is not None and target not in arriving:
+                arriving[target] = fact
+        for source, fact in facts.items():
+            if fact is not None and source not in arriving:
+                page.revise((scope, node_id, *source), None)
+        for target, fact in arriving.items():
+            if page.latest((scope, node_id, *target)) != fact:
+                page.revise((scope, node_id, *target), fact)
+    for name in _OPERAND_POSITION_FACT_PAGES:
+        page = book.page(name)
+        for _role, _ordinal, parent in old:
+            row = (scope, node_id, parent)
+            positions = page.latest(row)
+            if not positions:
+                continue
+            moved = tuple(
+                moves.get(tuple(position), tuple(position))
+                for position in positions
+            )
+            moved = tuple(position for position in moved if position is not None)
+            target_row = (scope, node_id, renamed.get(parent, parent))
+            if target_row != row:
+                page.revise(row, ())
+            if page.latest(target_row) != moved:
+                page.revise(target_row, moved)
+
+
+def fork_read_scope(graph: Any, cause: str) -> None:
+    """Give a graph copy its own read scope: a fork of its source's rows.
+
+    Every page row whose first element is the source read scope (the
+    binding each operand read, loop carried bindings, operand structure) is
+    copied under a freshly minted scope, and the copy's graph names that
+    scope.  A copy's rewrites -- a callsite fold removing an operand -- then
+    revise only its own rows.  Sharing one scope, a fold in one
+    specialization retired rows the original and every other specialization
+    read.  Page ``identity_transition`` row ``(new scope, "scope")`` records
+    ``("fork", source scope, cause)``.
+    """
+
+    graph_data = graph.G.graph
+    source = graph_data.get("lexical_read_scope")
+    if source is None:
+        return
+    source = tuple(source)
+    book = current_identity_book()
+    forked = book.mint_scope(f"{source[0]}|fork")
+    for page in tuple(book.pages.values()):
+        for row in page.scope_rows(source):
+            if page.name == "identity_transition" and row[1:] == ("scope",):
+                # A scope's origin is its own fact, not inherited.
+                continue
+            fact = page.latest(row)
+            if fact is not None:
+                page.set((forked, *row[1:]), 0, fact)
+    book.page("identity_transition").concord(
+        (forked, "scope"), ("fork", source, str(cause)),
+    )
+    graph_data["lexical_read_scope"] = forked
+    if tuple(graph_data.get("operand_position_scope") or ()) == source:
+        graph_data["operand_position_scope"] = forked
+
+
+def _append_operand(graph: Any, node_id: Any, parent: Any, role: str) -> None:
+    """Append one operand through ``_set_operands`` unless already present.
+
+    An append takes the next ordinal of its role, so no existing position
+    moves; it goes through the one writer so the operand list has one."""
+
+    parents = list(graph.G.nodes[node_id].get("parents") or ())
+    if (parent, role) not in parents:
+        _set_operands(
+            graph, node_id, [*parents, (parent, role)], cause="append_operand",
+        )
+
+
 def _replace_inputs(
     graph: Any,
     node_id: int,
     inputs: tuple[tuple[int, str], ...],
+    *,
+    fork_from: Mapping[tuple[Any, int], tuple[Any, ...]] | None = None,
 ) -> None:
     """Replace one wrapper's incoming topology with executable operands.
 
@@ -2078,7 +2284,9 @@ def _replace_inputs(
                 expected=expected,
             )
         resolved.append((predecessor, role))
-    graph.G.nodes[node_id]["parents"] = list(resolved)
+    _set_operands(
+        graph, node_id, resolved, cause="replace_inputs", fork_from=fork_from,
+    )
     for predecessor, role in resolved:
         graph.G.add_edge(predecessor, node_id, role=role)
         children = graph.G.nodes[predecessor].setdefault("children", [])
@@ -2166,13 +2374,13 @@ def _remove_node(graph: Any, node_id: int) -> None:
             if child_id != node_id
         ]
     for successor in tuple(graph.G.successors(node_id)):
-        graph.G.nodes[successor]["parents"] = [
+        _set_operands(graph, successor, [
             (parent_id, role)
             for parent_id, role in graph.G.nodes[successor].get(
                 "parents", ()
             )
             if parent_id != node_id
-        ]
+        ], cause="remove_node")
     graph.roots = [root for root in graph.roots if root != node_id]
     graph.G.remove_node(node_id)
 
@@ -2190,9 +2398,15 @@ def _concord_lexical_reads(
     read instead of per value.
     """
 
+    page = current_identity_book().page("lexical_read_binding")
+    # The read is a fact of the occurrence before it is one of any consumer:
+    # a keyword argument's wrapper (and with it the Name node) can be absent
+    # from the function subgraph, leaving the read with no consumer edge.
+    # Row ``(scope, "occurrence", id)`` is the source a later operand
+    # position forks from (``_set_operands``).
+    page.concord((scope, "occurrence", int(occurrence_id)), str(binding))
     if occurrence_id not in graph.G:
         return
-    page = current_identity_book().page("lexical_read_binding")
     for consumer in tuple(graph.G.successors(occurrence_id)):
         for role, ordinal, parent_id in _operand_positions(
             graph.G.nodes[consumer].get("parents", ())
@@ -2241,7 +2455,10 @@ def _redirect_value(
             replacement.append(
                 (producer_id if parent_id == old_id else parent_id, role)
             )
-        successor_data["parents"] = replacement
+        _set_operands(
+            graph, successor, replacement, cause="redirect_value",
+            same={old_id: producer_id},
+        )
         graph.G.add_edge(producer_id, successor, role=graph.G.edges[
             old_id,
             successor,
@@ -2324,6 +2541,9 @@ def _normalize_lexical_values(
         f"lexical_reads:{value_class_scope}"
     )
     ingestion_read_scope = (read_scope, "ingestion")
+    # Operand-position facts are keyed in the ingestion scope until canonical
+    # renumbering; ``_set_operands`` moves them with every operand rewrite.
+    graph.G.graph["operand_position_scope"] = ingestion_read_scope
     #: A bare ``return name`` has no consumer edge: its value becomes a root.
     #: The bindings each returned root value was returned under.
     return_root_bindings: dict[int, set[str]] = {}
@@ -4097,12 +4317,9 @@ def _normalize_lexical_values(
                             "children",
                             [],
                         ).append((node_id, "callee"))
-                    parents = graph.G.nodes[node_id].setdefault(
-                        "parents",
-                        [],
+                    _append_operand(
+                        graph, node_id, reference_node_id, "callee",
                     )
-                    if (reference_node_id, "callee") not in parents:
-                        parents.append((reference_node_id, "callee"))
                 else:
                     # A canonical numerical operation already identifies its
                     # implementation by node type.  Preserve the wrapper as
@@ -4151,11 +4368,7 @@ def _normalize_lexical_values(
                         )
                         if (node_id, role) not in children:
                             children.append((node_id, role))
-                        parents = graph.G.nodes[node_id].setdefault(
-                            "parents", []
-                        )
-                        if (resolved, role) not in parents:
-                            parents.append((resolved, role))
+                        _append_operand(graph, node_id, resolved, role)
                 for keyword in expression.keywords:
                     if keyword.arg is None:
                         continue
@@ -4183,11 +4396,7 @@ def _normalize_lexical_values(
                         )
                         if (node_id, role) not in children:
                             children.append((node_id, role))
-                        parents = graph.G.nodes[node_id].setdefault(
-                            "parents", []
-                        )
-                        if (resolved, role) not in parents:
-                            parents.append((resolved, role))
+                        _append_operand(graph, node_id, resolved, role)
                 if static_arguments:
                     attributes["static_call_arguments"] = static_arguments
 
@@ -4255,11 +4464,7 @@ def _normalize_lexical_values(
                     )
                     if (node_id, role) not in children:
                         children.append((node_id, role))
-                    parents = graph.G.nodes[node_id].setdefault(
-                        "parents", []
-                    )
-                    if (resolved, role) not in parents:
-                        parents.append((resolved, role))
+                    _append_operand(graph, node_id, resolved, role)
 
             # Rebuild every call from the values resolved at this lexical
             # program point.  Ingestion may omit a repeated Attribute/Name
@@ -4327,7 +4532,39 @@ def _normalize_lexical_values(
                         resolved_inputs.append((
                             closure_value, f"closure:{closure_name}",
                         ))
-                _replace_inputs(graph, node_id, tuple(resolved_inputs))
+                # ``total.item()``: the receiver Name was read by the
+                # attribute load (``value`` of ``total.item``); the rebuilt
+                # call takes the same occurrence as its ``operand``.  That is
+                # a second read position of one occurrence -- a fork of the
+                # read, which must carry its binding.
+                # Keyword arguments are the same shape: ``f(dt_prev=x)``
+                # reads ``x`` at the ``keyword`` node's ``value``; the call
+                # takes it as ``kw:dt_prev`` (found by the woodshop's
+                # ``step_with_dt_control_used`` call in a carried loop).
+                # A Name forks from its own occurrence's read (the wrapper
+                # may never have been its consumer); any other expression
+                # from the wrapper position that consumed it.
+                def read_source(value_expression, wrapper_id):
+                    if isinstance(value_expression, ast.Name):
+                        return ("occurrence", id(value_expression))
+                    return (wrapper_id, "value", 0)
+
+                receiver_fork: dict[tuple[str, int], tuple[Any, ...]] = {}
+                if (
+                    isinstance(expression.func, ast.Attribute)
+                    and any(role == "operand" for _v, role in resolved_inputs)
+                ):
+                    receiver_fork[("operand", 0)] = read_source(
+                        expression.func.value, id(expression.func),
+                    )
+                for keyword in expression.keywords:
+                    receiver_fork[(
+                        f"kw:{keyword.arg}" if keyword.arg else "kwargs", 0,
+                    )] = read_source(keyword.value, id(keyword))
+                _replace_inputs(
+                    graph, node_id, tuple(resolved_inputs),
+                    fork_from=receiver_fork or None,
+                )
                 result_class = call_attributes.get(
                     "result_class_ref", call_attributes.get("class_ref")
                 )
@@ -5295,6 +5532,7 @@ def _normalize_lexical_values(
 
             body_terminal = terminal_branch(body_statement.body)
             else_terminal = terminal_branch(body_statement.orelse)
+
             # A guard clause -- `if cond: body else: raise` or its mirror --
             # has only one arm that can ever reach the statement after the
             # if.  The other arm's bindings (an old value the raising arm
@@ -6050,8 +6288,14 @@ def _normalize_lexical_values(
                     ):
                         continue
                     site["loop_id"] = loop_id
-                    if site["action"] != "break":
-                        continue
+                    # A ``continue`` edge carries its site's bindings to the
+                    # latch exactly as a ``break`` carries them to the exit:
+                    # record them and make the site node consume them.  Only
+                    # a break creates post-loop break bindings.  (Found by
+                    # ``if dt > 0.2: dt = dt * 0.5; continue``: unrecorded,
+                    # the continue value had no consumer but a conditional
+                    # merge synthesized from ``dt``'s identity history.)
+                    is_break = site["action"] == "break"
                     site_values: dict[int, int] = {}
                     for name, value in site["bindings"].items():
                         if name in loop_target_bindings:
@@ -6071,7 +6315,7 @@ def _normalize_lexical_values(
                         ):
                             continue
                         site_values[int(initial)] = int(value)
-                        if name not in loop_carried_bindings:
+                        if is_break and name not in loop_carried_bindings:
                             loop_break_bindings[name] = (int(initial), int(value))
                     loop_break_sites[site_span] = site_values
                     # The break edge CONSUMES these values (the loop-exit
@@ -6098,6 +6342,35 @@ def _normalize_lexical_values(
                         )
                 loop_attributes["loop_break_sites"] = loop_break_sites
                 loop_attributes["loop_break_bindings"] = loop_break_bindings
+                # The loop READS each carried update through its backedge and
+                # each break continuation through its exit.  Those reads are
+                # graph edges into the loop node, so every dataflow walk
+                # (liveness, dead-call pruning, the collection after loop
+                # evaporation) sees them -- a value read only by the loop is
+                # not dead.  Without them ``dt_cap``'s last update in the
+                # woodshop ``run_superstep`` had out-degree zero and was
+                # deleted twice by two different pruners.  Updates are never
+                # descendants of their loop (its only children are its
+                # result ports), so these edges close no cycle.
+                ledger_reads = [
+                    (int(updated), "carried_update")
+                    for initial, updated in loop_carried_bindings.values()
+                    if int(updated) != int(initial)
+                ] + [
+                    (int(continuation), "break_value")
+                    for _initial, continuation in loop_break_bindings.values()
+                ]
+                for value_id, role in ledger_reads:
+                    if value_id not in graph.G or value_id == loop_id:
+                        continue
+                    if not graph.G.has_edge(value_id, loop_id):
+                        graph.G.add_edge(value_id, loop_id, role=role)
+                    children = graph.G.nodes[value_id].setdefault(
+                        "children", []
+                    )
+                    if (loop_id, role) not in children:
+                        children.append((loop_id, role))
+                    _append_operand(graph, loop_id, value_id, role)
                 for name, (_initial, continuation) in loop_break_bindings.items():
                     environment[name] = continuation
                 loop_attributes["loop_target_bindings"] = (
@@ -6615,6 +6888,9 @@ def _normalize_lexical_values(
     # previous reduction's facts.
     read_page = current_identity_book().page("lexical_read_binding")
     for row in read_page.scope_rows(ingestion_read_scope):
+        # A position an operand rewrite vacated holds None: no fact to carry.
+        if read_page.latest(row) is None:
+            continue
         if len(row) == 4 and row[1] == "return":
             read_page.concord((read_scope, *row[1:]), read_page.latest(row))
         elif len(row) == 4 and row[1] in mapping:
@@ -6623,6 +6899,7 @@ def _normalize_lexical_values(
                 read_page.latest(row),
             )
     graph.G.graph["lexical_read_scope"] = read_scope
+    graph.G.graph["operand_position_scope"] = read_scope
     # Per-return slot values are ids in the pre-canonical space too.
     graph.G.graph["return_slot_values"] = {
         span: tuple(
@@ -6788,11 +7065,11 @@ def _normalize_lexical_values(
                     for value_id in attributes[key]
                     if value_id in mapping
                 )
-        data["parents"] = [
+        _set_operands(graph, value_id, [
             (mapping[parent_id], role)
             for parent_id, role in data.get("parents", ())
             if parent_id in mapping
-        ]
+        ], cause="canonical_relabel", same=mapping)
         data["children"] = [
             (mapping[child_id], role)
             for child_id, role in data.get("children", ())
@@ -10013,7 +10290,13 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 else:
                     for predecessor in predecessors:
                         replacement_parents.append((predecessor, role))
-            successor_data["parents"] = replacement_parents
+            _set_operands(
+                graph, successor, replacement_parents, cause="dissolve_expr",
+                same=(
+                    {node_id: predecessors[0]} if len(predecessors) == 1
+                    else None
+                ),
+            )
             for predecessor in predecessors:
                 graph.G.add_edge(predecessor, successor)
                 predecessor_children = graph.G.nodes[predecessor].setdefault(
@@ -10054,13 +10337,13 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         # order preserved.
         predecessors = tuple(graph.G.predecessors(node_id))
         for successor in tuple(graph.G.successors(node_id)):
-            graph.G.nodes[successor]["parents"] = [
+            _set_operands(graph, successor, [
                 (parent_id, role)
                 for parent_id, role in graph.G.nodes[successor].get(
                     "parents", ()
                 )
                 if parent_id != node_id
-            ]
+            ], cause="dissolve_return")
         for returned in predecessors:
             graph.G.nodes[returned]["children"] = [
                 (child_id, role)
@@ -10499,7 +10782,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 member_data["type"] = "Input"
                 member_data["op"] = "input"
                 member_data["label"] = expression.id
-                member_data["parents"] = []
+                _set_operands(
+                    function_graph, member, [], cause="parameter_input",
+                )
             if (
                 member_data.get("type") == "Input"
                 and (
@@ -10509,11 +10794,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 member_data.setdefault("attributes", {})[
                     "value_kind"
                 ] = "scalar"
-            member_data["parents"] = [
+            _set_operands(function_graph, member, [
                 (parent, role)
                 for parent, role in member_data.get("parents", ())
                 if parent in included
-            ]
+            ], cause="function_subgraph")
             member_data["children"] = [
                 (child, role)
                 for child, role in member_data.get("children", ())

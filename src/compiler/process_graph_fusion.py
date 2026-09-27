@@ -172,18 +172,25 @@ def extract_clean_process_subgraph(
         int(node_id) for node_id in node_ids if int(node_id) in graph.G
     }
     extracted = copy.copy(graph)
+    from ..common.tensors.topological_reducer import (
+        _set_operands, fork_read_scope,
+    )
+
     extracted.G = graph.G.subgraph(included).copy()
     extracted.G.graph = isolate_metadata(dict(graph.G.graph))
+    # The copy owns its read facts from here on; its operand rewrites are
+    # recorded in its own scope, never in its source's.
+    fork_read_scope(extracted, "extract_clean_process_subgraph")
     for node_id in extracted.G:
         data = extracted.G.nodes[node_id]
         for key, value in tuple(data.items()):
             if key != "expr_obj":
                 data[key] = isolate_metadata(value)
-        data["parents"] = [
+        _set_operands(extracted, node_id, [
             (parent, role)
             for parent, role in data.get("parents", ())
             if parent in included
-        ]
+        ], cause="extract_clean_process_subgraph")
         data["children"] = [
             (child, role)
             for child, role in data.get("children", ())

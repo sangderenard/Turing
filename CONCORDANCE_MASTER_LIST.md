@@ -88,6 +88,173 @@ binding; call argument; one value passed as two call operands; while
 predicate through a region (never terminated); direct while predicate;
 `for` exit of two bindings sharing an update; shared-update tuple return.
 
+### A3a. Operand positions are identities (2026-09-26, woodshop)
+
+The position `(consumer, role, ordinal)` that keys `lexical_read_binding`
+lived only in the graph node's private `parents` list, rewritten directly
+by ~57 sites in 15 files.  A rewrite changed what a committed row's key
+named without the book knowing.
+
+- Found by: woodshop `lower_newton_dt_system` (LLVM, O0, piece link)
+  refused with `region 9 reads carried initial 195 through an operand no
+  lexical_read_binding row attributes`.  `AbstractTensor.minimum(dt_cap,
+  remainder)` (`dt_controller.py:698`, in `run_superstep`'s while) had its
+  read committed at `(call, 'args', 0)`; the reducer's Call branch then
+  rebuilt the operands through `_replace_inputs` as `arg:0`/`arg:1`, and
+  the planner's `consumer_operand` row `('arg:0', 0)` found no binding.
+- Fix: `topological_reducer._set_operands` is the one writer of an
+  operand list.  It pairs old and new positions by operand identity (same
+  role first, then in order; `same` maps a swapped id), revises page
+  **`identity_transition`** `(scope, consumer, role, ordinal) -> ("move",
+  consumer, new role, new ordinal, cause)` (`"retire"` when the operand
+  left; see A3c for `"fork"` and `"merge"`), moves every
+  position-keyed page (`lexical_read_binding` rows, `consumer_operand`
+  facts) and revises a vacated position to None.  The graph names its
+  scope (`operand_position_scope`: the ingestion read scope, then the
+  canonical read scope).  `_append_operand` appends through it.
+- Migrated: every reducer writer (`_replace_inputs`, `_remove_node`,
+  `_redirect_value`, the canonical relabel, Expr/Return dissolve, the
+  function-subgraph filter, parameter inputs, four appends).
+- Audit: the planner (`_concord_consumer_operands`) records any live read
+  row at a position its consumer no longer has on page
+  **`operand_position_orphan`**; `CorrelationTable` reports it as
+  `operand-position-orphan`.  With the writer bypassed the repro records
+  `cap` at `(12, 'args', 0)`; with it, none.
+- Guard: `tests/test_loop_binding_reads_native.py[call-argument-carried]`
+  (fails at `f9432d80`, passes now).  Gate: the 14 recorded gate failures
+  are identical at `f9432d80` on Windows; scorecard 18/19.
+- Open: the ~43 raw writes outside the reducer (`glsl_deployment_strategy`
+  10, `loop_composer` 8, `process_graph_fusion` 6, autograd 3, 11 others)
+  still bypass the writer; `call_argument_operand` facts are not yet moved.
+  Specialized graph copies share one read scope, so a post-canonical move
+  in one copy revises rows another copy reads: needs a per-copy scope
+  before those files migrate.
+- Next behind it (observed, not fixed): the woodshop loop 354 carries
+  `dt_cap` (update 305) and `last_dt_next` (update 297) from initial 195
+  (`last_dt_next = dt_cap`), but `loop_entry_state` owns only
+  `last_dt_next` -- the control loop's carried list lacks `dt_cap`'s entry,
+  so a body read of `dt_cap` would take the pre-loop value.
+
+### A3b. A rejection is a keyed fact (2026-09-26, woodshop)
+
+- Found by: the woodshop lowering, past A3a, sat in
+  `settle_call_result_types` round 1 (py-spy: two samples a minute apart
+  on one `propose` for `woodshop_newton_momentum`, value 11; 980 s CPU).
+- Cause: `TransformationLedger.propose` decided "already rejected?" by
+  scanning `events`; `_BookEventLog` had no `__iter__`, so each item
+  rebuilt the whole log from the book (O(E^2) per rejected proposal), and
+  `__len__` materialized every row to compute each event serial.  200
+  identities: 87 s.  A regression from moving the ledger onto the book
+  (`56255f4`).
+- Fix: page **`transformation_rejection`** `(scope, identity, rule, proof,
+  retained rule, retained proof) -> event serial`, read by one `latest`,
+  written by `concord`; `_BookEventLog.__iter__` builds once;
+  `IdentityPage.scope_row_count` counts a scope's rows without
+  materializing them (also used by `mint_scope`).  20000 identities:
+  0.72 s, same events and rejections.
+- Guard: `tests/test_transformation_priority.py::test_repeated_rejection_is_found_by_its_book_key_at_scale`.
+  Gate unchanged (14 recorded failures, scorecard 18/19).
+
+### A3c. Identity operators: fork and merge (2026-09-26, woodshop 195)
+
+The woodshop's `loop-scope-outer-read` on value 195 reproduced in seconds
+as `total_value = float(total.item())` inside a while that carries
+`total` (LLVM, 65.9 for 35.9).  It was not a missing fork of `dt_cap`: it
+was a merge applied without the loop-generation constraint.
+
+- Chain (observed): no region computes the rank-0 `item` (value 22), so
+  region 5 captured 22; the loop carries 7 (`total`), not 22, so the
+  control lowering passed 22 through; `fortran_c_shell` structural recovery
+  resolved 22 as `item(7)` by graph id and receipted `(22, 7,
+  scalar_item_identity)`; `_rebind_recorded_scalar_identities` rewrote the
+  call to id 7's only definition -- the pre-loop one.
+- **fork** (`_set_operands(fork_from=...)`): the call rebuild gives
+  `total.item()` a new `operand` position fed by the Name occurrence the
+  attribute load already read at `(attr, 'value', 0)`.  That second read
+  position now carries the binding; `identity_transition` records
+  `("fork", attr node, "value", 0, cause)`.  Also cleared the refusal
+  `control expression leaf ... no lexical_read_binding row` for
+  `if cap.item() > 100.0: break`.
+- **merge**: the planner (`_concord_item_operands`) records page
+  **`item_operand`** `(read scope, item) -> (operand, role, ordinal)`,
+  structure only.  The control lowering (`_region_feed`) reads the operand
+  by the binding at that position in the site's loop generation; a rank-0
+  value read is the item, recorded as `identity_transition` `(control
+  scope, item) -> ("merge", resolved id, "scalar_item")`.  The call then
+  never holds 22, so the id-keyed rebind has nothing to rewrite in loops.
+- Proof: with `_concord_item_operands` disabled the program computes 65.9;
+  with it, the authored 35.9.  Guard: `tests/test_loop_identity_operators_native.py`
+  (2 programs, LLVM; both fail at `f9432d80`).  Gate unchanged.
+- Found on the way, not fixed:
+  - LLVM `Const` with a tuple payload writes `i32 int(item)` into a buffer
+    sized by the result's declared shape: a float static iterable
+    `(0.7, 1.9)` (dtype `ssa.aggregate`, shape `()`) loads as 0.0.  The
+    Const declares neither its extent nor its element dtype.  The woodshop's
+    `for boundary in boundary_values` has this shape.
+  - C lane only: `while` + call + `break` refuses `%tN is unavailable`
+    although the SSA dominates; LLVM computes the authored answer.
+  - A dead `Cast` of `step` before an inner loop still reads the outer
+    generation (`loop-scope-outer-read`, no effect on results).
+  - `_rebind_recorded_scalar_identities` still rewrites by id
+    function-wide; with the merge resolved at the read site it no longer
+    fires inside loops, but it has no generation check of its own.
+
+### A3d. Heuristics replaced by graph facts (2026-09-26, woodshop)
+
+Found while driving the woodshop dt lowering to zero findings; each was a
+silent wrong answer or a refusal, reproduced in seconds, native LLVM (and C
+where noted) against the authored Python.
+
+- **Loop ledger reads are graph edges.**  A loop reads its carried updates
+  (backedge) and break continuations (exit) through ledgers on the loop
+  node, not edges, so values read only by the loop had out-degree zero.
+  Evaporation's dataflow collection (`evaporate_unrolled_loops`) and the
+  fold's dead-call pruning (`_fold_callsite_structural_values`) each
+  deleted a carried update (woodshop `dt_cap`, Phi 305; `dt =
+  minimum(dt * 1.5, 1.0)` after a `continue`); the composer then dropped
+  the pair and the body read the pre-loop value.  The reducer now makes
+  the loop node consume each update (`carried_update`) and continuation
+  (`break_value`).  Updates are never descendants of their loop (its only
+  children are its ports), so no cycle.  No pruner needed a change.
+- **Continue sites are recorded like break sites.**  The reducer claimed
+  only break sites (`loop_break_sites`, site-node inputs); a continue arm's
+  value had no consumer but a synthesized merge.  Continue sites now go
+  through the same claim (no break bindings), and `control_dependency_
+  value_ids` counts a `LoopControlBlock`'s `site_values`.
+- **No history-synthesized conditional merges.**  `_ordinary_conditional_
+  control_programs` synthesized merges from a name's identity history ("the
+  first version after the arms", and a nearest-dataflow-ancestor rule).
+  For a continue arm that version was the fall-through update, bound as
+  the if-merge.  Both paths are deleted; merges are the reducer's Phis,
+  which it creates for every runtime conditional whose arms differ.
+- **No name-history call-argument override.**  `_build_shell_hierarchy_
+  plan` replaced a call's argument edge with the source-latest definition
+  of the argument's name; it chose a continue arm's `dt * 0.5` over the
+  edge to the pre-branch `dt`.  Deleted; the edge is the identity.
+- **Non-falling-through arms restore bindings.**  The conditional lowering
+  snapshotted only merged identities; an arm that branches away (continue
+  in the arm) now restores every binding it published.
+- **Keyword and receiver reads fork from the occurrence.**  A keyword
+  wrapper (and its Name) can be absent from the function subgraph; the read
+  is committed at `(scope, "occurrence", id)` and a call's `kw:<name>` /
+  `operand` position forks from it (`ctrl.pi_update(dt_prev=dt_tensor)` in
+  `step_with_dt_control_used`, refused).
+- **LLVM tuple constants** are typed and sized from the payload, as in C
+  (float static iterables loaded as zeros).
+- Guards: `tests/test_loop_identity_operators_native.py` (7 programs).
+  `test_control_branch_compartments.py`: the synthesized-merge test now
+  asserts no merge is invented; a suppression-receipt assertion for the
+  deleted path was dropped.
+- Evidence: gate + `test_process_graph_function_linking.py` 23 failed /
+  283 passed, all 23 known at `f9432d80`; `test_fortran_c_shell.py` 20
+  failed identically on both trees (override deletion).
+- Open: `_set_operands` still pairs old/new positions by operand identity
+  and order; writers should declare their moves.  LLVM loop Phis are `phi
+  ptr` over the backedge slot (lost copy: `grow(cap, factor=f)` read `f`
+  after `f = f + 1`; C is correct).  C lane refuses `while` + call +
+  `break` (`%tN is unavailable`).  The kernel-emitter tuple Const
+  (`@const.vec`, i32) has the same shape as the fixed one.
+
 ### A4. Other fixes on the way
 
 - `ir_indexing._propagate_scalar_dtypes`: a declared scalar `Const` dtype

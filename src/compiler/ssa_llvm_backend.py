@@ -2413,14 +2413,60 @@ def _emit_repository_call_module(
                             "a contiguous sequence-address use",
                         ))
                         continue
-                target = pointer(result)
+                # A tuple payload is an aggregate constant: one element per
+                # payload item, of the result's own element type, in storage
+                # sized by the payload -- the C lane's rule.  Writing every
+                # item as ``i32 int(item)`` into storage sized by the declared
+                # shape turned the static iterable ``(0.7, 1.9)`` (dtype
+                # ``ssa.aggregate``, shape ``()``, read back as double) into
+                # zeros, so a ``for boundary in (0.7, 1.9)`` clamp never fired.
+                aggregate_items = None
                 if isinstance(payload, (tuple, list)):
-                    for index, item in enumerate(payload):
+                    from .ssa_c_backend import _flatten_numeric_aggregate
+
+                    try:
+                        flattened = _flatten_numeric_aggregate(payload)
+                    except TypeError as error:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation, str(error),
+                        ))
+                        continue
+                    if (
+                        len(flattened) == 1
+                        and _declared_span_rank(result) == 0
+                        and not tuple(result.shape or ())
+                    ):
+                        # A one-limb index tuple used as a scalar offset.
+                        payload = flattened[0]
+                    else:
+                        aggregate_items = tuple(flattened) or (0,)
+                        if (
+                            result_id not in pointers
+                            and result_id not in output_pointer
+                            and result_id not in allocated
+                        ):
+                            register = f"%value.{result_id}"
+                            _frame_slot(
+                                register, _value_llvm_type(result),
+                                len(aggregate_items),
+                                entry_allocas, entry_frees,
+                            )
+                            allocated.add(result_id)
+                            pointers[result_id] = register
+                target = pointer(result)
+                if aggregate_items is not None:
+                    llvm_type = _value_llvm_type(result)
+                    for index, item in enumerate(aggregate_items):
                         slot = f"%const.slot.{tag}.{index}"
                         body.append(
-                            f"  {slot} = getelementptr i32, ptr {target}, i64 {index}"
+                            f"  {slot} = getelementptr {llvm_type}, "
+                            f"ptr {target}, i64 {index}"
                         )
-                        body.append(f"  store i32 {int(item)}, ptr {slot}, align 4")
+                        body.append(
+                            f"  store {llvm_type} {literal(item, llvm_type)}, "
+                            f"ptr {slot}, align {_align(llvm_type)}"
+                        )
+                    register_cache.clear()
                 elif _declared_span_rank(result) > 0:
                     # A scalar payload with a span result is a fill, not a
                     # one-cell constant. Precision ABI expansion exposes the

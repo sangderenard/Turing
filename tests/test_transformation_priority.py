@@ -82,3 +82,34 @@ def test_increasing_but_undeclared_transition_rejected():
     ledger.propose(1, "a", "proof")
     with pytest.raises(TransformationConflict, match="Undeclared"):
         ledger.propose(1, "b", "proof")
+
+
+def test_repeated_rejection_is_found_by_its_book_key_at_scale():
+    """A rejection is a keyed fact: recorded once, found without a scan.
+
+    The ledger used to decide "already rejected?" by scanning every event,
+    and each event access rebuilt the event log from the book: 200
+    identities took 87 s and the woodshop dt system's call-result
+    settlement (3892 call operands) stalled in its first round.
+    """
+    import time
+
+    ledger = frame_transformation_ledger()
+    count = 5000
+    started = time.perf_counter()
+    for index in range(count):
+        ledger.propose(("call", index), "distinct_owner", ("first", index))
+    for _repeat in range(2):
+        for index in range(count):
+            assert not ledger.propose(
+                ("call", index), "distinct_owner", ("second", index),
+            )
+    elapsed = time.perf_counter() - started
+    rejected = [event for event in ledger.events if not event["accepted"]]
+    assert len(ledger.events) == 2 * count
+    assert len(rejected) == count
+    assert ledger._rejection_page.latest((
+        ledger.scope, ("call", 7), "distinct_owner", ("second", 7),
+        "distinct_owner", ("first", 7),
+    )) == count + 7
+    assert elapsed < 10.0, elapsed
