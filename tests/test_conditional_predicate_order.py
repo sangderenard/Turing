@@ -87,3 +87,44 @@ def test_item_capture_depends_on_its_operand_producer():
         finding for finding in table.findings(module)
         if finding.kind == "use-not-dominated"
     ] == []
+
+
+def test_call_projection_element_is_its_region_publication():
+    """A region computing an element of a call's record result owns that value.
+
+    ``run_superstep``: ``metrics = step_with_dt_control_used(...)`` then
+    ``if float(metrics.control_values[0].item()) > 0.0``.  The call's
+    projection walk also claimed the element read ``control_values[0]``,
+    which the planner computes in a region; the region reading it bound to
+    the call, so it and the ``if`` ran before the element's producer
+    (``use-not-dominated``; found in the woodshop dt system).  The walk now
+    descends only through declared aggregates.
+    """
+
+    source = (
+        "from src.common.tensors.abstraction import AbstractTensor\n"
+        "from src.common.dt_system.dt_scaler import Metrics\n\n"
+        "def measure(value):\n"
+        "    metrics = Metrics(value, 0.0, 0.0, 0.0)\n"
+        "    metrics.control_values[0] = value - 0.5\n"
+        "    return metrics\n\n"
+        "def train(value, limit):\n"
+        "    total = AbstractTensor.tensor(0.0)\n"
+        "    last = 0.0\n"
+        "    while total.item() < limit:\n"
+        "        metrics = measure(value)\n"
+        "        if float(metrics.control_values[0].item()) > 0.0:\n"
+        "            last = last + 1.0\n"
+        "        total += value\n"
+        "    return total * last\n"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, _exports = lower_ast_source_to_ssa(
+            source, "train", name="projorder", extraction_contract=CONTRACT,
+        )
+    table = CorrelationTable.build(module)
+    assert [
+        finding for finding in table.findings(module)
+        if finding.kind == "use-not-dominated"
+    ] == []

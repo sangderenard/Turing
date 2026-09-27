@@ -44,6 +44,14 @@ before that operation was recorded on the identity book:
   keyword wrapper (and its Name) is absent from the function subgraph, so
   the read had no row; it is now a fact of the occurrence (refused).
 
+* ``call-projection-element-predicate`` -- ``metrics = measure(value)``
+  then ``if float(metrics.control_values[0].item()) > 0.0`` in a while
+  body.  The call's projection walk claimed the element read, which a
+  region computes; the predicate's regions and the ``if`` were ordered
+  before that region (run_superstep, woodshop: use-not-dominated).  The
+  walk now descends only through declared aggregates (the call's results,
+  record-typed projections).
+
 All run through LLVM, the lane the dt-system builds use.
 """
 
@@ -199,6 +207,24 @@ _PROGRAMS = {
         "        dt = ctrl.pi_update(dt_prev=dt, dt_pen=AbstractTensor.tensor(1.0), osc=False)\n"
         "    return total * 1.0\n",
         ((0.3, 2.9), (0.25, 5.0), (2.0, 0.4)),
+    ),
+    "call-projection-element-predicate": (
+        _HEADER
+        + "from src.common.dt_system.dt_scaler import Metrics\n\n"
+        "def measure(value):\n"
+        "    metrics = Metrics(value, 0.0, 0.0, 0.0)\n"
+        "    metrics.control_values[0] = value - 0.5\n"
+        "    return metrics\n\n"
+        "def train(value, limit):\n"
+        "    total = AbstractTensor.tensor(0.0)\n"
+        "    last = 0.0\n"
+        "    while total.item() < limit:\n"
+        "        metrics = measure(value)\n"
+        "        if float(metrics.control_values[0].item()) > 0.0:\n"
+        "            last = last + 1.0\n"
+        "        total += value\n"
+        "    return total * last\n",
+        ((0.3, 2.9), (0.75, 3.0), (2.0, 0.4)),
     ),
     "item-in-break-test": (
         _HEADER

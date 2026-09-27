@@ -9928,9 +9928,24 @@ def _plan_callsite_projection_ids(graph_obj: Any, hierarchy_plan: Any) -> dict[i
         ] or [int(value_id) for value_id in item.result_value_ids]
         found: set[int] = set()
         pending = list(roots)
+        root_ids = set(roots)
         while pending:
             current = pending.pop()
             if current not in graph_obj:
+                continue
+            # Only an aggregate is projected: the call's own results, or a
+            # projection the reducer declared a record (``result_class_ref``).
+            # Anything else is a value the call delivers, and reading into it
+            # is ordinary computation the planner places in a region.
+            # Descending into ``metrics.control_values`` claimed its element
+            # ``control_values[0]`` for the call too; region 17 computes it,
+            # so one id had two producers and the region reading it bound to
+            # the call: run_superstep's ``if float(metrics.control_values[0]
+            # .item()) > 0.0`` and its feeding regions ran before region 17
+            # (woodshop dt system, use-not-dominated).
+            if current not in root_ids and not (
+                graph_obj.nodes[current].get("attributes") or {}
+            ).get("result_class_ref"):
                 continue
             for successor in graph_obj.successors(current):
                 data = graph_obj.nodes[successor]

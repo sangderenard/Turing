@@ -53,15 +53,46 @@ position its consumer no longer has; `CorrelationTable` reports it).
 - Baselines taken in the clean worktree `C:\Users\alber\AppData\Local\Temp\wtb`
   at `f9432d80`.
 
-## Remaining woodshop findings (14)
+## Follow-up: `run_superstep` use-not-dominated (14 → 13)
 
-1. **`use-not-dominated` ×1** — `run_superstep` value 273.  Diagnosed, not
-   fixed: `loop_control_next.1` (after the inner `for`) runs region 18, the
-   predicate producer of the following conditional (`if_true.4`), which
-   reads `%273`; region 17 produces `%273` in `if_merge.4`, after that
-   conditional.  Same class as `exchange_time_bound`, for a conditional in
-   the while body: find the builder of that conditional and make it declare
-   its predicate regions (or find why region 17 is not ordered before 18).
+Not the predicate-region class.  `metrics, dt_next, dt_used =
+step_with_dt_control_used(...)` then `if float(metrics.control_values[0]
+.item()) > 0.0`.  `_plan_callsite_projection_ids` walked GetAttr/Indexed
+transitively from the call's results and claimed the element
+`control_values[0]` for the call; region 17 computes it (book:
+`region_feed_consumer`, `consumer_operand` base).  One id, two producers:
+`dependency_order` bound region 18's feed to the call, so 18, 19 and the
+`if` ran before 17.  The walk now descends only through declared aggregates
+(the call's result bindings, projections carrying `result_class_ref`).
+`step_with_dt_control_used`'s direct field reads of `coerce_metrics`'
+record stay the call's.  A first attempt (region publications override
+projections) broke that case and was reverted.
+
+- Repro (1.4 s) and guards: `test_conditional_predicate_order.py::
+  test_call_projection_element_is_its_region_publication`,
+  `test_loop_identity_operators_native.py[call-projection-element-predicate]`
+  (LLVM matches Python; 2 findings at `f9432d80`).
+- All 14 woodshop findings reproduce by lowering `examples/llvm_dt_system.py`
+  `dt_system_over` over the one-law drift piece of
+  `tests/dt_system/test_llvm_dt_system.py` (~165 s).  After: 13, lowering
+  completes.
+- Gate + linking + guards: 26 failed / 280 passed; all 26 fail at
+  `f9432d80` (`test_fixed_width_sequence_append_passes_every_row_column`
+  is order-dependent, fails in-file on both trees).
+- Scorecard is **17/19** on this tree with or without the change (HEAD's
+  walk swapped in memory): level 16, conditional assignment of a
+  comparison, stops at EXECUTE (`UnboundLocalError: t9`).  18/19 at
+  `f9432d80`.  So `d0991f81` regressed level 16; not yet confirmed on a
+  clean `d0991f81` checkout.
+- Also logged: the class page puts the first tuple member's class on the
+  tuple call (`source_value_class_concordance (run_superstep, call) =
+  Metrics`; `topological_reducer.py` ~10983 writes a single returned class
+  onto the call when one of several outputs resolves); the member itself
+  has no class row.  Value ids drift by ±1 between identical runs.
+
+## Remaining woodshop findings (13)
+
+1. ~~`use-not-dominated` ×1~~ — fixed above.
 2. **`alias-target-missing` ×9** — `run_superstep` (71, 272 → 360/361) and
    `step_with_dt_control_used` (376–430 → minted ids).  Not investigated.
 3. **`descriptor-member-shared` ×2, `descriptor-member-unknown` ×2** —
