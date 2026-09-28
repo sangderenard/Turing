@@ -1,14 +1,12 @@
 """Backend-neutral lowering of subscript ops to SSA address primitives.
 
 ``d[i]`` and ``d[i] = v`` arrive as the ops ``Indexed(base, index...) -> res``
-and ``IndexedStore(base, index..., value) -> res``. Neither is a primitive any
-backend should special-case: both are an *address* into ``base`` followed by a
-load or a store. This module rewrites them to exactly that -- ``GetElementPtr``
-(base + indices) then ``Load`` / ``Store`` -- the same address vocabulary the
-repository SSA and every backend already speak (the WASM backend computes the
-address from the same selectors; the Fortran backend renders ``GetElementPtr``+
-``Load`` as ``base(i+1)`` and ``GetElementPtr``+``Store`` as ``base(i+1) = v``).
-So the subscript lowering lives once, at the SSA level, not once per backend.
+and ``IndexedStore(base, index..., value) -> res``. Once every selector is a
+scalar, both are an *address* into ``base`` followed by a load or a store. This
+module rewrites that proven scalar case to ``GetElementPtr`` plus ``Load`` /
+``Store`` -- the same address vocabulary the repository SSA and every backend
+already speak. Slice-bearing operations remain semantic until tensor/layout
+settlement can choose a view, gather, or scatter with authoritative extents.
 
 A store mutates ``base`` in place, so its result value (the "returned array")
 aliases ``base``: uses of the result are rewritten to ``base`` rather than
@@ -26,8 +24,9 @@ _SCATTER = ("IndexedStore", "index_set")
 
 
 def lower_indexing_to_ssa_addressing(functions) -> None:
-    """Rewrite ``Indexed``/``IndexedStore`` ops to ``GetElementPtr``+``Load``/
-    ``Store`` across the given SSA functions, in place.
+    """Rewrite scalar ``Indexed``/``IndexedStore`` ops to address primitives.
+
+    Slice-bearing operations remain intact for tensor/layout settlement.
 
     ``functions`` is a mapping of name -> repository SSA ``Function``.
     """
@@ -36,6 +35,33 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
         return SSAValue(GLOBAL_MONOTONIC_IDS.mint())
 
     for function in functions.values():
+
+        constants = {
+            int(instruction.res.id): instruction.attributes.get(
+                "constant", instruction.attributes.get("value")
+            )
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"Const", "const"}
+            and instruction.res is not None
+        }
+
+        def carries_slice_selector(instruction: Instr) -> bool:
+            canonical_op = str(
+                instruction.attributes.get("tensor_operation")
+                or instruction.attributes.get("tensor")
+                or instruction.op
+            )
+            if canonical_op in _GATHER:
+                selectors = instruction.args[1:]
+            elif canonical_op in _SCATTER:
+                selectors = instruction.args[1:-1]
+            else:
+                return False
+            return any(
+                isinstance(constants.get(int(selector.id)), slice)
+                for selector in selectors
+            )
 
         # base value each store's result aliases, so later uses read the same
         # storage the store mutated in place.
@@ -48,7 +74,14 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                     or instruction.attributes.get("tensor")
                     or instruction.op
                 )
-                if canonical_op in _GATHER and len(instruction.args) >= 2:
+                if carries_slice_selector(instruction):
+                    # A Python slice is not an address operand. Keep the
+                    # semantic indexing operation until tensor/layout
+                    # settlement can normalize its retained axes into a
+                    # contiguous view, gather/copy, or scatter/update. Only
+                    # all-scalar selectors are universal GEP arithmetic.
+                    rewritten.append(instruction)
+                elif canonical_op in _GATHER and len(instruction.args) >= 2:
                     base, *indices = instruction.args
                     address = fresh()
                     lowered_attributes = {

@@ -20,6 +20,8 @@ from src.transmogrifier.ssa import (
     Instr,
     IRModule,
     SSAValue,
+    SSASequenceDescriptor,
+    SSASequenceTable,
     SSATensorDescriptor,
     SSATensorTable,
 )
@@ -153,6 +155,58 @@ def test_settled_formal_restamps_lowered_broadcast_shape_constants():
     assert settle_repository_ssa_static_extent_operands(module)
     assert function.blocks["entry"].instrs[0].attributes["values"] == (
         8, 4, 128, 2, 3,
+    )
+
+
+def test_tensor_normalization_views_one_row_shaped_sequence_arena():
+    arena = SSAValue(10, "float64", shape=(3,))
+    iterable = SSAValue(30, "int64", shape=(4,))
+    result = SSAValue(20, "float64", shape=(3,), accounting={
+        "program_abi_rank": 2,
+        "program_abi_storage": "span",
+    })
+    function = Function("sequence_tensor_view", [arena, iterable], {
+        "entry": BasicBlock("entry", [
+            Instr("Cast", [arena], result, attributes={
+                "source_operator": "tensor",
+                "tensor_operation": "tensor",
+                "dtype": "float64",
+            }),
+            Instr("Ret", [result], None),
+        ]),
+    }, metadata={"sequence_capacity_sources": ((10, 30),)})
+    sequences = SSASequenceTable({
+        10: SSASequenceDescriptor(
+            sequence_id=10,
+            column_value_ids=(10,),
+            length_address_id=11,
+            capacity_value_id=12,
+            column_dtypes=("float64",),
+            column_shapes=((3,),),
+            writable=False,
+        ),
+    })
+    module = IRModule(
+        {function.name: function},
+        sequence_tables={function.name: sequences},
+    )
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference(),
+    ) == ()
+
+    instructions = function.blocks["entry"].instrs
+    assert [instruction.op for instruction in instructions] == ["Ret"]
+    assert instructions[0].args[0].id == arena.id
+    assert instructions[0].args[0].shape == (4, 3)
+    arena_descriptor = module.tensor_tables[function.name].by_id(arena.id)
+    result_descriptor = module.tensor_tables[function.name].by_id(result.id)
+    assert arena_descriptor.shape == (4, 3)
+    assert result_descriptor.data_value_id == arena.id
+    assert result_descriptor.alias_of == arena.id
+    assert not result_descriptor.owns_allocation
+    assert result.accounting["ssa_storage_view"]["operation"] == (
+        "tensor_sequence_view"
     )
 
 
@@ -470,6 +524,162 @@ def test_indexed_store_versions_the_same_resident_arena_in_place():
     assert descriptor is not None
     assert descriptor.alias_of == source.id
     assert not descriptor.owns_allocation
+
+
+def test_raw_slice_index_normalizes_through_repository_selection():
+    source = SSAValue(0, "float64", shape=(3,))
+    selector = SSAValue(1)
+    result = SSAValue(2, "float64")
+    function = Function("raw_slice", [source], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], selector, attributes={
+                "constant": slice(None, 2),
+            }),
+            Instr("Indexed", [source, selector], result),
+            Instr("Ret", [result], None),
+        ]),
+    })
+    module = IRModule({function.name: function})
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference(),
+    ) == ()
+
+    instructions = function.blocks["entry"].instrs
+    call = next(
+        instruction
+        for instruction in instructions
+        if instruction.op == "Call"
+    )
+    assert call.attributes["callee"] == "index_select_double"
+    assert call.attributes["basic_index_axes"] == (((0, 1), False),)
+    assert result.shape == (2,)
+    assert not any(
+        instruction.op == "Const" and instruction.res is selector
+        for instruction in instructions
+    )
+
+
+def test_raw_full_slice_and_column_normalize_to_one_selection():
+    source = SSAValue(0, "float64", shape=(4, 3))
+    rows = SSAValue(1)
+    column = SSAValue(2)
+    result = SSAValue(3, "float64")
+    function = Function("raw_column", [source], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], rows, attributes={
+                "constant": slice(None),
+            }),
+            Instr("Const", [], column, attributes={"constant": 1}),
+            Instr("Indexed", [source, rows, column], result),
+            Instr("Ret", [result], None),
+        ]),
+    })
+    module = IRModule({function.name: function})
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference(),
+    ) == ()
+
+    calls = [
+        instruction
+        for instruction in function.blocks["entry"].instrs
+        if instruction.op == "Call"
+    ]
+    assert [call.attributes["callee"] for call in calls] == [
+        "index_select_double"
+    ]
+    assert calls[0].attributes["basic_index_axes"] == (
+        ((0, 1, 2, 3), False),
+        ((1,), True),
+    )
+    assert result.shape == (4,)
+
+
+def test_raw_slice_uses_same_owner_region_tensor_descriptor():
+    produced = SSAValue(10, "float64", shape=(4, 3))
+    producer = Function("owner__planned_region_0", [], {
+        "entry": BasicBlock("entry", [Instr("Ret", [produced], None)]),
+    }, metadata={"source_region_integral": {"owner": "owner"}})
+    source = SSAValue(10, "float64", shape=(3,), accounting={
+        "program_abi_rank": 2,
+        "program_abi_storage": "span",
+    })
+    rows = SSAValue(11)
+    column = SSAValue(12)
+    result = SSAValue(13, "float64")
+    consumer = Function("owner__planned_region_1", [source], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], rows, attributes={"constant": slice(None)}),
+            Instr("Const", [], column, attributes={"constant": 0}),
+            Instr("Indexed", [source, rows, column], result),
+            Instr("Ret", [result], None),
+        ]),
+    }, metadata={"source_region_integral": {"owner": "owner"}})
+    producer_tensors = SSATensorTable()
+    producer_tensors.register(SSATensorDescriptor(
+        tensor_id=produced.id,
+        data_value_id=99,
+        dtype="float64",
+        shape=(4, 3),
+        strides=(3, 1),
+        storage="view",
+        alias_of=99,
+        arena_id=99,
+        allocation_owner=99,
+        owns_allocation=False,
+    ))
+    module = IRModule(
+        {producer.name: producer, consumer.name: consumer},
+        tensor_tables={producer.name: producer_tensors},
+    )
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference(),
+    ) == ()
+
+    call = next(
+        instruction
+        for instruction in consumer.blocks["entry"].instrs
+        if instruction.op == "Call"
+    )
+    assert call.attributes["basic_index_source_shape"] == (4, 3)
+    assert source.shape == (4, 3)
+    assert source.accounting["ssa_storage_view"]["storage_value_id"] == 99
+
+
+def test_raw_slice_store_normalizes_through_repository_assignment():
+    source = SSAValue(0, "float64", shape=(3,))
+    selector = SSAValue(1)
+    value = SSAValue(2, "float64", shape=(2,))
+    result = SSAValue(3, "float64", shape=(3,))
+    function = Function("raw_slice_store", [source, value], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], selector, attributes={
+                "constant": slice(None, 2),
+            }),
+            Instr("IndexedStore", [source, selector, value], result),
+            Instr("Ret", [result], None),
+        ]),
+    })
+    module = IRModule({function.name: function})
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference(),
+    ) == ()
+
+    instructions = function.blocks["entry"].instrs
+    call = next(
+        instruction
+        for instruction in instructions
+        if instruction.op == "Call"
+    )
+    assert call.attributes["callee"] == "index_assign_double"
+    assert call.attributes["basic_index_axes"] == (((0, 1), False),)
+    assert not any(
+        instruction.op == "Const" and instruction.res is selector
+        for instruction in instructions
+    )
 
 
 @pytest.mark.parametrize(

@@ -21,10 +21,16 @@ def test_tensor_constructor_spelling_is_canonicalized_during_ast_ingestion():
 
     from src.transmogrifier.graph.node_special_cases import tensor_operation_name
 
-    for spelling in ("Tensor([1.0])", "torch.Tensor([1.0])"):
+    for spelling in (
+        "Tensor([1.0])",
+        "torch.Tensor([1.0])",
+        "np.asarray([1.0], dtype=float)",
+        "numpy.asarray(value)",
+    ):
         call = ast.parse(spelling, mode="eval").body
         assert tensor_operation_name(call) == "tensor"
-        assert ast.unparse(call) == "tensor([1.0])"
+        assert isinstance(call.func, ast.Name)
+        assert call.func.id == "tensor"
 
 
 def test_frontend_qualified_tensor_call_is_abstracted_during_ast_ingestion():

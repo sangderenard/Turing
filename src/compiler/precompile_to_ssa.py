@@ -1389,6 +1389,90 @@ class _ControlSSABuilder:
                 nested_value_dtypes[sequence_id] = str(target_meta.dtype)
         from .identity_concordance import commit_sequence_contract
 
+        def authored_sequence_mutations(
+            block: ControlBlock,
+        ) -> tuple[ControlSequenceMutation, ...]:
+            """Return the exact resident effects carried by this control tree.
+
+            Loop mutations and lexical mutation blocks are two placements of
+            the same authored effect in some plans.  The ProcessGraph effect
+            identity is therefore the deduplication key; encounter order is
+            otherwise retained so conflicting contracts remain deterministic.
+            """
+
+            found: list[ControlSequenceMutation] = []
+            seen_effects: set[int] = set()
+
+            def visit(candidate: ControlBlock | None) -> None:
+                if candidate is None:
+                    return
+                mutations: tuple[ControlSequenceMutation, ...] = ()
+                if isinstance(candidate, SequenceMutationBlock):
+                    mutations = (candidate.mutation,)
+                elif isinstance(candidate, (LoopBlock, WhileBlock)):
+                    mutations = tuple(candidate.sequence_mutations)
+                for mutation in mutations:
+                    effect_id = int(mutation.effect_node_id)
+                    if effect_id not in seen_effects:
+                        seen_effects.add(effect_id)
+                        found.append(mutation)
+                if isinstance(candidate, SequenceBlock):
+                    for child in candidate.blocks:
+                        visit(child)
+                if isinstance(candidate, WhileBlock):
+                    visit(candidate.condition)
+                if isinstance(candidate, (ConditionalBlock, LoopBlock, WhileBlock)):
+                    visit(candidate.body)
+                if isinstance(candidate, ConditionalBlock):
+                    visit(candidate.orelse)
+                if isinstance(candidate, CallBlock):
+                    visit(candidate.callee)
+
+            visit(block)
+            return tuple(found)
+
+        control_mutations = authored_sequence_mutations(program.root)
+
+        static_sequence_capacities: dict[int, int] = {}
+
+        def collect_static_sequence_capacities(
+            block: ControlBlock | None,
+        ) -> None:
+            if block is None:
+                return
+            if isinstance(block, LoopBlock):
+                try:
+                    extent = len(range(
+                        int(block.start), int(block.stop), int(block.step),
+                    ))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    extent = None
+                if extent is not None:
+                    for mutation in block.sequence_mutations:
+                        sequence_id = int(mutation.sequence_value_id)
+                        incumbent = static_sequence_capacities.get(sequence_id)
+                        if incumbent is not None and incumbent != extent:
+                            raise ValueError(
+                                "one resident sequence has conflicting static "
+                                f"producer extents: sequence={sequence_id} "
+                                f"{incumbent} versus {extent}"
+                            )
+                        static_sequence_capacities[sequence_id] = extent
+            if isinstance(block, SequenceBlock):
+                for child in block.blocks:
+                    collect_static_sequence_capacities(child)
+            if isinstance(block, WhileBlock):
+                collect_static_sequence_capacities(block.condition)
+            if isinstance(block, (ConditionalBlock, LoopBlock, WhileBlock)):
+                collect_static_sequence_capacities(block.body)
+            if isinstance(block, ConditionalBlock):
+                collect_static_sequence_capacities(block.orelse)
+            if isinstance(block, CallBlock):
+                collect_static_sequence_capacities(block.callee)
+
+        collect_static_sequence_capacities(program.root)
+        self.static_sequence_capacities = static_sequence_capacities
+
         for sequence_id, policy, column_count, writable in sequence_declarations:
             committed = commit_sequence_contract(
                 function_name,
@@ -1406,6 +1490,44 @@ class _ControlSSABuilder:
                 if column < len(authored_column_dtypes) else None
                 for column in range(int(column_count))
             ]
+            column_shapes: list[tuple[int, ...]] = [
+                () for _column in range(int(column_count))
+            ]
+            # A retained comprehension appends the numerical value produced
+            # by its body.  That exact mutation edge owns the shape of one
+            # resident row; the sequence handle is not the row and must not
+            # inherit the row shape as its complete extent.  Preserve the row
+            # contract on the descriptor so storage and later tensor views can
+            # use ``row_index * row_width`` against the one physical arena.
+            for mutation in control_mutations:
+                if (
+                    int(mutation.sequence_value_id) != int(sequence_id)
+                    or str(mutation.operator) not in {"append", "add"}
+                    or len(tuple(mutation.argument_value_ids))
+                    != int(column_count)
+                ):
+                    continue
+                for column, argument_id in enumerate(
+                    mutation.argument_value_ids
+                ):
+                    meta = self.region_value_meta.get(int(argument_id))
+                    if meta is None:
+                        continue
+                    proposed_shape = tuple(map(int, meta.shape or ()))
+                    if proposed_shape:
+                        incumbent_shape = column_shapes[column]
+                        if incumbent_shape and incumbent_shape != proposed_shape:
+                            self.shortfalls.append(SSALoweringShortfall(
+                                "ssa-sequence", "conflicting-row-shape",
+                                f"{function_name}.sequence_declaration",
+                                f"sequence value {int(sequence_id)} column "
+                                f"{column} receives both {incumbent_shape!r} "
+                                f"and {proposed_shape!r}",
+                            ))
+                            continue
+                        column_shapes[column] = proposed_shape
+                    if column_dtypes[column] in {None, "unknown"}:
+                        column_dtypes[column] = str(meta.dtype)
             for _result_id, query_id, lookup_sequence_id in table_lookups:
                 if int(lookup_sequence_id) != int(sequence_id):
                     continue
@@ -1442,6 +1564,7 @@ class _ControlSSABuilder:
                     else None
                 ),
                 column_dtypes=tuple(column_dtypes),
+                column_shapes=tuple(column_shapes),
             )
         # Caller-provided arrays are the physical frame for both authored
         # inputs and compiler locals.  Their logical lifetimes are different:
@@ -4994,6 +5117,7 @@ class _ControlSSABuilder:
         nested_value_dtype: str | None = None,
         element_dtype: str | None = None,
         column_dtypes: tuple[str | None, ...] = (),
+        column_shapes: tuple[tuple[int, ...], ...] = (),
     ) -> SSASequenceDescriptor | None:
         value_id = int(value_id)
         resolved = self.resolved_sequence_schemas.get(value_id)
@@ -5060,6 +5184,11 @@ class _ControlSSABuilder:
             ) or "unknown"
             for column in range(int(column_count))
         )
+        proposed_column_shapes = tuple(
+            tuple(map(int, column_shapes[column]))
+            if column < len(column_shapes) else ()
+            for column in range(int(column_count))
+        )
         if existing is not None:
             if existing.key_columns != key_columns:
                 self.shortfalls.append(SSALoweringShortfall(
@@ -5103,6 +5232,26 @@ class _ControlSSABuilder:
                         "", "None", "unknown",
                     }:
                         value.dtype = str(dtype)
+            incumbent_shapes = tuple(existing.column_shapes) or tuple(
+                () for _column in existing.column_value_ids
+            )
+            merged_shapes = []
+            for column, (incumbent, proposed) in enumerate(zip(
+                incumbent_shapes, proposed_column_shapes, strict=True,
+            )):
+                if incumbent and proposed and incumbent != proposed:
+                    self.shortfalls.append(SSALoweringShortfall(
+                        "ssa-sequence", "conflicting-row-shape", location,
+                        f"sequence value {value_id} column {column} receives "
+                        f"both {incumbent!r} and {proposed!r}",
+                    ))
+                    return None
+                merged_shapes.append(incumbent or proposed)
+            if tuple(merged_shapes) != incumbent_shapes:
+                existing = replace(
+                    existing, column_shapes=tuple(merged_shapes),
+                )
+                self.sequence_descriptors[value_id] = existing
             return existing
         concorded_column_dtypes = concord_sequence_row_dtypes(
             self.function_name,
@@ -5126,6 +5275,7 @@ class _ControlSSABuilder:
             "sequence_arena": True,
             "transformation_priority": "compiler_storage_identity",
             "transformation_tie_policy": "incumbent",
+            "sequence_row_shape": proposed_column_shapes[0],
         }
         if first_dtype is not None and element_dtype is not None:
             # An explicit element contract (literal bytes, joined outer-row
@@ -5144,6 +5294,17 @@ class _ControlSSABuilder:
             ))
             for index in range(max(0, int(column_count) - 1))
         )
+        for index, column in enumerate(extra_columns, start=1):
+            column.accounting = {
+                **dict(column.accounting or {}),
+                "compiler_frame_storage": str(self.function_name),
+                "compiler_frame_sequence_id": value_id,
+                "compiler_frame_member": int(index),
+                "sequence_arena": True,
+                "sequence_row_shape": proposed_column_shapes[index],
+                "transformation_priority": "compiler_storage_identity",
+                "transformation_tie_policy": "incumbent",
+            }
         self.arguments.extend(extra_columns)
         # Mutable scalar cells are one-element typed arenas at the C ABI, not
         # opaque pointer-typed scalars (which the Fortran emitter would have
@@ -5252,6 +5413,7 @@ class _ControlSSABuilder:
                 str(data.dtype or "unknown"),
                 *(str(column.dtype or "unknown") for column in extra_columns),
             ),
+            column_shapes=proposed_column_shapes,
             key_columns=key_columns,
             live_flags_value_id=(
                 None if live_flags is None else int(live_flags.id)
@@ -8828,6 +8990,9 @@ class _ControlSSABuilder:
                         dict(self.sequence_descriptors),
                         owner=self.function_name,
                     ),
+                    "sequence_static_capacity_bounds": tuple(sorted(
+                        self.static_sequence_capacities.items()
+                    )),
                     "sequence_helper_functions": tuple(
                         self.sequence_helper_functions.values()
                     ),
@@ -11336,6 +11501,7 @@ def lower_control_sections_to_ssa(
     sequence_initializations: tuple[tuple[int, str, int], ...] = (),
     field_aliases: tuple[tuple[int, int], ...] = (),
     sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
+    sequence_capacity_sources: tuple[tuple[int, int], ...] = (),
     sequence_column_dtypes: Mapping[int, tuple[str, ...]] | None = None,
     sequence_record_identities: Mapping[int, str] | None = None,
     sequence_row_record_slots: Mapping[
@@ -11976,6 +12142,52 @@ def lower_control_sections_to_ssa(
             (str(tensor_shape_concordance_scope), int(uniform.value_id)),
             str(uniform.dtype),
         )
+    # ``np.asarray`` reaches the plan as canonical ``tensor``.  When its
+    # requested dtype already equals the operand dtype it is a view of the
+    # same storage identity, not a new arena.  Publish that fact before
+    # region captures are built so a later region reads the resident
+    # sequence root directly instead of receiving a row-shaped stand-in.
+    # This is the same value concordance used for indexed-store versions and
+    # loop-carried storage; no shape or name matching participates.
+    for expanded in expanded_plan_regions.values():
+        for instruction in expanded:
+            if (
+                instruction.res is None
+                or len(instruction.args) != 1
+                or str(instruction.op).casefold() != "cast"
+                or str((instruction.attributes or {}).get(
+                    "source_operator", ""
+                )).casefold() != "tensor"
+            ):
+                continue
+            source = instruction.args[0]
+            result = instruction.res
+            source_dtype = str(source.dtype or "unknown").casefold()
+            result_dtype = str(result.dtype or "unknown").casefold()
+            if (
+                source_dtype in {"", "none", "unknown"}
+                or result_dtype != source_dtype
+            ):
+                continue
+            alias_id, resident_id = int(result.id), int(source.id)
+            incumbent = value_concordance.resolve_alias(
+                control_name, alias_id
+            )
+            resident_root = value_concordance.resolve_alias(
+                control_name, resident_id
+            )
+            if incumbent == resident_root:
+                continue
+            if incumbent != alias_id:
+                raise ValueError(
+                    "tensor normalization identity disagrees with planning "
+                    f"concordance for {control_name!r}: result={alias_id} "
+                    f"already resolves to {incumbent}, operand resolves to "
+                    f"{resident_root}"
+                )
+            value_concordance.bind_alias(
+                control_name, alias_id, resident_root
+            )
     alias_neighbors: dict[int, set[int]] = {}
     for left, right in control.value_aliases:
         left, right = int(left), int(right)
@@ -13739,6 +13951,14 @@ def lower_control_sections_to_ssa(
     control_function.metadata[
         "tensor_shape_concordance_scope"
     ] = tensor_shape_concordance_scope
+    # The ProcessGraph owns this exact collection->iterable edge.  Publish it
+    # before repository tensor lowering below; attaching it only after this
+    # function returns makes dynamic collection extents invisible at the one
+    # phase that must turn ``rows[:, j]`` into bounded index arithmetic.
+    control_function.metadata["sequence_capacity_sources"] = tuple(
+        (int(sequence_id), int(source_id))
+        for sequence_id, source_id in sequence_capacity_sources
+    )
     debug_region_output_loads(control_function, "after-control-lowering")
     control_function = _materialize_control_constants(
         control_function,
@@ -14098,6 +14318,123 @@ def lower_control_sections_to_ssa(
                     )),
                     bool(attributes.get("host_resident", False)),
                 ))
+    # A planned region that captures a resident sequence arena may perform
+    # rank-aware indexing whose leading extent is the sequence's live length.
+    # Make that cell an ordinary ABI operand before tensor lowering.  The
+    # sequence descriptor is the authority for the correlation; calls and
+    # formals are extended together, so no stage-local ID comparison is used.
+    control_sequences = sequence_tables.get(control_function.name)
+    if control_sequences is not None:
+        for region_function in functions.values():
+            receipt = (
+                region_function.metadata or {}
+            ).get("source_region_integral") or {}
+            if str(receipt.get("owner") or "") != control_function.name:
+                continue
+            additions: list[tuple[int, int]] = []
+            existing_ids = {int(value.id) for value in region_function.args}
+            for argument in tuple(region_function.args):
+                accounting = dict(argument.accounting or {})
+                storage_view = accounting.get("ssa_storage_view") or {}
+                candidate_ids = {
+                    int(argument.id),
+                    final_resident(int(argument.id)),
+                    *(
+                        (int(accounting["ssa_storage_alias"]),)
+                        if accounting.get("ssa_storage_alias") is not None
+                        else ()
+                    ),
+                    *(
+                        (int(storage_view["storage_value_id"]),)
+                        if storage_view.get("storage_value_id") is not None
+                        else ()
+                    ),
+                }
+                descriptors = {
+                    descriptor.sequence_id: descriptor
+                    for candidate_id in candidate_ids
+                    for descriptor in (
+                        control_sequences.by_id(candidate_id),
+                    )
+                    if descriptor is not None
+                }
+                for candidate_id in candidate_ids:
+                    claims = tuple(control_sequences.member_claims(candidate_id))
+                    sequence_ids = {
+                        int(sequence_id)
+                        for sequence_id, role in claims
+                        if tuple(role) == ("column", 0)
+                    }
+                    descriptors.update({
+                        sequence_id: control_sequences.by_id(sequence_id)
+                        for sequence_id in sequence_ids
+                        if control_sequences.by_id(sequence_id) is not None
+                    })
+                if len(descriptors) != 1:
+                    continue
+                descriptor = next(iter(descriptors.values()))
+                length_id = int(descriptor.length_address_id)
+                if length_id in existing_ids:
+                    continue
+                existing_ids.add(length_id)
+                region_function.args.append(SSAValue(
+                    length_id,
+                    dtype="int64",
+                    shape=(1,),
+                    accounting={
+                        "sequence_length_for": int(descriptor.sequence_id),
+                        "compiler_frame_storage": control_function.name,
+                    },
+                ))
+                additions.append((int(descriptor.sequence_id), length_id))
+            if not additions:
+                continue
+            for caller in functions.values():
+                for caller_block in caller.blocks.values():
+                    for call_instruction in caller_block.instrs:
+                        if (
+                            call_instruction.op not in {"Call", "call"}
+                            or str(call_instruction.attributes.get("callee"))
+                            != region_function.name
+                        ):
+                            continue
+                        present = {
+                            int(value.id) for value in call_instruction.args
+                        }
+                        appended = [
+                            SSAValue(
+                                length_id,
+                                dtype="int64",
+                                shape=(1,),
+                                accounting={
+                                    "sequence_length_for": sequence_id,
+                                    "compiler_frame_storage": (
+                                        control_function.name
+                                    ),
+                                },
+                            )
+                            for sequence_id, length_id in additions
+                            if length_id not in present
+                        ]
+                        call_instruction.args.extend(appended)
+                        if appended:
+                            attributes = dict(call_instruction.attributes)
+                            if "feed_ids" in attributes:
+                                attributes["feed_ids"] = (
+                                    *tuple(attributes["feed_ids"]),
+                                    *(int(value.id) for value in appended),
+                                )
+                            if "feed_shapes" in attributes:
+                                attributes["feed_shapes"] = (
+                                    *tuple(attributes["feed_shapes"]),
+                                    *((1,) for _value in appended),
+                                )
+                            if "feed_dtypes" in attributes:
+                                attributes["feed_dtypes"] = (
+                                    *tuple(attributes["feed_dtypes"]),
+                                    *("int64" for _value in appended),
+                                )
+                            call_instruction.attributes = attributes
     module = IRModule(
         link_required_ssa_features(functions),
         recursion_table={

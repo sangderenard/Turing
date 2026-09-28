@@ -144,8 +144,15 @@ def module_storage_requirements(
             descriptor = table.sequences.get(int(sequence_id))
             if descriptor is None:
                 continue
-            for column_id in descriptor.column_value_ids:
-                shapes[function_name].setdefault(int(column_id), set()).add((max(1, int(count)),))
+            row_shapes = descriptor.column_shapes or tuple(
+                () for _column in descriptor.column_value_ids
+            )
+            for column_id, row_shape in zip(
+                descriptor.column_value_ids, row_shapes, strict=True,
+            ):
+                shapes[function_name].setdefault(int(column_id), set()).add(
+                    (max(1, int(count)), *tuple(row_shape))
+                )
     for function_name, table in tensor_tables.items():
         function_name = str(function_name)
         if function_name not in functions:
@@ -184,8 +191,20 @@ def module_storage_requirements(
                     continue
                 # A retained comprehension emits at most one row per input
                 # element. Filtering/deduplication can only reduce that count.
-                bounds = {(max(1, shape[0]),) for shape in shapes[caller_name].get(int(source_id), ()) if shape}
-                for column_id in descriptor.column_value_ids:
+                outer_bounds = {
+                    max(1, shape[0])
+                    for shape in shapes[caller_name].get(int(source_id), ())
+                    if shape
+                }
+                row_shapes = descriptor.column_shapes or tuple(
+                    () for _column in descriptor.column_value_ids
+                )
+                for column_id, row_shape in zip(
+                    descriptor.column_value_ids, row_shapes, strict=True,
+                ):
+                    bounds = {
+                        (outer, *tuple(row_shape)) for outer in outer_bounds
+                    }
                     column_shapes = shapes[caller_name].setdefault(int(column_id), set())
                     if not bounds.issubset(column_shapes):
                         column_shapes.update(bounds)

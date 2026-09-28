@@ -1,6 +1,35 @@
 import pytest
 from src.compiler.fortran_c_shell import _full_native_link_failures, _undefined_repository_ssa_operands
+from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 from src.transmogrifier.ssa import SSAValue, Instr, Function, BasicBlock, IRModule
+
+
+def test_compiler_frame_storage_is_a_defined_native_activation_slot():
+    arena = SSAValue(10, "float64", accounting={
+        "compiler_frame_storage": "root",
+        "compiler_frame_sequence_id": 10,
+        "compiler_frame_member": 0,
+        "sequence_arena": True,
+    })
+    formal = SSAValue(20, "float64")
+    callee = Function("region", [formal], {
+        "entry": BasicBlock("entry", [Instr("Ret", [], None)]),
+    })
+    root = Function("root", [], {
+        "entry": BasicBlock("entry", [
+            Instr("Call", [arena], None, attributes={"callee": callee.name}),
+            Instr("Ret", [], None),
+        ]),
+    })
+    module = IRModule({root.name: root, callee.name: callee})
+
+    assert _undefined_repository_ssa_operands(module) == ()
+    artifact = emit_ssa_module_to_c(module, root.name)
+    assert artifact.complete, artifact.shortfalls
+    assert "frame_storage_0 = calloc(1" in artifact.source
+
+    arena.accounting = {"compiler_frame_storage": "another_function"}
+    assert _undefined_repository_ssa_operands(module)[0]["value_id"] == 10
 
 
 @pytest.mark.parametrize('accounting', ['invented', 'record', 'workspace', 'member', 'local_member', 'local_view', 'zero_args'])

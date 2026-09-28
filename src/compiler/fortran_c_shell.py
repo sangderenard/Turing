@@ -18706,6 +18706,19 @@ def _class_surface_ssa_program(
         sequence_declarations = tuple(dict.fromkeys(
             concorded_sequence_declarations
         ))
+        sequence_capacity_sources = tuple(
+            (
+                int(data.get("value_id", node_id)),
+                int(graph_obj.nodes[int(source_id)].get(
+                    "value_id", source_id
+                )),
+            )
+            for node_id, data in graph_obj.nodes(data=True)
+            for source_id in ((data.get("attributes") or {}).get(
+                "collection_iterable_value_id"
+            ),)
+            if source_id is not None and int(source_id) in graph_obj
+        )
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -18768,6 +18781,7 @@ def _class_surface_ssa_program(
                 sequence_initializations=sequence_initializations,
                 field_aliases=field_aliases,
                 sequence_declarations=sequence_declarations,
+                sequence_capacity_sources=sequence_capacity_sources,
                 sequence_column_dtypes=_sequence_column_dtype_contracts(
                     graph_obj, sequence_declarations
                 ),
@@ -19194,13 +19208,9 @@ def _class_surface_ssa_program(
                     nonmutating_call_ids=nonmutating_record_calls,
                 )
             )
-            module_ir.functions[symbol].metadata["sequence_capacity_sources"] = tuple(
-                (int(data.get("value_id", node_id)), int(
-                    graph_obj.nodes[int(source_id)].get("value_id", source_id)))
-                for node_id, data in graph_obj.nodes(data=True)
-                for source_id in ((data.get("attributes") or {}).get("collection_iterable_value_id"),)
-                if source_id is not None and int(source_id) in graph_obj
-            )
+            module_ir.functions[symbol].metadata[
+                "sequence_capacity_sources"
+            ] = sequence_capacity_sources
             source_output_value_ids = tuple(
                 int(history[-1])
                 for name in tuple(
@@ -23517,6 +23527,17 @@ def _class_surface_ssa_program(
                                 None if status_id is None else int(status_id)
                             ),
                             column_dtypes=dtypes,
+                            column_shapes=tuple(
+                                dict(zip(
+                                    sequence.column_value_ids,
+                                    sequence.column_shapes or tuple(
+                                        () for _value_id
+                                        in sequence.column_value_ids
+                                    ),
+                                    strict=True,
+                                )).get(int(column_id), ())
+                                for column_id in column_ids
+                            ),
                             key_columns=tuple(map(int, key_columns)),
                             live_flags_value_id=(
                                 None if live_flags_id is None
@@ -26804,6 +26825,7 @@ def _class_surface_ssa_program(
                                     else remap[int(source_sequence.status_address_id)]
                                 ),
                                 column_dtypes=tuple(source_sequence.column_dtypes),
+                                column_shapes=tuple(source_sequence.column_shapes),
                                 key_columns=tuple(source_sequence.key_columns),
                                 live_flags_value_id=(
                                     None
@@ -28035,6 +28057,9 @@ def _class_surface_ssa_program(
                                         ),
                                         column_dtypes=tuple(
                                             sequence.column_dtypes
+                                        ),
+                                        column_shapes=tuple(
+                                            sequence.column_shapes
                                         ),
                                         key_columns=tuple(sequence.key_columns),
                                         live_flags_value_id=(
@@ -31008,6 +31033,9 @@ def _class_surface_ssa_program(
                                     ),
                                     column_dtypes=tuple(
                                         sequence.column_dtypes
+                                    ),
+                                    column_shapes=tuple(
+                                        sequence.column_shapes
                                     ),
                                     key_columns=tuple(sequence.key_columns),
                                     live_flags_value_id=(
@@ -37752,6 +37780,7 @@ def _class_surface_ssa_program(
                             frame_map[int(descriptor.status_address_id)]
                         ),
                         column_dtypes=tuple(descriptor.column_dtypes),
+                        column_shapes=tuple(descriptor.column_shapes),
                         key_columns=tuple(descriptor.key_columns),
                         live_flags_value_id=(
                             None if descriptor.live_flags_value_id is None else
@@ -38554,6 +38583,7 @@ def _class_surface_ssa_program(
                                 frame_map[int(descriptor.status_address_id)]
                             ),
                             column_dtypes=tuple(descriptor.column_dtypes),
+                            column_shapes=tuple(descriptor.column_shapes),
                             key_columns=tuple(descriptor.key_columns),
                             live_flags_value_id=(
                                 None
@@ -40290,16 +40320,23 @@ def _undefined_repository_ssa_operands(
                 for argument in instruction.args:
                     value_id = int(argument.id)
                     key = (str(block_name), str(instruction.op), value_id)
-                    if value_id not in defined and key not in seen:
+                    accounting = dict(argument.accounting or {})
+                    compiler_frame_definition = (
+                        str(accounting.get("compiler_frame_storage") or "")
+                        == str(function_name)
+                    )
+                    if (
+                        value_id not in defined
+                        and not compiler_frame_definition
+                        and key not in seen
+                    ):
                         seen.add(key)
                         findings.append({
                             "function": str(function_name),
                             "block": str(block_name),
                             "operation": str(instruction.op),
                             "value_id": value_id,
-                            "value_accounting": dict(
-                                argument.accounting or {}
-                            ),
+                            "value_accounting": accounting,
                             "value_names": tuple(
                                 str(name)
                                 for name, named_id in function.metadata.get(

@@ -22,6 +22,26 @@ def test_native_scalar_payload_fills_shaped_constant(tmp_path, payload):
     np.testing.assert_array_equal(execution.buffers[0], np.full((2, 3), payload))
 
 
+def test_native_reports_unsettled_slice_selector_without_converting_it():
+    source = SSAValue(0, "float64")
+    selector = SSAValue(1)
+    result = SSAValue(2, "float64")
+    root = Function("root", [source], {"entry": BasicBlock("entry", [
+        Instr("Const", [], selector, attributes={"value": slice(None, 2)}),
+        Instr("Indexed", [source, selector], result),
+        Instr("Ret", [result], None),
+    ])})
+
+    artifact = emit_ssa_module_to_c(IRModule({"root": root}), "root")
+
+    assert not artifact.complete
+    assert any(
+        "semantic slice selector" in shortfall.reason
+        and "authoritative source shape" in shortfall.reason
+        for shortfall in artifact.shortfalls
+    )
+
+
 def test_full_value_trace_prints_every_shaped_result_lane(tmp_path, monkeypatch):
     value = SSAValue(0, 'float64', (2, 3))
     root = Function('root', [], {'entry': BasicBlock('entry', [

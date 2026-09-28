@@ -17412,7 +17412,7 @@ def _operand_descriptor(graph: Any, value_id: int) -> dict[str, Any] | None:
 
 _DTYPE_CAST_OPERATIONS = frozenset({
     "to_dtype", "astype", "cast", "type_as", "to", "float", "double",
-    "int", "long", "bool_",
+    "int", "long", "bool_", "tensor",
 })
 
 
@@ -17747,7 +17747,8 @@ def _tensor_descriptor_rule(
     # the word ``Call`` loses shape at perfectly ordinary views such as
     # ``abs(pixel_x)`` even though the tensor operand is already proven.
     descriptor_operation = str(
-        (data.get("attributes") or {}).get("tensor")
+        (data.get("attributes") or {}).get("tensor_operation")
+        or (data.get("attributes") or {}).get("tensor")
         or (data.get("attributes") or {}).get("tensor_candidate")
         or data.get("op")
         or data.get("type")
@@ -17763,7 +17764,21 @@ def _tensor_descriptor_rule(
         ):
             descriptor_operation = precision_operation
     provisional_tensor = None
-    if (
+    collection_loop_result = bool(
+        descriptor_operation == "loopresult"
+        and str((data.get("attributes") or {}).get("result_kind"))
+        == "collection"
+    )
+    if collection_loop_result:
+        # A collection LoopResult's inherited tensor fact commonly belongs
+        # to the value appended on each iteration.  It is a row descriptor,
+        # not the descriptor of the collection port.  Re-run the collection
+        # law even when that row fact already has a concrete shape; accepting
+        # it here erases the leading iteration axis and later makes ``[:, j]``
+        # appear to over-index a vector.
+        provisional_tensor = dict(tensor)
+        tensor = {}
+    elif (
         graph.G.graph.get("planner_tensor_descriptors")
         and descriptor_operation in (
             {
@@ -17782,6 +17797,8 @@ def _tensor_descriptor_rule(
         provisional_tensor = dict(tensor)
         tensor = {}
     elif tensor.get("metadata_state") == "dynamic" or (
+        descriptor_operation == "tensor"
+    ) or (
         descriptor_operation in {
             "identity", "loopresult", "loopexit", "loopstateport",
         }
@@ -17789,9 +17806,12 @@ def _tensor_descriptor_rule(
         and str(tensor.get("dtype") or "unknown") == "unknown"
     ):
         # Dynamic metadata is a physical span/rank fallback, not a settled
-        # logical shape.  Give exact operator identity (clone, loop result,
-        # indexing, cast, and call-result projection) a chance to recover the
-        # caller-proven descriptor before returning that fallback.
+        # logical shape.  Give exact operator identity (tensor normalization,
+        # clone, loop result, indexing, cast, and call-result projection) a
+        # chance to recover the caller-proven descriptor before returning
+        # that fallback.  In particular, frontend ``np.asarray(x)`` is
+        # canonical ``tensor(x)`` here; its empty graph-domain default must
+        # not outrank the exact descriptor already attached to ``x``.
         provisional_tensor = dict(tensor)
         tensor = {}
     declared_rank = int(
@@ -17895,6 +17915,65 @@ def _tensor_descriptor_rule(
                 tensor["python_type"] = str(boundary["python_type"])
     if "shape" not in tensor:
         operation = descriptor_operation
+        if collection_loop_result:
+            attributes = data.get("attributes") or {}
+            element_sources = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role).casefold() == "value"
+                and int(parent) in graph.G
+            )
+            element = (
+                _tensor_descriptor(graph, element_sources[0], seen)
+                if len(element_sources) == 1 else None
+            )
+            iterable_id = attributes.get("collection_iterable_value_id")
+            iterable = (
+                _tensor_descriptor(graph, int(iterable_id), seen)
+                if iterable_id is not None and int(iterable_id) in graph.G
+                else None
+            )
+            materializer_id = attributes.get("materializer_node_id")
+            materializer_expression = (
+                graph.G.nodes[int(materializer_id)].get("expr_obj")
+                if materializer_id is not None
+                and int(materializer_id) in graph.G else None
+            )
+            exact_one_per_input = bool(
+                isinstance(materializer_expression, (
+                    ast.ListComp, ast.SetComp, ast.GeneratorExp,
+                ))
+                and len(materializer_expression.generators) == 1
+                and not materializer_expression.generators[0].ifs
+            )
+            if element is not None:
+                element_shape = tuple(map(
+                    int, element.get("shape") or (),
+                ))
+                element_rank = int(element.get(
+                    "rank", len(element_shape),
+                ))
+                iterable_shape = tuple(
+                    map(int, (iterable or {}).get("shape") or ())
+                )
+                if exact_one_per_input and iterable_shape:
+                    return {
+                        "shape": (int(iterable_shape[0]), *element_shape),
+                        "dtype": str(element.get("dtype") or "float64"),
+                        "rank": 1 + element_rank,
+                    }
+                # The resident sequence's length cell owns the leading
+                # extent when the iterable is dynamic.  Preserve the exact
+                # rank here instead of publishing the element's row shape as
+                # the entire collection; repository SSA later binds that
+                # leading extent to the sequence descriptor.
+                return {
+                    "shape": (),
+                    "dtype": str(element.get("dtype") or "float64"),
+                    "rank": 1 + element_rank,
+                    "metadata_state": "dynamic",
+                    "sequence_row_shape": element_shape,
+                }
         if operation in {
             "identity", "loopresult", "loopexit", "loopstateport",
         }:
@@ -18540,6 +18619,10 @@ def _tensor_descriptor_rule(
         **(
             {"python_type": str(tensor["python_type"])}
             if tensor.get("python_type") else {}
+        ),
+        **(
+            {"sequence_row_shape": tuple(tensor["sequence_row_shape"])}
+            if tensor.get("sequence_row_shape") is not None else {}
         ),
     }
 
@@ -20011,10 +20094,26 @@ def _fold_callsite_structural_values(
                         ))
                         changed = True
                         break
+            # The graph spelling may remain ``Call`` after the concrete
+            # frontend qualifier was stripped.  Descriptor laws and their
+            # publication follow the canonical tensor identity carried by
+            # the node, not that structural AST spelling.
+            semantic_operation = str(
+                (data.get("attributes") or {}).get("tensor_operation")
+                or (data.get("attributes") or {}).get("tensor_candidate")
+                or operation
+            ).casefold()
+            existing_tensor = data.get("tensor") or {}
             inherited_descriptor = _tensor_descriptor(graph, node_id)
             if (
                 inherited_descriptor is not None
-                and "shape" not in (data.get("tensor") or {})
+                and (
+                    semantic_operation == "tensor"
+                    or "shape" not in existing_tensor
+                    or (
+                        not tuple(existing_tensor.get("shape") or ())
+                    )
+                )
                 and (
                     operation in {
                         "neg", "abs", "sin", "cos", "tan", "exp", "log",
@@ -20029,6 +20128,7 @@ def _fold_callsite_structural_values(
                         )) in {"real", "imag"}
                     )
                     or operation in _DTYPE_CAST_OPERATIONS
+                    or semantic_operation in _DTYPE_CAST_OPERATIONS
                 )
             ):
                 # These nodes preserve or alias a tensor descriptor.  Store
@@ -20037,11 +20137,6 @@ def _fold_callsite_structural_values(
                 data["tensor"] = copy.deepcopy(inherited_descriptor)
             # The semantic operator name is the authored tensor operation
             # (``greater_equal`` for ``>=``), not only the AST spelling.
-            semantic_operation = str(
-                (data.get("attributes") or {}).get("tensor_operation")
-                or (data.get("attributes") or {}).get("tensor_candidate")
-                or operation
-            ).casefold()
             comparison_operations = {
                 "equal", "eq", "not_equal", "ne", "lt", "le", "gt", "ge",
                 "less", "less_equal", "greater", "greater_equal",

@@ -619,6 +619,34 @@ def test_index_dtype_propagation_is_scoped_per_function_identity():
     assert aggregate.dtype == "ssa.aggregate"
 
 
+def test_index_address_lowering_preserves_slice_semantics():
+    from src.compiler.ir_indexing import lower_indexing_to_ssa_addressing
+
+    base = SSAValue(1, dtype="float64", shape=(3,))
+    selector = SSAValue(2)
+    selected = SSAValue(3, dtype="float64", shape=(2,))
+    replacement = SSAValue(4, dtype="float64", shape=(2,))
+    stored = SSAValue(5, dtype="float64", shape=(3,))
+    function = Function("slice_views", [base, replacement], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], selector, attributes={
+                "value": slice(None, 2),
+            }),
+            Instr("Indexed", [base, selector], selected),
+            Instr("IndexedStore", [base, selector, replacement], stored),
+            Instr("Ret", [stored], None),
+        ]),
+    })
+
+    lower_indexing_to_ssa_addressing({function.name: function})
+
+    operations = [
+        instruction.op
+        for instruction in function.blocks["entry"].instrs
+    ]
+    assert operations == ["Const", "Indexed", "IndexedStore", "Ret"]
+
+
 def test_record_field_getattr_becomes_a_loaded_region_capture():
     from src.compiler.hierarchical_plan import PlanClosure, PlanLine
 

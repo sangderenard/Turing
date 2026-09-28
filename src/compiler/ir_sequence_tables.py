@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from math import prod
 
 from ..transmogrifier.ssa import (
     BasicBlock,
@@ -32,6 +33,7 @@ from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 class SSASequenceShortfallCode(str, Enum):
     DYNAMIC_GROWTH_UNAVAILABLE = "dynamic-growth-unavailable"
     READ_ONLY_DESTINATION = "read-only-destination"
+    SHAPED_KEY_UNAVAILABLE = "shaped-key-unavailable"
 
 
 @dataclass(frozen=True)
@@ -157,8 +159,12 @@ class _Builder:
         self.blocks[name] = block
         return block
 
-    def fresh(self, dtype: str | None = None) -> SSAValue:
-        return SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=dtype)
+    def fresh(
+        self, dtype: str | None = None, shape: tuple[int, ...] = (),
+    ) -> SSAValue:
+        return SSAValue(
+            GLOBAL_MONOTONIC_IDS.mint(), dtype=dtype, shape=tuple(shape),
+        )
 
     def emit(
         self,
@@ -271,10 +277,15 @@ def _storage_values(
     descriptor: SSASequenceDescriptor,
 ) -> tuple[SSAValue, ...]:
     values = [
-        *(SSAValue(value_id, dtype=dtype) for value_id, dtype in zip(
+        *(SSAValue(
+            value_id, dtype=dtype,
+            accounting={"sequence_row_shape": tuple(shape)},
+        ) for value_id, dtype, shape in zip(
             descriptor.column_value_ids,
             descriptor.column_dtypes
             or ("unknown",) * len(descriptor.column_value_ids),
+            descriptor.column_shapes
+            or ((),) * len(descriptor.column_value_ids),
         )),
         # A sequence's length/capacity cells are shared ABI storage -- every
         # caller and every helper generated here must agree on one true
@@ -341,15 +352,29 @@ def lower_sequence_insert(
     unsupported = _unsupported_destination(descriptor, operation)
     if unsupported is not None:
         return unsupported
+    column_shapes = descriptor.column_shapes or tuple(
+        () for _column in descriptor.column_value_ids
+    )
+    if any(column_shapes[int(column)] for column in descriptor.key_columns):
+        return SSASequenceLowering(shortfalls=(SSASequenceLoweringShortfall(
+            SSASequenceShortfallCode.SHAPED_KEY_UNAVAILABLE,
+            descriptor.sequence_id,
+            operation,
+            "unique insertion requires an elementwise equality contract for "
+            "a shaped key column",
+        ),))
 
     storage = _storage_values(descriptor)
     builder = _Builder(_first_fresh_identity(
         descriptor, values=storage, minimum=first_value_id
     ))
     row_values = tuple(
-        builder.fresh(dtype)
-        for dtype in descriptor.column_dtypes
-        or ("unknown",) * len(descriptor.column_value_ids)
+        builder.fresh(dtype, tuple(shape))
+        for dtype, shape in zip(
+            descriptor.column_dtypes
+            or ("unknown",) * len(descriptor.column_value_ids),
+            column_shapes,
+        )
     )
     columns = tuple(SSAValue(value_id, dtype=value.dtype) for value_id, value in zip(
         descriptor.column_value_ids, row_values
@@ -440,10 +465,40 @@ def lower_sequence_insert(
     has_capacity = builder.fresh("bool")
     builder.emit(capacity_check, "Lt", [current_length, capacity], has_capacity)
     builder.cond(capacity_check, has_capacity, write, full)
-    for column, value in zip(columns, row_values):
-        address = builder.fresh("ptr")
-        builder.emit(write, "GetElementPtr", [column, current_length], address)
-        builder.emit(write, "Store", [value, address])
+    for column, value, row_shape in zip(
+        columns, row_values, column_shapes, strict=True,
+    ):
+        row_width = prod(row_shape) if row_shape else 1
+        row_offset = current_length
+        if row_width != 1:
+            width = builder.const(write, row_width)
+            row_offset = builder.fresh("int64")
+            builder.emit(write, "Mul", [current_length, width], row_offset)
+        for element_index in range(row_width):
+            destination_index = row_offset
+            if element_index:
+                destination_index = builder.fresh("int64")
+                builder.emit(
+                    write, "Add",
+                    [row_offset, builder.const(write, element_index)],
+                    destination_index,
+                )
+            destination_address = builder.fresh("ptr")
+            builder.emit(
+                write, "GetElementPtr",
+                [column, destination_index], destination_address,
+            )
+            stored = value
+            if row_width != 1:
+                source_address = builder.fresh("ptr")
+                stored = builder.fresh(value.dtype)
+                builder.emit(
+                    write, "GetElementPtr",
+                    [value, builder.const(write, element_index)],
+                    source_address,
+                )
+                builder.emit(write, "Load", [source_address], stored)
+            builder.emit(write, "Store", [stored, destination_address])
     if live_flags is not None:
         live_address = builder.fresh("ptr")
         builder.emit(write, "GetElementPtr", [live_flags, current_length], live_address)

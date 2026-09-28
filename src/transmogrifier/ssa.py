@@ -776,6 +776,12 @@ class SSASequenceDescriptor:
     capacity_value_id: int
     status_address_id: int | None = None
     column_dtypes: tuple[str, ...] = ()
+    # Logical shape of one row in each physical column.  Scalar columns use
+    # ``()``.  A shaped column is still one contiguous arena: row ``i`` starts
+    # at ``i * prod(column_shapes[column])``.  This preserves one storage
+    # identity while allowing a resident comprehension of vectors to become
+    # a matrix view without allocating a parallel object.
+    column_shapes: tuple[tuple[int, ...], ...] = ()
     key_columns: tuple[int, ...] = ()
     live_flags_value_id: int | None = None
     capacity_policy: SSASequenceCapacityPolicy = SSASequenceCapacityPolicy.FIXED
@@ -797,6 +803,15 @@ class SSASequenceDescriptor:
             self.column_value_ids
         ):
             raise ValueError("SSA sequence dtypes must match its data columns")
+        if self.column_shapes and len(self.column_shapes) != len(
+            self.column_value_ids
+        ):
+            raise ValueError("SSA sequence shapes must match its data columns")
+        if any(
+            any(not isinstance(extent, int) or extent <= 0 for extent in shape)
+            for shape in self.column_shapes
+        ):
+            raise ValueError("SSA sequence row shapes require positive static extents")
         if len(set(self.key_columns)) != len(self.key_columns):
             raise ValueError("SSA sequence key columns must be unique")
         if any(
@@ -842,6 +857,7 @@ class SSASequenceDescriptor:
             "capacity_value_id": int(self.capacity_value_id),
             "status_address_id": self.status_address_id,
             "column_dtypes": list(self.column_dtypes),
+            "column_shapes": [list(shape) for shape in self.column_shapes],
             "key_columns": [int(item) for item in self.key_columns],
             "live_flags_value_id": self.live_flags_value_id,
             "capacity_policy": self.capacity_policy.value,

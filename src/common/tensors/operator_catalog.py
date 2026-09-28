@@ -269,6 +269,14 @@ OPERATOR_ALIASES = {
     # ingestion.  ``Tensor(...)`` is the public constructor spelling left by
     # that step; repository IR owns the canonical ``tensor(...)`` operation.
     "Tensor": "tensor",
+    # NumPy is frontend syntax at the source boundary.  ``asarray`` has the
+    # repository's existing idempotent tensor-normalization semantics: an
+    # already resident tensor keeps its storage (subject to an authored dtype
+    # cast), while a structural sequence is materialized by that same
+    # canonical constructor.  Keeping this in the shared alias catalogue
+    # makes ingestion strip ``np`` before source pursuit can mistake the
+    # extension callable for a native host boundary.
+    "asarray": "tensor",
     "abs_": "abs",
     "argmax_": "argmax",
     "argmin_": "argmin",

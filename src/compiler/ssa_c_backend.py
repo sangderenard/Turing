@@ -2189,6 +2189,46 @@ def emit_ssa_module_to_c(
             int(output.id): _value_buffer_c_type(output)
             for output in native_outputs[fn]
         })
+        # Compiler-frame storage is an allocation declaration, not an SSA
+        # computation.  Planned regions may be its first textual consumer,
+        # so no defining instruction or formal exists to seed ``addresses``.
+        # Materialize the declared activation slot here, from the same
+        # backend-neutral storage requirement used for tensor temporaries.
+        # This is the C spelling of LLVM's entry-block alloca and keeps the
+        # one physical sequence/tensor arena named by the concordance.
+        compiler_frame_values: dict[int, object] = {}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                for value in instruction.args:
+                    accounting = dict(value.accounting or {})
+                    if (
+                        str(accounting.get("compiler_frame_storage") or "")
+                        == str(fn)
+                    ):
+                        compiler_frame_values.setdefault(int(value.id), value)
+        for value_id, value in compiler_frame_values.items():
+            if value_id in addresses:
+                continue
+            requirement = storage_requirements_by_function.get(fn, {}).get(
+                value_id
+            )
+            shape = tuple(value.shape or ())
+            element_count = (
+                int(requirement.element_count)
+                if requirement is not None
+                and requirement.element_count is not None
+                else math.prod(shape) if shape else 1
+            )
+            storage = activation_array(buffer_type(value), element_count)
+            addresses[value_id] = storage
+            expressions[value_id] = (
+                storage
+                if (value.accounting or {}).get("sequence_arena")
+                else storage_expression(value, storage)
+            )
+            object_addresses[id(value)] = storage
+            object_expressions[id(value)] = expressions[value_id]
+            address_buffer_types[value_id] = buffer_type(value)
         local_tensor_declarations: list[str] = []
         if tensor_table is not None:
             for descriptor in tensor_table.tensors.values():
@@ -3005,6 +3045,16 @@ def emit_ssa_module_to_c(
                         # parsing or floating-point conversion loses identity.
                         held = string_token(held)
                         token_value_ids.add(int(instruction.res.id))
+                    if isinstance(held, slice):
+                        shortfalls.append(CEmissionShortfall(
+                            op,
+                            "semantic slice selector "
+                            f"%t{instruction.res.id} survived tensor/layout "
+                            f"settlement in {fn}; its Indexed consumer must "
+                            "be normalized with an authoritative source "
+                            "shape before C emission",
+                        ))
+                        continue
                     if is_integer(instruction.res) or isinstance(held, int):
                         expressions[int(instruction.res.id)] = str(int(held))
                         integer_ids.add(int(instruction.res.id))
@@ -4888,7 +4938,16 @@ def emit_ssa_module_to_c(
             if capacity is not None and columns and all(
                 column in allocation_counts for column in columns
             ):
-                count = min(allocation_counts[column] for column in columns)
+                row_shapes = sequence.column_shapes or tuple(
+                    () for _column in sequence.column_value_ids
+                )
+                count = min(
+                    allocation_counts[column]
+                    // max(1, math.prod(row_shape or (1,)))
+                    for column, row_shape in zip(
+                        columns, row_shapes, strict=True,
+                    )
+                )
                 entry_lines.append(f"    ((int64_t *){capacity})[0] = {count};")
     # -- record-parameter relocation prologue -------------------------------
     # Record parameters are runtime cell arenas (the program mutates scalar

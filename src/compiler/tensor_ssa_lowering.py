@@ -15,6 +15,7 @@ from hashlib import sha256
 from math import prod
 from typing import Any, Iterable, Mapping
 
+from ..common.tensors.abstraction_methods.indexing import normalize_basic_index
 from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import c_tensor_opcode
 from ..transmogrifier.ssa import (
     IRModule,
@@ -264,6 +265,10 @@ _CAST_OPERATIONS = {
     "long": "cast_double_to_int_values",
     "int": "cast_double_to_int_values",
     "long_cast": "cast_double_to_int_values",
+    # Frontend tensor construction is normalization.  Existing tensor spans
+    # retain their storage; resident sequences use the sequence descriptor to
+    # expose their one arena as a shaped view when dtype already agrees.
+    "tensor": None,
 }
 _REDUCTION_CODES = {"sum": 0, "prod": 1, "min": 2, "max": 3, "any": 4, "all": 5}
 _SHAPED_SSA_OPERATIONS = {
@@ -2017,6 +2022,167 @@ def lower_tensor_calls_to_repository_ssa(
         # count from a formal whose true rank was already proven
         # elsewhere, just not onto this particular object.
         numeric_scope = (function.metadata or {}).get("source_numeric_scope")
+        source_owner = str(
+            ((function.metadata or {}).get("source_region_integral") or {}).get(
+                "owner"
+            )
+            or numeric_scope
+            or function_name
+        )
+        sequence_table = (
+            getattr(module, "sequence_tables", {}).get(function_name)
+            or getattr(module, "sequence_tables", {}).get(source_owner)
+        )
+
+        def resident_sequence(value: SSAValue):
+            """The exact sequence descriptor naming this arena identity."""
+
+            if sequence_table is None:
+                return None
+            accounting = dict(value.accounting or {})
+            storage_view = accounting.get("ssa_storage_view") or {}
+            from .identity_concordance import current_identity_book
+
+            concordance = current_identity_book().page(
+                "control_value_concordance"
+            )
+            candidate_ids = {
+                int(value.id),
+                int(concordance.resolve_alias(source_owner, int(value.id))),
+                *(
+                    (int(accounting["ssa_storage_alias"]),)
+                    if accounting.get("ssa_storage_alias") is not None else ()
+                ),
+                *(
+                    (int(storage_view["storage_value_id"]),)
+                    if storage_view.get("storage_value_id") is not None else ()
+                ),
+            }
+            descriptors = {
+                descriptor.sequence_id: descriptor
+                for candidate_id in candidate_ids
+                for descriptor in (sequence_table.by_id(candidate_id),)
+                if descriptor is not None
+            }
+            for candidate_id in candidate_ids:
+                descriptors.update({
+                    int(sequence_id): sequence_table.by_id(int(sequence_id))
+                    for sequence_id, role
+                    in sequence_table.member_claims(candidate_id)
+                    if tuple(role) == ("column", 0)
+                    and sequence_table.by_id(int(sequence_id)) is not None
+                })
+            if len(descriptors) != 1:
+                return None
+            return next(iter(descriptors.values()))
+
+        def owner_tensor_descriptor(value: SSAValue):
+            """A unanimous descriptor published by this source integral.
+
+            Planned numerical regions are separate repository functions but
+            their receipt gives them one source owner and their value ids are
+            identities in that owner's concordance.  A producer region may
+            therefore publish the tensor view before a later consumer region
+            sees the same id as a formal.  Do not compare unrelated local ids:
+            only tables whose function receipt names this exact owner enter.
+            """
+
+            candidates = []
+            for table_name, table in getattr(
+                module, "tensor_tables", {}
+            ).items():
+                table_function = module.functions.get(str(table_name))
+                if table_function is None:
+                    continue
+                receipt = (
+                    table_function.metadata or {}
+                ).get("source_region_integral") or {}
+                table_owner = str(
+                    receipt.get("owner") or table_function.name
+                )
+                if table_owner != source_owner:
+                    continue
+                descriptor = table.by_id(int(value.id))
+                if descriptor is not None:
+                    candidates.append(descriptor)
+            contracts = {
+                (
+                    int(descriptor.data_value_id),
+                    str(descriptor.dtype),
+                    tuple(descriptor.shape),
+                    tuple(descriptor.strides),
+                )
+                for descriptor in candidates
+            }
+            if len(contracts) != 1:
+                return None
+            return candidates[0]
+
+        def sequence_outer_extent(sequence) -> int | None:
+            """Return the exact static producer extent for one sequence."""
+
+            owner_function = module.functions.get(source_owner)
+            if owner_function is None:
+                return None
+            authored_bounds = {
+                int(sequence_id): int(extent)
+                for sequence_id, extent in (
+                    owner_function.metadata or {}
+                ).get("sequence_static_capacity_bounds", ())
+            }
+            if int(sequence.sequence_id) in authored_bounds:
+                return authored_bounds[int(sequence.sequence_id)]
+            source_ids = {
+                int(source_id)
+                for sequence_id, source_id in (
+                    owner_function.metadata or {}
+                ).get("sequence_capacity_sources", ())
+                if int(sequence_id) == int(sequence.sequence_id)
+            }
+            if len(source_ids) != 1:
+                return None
+            source_id = next(iter(source_ids))
+            extents: set[int] = set()
+            for candidate_function in module.functions.values():
+                receipt = (
+                    candidate_function.metadata or {}
+                ).get("source_region_integral") or {}
+                candidate_owner = str(
+                    receipt.get("owner") or candidate_function.name
+                )
+                if candidate_owner != source_owner:
+                    continue
+                values = list(candidate_function.args)
+                for candidate_block in candidate_function.blocks.values():
+                    for candidate_instruction in candidate_block.instrs:
+                        values.extend(candidate_instruction.args)
+                        if candidate_instruction.res is not None:
+                            values.append(candidate_instruction.res)
+                extents.update(
+                    int(value.shape[0])
+                    for value in values
+                    if int(value.id) == source_id and tuple(value.shape or ())
+                )
+            for table_name, table in getattr(
+                module, "tensor_tables", {}
+            ).items():
+                candidate_function = module.functions.get(str(table_name))
+                if candidate_function is None:
+                    continue
+                receipt = (
+                    candidate_function.metadata or {}
+                ).get("source_region_integral") or {}
+                candidate_owner = str(
+                    receipt.get("owner") or candidate_function.name
+                )
+                if candidate_owner != source_owner:
+                    continue
+                descriptor = table.by_id(source_id)
+                if descriptor is not None and tuple(descriptor.shape):
+                    extents.add(int(descriptor.shape[0]))
+            if len(extents) != 1:
+                return None
+            return next(iter(extents))
         _settle_operand_shapes(function_name, function.args, numeric_scope)
         function_argument_ids = {int(value.id) for value in function.args}
         unresolved_argument_ids = {
@@ -2401,6 +2567,10 @@ def lower_tensor_calls_to_repository_ssa(
                     instruction.attributes.get("tensor_operation")
                     or instruction.attributes.get("tensor")
                     or instruction.attributes.get("tensor_candidate")
+                    or (
+                        instruction.attributes.get("source_operator")
+                        if instruction.op in {"Cast", "cast"} else None
+                    )
                 )
                 # ProcessGraph spells Python arithmetic as ordinary SSA
                 # opcodes rather than attaching tensor metadata. Once shape
@@ -2416,6 +2586,22 @@ def lower_tensor_calls_to_repository_ssa(
                     and (
                         tuple(instruction.res.shape)
                         or any(tuple(argument.shape) for argument in instruction.args)
+                        # A retained Python slice is already proof that this
+                        # is semantic tensor indexing, even when its source
+                        # extent arrives later than the local SSA value.  It
+                        # must reach basic-index normalization rather than the
+                        # scalar address pass.
+                        or (
+                            instruction.op in {"Indexed", "IndexedStore"}
+                            and any(
+                                isinstance(constants.get(int(selector.id)), slice)
+                                for selector in (
+                                    instruction.args[1:]
+                                    if instruction.op == "Indexed"
+                                    else instruction.args[1:-1]
+                                )
+                            )
+                        )
                         # Dynamic tensor spans deliberately have no invented
                         # static extents.  Their tensor identity is carried by
                         # the shape concordance as ordinary SSA accounting;
@@ -2554,6 +2740,169 @@ def lower_tensor_calls_to_repository_ssa(
                     raw_axes = instruction.attributes.get(
                         "basic_index_axes"
                     )
+                    if raw_axes is None and args:
+                        source = args[0]
+                        authored_indices = (
+                            args[1:]
+                            if operation == "basic_index"
+                            else args[1:-1]
+                        )
+                        decoded_indices = tuple(
+                            constants.get(int(value.id), value)
+                            for value in authored_indices
+                        )
+                        source_shape = tuple(map(
+                            int,
+                            instruction.attributes.get(
+                                "basic_index_source_shape",
+                                tuple(source.shape or ()),
+                            ),
+                        ))
+                        declared_source_rank = int(
+                            (source.accounting or {}).get(
+                                "program_abi_rank", 0
+                            ) or 0
+                        )
+                        if declared_source_rank > len(source_shape):
+                            source_sequence = resident_sequence(source)
+                            row_shape = (
+                                tuple((
+                                    source_sequence.column_shapes
+                                    or ((),)
+                                )[0])
+                                if source_sequence is not None
+                                and len(source_sequence.column_value_ids) == 1
+                                else None
+                            )
+                            if (
+                                row_shape == ()
+                                and source_sequence is not None
+                                and declared_source_rank
+                                == 1 + len(source_shape)
+                            ):
+                                row_shape = source_shape
+                            outer_extent = (
+                                sequence_outer_extent(source_sequence)
+                                if source_sequence is not None else None
+                            )
+                            if (
+                                row_shape is not None
+                                and outer_extent is not None
+                                and declared_source_rank
+                                == 1 + len(row_shape)
+                            ):
+                                source_shape = (outer_extent, *row_shape)
+                                source.shape = source_shape
+                            else:
+                                published = owner_tensor_descriptor(source)
+                            if (
+                                source_shape == tuple(source.shape or ())
+                                and len(source_shape) == declared_source_rank
+                            ):
+                                pass
+                            elif (
+                                published is not None
+                                and len(tuple(published.shape))
+                                == declared_source_rank
+                            ):
+                                source_shape = tuple(published.shape)
+                                source.shape = source_shape
+                                source.accounting = {
+                                    **dict(source.accounting or {}),
+                                    "ssa_storage_view": {
+                                        "storage_value_id": int(
+                                            published.data_value_id
+                                        ),
+                                        "view_shape": source_shape,
+                                        "operation": (
+                                            "source_integral_tensor_view"
+                                        ),
+                                    },
+                                }
+                        if not source_shape:
+                            source_accounting = dict(source.accounting or {})
+                            fixed_length = source_accounting.get(
+                                "program_abi_fixed_length"
+                            )
+                            if (
+                                fixed_length is not None
+                                and int(source_accounting.get(
+                                    "program_abi_rank", 0
+                                ) or 0) == 1
+                            ):
+                                source_shape = (int(fixed_length),)
+                        if (
+                            source_shape
+                            and (
+                                declared_source_rank <= 0
+                                or len(source_shape) == declared_source_rank
+                            )
+                            and authored_indices
+                            and all(
+                                isinstance(value, (int, slice))
+                                or value is Ellipsis
+                                for value in decoded_indices
+                            )
+                        ):
+                            try:
+                                normalized_axes, selected_shape = (
+                                    normalize_basic_index(
+                                        tuple(decoded_indices), source_shape
+                                    )
+                                )
+                            except IndexError as exc:
+                                source_definitions = tuple(
+                                    {
+                                        "block": defining_block,
+                                        "op": defining.op,
+                                        "args": tuple(
+                                            int(value.id)
+                                            for value in defining.args
+                                        ),
+                                        "attributes": dict(
+                                            defining.attributes or {}
+                                        ),
+                                    }
+                                    for defining_block, defining_body
+                                    in function.blocks.items()
+                                    for defining in defining_body.instrs
+                                    if defining.res is not None
+                                    and int(defining.res.id) == int(source.id)
+                                )
+                                raise ValueError(
+                                    "repository tensor index contract failed: "
+                                    f"function={function_name!r} "
+                                    f"block={block_name!r} "
+                                    f"operation={operation!r} "
+                                    f"result=%{int(result.id)} "
+                                    f"source=%{int(source.id)} "
+                                    f"source_shape={source_shape!r} "
+                                    f"selectors={decoded_indices!r} "
+                                    f"source_accounting="
+                                    f"{dict(source.accounting or {})!r} "
+                                    f"source_definitions="
+                                    f"{source_definitions!r} "
+                                    f"source_owner={source_owner!r} "
+                                    f"sequence_table_owners="
+                                    f"{tuple(getattr(module, 'sequence_tables', {}))!r} "
+                                    f"owner_sequences="
+                                    f"{tuple((int(item.sequence_id), tuple(item.column_value_ids), tuple(item.column_shapes)) for item in (sequence_table.sequences.values() if sequence_table is not None else ()))!r} "
+                                    f"capacity_sources="
+                                    f"{tuple((module.functions.get(source_owner).metadata or {}).get('sequence_capacity_sources', ())) if module.functions.get(source_owner) is not None else ()!r}"
+                                ) from exc
+                            raw_axes = tuple(
+                                (tuple(map(int, indices)), bool(drop_axis))
+                                for indices, drop_axis in normalized_axes
+                            )
+                            result.shape = tuple(map(int, selected_shape))
+                            instruction = dataclasses.replace(
+                                instruction,
+                                attributes={
+                                    **instruction.attributes,
+                                    "basic_index_axes": raw_axes,
+                                    "basic_index_source_shape": source_shape,
+                                },
+                            )
                     if (
                         operation == "basic_index"
                         and raw_axes is None
@@ -2599,6 +2948,99 @@ def lower_tensor_calls_to_repository_ssa(
                                 int(value.id): value
                                 for value in function.args
                             }
+                            source_sequence = resident_sequence(source)
+                            if (
+                                (shape_id is None or rank_id is None)
+                                and source_sequence is not None
+                                and len(source_sequence.column_value_ids) == 1
+                            ):
+                                length_value = next((
+                                    value for value in function.args
+                                    if int((value.accounting or {}).get(
+                                        "sequence_length_for", -1
+                                    )) == int(source_sequence.sequence_id)
+                                ), None)
+                                row_shape = tuple(
+                                    (source_sequence.column_shapes or ((),))[0]
+                                )
+                                if (
+                                    not row_shape
+                                    and source_rank
+                                    == 1 + len(tuple(source.shape or ()))
+                                ):
+                                    row_shape = tuple(source.shape)
+                                if (
+                                    length_value is not None
+                                    and source_rank == 2
+                                    and len(row_shape) == 1
+                                ):
+                                    live_length_i64 = fresh(dtype="int64")
+                                    live_length = fresh(dtype="int32")
+                                    shape_value, shape_definition = int_vector(
+                                        (0, prod(row_shape))
+                                    )
+                                    rank_value, rank_definition = constant(
+                                        source_rank, "int32"
+                                    )
+                                    zero, zero_definition = constant(0, "int64")
+                                    row_width, row_width_definition = constant(
+                                        prod(row_shape), "int32"
+                                    )
+                                    first_address = fresh(dtype="ptr")
+                                    source_element_count = fresh(dtype="int32")
+                                    prefix.extend((
+                                        shape_definition,
+                                        Instr(
+                                            Handler.Load.value,
+                                            [length_value], live_length_i64,
+                                            attributes={
+                                                "binding": "sequence-tensor-length",
+                                            },
+                                        ),
+                                        Instr(
+                                            Handler.Cast.value,
+                                            [live_length_i64], live_length,
+                                            attributes={
+                                                "source_dtype": "int64",
+                                                "target_dtype": "int32",
+                                                "binding": "sequence-tensor-length",
+                                            },
+                                        ),
+                                        zero_definition,
+                                        Instr(
+                                            Handler.GetElementPtr.value,
+                                            [shape_value, zero], first_address,
+                                        ),
+                                        Instr(
+                                            Handler.Store.value,
+                                            [live_length, first_address], None,
+                                        ),
+                                        row_width_definition,
+                                        rank_definition,
+                                        Instr(
+                                            Handler.Mul.value,
+                                            [live_length, row_width],
+                                            source_element_count,
+                                        ),
+                                    ))
+                                    shape_id = int(shape_value.id)
+                                    rank_id = int(rank_value.id)
+                                    values_by_id[shape_id] = shape_value
+                                    values_by_id[rank_id] = rank_value
+                                    source.accounting = {
+                                        **source_accounting,
+                                        "tensor_metadata_state": "dynamic",
+                                        "tensor_shape_value_id": shape_id,
+                                        "tensor_rank_value_id": rank_id,
+                                        "tensor_element_count_value_id": int(
+                                            source_element_count.id
+                                        ),
+                                        "sequence_id": int(
+                                            source_sequence.sequence_id
+                                        ),
+                                        "sequence_row_shape": row_shape,
+                                    }
+                                    source_accounting = dict(source.accounting)
                             if shape_id is None or rank_id is None:
                                 shortfalls.append(TensorSSALoweringShortfall(
                                     function_name,
@@ -2630,10 +3072,44 @@ def lower_tensor_calls_to_repository_ssa(
                                 ),
                             )
                             dynamic_index = authored_indices[-1]
-                            index_vector = fresh(shape=(1,), dtype="int32")
-                            register_tensor(
-                                index_vector, storage="temporary"
-                            )
+                            decoded_index = decoded_indices[-1]
+                            if isinstance(decoded_index, int):
+                                index_vector, index_definition = int_vector((
+                                    decoded_index,
+                                ))
+                                index_definition.attributes["binding"] = (
+                                    "dynamic-index-vector"
+                                )
+                                index_prefix = (index_definition,)
+                            else:
+                                index_vector, index_definition = int_vector((0,))
+                                index_definition.attributes["binding"] = (
+                                    "dynamic-index-vector"
+                                )
+                                index_zero, index_zero_definition = constant(
+                                    0, "int64"
+                                )
+                                index_address = fresh(dtype="ptr")
+                                index_prefix = (
+                                    index_definition,
+                                    index_zero_definition,
+                                    Instr(
+                                        Handler.GetElementPtr.value,
+                                        [index_vector, index_zero],
+                                        index_address,
+                                        attributes={
+                                            "binding": "dynamic-index-vector",
+                                        },
+                                    ),
+                                    Instr(
+                                        Handler.Store.value,
+                                        [dynamic_index, index_address],
+                                        None,
+                                        attributes={
+                                            "binding": "dynamic-index-vector",
+                                        },
+                                    ),
+                                )
                             output_rank, output_rank_def = constant(
                                 source_rank - 1, "int32"
                             )
@@ -2675,14 +3151,7 @@ def lower_tensor_calls_to_repository_ssa(
                                     )
                                 ]
                             prefix.extend((
-                                Instr(
-                                    Handler.Store.value,
-                                    [dynamic_index, index_vector],
-                                    None,
-                                    attributes={
-                                        "binding": "dynamic-index-vector",
-                                    },
-                                ),
+                                *index_prefix,
                                 output_rank_def,
                                 Instr(
                                     Handler.Load.value,
@@ -3407,6 +3876,114 @@ def lower_tensor_calls_to_repository_ssa(
                             **dict(value.accounting or {}),
                             "physical_dtype": "float64",
                         }
+                if operation == "tensor" and source is not None:
+                    sequence = resident_sequence(source)
+                    row_shape: tuple[int, ...] | None = None
+                    if sequence is not None:
+                        if len(sequence.column_value_ids) != 1:
+                            shortfalls.append(TensorSSALoweringShortfall(
+                                function_name,
+                                block_name,
+                                operation,
+                                "tensor materialization requires one resident "
+                                "sequence value column",
+                            ))
+                            rewritten.append(instruction)
+                            continue
+                        row_shape = tuple(
+                            (sequence.column_shapes or ((),))[0]
+                        )
+                        column_dtype = str(
+                            (sequence.column_dtypes or (source.dtype,))[0]
+                            or source.dtype or "unknown"
+                        )
+                        if column_dtype not in {"", "None", "unknown"}:
+                            source.dtype = column_dtype
+                        declared_rank = int(
+                            (result.accounting or {}).get(
+                                "program_abi_rank", 0
+                            ) or 0
+                        )
+                        if (
+                            not row_shape
+                            and declared_rank
+                            == 1 + len(tuple(result.shape or ()))
+                        ):
+                            row_shape = tuple(result.shape)
+                        if (
+                            declared_rank == 1 + len(row_shape)
+                            and tuple(result.shape or ()) == row_shape
+                        ):
+                            outer_extent = sequence_outer_extent(sequence)
+                            if outer_extent is not None:
+                                result.shape = (outer_extent, *row_shape)
+                    requested_dtype = str(result.dtype or source.dtype or "")
+                    shape_preserving = (
+                        tuple(result.shape or ()) == tuple(source.shape or ())
+                        if sequence is None
+                        else bool(tuple(result.shape or ()))
+                        and tuple(result.shape or ())[1:] == row_shape
+                    )
+                    if (
+                        shape_preserving
+                        and requested_dtype == str(source.dtype or "")
+                    ):
+                        if sequence is not None:
+                            # The sequence column and tensor data pointer are
+                            # the same SSA identity.  Once the graph proves
+                            # the outer extent, publish the complete logical
+                            # view on that identity before its tensor
+                            # descriptor freezes strides and byte width.
+                            source.shape = tuple(result.shape)
+                            source.accounting = {
+                                **dict(source.accounting or {}),
+                                "sequence_id": int(sequence.sequence_id),
+                                "sequence_row_shape": row_shape,
+                            }
+                        source_descriptor = register_tensor(
+                            source,
+                            storage=(
+                                "input"
+                                if int(source.id) in function_argument_ids
+                                else "temporary"
+                            ),
+                        )
+                        result.accounting = {
+                            **dict(result.accounting or {}),
+                            "ssa_storage_view": {
+                                "storage_value_id": int(source.id),
+                                "view_shape": tuple(result.shape),
+                                "operation": (
+                                    "tensor_sequence_view"
+                                    if sequence is not None
+                                    else "tensor_identity_view"
+                                ),
+                            },
+                            **(
+                                {
+                                    "sequence_id": int(sequence.sequence_id),
+                                    "sequence_row_shape": row_shape,
+                                }
+                                if sequence is not None else {}
+                            ),
+                        }
+                        register_tensor(
+                            result,
+                            storage="view",
+                            alias_of=int(source_descriptor.tensor_id),
+                            data_value_id=int(source_descriptor.data_value_id),
+                        )
+                        aliases[int(result.id)] = SSAValue(
+                            int(source.id),
+                            dtype=result.dtype or source.dtype,
+                            shape=tuple(result.shape),
+                            device=result.device or source.device,
+                            accounting={
+                                **dict(source.accounting or {}),
+                                **dict(result.accounting or {}),
+                            },
+                        )
+                        continue
                 source_descriptor = None
                 if source is not None:
                     source_descriptor = register_tensor(
@@ -4632,6 +5209,31 @@ def lower_tensor_calls_to_repository_ssa(
                     ))
                 rewritten.append(instruction)
             block.instrs[:] = rewritten
+
+        # Slice objects are compile-time selector syntax, never runtime scalar
+        # constants.  Once every consumer has normalized away, discard their
+        # now-dead definitions so a scalar backend cannot be asked to emit
+        # ``float(slice(...))``.  Shared selectors remain until their final
+        # semantic consumer is lowered.
+        used_value_ids = {
+            int(argument.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            for argument in instruction.args
+        }
+        for block in function.blocks.values():
+            block.instrs[:] = [
+                instruction
+                for instruction in block.instrs
+                if not (
+                    instruction.op in {"Const", "const"}
+                    and instruction.res is not None
+                    and isinstance(
+                        constants.get(int(instruction.res.id)), slice
+                    )
+                    and int(instruction.res.id) not in used_value_ids
+                )
+            ]
 
         if aliases:
             for block in function.blocks.values():

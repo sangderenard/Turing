@@ -25,6 +25,7 @@ import ast
 import pathlib
 import warnings
 
+import numpy as np
 import pytest
 
 yaml = pytest.importorskip("yaml")
@@ -337,6 +338,53 @@ def test_declared_extents_reach_the_formals_and_the_operands(tmp_path):
     opcode, result_shape, argument_shapes = operands[0]
     assert result_shape == (4,)
     assert argument_shapes == [(4,), (4,)]
+
+
+def test_numpy_asarray_is_frontend_tensor_normalization_before_slice(tmp_path):
+    """The frontend spelling cannot become a NumPy native-extension call.
+
+    Its canonical ``tensor`` value is the same shaped dataflow value as the
+    declared span (with an optional dtype cast), so the following slice reads
+    the exact source extent rather than a scalar graph-domain default.
+    """
+
+    contract = _contract(tmp_path, [_span("x", (3,))])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, _ = lower_ast_source_to_ssa(
+            "def f(x):\n"
+            "    return np.asarray(x, dtype=float)[:2]\n",
+            "f",
+            name="asarray_slice",
+            python_bindings={"np": np},
+            extraction_contract=contract,
+        )
+
+    instructions = [
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+    cast = next(
+        instruction for instruction in instructions
+        if instruction.op == "Cast"
+        and instruction.attributes.get("source_operator") == "tensor"
+    )
+    indexed = next(
+        instruction for instruction in instructions
+        if instruction.op == "Indexed"
+    )
+
+    assert tuple(cast.args[0].shape) == (3,)
+    assert tuple(cast.res.shape) == (3,)
+    assert tuple(indexed.args[0].shape) == (3,)
+    assert tuple(indexed.res.shape) == (2,)
+    assert indexed.attributes["basic_index_source_shape"] == (3,)
+    assert not any(
+        instruction.attributes.get("callee") == "numpy.asarray"
+        for instruction in instructions
+    )
 
 
 def test_rank_alone_is_not_enough(tmp_path):
