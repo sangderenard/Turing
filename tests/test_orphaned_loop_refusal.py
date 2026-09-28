@@ -70,6 +70,17 @@ BARE_RAISE_SOURCE = (
     "    return total\n"
 )
 
+# The empty destructuring target intentionally creates no target binding.
+# The iterable remains the exact owner of the runtime loop extent, so the
+# compiler must retain a CFG loop around the scheduled body instead of
+# calling the bound unresolved.
+TARGETLESS_ITERABLE_SOURCE = (
+    "def train(total, rows):\n"
+    "    for [] in rows:\n"
+    "        total = total + 1.0\n"
+    "    return total\n"
+)
+
 # Identical shape, benign else instead of raise: proves the guard-clause
 # handling is about `raise` specifically, not any if/else inside a loop.
 BENIGN_CONTROL_SOURCE = (
@@ -115,6 +126,26 @@ def test_a_guard_clause_raise_inside_a_loop_compiles_and_validates():
         "loop_header", "loop_body", "loop_latch", "loop_exit",
         "validation_pass", "validation_fail",
     } <= set(fn.blocks)
+
+
+def test_iterable_identity_retains_loop_when_target_has_no_binding():
+    module, outputs, exports = _lower(
+        TARGETLESS_ITERABLE_SOURCE, "targetless_iterable",
+    )
+    fn = module.functions["targetless_iterable__train"]
+
+    assert {"loop_header", "loop_body", "loop_latch", "loop_exit"} <= set(
+        fn.blocks
+    )
+    extent, = (
+        instruction
+        for block in fn.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "iterable_extent"
+    )
+    assert extent.attributes["source_value_id"] in {
+        int(value_id) for _name, value_id in fn.metadata["parameter_names"]
+    }
 
 
 def test_the_same_shape_without_raise_compiles_cleanly():

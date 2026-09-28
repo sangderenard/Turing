@@ -2745,14 +2745,31 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
         for formal in function.args:
             formal_id = int(formal.id)
             accounting = dict(formal.accounting or {})
+            constructor_field_value = (
+                accounting.get("record_constructor_value") is not None
+                and accounting.get("program_abi_parameter") is None
+            )
             if (
                 formal_id in named
                 or formal_id in recorded
-                or any(accounting.get(key) not in {None, ""} for key in (
-                    "program_abi_storage", "program_abi_parameter",
-                    "program_abi_field", "linked_call_frame_storage",
-                    "compiler_frame_storage", "returned_record_storage",
-                ))
+                or accounting.get("program_abi_parameter") not in {None, ""}
+                or (
+                    not constructor_field_value
+                    and any(
+                        accounting.get(key) not in {None, ""}
+                        for key in (
+                            "program_abi_storage", "program_abi_field",
+                        )
+                    )
+                )
+                or any(
+                    accounting.get(key) not in {None, ""}
+                    for key in (
+                        "linked_call_frame_storage",
+                        "compiler_frame_storage",
+                        "returned_record_storage",
+                    )
+                )
             ):
                 continue
             sources = incoming.get((str(function_name), formal_id), ())

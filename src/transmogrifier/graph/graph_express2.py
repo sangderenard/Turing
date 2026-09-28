@@ -4,6 +4,7 @@ import numpy as np
 import ast
 import builtins
 import copy
+from fnmatch import fnmatchcase
 import importlib
 import inspect
 import math
@@ -1568,6 +1569,7 @@ def _expand_unresolved_ast_parents(
     package=None,
     include=None,
     pursuit_roots=None,
+    dependency_seed_definitions=(),
     tensor_code_references=None,
     source_ast_normalizers=(),
     profile_verbose=False,
@@ -1734,6 +1736,12 @@ def _expand_unresolved_ast_parents(
             getattr(definition, "_python_bindings", None)
             or root_bindings
         )
+        # A declared record parameter is source identity, not a runtime
+        # object.  The compiler publishes those exact bindings before
+        # pursuit so an unannotated wrapper such as ``world.step()`` can
+        # activate the retained method body whose ABI it names.  Keep them
+        # separate from ``_python_bindings``: replacing the latter with only
+        # parameter facts would discard the definition's lexical globals.
         owner_class = source_class_of_method.get(id(definition))
         if owner_class is not None:
             # Keep a retained external class's defining-module bindings. The
@@ -1842,6 +1850,25 @@ def _expand_unresolved_ast_parents(
             call
             for definition in root_definitions
             for call in lexical_calls(definition)
+        )
+        # A retained class body is already present in the graph and its
+        # ``self.method`` edges belong to class dispatch.  A closed lexical
+        # factory call has no runtime actuals from which later call-frame
+        # linking could recover its result, though: its source body is the
+        # value definition.  Seed exactly those zero-argument Python
+        # functions from the ABI-selected method closure without reopening
+        # the whole retained class through the general parent worklist.
+        pending_calls.extend(
+            call
+            for definition in dependency_seed_definitions
+            for call in lexical_calls(definition)
+            if isinstance(call.func, ast.Name)
+            and not call.args
+            and not call.keywords
+            and inspect.isfunction(_resolve_ast_parent_reference(
+                call.func,
+                node_bindings.get(id(call), root_bindings),
+            ))
         )
         active_seed_definitions = root_definitions
     else:
@@ -3534,6 +3561,7 @@ class ProcessGraph:
         source_ast_normalizers=(),
         retained_ast_normalizers=(),
         retain=(),
+        source_parameter_records=(),
         profile_verbose=False,
         progress=None,
         boundary_namespace=None,
@@ -3667,6 +3695,9 @@ class ProcessGraph:
                     "source is unavailable"
                 )
             definition = _attach_external_methods(retained_class, definition)
+            retained_qualname = str(getattr(
+                retained_class, "__qualname__", retained_class.__name__,
+            ))
             if retained_ast_normalizers:
                 retained_module = ast.Module(
                     body=[definition], type_ignores=[]
@@ -3675,6 +3706,14 @@ class ProcessGraph:
                     normalize(retained_module)
                 ast.fix_missing_locations(retained_module)
                 definition = retained_module.body[0]
+            definition._python_record_identity_keys = (
+                (
+                    f"{getattr(retained_class, '__module__', '')}."
+                    f"{retained_qualname}"
+                ).strip("."),
+                retained_qualname,
+                str(retained_class.__name__),
+            )
             # A retained class is external source. Its method free names live
             # in the defining module, not in the submitted program's globals.
             # Preserve that exact lexical environment so source pursuit can
@@ -3691,6 +3730,103 @@ class ProcessGraph:
                     member._python_bindings = definition._python_bindings
             tree.body.append(definition)
             existing_classes.add(identity)
+
+        # Program-ABI record bindings are already the authoritative answer to
+        # the source-level type of a boundary parameter.  Publish that answer
+        # to source pursuit before it decides which method bodies are live.
+        # The value is the exact class AST already present in this graph, so
+        # method selection continues through the normal source-method
+        # concordance and never constructs a Python object or a stand-in.
+        class_candidates = {}
+        for definition in (
+            node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+        ):
+            source_identity = getattr(
+                definition, "_python_source_identity", None,
+            )
+            keys = {str(definition.name)}
+            keys.update(map(str, getattr(
+                definition, "_python_record_identity_keys", (),
+            )))
+            if (
+                isinstance(source_identity, tuple)
+                and len(source_identity) == 2
+            ):
+                qualified = ".".join(map(str, source_identity)).strip(".")
+                keys.update((qualified, str(source_identity[1])))
+            for key in filter(None, keys):
+                class_candidates.setdefault(key, []).append(definition)
+
+        def qualified_definitions(body, prefix=()):
+            for definition in body:
+                if isinstance(definition, ast.ClassDef):
+                    yield from qualified_definitions(
+                        definition.body, (*prefix, definition.name),
+                    )
+                elif isinstance(
+                    definition, (ast.FunctionDef, ast.AsyncFunctionDef),
+                ):
+                    qualified = ".".join((*prefix, definition.name))
+                    yield qualified, definition
+
+        parameter_records = tuple(dict(record) for record in (
+            source_parameter_records or ()
+        ))
+        dependency_seed_definitions = []
+        for qualified_name, definition in qualified_definitions(tree.body):
+            for record in parameter_records:
+                if not fnmatchcase(
+                    qualified_name, str(record.get("function") or ""),
+                ):
+                    continue
+                candidates = []
+                for key in (
+                    record.get("record"),
+                    record.get("identity"),
+                    str(record.get("identity") or "").rsplit(".", 1)[-1],
+                ):
+                    candidates.extend(class_candidates.get(str(key), ()))
+                candidates = tuple(dict.fromkeys(candidates))
+                if len(candidates) != 1:
+                    continue
+                owner = candidates[0]
+                methods = {
+                    str(member.name): member
+                    for member in owner.body
+                    if isinstance(member, (
+                        ast.FunctionDef, ast.AsyncFunctionDef,
+                    ))
+                }
+                parameter = str(record["parameter"])
+                selected = [
+                    methods[call.func.attr]
+                    for call in ast.walk(definition)
+                    if isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == parameter
+                    and call.func.attr in methods
+                ]
+                # Follow only same-owner method edges here. The class graph
+                # owns those calls physically; this traversal merely finds
+                # each reachable method's lexical free-function seeds.
+                pending = list(selected)
+                seen_methods = set()
+                while pending:
+                    method = pending.pop(0)
+                    if id(method) in seen_methods:
+                        continue
+                    seen_methods.add(id(method))
+                    dependency_seed_definitions.append(method)
+                    pending.extend(
+                        methods[call.func.attr]
+                        for call in ast.walk(method)
+                        if isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id in {"self", "cls"}
+                        and call.func.attr in methods
+                    )
 
         # Dissolve recognised spans at the seam -- before parent-expansion, IR
         # mapping, state-machine planning, and the normalizer each walk the
@@ -3726,6 +3862,9 @@ class ProcessGraph:
                     package=getattr(self, "python_package", None),
                     include=parent_include,
                     pursuit_roots=pursuit_roots,
+                    dependency_seed_definitions=tuple(dict.fromkeys(
+                        dependency_seed_definitions
+                    )),
                     tensor_code_references=tensor_code_references,
                     source_ast_normalizers=source_ast_normalizers,
                     profile_verbose=profile_verbose,

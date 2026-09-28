@@ -94,6 +94,25 @@ def test_default_contract_draws_python_native_and_decompile_lines():
     )
 
 
+def test_reference_field_normalizes_its_repository_physical_dtype():
+    contract = ExtractionContract(CONTRACT).with_program_abi({
+        "records": {
+            "State": {
+                "identity": "tests.State",
+                "fields": {
+                    "payload": {"storage": "reference", "optional": True},
+                },
+            },
+        },
+        "bindings": [],
+        "values": [],
+    })
+
+    field = contract.program_abi.records["State"].fields["payload"]
+    assert field.dtype == "opaque_ref"
+    assert field.receipt()["dtype"] == "opaque_ref"
+
+
 @pytest.mark.parametrize("native_abi,expected", [
     (None, ExtractionAction.REJECT),
     ("cpython-c-api", ExtractionAction.REJECT),

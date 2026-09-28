@@ -48,6 +48,43 @@ def test_hidden_formal_is_accounted_when_every_call_supplies_frame_storage():
         end_identity_book(token)
 
 
+def test_constructor_field_value_keeps_proven_compiler_frame_ownership():
+    formal = SSAValue(3, "float64", accounting={
+        "program_abi_record": "WorldContact",
+        "program_abi_field": "penetration_m",
+        "program_abi_storage": "scalar",
+        "record_constructor_value": 171,
+    })
+    callee = Function(
+        "resolve_pair", [formal],
+        {"entry": BasicBlock("entry", [Instr("Ret", [], None)])},
+        metadata={"parameter_names": (("self", 99),)},
+    )
+    actual = SSAValue(20, "float64", accounting={
+        "compiler_frame_storage": "caller",
+    })
+    caller = Function("caller", [actual], {
+        "entry": BasicBlock("entry", [
+            Instr("Call", [actual], None, attributes={
+                "callee": "resolve_pair",
+            }),
+            Instr("Ret", [], None),
+        ]),
+    })
+    module = IRModule({"caller": caller, "resolve_pair": callee})
+    book, token = begin_identity_book()
+    module.metadata["identity_book"] = book
+    try:
+        receipts = concord_compiler_frame_formals(module)
+
+        assert receipts[0]["formal_id"] == 3
+        assert formal.accounting["program_abi_field"] == "penetration_m"
+        assert formal.accounting["compiler_frame_storage"] == "resolve_pair"
+        assert callee.metadata["storage_formals"][0]["value_id"] == 3
+    finally:
+        end_identity_book(token)
+
+
 def test_program_abi_field_retires_its_provisional_frame_lease():
     field = SSAValue(3, "float64", accounting={
         "program_abi_record": "Metrics",

@@ -165,11 +165,23 @@ def check_formal_parity(module: Any) -> list[Finding]:
                     )
             except Exception:  # noqa: BLE001 -- diagnostics never fail a build
                 pass
+            by_id = {
+                int(argument.id): argument
+                for argument in getattr(function, "args", ())
+            }
+            unnamed_accounting = {
+                int(value_id): dict(
+                    getattr(by_id.get(int(value_id)), "accounting", None)
+                    or {}
+                )
+                for value_id in unnamed
+            }
             findings.append(Finding(
                 "formal_parity", str(name),
                 f"{len(formals)} formals but only {len(set(formals) & accounted)} named or "
                 "ABI-accounted; "
-                f"unnamed value ids {unnamed} -- no caller can know what to "
+                f"unnamed value ids {unnamed} with accounting "
+                f"{unnamed_accounting!r} -- no caller can know what to "
                 "pass. If one is also in a region's output_ids, this is the "
                 "formal/region-output collision.",
             ))

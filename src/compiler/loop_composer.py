@@ -4040,6 +4040,7 @@ def analyze_shader_loop_reductions(
             loop.iterator_kind == "arithmetic_sequence"
             and len(loop.target_bindings) == 1
         ) else ()
+        enumerated_source_id = None
         if (
             loop.stop is None
             and loop.stop_node is None
@@ -4061,6 +4062,7 @@ def analyze_shader_loop_reductions(
                     ),
                     None,
                 )
+                enumerated_source_id = source_id
                 if source_id is not None and len(loop.target_bindings) == 2:
                     projected_iterable_bindings = (
                         (
@@ -4088,7 +4090,9 @@ def analyze_shader_loop_reductions(
                     in enumerate(loop.target_bindings)
                 )
         iterable_extent_id = (
-            int(projected_iterable_bindings[0][0])
+            int(enumerated_source_id)
+            if enumerated_source_id is not None
+            else int(projected_iterable_bindings[0][0])
             if projected_iterable_bindings
             else loop.iterable_node
         )
@@ -4853,19 +4857,18 @@ def analyze_shader_loop_reductions(
             for effect in loop.state_effects
         ):
             blockers.append("opaque-state-effect")
+        # The iterable, not the loop target, owns a ``for`` loop's runtime
+        # bound.  A target can legitimately publish no value identity (for
+        # example ``for [] in rows``), while the iterable still has an exact
+        # resident identity whose logical length the SSA lowerer can load.
+        # Treating target projection as proof of the bound orphaned the body
+        # regions even though ``__iterable_extent_<id>__`` was available.
         if (
             loop.source_type != "While"
             and loop.stop is None
             and loop.stop_node is None
-            and not (
-                loop.iterable_node is not None
-                and bool(loop.target_bindings)
-                and (
-                    len(loop.target_bindings) == 1
-                    or loop.iterable_constant is not None
-                    or bool(projected_iterable_bindings)
-                )
-            )
+            and loop.iterable_node is None
+            and loop.iterable_constant is None
         ):
             blockers.append("unresolved-loop-bound")
         for node_id in loop.body_nodes:
@@ -5212,7 +5215,6 @@ def analyze_shader_loop_reductions(
                     )
                     else f"__iterable_extent_{iterable_extent_id}__"
                     if loop.stop_node is None and loop.iterable_node is not None
-                    and bool(loop.target_bindings)
                     and loop.iterable_constant is None
                     else str(len(loop.iterable_constant))
                     if loop.iterable_constant is not None

@@ -1317,6 +1317,56 @@ class Controller:
     assert contract[5] == "Controller"
 
 
+def test_result_record_identity_classifies_receiver_field_write():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Metrics:
+    def __init__(self, value):
+        self.value = value
+
+class State:
+    def step(self):
+        metrics = Metrics(1.0)
+        self.last_metrics = metrics
+        return metrics.value
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    executable = graph.function_table.entry("step").graph.G
+    constructor = next(
+        data
+        for _node_id, data in executable.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and (data.get("attributes") or {}).get("class_ref") == "Metrics"
+    )
+    constructor["attributes"]["result_class_ref"] = constructor[
+        "attributes"
+    ].pop("class_ref")
+    executable.graph["parameter_record_abi"] = {
+        "self": {
+            "identity": "State",
+            "fields": {
+                "last_metrics": {
+                    "storage": "reference",
+                    "mutable": True,
+                    "optional": True,
+                },
+            },
+        },
+    }
+
+    from src.compiler.fortran_c_shell import _field_slot_ops
+
+    contract = _field_slot_ops(executable)
+
+    assert contract[17] == ((0, "Metrics", constructor["value_id"]),)
+
+
 def test_descendant_loop_owns_its_sequence_mutation_effect():
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(

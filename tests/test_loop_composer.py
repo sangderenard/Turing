@@ -1156,6 +1156,33 @@ def test_enumerate_resident_iterable_exports_projected_bindings():
     )
 
 
+def test_enumerate_nested_target_uses_source_iterable_extent():
+    graph = _function_graph(
+        "def kernel(rows):\n"
+        "    total = 0\n"
+        "    for index, (left, right) in enumerate(rows):\n"
+        "        total = total + index + left + right\n"
+        "    return total\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.body_nodes,)
+    )
+    enumerate_node = graph.G.nodes[int(plan.loop.iterable_node)]
+    source_id = next(
+        int(parent)
+        for parent, role in enumerate_node["parents"]
+        if str(role) in {"arg", "args", "arg:0", "arg0"}
+    )
+
+    assert len(plan.loop.target_bindings) == 3
+    assert reduction.control_program is not None
+    assert reduction.control_program.root.stop == (
+        f"__iterable_extent_{source_id}__"
+    )
+
+
 def test_structural_fold_refreshes_retained_loop_order_after_removing_constants():
     from src.compiler.glsl_deployment_strategy import _dependency_order
 

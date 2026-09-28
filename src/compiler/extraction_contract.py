@@ -299,6 +299,12 @@ class ProgramABIField:
             raise ExtractionContractError(
                 f"{location}.dtype is required for {storage} storage"
             )
+        if storage == "reference" and dtype is None:
+            # ``reference`` has one repository-level physical type.  Publish
+            # it in the normalized contract so source-derived record fields
+            # and ProgramABI-materialized fields cannot spell the same slot
+            # as ``opaque_ref`` and ``None`` respectively.
+            dtype = "opaque_ref"
         nested_record = raw.get("record")
         if storage == "record":
             if not nested_record:

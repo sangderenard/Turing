@@ -443,6 +443,96 @@ def _publish_concordant_function_aliases(
     return aliases
 
 
+def _concord_unbound_variant_rows(function: Any) -> dict[int, int]:
+    """Advance provisional row carriers to an exact linked resident.
+
+    Variant-aware region planning can precede source-call linking. It then
+    creates a row carrier whose ``unbound_variant_source_id`` names the
+    semantic aggregate. If linking later advances that source to a physical
+    span, the row carrier is a view of the same resident, not another ABI
+    object. Publish that second edge through the ordinary concordance so
+    dominance-aware alias settlement and signature pruning remain the sole
+    mutation transaction.
+    """
+
+    aliases = _concordant_function_aliases(function)
+
+    def terminal(value_id: int) -> int:
+        current = int(value_id)
+        seen: set[int] = set()
+        while current in aliases and current not in seen:
+            seen.add(current)
+            current = int(aliases[current])
+        return current
+
+    values_by_id = {
+        int(argument.id): argument for argument in function.args
+    }
+    values_by_id.update({
+        int(instruction.res.id): instruction.res
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+    })
+    physical_ids = set(values_by_id)
+    bindings = {}
+    for argument in function.args:
+        source_id = (argument.accounting or {}).get(
+            "unbound_variant_source_id"
+        )
+        if source_id is None:
+            continue
+        resident_id = terminal(int(source_id))
+        if resident_id == int(source_id):
+            # Planned-region calls preserve their source feed identities even
+            # after call linking replaces an aggregate result by its exact
+            # physical span. A provisional variant row and the linked span
+            # can therefore coexist as actuals for the same feed id. Accept
+            # the span only when every non-provisional physical occurrence
+            # agrees on one resident; multiple candidates are a real variant
+            # and deliberately remain distinct.
+            candidates = {
+                int(actual.id)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Call", "call"}
+                for position, feed_id in enumerate(tuple(
+                    instruction.attributes.get("feed_ids") or ()
+                ))
+                if int(feed_id) == int(source_id)
+                and position < len(instruction.args)
+                for actual in (instruction.args[position],)
+                if int(actual.id) not in {
+                    int(argument.id), int(source_id),
+                }
+                and (
+                    (actual.accounting or {}).get(
+                        "linked_call_frame_storage"
+                    ) is not None
+                    or (
+                        (actual.accounting or {}).get(
+                            "program_abi_storage"
+                        ) == "span"
+                    )
+                )
+            }
+            if len(candidates) == 1:
+                resident_id = next(iter(candidates))
+        if (
+            resident_id != int(source_id)
+            and resident_id != int(argument.id)
+            and resident_id in physical_ids
+        ):
+            bindings[int(argument.id)] = resident_id
+    if not bindings:
+        return aliases
+    return _publish_concordant_function_aliases(
+        function,
+        bindings,
+        provenance="linked_variant_row_resident",
+    )
+
+
 def _concordant_function_resident(function: Any, value_id: int) -> int:
     """Return the terminal physical resident for one function-local value."""
 
@@ -2449,6 +2539,24 @@ def _linked_caller_member(
                         memberships.append((
                             int(record_id), field_name, ("sequence", role),
                         ))
+    # A sequence field's ``value_ids`` are a flattened physical inventory of
+    # the same members named more precisely by ``sequence_member``.  Prefer
+    # the role-labelled sequence claims.  Treating the positional inventory
+    # as an independent field contract loses the distinction between shared
+    # columns/extents and private operational cells such as status.
+    sequence_fields = {
+        (record_id, field_name)
+        for record_id, field_name, member in memberships
+        if member[0] == "sequence"
+    }
+    memberships = [
+        (record_id, field_name, member)
+        for record_id, field_name, member in memberships
+        if not (
+            member[0] == "value"
+            and (record_id, field_name) in sequence_fields
+        )
+    ]
     for record_id, field_name, member in dict.fromkeys(memberships):
         descriptor = callee_records.records.get(record_id)
         field = None if descriptor is None else next((
@@ -2478,6 +2586,28 @@ def _linked_caller_member(
             candidate for candidate in caller_descriptor.fields
             if candidate.storage_identity == field.storage_identity
         ), None)
+        if caller_field is None and member[0] == "sequence":
+            # ProgramABI keyed fields are deliberately represented by their
+            # physical ``length``/``keys``/``values`` fields, not by a second
+            # opaque parent field.  Materialization records the exact logical
+            # field -> member-role decomposition on the identity book.  Follow
+            # that graph receipt here, so a callee's local sequence view binds
+            # to the caller's resident parts without matching names, positions,
+            # dtypes, or SSA accounting.  A role absent from an existing
+            # receipt is callee-private operational storage (normally status).
+            decomposition = current_identity_book().page(
+                "record_field_decomposition"
+            ).latest((
+                caller_records.owner,
+                int(caller_record_id),
+                str(field.storage_identity),
+            ))
+            if decomposition is not None:
+                caller_member = dict(decomposition).get(tuple(member[1]))
+                if caller_member is not None:
+                    resolved.add(int(caller_member))
+                    sequence_members.add(int(caller_member))
+                continue
         if caller_field is None and grow_caller_field is not None:
             caller_field = grow_caller_field(
                 int(caller_record_id), field, member, callee_id,
@@ -4683,9 +4813,63 @@ def _authored_sequence_record_views(
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
             visit(statement.name, statement)
         elif isinstance(statement, ast.ClassDef):
+            # ``self.rows: list[Row] = []`` is the receiver-field form of the
+            # same authored contract.  Publish it on each method that actually
+            # reads that field; the method graph's GetAttr identity then owns
+            # the columnar row view.  Restricting this to explicit annotated
+            # assignments and complete record schemas avoids inferring an
+            # element type from append values or runtime contents.
+            receiver_sequence_fields: dict[str, str] = {}
+            initializer = next((
+                member for member in statement.body
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and member.name == "__init__"
+            ), None)
+            if initializer is not None:
+                for node in ast.walk(initializer):
+                    if not (
+                        isinstance(node, ast.AnnAssign)
+                        and isinstance(node.target, ast.Attribute)
+                        and isinstance(node.target.value, ast.Name)
+                        and node.target.value.id == "self"
+                    ):
+                        continue
+                    identity = element_record(node.annotation)
+                    if identity is not None:
+                        receiver_sequence_fields[
+                            str(node.target.attr)
+                        ] = identity
             for member in statement.body:
                 if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    visit(f"{statement.name}.{member.name}", member)
+                    qualified_name = f"{statement.name}.{member.name}"
+                    visit(qualified_name, member)
+                    used_fields = {
+                        str(node.attr)
+                        for node in ast.walk(member)
+                        if (
+                            isinstance(node, ast.Attribute)
+                            and isinstance(node.value, ast.Name)
+                            and node.value.id == "self"
+                        )
+                    }
+                    for field_name in sorted(
+                        used_fields & set(receiver_sequence_fields)
+                    ):
+                        identity = receiver_sequence_fields[field_name]
+                        schema = dict(schemas[identity])
+                        views.setdefault(qualified_name, {})[
+                            field_name
+                        ] = {
+                            "identity": str(
+                                schema.get("identity") or identity
+                            ),
+                            "fields": copy.deepcopy(dict(
+                                schema.get("fields") or {}
+                            )),
+                            "aggregate_kind": "tuple",
+                            "mutable": True,
+                            "source_derived": True,
+                        }
     return views
 
 
@@ -4847,7 +5031,14 @@ def _record_row_physical_columns(
             continue
         if bool(receipt.get("optional")):
             columns.append((f"{field_name}.__present", "bool"))
-        columns.append((str(field_name), dtype))
+        fixed_length = receipt.get("fixed_length")
+        if storage == "span" and fixed_length is not None:
+            columns.extend(
+                (str(field_name), dtype)
+                for _ in range(int(fixed_length))
+            )
+        else:
+            columns.append((str(field_name), dtype))
     return tuple(columns)
 
 
@@ -7327,7 +7518,22 @@ def _field_slot_ops(
         )
     for binding_name, record in _graph_sequence_record_abi(graph_obj).items():
         width = len(_record_row_physical_columns(record))
-        for value_id in identity.get(str(binding_name), ()):
+        binding_value_ids = set(map(
+            int, identity.get(str(binding_name), ()),
+        ))
+        # Receiver-field annotations are published under their authored field
+        # name.  A GetAttr does not necessarily enter that spelling in the
+        # lexical identity table, but its attribute role is the exact same
+        # source identity.  Follow that graph edge instead of losing the row
+        # contract merely because the value was reached through ``self``.
+        binding_value_ids.update(
+            int(data.get("value_id", node_id))
+            for node_id, data in graph_obj.nodes(data=True)
+            if node_operation(data) == "getattr"
+            and str((data.get("attributes") or {}).get("attribute"))
+            == str(binding_name)
+        )
+        for value_id in binding_value_ids:
             annotated_row_widths[int(value_id)] = int(width)
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
@@ -7355,7 +7561,17 @@ def _field_slot_ops(
     for binding_name, sequence_record in _graph_sequence_record_abi(
         graph_obj
     ).items():
-        for value_id in identity.get(str(binding_name), ()):
+        binding_value_ids = set(map(
+            int, identity.get(str(binding_name), ()),
+        ))
+        binding_value_ids.update(
+            int(data.get("value_id", node_id))
+            for node_id, data in graph_obj.nodes(data=True)
+            if node_operation(data) == "getattr"
+            and str((data.get("attributes") or {}).get("attribute"))
+            == str(binding_name)
+        )
+        for value_id in binding_value_ids:
             sequence_record_by_value[int(value_id)] = sequence_record
     parameter_record_by_value = {
         int(value_id): record
@@ -7843,11 +8059,26 @@ def _field_slot_ops(
             }:
                 sequence_id = field_sequence_ids[canonical_field(str(attribute))]
                 if int(result_id) == sequence_id:
+                    declared_field = dict(
+                        dict(declared_self_record.get("fields") or {}).get(
+                            canonical_field(str(attribute))
+                        ) or {}
+                    )
+                    sequence_writable = (
+                        bool(declared_field.get("mutable"))
+                        if "mutable" in declared_field
+                        else aggregate_kind not in {"tuple", "bytes"}
+                    )
                     sequence_declarations.append((
                         sequence_id,
                         "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
-                        2 if aggregate_kind == "dict" else 1,
-                        aggregate_kind not in {"tuple", "bytes"},
+                        (
+                            2 if aggregate_kind == "dict" else
+                            max(1, annotated_row_widths.get(
+                                int(sequence_id), 1,
+                            ))
+                        ),
+                        sequence_writable,
                     ))
                 storage_identity = f"{owner}.{canonical_field(str(attribute))}"
                 if storage_identity in retained_storage_identities:
@@ -7888,7 +8119,17 @@ def _field_slot_ops(
                         ),
                         "host_resident": True,
                     }
-            nested_class_identity = source_attributes.get("class_ref")
+            # ``class_ref`` is the constructor spelling retained on a direct
+            # construction.  Call/result specialization can replace that
+            # spelling with ``result_class_ref`` while preserving the same
+            # authored value identity.  Both facts say that the value stored
+            # in this field is the record instance; consulting only the former
+            # degraded a specialized ``Metrics`` write to an untyped scalar
+            # receiver slot.
+            nested_class_identity = (
+                source_attributes.get("result_class_ref")
+                or source_attributes.get("class_ref")
+            )
             if nested_class_identity is not None:
                 nested_record_fields[slot_of[canonical_attribute]] = (
                     str(nested_class_identity), int(source_id)
@@ -7898,9 +8139,19 @@ def _field_slot_ops(
                 or field_aggregate_kinds.get(str(attribute))
             )
             if (
-                aggregate_kind in {"list", "set", "dict", "bytearray"}
+                aggregate_kind in {
+                    "list", "set", "dict", "tuple", "bytearray",
+                }
                 and attribute not in field_aliases
             ):
+                # A tuple assignment replaces an object field with one
+                # indexable resident just as a list assignment does.  Tuple
+                # immutability governs element mutation; it does not turn the
+                # whole value into an opaque reference.  Publishing the write
+                # source as the field's sequence identity lets reads,
+                # iteration and call-frame forwarding derive views of that
+                # same resident instead of materializing an opaque slot beside
+                # a second sequence object.
                 sequence_initializations.append((
                     int(source_id),
                     "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
@@ -14073,9 +14324,20 @@ def _sequence_record_identity_contracts(
     ))
     result: dict[int, str] = {}
     for binding_name, record in records.items():
+        binding_ids = tuple(dict.fromkeys((
+            *map(int, identities.get(str(binding_name), ())),
+            *(
+                int(data.get("value_id", node_id))
+                for node_id, data in graph_obj.nodes(data=True)
+                if str(data.get("op") or data.get("type") or "").casefold()
+                == "getattr"
+                and str((data.get("attributes") or {}).get("attribute"))
+                == str(binding_name)
+            ),
+        )))
         sequence_id = next((
             int(value_id)
-            for value_id in identities.get(str(binding_name), ())
+            for value_id in binding_ids
             if int(value_id) in declared
         ), None)
         if sequence_id is None:
@@ -20304,6 +20566,59 @@ def _class_surface_ssa_program(
                 ))
                 values[value_id] = result
                 return result
+            if operation == "asarray":
+                operand_ids = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) in {"arg:0", "operand", "value"}
+                )
+                if len(operand_ids) != 1:
+                    structural_shortfalls.append((
+                        value_id, operation, "array-source-arity",
+                    ))
+                    return None
+                operand = ensure_structural_value(operand_ids[0])
+                if operand is None:
+                    structural_shortfalls.append((
+                        value_id, operation,
+                        f"array-source:{operand_ids[0]}",
+                    ))
+                    return None
+                tensor = dict(data.get("tensor") or {})
+                target_dtype = str(
+                    tensor.get("dtype") or operand.dtype or "unknown"
+                )
+                target_shape = tuple(
+                    tensor.get("shape") or operand.shape or ()
+                )
+                if (
+                    target_dtype in {"", "unknown", str(operand.dtype)}
+                    and target_shape == tuple(operand.shape or ())
+                ):
+                    # ``numpy.asarray`` is a view when the resident already
+                    # has the requested representation.  Preserve that exact
+                    # storage identity; manufacturing an unproduced call
+                    # result here stranded simple span-return helpers such as
+                    # ``return np.asarray(record.vector, dtype=float)``.
+                    values[value_id] = operand
+                    _publish_concordant_function_aliases(
+                        function,
+                        {value_id: int(operand.id)},
+                        provenance="structural_asarray_identity",
+                    )
+                    return operand
+                result = SSAValue(
+                    value_id, dtype=target_dtype, shape=target_shape,
+                )
+                insertions.append(Instr(
+                    "Cast", [operand], result,
+                    attributes={
+                        "structural_operation": "asarray",
+                        "target_dtype": target_dtype,
+                    },
+                ))
+                values[value_id] = result
+                return result
             if operation in {"int", "float", "bool"}:
                 operands = tuple(
                     int(parent)
@@ -20589,6 +20904,30 @@ def _class_surface_ssa_program(
             for instruction in block.instrs
             for argument in instruction.args
         }
+        deferred_record_ids = {
+            int(deferred[0])
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if (
+                deferred := instruction.attributes.get(
+                    "ssa_deferred_record_row"
+                )
+            ) is not None
+        }
+        deferred_record_member_ids = {
+            int(value_id)
+            for record_id, descriptor in tuple(
+                getattr(all_record_tables.get(symbol), "records", {}).items()
+            )
+            if int(record_id) in deferred_record_ids
+            for field in descriptor.fields
+            for value_id in field.value_ids
+        }
+        used_argument_objects.update(
+            id(argument)
+            for argument in function.args
+            if int(argument.id) in deferred_record_member_ids
+        )
         function.args[:] = [
             argument for argument in function.args
             if not (
@@ -21481,24 +21820,92 @@ def _class_surface_ssa_program(
     # alternative of expanding every schema field at every call boundary.
     # All of this pass's working state is on the identity book, under one
     # scope per invocation: the declared record parameter each value id is
-    # (``record_parameter_value``), the field set each record parameter
-    # needs (``record_field_demand``) and writes (``record_field_write``),
-    # and the exact call edges that forward one parameter into another
-    # (``record_forwarding_edge``).  The declared layouts themselves are the
-    # source graphs' ``parameter_record_abi``.
+    # (``record_parameter_value``), the access roles of each exact declared
+    # field (``record_field_access``), and the exact call edges that forward
+    # one parameter into another (``record_forwarding_edge``).  Keeping read,
+    # write, and structural-layout need on ONE field row matters: splitting
+    # them into parallel parameter-level sets once allowed a transitive write
+    # to reach a caller without making the caller materialize that field.
+    # The declared layouts themselves are the source graphs'
+    # ``parameter_record_abi``.
     from .identity_concordance import mint_scope
 
-    demand_scope = mint_scope("record_field_demand")
-    demand_book = current_identity_book()
-    record_parameter_by_value = demand_book.page(
+    access_scope = mint_scope("record_field_access")
+    access_book = current_identity_book()
+    record_parameter_by_value = access_book.page(
         "record_parameter_value"
-    ).mapping(demand_scope)
-    record_field_demands = demand_book.page(
-        "record_field_demand"
-    ).mapping(demand_scope)
+    ).mapping(access_scope)
+    record_field_access = access_book.page(
+        "record_field_access"
+    ).mapping(access_scope)
+    record_field_access_path = access_book.page(
+        "record_field_access_path"
+    )
+    record_field_sequence_view = access_book.page(
+        "record_field_sequence_view"
+    )
+
+    def declared_field_storage_identity(
+        record: Mapping[str, Any], field_path: str,
+    ) -> str:
+        """Resolve one schema path to its declared storage identity."""
+
+        current = dict(record)
+        parts = str(field_path).split(".")
+        for position, part in enumerate(parts):
+            fields = dict(current.get("fields") or {})
+            field = dict(fields[part])
+            identity = f"{current.get('identity')}.{part}"
+            if position == len(parts) - 1:
+                return identity
+            current = dict(abi_records[str(field["record"])])
+        raise AssertionError("empty declared record field path")
+
+    def note_record_field_access(
+        parameter_key: tuple[str, str],
+        record: Mapping[str, Any],
+        field_path: str,
+        role: str,
+        witness: tuple[Any, ...],
+    ) -> bool:
+        """Publish one exact field-access fact and its provenance path."""
+
+        storage_identity = declared_field_storage_identity(record, field_path)
+        key = (parameter_key, str(field_path), storage_identity)
+        role = str(role)
+        incumbent = frozenset(record_field_access.get(key, frozenset()))
+        if role in incumbent:
+            return False
+        record_field_access[key] = incumbent | {role}
+        record_field_access_path.concord(
+            (access_scope, key, role), tuple(witness),
+        )
+        return True
+
+    def field_access_receipts(
+        parameter_key: tuple[str, str],
+        field_path: str,
+        storage_identity: str,
+    ) -> frozenset[str]:
+        return frozenset(record_field_access.get(
+            (parameter_key, str(field_path), str(storage_identity)),
+            frozenset(),
+        ))
+
+    def sequence_view_receipt(descriptor: Any) -> tuple[Any, ...]:
+        """The identity-independent physical shape of one sequence view."""
+
+        return (
+            tuple(map(str, descriptor.column_dtypes)),
+            len(tuple(descriptor.column_value_ids)),
+            tuple(map(int, descriptor.key_columns)),
+            bool(descriptor.live_flags_value_id is not None),
+            str(descriptor.capacity_policy.value),
+            bool(descriptor.child_table_pool is not None),
+        )
     # A typed sequence row has one complete, fixed physical ABI.  Once a
     # record identity is used as such a row anywhere in this source closure,
-    # demand-minimizing one occurrence of that same exact type to a field
+    # access-minimizing one occurrence of that same exact type to a field
     # subset would make whole-record append impossible after it crosses a call
     # boundary.  Retain the full schema for that identity throughout linking.
     sequence_row_record_identities = {
@@ -21536,21 +21943,11 @@ def _class_surface_ssa_program(
     numeric_record_abi_page = current_identity_book().page(
         "source_numeric_record_abi_concordance"
     )
-    # Which fields a function's OWN body writes locally (a direct SetAttr).
-    # ``record_field_demands`` (reads) is forwarded transitively below via
-    # ``record_forwarding_edges`` so a deep callee's need reaches every
-    # caller; writes need the identical treatment, or a caller several
-    # calls above the actual mutation sees its own post-call read of a
-    # mutable field as an ordinary, never-written value -- materializing a
-    # second, disconnected "input" copy that is permanently stuck at the
-    # field's pre-call snapshot while the real, correctly-threaded mutation
-    # flows through a separate value the caller's own read never resolves
-    # to (observed: ``last_wave_speed``/``last_height_violation``/
-    # ``last_tracer_violation``, each written only inside a deeply nested
-    # callee, stayed at their initial 0.0 in the compiled output).
-    record_field_writes = demand_book.page(
-        "record_field_write"
-    ).mapping(demand_scope)
+    # A function's local reads, writes, and structural-layout requirements
+    # are roles of the same exact field.  They are forwarded transitively
+    # below via ``record_forwarding_edges``.  In particular, a write several
+    # calls deep must make every forwarding caller own the same in/out slot;
+    # otherwise the mutation lands in private callee storage.
     for source_symbol, source_graph in source_graphs_by_symbol.items():
         identities = source_graph.graph.get("identity_table") or {}
         declared = dict(
@@ -21558,14 +21955,12 @@ def _class_surface_ssa_program(
         )
         for parameter_name, record in declared.items():
             key = (str(source_symbol), str(parameter_name))
-            record_field_demands.setdefault(key, frozenset())
-            record_field_writes.setdefault(key, frozenset())
             parameter_ids = set(map(
                 int, identities.get(str(parameter_name), ())
             ))
             for value_id in parameter_ids:
-                demand_book.page("record_parameter_value").concord(
-                    (demand_scope, (str(source_symbol), int(value_id))), key,
+                access_book.page("record_parameter_value").concord(
+                    (access_scope, (str(source_symbol), int(value_id))), key,
                 )
             declared_fields = set(map(
                 str, dict(record.get("fields") or {})
@@ -21576,7 +21971,11 @@ def _class_surface_ssa_program(
                 or record_identity.rsplit(".", 1)[-1] == row_identity
                 for row_identity in sequence_row_record_identities
             ):
-                record_field_demands[key] |= frozenset(declared_fields)
+                for field_name in sorted(declared_fields):
+                    note_record_field_access(
+                        key, record, field_name, "layout",
+                        (("sequence-row-layout", record_identity),),
+                    )
             if any(
                 row[0] == record_identity
                 for row in numeric_record_abi_page.rows()
@@ -21598,11 +21997,14 @@ def _class_surface_ssa_program(
                                 f"{path}.",
                                 dict(abi_records[str(field.get("record"))]),
                             ))
-                record_field_demands[key] |= frozenset(
-                    current_identity_book().page(
-                        "record_field_demand_concordance"
-                    ).concord(key, tuple(sorted(leaf_paths)))
-                )
+                demanded_leaf_paths = current_identity_book().page(
+                    "record_field_demand_concordance"
+                ).concord(key, tuple(sorted(leaf_paths)))
+                for field_path in demanded_leaf_paths:
+                    note_record_field_access(
+                        key, record, str(field_path), "layout",
+                        (("numeric-record-layout", record_identity),),
+                    )
             direct_field_by_value: dict[int, str] = {}
             for node_id, data in source_graph.nodes(data=True):
                 operation = str(
@@ -21617,7 +22019,10 @@ def _class_surface_ssa_program(
                         owner_id in parameter_ids
                         and attribute in declared_fields
                     ):
-                        record_field_demands[key] |= {attribute}
+                        note_record_field_access(
+                            key, record, attribute, "read",
+                            (("source-node", str(source_symbol), int(node_id)),),
+                        )
                         direct_field_by_value[result_id] = attribute
                     continue
                 if operation != "setattr":
@@ -21633,7 +22038,10 @@ def _class_surface_ssa_program(
                     for parent, role in data.get("parents") or ()
                 ):
                     continue
-                record_field_writes[key] |= {attribute}
+                note_record_field_access(
+                    key, record, attribute, "write",
+                    (("source-node", str(source_symbol), int(node_id)),),
+                )
             # Subscript assignment mutates the field's resident span through
             # IndexedStore; it does not need (and therefore does not create) a
             # SetAttr node.  Follow the same graph-owned storage aliases used
@@ -21654,7 +22062,10 @@ def _class_surface_ssa_program(
                     resolve_indexed_storage(int(value_id))
                 )
                 if attribute is not None:
-                    record_field_writes[key] |= {attribute}
+                    note_record_field_access(
+                        key, record, attribute, "write",
+                        (("indexed-storage", str(source_symbol), int(value_id)),),
+                    )
 
     def declared_record_parameter(key: tuple[str, str]) -> Mapping[str, Any]:
         """The declared ``parameter_record_abi`` layout one key names."""
@@ -21664,6 +22075,66 @@ def _class_surface_ssa_program(
             source_graphs_by_symbol[symbol].graph.get("parameter_record_abi")
             or {}
         )[parameter_name]
+
+    # A sequence descriptor is an indexed view of one declared field, not a
+    # second object.  Seed that stronger representation from every local view
+    # already proven by source lowering.  The exact storage identity is the
+    # cross-function key; numeric sequence ids remain frame-local.
+    local_sequence_views: dict[str, list[tuple[Any, ...]]] = {}
+    for source_symbol, table in all_record_tables.items():
+        sequence_table = all_sequence_tables.get(str(source_symbol))
+        if sequence_table is None:
+            continue
+        for record_id, descriptor in tuple(table.records.items()):
+            parameter_key = record_parameter_by_value.get((
+                str(source_symbol), int(record_id),
+            ))
+            if parameter_key is None:
+                continue
+            declared_record = declared_record_parameter(parameter_key)
+            for field in descriptor.fields:
+                if field.sequence_id is None:
+                    continue
+                sequence = sequence_table.by_id(int(field.sequence_id))
+                if sequence is None:
+                    continue
+                storage_identity = str(field.storage_identity)
+                local_sequence_views.setdefault(
+                    storage_identity, []
+                ).append(sequence_view_receipt(sequence))
+                note_record_field_access(
+                    parameter_key,
+                    declared_record,
+                    str(field.name),
+                    "sequence",
+                    ((
+                        "local-sequence-view", str(source_symbol),
+                        int(record_id), int(field.sequence_id),
+                    ),),
+                )
+    for storage_identity, receipts in local_sequence_views.items():
+        candidates = tuple(dict.fromkeys(receipts))
+        # ``reference`` fields initially expose one unknown placeholder
+        # column.  A complete authored Sequence[Record] annotation is stronger
+        # evidence for that SAME storage identity, so select it before the
+        # concordance is committed.  Multiple non-placeholder layouts remain
+        # a hard disagreement.
+        materialized = tuple(
+            receipt for receipt in candidates
+            if not (
+                receipt[0] == ("unknown",)
+                and receipt[1] == 1
+            )
+        )
+        decisive = materialized or candidates
+        if len(decisive) != 1:
+            raise ValueError(
+                "record field sequence view disagreement for "
+                f"{storage_identity!r}: {decisive!r}"
+            )
+        record_field_sequence_view.concord(
+            (access_scope, storage_identity), decisive[0],
+        )
 
     def planned_callee_symbol(
         planned_call: Any, caller_graph: Any, caller_shell: Any,
@@ -21690,9 +22161,9 @@ def _class_surface_ssa_program(
             else function_symbols.get(int(reference))
         )
 
-    record_forwarding_edges = demand_book.page(
+    record_forwarding_edges = access_book.page(
         "record_forwarding_edge"
-    ).mapping(demand_scope)
+    ).mapping(access_scope)
     for caller_symbol, planned_call, caller_graph, _module, caller_shell in (
         pending_call_records
     ):
@@ -21724,21 +22195,72 @@ def _class_surface_ssa_program(
     while changed:
         changed = False
         for caller_key, callee_key in tuple(record_forwarding_edges):
-            missing = (
-                record_field_demands[callee_key]
-                - record_field_demands[caller_key]
-            )
-            if missing:
-                record_field_demands[caller_key] |= missing
-                changed = True
-            missing_writes = (
-                record_field_writes.get(callee_key, frozenset())
-                - record_field_writes.get(caller_key, frozenset())
-            )
-            if missing_writes:
-                record_field_writes[caller_key] = (
-                    record_field_writes.get(caller_key, frozenset())
-                    | missing_writes
+            callsites = tuple(record_forwarding_edges[
+                (caller_key, callee_key)
+            ])
+            for access_key, receipts in tuple(record_field_access.items()):
+                parameter_key, field_path, storage_identity = access_key
+                if parameter_key != callee_key:
+                    continue
+                caller_access_key = (
+                    caller_key, field_path, storage_identity,
+                )
+                incumbent = frozenset(record_field_access.get(
+                    caller_access_key, frozenset(),
+                ))
+                propagated = frozenset(map(str, receipts))
+                if propagated - incumbent:
+                    record_field_access[caller_access_key] = (
+                        incumbent | propagated
+                    )
+                    for role in sorted(propagated - incumbent):
+                        callee_path = record_field_access_path.latest(
+                            (access_scope, access_key, role), ()
+                        )
+                        record_field_access_path.concord(
+                            (access_scope, caller_access_key, role),
+                            (
+                                (
+                                    "callsite", str(caller_key[0]),
+                                    int(callsites[0]), str(callee_key[0]),
+                                ),
+                                *tuple(callee_path),
+                            ),
+                        )
+                    changed = True
+
+            # Representation demand is symmetric across a forwarding edge.
+            # A callee write and a caller indexed read are views of the same
+            # record field, so either side's proven sequence view requires the
+            # other side to expose that same physical member surface.  Access
+            # effects themselves remain directional above.
+            for access_key, receipts in tuple(record_field_access.items()):
+                parameter_key, field_path, storage_identity = access_key
+                if parameter_key != caller_key or "sequence" not in receipts:
+                    continue
+                callee_access_key = (
+                    callee_key, field_path, storage_identity,
+                )
+                incumbent = frozenset(record_field_access.get(
+                    callee_access_key, frozenset(),
+                ))
+                if "sequence" in incumbent:
+                    continue
+                record_field_access[callee_access_key] = (
+                    incumbent | {"sequence"}
+                )
+                caller_path = record_field_access_path.latest(
+                    (access_scope, access_key, "sequence"), ()
+                )
+                record_field_access_path.concord(
+                    (access_scope, callee_access_key, "sequence"),
+                    (
+                        (
+                            "callsite-sequence-view", str(caller_key[0]),
+                            int(callsites[0]), str(callee_key[0]),
+                        ),
+                        *tuple(caller_path),
+                    ),
                 )
                 changed = True
 
@@ -22077,16 +22599,22 @@ def _class_surface_ssa_program(
                     owner_ids, str(nested_name)
                 )
                 nested_path = f"{field_path}.{nested_name}"
+                nested_storage_identity = (
+                    f"{schema_identity}.{nested_name}"
+                )
+                access_receipts = field_access_receipts(
+                    (str(symbol), str(parameter_name)),
+                    nested_path,
+                    nested_storage_identity,
+                )
                 if not candidates:
-                    if nested_path not in record_field_demands.get(
-                        (str(symbol), str(parameter_name)), set()
-                    ):
+                    if not access_receipts:
                         continue
                     current_identity_book().page(
                         "numeral_leaf_materialization_concordance"
                     ).concord(
                         (str(symbol), str(parameter_name), nested_path),
-                        "demanded_unread_leaf",
+                        "required_unread_leaf",
                     )
                     candidates = (GLOBAL_MONOTONIC_IDS.mint(),)
                 nested_storage = str(nested_field.get("storage") or "")
@@ -22831,9 +23359,7 @@ def _class_surface_ssa_program(
                 ))
 
         for parameter_name, record in declared_records.items():
-            demanded_fields = record_field_demands.get(
-                (str(symbol), str(parameter_name)), set()
-            )
+            parameter_key = (str(symbol), str(parameter_name))
             parameter_ids = set(map(
                 int, identities.get(str(parameter_name), ())
             ))
@@ -22844,20 +23370,14 @@ def _class_surface_ssa_program(
                 if int(value.id) in parameter_ids
             ), min(parameter_ids))
             written_fields = {
-                str((data.get("attributes") or {}).get("attribute"))
-                for _node_id, data in graph.nodes(data=True)
-                if str(data.get("type") or data.get("op") or "").casefold()
-                == "setattr"
-                and (data.get("attributes") or {}).get("attribute")
-                is not None
-                and any(
-                    int(parent) in parameter_ids
-                    and str(role) in {"value", "object", "base", "receiver"}
-                    for parent, role in data.get("parents") or ()
+                str(field_name)
+                for field_name in dict(record.get("fields") or {})
+                if "write" in field_access_receipts(
+                    parameter_key,
+                    str(field_name),
+                    f"{record['identity']}.{field_name}",
                 )
-            } | record_field_writes.get(
-                (str(symbol), str(parameter_name)), set()
-            )
+            }
             write_source_ids_by_field: dict[str, tuple[int, ...]] = {}
             for _node_id, data in graph.nodes(data=True):
                 if (
@@ -22891,6 +23411,10 @@ def _class_surface_ssa_program(
             for field_name, field in dict(record.get("fields") or {}).items():
                 storage = str(field.get("storage") or "")
                 mutable = bool(field.get("mutable", False))
+                storage_identity = f"{record['identity']}.{field_name}"
+                access_receipts = field_access_receipts(
+                    parameter_key, str(field_name), storage_identity,
+                )
                 candidate_ids = tuple(dict.fromkeys(
                     resolve_record_storage(value_id) for value_id in (
                     *(
@@ -22916,9 +23440,188 @@ def _class_surface_ssa_program(
                     ),
                 )))
                 if not candidate_ids:
-                    if str(field_name) not in demanded_fields:
+                    if not access_receipts:
                         continue
                     candidate_ids = (GLOBAL_MONOTONIC_IDS.mint(),)
+                if (
+                    "sequence" in access_receipts
+                    and storage not in {"keyed", "table", "record"}
+                ):
+                    view = record_field_sequence_view.latest((
+                        access_scope, storage_identity,
+                    ))
+                    if view is None:
+                        raise ValueError(
+                            f"{symbol}: field {storage_identity!r} requires "
+                            "a sequence view but has no structural receipt"
+                        )
+                    (
+                        column_dtypes, column_count, key_columns,
+                        retains_deleted_rows, capacity_policy,
+                        has_child_table,
+                    ) = view
+                    if has_child_table:
+                        raise ValueError(
+                            f"{symbol}: field {storage_identity!r} requires "
+                            "a child-table sequence view whose exact pool "
+                            "descriptor is not present in this frame"
+                        )
+                    sequence_table = all_sequence_tables.setdefault(
+                        symbol, SSASequenceTable(owner=symbol)
+                    )
+                    sequence_id = next((
+                        int(value_id)
+                        for value_id in candidate_ids
+                        if sequence_table.by_id(int(value_id)) is not None
+                    ), int(candidate_ids[0]))
+                    sequence = sequence_table.by_id(sequence_id)
+                    column_count = int(column_count)
+                    dtypes = tuple(map(str, column_dtypes))
+                    if not dtypes:
+                        dtypes = ("unknown",) * column_count
+                    # A reference field first encountered as an untyped list
+                    # has one provisional arena.  Once the concordance has an
+                    # authored Sequence[Record] view, that is not a second
+                    # object: it is the exact indexed view of the same field.
+                    # Refine only that deliberately weak placeholder, keeping
+                    # its sequence/first-column and extent identities while
+                    # adding the newly proven physical columns.
+                    provisional_sequence = (
+                        sequence is not None
+                        and len(sequence.column_value_ids) == 1
+                        and tuple(sequence.column_dtypes or ("unknown",))
+                        == ("unknown",)
+                        and not sequence.key_columns
+                        and sequence.child_table_pool is None
+                    )
+                    if provisional_sequence and column_count > 1:
+                        column_ids = (
+                            int(sequence.column_value_ids[0]),
+                            *(
+                                GLOBAL_MONOTONIC_IDS.mint()
+                                for _ in range(column_count - 1)
+                            ),
+                        )
+                        live_flags_id = sequence.live_flags_value_id
+                        if retains_deleted_rows and live_flags_id is None:
+                            live_flags_id = GLOBAL_MONOTONIC_IDS.mint()
+                        status_id = sequence.status_address_id
+                        if mutable and status_id is None:
+                            status_id = GLOBAL_MONOTONIC_IDS.mint()
+                        sequence = SSASequenceDescriptor(
+                            sequence_id=int(sequence.sequence_id),
+                            column_value_ids=tuple(map(int, column_ids)),
+                            length_address_id=int(sequence.length_address_id),
+                            capacity_value_id=int(sequence.capacity_value_id),
+                            status_address_id=(
+                                None if status_id is None else int(status_id)
+                            ),
+                            column_dtypes=dtypes,
+                            key_columns=tuple(map(int, key_columns)),
+                            live_flags_value_id=(
+                                None if live_flags_id is None
+                                else int(live_flags_id)
+                            ),
+                            capacity_policy=str(capacity_policy),
+                            writable=bool(mutable),
+                        )
+                        # Direct revision is intentional: register() rejects
+                        # descriptor disagreement, whereas this transition is
+                        # the concordance-authorized completion of a single
+                        # provisional descriptor. _BookRows updates all
+                        # sequence-member claims for the replacement.
+                        sequence_table.sequences[int(sequence_id)] = sequence
+                    if sequence is None:
+                        column_ids = (
+                            sequence_id,
+                            *(
+                                GLOBAL_MONOTONIC_IDS.mint()
+                                for _ in range(max(0, column_count - 1))
+                            ),
+                        )
+                        length_id = GLOBAL_MONOTONIC_IDS.mint()
+                        capacity_id = GLOBAL_MONOTONIC_IDS.mint()
+                        status_id = (
+                            GLOBAL_MONOTONIC_IDS.mint() if mutable else None
+                        )
+                        live_flags_id = (
+                            GLOBAL_MONOTONIC_IDS.mint()
+                            if retains_deleted_rows else None
+                        )
+                        members = (
+                            tuple(zip(column_ids, dtypes))
+                            + (
+                                (length_id, "int64"),
+                                (capacity_id, "int64"),
+                            )
+                            + (
+                                ((status_id, "int"),)
+                                if status_id is not None else ()
+                            )
+                            + (
+                                ((live_flags_id, "bool"),)
+                                if live_flags_id is not None else ()
+                            )
+                        )
+                        for member_id, member_dtype in members:
+                            value = values.get(int(member_id))
+                            if value is None:
+                                value = SSAValue(
+                                    int(member_id), dtype=str(member_dtype)
+                                )
+                                function.args.append(value)
+                                values[int(member_id)] = value
+                            value.accounting = {
+                                **dict(value.accounting or {}),
+                                "program_abi_record": str(record["identity"]),
+                                "program_abi_parameter": str(parameter_name),
+                                "program_abi_field": str(field_name),
+                                "program_abi_storage": "sequence",
+                                "program_abi_mutable": mutable,
+                                "record_field_sequence_view": True,
+                            }
+                        sequence = sequence_table.register(
+                            SSASequenceDescriptor(
+                                sequence_id=sequence_id,
+                                column_value_ids=tuple(map(int, column_ids)),
+                                length_address_id=int(length_id),
+                                capacity_value_id=int(capacity_id),
+                                status_address_id=(
+                                    None if status_id is None
+                                    else int(status_id)
+                                ),
+                                column_dtypes=dtypes,
+                                key_columns=tuple(map(int, key_columns)),
+                                live_flags_value_id=(
+                                    None if live_flags_id is None
+                                    else int(live_flags_id)
+                                ),
+                                capacity_policy=str(capacity_policy),
+                                writable=mutable,
+                            )
+                        )
+                    physical_members = tuple(dict.fromkeys((
+                        *map(int, sequence.column_value_ids),
+                        int(sequence.length_address_id),
+                        int(sequence.capacity_value_id),
+                        *(
+                            (int(sequence.status_address_id),)
+                            if sequence.status_address_id is not None else ()
+                        ),
+                        *(
+                            (int(sequence.live_flags_value_id),)
+                            if sequence.live_flags_value_id is not None else ()
+                        ),
+                    )))
+                    fields.append(SSARecordFieldDescriptor(
+                        str(field_name),
+                        SSARecordFieldStorage.SEQUENCE,
+                        storage_identity=storage_identity,
+                        value_ids=physical_members,
+                        sequence_id=int(sequence.sequence_id),
+                        writable=mutable,
+                    ))
+                    continue
                 if storage == "keyed":
                     key_encoding = str(
                         field.get("key_encoding") or "string_token"
@@ -22940,6 +23643,40 @@ def _class_surface_ssa_program(
                             ),
                         }),
                     }
+
+                    def publish_keyed_decomposition(
+                        part_ids: Mapping[str, int],
+                    ) -> None:
+                        """Record this declared field's exact physical view."""
+
+                        keys_id = int(part_ids["keys"])
+                        values_id = int(part_ids.get("values", keys_id))
+                        length_id = int(part_ids["length"])
+                        # A caller-supplied keyed mapping is exactly full.  Its
+                        # local sequence view therefore shares length and
+                        # capacity; status remains private to that view.
+                        roles = (
+                            (("handle",), keys_id),
+                            (("column", 0), keys_id),
+                            # A key-as-value mapping still has two logical
+                            # item columns.  Their physical identities alias;
+                            # the decomposition must say so explicitly rather
+                            # than making the second role look absent/private.
+                            (("column", 1), values_id),
+                            (("length_address_id",), length_id),
+                            (("capacity_value_id",), length_id),
+                        )
+                        current_identity_book().page(
+                            "record_field_decomposition"
+                        ).concord(
+                            (
+                                table.owner,
+                                int(record_id),
+                                f"{record['identity']}.{field_name}",
+                            ),
+                            roles,
+                        )
+
                     # Materialize once per function. A second pass over the
                     # same symbol sees different attribute occurrences, so
                     # re-running would append a second set of slots and leave
@@ -22999,6 +23736,7 @@ def _class_surface_ssa_program(
                                 dtype=part_dtype,
                                 writable=bool(mutable),
                             ))
+                        publish_keyed_decomposition(existing_parts)
                         continue
                     # A mapping keyed by words is not one opaque handle. It is
                     # a length plus two parallel vectors: the keys as the
@@ -23053,6 +23791,7 @@ def _class_surface_ssa_program(
                         ))
                     if value_identity == "key":
                         part_ids["values"] = part_ids["keys"]
+                    publish_keyed_decomposition(part_ids)
                     for value_id in candidate_ids:
                         mapping = values.get(int(value_id))
                         if mapping is None:
@@ -23660,6 +24399,15 @@ def _class_surface_ssa_program(
         constants = []
         table = all_record_tables.setdefault(symbol, SSARecordTable(owner=symbol))
         layouts = []
+        source_nodes_by_value_id = {
+            int(data.get("value_id", node_id)): data
+            for node_id, data in graph.nodes(data=True)
+        }
+
+        def source_value_id(node_id: int) -> int:
+            data = graph.nodes.get(int(node_id), {})
+            return int(data.get("value_id", node_id))
+
         for node_id, data in graph.nodes(data=True):
             matched = abi_record_for_call(data)
             if matched is None:
@@ -23672,7 +24420,7 @@ def _class_surface_ssa_program(
                 dict(record.get("fields") or {}).items()
             )
             keyword_values = {
-                str(role).split(":", 1)[1]: int(parent)
+                str(role).split(":", 1)[1]: source_value_id(int(parent))
                 for parent, role in data.get("parents") or ()
                 if str(role).startswith("kw:")
             }
@@ -23682,7 +24430,7 @@ def _class_surface_ssa_program(
             # taking the set's order would bind field N to whichever
             # argument iteration happened to reach first.
             positional_values = [
-                int(parent)
+                source_value_id(int(parent))
                 for parent in ordered_arguments(data.get("parents") or ())
             ]
             fields = []
@@ -23743,7 +24491,7 @@ def _class_surface_ssa_program(
                     values[value_id] = value
                 source = (
                     {} if value_id is None
-                    else graph.nodes.get(int(value_id), {})
+                    else source_nodes_by_value_id.get(int(value_id), {})
                 )
                 source_attributes = dict(source.get("attributes") or {})
                 physical_value_ids = (
@@ -23769,7 +24517,9 @@ def _class_surface_ssa_program(
                 for physical_value_id in physical_value_ids:
                     if int(physical_value_id) in values:
                         continue
-                    source = graph.nodes.get(int(physical_value_id), {})
+                    source = source_nodes_by_value_id.get(
+                        int(physical_value_id), {}
+                    )
                     source_attributes = dict(source.get("attributes") or {})
                     if str(
                         source.get("type") or source.get("op") or ""
@@ -23804,16 +24554,64 @@ def _class_surface_ssa_program(
                     value = values[int(physical_value_id)]
                     if value.dtype in {None, "unknown"} and dtype is not None:
                         value.dtype = str(dtype)
-                    source_node = graph.nodes.get(int(physical_value_id), {})
+                    value.accounting = {
+                        **dict(value.accounting or {}),
+                        "program_abi_record": str(record["identity"]),
+                        "program_abi_field": str(field_name),
+                        "program_abi_storage": str(field.get("storage") or ""),
+                        "program_abi_rank": int(field.get("rank", 0)),
+                        "program_abi_mutable": bool(
+                            field.get("mutable", False)
+                        ),
+                        "record_constructor_value": int(record_id),
+                    }
+                    source_node = source_nodes_by_value_id.get(
+                        int(physical_value_id), {}
+                    )
                     source_attrs = source_node.get("attributes") or {}
-                    if (source_node.get("type") == "Input"
-                            and source_attrs.get("binding_kind") == "parameter"
-                            and any(value is argument for argument in function.args)):
+                    if (
+                        str(
+                            source_node.get("type")
+                            or source_node.get("op")
+                            or ""
+                        ).casefold() == "input"
+                        and source_attrs.get("binding_kind") == "parameter"
+                    ):
                         # A parameter used only by a record constructor has no
-                        # numerical-region use. Its late materialization still
-                        # has the exact authored input identity and ABI name.
+                        # numerical-region use, so local numerical lowering may
+                        # never have put it on the function signature.  The
+                        # constructor field is nevertheless a real use. Retain
+                        # that exact source Input as a formal and name it from
+                        # the authored binding; later frame pruning then sees
+                        # the same public identity as every ordinary parameter.
                         parameter_name = str(source_attrs.get("binding_name") or "")
                         names = tuple(function.metadata.get("parameter_names", ()))
+                        retained_id = _retained_parameter_identity(
+                            parameter_name,
+                            (graph.graph.get("identity_table") or {}).get(
+                                parameter_name, ()
+                            ),
+                            names,
+                        )
+                        retained_value = next((
+                            argument for argument in function.args
+                            if retained_id is not None
+                            and int(argument.id) == int(retained_id)
+                        ), None)
+                        if retained_value is not None:
+                            physical_value_ids = tuple(
+                                int(retained_value.id)
+                                if int(physical_id) == int(value.id)
+                                else int(physical_id)
+                                for physical_id in physical_value_ids
+                            )
+                            values[int(retained_value.id)] = retained_value
+                            value = retained_value
+                        elif not any(
+                            int(argument.id) == int(value.id)
+                            for argument in function.args
+                        ):
+                            function.args.append(value)
                         if parameter_name and not any(
                             name == parameter_name or int(named_id) == int(value.id)
                             for name, named_id in names
@@ -25103,6 +25901,64 @@ def _class_surface_ssa_program(
                 # them later.  Stamp the owner now, while the source graph is
                 # at hand; the storage is bound after call-frame linking.
                 instruction.attributes["keyed_lookup_owner"] = str(owner)
+
+        # Local loop lowering initially owns an anonymous sequence descriptor
+        # because ProgramABI record parts do not exist yet.  Now that keyed
+        # materialization has published the exact decomposition, advance that
+        # descriptor to the resident part identities too.  This is the graph
+        # view of the same transition consumed by call linking: the sequence
+        # is derived from the record parts, not a parallel storage object.
+        record_table = all_record_tables.get(symbol)
+        sequence_table = all_sequence_tables.get(symbol)
+        decomposition_page = current_identity_book().page(
+            "record_field_decomposition"
+        )
+        if record_table is not None and sequence_table is not None:
+            for record_id, descriptor in tuple(record_table.records.items()):
+                revised_fields = []
+                changed_descriptor = False
+                for record_field in descriptor.fields:
+                    old_sequence_id = record_field.sequence_id
+                    decomposition = (
+                        None if old_sequence_id is None
+                        else decomposition_page.latest((
+                            record_table.owner,
+                            int(record_id),
+                            str(record_field.storage_identity),
+                        ))
+                    )
+                    old_sequence = (
+                        None if old_sequence_id is None
+                        else sequence_table.by_id(int(old_sequence_id))
+                    )
+                    if decomposition is None or old_sequence is None:
+                        revised_fields.append(record_field)
+                        continue
+                    roles = dict(decomposition)
+                    columns = tuple(
+                        int(roles[("column", position)])
+                        for position in range(len(old_sequence.column_value_ids))
+                    )
+                    resident_sequence = replace(
+                        old_sequence,
+                        sequence_id=int(roles[("handle",)]),
+                        column_value_ids=columns,
+                        length_address_id=int(roles[("length_address_id",)]),
+                        capacity_value_id=int(roles[("capacity_value_id",)]),
+                    )
+                    if int(old_sequence_id) != int(resident_sequence.sequence_id):
+                        del sequence_table.sequences[int(old_sequence_id)]
+                    sequence_table.register(resident_sequence)
+                    revised_fields.append(replace(
+                        record_field,
+                        value_ids=(),
+                        sequence_id=int(resident_sequence.sequence_id),
+                    ))
+                    changed_descriptor = True
+                if changed_descriptor:
+                    record_table.records[int(record_id)] = replace(
+                        descriptor, fields=tuple(revised_fields),
+                    )
         if not replacements:
             return
 
@@ -25290,6 +26146,39 @@ def _class_surface_ssa_program(
             )
             if accounting.get(key) is not None
         )
+        # Deferred Sequence[Record] insertion still carries one semantic
+        # record operand at this phase.  Its descriptor is the exact pending
+        # physical use of every member; count those members as consumed before
+        # deciding that a same-numbered formal is merely a dead conceptual
+        # record handle.  The record identity set is derived from authored row
+        # annotations and deferred-row receipts above, never from field names.
+        if record_table is not None:
+            consumed_record_ids = (
+                set(map(int, record_table.records)) & consumed_ids
+            )
+            consumed_ids.update(
+                int(value_id)
+                for record_id, descriptor in record_table.records.items()
+                if int(record_id) in consumed_record_ids
+                for field in descriptor.fields
+                for value_id in field.value_ids
+            )
+            deferred_record_ids = {
+                int(deferred[0])
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                for deferred in (
+                    instruction.attributes.get("ssa_deferred_record_row"),
+                )
+                if deferred is not None
+            }
+            consumed_ids.update(
+                int(value_id)
+                for record_id, descriptor in record_table.records.items()
+                if int(record_id) in deferred_record_ids
+                for field in descriptor.fields
+                for value_id in field.value_ids
+            )
         function.args = [
             argument for argument in function.args
             if not _is_dead_conceptual_record_argument(
@@ -28113,6 +29002,14 @@ def _class_surface_ssa_program(
             )
             if argument_id in consumed and not defines_unaccounted_formal:
                 continue
+            # A deferred record-row insertion is a real pending use even
+            # before its semantic record operand is expanded into physical
+            # append arguments.  Its descriptor is the durable liveness
+            # receipt.  Do not erase such a formal merely because every
+            # current incoming edge happens to carry a literal; expansion
+            # still needs the value (and may later specialize it normally).
+            if argument_id in record_storage and not defines_unaccounted_formal:
+                continue
             if defines_unaccounted_formal:
                 removable.add(argument_id)
                 continue
@@ -29591,7 +30488,13 @@ def _class_surface_ssa_program(
                     linked_sequence_members: set[int] = set()
                     reconciled_bindings = []
                     for callee_id, kind, source in refreshed_frame_bindings:
-                        existing = values.get(int(source)) if str(kind) == "caller_storage" else None
+                        materializing_kinds = {
+                            "caller_value", "caller_alias", "caller_storage",
+                        }
+                        existing = (
+                            values.get(int(source))
+                            if str(kind) in materializing_kinds else None
+                        )
                         existing_accounting = {} if existing is None else (existing.accounting or {})
                         explicitly_split = any(existing_accounting.get(key) is not None for key in
                                                ("split_from_unproven_alias", "split_from_result_storage"))
@@ -29605,7 +30508,19 @@ def _class_surface_ssa_program(
                                 {int(value.id) for value in caller.args},
                                 linked_sequence_members,
                             )
-                            if str(kind) == "caller_storage" and not explicitly_split
+                            # These labels describe how the incumbent source
+                            # was first obtained, not whether the callee
+                            # formal is a record member.  A field formal can
+                            # initially inherit an authored caller-value or
+                            # alias binding before record ABI materialization
+                            # gives that same numeric formal id its exact
+                            # field identity.  Reconcile every materializing
+                            # label through the record concordance; otherwise
+                            # the stale source is later paired positionally
+                            # with an unrelated field (Woodshop bound
+                            # ``last_metrics`` to ``restitution`` this way).
+                            if str(kind) in materializing_kinds
+                            and not explicitly_split
                             else None
                         )
                         if linked_member is not None and int(linked_member) != int(source):
@@ -31201,6 +32116,9 @@ def _class_surface_ssa_program(
                 returns_void = (
                     not record.result_bindings and not callee_outputs
                 )
+                discards_result = (
+                    not record.result_bindings and bool(callee_outputs)
+                )
                 native_result_contract = tuple(
                     (int(output.id), str(output.dtype), tuple(output.shape or ()))
                     for output in callee_outputs
@@ -31215,7 +32133,7 @@ def _class_surface_ssa_program(
                         f"physical_result_bindings={tuple(physical_result_bindings)} "
                         f"returns_value={returns_value} bound_aggregate={returns_bound_aggregate} "
                         f"aggregate={returns_aggregate} structural={returns_structural_record} "
-                        f"void={returns_void}",
+                        f"void={returns_void} discarded={discards_result}",
                         file=sys.stderr, flush=True,
                     )
                 previous_native_call = next((
@@ -31240,6 +32158,7 @@ def _class_surface_ssa_program(
                         or returns_bound_aggregate
                         or returns_aggregate
                         or returns_void
+                        or discards_result
                         or returns_structural_record
                     )
                     and record.decomposition != "requires_loop_instance_pool"
@@ -31266,6 +32185,7 @@ def _class_surface_ssa_program(
                         or returns_bound_aggregate
                         or returns_aggregate
                         or returns_void
+                        or discards_result
                         or returns_structural_record
                     ) else None,
                     "loop_instance_pool_required" if (
@@ -31651,6 +32571,46 @@ def _class_surface_ssa_program(
                                 int(source)
                             )
                             value = scheduled_source(int(argument.id))
+                            if value is not None:
+                                formal_accounting = dict(
+                                    argument.accounting or {}
+                                )
+                                scheduled_accounting = dict(
+                                    value.accounting or {}
+                                )
+                                formal_field_identity = (
+                                    formal_accounting.get(
+                                        "program_abi_record"
+                                    ),
+                                    formal_accounting.get(
+                                        "program_abi_field"
+                                    ),
+                                )
+                                scheduled_field_identity = (
+                                    scheduled_accounting.get(
+                                        "program_abi_record"
+                                    ),
+                                    scheduled_accounting.get(
+                                        "program_abi_field"
+                                    ),
+                                )
+                                if (
+                                    formal_field_identity[1] is not None
+                                    and scheduled_field_identity
+                                    != formal_field_identity
+                                ):
+                                    # The marker was cut before record ABI
+                                    # materialization finalized this formal's
+                                    # field identity.  It remains the exact
+                                    # lexical occurrence only when it is a
+                                    # current view of the SAME declared field;
+                                    # an occurrence of another field is stale
+                                    # even if an earlier numeric-id binding
+                                    # associated it with this formal.  Fall
+                                    # through to the concorded physical source
+                                    # instead of letting positional history
+                                    # override record identity.
+                                    value = None
                             source_node_id = (
                                 physical_source
                                 if caller_graph is not None
@@ -33134,9 +34094,34 @@ def _class_surface_ssa_program(
     for function_name, function in tuple(all_functions.items()):
         record_table = all_record_tables.get(function_name)
         current_values = function_values(function)
+        caller_graph = source_graphs_by_symbol.get(function_name)
         record_identity_aliases = _concordant_function_aliases(
             function, include_output_identities=True,
         )
+        retained_parameters_by_name: dict[str, set[int]] = {}
+        for parameter_name, value_id in function.metadata.get(
+            "parameter_names", ()
+        ):
+            if int(value_id) in current_values:
+                retained_parameters_by_name.setdefault(
+                    str(parameter_name), set()
+                ).add(int(value_id))
+        historical_parameter_names: dict[int, set[str]] = {}
+        if caller_graph is not None:
+            authored_parameters = set(map(
+                str,
+                caller_graph.graph.get("function_parameters", ())
+                or function.metadata.get("authored_parameters", ()),
+            ))
+            for parameter_name, history in dict(
+                caller_graph.graph.get("identity_table") or {}
+            ).items():
+                if str(parameter_name) not in authored_parameters:
+                    continue
+                for value_id in history:
+                    historical_parameter_names.setdefault(
+                        int(value_id), set()
+                    ).add(str(parameter_name))
 
         def resident_record_id(value_id: int) -> int:
             current = int(value_id)
@@ -33144,6 +34129,18 @@ def _class_surface_ssa_program(
             while current in record_identity_aliases and current not in seen:
                 seen.add(current)
                 current = int(record_identity_aliases[current])
+            if current not in current_values:
+                candidates = {
+                    int(retained_id)
+                    for parameter_name in historical_parameter_names.get(
+                        int(value_id), ()
+                    )
+                    for retained_id in retained_parameters_by_name.get(
+                        str(parameter_name), ()
+                    )
+                }
+                if len(candidates) == 1:
+                    current = next(iter(candidates))
             return current
 
         exact_output_values = {
@@ -33168,7 +34165,7 @@ def _class_surface_ssa_program(
         }
         unresolved_rows = []
         for block in function.blocks.values():
-            for instruction in block.instrs:
+            for instruction in tuple(block.instrs):
                 deferred = instruction.attributes.get(
                     "ssa_deferred_record_row"
                 )
@@ -33185,7 +34182,6 @@ def _class_surface_ssa_program(
                     None if record_table is None else
                     record_table.records.get(descriptor_id)
                 )
-                caller_graph = source_graphs_by_symbol.get(function_name)
                 abi_record = None
                 if caller_graph is not None:
                     graph_records = dict(
@@ -33205,21 +34201,31 @@ def _class_surface_ssa_program(
                     str(field.name): field
                     for field in (() if descriptor is None else descriptor.fields)
                 }
+                descriptor_field_diagnostics = tuple(
+                    (
+                        str(field.name), field.storage.value,
+                        tuple(map(int, field.value_ids)), field.sequence_id,
+                    )
+                    for field in (() if descriptor is None else descriptor.fields)
+                )
                 ordered_columns = (
                     () if abi_record is None else
                     _record_row_physical_columns(abi_record)
                 )
                 ordered_row = []
                 missing_columns = []
+                column_counts: dict[str, int] = {}
+                for column_name, _column_dtype in ordered_columns:
+                    column_counts[str(column_name)] = (
+                        column_counts.get(str(column_name), 0) + 1
+                    )
+                column_positions: dict[str, int] = {}
+                physical_ids_by_field: dict[str, tuple[int, ...]] = {}
+                span_projection_instructions = []
                 for column_name, column_dtype in ordered_columns:
                     field = fields_by_name.get(str(column_name))
                     if field is None:
                         missing_columns.append(str(column_name))
-                    elif len(field.value_ids) == 1:
-                        ordered_row.append((
-                            "value", int(field.value_ids[0]),
-                            str(column_dtype or field.dtype or "unknown"), field,
-                        ))
                     elif (
                         field.storage is SSARecordFieldStorage.SEQUENCE
                         and field.sequence_id is not None
@@ -33229,7 +34235,108 @@ def _class_surface_ssa_program(
                             "int64", field,
                         ))
                     else:
-                        missing_columns.append(str(column_name))
+                        field_name = str(column_name)
+                        physical_ids = physical_ids_by_field.get(field_name)
+                        if physical_ids is None:
+                            physical_ids = tuple(
+                                resident_record_id(int(value_id))
+                                for value_id in field.value_ids
+                            )
+                            required = int(column_counts[field_name])
+                            if (
+                                field.storage is SSARecordFieldStorage.SPAN
+                                and required > 1
+                                and len(physical_ids) == 1
+                                and physical_ids[0] in current_values
+                            ):
+                                # A fixed span may be represented by one arena
+                                # in the constructor and by one scalar column
+                                # per element in a Sequence[Record].  Project
+                                # that exact ABI-known extent at the append
+                                # boundary; the span remains the sole source
+                                # object and no parallel container is created.
+                                base = current_values[physical_ids[0]]
+                                projected_ids = []
+                                for element_index in range(required):
+                                    index_value = SSAValue(
+                                        GLOBAL_MONOTONIC_IDS.mint(), dtype="int"
+                                    )
+                                    address = SSAValue(
+                                        GLOBAL_MONOTONIC_IDS.mint(), dtype="ptr"
+                                    )
+                                    projected = SSAValue(
+                                        GLOBAL_MONOTONIC_IDS.mint(),
+                                        dtype=str(
+                                            column_dtype
+                                            or field.dtype
+                                            or "unknown"
+                                        ),
+                                        accounting={
+                                            "record_span_projection": (
+                                                str(expected_identity),
+                                                field_name,
+                                                int(element_index),
+                                            ),
+                                            "record_span_source": int(base.id),
+                                        },
+                                    )
+                                    span_projection_instructions.extend((
+                                        Instr(
+                                            "Const", [], index_value,
+                                            attributes={
+                                                "value": int(element_index),
+                                            },
+                                        ),
+                                        Instr(
+                                            "GetElementPtr",
+                                            [base, index_value], address,
+                                            attributes={
+                                                "binding": (
+                                                    "record_fixed_span_element"
+                                                ),
+                                                "record_identity": str(
+                                                    expected_identity
+                                                ),
+                                                "record_field": field_name,
+                                                "element_index": int(
+                                                    element_index
+                                                ),
+                                            },
+                                        ),
+                                        Instr(
+                                            "Load", [address], projected,
+                                            attributes={
+                                                "binding": (
+                                                    "record_fixed_span_element"
+                                                ),
+                                                "record_identity": str(
+                                                    expected_identity
+                                                ),
+                                                "record_field": field_name,
+                                                "element_index": int(
+                                                    element_index
+                                                ),
+                                            },
+                                        ),
+                                    ))
+                                    current_values[int(projected.id)] = projected
+                                    projected_ids.append(int(projected.id))
+                                physical_ids = tuple(projected_ids)
+                            physical_ids_by_field[field_name] = physical_ids
+                        position = column_positions.get(field_name, 0)
+                        column_positions[field_name] = position + 1
+                        if position >= len(physical_ids):
+                            missing_columns.append(str(column_name))
+                            continue
+                        ordered_row.append((
+                            "value", int(physical_ids[position]),
+                            str(column_dtype or field.dtype or "unknown"), field,
+                        ))
+                if span_projection_instructions:
+                    insertion_index = block.instrs.index(instruction)
+                    block.instrs[
+                        insertion_index:insertion_index
+                    ] = span_projection_instructions
                 layout_with_dtypes = tuple(
                     (int(value_id), str(dtype))
                     for kind, value_id, dtype, _field in ordered_row
@@ -33244,6 +34351,10 @@ def _class_surface_ssa_program(
                 layout = tuple(value_id for value_id, _dtype in layout_with_dtypes)
                 nested_rows = tuple(
                     item for item in ordered_row if item[0] == "sequence"
+                )
+                missing_value_ids = tuple(
+                    value_id for value_id in layout
+                    if value_id not in current_values
                 )
                 reason = None
                 if descriptor is None:
@@ -33263,7 +34374,8 @@ def _class_surface_ssa_program(
                 elif missing_columns:
                     reason = (
                         "record entry lacks physical column(s) "
-                        f"{missing_columns!r}"
+                        f"{missing_columns!r}; descriptor_fields="
+                        f"{descriptor_field_diagnostics!r}"
                     )
                 elif len(layout) + len(nested_rows) != int(expected_columns):
                     reason = (
@@ -33271,8 +34383,44 @@ def _class_surface_ssa_program(
                         "column(s), expected "
                         f"{int(expected_columns)}"
                     )
-                elif any(value_id not in current_values for value_id in layout):
-                    reason = "one or more physical record fields have no caller value"
+                elif missing_value_ids:
+                    source_identity_diagnostics = tuple(
+                        (
+                            int(value_id),
+                            tuple(
+                                (
+                                    int(node_id),
+                                    str(data.get("type") or data.get("op") or ""),
+                                    dict(data.get("attributes") or {}),
+                                )
+                                for node_id, data in (
+                                    () if caller_graph is None else
+                                    caller_graph.nodes(data=True)
+                                )
+                                if int(data.get("value_id", node_id))
+                                == int(value_id)
+                            ),
+                            tuple(
+                                str(name)
+                                for name, history in (
+                                    {} if caller_graph is None else dict(
+                                        caller_graph.graph.get("identity_table")
+                                        or {}
+                                    )
+                                ).items()
+                                if int(value_id) in set(map(int, history))
+                            ),
+                        )
+                        for value_id in missing_value_ids
+                    )
+                    reason = (
+                        "physical record field ids have no caller value: "
+                        f"{missing_value_ids!r}; layout={layout!r}; "
+                        f"descriptor_fields={descriptor_field_diagnostics!r}; "
+                        f"source_identities={source_identity_diagnostics!r}; "
+                        "retained_parameters="
+                        f"{tuple(function.metadata.get('parameter_names', ()))!r}"
+                    )
                 elif not instruction.args:
                     reason = "semantic record operand is not the final row argument"
                 else:
@@ -34019,7 +35167,7 @@ def _class_surface_ssa_program(
     # scalar input even though ordinary arithmetic consumers were rebound to
     # the real Metrics projection.
     for function in all_functions.values():
-        aliases = _concordant_function_aliases(function)
+        aliases = _concord_unbound_variant_rows(function)
         if not aliases:
             continue
         receipts = _apply_concorded_function_aliases(function, aliases)
@@ -34235,9 +35383,65 @@ def _class_surface_ssa_program(
     )
     physical_conflicts = physical_call_input_conflicts(all_functions)
     if physical_conflicts:
+        conflict_provenance = []
+        for (
+            caller_name, actual_id, actual_type,
+            callee_name, formal_id, formal_type,
+        ) in physical_conflicts:
+            caller = all_functions[str(caller_name)]
+            callee = all_functions[str(callee_name)]
+            call = next((
+                instruction
+                for block in caller.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Call", "call"}
+                and str(instruction.attributes.get("callee")) == str(callee_name)
+                and any(
+                    int(argument.id) == int(actual_id)
+                    for argument in instruction.args
+                )
+            ), None)
+            actual = next((
+                argument for argument in (() if call is None else call.args)
+                if int(argument.id) == int(actual_id)
+            ), None)
+            formal = next((
+                argument for argument in callee.args
+                if int(argument.id) == int(formal_id)
+            ), None)
+            callsite_id = (
+                None if call is None
+                else call.attributes.get("plan_callsite_id")
+            )
+            source_record = next((
+                record
+                for record in call_records.get(str(caller_name), ())
+                if int(record.callsite_id) == int(callsite_id)
+                and str(record.callee_symbol) == str(callee_name)
+            ), None) if callsite_id is not None else None
+            conflict_provenance.append((
+                str(caller_name), int(actual_id), str(actual_type),
+                dict(() if actual is None else actual.accounting or {}),
+                str(callee_name), int(formal_id), str(formal_type),
+                dict(() if formal is None else formal.accounting or {}),
+                "callsite", callsite_id,
+                "frame_binding", next((
+                    tuple(binding)
+                    for binding in (() if source_record is None else source_record.frame_bindings)
+                    if int(binding[0]) == int(formal_id)
+                ), None),
+                "caller_alias", _concordant_function_aliases(caller).get(
+                    next((
+                        int(binding[2])
+                        for binding in (() if source_record is None else source_record.frame_bindings)
+                        if int(binding[0]) == int(formal_id)
+                        and isinstance(binding[2], int)
+                    ), -1)
+                ),
+            ))
         raise ValueError(
             f"{len(physical_conflicts)} incompatible physical call inputs; storage types are immutable: "
-            + "; ".join(map(str, physical_conflicts))
+            + "; ".join(map(str, conflict_provenance))
         )
     call_type_passes = 0
     call_type_pass_bound = 64 + sum(
@@ -36252,6 +37456,13 @@ def _class_surface_ssa_program(
                                     or SSASequenceTable()
                                 ).by_id(int(caller_field.sequence_id)),
                             )
+                            # The descriptor roles above are the complete
+                            # sequence correlation.  Falling through to the
+                            # generic single-slot record-field path would map
+                            # every column/extent/status member onto the first
+                            # column and recreate an apparent second physical
+                            # layout for this same field.
+                            continue
                         if (
                             caller_field is None
                             or not caller_field.value_ids
@@ -39029,11 +40240,24 @@ def _full_native_link_failures(
         {"function": finding.function, "detail": finding.detail}
         for finding in check_formal_parity(module)
     ) if module is not None else ()
+    unresolved_record_rows = tuple(
+        {
+            "function": str(function_name),
+            **dict(row),
+        }
+        for function_name, function in (
+            () if module is None else module.functions.items()
+        )
+        for row in function.metadata.get(
+            "unresolved_record_sequence_rows", ()
+        )
+    )
     return {
         "unmaterialized_boundaries": tuple(unmaterialized_boundaries),
         "unresolved_call_records": tuple(unresolved_call_records),
         "undefined_operands": tuple(undefined_operands),
         "unaccounted_formals": unaccounted_formals,
+        "unresolved_record_sequence_rows": unresolved_record_rows,
         "structural_outputs": tuple(
             {"function": finding.function, "detail": finding.detail}
             for finding in check_structural_outputs(module)
@@ -39128,7 +40352,12 @@ def _rebind_linked_storage_alias(
     # on every iteration.
     if accounting.get("ssa_loop_carried_feed") is not None:
         return argument
-    if accounting.get("ssa_storage_alias") != int(placeholder.id):
+    storage_alias = accounting.get("ssa_storage_alias")
+    variant_source = accounting.get("unbound_variant_source_id")
+    if (
+        storage_alias != int(placeholder.id)
+        and variant_source != int(placeholder.id)
+    ):
         return argument
     return SSAValue(
         int(replacement.id),
@@ -39139,6 +40368,14 @@ def _rebind_linked_storage_alias(
             **accounting,
             "ssa_storage_alias": int(replacement.id),
             "ssa_linked_storage_from": int(placeholder.id),
+            **(
+                {
+                    "ssa_linked_variant_row_from": int(storage_alias),
+                }
+                if variant_source == int(placeholder.id)
+                and storage_alias != int(placeholder.id)
+                else {}
+            ),
         },
     )
 
@@ -40146,16 +41383,472 @@ def _lower_ast_source_to_ssa_impl(
     # LLVM module in rather than re-lower the body.
     from .extraction_contract import llvm_piece_of
 
+    # A retained record can own a compile-time mapping of already-compiled
+    # pieces even though the record itself crosses the native boundary.  The
+    # mapping is not runtime state in that case: ``__init__`` constructs it
+    # once from literal arguments, no class method replaces the field, and
+    # consumers select entries by literal key.  Resolve that exact authored
+    # path before source pursuit so the selected piece follows the same
+    # repository-SSA/LLVM link path as a top-level Python binding.  This is
+    # deliberately narrower than general Python constant folding: the result
+    # must be a mapping made entirely of declared LLVM pieces, and only the
+    # literal entries actually read by retained source are published.
+    python_bindings = dict(python_bindings or {})
+    static_piece_bindings: dict[tuple[str, str, str], str] = {}
+    static_piece_call_specializations: dict[
+        tuple[str, str, str, str], str
+    ] = {}
+    static_piece_sequence_bindings: dict[
+        tuple[str, str], tuple[str, ...]
+    ] = {}
+    static_piece_helper_definitions: list[ast.FunctionDef] = []
+    static_piece_receipts: list[dict[str, Any]] = []
+    retained_piece_classes: list[tuple[type, ast.ClassDef]] = []
+    for retained_class in retain:
+        if not inspect.isclass(retained_class):
+            continue
+        try:
+            retained_source = textwrap.dedent(inspect.getsource(retained_class))
+            retained_tree = ast.parse(retained_source)
+        except (OSError, TypeError, IndentationError, SyntaxError):
+            continue
+        class_definition = next((
+            statement for statement in retained_tree.body
+            if isinstance(statement, ast.ClassDef)
+            and statement.name == retained_class.__name__
+        ), None)
+        if class_definition is None:
+            continue
+        retained_piece_classes.append((retained_class, class_definition))
+        literal_reads: dict[str, set[str]] = {}
+        for node in ast.walk(class_definition):
+            if not (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.ctx, ast.Load)
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "self"
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)
+            ):
+                continue
+            literal_reads.setdefault(node.value.attr, set()).add(
+                str(node.slice.value)
+            )
+        initializer = next((
+            member for member in class_definition.body
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and member.name == "__init__"
+        ), None)
+        if initializer is None:
+            continue
+        assignments: dict[str, ast.Call] = {}
+        assignment_counts: dict[str, int] = {}
+        for node in ast.walk(class_definition):
+            targets = (
+                tuple(node.targets)
+                if isinstance(node, ast.Assign)
+                else (node.target,)
+                if isinstance(node, ast.AnnAssign)
+                else ()
+            )
+            for target in targets:
+                if not (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                ):
+                    continue
+                assignment_counts[target.attr] = (
+                    assignment_counts.get(target.attr, 0) + 1
+                )
+                if (
+                    node in ast.walk(initializer)
+                    and isinstance(getattr(node, "value", None), ast.Call)
+                ):
+                    assignments[target.attr] = node.value
+        for field_name, keys in literal_reads.items():
+            call = assignments.get(field_name)
+            if call is None or assignment_counts.get(field_name) != 1:
+                continue
+            if not isinstance(call.func, ast.Name):
+                continue
+            factory = python_bindings.get(call.func.id)
+            if not callable(factory) or any(
+                keyword.arg is None for keyword in call.keywords
+            ):
+                continue
+            try:
+                args = tuple(ast.literal_eval(argument) for argument in call.args)
+                kwargs = {
+                    str(keyword.arg): ast.literal_eval(keyword.value)
+                    for keyword in call.keywords
+                }
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                continue
+            try:
+                mapping = factory(*args, **kwargs)
+            except Exception:
+                # Static resolution is an optimization and link-discovery
+                # step.  Preserve the ordinary source path so its own error
+                # remains authoritative when a factory cannot be evaluated.
+                continue
+            if not isinstance(mapping, Mapping) or not all(
+                llvm_piece_of(value) is not None
+                and getattr(value, "module", None) is not None
+                for value in mapping.values()
+            ):
+                continue
+            class_identity = (
+                f"{retained_class.__module__}.{retained_class.__qualname__}"
+            )
+            for key in sorted(keys):
+                piece = mapping.get(key)
+                if llvm_piece_of(piece) is None:
+                    continue
+                digest = hashlib.sha256(
+                    f"{class_identity}|{field_name}|{key}".encode("utf-8")
+                ).hexdigest()[:12]
+                binding_name = (
+                    f"__turing_piece_{retained_class.__name__}_"
+                    f"{field_name.strip('_')}_{digest}"
+                )
+                python_bindings[binding_name] = piece
+                static_piece_bindings[
+                    (retained_class.__name__, field_name, key)
+                ] = binding_name
+                fact = (
+                    binding_name,
+                    str(piece.entry),
+                    str(piece.artifact.name),
+                )
+                current_identity_book().page(
+                    "static_record_piece_mapping_concordance"
+                ).concord((class_identity, field_name, key), fact)
+                static_piece_receipts.append({
+                    "record": class_identity,
+                    "field": field_name,
+                    "key": key,
+                    "binding": binding_name,
+                    "entry": str(piece.entry),
+                })
+                for source_call in (
+                    node for node in ast.walk(class_definition)
+                    if isinstance(node, ast.Call) and node.args
+                ):
+                    selected = source_call.args[0]
+                    if not (
+                        isinstance(source_call.func, ast.Name)
+                        and isinstance(selected, ast.Subscript)
+                        and isinstance(selected.value, ast.Attribute)
+                        and isinstance(selected.value.value, ast.Name)
+                        and selected.value.value.id == "self"
+                        and selected.value.attr == field_name
+                        and isinstance(selected.slice, ast.Constant)
+                        and str(selected.slice.value) == key
+                    ):
+                        continue
+                    wrapper_name = str(source_call.func.id)
+                    wrapper = python_bindings.get(wrapper_name)
+                    if not inspect.isfunction(wrapper):
+                        continue
+                    try:
+                        wrapper_tree = ast.parse(textwrap.dedent(
+                            inspect.getsource(wrapper)
+                        ))
+                    except (OSError, TypeError, IndentationError, SyntaxError):
+                        continue
+                    wrapper_definition = next((
+                        statement for statement in wrapper_tree.body
+                        if isinstance(statement, ast.FunctionDef)
+                    ), None)
+                    if wrapper_definition is None:
+                        continue
+                    positional = [
+                        *wrapper_definition.args.posonlyargs,
+                        *wrapper_definition.args.args,
+                    ]
+                    if not positional or wrapper_definition.args.defaults:
+                        continue
+                    piece_parameter = str(positional[0].arg)
+                    if any(
+                        isinstance(node, ast.Name)
+                        and node.id == piece_parameter
+                        and isinstance(node.ctx, (ast.Store, ast.Del))
+                        for node in ast.walk(wrapper_definition)
+                    ):
+                        continue
+                    helper_digest = hashlib.sha256(
+                        f"{wrapper_name}|{binding_name}".encode("utf-8")
+                    ).hexdigest()[:12]
+                    helper_name = (
+                        f"__turing_static_{wrapper_name.strip('_')}_"
+                        f"{helper_digest}"
+                    )
+                    specialization_key = (
+                        retained_class.__name__, field_name, key,
+                        wrapper_name,
+                    )
+                    static_piece_call_specializations[
+                        specialization_key
+                    ] = helper_name
+                    if any(
+                        definition.name == helper_name
+                        for definition in static_piece_helper_definitions
+                    ):
+                        continue
+                    wrapper_definition = copy.deepcopy(wrapper_definition)
+                    wrapper_definition.name = helper_name
+                    if wrapper_definition.args.posonlyargs:
+                        wrapper_definition.args.posonlyargs = (
+                            wrapper_definition.args.posonlyargs[1:]
+                        )
+                    else:
+                        wrapper_definition.args.args = (
+                            wrapper_definition.args.args[1:]
+                        )
+                    wrapper_definition.decorator_list = []
+
+                    class PieceParameterSpecializer(ast.NodeTransformer):
+                        def visit_Name(self, node: ast.Name):
+                            if (
+                                node.id == piece_parameter
+                                and isinstance(node.ctx, ast.Load)
+                            ):
+                                return ast.copy_location(ast.Name(
+                                    id=binding_name, ctx=ast.Load(),
+                                ), node)
+                            return node
+
+                    PieceParameterSpecializer().visit(wrapper_definition)
+                    ast.fix_missing_locations(wrapper_definition)
+                    static_piece_helper_definitions.append(wrapper_definition)
+
+    # The sequence analogue is a piece factory parameterized by the declared
+    # extent of another field, e.g. ``batch = len(self.items)`` followed by
+    # ``self.pieces = make_pieces(batch)``.  The ProgramABI shape makes that
+    # argument a compile-time fact.  Publish each returned piece separately
+    # and make reads of the field an indexed view of that one exact series;
+    # the source assignment remains in place for its ordinary state effect.
+    abi_record_receipts = tuple(
+        dict(record)
+        for record in (
+            extraction_policy.program_abi.receipt().get("records", {}).values()
+        )
+    )
+    for retained_class, class_definition in retained_piece_classes:
+        class_identity = (
+            f"{retained_class.__module__}.{retained_class.__qualname__}"
+        )
+        record_candidates = tuple(
+            record for record in abi_record_receipts
+            if str(record.get("identity")) in {
+                class_identity,
+                retained_class.__name__,
+            }
+            or str(record.get("identity", "")).rsplit(".", 1)[-1]
+            == retained_class.__name__
+        )
+        if len(record_candidates) != 1:
+            continue
+        record_fields = dict(record_candidates[0].get("fields") or {})
+        for method in (
+            member for member in class_definition.body
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            extent_values: dict[str, int] = {}
+            for statement in method.body:
+                if not (
+                    isinstance(statement, ast.Assign)
+                    and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name)
+                    and isinstance(statement.value, ast.Call)
+                    and isinstance(statement.value.func, ast.Name)
+                    and statement.value.func.id == "len"
+                    and len(statement.value.args) == 1
+                    and isinstance(statement.value.args[0], ast.Attribute)
+                    and isinstance(statement.value.args[0].value, ast.Name)
+                    and statement.value.args[0].value.id == "self"
+                ):
+                    continue
+                source_field = dict(record_fields.get(
+                    statement.value.args[0].attr
+                ) or {})
+                shape = source_field.get("shape")
+                if shape is not None and len(shape) == 1:
+                    extent_values[statement.targets[0].id] = int(shape[0])
+            if not extent_values:
+                continue
+            for statement in method.body:
+                if not (
+                    isinstance(statement, ast.Assign)
+                    and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Attribute)
+                    and isinstance(statement.targets[0].value, ast.Name)
+                    and statement.targets[0].value.id == "self"
+                    and isinstance(statement.value, ast.Call)
+                    and isinstance(statement.value.func, ast.Name)
+                    and not statement.value.keywords
+                ):
+                    continue
+                factory = python_bindings.get(statement.value.func.id)
+                if not callable(factory):
+                    continue
+                resolved_args = []
+                try:
+                    for argument in statement.value.args:
+                        if (
+                            isinstance(argument, ast.Name)
+                            and argument.id in extent_values
+                        ):
+                            resolved_args.append(extent_values[argument.id])
+                        else:
+                            resolved_args.append(ast.literal_eval(argument))
+                except (ValueError, TypeError, SyntaxError):
+                    continue
+                try:
+                    pieces = factory(*resolved_args)
+                except Exception:
+                    continue
+                if not isinstance(pieces, (tuple, list)) or not pieces or not all(
+                    llvm_piece_of(piece) is not None
+                    and getattr(piece, "module", None) is not None
+                    for piece in pieces
+                ):
+                    continue
+                field_name = str(statement.targets[0].attr)
+                binding_names = []
+                for index, piece in enumerate(pieces):
+                    digest = hashlib.sha256(
+                        f"{class_identity}|{field_name}|{index}|"
+                        f"{piece.entry}".encode("utf-8")
+                    ).hexdigest()[:12]
+                    binding_name = (
+                        f"__turing_piece_{retained_class.__name__}_"
+                        f"{field_name.strip('_')}_{index}_{digest}"
+                    )
+                    python_bindings[binding_name] = piece
+                    binding_names.append(binding_name)
+                series = tuple(binding_names)
+                static_piece_sequence_bindings[
+                    (retained_class.__name__, field_name)
+                ] = series
+                current_identity_book().page(
+                    "static_record_piece_sequence_concordance"
+                ).concord((class_identity, field_name), tuple(
+                    (
+                        binding_name,
+                        str(piece.entry),
+                        str(piece.artifact.name),
+                    )
+                    for binding_name, piece in zip(series, pieces)
+                ))
+                static_piece_receipts.append({
+                    "record": class_identity,
+                    "field": field_name,
+                    "series": series,
+                    "extent_source": tuple(sorted(extent_values.items())),
+                })
+
+    if static_piece_helper_definitions:
+        tree.body.extend(static_piece_helper_definitions)
+        ast.fix_missing_locations(tree)
+
+    def link_static_record_piece_lookups(module: ast.AST) -> None:
+        """Replace proven retained-record piece reads by their link symbol."""
+
+        if not static_piece_bindings:
+            return
+
+        class PieceLookupLinker(ast.NodeTransformer):
+            def __init__(self) -> None:
+                self.class_names: list[str] = []
+
+            def visit_ClassDef(self, node: ast.ClassDef):
+                self.class_names.append(str(node.name))
+                try:
+                    return self.generic_visit(node)
+                finally:
+                    self.class_names.pop()
+
+            def visit_Subscript(self, node: ast.Subscript):
+                node = self.generic_visit(node)
+                if not self.class_names or not (
+                    isinstance(node.ctx, ast.Load)
+                    and isinstance(node.value, ast.Attribute)
+                    and isinstance(node.value.value, ast.Name)
+                    and node.value.value.id == "self"
+                    and isinstance(node.slice, ast.Constant)
+                    and isinstance(node.slice.value, str)
+                ):
+                    return node
+                binding = static_piece_bindings.get((
+                    self.class_names[-1], node.value.attr,
+                    str(node.slice.value),
+                ))
+                if binding is None:
+                    return node
+                return ast.copy_location(
+                    ast.Name(id=binding, ctx=ast.Load()), node,
+                )
+
+            def visit_Attribute(self, node: ast.Attribute):
+                node = self.generic_visit(node)
+                if not self.class_names or not (
+                    isinstance(node.ctx, ast.Load)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "self"
+                ):
+                    return node
+                series = static_piece_sequence_bindings.get((
+                    self.class_names[-1], str(node.attr),
+                ))
+                if series is None:
+                    return node
+                return ast.copy_location(ast.Tuple(
+                    elts=[
+                        ast.Name(id=binding, ctx=ast.Load())
+                        for binding in series
+                    ],
+                    ctx=ast.Load(),
+                ), node)
+
+            def visit_Call(self, node: ast.Call):
+                original_first = node.args[0] if node.args else None
+                specialization = None
+                if self.class_names and (
+                    isinstance(node.func, ast.Name)
+                    and isinstance(original_first, ast.Subscript)
+                    and isinstance(original_first.value, ast.Attribute)
+                    and isinstance(original_first.value.value, ast.Name)
+                    and original_first.value.value.id == "self"
+                    and isinstance(original_first.slice, ast.Constant)
+                ):
+                    specialization = static_piece_call_specializations.get((
+                        self.class_names[-1], original_first.value.attr,
+                        str(original_first.slice.value), str(node.func.id),
+                    ))
+                node = self.generic_visit(node)
+                if specialization is not None:
+                    node.func = ast.copy_location(ast.Name(
+                        id=specialization, ctx=ast.Load(),
+                    ), node.func)
+                    node.args = node.args[1:]
+                return node
+
+        PieceLookupLinker().visit(module)
+        ast.fix_missing_locations(module)
+
     linked_pieces = {
         str(name): piece
-        for name, value in dict(python_bindings or {}).items()
+        for name, value in python_bindings.items()
         for piece in (llvm_piece_of(value),)
         if piece is not None and getattr(piece, "module", None) is not None
     }
     if linked_pieces:
         linked_repository_ssa = dict(linked_repository_ssa or {})
-        for name, piece in linked_pieces.items():
-            if name in linked_repository_ssa:
+        for piece_binding_name, piece in linked_pieces.items():
+            if piece_binding_name in linked_repository_ssa:
                 continue
             piece_root = piece.module.functions[str(piece.entry)]
             piece_root.metadata["llvm_piece"] = {
@@ -40169,11 +41862,12 @@ def _lower_ast_source_to_ssa_impl(
                     (int(v), str(kind), None if axis is None else int(axis))
                     for v, kind, axis in piece.artifact.extent_order),
             }
-            linked_repository_ssa[name] = (
+            linked_repository_ssa[piece_binding_name] = (
                 piece.module, str(piece.entry), dict(piece.outputs or {}),
             )
             if not any(
-                isinstance(statement, ast.FunctionDef) and statement.name == name
+                isinstance(statement, ast.FunctionDef)
+                and statement.name == piece_binding_name
                 for statement in tree.body
             ):
                 piece_source = getattr(piece, "source", None)
@@ -40185,11 +41879,11 @@ def _lower_ast_source_to_ssa_impl(
                     for statement in ast.parse(str(piece_source)).body:
                         if isinstance(statement, ast.FunctionDef):
                             stub = statement
-                            stub.name = name
+                            stub.name = piece_binding_name
                             break
                 if stub is None:
                     stub = ast.FunctionDef(
-                        name=name,
+                        name=piece_binding_name,
                         args=ast.arguments(
                             posonlyargs=[], vararg=None, kwonlyargs=[], kw_defaults=[],
                             kwarg=None, defaults=[],
@@ -40510,15 +42204,34 @@ def _lower_ast_source_to_ssa_impl(
                 _normalize_direct_tail_recursion,
                 normalize_discovered_destructuring,
             ),
-            retained_ast_normalizers=(
-                specialize_same_type_numeric_operators,
-            ) if specialized_operator_methods else (),
+            retained_ast_normalizers=tuple(filter(None, (
+                link_static_record_piece_lookups
+                if (
+                    static_piece_bindings
+                    or static_piece_sequence_bindings
+                ) else None,
+                specialize_same_type_numeric_operators
+                if specialized_operator_methods else None,
+            ))),
             retain=retain,
+            source_parameter_records=tuple(
+                {
+                    **binding.receipt(),
+                    "identity": extraction_policy.program_abi.records[
+                        binding.record
+                    ].identity,
+                }
+                for binding in extraction_policy.program_abi.bindings
+            ),
             progress=report,
         )
     if numeric_specialization_receipts:
         graph.G.graph["numeric_source_specializations"] = tuple(
             dict(receipt) for receipt in numeric_specialization_receipts
+        )
+    if static_piece_receipts:
+        graph.G.graph["static_record_piece_links"] = tuple(
+            dict(receipt) for receipt in static_piece_receipts
         )
     declared_class_field_contracts: dict[
         tuple[str, str], Mapping[str, Any]
@@ -41351,9 +43064,50 @@ def _lower_ast_source_to_ssa_impl(
                                 continue
                             _dump.write(f"FUNCTION {_fn_name}" + "\n")
                             _dump.write(
-                                f"  args={[(int(a.id), str(a.dtype)) for a in _fn.args]}"
+                                "  args="
+                                f"{[(int(a.id), str(a.dtype), dict(a.accounting or {})) for a in _fn.args]}"
                                 + "\n"
                             )
+                            _dump.write(
+                                "  signature_metadata="
+                                f"{{{', '.join(f'{key!r}: {_fn.metadata.get(key)!r}' for key in ('parameter_names', 'authored_parameters', 'storage_formals', 'closure_formals', 'parameter_member_formals', 'value_aliases'))}}}"
+                                + "\n"
+                            )
+                            _source_graph = _source_graph_for_lowered_function(
+                                final_source_graphs_by_symbol,
+                                str(_fn_name),
+                                _fn,
+                            )
+                            if _source_graph is not None:
+                                _formal_ids = {
+                                    int(argument.id) for argument in _fn.args
+                                }
+                                _source_formals = tuple(
+                                    {
+                                        "node_id": int(node_id),
+                                        "value_id": int(data.get(
+                                            "value_id", node_id
+                                        )),
+                                        "op": str(
+                                            data.get("op")
+                                            or data.get("type")
+                                            or ""
+                                        ),
+                                        "parents": tuple(
+                                            data.get("parents") or ()
+                                        ),
+                                        "attributes": dict(
+                                            data.get("attributes") or {}
+                                        ),
+                                    }
+                                    for node_id, data
+                                    in _source_graph.nodes(data=True)
+                                    if int(data.get("value_id", node_id))
+                                    in _formal_ids
+                                )
+                                _dump.write(
+                                    f"  source_formals={_source_formals!r}\n"
+                                )
                             for _block_name, _block in _fn.blocks.items():
                                 _dump.write(
                                     f"  BLOCK {_block_name} successors={_block.successors}"
@@ -41403,6 +43157,8 @@ def _lower_ast_source_to_ssa_impl(
                     f"undefined_operands={len(undefined_operands)}, "
                     f"undefined_details={undefined_operands[:16]!r}, "
                     f"unaccounted_formals={full_native_failures['unaccounted_formals']!r}, "
+                    "unresolved_record_sequence_rows="
+                    f"{full_native_failures['unresolved_record_sequence_rows']!r}, "
                     f"optional_merges={full_native_failures['unrepresented_optional_merges']!r}, "
                     f"structural_outputs={full_native_failures['structural_outputs']!r}, "
                     "non_native="

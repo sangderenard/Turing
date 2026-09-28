@@ -29,6 +29,10 @@ def _source_helper(value):
     return value * 2 + 1
 
 
+def _closed_source_helper():
+    return _source_helper(3)
+
+
 class _RegisteredMethodOwner:
     def run(self):
         return _source_helper(3)
@@ -43,6 +47,11 @@ class _RetainedMethodDependencyOwner:
 
     def step(self, value):
         return _source_helper(value)
+
+
+class _ABIActivatedMethodDependencyOwner:
+    def run(self, value=3):
+        return _closed_source_helper()
 
 
 class _ConstructorDependencyOwner:
@@ -137,6 +146,41 @@ def test_retained_source_method_pursues_its_method_body_dependencies():
         call["name"] == "step"
         for call in graph.G.graph["unresolved_ast_calls"]
     )
+
+
+def test_record_abi_parameter_activates_retained_method_dependencies():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            ast.parse(
+                "def entry(owner):\n"
+                "    return owner.run()\n"
+            ),
+            resolve_unresolved_parents=True,
+            parent_include=_source_dependency_is_not_tensor_primitive,
+            pursuit_roots=("entry",),
+            retain=(_ABIActivatedMethodDependencyOwner,),
+            source_parameter_records=({
+                "function": "entry",
+                "parameter": "owner",
+                "record": "Owner",
+                "identity": (
+                    f"{_ABIActivatedMethodDependencyOwner.__module__}."
+                    f"{_ABIActivatedMethodDependencyOwner.__qualname__}"
+                ),
+            },),
+        )
+
+    helper_id, _helper = _definitions(graph, "_closed_source_helper")[0]
+    helper_call_id, helper_call = next(
+        (node_id, data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Name)
+        and data["expr_obj"].func.id == "_closed_source_helper"
+    )
+    assert graph.G.has_edge(helper_id, helper_call_id)
+    assert helper_call["attributes"]["resolved_ast_parent"] == helper_id
 
 
 def test_lexical_pursuit_follows_nested_helpers_but_respects_parameter_shadowing():

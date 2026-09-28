@@ -13770,6 +13770,23 @@ def lower_control_sections_to_ssa(
         str(name): dict(contract)
         for name, contract in dict(record_field_contracts or {}).items()
     }
+    # Reference is a physical ABI storage class, not an untyped scalar.  A
+    # static-reference write also proves that class for source-derived records;
+    # an explicit ProgramABI declaration proves it even when this particular
+    # method only reads the field or writes a value produced elsewhere.
+    reference_slots = {
+        int(slot) for slot, name in enumerate(field_names)
+        if str((declared_contracts.get(name) or {}).get("storage") or "")
+        == "reference"
+    } | {
+        int(slot)
+        for kind, value_id, slot in field_ops
+        if kind == "write"
+        and isinstance((field_const_sources or {}).get(int(value_id)), Mapping)
+        and (field_const_sources or {})[int(value_id)].get(
+            "ssa_reference_identity"
+        ) is not None
+    }
     span_slots = {
         int(slot) for slot, name in enumerate(field_names)
         if str((declared_contracts.get(name) or {}).get("storage") or "")
@@ -13819,7 +13836,9 @@ def lower_control_sections_to_ssa(
     }
     undeclared_scalar_fields = tuple(
         name for slot, name in enumerate(field_names)
-        if slot in compact_slot and name not in declared_field_dtypes
+        if slot in compact_slot
+        and slot not in reference_slots
+        and name not in declared_field_dtypes
     )
     if scalar_slots and declared_field_dtypes and undeclared_scalar_fields:
         raise ValueError(
@@ -13832,7 +13851,10 @@ def lower_control_sections_to_ssa(
         sorted(scalar_dtypes)[0] if scalar_dtypes else "float64"
     )
     scalar_slot_dtypes = {
-        compact_slot[old_slot]: declared_field_dtypes.get(name, receiver_scalar_dtype)
+        compact_slot[old_slot]: (
+            "opaque_ref" if old_slot in reference_slots
+            else declared_field_dtypes.get(name, receiver_scalar_dtype)
+        )
         for old_slot, name in enumerate(field_names)
         if old_slot in compact_slot
     }
@@ -13842,7 +13864,9 @@ def lower_control_sections_to_ssa(
             "program_abi_record": str(record_identity),
             "program_abi_parameter": "self",
             "program_abi_field": str(field_names[old_slot]),
-            "program_abi_storage": "scalar",
+            "program_abi_storage": (
+                "reference" if old_slot in reference_slots else "scalar"
+            ),
             "program_abi_rank": 0,
             "program_abi_mutable": bool(
                 (record_field_mutability or {}).get(field_names[old_slot], False)
@@ -13931,15 +13955,6 @@ def lower_control_sections_to_ssa(
                 *rebindings,
             ))
     record_tables = {}
-    reference_slots = {
-        int(slot)
-        for kind, value_id, slot in field_ops
-        if kind == "write"
-        and isinstance((field_const_sources or {}).get(int(value_id)), Mapping)
-        and (field_const_sources or {})[int(value_id)].get(
-            "ssa_reference_identity"
-        ) is not None
-    }
     if record_identity is not None and field_names:
         from ..transmogrifier.ssa import (
             SSARecordDescriptor,

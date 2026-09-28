@@ -27,6 +27,7 @@ from src.compiler.fortran_c_shell import (
     _preferred_linked_field_candidates,
     _publish_concorded_output_identities,
     _concord_record_return_phi_inputs,
+    _concord_unbound_variant_rows,
     _apply_concorded_function_aliases,
     _prune_dead_entry_field_aliases,
     _prune_unused_callee_formals,
@@ -72,6 +73,38 @@ import yaml
 KEYED_CONTRACT = ExtractionContract(CONTRACT).with_program_abi(yaml.safe_load(
     (Path(__file__).parent / "fixtures/keyed_dt_record_abi.yaml").read_text()))
 
+
+class _ForwardedKeyedOwner:
+    def total(self):
+        result = 0.0
+        for _name, value in self.items.items():
+            result = result + value
+        return result
+
+
+class _OptionalWriteOwner:
+    def write_last_metrics(self, value):
+        self.last_metrics = value
+        return value
+
+
+def _make_forwarded_tuple():
+    return (1.0, 2.0, 3.0)
+
+
+class _ForwardedTupleOwner:
+    def __init__(self):
+        self.pieces = ()
+
+    def ensure(self):
+        self.pieces = _make_forwarded_tuple()
+
+    def total(self):
+        self.ensure()
+        result = 0.0
+        for piece in self.pieces:
+            result = result + piece
+        return result
 
 
 def test_duplicate_record_result_position_uses_first_physical_incumbent():
@@ -1038,6 +1071,32 @@ def test_linker_rebinds_only_proven_ordered_views_of_freshened_storage():
     assert _rebind_linked_storage_alias(
         unrelated_collision, placeholder, replacement,
     ) is unrelated_collision
+
+    # A heterogeneous projection initially publishes a private row carrier,
+    # but later source-call linking can prove that its semantic source is an
+    # exact resident span.  The source receipt is the concordance edge: use a
+    # typed view of that resident rather than retaining a second physical
+    # object solely for the region that mutates the row.
+    provisional_variant_row = SSAValue(
+        53,
+        dtype="float64",
+        shape=(3,),
+        accounting={
+            "ssa_storage_alias": 53,
+            "unbound_variant_source_id": 7,
+            "variant_column": "row",
+            "ssa_region_feed": (11, 0),
+        },
+    )
+    rebound_variant_row = _rebind_linked_storage_alias(
+        provisional_variant_row, placeholder, replacement,
+    )
+    assert rebound_variant_row.id == replacement.id
+    assert rebound_variant_row.shape == (3,)
+    assert rebound_variant_row.accounting["ssa_storage_alias"] == replacement.id
+    assert rebound_variant_row.accounting["ssa_linked_variant_row_from"] == 53
+    assert is_storage_view(rebound_variant_row, replacement)
+
     assert _rebind_linked_storage_alias(
         placeholder, placeholder, replacement,
     ) is replacement
@@ -1054,6 +1113,55 @@ def test_linker_rebinds_only_proven_ordered_views_of_freshened_storage():
     assert _rebind_linked_storage_alias(
         loop_carried_view, placeholder, replacement,
     ) is loop_carried_view
+
+
+def test_unbound_variant_row_follows_concorded_source_resident():
+    source = SSAValue(7, dtype="ssa.aggregate")
+    row = SSAValue(53, dtype="float64", accounting={
+        "unbound_variant_source_id": 7,
+        "variant_column": "row",
+    })
+    resident = SSAValue(41, dtype="float64", shape=(3,), accounting={
+        "linked_call_frame_storage": "vector_source",
+    })
+    function = Function(
+        "caller", [source, row, resident],
+        {"entry": BasicBlock("entry", [Instr("Ret", [row], None)])},
+        metadata={"value_aliases": {7: 41}},
+    )
+
+    aliases = _concord_unbound_variant_rows(function)
+
+    assert aliases[7] == 41
+    assert aliases[53] == 41
+
+
+def test_unbound_variant_row_follows_unique_exact_region_feed_resident():
+    source = SSAValue(7, dtype="ssa.aggregate")
+    row = SSAValue(53, dtype="float64", accounting={
+        "unbound_variant_source_id": 7,
+        "variant_column": "row",
+    })
+    resident = SSAValue(41, dtype="float64", shape=(3,), accounting={
+        "linked_call_frame_storage": "vector_source",
+    })
+    function = Function(
+        "caller", [source, row, resident],
+        {"entry": BasicBlock("entry", [
+            Instr("Call", [resident], None, attributes={
+                "callee": "reader", "feed_ids": (7,),
+            }),
+            Instr("Call", [row], None, attributes={
+                "callee": "writer", "feed_ids": (7,),
+            }),
+            Instr("Ret", [], None),
+        ])},
+        metadata={},
+    )
+
+    aliases = _concord_unbound_variant_rows(function)
+
+    assert aliases[53] == 41
 
 
 def test_linker_fresh_ids_ignore_integer_frame_payloads():
@@ -3119,6 +3227,301 @@ def test_keyed_mapping_lowers_to_token_and_value_vectors():
         "error_channels.values"
     ].id
     assert max(int(value.id) for value in root.args) < 1_000_000_000
+
+
+def test_forwarded_keyed_record_links_declared_field_decomposition():
+    """A call edge binds one keyed field through its exact physical parts."""
+
+    identity = (
+        f"{_ForwardedKeyedOwner.__module__}."
+        f"{_ForwardedKeyedOwner.__qualname__}"
+    )
+    contract = ExtractionContract(CONTRACT).with_program_abi({
+        "records": {
+            "ForwardedKeyedOwner": {
+                "identity": identity,
+                "fields": {
+                    "items": {
+                        "storage": "keyed",
+                        "dtype": "float64",
+                        "mutable": True,
+                    },
+                },
+            },
+        },
+        "bindings": [
+            {
+                "function": "root",
+                "parameter": "owner",
+                "record": "ForwardedKeyedOwner",
+            },
+            {
+                "function": "*total",
+                "parameter": "self",
+                "record": "ForwardedKeyedOwner",
+            },
+        ],
+        "values": [],
+    })
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(owner):\n"
+        "    return owner.total()\n",
+        "root",
+        name="forwarded_keyed_record",
+        python_bindings={"_ForwardedKeyedOwner": _ForwardedKeyedOwner},
+        extraction_contract=contract,
+        retain=(_ForwardedKeyedOwner,),
+    )
+
+    root = module.functions["forwarded_keyed_record__root"]
+    consume = next(
+        function for symbol, function in module.functions.items()
+        if "__total" in symbol and "__planned_region" not in symbol
+    )
+    record = next(iter(module.call_table[root.name]))
+    assert record.resolution == "native_call"
+    assert not root.metadata.get("unresolved_call_diagnostics")
+    assert not consume.metadata.get("unresolved_call_diagnostics")
+
+    root_parts = {
+        (value.accounting or {}).get("program_abi_keyed_part"): int(value.id)
+        for value in root.args
+        if (value.accounting or {}).get("program_abi_keyed_owner") == "items"
+    }
+    assert set(root_parts) == {"length", "keys", "values"}
+    callee_sequence = next(iter(
+        module.sequence_tables[consume.name].sequences.values()
+    ))
+    frame = {
+        int(callee_id): int(source)
+        for callee_id, kind, source in record.frame_bindings
+        if kind == "caller_storage"
+    }
+    assert frame[int(callee_sequence.sequence_id)] == root_parts["keys"]
+    assert frame[int(callee_sequence.column_value_ids[0])] == root_parts["keys"]
+    assert frame[int(callee_sequence.column_value_ids[1])] == root_parts["values"]
+    assert frame[int(callee_sequence.length_address_id)] == root_parts["length"]
+    assert frame[int(callee_sequence.capacity_value_id)] == root_parts["length"]
+    assert frame[int(callee_sequence.status_address_id)] not in set(
+        root_parts.values()
+    )
+
+    root_record = next(iter(module.record_tables[root.name].records.values()))
+    decomposition = module.record_tables[root.name].book.page(
+        "record_field_decomposition"
+    ).latest((
+        module.record_tables[root.name].owner,
+        int(root_record.record_id),
+        f"{identity}.items",
+    ))
+    assert dict(decomposition) == {
+        ("handle",): root_parts["keys"],
+        ("column", 0): root_parts["keys"],
+        ("column", 1): root_parts["values"],
+        ("length_address_id",): root_parts["length"],
+        ("capacity_value_id",): root_parts["length"],
+    }
+    from src.compiler.identity_concordance import concordance_report
+
+    assert "0 finding(s)" in concordance_report(module)
+
+
+def test_forwarded_write_only_optional_field_follows_access_concordance():
+    """A deep optional write makes one exact caller-owned in/out pair."""
+
+    identity = (
+        f"{_OptionalWriteOwner.__module__}."
+        f"{_OptionalWriteOwner.__qualname__}"
+    )
+    contract = ExtractionContract(CONTRACT).with_program_abi({
+        "records": {
+            "OptionalWriteOwner": {
+                "identity": identity,
+                "fields": {
+                    "last_metrics": {
+                        "storage": "reference",
+                        "mutable": True,
+                        "optional": True,
+                    },
+                    "unrelated": {
+                        "storage": "reference",
+                        "mutable": True,
+                        "optional": True,
+                    },
+                },
+            },
+        },
+        "bindings": [
+            {
+                "function": "root",
+                "parameter": "owner",
+                "record": "OptionalWriteOwner",
+            },
+            {
+                "function": "*write_last_metrics",
+                "parameter": "self",
+                "record": "OptionalWriteOwner",
+            },
+        ],
+        "values": [],
+    })
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(owner, value):\n"
+        "    return owner.write_last_metrics(value)\n",
+        "root",
+        name="forwarded_optional_write",
+        python_bindings={"_OptionalWriteOwner": _OptionalWriteOwner},
+        extraction_contract=contract,
+        retain=(_OptionalWriteOwner,),
+    )
+
+    root = module.functions["forwarded_optional_write__root"]
+    callee = next(
+        function for symbol, function in module.functions.items()
+        if "__write_last_metrics" in symbol
+        and "__planned_region" not in symbol
+    )
+    call = next(iter(module.call_table[root.name]))
+    assert call.resolution == "native_call"
+
+    root_record = next(iter(module.record_tables[root.name].records.values()))
+    callee_record = next(
+        record
+        for record in module.record_tables[callee.name].records.values()
+        if record.identity == identity
+    )
+    root_fields = {field.name: field for field in root_record.fields}
+    callee_fields = {field.name: field for field in callee_record.fields}
+    assert "last_metrics" in root_fields
+    assert "last_metrics.__present" in root_fields
+    assert "unrelated" not in root_fields
+    assert "unrelated.__present" not in root_fields
+
+    frame = {
+        int(callee_id): int(source)
+        for callee_id, kind, source in call.frame_bindings
+        if kind == "caller_storage"
+    }
+    assert frame[int(callee_fields["last_metrics"].value_ids[0])] == int(
+        root_fields["last_metrics"].value_ids[0]
+    )
+    assert frame[
+        int(callee_fields["last_metrics.__present"].value_ids[0])
+    ] == int(root_fields["last_metrics.__present"].value_ids[0])
+
+    access_page = module.record_tables[root.name].book.page(
+        "record_field_access"
+    )
+    access_key = (
+        (root.name, "owner"),
+        "last_metrics",
+        f"{identity}.last_metrics",
+    )
+    access_row = next(
+        row for row in access_page.rows()
+        if isinstance(row, tuple) and len(row) == 2 and row[1] == access_key
+    )
+    assert access_page.latest(access_row) == frozenset({"write"})
+    path_page = module.record_tables[root.name].book.page(
+        "record_field_access_path"
+    )
+    witness = path_page.latest((access_row[0], access_key, "write"))
+    assert witness[0][0] == "callsite"
+    assert witness[-1][0] == "source-node"
+
+    from src.compiler.identity_concordance import concordance_report
+
+    assert "0 finding(s)" in concordance_report(module)
+
+
+def test_forwarded_tuple_field_has_one_sequence_resident():
+    """A tuple write and an iterated read share one field representation."""
+
+    identity = (
+        f"{_ForwardedTupleOwner.__module__}."
+        f"{_ForwardedTupleOwner.__qualname__}"
+    )
+    contract = ExtractionContract(CONTRACT).with_program_abi({
+        "records": {
+            "ForwardedTupleOwner": {
+                "identity": identity,
+                "fields": {
+                    "pieces": {
+                        # The frontier declaration may know only that the
+                        # authored Python value crosses by reference.  The
+                        # retained class source supplies the stronger exact
+                        # tuple/indexing view.
+                        "storage": "reference",
+                        "mutable": True,
+                    },
+                },
+            },
+        },
+        "bindings": [
+            {
+                "function": "root",
+                "parameter": "owner",
+                "record": "ForwardedTupleOwner",
+            },
+            {
+                "function": "*ensure",
+                "parameter": "self",
+                "record": "ForwardedTupleOwner",
+            },
+            {
+                "function": "*total",
+                "parameter": "self",
+                "record": "ForwardedTupleOwner",
+            },
+        ],
+        "values": [],
+    })
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(owner):\n"
+        "    return owner.total()\n",
+        "root",
+        name="forwarded_tuple_field",
+        python_bindings={
+            "_ForwardedTupleOwner": _ForwardedTupleOwner,
+            "_make_forwarded_tuple": _make_forwarded_tuple,
+        },
+        extraction_contract=contract,
+        retain=(_ForwardedTupleOwner,),
+    )
+
+    records = [
+        record
+        for table in module.record_tables.values()
+        for record in table.records.values()
+        if record.identity == identity
+    ]
+    fields = [
+        field
+        for record in records
+        for field in record.fields
+        if field.storage_identity == f"{identity}.pieces"
+    ]
+    assert fields
+    assert all(
+        field.storage is SSARecordFieldStorage.SEQUENCE
+        for field in fields
+    )
+    assert all(not field.value_ids or field.sequence_id is not None
+               for field in fields)
+
+    total = next(
+        function for symbol, function in module.functions.items()
+        if "__total" in symbol and "__planned_region" not in symbol
+    )
+    ensure = next(
+        function for symbol, function in module.functions.items()
+        if "__ensure" in symbol and "__planned_region" not in symbol
+    )
+    call = next(
+        record for record in module.call_table[total.name]
+        if record.callee_symbol == ensure.name
+    )
+    assert call.resolution == "native_call"
 
 
 def test_dynamic_dict_literal_is_populated_and_returned_with_its_record():

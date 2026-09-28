@@ -1231,16 +1231,26 @@ def test_static_program_reference_is_typed_ssa_and_native_handle_storage():
         ControlProgram(SequenceBlock(())),
         identity_table={"self": (5,)},
         self_value_id=5,
-        field_ops=(("write", 11, 0),),
-        field_const_sources={11: {
-            "ssa_reference_identity": "autograd.tape",
-            "reference_kind": "static-python",
-            "reference_handle": handle,
-            "host_resident": True,
-        }},
-        field_count=1,
-        field_names=("_tape",),
+        field_ops=(("write", 11, 0), ("write", 12, 1)),
+        field_const_sources={
+            11: {
+                "ssa_reference_identity": "autograd.tape",
+                "reference_kind": "static-python",
+                "reference_handle": handle,
+                "host_resident": True,
+            },
+            12: 2.5,
+        },
+        field_count=2,
+        field_names=("_tape", "gain"),
         record_identity="AbstractTensor",
+        record_field_dtypes={"gain": "float64"},
+        record_field_contracts={
+            "_tape": {"storage": "reference", "mutable": True},
+            "gain": {
+                "storage": "scalar", "dtype": "float64", "mutable": True,
+            },
+        },
     )
 
     assert shortfalls == ()
@@ -1264,6 +1274,8 @@ def test_static_program_reference_is_typed_ssa_and_native_handle_storage():
     record = module.record_tables["planned_control"].records[5]
     assert record.fields[0].storage is SSARecordFieldStorage.REFERENCE
     assert record.fields[0].dtype == "opaque_ref"
+    assert record.fields[1].storage is SSARecordFieldStorage.SCALAR
+    assert record.fields[1].dtype == "float64"
 
     fortran = emit_module(
         module, name="opaque_reference_probe",
@@ -1278,3 +1290,34 @@ def test_static_program_reference_is_typed_ssa_and_native_handle_storage():
     )
     assert llvm.shortfalls == ()
     assert f"store i64 {handle}" in llvm.llvm_ir
+
+
+def test_declared_reference_read_never_requires_scalar_dtype():
+    module, shortfalls, _ = lower_control_sections_to_ssa(
+        ControlProgram(SequenceBlock(())),
+        identity_table={"self": (5,), "result": (11,)},
+        function_outputs=("result",),
+        self_value_id=5,
+        field_ops=(("read", 11, 0),),
+        field_count=1,
+        field_names=("last_metrics",),
+        record_identity="State",
+        record_field_contracts={
+            "last_metrics": {
+                "storage": "reference", "mutable": False, "optional": True,
+            },
+        },
+    )
+
+    assert shortfalls == ()
+    function = module.functions["planned_control"]
+    load = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Load"
+    )
+    assert load.res.dtype == "opaque_ref"
+    field = module.record_tables["planned_control"].records[5].fields[0]
+    assert field.storage is SSARecordFieldStorage.REFERENCE
+    assert field.dtype == "opaque_ref"
