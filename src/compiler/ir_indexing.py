@@ -51,10 +51,20 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                 if canonical_op in _GATHER and len(instruction.args) >= 2:
                     base, *indices = instruction.args
                     address = fresh()
+                    lowered_attributes = {
+                        **dict(instruction.attributes or {}),
+                        "lowered_from": str(canonical_op),
+                    }
                     rewritten.append(
-                        Instr("GetElementPtr", [base, *indices], address)
+                        Instr(
+                            "GetElementPtr", [base, *indices], address,
+                            attributes=lowered_attributes,
+                        )
                     )
-                    rewritten.append(Instr("Load", [address], instruction.res))
+                    rewritten.append(Instr(
+                        "Load", [address], instruction.res,
+                        attributes=lowered_attributes,
+                    ))
                 elif canonical_op in _SCATTER and len(instruction.args) >= 3:
                     base = instruction.args[0]
                     value = instruction.args[-1]

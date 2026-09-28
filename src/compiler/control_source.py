@@ -70,6 +70,13 @@ class ControlExpression:
     # lowering.  Not part of equality: two leaves reading one value compute
     # the same expression wherever they sit.
     read: tuple | None = field(default=None, compare=False)
+    # Exact ProgramABI ownership for an optional-presence leaf.  A Boolean
+    # control value can outlive the graph node that introduced it, so carry
+    # the semantic owner through Control IR instead of re-deriving it from an
+    # integer id during SSA construction.
+    program_abi_parameter: str | None = None
+    program_abi_field: str | None = None
+    program_abi_record: str | None = None
 
 
 @dataclass(frozen=True)

@@ -778,26 +778,101 @@ def settle_repository_ssa_static_extent_operands(module: IRModule) -> bool:
                 definition.attributes = attributes
                 changed = True
 
+        def exact_feed_count(value: SSAValue) -> int | None:
+            """Count the actual crossing this region's recorded call edge.
+
+            A scalar actual can acquire the destination span's shape on its
+            callee-local occurrence.  That view is useful to the indexed-store
+            kernel but does not enlarge the actual's storage.  Conversely, a
+            linked tensor result may settle from rank zero to its true span
+            only after this kernel was first lowered.  The exact feed receipt
+            distinguishes those cases without choosing a local incumbent.
+            """
+
+            receipt = dict(value.accounting or {}).get(
+                "exact_region_feed_source"
+            )
+            if isinstance(receipt, (tuple, list)) and len(receipt) == 3:
+                caller_name, actual_id, argument_index = receipt
+                caller = module.functions.get(str(caller_name))
+                counts: set[int] = set()
+                if caller is not None:
+                    for caller_block in caller.blocks.values():
+                        for call_instruction in caller_block.instrs:
+                            if (
+                                call_instruction.op not in {"Call", "call"}
+                                or call_instruction.attributes.get("callee")
+                                != function_name
+                            ):
+                                continue
+                            position = int(argument_index)
+                            if position >= len(call_instruction.args):
+                                continue
+                            actual = call_instruction.args[position]
+                            if int(actual.id) != int(actual_id):
+                                continue
+                            count = _known_count(actual)
+                            if count is not None:
+                                counts.add(count)
+                if len(counts) == 1:
+                    return next(iter(counts))
+            return _known_count(value)
+
         for block in function.blocks.values():
             for instruction in block.instrs:
-                if (
-                    instruction.op != "Call"
-                    or instruction.attributes.get("callee")
-                    != "broadcast_double"
-                    or len(instruction.args) < 6
-                ):
+                if instruction.op != "Call":
                     continue
-                source_shape = tuple(instruction.args[0].shape or ())
-                output_shape = tuple(instruction.args[1].shape or ())
-                # Exact SSA occurrences, not canonical integer ids, own view
-                # shape.  Consulting the table first would replace legitimate
-                # reshape/broadcast views with their allocation owner's shape.
+                callee = instruction.attributes.get("callee")
+                if callee == "broadcast_double" and len(instruction.args) >= 6:
+                    source_shape = tuple(instruction.args[0].shape or ())
+                    output_shape = tuple(instruction.args[1].shape or ())
+                    # Exact SSA occurrences, not canonical integer ids, own
+                    # view shape. Consulting the table first would replace
+                    # legitimate reshape/broadcast views with their allocation
+                    # owner's shape.
+                    if source_shape:
+                        stamp(instruction.args[2], source_shape, vector=True)
+                        stamp(
+                            instruction.args[3], len(source_shape), vector=False
+                        )
+                    if output_shape:
+                        stamp(instruction.args[4], output_shape, vector=True)
+                        stamp(
+                            instruction.args[5], len(output_shape), vector=False
+                        )
+                    continue
+                if callee not in {"index_assign_double", "index_set_double"}:
+                    continue
+                inplace = callee == "index_assign_double"
+                minimum_args = 7 if inplace else 8
+                if len(instruction.args) < minimum_args:
+                    continue
+                source_index = 0
+                shape_index = 1 if inplace else 2
+                rank_index = 2 if inplace else 3
+                value_index = 5 if inplace else 6
+                count_index = 6 if inplace else 7
+                source_shape = tuple(
+                    instruction.args[source_index].shape or ()
+                )
                 if source_shape:
-                    stamp(instruction.args[2], source_shape, vector=True)
-                    stamp(instruction.args[3], len(source_shape), vector=False)
-                if output_shape:
-                    stamp(instruction.args[4], output_shape, vector=True)
-                    stamp(instruction.args[5], len(output_shape), vector=False)
+                    stamp(
+                        instruction.args[shape_index], source_shape, vector=True
+                    )
+                    stamp(
+                        instruction.args[rank_index],
+                        len(source_shape),
+                        vector=False,
+                    )
+                value_count = exact_feed_count(
+                    instruction.args[value_index]
+                )
+                if value_count is not None:
+                    stamp(
+                        instruction.args[count_index],
+                        value_count,
+                        vector=False,
+                    )
     return changed
 
 

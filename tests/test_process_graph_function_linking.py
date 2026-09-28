@@ -579,6 +579,71 @@ def test_planned_region_record_projection_reads_shared_concordance():
     )
 
 
+def test_planned_region_captures_proven_record_span_directly():
+    owner_name = "controller"
+    region_name = "controller__planned_region_7"
+    record = SSAValue(7, dtype="ssa.aggregate")
+    channel_values = SSAValue(124, dtype="float64", shape=(10,))
+    call = Instr(
+        "Call", [record], SSAValue(680, dtype="ssa.aggregate"),
+        attributes={
+            "callee": region_name,
+            "feed_ids": (7,),
+            "feed_shapes": ((),),
+            "feed_dtypes": ("ssa.aggregate",),
+            "output_ids": (311,),
+            "result_convention": "ssa.aggregate",
+        },
+    )
+    owner = Function(
+        owner_name, [record, channel_values],
+        {"entry": BasicBlock("entry", [call])},
+        metadata={"value_aliases": {311: 124}},
+    )
+    projected = SSAValue(311, dtype="float64", shape=(10,))
+    region = Function(
+        region_name, [SSAValue(7, dtype="ssa.aggregate")],
+        {"entry": BasicBlock("entry", [
+            Instr(
+                "getattr", [SSAValue(7, dtype="ssa.aggregate")], projected,
+                attributes={
+                    "attribute": "error_channels",
+                    "initial_record_field_state": True,
+                },
+            ),
+            Instr("Ret", [projected], None),
+        ])},
+        metadata={"source_region_integral": {
+            "owner": owner_name,
+            "capture_value_ids": (7,),
+            "output_value_ids": (311,),
+        }},
+    )
+    records = SSARecordTable()
+    records.register(SSARecordDescriptor(
+        7,
+        "Metrics",
+        fields=(SSARecordFieldDescriptor(
+            "error_channels",
+            SSARecordFieldStorage.SPAN,
+            storage_identity="Metrics.error_channels",
+            value_ids=(124,),
+            dtype="float64",
+        ),),
+    ))
+
+    assert _lower_planned_region_record_projection_captures(
+        {owner_name: owner, region_name: region},
+        {owner_name: records},
+    ) == 1
+    assert [value.id for value in region.args] == [7, 124]
+    assert [value.id for value in call.args] == [7, 124]
+    projection = region.blocks["entry"].instrs[0]
+    assert projection.op == "Cast"
+    assert projection.args[0].id == 124
+    assert projection.args[0].shape == (10,)
+
+
 def test_identity_audit_rejects_private_alias_snapshot():
     from src.compiler.identity_concordance import (
         IdentityBook,
@@ -1493,6 +1558,567 @@ def test_optional_record_field_materializes_presence_and_payload_slots(tmp_path)
     for value, expected in ((None, 1.0), (0.0, 0.0), (2.5, 2.5)):
         feeds = _managed_native_feeds_by_id(
             lowered, {"limits": SimpleNamespace(floor=value)},
+        )
+        execution = artifact.prepare_execution(feeds).run()
+        assert np.asarray(execution.buffers[result_id]).item() == expected
+
+
+def test_forwarded_record_optional_field_keeps_presence_control(tmp_path):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.vehicle_python_compilation import (
+        VehiclePythonSSALowering,
+        _managed_native_feeds_by_id,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {
+                "Limits": {
+                    "identity": "tests.Limits",
+                    "fields": {
+                        "floor": {
+                            "storage": "scalar",
+                            "dtype": "float64",
+                            "optional": True,
+                        },
+                    },
+                },
+            },
+            "bindings": [{
+                "function": "*",
+                "parameter": "limits",
+                "record": "Limits",
+            }],
+            "values": [],
+        })
+    )
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def forward(limits):\n"
+        "    return limits\n\n"
+        "def root(limits, value):\n"
+        "    current = forward(limits)\n"
+        "    result = value + 1.0\n"
+        "    if current.floor is not None:\n"
+        "        result = min(result, current.floor)\n"
+        "    return result\n",
+        "root",
+        name="forwarded_optional_record_control",
+        extraction_contract=contract,
+    )
+
+    root = module.functions["forwarded_optional_record_control__root"]
+    payload_formal = next(arg for arg in root.args if int(arg.id) == 9)
+    assert payload_formal.accounting["program_abi_record"] == "tests.Limits"
+    assert payload_formal.accounting["program_abi_field"] == "floor"
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(
+        tmp_path / "forwarded_optional_record_control", optimization="O0"
+    )
+    lowered = VehiclePythonSSALowering(module, root.name, outputs, exports)
+    result_id = outputs[root.name][0].id
+    for floor, expected in ((None, 3.0), (0.0, 0.0), (2.5, 2.5)):
+        feeds = _managed_native_feeds_by_id(
+            lowered,
+            {"limits": SimpleNamespace(floor=floor), "value": 2.0},
+        )
+        execution = artifact.prepare_execution(feeds).run()
+        assert np.asarray(execution.buffers[result_id]).item() == expected
+
+
+def test_bound_method_receiver_keeps_optional_field_presence(tmp_path):
+    """The ``operand`` edge must specialize a method's ``self`` record."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.vehicle_python_compilation import (
+        VehiclePythonSSALowering,
+        _managed_native_feeds_by_id,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {
+                "Controller": {
+                    "identity": "tests.Controller",
+                    "fields": {
+                        "ceiling": {
+                            "storage": "scalar",
+                            "dtype": "float64",
+                            "optional": True,
+                        },
+                    },
+                },
+            },
+            "bindings": [{
+                "function": "root",
+                "parameter": "controller",
+                "record": "Controller",
+            }],
+            "values": [{
+                "function": "root", "parameter": "value",
+                "storage": "scalar", "dtype": "float64", "rank": 0,
+                "python_type": "builtins.float",
+            }],
+        })
+    )
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "class Controller:\n"
+        "    def clamp(self, value):\n"
+        "        result = value\n"
+        "        if self.ceiling is not None:\n"
+        "            result = min(result, self.ceiling)\n"
+        "        return result\n\n"
+        "def root(controller, value):\n"
+        "    return controller.clamp(value)\n",
+        "root",
+        name="method_optional_receiver",
+        extraction_contract=contract,
+    )
+
+    root = module.functions["method_optional_receiver__root"]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "method_optional_receiver", optimization="O0")
+    lowered = VehiclePythonSSALowering(module, root.name, outputs, exports)
+    result_id = outputs[root.name][0].id
+    for ceiling, expected in ((None, 2.0), (0.0, 0.0), (1.5, 1.5)):
+        feeds = _managed_native_feeds_by_id(
+            lowered,
+            {
+                "controller": SimpleNamespace(ceiling=ceiling),
+                "value": 2.0,
+            },
+        )
+        execution = artifact.prepare_execution(feeds).run()
+        assert np.asarray(execution.buffers[result_id]).item() == expected
+
+
+def test_bound_method_optional_field_presence_survives_default_rebind(tmp_path):
+    """A receiver field keeps presence through ``x = self.x if x is None``."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.vehicle_python_compilation import (
+        VehiclePythonSSALowering,
+        _managed_native_feeds_by_id,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {
+                "Controller": {
+                    "identity": "tests.Controller",
+                    "fields": {
+                        "ceiling": {
+                            "storage": "scalar",
+                            "dtype": "float64",
+                            "optional": True,
+                        },
+                    },
+                },
+            },
+            "bindings": [{
+                "function": "root",
+                "parameter": "controller",
+                "record": "Controller",
+            }],
+            "values": [{
+                "function": "root", "parameter": "value",
+                "storage": "scalar", "dtype": "float64", "rank": 0,
+                "python_type": "builtins.float",
+            }],
+        })
+    )
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "class Controller:\n"
+        "    def clamp(self, value, *, ceiling=None):\n"
+        "        ceiling = self.ceiling if ceiling is None else ceiling\n"
+        "        selected = ceiling if ceiling is not None else -3.0\n"
+        "        return selected\n\n"
+        "def root(controller, value):\n"
+        "    return controller.clamp(value)\n",
+        "root",
+        name="method_optional_receiver_rebind",
+        extraction_contract=contract,
+    )
+
+    root = module.functions["method_optional_receiver_rebind__root"]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(
+        tmp_path / "method_optional_receiver_rebind", optimization="O0"
+    )
+    lowered = VehiclePythonSSALowering(module, root.name, outputs, exports)
+    result_id = outputs[root.name][0].id
+    for ceiling, expected in ((None, -3.0), (0.0, 0.0), (1.5, 1.5)):
+        feeds = _managed_native_feeds_by_id(
+            lowered,
+            {
+                "controller": SimpleNamespace(ceiling=ceiling),
+                "value": 2.0,
+            },
+        )
+        execution = artifact.prepare_execution(feeds).run()
+        assert np.asarray(execution.buffers[result_id]).item() == expected
+
+
+def test_two_receiver_optional_defaults_dominate_their_controls(tmp_path):
+    """Selected receiver payloads remain available to both optional arms."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.vehicle_python_compilation import (
+        VehiclePythonSSALowering,
+        _managed_native_feeds_by_id,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {
+                "Controller": {
+                    "identity": "tests.Controller",
+                    "fields": {
+                        "floor": {
+                            "storage": "scalar", "dtype": "float64",
+                            "optional": True,
+                        },
+                        "ceiling": {
+                            "storage": "scalar", "dtype": "float64",
+                            "optional": True,
+                        },
+                        "acc": {
+                            "storage": "scalar", "dtype": "float64",
+                            "mutable": True,
+                        },
+                    },
+                },
+            },
+            "bindings": [{
+                "function": "root",
+                "parameter": "controller",
+                "record": "Controller",
+            }],
+            "values": [{
+                "function": "root", "parameter": "value",
+                "storage": "scalar", "dtype": "float64", "rank": 0,
+                "python_type": "builtins.float",
+            }],
+        })
+    )
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "class Controller:\n"
+        "    def clamp(self, value, *, floor=None, ceiling=None):\n"
+        "        floor = self.floor if floor is None else floor\n"
+        "        ceiling = self.ceiling if ceiling is None else ceiling\n"
+        "        self.acc = self.acc + 0.0\n"
+        "        selected_floor = floor if floor is not None else -3.0\n"
+        "        result = max(value, selected_floor)\n"
+        "        if floor is not None:\n"
+        "            result = max(result, floor)\n"
+        "        if ceiling is not None:\n"
+        "            result = min(result, ceiling)\n"
+        "        return result\n\n"
+        "def root(controller, value):\n"
+        "    return controller.clamp(value)\n",
+        "root",
+        name="method_two_optional_receiver_rebinds",
+        extraction_contract=contract,
+    )
+
+    root = module.functions["method_two_optional_receiver_rebinds__root"]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(
+        tmp_path / "method_two_optional_receiver_rebinds", optimization="O0"
+    )
+    lowered = VehiclePythonSSALowering(module, root.name, outputs, exports)
+    result_id = outputs[root.name][0].id
+    cases = (
+        (None, None, 2.0),
+        (3.0, None, 3.0),
+        (None, 1.0, 1.0),
+        (3.0, 4.0, 3.0),
+    )
+    for floor, ceiling, expected in cases:
+        feeds = _managed_native_feeds_by_id(
+            lowered,
+            {
+                "controller": SimpleNamespace(
+                    floor=floor, ceiling=ceiling, acc=0.0,
+                ),
+                "value": 2.0,
+            },
+        )
+        execution = artifact.prepare_execution(feeds).run()
+        assert np.asarray(execution.buffers[result_id]).item() == expected
+
+
+def test_distinct_loop_carried_scalar_updates_keep_distinct_return_identity(
+    tmp_path,
+):
+    """A related update must not make two authored loop residents identical."""
+    import numpy as np
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.vehicle_python_compilation import (
+        VehiclePythonSSALowering,
+        _managed_native_feeds_by_id,
+    )
+
+    values = [
+        {
+            "function": "root",
+            "parameter": name,
+            "storage": "scalar",
+            "dtype": dtype,
+            "rank": 0,
+            "python_type": python_type,
+        }
+        for name, dtype, python_type in (
+            ("cap_initial", "float64", "builtins.float"),
+            ("proposal", "float64", "builtins.float"),
+            ("iterations", "int64", "builtins.int"),
+        )
+    ]
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {}, "bindings": [], "values": values,
+        })
+    )
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def root(cap_initial, proposal, iterations):\n"
+        "    cap = cap_initial\n"
+        "    last = cap\n"
+        "    index = 0\n"
+        "    while index < iterations:\n"
+        "        cap = min(cap, proposal)\n"
+        "        last = proposal\n"
+        "        index += 1\n"
+        "    return cap, last\n",
+        "root",
+        name="distinct_loop_carried_returns",
+        extraction_contract=contract,
+    )
+
+    root = module.functions["distinct_loop_carried_returns__root"]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "distinct_loop_carried_returns", optimization="O0")
+    lowered = VehiclePythonSSALowering(module, root.name, outputs, exports)
+    feeds = _managed_native_feeds_by_id(
+        lowered,
+        {"cap_initial": 1.0, "proposal": 2.0, "iterations": 1},
+    )
+    execution = artifact.prepare_execution(feeds).run()
+    cap_id, last_id = (value.id for value in outputs[root.name])
+    assert np.asarray(execution.buffers[cap_id]).item() == 1.0
+    assert np.asarray(execution.buffers[last_id]).item() == 2.0
+
+
+def test_forwarded_optional_scalar_presence_survives_two_linked_calls(tmp_path):
+    """An absent forwarded payload must not become a true None-test."""
+    import numpy as np
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.vehicle_python_compilation import (
+        VehiclePythonSSALowering,
+        _managed_native_feeds_by_id,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {}, "bindings": [],
+            "values": [
+                {
+                    "function": "root", "parameter": "flag",
+                    "storage": "scalar", "dtype": "bool", "rank": 0,
+                    "python_type": "builtins.bool",
+                },
+                {
+                    "function": "root", "parameter": "value",
+                    "storage": "scalar", "dtype": "float64", "rank": 0,
+                    "python_type": "builtins.float",
+                },
+            ],
+        })
+    )
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def leaf(flag):\n"
+        "    if flag:\n"
+        "        return 0.5\n"
+        "    return None\n\n"
+        "def middle(flag):\n"
+        "    return leaf(flag)\n\n"
+        "def root(flag, value):\n"
+        "    bound = middle(flag)\n"
+        "    result = value\n"
+        "    if bound is not None:\n"
+        "        result = min(result, bound)\n"
+        "    return result\n",
+        "root",
+        name="forwarded_optional_scalar_control",
+        extraction_contract=contract,
+    )
+
+    root = module.functions["forwarded_optional_scalar_control__root"]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(
+        tmp_path / "forwarded_optional_scalar_control", optimization="O0"
+    )
+    lowered = VehiclePythonSSALowering(module, root.name, outputs, exports)
+    result_id = outputs[root.name][0].id
+    for flag, expected in ((False, 2.0), (True, 0.5)):
+        feeds = _managed_native_feeds_by_id(
+            lowered,
+            {"flag": flag, "value": 2.0},
+        )
+        execution = artifact.prepare_execution(feeds).run()
+        assert np.asarray(execution.buffers[result_id]).item() == expected
+
+
+def test_authored_scalar_value_survives_two_linked_calls(tmp_path):
+    """A linked wrapper must forward the caller's value, not a fresh slot."""
+    import numpy as np
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.vehicle_python_compilation import (
+        VehiclePythonSSALowering,
+        _managed_native_feeds_by_id,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {}, "bindings": [],
+            "values": [{
+                "function": "root", "parameter": "value",
+                "storage": "scalar", "dtype": "float64", "rank": 0,
+                "python_type": "builtins.float",
+            }],
+        })
+    )
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def leaf(value):\n"
+        "    return value * 2.0\n\n"
+        "def middle(value):\n"
+        "    return leaf(value)\n\n"
+        "def root(value):\n"
+        "    return middle(value)\n",
+        "root",
+        name="forwarded_authored_scalar",
+        extraction_contract=contract,
+    )
+
+    root = module.functions["forwarded_authored_scalar__root"]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "forwarded_authored_scalar", optimization="O0")
+    lowered = VehiclePythonSSALowering(module, root.name, outputs, exports)
+    feeds = _managed_native_feeds_by_id(lowered, {"value": 0.25})
+    execution = artifact.prepare_execution(feeds).run()
+    result_id = outputs[root.name][0].id
+    assert np.asarray(execution.buffers[result_id]).item() == 0.5
+
+
+def test_authored_scalar_payload_survives_forwarded_optional_calls(tmp_path):
+    """Optional control must not disconnect a second authored call edge."""
+    import numpy as np
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.vehicle_python_compilation import (
+        VehiclePythonSSALowering,
+        _managed_native_feeds_by_id,
+    )
+
+    values = [
+        {
+            "function": "root", "parameter": name,
+            "storage": "scalar", "dtype": dtype, "rank": 0,
+            "python_type": python_type,
+        }
+        for name, dtype, python_type in (
+            ("flag", "bool", "builtins.bool"),
+            ("value", "float64", "builtins.float"),
+            ("limit", "float64", "builtins.float"),
+        )
+    ]
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {}, "bindings": [], "values": values,
+        })
+    )
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def leaf(flag, limit):\n"
+        "    if flag:\n"
+        "        return limit\n"
+        "    return None\n\n"
+        "def middle(flag, limit):\n"
+        "    return leaf(flag, limit)\n\n"
+        "def root(flag, value, limit):\n"
+        "    bound = middle(flag, limit)\n"
+        "    result = value\n"
+        "    if bound is not None:\n"
+        "        result = min(result, bound)\n"
+        "    return result\n",
+        "root",
+        name="forwarded_authored_optional_payload",
+        extraction_contract=contract,
+    )
+
+    root = module.functions["forwarded_authored_optional_payload__root"]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(
+        tmp_path / "forwarded_authored_optional_payload", optimization="O0"
+    )
+    lowered = VehiclePythonSSALowering(module, root.name, outputs, exports)
+    result_id = outputs[root.name][0].id
+    for flag, expected in ((False, 2.0), (True, 0.5)):
+        feeds = _managed_native_feeds_by_id(
+            lowered, {"flag": flag, "value": 2.0, "limit": 0.5},
         )
         execution = artifact.prepare_execution(feeds).run()
         assert np.asarray(execution.buffers[result_id]).item() == expected
@@ -3698,7 +4324,8 @@ def test_loop_carried_call_record_is_expanded_on_public_return():
         "mass_err=0.0)\n"
         "    return metrics, value\n\n"
         "def root(value):\n"
-        "    last = None\n"
+        "    last = Metrics(max_vel=0.0, max_flux=0.0, div_inf=0.0, "
+        "mass_err=0.0)\n"
         "    result = value\n"
         "    index = 0\n"
         "    while index < 1:\n"
@@ -3719,8 +4346,17 @@ def test_loop_carried_call_record_is_expanded_on_public_return():
         if instruction.op == "Ret"
     )
     layouts = dict(root.metadata["record_return_layouts"])
-    assert len(layouts) == 1
-    assert len(returned) == 1 + len(next(iter(layouts.values())))
+    semantic_record_id = int(root.metadata["semantic_output_ids"][-1])
+    exit_fields = tuple(
+        int(instruction.res.id)
+        for instruction in root.blocks["while_exit"].instrs
+        if instruction.op == "Phi"
+        and instruction.attributes.get("binding") == "loop_result_port"
+        and instruction.attributes.get("record_field_phi")
+    )
+    assert exit_fields
+    assert layouts[semantic_record_id] == exit_fields
+    assert len(returned) == 1 + len(exit_fields)
     assert outputs[root.name] == tuple(returned)
     assert not root.metadata.get("unresolved_call_diagnostics")
     assert not any(
@@ -3728,6 +4364,99 @@ def test_loop_carried_call_record_is_expanded_on_public_return():
         for block in root.blocks.values()
         for instruction in block.instrs
     )
+
+
+def test_mixed_call_results_read_authored_projection_concordance():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def child(value):\n"
+        "    metrics = Metrics(max_vel=value, max_flux=value, div_inf=0.0, "
+        "mass_err=0.0)\n"
+        "    return metrics, value + 1.0, value + 2.0\n\n"
+        "def root(value):\n"
+        "    metrics = Metrics(max_vel=0.0, max_flux=0.0, div_inf=0.0, "
+        "mass_err=0.0)\n"
+        "    total = 0.0\n"
+        "    cap = value\n"
+        "    while total < value:\n"
+        "        metrics, dt_next, dt_used = child(value)\n"
+        "        total = total + dt_used\n"
+        "        cap = cap + dt_next\n"
+        "    return total, cap, metrics\n",
+        "root",
+        name="mixed_result_projection_concordance",
+        python_bindings={"Metrics": Metrics},
+        extraction_contract=CONTRACT,
+    )
+
+    root_name = "mixed_result_projection_concordance__root"
+    call_record = next(iter(module.call_table[root_name]))
+    book = module.metadata["identity_book"]
+    source_page = book.page("assignment_projection_source_concordance")
+    identity_page = book.page("call_result_projection_concordance")
+    transition_page = book.page("assignment_projection_identity_concordance")
+    source_rows = source_page.rows()
+    assert tuple(source_page.latest(row) for row in source_rows) == (
+        "metrics", "dt_next", "dt_used",
+    )
+    identity_rows = identity_page.scope_rows(int(call_record.callsite_id))
+    identity_facts = tuple(identity_page.latest(row) for row in identity_rows)
+    assert identity_facts == ((0,), (1,), (2,))
+    caller_result_ids = tuple(
+        int(caller_id) for _callee_id, caller_id in call_record.result_bindings
+    )
+    assert caller_result_ids == tuple(int(row[1]) for row in identity_rows)
+    transition_rows = tuple(
+        row for row in transition_page.scope_rows(root_name)
+        if int(row[1]) == int(call_record.callsite_id)
+    )
+    assert tuple(int(row[2]) for row in transition_rows) == (0, 1, 2)
+    transition_facts = tuple(
+        transition_page.latest(row) for row in transition_rows
+    )
+    assert tuple(fact[1] for fact in transition_facts) == (
+        "metrics", "dt_next", "dt_used",
+    )
+    assert caller_result_ids == tuple(int(fact[2]) for fact in transition_facts)
+
+
+def _discovered_projection_pair(value):
+    return value + 1.0, value + 2.0
+
+
+def _discovered_projection_unpack(value):
+    first, second = _discovered_projection_pair(value)
+    return first - second
+
+
+def test_discovered_dependency_destructuring_marks_concordance():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(value):\n"
+        "    return _discovered_projection_unpack(value)\n",
+        "root",
+        name="discovered_projection_concordance",
+        python_bindings={
+            "_discovered_projection_unpack": _discovered_projection_unpack,
+            "_discovered_projection_pair": _discovered_projection_pair,
+        },
+        extraction_contract=CONTRACT,
+    )
+
+    receipts = module.metadata["destructuring_assignment_normalization"]
+    receipt = next(
+        item for item in receipts
+        if item["scope"] == "_discovered_projection_unpack"
+    )
+    assert tuple(item[2] for item in receipt["projections"]) == (
+        "first", "second",
+    )
+    page = module.metadata["identity_book"].page(
+        "assignment_projection_identity_concordance"
+    )
+    rows = tuple(
+        row for row in page.rows()
+        if "_discovered_projection_unpack" in str(row[0])
+    )
+    assert tuple(int(row[2]) for row in rows) == (0, 1)
 
 
 def test_specialized_function_argument_is_erased_from_runtime_frame():

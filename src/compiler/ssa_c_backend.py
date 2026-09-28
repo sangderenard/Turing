@@ -804,11 +804,15 @@ class CStandaloneExecutable:
     final_outputs_path: Path
     entrypoint: str
 
-    def run(self, *, frames: int = 1) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, *, frames: int = 1, warmup: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
         if frames < 0:
             raise ValueError("native C shell frame count cannot be negative")
+        if warmup < 0:
+            raise ValueError("native C shell warmup count cannot be negative")
         return subprocess.run(
-            [str(self.executable_path), str(frames)],
+            [str(self.executable_path), str(frames), str(warmup)],
             cwd=str(self.directory),
             capture_output=True,
             text=True,
@@ -1155,6 +1159,7 @@ class CModuleArtifact:
             "#include <stdio.h>",
             "#include <stdlib.h>",
             "#include <string.h>",
+            "#include <time.h>",
             "",
             f"void {self.name}(void **buffers, long long *extents);",
             f"enum {{ BUFFER_COUNT = {len(self.buffer_order)} }};",
@@ -1186,14 +1191,29 @@ class CModuleArtifact:
             "    return 1;",
             "}",
             "",
+            "static double wall_seconds(void) {",
+            "    struct timespec instant;",
+            "    if (timespec_get(&instant, TIME_UTC) != TIME_UTC) return -1.0;",
+            "    return (double)instant.tv_sec + (double)instant.tv_nsec * 1.0e-9;",
+            "}",
+            "",
             "int main(int argc, char **argv) {",
             "    char *end = NULL;",
             "    unsigned long long frames = 1;",
+            "    unsigned long long warmup = 0;",
             "    if (argc > 1) {",
             "        errno = 0;",
             "        frames = strtoull(argv[1], &end, 10);",
             "        if (errno || !end || *end) {",
             "            fputs(\"invalid frame count\\n\", stderr);",
+            "            return 2;",
+            "        }",
+            "    }",
+            "    if (argc > 2) {",
+            "        errno = 0;",
+            "        warmup = strtoull(argv[2], &end, 10);",
+            "        if (errno || !end || *end) {",
+            "            fputs(\"invalid warmup count\\n\", stderr);",
             "            return 2;",
             "        }",
             "    }",
@@ -1219,8 +1239,16 @@ class CModuleArtifact:
             "    fclose(input);",
             f"    long long extents[{max(1, len(extent_values))}] = "
             f"{{{extent_literals}}};",
+            "    for (unsigned long long frame = 0; frame < warmup; ++frame)",
+            f"        {self.name}(buffers, extents);",
+            "    double started = wall_seconds();",
+            "    if (started < 0.0) {",
+            "        fputs(\"native wall clock unavailable\\n\", stderr);",
+            "        return 6;",
+            "    }",
             "    for (unsigned long long frame = 0; frame < frames; ++frame)",
             f"        {self.name}(buffers, extents);",
+            "    double elapsed = wall_seconds() - started;",
             "    FILE *output = fopen(output_path, \"wb\");",
             "    if (!output || !transfer_buffers(output, buffers, 1)) {",
             "        fputs(\"could not write complete final-outputs.bin\\n\", stderr);",
@@ -1228,7 +1256,10 @@ class CModuleArtifact:
             "    }",
             "    fclose(output);",
             "    for (size_t i = 0; i < BUFFER_COUNT; ++i) free(buffers[i]);",
-            f"    printf(\"entry={self.name} frames=%llu buffers=%d\\n\", frames, BUFFER_COUNT);",
+            f"    printf(\"entry={self.name} frames=%llu warmup=%llu buffers=%d elapsed_s=%.9f ns_per_frame=%.3f fps=%.6f\\n\",",
+            "        frames, warmup, BUFFER_COUNT, elapsed,",
+            "        frames ? elapsed * 1.0e9 / (double)frames : 0.0,",
+            "        elapsed > 0.0 ? (double)frames / elapsed : 0.0);",
             "    return 0;",
             "}",
             "",
@@ -1334,6 +1365,13 @@ _TRACE_HELPERS = (
     "        n > 0 ? p[0] : 0.0, n > 1 ? p[1] : 0.0, n > 2 ? p[2] : 0.0, n > 3 ? p[3] : 0.0, sum, nan_count);",
     "    fflush(turing_trace_stream);",
     "}",
+    "static void turing_trace_arr_full(const char *fn, const char *blk, const char *text, const double *p, long long n) {",
+    "    turing_trace_open(); if (!turing_trace_stream) return;",
+    "    fprintf(turing_trace_stream, \"%s | %s | %s = [n=%lld\", fn, blk, text, n);",
+    "    for (long long i = 0; i < n; ++i) fprintf(turing_trace_stream, \" [%lld]=%.17g\", i, p[i]);",
+    "    fprintf(turing_trace_stream, \"]\\n\");",
+    "    fflush(turing_trace_stream);",
+    "}",
 )
 
 
@@ -1354,6 +1392,7 @@ def emit_ssa_module_to_c(
     entry_name: str | None = None,
     watch: Sequence[int] = (),
     trace: bool = False,
+    trace_full_values: bool = False,
 ) -> CModuleArtifact:
     """Emit ``function_name`` and its call closure as one C module.
 
@@ -2413,11 +2452,85 @@ def emit_ssa_module_to_c(
                 or _is_integer_dtype(value.dtype)
             )
 
+        emission_context: dict[str, object | None] = {
+            "block": None,
+            "instruction": None,
+        }
+
+        def _operand_shortfall_detail(value, *, address: bool = False) -> str:
+            """Describe the physical SSA relation that emission could not bind.
+
+            Integer ids are not globally unique across composed repositories, so
+            the object identity and the integer-id candidates are both material
+            evidence.  Keep this diagnostic at the point where that distinction
+            is still available instead of reducing the failure to ``%tN``.
+            """
+
+            consumer = emission_context.get("instruction")
+            consumer_block = emission_context.get("block")
+
+            def describe_instruction(instruction) -> str:
+                result = (
+                    "-" if instruction.res is None
+                    else f"%t{int(instruction.res.id)}@{id(instruction.res):x}"
+                )
+                arguments = ",".join(
+                    f"%t{int(argument.id)}@{id(argument):x}"
+                    for argument in instruction.args
+                )
+                return f"{result}={instruction.op}({arguments})"
+
+            consumer_text = (
+                "outside-instruction"
+                if consumer is None
+                else describe_instruction(consumer)
+            )
+            same_object: list[str] = []
+            same_integer: list[str] = []
+            for candidate_block, candidate in (
+                (name, instruction)
+                for name, block in function.blocks.items()
+                for instruction in block.instrs
+                if instruction.res is not None
+            ):
+                description = (
+                    f"{candidate_block}:{describe_instruction(candidate)}"
+                )
+                if candidate.res is value:
+                    same_object.append(description)
+                if int(candidate.res.id) == int(value.id):
+                    same_integer.append(description)
+            formal_candidates = [
+                f"%t{int(formal.id)}@{id(formal):x}"
+                for formal in function.args
+                if int(formal.id) == int(value.id)
+            ]
+            accounting = dict(value.accounting or {})
+            provenance = {
+                key: accounting[key]
+                for key in sorted(accounting)
+                if key in {
+                    "abi_field", "binding", "origin", "parameter",
+                    "program_abi_field", "program_abi_parameter",
+                    "source", "source_id", "source_name",
+                }
+            }
+            need = "address" if address else "value"
+            return (
+                f"%t{value.id}@{id(value):x} has no {need} in {fn}; "
+                f"consumer={consumer_block}:{consumer_text}; "
+                f"dtype={value.dtype!s} shape={tuple(value.shape or ())!r}; "
+                f"object_producers={same_object!r}; "
+                f"id_producers={same_integer!r}; "
+                f"id_formals={formal_candidates!r}; "
+                f"provenance={provenance!r}"
+            )
+
         def operand(value) -> str | None:
             held = object_expressions.get(id(value), expressions.get(int(value.id)))
             if held is None:
                 shortfalls.append(CEmissionShortfall(
-                    "operand", f"%t{value.id} is unavailable in {fn}",
+                    "operand", _operand_shortfall_detail(value),
                 ))
             return held
 
@@ -2428,7 +2541,7 @@ def emit_ssa_module_to_c(
             )
             if held is None:
                 shortfalls.append(CEmissionShortfall(
-                    "operand", f"%t{value.id} has no address in {fn}",
+                    "operand", _operand_shortfall_detail(value, address=True),
                 ))
             return held
 
@@ -2654,7 +2767,37 @@ def emit_ssa_module_to_c(
             blk_text = _trace_text(block_name)
             text = _trace_text(instruction_text(instruction))
             if instruction.res is None:
-                if instruction.op in {"Call", "call", "Store", "store"}:
+                if instruction.op in {"Call", "call"}:
+                    lines = [
+                        f"        turing_trace_event({fn_text}, {blk_text}, "
+                        f"{text});"
+                    ]
+                    if trace_full_values:
+                        for index, argument in enumerate(instruction.args):
+                            if (
+                                str(argument.dtype or "") == "ssa.aggregate"
+                                or _pointer_value_depth(argument) > 0
+                            ):
+                                continue
+                            expression = object_expressions.get(
+                                id(argument), expressions.get(int(argument.id))
+                            )
+                            if expression is None:
+                                continue
+                            try:
+                                ctype = buffer_type(argument)
+                            except Exception:  # noqa: BLE001
+                                continue
+                            argument_text = _trace_text(
+                                f"{instruction_text(instruction)} "
+                                f"arg[{index}]=%t{int(argument.id)}"
+                            )
+                            lines.extend(value_trace_lines(
+                                fn_text, blk_text, argument_text,
+                                argument, expression, ctype,
+                            ))
+                    return lines
+                if instruction.op in {"Store", "store"}:
                     return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
                 return []
             result_id = int(instruction.res.id)
@@ -2699,13 +2842,17 @@ def emit_ssa_module_to_c(
             address = addresses.get(value_id)
             plain_local = bool(_re.fullmatch(r"t\d+", str(expression)))
             literal = bool(_re.fullmatch(r"-?\d+(\.\d*)?([eE][-+]?\d+)?|\d+\.\d*[eE][-+]?\d+|0x[0-9a-fA-F]+p?[-+]?\d*", str(expression)))
+            array_trace = (
+                "turing_trace_arr_full"
+                if trace_full_values else "turing_trace_arr"
+            )
             if ctype in {"double", "float"}:
                 if address is not None and (static or not shape):
-                    return [f"        turing_trace_arr({fn_text}, {blk_text}, {text}, (const double *)({address}), {count}LL);"]
+                    return [f"        {array_trace}({fn_text}, {blk_text}, {text}, (const double *)({address}), {count}LL);"]
                 if not shape and (plain_local or literal):
                     return [f"        turing_trace_f64({fn_text}, {blk_text}, {text}, (double)({expression}));"]
                 if not shape and "(double *)" in str(expression):
-                    return [f"        turing_trace_arr({fn_text}, {blk_text}, {text}, (const double *)({expression}), 1LL);"]
+                    return [f"        {array_trace}({fn_text}, {blk_text}, {text}, (const double *)({expression}), 1LL);"]
                 return [f"        turing_trace_event({fn_text}, {blk_text}, {text});"]
             if ctype in {"int64_t", "int32_t", "uint8_t", "int"}:
                 if not shape and (plain_local or literal):
@@ -2748,6 +2895,8 @@ def emit_ssa_module_to_c(
                 body.append("        turing_pool_effect_lock();")
             for position, instruction in enumerate(block.instrs):
                 flush_trace()
+                emission_context["block"] = block_name
+                emission_context["instruction"] = instruction
                 if trace_this_function:
                     pending_trace.append((instruction, block_name))
                 if block_is_guarded and position == len(block.instrs) - 1:
@@ -4895,6 +5044,7 @@ def emit_ssa_to_c(
     entry_name: str | None = None,
     watch: Sequence[int] = (),
     trace: bool = False,
+    trace_full_values: bool = False,
 ) -> CModuleArtifact:
     """Canonical C backend entry: preserve the complete repository module.
 
@@ -4905,7 +5055,7 @@ def emit_ssa_to_c(
 
     return emit_ssa_module_to_c(
         module, function_name, entry_name=entry_name, watch=watch,
-        trace=trace,
+        trace=trace, trace_full_values=trace_full_values,
     )
 
 

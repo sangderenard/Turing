@@ -3139,6 +3139,161 @@ def _prune_unused_callee_formals(
             return total
 
 
+def _reindex_frame_aliased_call_results(
+    functions: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Resolve a frame-aliased result against the final callee signature.
+
+    ``ssa_output_argument`` is an emitted-ABI position, not an identity.
+    Record construction and dead conceptual-formal pruning can move that
+    position after source-call linking. ``ssa_output_formal_id`` is the exact
+    callee-local identity established by the linker; derive the final position
+    from it at the completed-module seam and leave a receipt on the call.
+    """
+
+    receipts = []
+    for caller_name, caller in functions.items():
+        for block_name, block in caller.blocks.items():
+            for instruction in block.instrs:
+                if (
+                    instruction.op not in {"Call", "call"}
+                    or not instruction.attributes.get(
+                        "result_aliases_frame"
+                    )
+                ):
+                    continue
+                callee_name = str(
+                    instruction.attributes.get("callee") or ""
+                )
+                callee = functions.get(callee_name)
+                formal_id = instruction.attributes.get(
+                    "ssa_output_formal_id"
+                )
+                if callee is None or formal_id is None:
+                    continue
+                positions = tuple(
+                    index for index, formal in enumerate(callee.args)
+                    if int(formal.id) == int(formal_id)
+                )
+                if len(positions) != 1:
+                    raise ValueError(
+                        "frame-aliased result formal is absent or duplicated "
+                        "in the final callee signature: "
+                        f"caller={caller_name!r}, callee={callee_name!r}, "
+                        f"formal={int(formal_id)}, positions={positions!r}"
+                    )
+                old_position = instruction.attributes.get(
+                    "ssa_output_argument"
+                )
+                new_position = int(positions[0])
+                instruction.attributes["ssa_output_argument"] = new_position
+                if old_position == new_position:
+                    continue
+                receipt = {
+                    "caller": str(caller_name),
+                    "block": str(block_name),
+                    "callee": callee_name,
+                    "formal_id": int(formal_id),
+                    "old_position": int(old_position),
+                    "new_position": new_position,
+                    "reason": "final_callee_signature",
+                }
+                instruction.attributes[
+                    "ssa_output_argument_reindexed"
+                ] = receipt
+                receipts.append(receipt)
+    return tuple(receipts)
+
+
+def _reconcile_singleton_destructured_call_results(
+    functions: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Make the final linked Call define its exact singleton projection.
+
+    Source-call frame settlement is a fixed point.  A later round can rebuild
+    a linked call from its original PlanCall result even after the
+    destructuring concordance has proved that a one-member native return is
+    the authored ``temporary[0]`` target.  At the completed-module seam the
+    receipt is authoritative: move the Call definition to that exact target
+    and retire only its compiler-owned placeholder formal.
+    """
+
+    reconciled = []
+    for caller_name, caller in functions.items():
+        for receipt in caller.metadata.get(
+            "singleton_call_result_concordance", ()
+        ):
+            temporary_id = int(receipt["temporary_id"])
+            projected_id = int(receipt["projected_result_id"])
+            callsite_id = int(receipt["callsite_id"])
+            callee_name = str(receipt["callee"])
+            calls = tuple(
+                (block_name, instruction)
+                for block_name, block in caller.blocks.items()
+                for instruction in block.instrs
+                if instruction.op in {"Call", "call"}
+                and str(instruction.attributes.get("callee") or "")
+                == callee_name
+                and int(instruction.attributes.get(
+                    "plan_callsite_id", -1
+                )) == callsite_id
+            )
+            if len(calls) != 1:
+                continue
+            block_name, instruction = calls[0]
+            if (
+                instruction.res is None
+                or int(instruction.res.id) != temporary_id
+            ):
+                continue
+            exact_values = {
+                id(value): value
+                for value in (
+                    *caller.args,
+                    *(
+                        argument
+                        for block in caller.blocks.values()
+                        for candidate in block.instrs
+                        for argument in candidate.args
+                    ),
+                )
+                if int(value.id) == projected_id
+            }
+            projected = (
+                next(iter(exact_values.values()))
+                if len(exact_values) == 1
+                else type(instruction.res)(
+                    projected_id,
+                    dtype=instruction.res.dtype,
+                    shape=instruction.res.shape,
+                    device=instruction.res.device,
+                    accounting=dict(instruction.res.accounting or {}),
+                )
+            )
+            projected.dtype = instruction.res.dtype
+            projected.shape = tuple(instruction.res.shape or ())
+            projected.device = instruction.res.device
+            projected.accounting = {
+                **dict(projected.accounting or {}),
+                **dict(instruction.res.accounting or {}),
+            }
+            instruction.res = projected
+            row = {
+                "caller": str(caller_name),
+                "block": str(block_name),
+                "callee": callee_name,
+                "callsite_id": callsite_id,
+                "temporary_id": temporary_id,
+                "projected_result_id": projected_id,
+                "reason": "final_singleton_destructuring_concordance",
+            }
+            instruction.attributes[
+                "singleton_result_reconciled"
+            ] = row
+            reconciled.append(row)
+    return tuple(reconciled)
+
+
 def _prune_unused_callee_formals_once(
     functions: Mapping[str, Any],
     call_records: Mapping[str, list[Any]] | None = None,
@@ -3274,6 +3429,20 @@ def _prune_unused_callee_formals_once(
             ) == "unused"
         }
         for call in callers:
+            old_output_position = call.attributes.get(
+                "ssa_output_argument"
+            )
+            output_formal_id = call.attributes.get(
+                "ssa_output_formal_id"
+            )
+            if (
+                output_formal_id is None
+                and old_output_position is not None
+                and 0 <= int(old_output_position) < original_arity
+            ):
+                output_formal_id = int(
+                    callee.args[int(old_output_position)].id
+                )
             if len(call.args) < original_arity:
                 declared_inputs = tuple(
                     call.attributes.get("callee_input_ids") or ()
@@ -3307,6 +3476,36 @@ def _prune_unused_callee_formals_once(
                 call.attributes[attribute_name] = tuple(
                     values[index] for index in keep_indices
                 )
+            if output_formal_id is not None:
+                output_positions = tuple(
+                    new_index
+                    for new_index, old_index in enumerate(keep_indices)
+                    if int(callee.args[old_index].id)
+                    == int(output_formal_id)
+                )
+                if len(output_positions) != 1:
+                    raise ValueError(
+                        "pruning removed or duplicated the exact frame-"
+                        "aliased result formal: "
+                        f"callee={callee_name!r}, "
+                        f"formal={int(output_formal_id)}, "
+                        f"positions={output_positions!r}"
+                    )
+                new_output_position = int(output_positions[0])
+                call.attributes["ssa_output_formal_id"] = int(
+                    output_formal_id
+                )
+                call.attributes["ssa_output_argument"] = (
+                    new_output_position
+                )
+                if old_output_position != new_output_position:
+                    call.attributes[
+                        "ssa_output_argument_reindexed"
+                    ] = (
+                        int(old_output_position), new_output_position,
+                        int(output_formal_id),
+                        "pruned_callee_formal_concordance",
+                    )
         callee.args = [callee.args[index] for index in keep_indices]
         integral = dict(metadata.get("source_region_integral") or {})
         if integral.get("capture_value_ids") is not None:
@@ -3390,13 +3589,13 @@ def _lower_planned_region_record_projection_captures(
     functions: Mapping[str, Any],
     record_tables: Mapping[str, Any],
 ) -> int:
-    """Pass proven scalar record fields into numerical regions explicitly.
+    """Pass proven physical record fields into numerical regions explicitly.
 
     A planned numerical region cannot interpret a conceptual Python record
     handle.  Late record linking can nevertheless leave an initial-state
     ``getattr`` in such a region after the owner has already resolved that
-    projection to one physical scalar field.  Move that exact resident value
-    across the region boundary and replace the projection with a scalar cast.
+    projection to one physical scalar or span field.  Move that exact resident
+    value across the region boundary and replace the projection with a cast.
 
     The proof is deliberately closed: the region names one owner, every
     projection result reaches a finite owner alias chain, the call's receiver
@@ -3500,7 +3699,6 @@ def _lower_planned_region_record_projection_captures(
                 if (
                     receiver_position is None
                     or resident is None
-                    or tuple(resident.shape or ())
                 ):
                     continue
 
@@ -3551,7 +3749,10 @@ def _lower_planned_region_record_projection_captures(
                         resident_fields = tuple(
                             field.name for field in descriptor.fields
                             if (
-                                field.storage is SSARecordFieldStorage.SCALAR
+                                field.storage in {
+                                    SSARecordFieldStorage.SCALAR,
+                                    SSARecordFieldStorage.SPAN,
+                                }
                                 and resident_id in map(int, field.value_ids)
                             )
                         )
@@ -3561,7 +3762,10 @@ def _lower_planned_region_record_projection_captures(
                         field for field in (() if descriptor is None else descriptor.fields)
                         if (
                             field.name == attribute
-                            and field.storage is SSARecordFieldStorage.SCALAR
+                            and field.storage in {
+                                SSARecordFieldStorage.SCALAR,
+                                SSARecordFieldStorage.SPAN,
+                            }
                             and resident_id in map(int, field.value_ids)
                         )
                     )
@@ -3871,6 +4075,36 @@ def _record_field_read(graph: Any, node_id: Any, data: Mapping[str, Any]):
     )
 
 
+def _exact_structural_value_origin(graph_obj: Any, value_id: int) -> int:
+    """Follow only proved identity-return forwarding to its source value.
+
+    ``_fold_callsite_structural_values`` records an exact callee-return fact on
+    the call result.  A field read through ``alias = identity(record)`` is
+    therefore still a projection of the caller-owned record, not a new
+    anonymous storage location.  Resolve by value identity, and stop if a
+    value has no unique graph node or if a malformed cycle is encountered.
+    """
+
+    current = int(value_id)
+    visited: set[int] = set()
+    while current not in visited:
+        visited.add(current)
+        candidates = [
+            int(node_id)
+            for node_id, data in graph_obj.nodes(data=True)
+            if int(data.get("value_id", node_id)) == current
+        ]
+        if len(candidates) != 1:
+            break
+        forwarded = (
+            graph_obj.nodes[candidates[0]].get("attributes") or {}
+        ).get("structural_identity_actual_value_id")
+        if forwarded is None:
+            break
+        current = int(forwarded)
+    return current
+
+
 def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
     """Give each optional record field one explicit presence identity.
 
@@ -3958,7 +4192,13 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
                 if field_read is None:
                     continue
                 _result_id, owner_id, read_field = field_read
-                if read_field != str(field_name) or owner_id not in owner_ids:
+                owner_origin = _exact_structural_value_origin(
+                    graph, int(owner_id)
+                )
+                if (
+                    read_field != str(field_name)
+                    or owner_origin not in owner_ids
+                ):
                     continue
                 for compare_id in tuple(graph.successors(getter_id)):
                     compare = graph.nodes[compare_id]
@@ -9681,16 +9921,29 @@ def _attach_graph_control_expressions(
         CallBlock, ConditionalBlock, LoopBlock, SequenceBlock, WhileBlock,
     )
 
+    def owns_optional_presence(expression: Any) -> bool:
+        if expression is None:
+            return False
+        return (
+            str(expression.op) == "optional_presence"
+            or any(owns_optional_presence(item) for item in expression.operands)
+        )
+
     def attach(block):
         if isinstance(block, ConditionalBlock):
+            predicate_expression = (
+                block.predicate_expression
+                if owns_optional_presence(block.predicate_expression)
+                else _graph_control_expression(
+                    graph_obj, int(block.predicate_value_id),
+                    resident=resident,
+                )
+            )
             return replace(
                 block,
                 body=attach(block.body),
                 orelse=(None if block.orelse is None else attach(block.orelse)),
-                predicate_expression=_graph_control_expression(
-                    graph_obj, int(block.predicate_value_id),
-                    resident=resident,
-                ),
+                predicate_expression=predicate_expression,
             )
         if isinstance(block, SequenceBlock):
             return replace(
@@ -15362,6 +15615,13 @@ def _class_surface_ssa_program(
 
     program_started = time.monotonic()
     previous_report = program_started
+    assignment_projections = tuple(
+        (str(getattr(receipt, "scope", "<module>")), *tuple(item))
+        for receipt in getattr(
+            compilation, "assignment_normalization", ()
+        )
+        for item in getattr(receipt, "projections", ())
+    )
 
     def report(message: str) -> None:
         nonlocal previous_report
@@ -15405,6 +15665,23 @@ def _class_surface_ssa_program(
     # fact settled later, both about the same numbered value, land on pages
     # that can be read against each other.
     module_metadata["identity_book"] = current_identity_book()
+    # Destructuring normalization is the operation that establishes which
+    # authored target each evaluate-once aggregate position denotes.  Publish
+    # that fact when the normalized source enters this compile; later stages
+    # may attach SSA identities to it, but must not rediscover the relation
+    # from graph traversal order.
+    assignment_projection_source = module_metadata["identity_book"].page(
+        "assignment_projection_source_concordance"
+    )
+    for source_scope, aggregate_name, projection, target_name in (
+        assignment_projections
+    ):
+        assignment_projection_source.concord(
+            (
+                str(source_scope), str(aggregate_name), int(projection),
+            ),
+            str(target_name),
+        )
     argument_binding_page = module_metadata["identity_book"].page(
         "argument_binding"
     )
@@ -15597,12 +15874,12 @@ def _class_surface_ssa_program(
                 )
                 field = dict(fields.get(field_name) or {})
                 if not field or not any(
-                    (
-                        int(parent) in owner_ids
-                        or int(planned_graph.nodes[parent].get(
+                    _exact_structural_value_origin(
+                        planned_graph,
+                        int(planned_graph.nodes[parent].get(
                             "value_id", parent
-                        )) in owner_ids
-                    )
+                        )),
+                    ) in owner_ids
                     and str(role) in {"value", "object", "base", "receiver"}
                     for parent, role in data.get("parents") or ()
                     if parent in planned_graph
@@ -15617,6 +15894,7 @@ def _class_surface_ssa_program(
                     str(record.get("identity") or parameter_name),
                     str(field_name),
                 )
+                contract["program_abi_parameter"] = str(parameter_name)
                 if (
                     contract.get("shape") is None
                     and field.get("fixed_length") is not None
@@ -15845,6 +16123,8 @@ def _class_surface_ssa_program(
                     ))
             field_identity_key = "program_abi_field_identity"
             ambiguous_field_key = "program_abi_field_identity_ambiguous"
+            parameter_owner_key = "program_abi_parameter"
+            ambiguous_parameter_key = "program_abi_parameter_ambiguous"
             if source.get(ambiguous_field_key):
                 if (
                     existing.pop(field_identity_key, None) is not None
@@ -15852,8 +16132,15 @@ def _class_surface_ssa_program(
                 ):
                     existing[ambiguous_field_key] = True
                     changed = True
+            if source.get(ambiguous_parameter_key):
+                if (
+                    existing.pop(parameter_owner_key, None) is not None
+                    or not existing.get(ambiguous_parameter_key)
+                ):
+                    existing[ambiguous_parameter_key] = True
+                    changed = True
             for key, value in source.items():
-                if key == ambiguous_field_key:
+                if key in {ambiguous_field_key, ambiguous_parameter_key}:
                     continue
                 if key == field_identity_key:
                     if existing.get(ambiguous_field_key):
@@ -15865,6 +16152,18 @@ def _class_surface_ssa_program(
                     elif tuple(incumbent) != tuple(value):
                         existing.pop(key, None)
                         existing[ambiguous_field_key] = True
+                        changed = True
+                    continue
+                if key == parameter_owner_key:
+                    if existing.get(ambiguous_parameter_key):
+                        continue
+                    incumbent = existing.get(key)
+                    if incumbent is None:
+                        existing[key] = value
+                        changed = True
+                    elif str(incumbent) != str(value):
+                        existing.pop(key, None)
+                        existing[ambiguous_parameter_key] = True
                         changed = True
                     continue
                 if key not in existing:
@@ -17796,12 +18095,12 @@ def _class_surface_ssa_program(
                 )
                 field = dict(fields_by_name.get(field_name) or {})
                 if not field or not any(
-                    (
-                        int(parent) in owner_ids
-                        or int(graph_obj.nodes[parent].get(
+                    _exact_structural_value_origin(
+                        graph_obj,
+                        int(graph_obj.nodes[parent].get(
                             "value_id", parent
-                        )) in owner_ids
-                    )
+                        )),
+                    ) in owner_ids
                     and str(role) in {"value", "object", "base", "receiver"}
                     for parent, role in data.get("parents") or ()
                     if parent in graph_obj
@@ -18343,6 +18642,11 @@ def _class_surface_ssa_program(
                     )
                     accounting.setdefault(
                         "program_abi_field", str(field_name),
+                    )
+                if contract.get("program_abi_parameter") is not None:
+                    accounting.setdefault(
+                        "program_abi_parameter",
+                        str(contract["program_abi_parameter"]),
                     )
                 if contract.get("storage") is not None:
                     accounting.setdefault(
@@ -20904,16 +21208,61 @@ def _class_surface_ssa_program(
                     for recovered in reversed(insertions):
                         if recovered.res is None:
                             continue
-                        uses = [
-                            (candidate_block, offset, candidate)
-                            for candidate_block in function.blocks.values()
-                            for offset, candidate in enumerate(candidate_block.instrs)
-                            if id(candidate) not in insertion_objects
-                            and any(
-                                int(argument.id) == int(recovered.res.id)
-                                for argument in candidate.args
-                            )
-                        ]
+                        uses = []
+                        for candidate_block in function.blocks.values():
+                            for offset, candidate in enumerate(
+                                candidate_block.instrs
+                            ):
+                                if id(candidate) in insertion_objects:
+                                    continue
+                                matching_positions = tuple(
+                                    position
+                                    for position, argument in enumerate(
+                                        candidate.args
+                                    )
+                                    if int(argument.id) == int(
+                                        recovered.res.id
+                                    )
+                                )
+                                if not matching_positions:
+                                    continue
+                                if str(candidate.op).casefold() == "phi":
+                                    # A Phi does not consume its arguments in
+                                    # its own block. Each operand is read on
+                                    # the corresponding predecessor edge. A
+                                    # recovered definition placed immediately
+                                    # before the Phi is therefore too late and
+                                    # creates a use-before-def in the outgoing
+                                    # predecessor (the optional receiver field
+                                    # selected by an IfExp exposed this).
+                                    incoming = tuple(
+                                        candidate.attributes.get(
+                                            "incoming_blocks", ()
+                                        )
+                                    )
+                                    edge_uses = []
+                                    for position in matching_positions:
+                                        if position >= len(incoming):
+                                            continue
+                                        edge_block = function.blocks.get(
+                                            str(incoming[position])
+                                        )
+                                        if edge_block is None:
+                                            continue
+                                        edge_uses.append((
+                                            edge_block,
+                                            max(len(edge_block.instrs) - 1, 0),
+                                            (
+                                                edge_block.instrs[-1]
+                                                if edge_block.instrs else None
+                                            ),
+                                        ))
+                                    if edge_uses:
+                                        uses.extend(edge_uses)
+                                        continue
+                                uses.append((
+                                    candidate_block, offset, candidate,
+                                ))
                         # A private structural value belongs immediately
                         # before its exact consumer.  When it feeds several
                         # control blocks there is no single consumer to sit
@@ -23229,11 +23578,35 @@ def _class_surface_ssa_program(
                 # ``ctrl`` in the caller with ``self`` in the callee without
                 # allocating a second receiver arena.
                 for parameter_id in sorted(parameter_ids):
-                    if int(parameter_id) in table.records:
-                        continue
+                    # A source-derived descriptor may already own this record
+                    # id with the physical payload view selected before
+                    # ProgramABI materialization. Preserve that incumbent
+                    # mapping and add the declared members it did not yet know
+                    # (notably an optional field's ``.__present`` slot).
+                    # Replacing an incumbent payload with a later GetAttr id
+                    # would discard the aggregate load relation; skipping the
+                    # descriptor entirely leaves method receivers without the
+                    # presence member and leases a private false Boolean.
+                    incumbent = table.records.get(int(parameter_id))
+                    incumbent_names = {
+                        field.name for field in (
+                            () if incumbent is None else incumbent.fields
+                        )
+                    }
+                    declared_surface = (
+                        tuple(fields)
+                        if incumbent is None
+                        else (
+                            *incumbent.fields,
+                            *(
+                                field for field in fields
+                                if field.name not in incumbent_names
+                            ),
+                        )
+                    )
                     table.register(SSARecordDescriptor(
                         int(parameter_id), str(record["identity"]),
-                        tuple(fields),
+                        tuple(declared_surface),
                     ))
         # A contract-bound method receiver is not an opaque class arena at the
         # native boundary.  Every written ``self`` field is a caller-owned
@@ -23858,7 +24231,13 @@ def _class_surface_ssa_program(
                         # marker therefore makes this a fixed-point terminal.
                         rebuilt.append(instruction)
                         continue
-                    if result_id in table.records or not instruction.args:
+                    if (
+                        not instruction.args
+                        or (
+                            result_id in table.records
+                            and attributes.get("record_loop_phi") is None
+                        )
+                    ):
                         rebuilt.append(instruction)
                         continue
                     incoming = tuple(
@@ -24037,7 +24416,73 @@ def _class_surface_ssa_program(
                                 f"concordance_layout={incumbent_layout!r}, "
                                 f"phi_layout={layout!r}"
                             )
-                    table.register(merged_descriptor)
+                    if (
+                        attributes.get("record_loop_phi") is not None
+                        and result_id in table.records
+                    ):
+                        incumbent = table.records[result_id]
+                        schema = lambda descriptor: (
+                            str(descriptor.identity),
+                            tuple(sorted(
+                                (
+                                    str(field.name), field.storage,
+                                    str(field.storage_identity),
+                                    len(field.value_ids), field.offset,
+                                    field.dtype,
+                                )
+                                for field in descriptor.fields
+                            )),
+                        )
+                        if schema(incumbent) != schema(merged_descriptor):
+                            raise ValueError(
+                                "loop record Phi changed the record schema: "
+                                f"symbol={symbol!r}, result={result_id}, "
+                                f"incumbent={schema(incumbent)!r}, "
+                                f"merged={schema(merged_descriptor)!r}"
+                            )
+                        old_physical_layout = tuple(
+                            int(value_id)
+                            for field in incumbent.fields
+                            for value_id in field.value_ids
+                        )
+                        transition_page = current_identity_book().page(
+                            "loop_record_layout_concordance"
+                        )
+                        transition_row = (
+                            str(symbol),
+                            int(attributes["source_loop_node_id"]),
+                            result_id,
+                        )
+                        transition_claim = (
+                            old_physical_layout,
+                            tuple(merged_layout),
+                            "record_loop_phi",
+                        )
+                        incumbent_claim = transition_page.latest(
+                            transition_row
+                        )
+                        if incumbent_claim is None:
+                            transition_page.set(
+                                transition_row, 0, transition_claim
+                            )
+                            function.metadata.setdefault(
+                                "loop_record_layout_transitions", []
+                            ).append((transition_row, transition_claim))
+                        elif incumbent_claim != transition_claim:
+                            raise ValueError(
+                                "loop record layout concordance disagreement: "
+                                f"row={transition_row!r}, "
+                                f"concordance={incumbent_claim!r}, "
+                                f"candidate={transition_claim!r}"
+                            )
+                        # The semantic record id persists while its physical
+                        # members advance through the loop-exit Phi.  Direct
+                        # assignment is the table's sanctioned revision path:
+                        # _BookRows appends record_descriptor history and
+                        # revises every record_member claim in lockstep.
+                        table.records[result_id] = merged_descriptor
+                    else:
+                        table.register(merged_descriptor)
                     layouts[result_id] = tuple(merged_layout)
                     changed = True
                 block.instrs = rebuilt
@@ -24081,7 +24526,6 @@ def _class_surface_ssa_program(
                     instruction.args[start:start + len(old_layout)] = [
                         current_values[value_id] for value_id in new_layout
                     ]
-
     def materialize_loop_record_phis(symbol: str) -> None:
         """Create fieldwise Phis for an exact record assignment in a loop.
 
@@ -24272,8 +24716,8 @@ def _class_surface_ssa_program(
                         projected_updated_id,
                         result_id,
                         discarded_fields,
-                        "incumbent_schema",
-                        "incumbent_on_equal_priority",
+                        "authored_loop_carried_schema",
+                        "exact_source_loop_result",
                     ))
 
                 header_name = next((
@@ -24383,7 +24827,7 @@ def _class_surface_ssa_program(
                     loop_id, result_id, updated_id, header_record_id,
                     old_layout,
                     "exact_call_record_loop_phi",
-                    "incumbent_on_equal_priority",
+                    "exact_source_loop_result",
                 ))
                 completed.add(key)
         if receipts:
@@ -25808,6 +26252,61 @@ def _class_surface_ssa_program(
         symbol: link_order_page.concord((str(artifact_name), symbol), rank)
         for symbol, rank in link_rank.items()
     }
+    projection_identity_page = current_identity_book().page(
+        "call_result_projection_concordance"
+    )
+    assignment_projection_identity_page = current_identity_book().page(
+        "assignment_projection_identity_concordance"
+    )
+    for (
+        caller_symbol, planned_call, caller_graph, _module, _caller_shell
+    ) in pending_call_records:
+        callsite_id = int(planned_call.callsite_id)
+        identities = caller_graph.graph.get("identity_table") or {}
+        caller_source_scopes = {
+            str(value)
+            for key in ("function_name", "qualified_name")
+            for value in (caller_graph.graph.get(key),)
+            if value
+        }
+        caller_projections = {
+            int(path[0]): int(row[1])
+            for row in projection_identity_page.scope_rows(callsite_id)
+            for path in (projection_identity_page.latest(row),)
+            if (
+                isinstance(row, tuple) and len(row) == 2
+                and path and len(path) == 1
+            )
+        }
+        for source_row in assignment_projection_source.rows():
+            if not (isinstance(source_row, tuple) and len(source_row) == 3):
+                continue
+            source_scope, aggregate_name, projection = source_row
+            if not any(
+                str(source_scope) == candidate
+                or str(source_scope).endswith("." + candidate)
+                or candidate.endswith("." + str(source_scope))
+                for candidate in caller_source_scopes
+            ):
+                continue
+            if callsite_id not in set(map(
+                int, identities.get(str(aggregate_name), ()),
+            )):
+                continue
+            target_name = assignment_projection_source.latest(source_row)
+            target_history = tuple(map(
+                int, identities.get(str(target_name), ()),
+            ))
+            caller_projection_id = caller_projections.get(int(projection))
+            if caller_projection_id is None or not target_history:
+                continue
+            assignment_projection_identity_page.concord(
+                (str(caller_symbol), callsite_id, int(projection)),
+                (
+                    str(aggregate_name), str(target_name),
+                    int(caller_projection_id), target_history,
+                ),
+            )
     from ..transmogrifier.ssa import SSACallTable
 
     # The linker's call records are stored on the identity book; every
@@ -27810,9 +28309,15 @@ def _class_surface_ssa_program(
                         "value", "object", "base", "operand",
                     }
                 ), None)
-                descriptor = (
+                receiver_origin_id = (
                     None if receiver_id is None
-                    else descriptors_by_owner.get(int(receiver_id))
+                    else _exact_structural_value_origin(
+                        graph, int(receiver_id)
+                    )
+                )
+                descriptor = (
+                    None if receiver_origin_id is None
+                    else descriptors_by_owner.get(int(receiver_origin_id))
                 )
                 attribute = str(
                     (data.get("attributes") or {}).get("attribute") or ""
@@ -28920,10 +29425,115 @@ def _class_surface_ssa_program(
                     semantic_output_ids = tuple(map(
                         int, callee.metadata.get("semantic_output_ids", ())
                     ))
+                    # Process-graph scheduling is free to enumerate the
+                    # projections of an evaluate-once destructuring temporary
+                    # in dependency order.  That order is not the Python
+                    # return contract.  The concordance page carries the
+                    # authored path with its exact caller projection identity,
+                    # so restore that order before pairing caller bindings
+                    # with the callee's semantic outputs.
+                    # Without this, a mixed ``record, scalar, scalar`` return
+                    # can exchange the two scalar identities when their first
+                    # consumers happen to schedule in the opposite order.
+                    projection_groups: dict[str, dict[int, int]] = {}
+                    for row in assignment_projection_identity_page.scope_rows(
+                        str(caller_symbol)
+                    ):
+                        if not (
+                            isinstance(row, tuple)
+                            and len(row) == 3
+                            and int(row[1]) == int(record.callsite_id)
+                        ):
+                            continue
+                        _scope, _callsite_id, projection = row
+                        fact = assignment_projection_identity_page.latest(row)
+                        if not (
+                            isinstance(fact, tuple) and len(fact) == 4
+                        ):
+                            continue
+                        aggregate_name, _target_name, projection_id, history = fact
+                        projection_groups.setdefault(
+                            str(aggregate_name), {}
+                        ).update(
+                            (int(value_id), int(projection))
+                            for value_id in {
+                                int(projection_id), *map(int, history),
+                            }
+                        )
+                    ordered_result_bindings = tuple(record.result_bindings)
+                    matching_projection_orders = []
+                    for aggregate_name, projections in (
+                        projection_groups.items()
+                    ):
+                        positions: list[int | None] = []
+                        for _callee_id, caller_id in record.result_bindings:
+                            positions.append(projections.get(int(caller_id)))
+                        known_positions = {
+                            int(position) for position in positions
+                            if position is not None
+                        }
+                        missing_bindings = [
+                            index for index, position in enumerate(positions)
+                            if position is None
+                        ]
+                        missing_positions = set(range(len(positions))).difference(
+                            known_positions
+                        )
+                        # A record-valued projection can already have become
+                        # its physical field aggregate while scalar siblings
+                        # retain their exact source projection ids.  When the
+                        # concorded siblings leave one and only one unmatched
+                        # binding and position, that pair is the unique
+                        # completion of the authored relation.  More than one
+                        # missing pair is ambiguous and remains untouched.
+                        if (
+                            len(missing_bindings) == 1
+                            and len(missing_positions) == 1
+                            and known_positions
+                        ):
+                            positions[missing_bindings[0]] = (
+                                next(iter(missing_positions))
+                            )
+                        if (
+                            len(positions) == len(record.result_bindings)
+                            and all(position is not None for position in positions)
+                            and len(set(positions)) == len(positions)
+                            and set(positions) == set(range(len(positions)))
+                        ):
+                            matching_projection_orders.append((
+                                str(aggregate_name), tuple(map(int, positions))
+                            ))
+                    if len(matching_projection_orders) == 1:
+                        aggregate_name, positions = (
+                            matching_projection_orders[0]
+                        )
+                        ordered_result_bindings = tuple(
+                            binding for _position, binding in sorted(zip(
+                                positions,
+                                record.result_bindings,
+                                strict=True,
+                            ))
+                        )
+                        if ordered_result_bindings != tuple(
+                            record.result_bindings
+                        ):
+                            receipt = {
+                                "callsite_id": int(record.callsite_id),
+                                "callee": str(record.callee_symbol),
+                                "aggregate": aggregate_name,
+                                "before": tuple(record.result_bindings),
+                                "after": ordered_result_bindings,
+                                "authority": "assignment_projection_identity",
+                            }
+                            receipts = caller.metadata.setdefault(
+                                "destructured_call_result_concordance", []
+                            )
+                            if receipt not in receipts:
+                                receipts.append(receipt)
                     if (
                         semantic_output_ids
                         and len(semantic_output_ids)
-                        == len(record.result_bindings)
+                        == len(ordered_result_bindings)
                     ):
                         # Source-call result bindings and callee-local SSA use
                         # independent numeric namespaces. Their ordered
@@ -28936,7 +29546,7 @@ def _class_surface_ssa_program(
                                 (int(callee_id), int(caller_id))
                                 for callee_id, (_old_id, caller_id) in zip(
                                     semantic_output_ids,
-                                    record.result_bindings,
+                                    ordered_result_bindings,
                                     strict=True,
                                 )
                             ),
@@ -29907,6 +30517,174 @@ def _class_surface_ssa_program(
                         record, frame_bindings=tuple(distinct_bindings)
                     )
                 caller_value_aliases = _concordant_function_aliases(caller)
+
+                # Destructuring normalization spells a singleton call as
+                #
+                #   __turing_assignment_value_N = callee(...)
+                #   authored_name = __turing_assignment_value_N[0]
+                #
+                # A repository callee with one physical Ret has already
+                # flattened that one-member Python tuple.  Its PlanCall still
+                # names the evaluate-once temporary, while all authored uses
+                # name the exact indexed projection.  If that projection is
+                # not concorded here it is mistaken for caller-owned frame
+                # storage: the native result is written to a dead temporary
+                # and the following operation reads an uninitialised formal.
+                #
+                # Restrict this to compiler-authored temporaries and an exact
+                # literal-zero projection of a sole physical result.  An
+                # authored ``array[0]`` is therefore still an element load,
+                # not a flattened call result.
+                if (
+                    len(record.result_bindings) == 1
+                    and len(callee_outputs) == 1
+                ):
+                    callee_result_id, caller_result_id = (
+                        record.result_bindings[0]
+                    )
+                    value_names = {
+                        int(value_id): str(name)
+                        for name, value_id in caller.metadata.get(
+                            "value_names", ()
+                        )
+                    }
+                    temporary_name = value_names.get(
+                        int(caller_result_id), ""
+                    )
+                    if temporary_name.startswith(
+                        "__turing_assignment_value_"
+                    ):
+                        receipt_targets = tuple(
+                            target_name
+                            for (
+                                _source_scope, aggregate_name, projection,
+                                target_name,
+                            )
+                            in assignment_projections
+                            if aggregate_name == temporary_name
+                            and int(projection) == 0
+                        )
+                        receipt_projection_ids = tuple(
+                            int(value_id)
+                            for target_name in receipt_targets
+                            for name, value_id in caller.metadata.get(
+                                "value_names", ()
+                            )
+                            if str(name) == str(target_name)
+                        )
+                        aggregate_node_id = caller_node_by_value.get(
+                            int(caller_result_id), int(caller_result_id)
+                        )
+                        projection_ids: set[int] = set()
+                        if (
+                            caller_graph is not None
+                            and aggregate_node_id in caller_graph
+                        ):
+                            aggregate_node = caller_graph.nodes[
+                                aggregate_node_id
+                            ]
+                            projection_ids.update(map(
+                                int,
+                                caller_graph.successors(aggregate_node_id),
+                            ))
+                            projection_ids.update(
+                                int(child_id)
+                                for child_id, _role
+                                in aggregate_node.get("children", ())
+                            )
+                            projection_ids.update(
+                                int(node_id)
+                                for node_id, data
+                                in caller_graph.nodes(data=True)
+                                if any(
+                                    int(parent_id) == aggregate_node_id
+                                    and str(role) == "base"
+                                    for parent_id, role
+                                    in data.get("parents", ())
+                                )
+                            )
+                        singleton_projections = []
+                        # The AST spelling is the strongest receipt here. The
+                        # reduced graph may interpose the temporary's Name
+                        # node between the call value and Subscript node, so a
+                        # successor-only search is insufficient.
+                        for projection_id, projection in (() if caller_graph is None else
+                            caller_graph.nodes(data=True)
+                        ):
+                            expression = projection.get("expr_obj")
+                            if not (
+                                isinstance(expression, ast.Subscript)
+                                and isinstance(expression.value, ast.Name)
+                                and expression.value.id == temporary_name
+                            ):
+                                continue
+                            literal = expression.slice
+                            if isinstance(literal, ast.Constant):
+                                literal = literal.value
+                            if literal == 0 and not isinstance(literal, bool):
+                                singleton_projections.append(int(
+                                    projection.get(
+                                        "value_id", projection_id
+                                    )
+                                ))
+                        for projection_id in projection_ids:
+                            if (
+                                caller_graph is None
+                                or projection_id not in caller_graph
+                            ):
+                                continue
+                            projection = caller_graph.nodes[projection_id]
+                            if str(
+                                projection.get("op")
+                                or projection.get("type")
+                                or ""
+                            ).casefold() not in {"indexed", "subscript"}:
+                                continue
+                            index_ids = tuple(
+                                int(parent)
+                                for parent, role
+                                in projection.get("parents") or ()
+                                if str(role) in {"index", "slice"}
+                            )
+                            if len(index_ids) != 1 or (
+                                index_ids[0] not in caller_graph
+                            ):
+                                continue
+                            index_node = caller_graph.nodes[index_ids[0]]
+                            literal = index_node.get("constant")
+                            if literal is None:
+                                literal = (
+                                    index_node.get("attributes") or {}
+                                ).get("value")
+                            if literal == 0 and not isinstance(literal, bool):
+                                singleton_projections.append(int(
+                                    projection.get(
+                                        "value_id", projection_id
+                                    )
+                                ))
+                        singleton_projections = sorted(set(
+                            (*receipt_projection_ids, *singleton_projections)
+                        ))
+                        if len(singleton_projections) == 1:
+                            projected_result_id = singleton_projections[0]
+                            record = replace(record, result_bindings=((
+                                int(callee_result_id), projected_result_id,
+                            ),))
+                            receipt = {
+                                "callsite_id": int(record.callsite_id),
+                                "callee": str(record.callee_symbol),
+                                "temporary_id": int(caller_result_id),
+                                "projected_result_id": projected_result_id,
+                                "reason": (
+                                    "compiler_normalized_singleton_"
+                                    "destructuring"
+                                ),
+                            }
+                            receipts = caller.metadata.setdefault(
+                                "singleton_call_result_concordance", []
+                            )
+                            if receipt not in receipts:
+                                receipts.append(receipt)
 
                 def physical_caller_storage(value_id: int) -> int:
                     current = int(value_id)
@@ -31096,11 +31874,44 @@ def _class_surface_ssa_program(
                                         ),
                                     ))
                         else:
-                            result = values.get(int(caller_result_id), SSAValue(
-                                int(caller_result_id),
-                                dtype=callee_output.dtype,
-                                shape=callee_output.shape,
-                            ))
+                            result = values.get(int(caller_result_id))
+                            if (
+                                result is None
+                                or int(result.id) != int(caller_result_id)
+                            ):
+                                # The value ledger also indexes proven frame
+                                # aliases by their semantic ids.  A direct
+                                # scalar return is a definition of the exact
+                                # caller binding, not of the physical value
+                                # currently stored under that key.  Reuse the
+                                # exact placeholder already held by its
+                                # consumers when possible; otherwise mint the
+                                # same exact SSA identity here.  Mutable
+                                # aggregate returns that truly alias a frame
+                                # argument took the branch above.
+                                exact_arguments = tuple(
+                                    value for value in caller.args
+                                    if int(value.id) == int(caller_result_id)
+                                )
+                                exact_operands = {
+                                    id(value): value
+                                    for block in caller.blocks.values()
+                                    for instruction in block.instrs
+                                    for value in instruction.args
+                                    if int(value.id) == int(caller_result_id)
+                                }
+                                result = (
+                                    exact_arguments[0]
+                                    if len(exact_arguments) == 1
+                                    else next(iter(exact_operands.values()))
+                                    if len(exact_operands) == 1
+                                    else SSAValue(
+                                        int(caller_result_id),
+                                        dtype=callee_output.dtype,
+                                        shape=callee_output.shape,
+                                    )
+                                )
+                            values[int(caller_result_id)] = result
                         # The caller-side placeholder may predate source-call
                         # linking and therefore carry no useful type.  A
                         # resolved call's physical result contract is the
@@ -31196,6 +32007,15 @@ def _class_surface_ssa_program(
                                 "ssa_output_argument": int(
                                     aliased_return_argument_index
                                 ),
+                                # The position is only the current physical
+                                # spelling. Conceptual-record pruning can
+                                # remove earlier formals. Retain the exact
+                                # callee SSA identity so that transaction can
+                                # rederive the position instead of leaving a
+                                # stale integer naming another slot.
+                                "ssa_output_formal_id": int(callee.args[
+                                    int(aliased_return_argument_index)
+                                ].id),
                                 "result_aliases_frame": True,
                                 "semantic_result_id": int(caller_result_id),
                             } if aliased_return_argument_index is not None else {}),
@@ -31927,6 +32747,9 @@ def _class_surface_ssa_program(
             previous_loop_record_receipts = len(function.metadata.get(
                 "loop_record_phi_materializations", ()
             ))
+            previous_loop_layout_transitions = len(function.metadata.get(
+                "loop_record_layout_transitions", ()
+            ))
             materialize_loop_record_phis(function_name)
             materialize_record_phis(function_name)
             if (
@@ -31934,6 +32757,9 @@ def _class_surface_ssa_program(
                 or len(function.metadata.get(
                     "loop_record_phi_materializations", ()
                 )) != previous_loop_record_receipts
+                or len(function.metadata.get(
+                    "loop_record_layout_transitions", ()
+                )) != previous_loop_layout_transitions
             ):
                 changed = True
             # Loop-carried and loop-result ports are semantic aliases of their
@@ -35216,6 +36042,25 @@ def _class_surface_ssa_program(
                         for offset in range(len(layout))
                     ):
                         continue
+                    physical_layout = tuple(
+                        int(resolved_position_to_output[start + offset])
+                        for offset in range(len(layout))
+                    )
+                    if sorted(physical_layout) == sorted(caller_layout):
+                        # The fixed-point linker has already concorded every
+                        # physical field occurrence.  Record descriptors and
+                        # call ABI surfaces may enumerate those same slots in
+                        # different schema orders; order is not identity and
+                        # must not manufacture a permutation of aliases.
+                        all_functions[str(caller_symbol)].metadata.setdefault(
+                            "returned_record_concordant_surfaces", []
+                        ).append((
+                            int(call_record.callsite_id),
+                            int(callee_id), int(caller_id),
+                            caller_layout, physical_layout,
+                            "exact_physical_multiset",
+                        ))
+                        continue
                     reconciled = []
                     for offset, field_id in enumerate(caller_layout):
                         physical_id = int(
@@ -36958,6 +37803,7 @@ def _class_surface_ssa_program(
         legalize_aggregate_output_views,
         lower_tensor_calls_to_repository_ssa,
         propagate_repository_ssa_call_metadata,
+        settle_repository_ssa_static_extent_operands,
     )
     if tensor_ssa_reference is not None:
         late_tensor_functions = {
@@ -37111,6 +37957,330 @@ def _class_surface_ssa_program(
         lowered_module.metadata[
             "post_aggregate_frame_reconciliations"
         ] = tuple(post_aggregate_frame_reconciliations)
+
+    # Physical record/call legalization can materialize a pure field
+    # projection after control lowering has already built the Phi that reads
+    # it.  A Phi argument is consumed on its named predecessor edge, not in
+    # the merge block.  Consequently a projection inserted immediately before
+    # that Phi is a real use-before-definition even though textual order in
+    # the merge block looks plausible.  Relocate only a uniquely produced,
+    # edge-private, effect-free projection closure after proving that all of
+    # its external operands dominate the predecessor. Ambiguous/shared cases
+    # deliberately remain for the SSA checker/backend to reject.
+    phi_edge_projection_repairs = []
+    phi_edge_page = current_identity_book().page(
+        "phi_edge_projection_placement_concordance"
+    )
+    pure_projection_ops = {
+        "const", "cast", "getelementptr", "indexed", "gather", "load",
+    }
+    for function_name, function in lowered_module.functions.items():
+        if not function.blocks:
+            continue
+        entry_name = (
+            "entry" if "entry" in function.blocks
+            else next(iter(function.blocks))
+        )
+        cfg = nx.DiGraph()
+        cfg.add_nodes_from(function.blocks)
+        for block_name, block in function.blocks.items():
+            cfg.add_edges_from(
+                (str(block_name), str(successor))
+                for successor in block.successors
+                if successor in function.blocks
+            )
+        reachable = {entry_name, *nx.descendants(cfg, entry_name)}
+        immediate = nx.immediate_dominators(
+            cfg.subgraph(reachable), entry_name
+        )
+        immediate[entry_name] = entry_name
+
+        def dominates(owner: str, target: str) -> bool:
+            current = str(target)
+            while current in immediate:
+                if current == str(owner):
+                    return True
+                parent = immediate[current]
+                if parent == current:
+                    break
+                current = parent
+            return False
+
+        def locations():
+            return {
+                int(instruction.res.id): (block_name, index, instruction)
+                for block_name, block in function.blocks.items()
+                for index, instruction in enumerate(block.instrs)
+                if instruction.res is not None
+            }
+
+        changed = True
+        while changed:
+            changed = False
+            definitions = locations()
+            formal_ids = {int(argument.id) for argument in function.args}
+            producer_counts: dict[int, int] = {}
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.res is not None:
+                        value_id = int(instruction.res.id)
+                        producer_counts[value_id] = (
+                            producer_counts.get(value_id, 0) + 1
+                        )
+            for merge_name, merge in function.blocks.items():
+                for phi in tuple(merge.instrs):
+                    if str(phi.op).casefold() != "phi":
+                        continue
+                    incoming = tuple(
+                        phi.attributes.get("incoming_blocks", ())
+                    )
+                    for position, argument in enumerate(tuple(phi.args)):
+                        value_id = int(argument.id)
+                        if (
+                            position >= len(incoming)
+                            or value_id in formal_ids
+                            or producer_counts.get(value_id) != 1
+                        ):
+                            continue
+                        producer_location = definitions.get(value_id)
+                        predecessor_name = str(incoming[position])
+                        predecessor = function.blocks.get(predecessor_name)
+                        if (
+                            producer_location is None
+                            or predecessor is None
+                            or producer_location[0] != merge_name
+                            or str(producer_location[2].op).casefold()
+                            not in pure_projection_ops
+                        ):
+                            continue
+                        # Numeric equality is admitted only after unique
+                        # producer proof. This covers a control placeholder
+                        # and its later physical projection occurrence without
+                        # conflating independent planner namespaces.
+                        uses = [
+                            (
+                                candidate_block_name, candidate,
+                                candidate_position,
+                            )
+                            for candidate_block_name, candidate_block
+                            in function.blocks.items()
+                            for candidate in candidate_block.instrs
+                            for candidate_position, candidate_argument
+                            in enumerate(candidate.args)
+                            if int(candidate_argument.id) == value_id
+                        ]
+                        if not any(
+                            candidate is phi
+                            and candidate_position == position
+                            for _block_name, candidate, candidate_position
+                            in uses
+                        ):
+                            continue
+                        semantic_uses = []
+                        valid_uses = True
+                        for use_block_name, candidate, candidate_position in uses:
+                            if str(candidate.op).casefold() != "phi":
+                                semantic_uses.append((
+                                    str(use_block_name), candidate,
+                                ))
+                                continue
+                            candidate_incoming = tuple(
+                                candidate.attributes.get(
+                                    "incoming_blocks", ()
+                                )
+                            )
+                            if candidate_position >= len(candidate_incoming):
+                                valid_uses = False
+                                break
+                            edge_name = str(
+                                candidate_incoming[candidate_position]
+                            )
+                            edge = function.blocks.get(edge_name)
+                            if edge is None:
+                                valid_uses = False
+                                break
+                            semantic_uses.append((
+                                edge_name,
+                                edge.instrs[-1] if edge.instrs else None,
+                            ))
+                        if not valid_uses or not semantic_uses:
+                            continue
+                        use_block_names = {
+                            block_name for block_name, _consumer
+                            in semantic_uses
+                        }
+                        if len(use_block_names) == 1:
+                            placement_name = next(iter(use_block_names))
+                            placement_reason = "phi_predecessor_edge"
+                        else:
+                            producer_accounting = dict(
+                                producer_location[2].res.accounting or {}
+                            )
+                            if (
+                                producer_accounting.get(
+                                    "program_abi_field"
+                                ) is None
+                                or bool(producer_accounting.get(
+                                    "program_abi_field_written", False
+                                ))
+                            ):
+                                continue
+
+                            def dominator_chain(block_name: str) -> set[str]:
+                                chain = set()
+                                current = str(block_name)
+                                while current in immediate:
+                                    chain.add(current)
+                                    parent = immediate[current]
+                                    if parent == current:
+                                        break
+                                    current = parent
+                                return chain
+
+                            common = set.intersection(*(
+                                dominator_chain(block_name)
+                                for block_name in use_block_names
+                            ))
+                            if not common:
+                                continue
+
+                            def dominance_depth(block_name: str) -> int:
+                                depth = 0
+                                current = str(block_name)
+                                while current in immediate:
+                                    parent = immediate[current]
+                                    if parent == current:
+                                        return depth
+                                    depth += 1
+                                    current = parent
+                                return -1
+
+                            placement_name = max(
+                                common, key=dominance_depth
+                            )
+                            placement_reason = (
+                                "read_only_field_common_dominator"
+                            )
+                        placement = function.blocks.get(placement_name)
+                        if placement is None:
+                            continue
+                        closure_ids = {value_id}
+                        pending = [value_id]
+                        while pending:
+                            current_id = pending.pop()
+                            _owner, _index, current_instruction = definitions[
+                                current_id
+                            ]
+                            for dependency in current_instruction.args:
+                                dependency_id = int(dependency.id)
+                                dependency_location = definitions.get(
+                                    dependency_id
+                                )
+                                if (
+                                    dependency_location is not None
+                                    and dependency_location[0] == merge_name
+                                    and str(
+                                        dependency_location[2].op
+                                    ).casefold() in pure_projection_ops
+                                    and producer_counts.get(dependency_id) == 1
+                                    and dependency_id not in closure_ids
+                                ):
+                                    closure_ids.add(dependency_id)
+                                    pending.append(dependency_id)
+                        moving = [
+                            instruction
+                            for instruction in merge.instrs
+                            if instruction.res is not None
+                            and int(instruction.res.id) in closure_ids
+                        ]
+                        if not moving:
+                            continue
+                        external = {
+                            int(dependency.id)
+                            for instruction in moving
+                            for dependency in instruction.args
+                            if int(dependency.id) not in closure_ids
+                        }
+                        dependencies_dominate = True
+                        for dependency_id in external:
+                            if dependency_id in formal_ids:
+                                continue
+                            dependency_location = definitions.get(
+                                dependency_id
+                            )
+                            if (
+                                dependency_location is None
+                                or not dominates(
+                                    dependency_location[0], placement_name
+                                )
+                            ):
+                                dependencies_dominate = False
+                                break
+                        if not dependencies_dominate:
+                            continue
+                        terminator_index = (
+                            len(placement.instrs) - 1
+                            if placement.instrs and str(
+                                placement.instrs[-1].op
+                            ).casefold() in {
+                                "br", "condbr", "ret", "return"
+                            }
+                            else len(placement.instrs)
+                        )
+                        local_use_indices = [
+                            placement.instrs.index(consumer)
+                            for block_name, consumer in semantic_uses
+                            if block_name == placement_name
+                            and consumer is not None
+                            and consumer in placement.instrs
+                        ]
+                        insertion_index = min(
+                            (terminator_index, *local_use_indices)
+                        )
+                        local_dependency_indices = [
+                            dependency_location[1]
+                            for dependency_id in external
+                            for dependency_location in (
+                                definitions.get(dependency_id),
+                            )
+                            if dependency_location is not None
+                            and dependency_location[0] == placement_name
+                        ]
+                        if local_dependency_indices:
+                            insertion_index = max(
+                                insertion_index,
+                                max(local_dependency_indices) + 1,
+                            )
+                        if local_use_indices and insertion_index > min(
+                            local_use_indices
+                        ):
+                            continue
+                        merge.instrs = [
+                            instruction for instruction in merge.instrs
+                            if instruction not in moving
+                        ]
+                        placement.instrs[
+                            insertion_index:insertion_index
+                        ] = moving
+                        receipt = (
+                            str(function_name),
+                            None if phi.res is None else int(phi.res.id),
+                            int(position), predecessor_name, value_id,
+                            tuple(int(instruction.res.id) for instruction in moving),
+                            placement_name, placement_reason,
+                        )
+                        phi_edge_page.concord(receipt[:5], receipt[5:])
+                        phi_edge_projection_repairs.append(receipt)
+                        changed = True
+                        break
+                    if changed:
+                        break
+                if changed:
+                    break
+    if phi_edge_projection_repairs:
+        lowered_module.metadata[
+            "phi_edge_projection_repairs"
+        ] = tuple(phi_edge_projection_repairs)
     # A source return expression may be owned by a path-correlated numerical
     # region even though the synthesized physical return edge is later in the
     # CFG. Standard SSA cannot encode "this earlier branch necessarily ran
@@ -37310,6 +38480,9 @@ def _class_surface_ssa_program(
     from .ir_indexing import lower_indexing_to_ssa_addressing
 
     lower_indexing_to_ssa_addressing(lowered_module.functions)
+    lowered_module.metadata["final_static_extent_restamp"] = bool(
+        settle_repository_ssa_static_extent_operands(lowered_module)
+    )
 
     report(
         f"complete; functions={len(lowered_module.functions)} "
@@ -38019,6 +39192,7 @@ def _lower_resolved_process_graph_deployment(
     ] | None = None,
     subdivision_request: Mapping[str, Any] | None = None,
     allow_authored_source_callees: bool = False,
+    assignment_normalization: Iterable[Any] = (),
     progress: Callable[[str], None] | None = None,
 ):
     """Lower an already reduced ProcessGraph through the canonical backend path.
@@ -38275,6 +39449,7 @@ def _lower_resolved_process_graph_deployment(
     compilation = SimpleNamespace(
         deployment=deployment,
         class_navigation=build_class_navigation_table(graph),
+        assignment_normalization=tuple(assignment_normalization),
     )
     report("ssa-source: lowering full planned source to repository SSA")
     artifact_name = _identifier(str(name or entrypoint or "whole_source"))
@@ -39047,7 +40222,7 @@ def _lower_ast_source_to_ssa_impl(
             "direct tail-recursive call(s)"
         )
 
-    assignment_receipts = normalize_destructuring_assignments(tree)
+    assignment_receipts = list(normalize_destructuring_assignments(tree))
     if assignment_receipts:
         report(
             "ssa-source: normalized "
@@ -39279,6 +40454,7 @@ def _lower_ast_source_to_ssa_impl(
         boundary_namespace=boundary_namespace,
         source_language=source_language,
     )
+    graph.G.graph["assignment_normalization_receipts"] = assignment_receipts
     linked_process_graphs = {
         str(function_name): function_graph
         for function_name, function_graph in dict(
@@ -39298,6 +40474,19 @@ def _lower_ast_source_to_ssa_impl(
     graph.G.graph["external_class_field_aggregate_kinds"] = dict(
         external_class_field_aggregate_kinds or {}
     )
+
+    def normalize_discovered_destructuring(discovered_tree: ast.AST) -> None:
+        """Apply the same assignment operation to every pursued definition.
+
+        Parent ingestion parses dependency source after the entry module was
+        normalized.  Its destructuring must publish receipts into this same
+        compilation transaction before ProcessGraph construction, otherwise
+        call projections in dependencies have no authored target identity.
+        """
+
+        receipts = normalize_destructuring_assignments(discovered_tree)
+        assignment_receipts.extend(receipts)
+
     report("ssa-source: building complete ProcessGraph source closure")
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(
@@ -39319,6 +40508,7 @@ def _lower_ast_source_to_ssa_impl(
             source_ast_normalizers=(
                 _normalize_none_default_assignments,
                 _normalize_direct_tail_recursion,
+                normalize_discovered_destructuring,
             ),
             retained_ast_normalizers=(
                 specialize_same_type_numeric_operators,
@@ -39789,6 +40979,7 @@ def _lower_ast_source_to_ssa_impl(
         runtime_closure_only=runtime_closure_only,
         tensor_ssa_reference=tensor_ssa_reference,
         linked_source_region_ssa=linked_source_region_ssa,
+        assignment_normalization=assignment_receipts,
         progress=progress,
     )
     if numeric_specialization_receipts:
@@ -39817,8 +41008,10 @@ def _lower_ast_source_to_ssa_impl(
     )
     module.metadata["destructuring_assignment_normalization"] = tuple({
         "line": receipt.line,
+        "scope": receipt.scope,
         "target_count": receipt.target_count,
         "temporary_names": receipt.temporary_names,
+        "projections": receipt.projections,
     } for receipt in assignment_receipts)
     module.metadata["compilation_unit_plan"] = compilation_unit_plan.to_mapping()
     module.metadata["closure_formal_receipts"] = _record_module_closure_formals(
@@ -40066,6 +41259,22 @@ def _lower_ast_source_to_ssa_impl(
                 module.metadata["final_pruned_dead_entry_field_aliases"] = int(
                     final_pruned_entry_field_aliases
                 )
+            frame_result_reindexing = _reindex_frame_aliased_call_results(
+                module.functions
+            )
+            if frame_result_reindexing:
+                module.metadata[
+                    "frame_aliased_result_reindexing"
+                ] = frame_result_reindexing
+            singleton_result_reconciliation = (
+                _reconcile_singleton_destructured_call_results(
+                    module.functions
+                )
+            )
+            if singleton_result_reconciliation:
+                module.metadata[
+                    "singleton_result_reconciliation"
+                ] = singleton_result_reconciliation
             if final_pruned_formals:
                 module.call_table = {
                     caller: tuple(records)
@@ -40387,6 +41596,24 @@ def _lower_ast_source_to_ssa_impl(
                 *function.metadata["loop_interchange_decisions"], decision,
             )
     _report_unmaterialised_record_parameters(module, extraction_contract)
+    if (
+        extraction_policy is not None
+        and extraction_policy.execution.require_full_native
+    ):
+        # Source catalogue graphs have finished supplying every extraction,
+        # call, and shell-boundary fact above.  A native-only module must not
+        # retain their live ``python_bindings`` heaps (including imported
+        # module objects) after that point.  Use the repository's established
+        # finalization transaction; deterministic FunctionReference addresses
+        # and all lowered repository SSA remain intact.
+        from .project_compilation_product import (
+            detach_repository_ssa_frontend,
+        )
+
+        detach_repository_ssa_frontend(module)
+        gate = dict(module.metadata.get("full_native_link_gate") or {})
+        gate["frontend_representations_detached"] = True
+        module.metadata["full_native_link_gate"] = gate
     return module, outputs, exports
 
 
@@ -40482,25 +41709,27 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
         from .identity_concordance import (
             concord_compiler_frame_formals,
             concord_loop_scope_latch_residents,
+            concord_program_abi_frame_transitions,
         )
 
         _loop_scope_reconciliations = concord_loop_scope_latch_residents(
             module
         )
+        _program_abi_frame_transitions = (
+            concord_program_abi_frame_transitions(module)
+        )
         _frame_formal_reconciliations = concord_compiler_frame_formals(module)
         _progress = kwargs.get("progress")
-        # Ask the concordance's own detector the same question here, so a
-        # disagreement between the two walks is reported where it happens
-        # rather than inferred from a failure three stages later.
+        # Ask the concordance's own detector over the final module, after the
+        # optional ABI and temporal repairs.  Reporting only dominance here
+        # made "detector still reports 0" untrue when another concordance
+        # invariant was introduced by a late pass.
         _unresolved = ()
         try:
             from .identity_concordance import CorrelationTable
 
             _table = CorrelationTable.build(module)
-            _unresolved = tuple(
-                finding for finding in _table.findings(module)
-                if finding.kind == "use-not-dominated"
-            )
+            _unresolved = tuple(_table.findings(module))
         except Exception as _error:
             _unresolved = (f"detector failed: {_error}",)
         if _progress is not None:
@@ -40508,7 +41737,9 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
                 "ssa-program: loop-result uses reconciled at the module "
                 f"boundary: {reconciled}; record-Phi temporal uses reconciled: "
                 f"{_record_phi_temporal_repairs}; loop-scope latch residents concorded: "
-                f"{len(_loop_scope_reconciliations)}; compiler-frame formals "
+                f"{len(_loop_scope_reconciliations)}; ProgramABI frame "
+                f"transitions concorded: {len(_program_abi_frame_transitions)}; "
+                "compiler-frame formals "
                 f"concorded: {len(_frame_formal_reconciliations)}; detector "
                 "still reports "
                 f"{len(_unresolved)}: "

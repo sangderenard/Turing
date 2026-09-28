@@ -13,6 +13,10 @@ def test_flat_unpack_is_one_evaluated_value_and_ordinary_assignments():
     receipts = normalize_destructuring_assignments(tree)
 
     assert len(receipts) == 1
+    assert receipts[0].projections == (
+        ("__turing_assignment_value_0", 0, "left"),
+        ("__turing_assignment_value_0", 1, "right"),
+    )
     assert ast.unparse(tree).splitlines() == [
         "__turing_assignment_value_0 = produce()",
         "left = __turing_assignment_value_0[0]",

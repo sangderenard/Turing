@@ -42,6 +42,131 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
     contracts: dict[str, dict[str, Any]] = {}
     receipts: list[dict[str, Any]] = []
 
+    # Call-frame and returned-record reconciliation can replace an early
+    # ProgramABI argument object with another occurrence of the same settled
+    # SSA identity.  The record descriptor is the final physical owner, so
+    # restamp its optional payload/presence pair on every surviving local
+    # occurrence before optional controls and native signatures are emitted.
+    # This is identity concordance, not inference: ambiguous/missing pairs are
+    # left untouched.
+    record_presence_receipts: list[dict[str, Any]] = []
+    record_tables = getattr(module, "record_tables", {}) or {}
+    for function_name, function in functions.items():
+        table = record_tables.get(function_name)
+        if table is None:
+            continue
+        occurrences: dict[int, list[SSAValue]] = {}
+        for value in (
+            *function.args,
+            *(
+                item
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                for item in (
+                    *instruction.args,
+                    *((instruction.res,) if instruction.res is not None else ()),
+                )
+            ),
+        ):
+            bucket = occurrences.setdefault(int(value.id), [])
+            if not any(value is incumbent for incumbent in bucket):
+                bucket.append(value)
+        for record in table.records.values():
+            fields = {field.name: field for field in record.fields}
+            for name, presence_field in fields.items():
+                if not name.endswith(".__present"):
+                    continue
+                payload_name = name.removesuffix(".__present")
+                payload_field = fields.get(payload_name)
+                if (
+                    payload_field is None
+                    or len(payload_field.value_ids) != 1
+                    or len(presence_field.value_ids) != 1
+                    or str(presence_field.dtype or "").casefold() != "bool"
+                ):
+                    continue
+                payload_id = int(payload_field.value_ids[0])
+                presence_id = int(presence_field.value_ids[0])
+                payload_values = occurrences.get(payload_id, ())
+                presence_values = occurrences.get(presence_id, ())
+                if not payload_values or not presence_values:
+                    continue
+                for payload in payload_values:
+                    accounting = dict(payload.accounting or {})
+                    leased_from = accounting.pop(
+                        "linked_call_frame_storage", None,
+                    )
+                    payload.accounting = {
+                        **accounting,
+                        "program_abi_record": str(record.identity),
+                        "program_abi_field": str(payload_name),
+                        "program_abi_storage": "scalar",
+                        "program_abi_optional_payload": True,
+                        "ssa_optional_presence_id": presence_id,
+                        **({
+                            "record_descriptor_reconciled_frame_storage": (
+                                str(leased_from)
+                            ),
+                            "record_descriptor_storage_priority": (
+                                "exact_record_descriptor"
+                            ),
+                        } if leased_from is not None else {}),
+                    }
+                for presence in presence_values:
+                    presence.dtype = "bool"
+                    presence.shape = ()
+                    accounting = dict(presence.accounting or {})
+                    leased_from = accounting.pop(
+                        "linked_call_frame_storage", None,
+                    )
+                    accounting = {
+                        **accounting,
+                        "program_abi_record": str(record.identity),
+                        "program_abi_field": str(payload_name),
+                        "program_abi_storage": "scalar",
+                        "program_abi_optional_presence": True,
+                        "program_abi_optional_present_when": True,
+                        "ssa_optional_payload_id": payload_id,
+                        "physical_dtype": "bool",
+                        **({
+                            "record_descriptor_reconciled_frame_storage": (
+                                str(leased_from)
+                            ),
+                            "record_descriptor_storage_priority": (
+                                "exact_record_descriptor"
+                            ),
+                        } if leased_from is not None else {}),
+                    }
+                    # The descriptor confirms the physical Boolean type, but
+                    # an earlier ProgramABI lowering is the stronger origin
+                    # receipt.  Equal facts keep their incumbent provenance.
+                    accounting.setdefault(
+                        "physical_dtype_provenance",
+                        "record_descriptor_optional_presence",
+                    )
+                    accounting.setdefault(
+                        "physical_dtype_tie_policy", "incumbent",
+                    )
+                    presence.accounting = accounting
+                record_presence_receipts.append({
+                    "function": str(function_name),
+                    "record": str(record.identity),
+                    "field": str(payload_name),
+                    "payload_value_id": payload_id,
+                    "presence_value_id": presence_id,
+                    "priority": "exact_record_descriptor",
+                    "tie_policy": "incumbent",
+                })
+
+    if record_presence_receipts:
+        metadata = getattr(module, "metadata", None)
+        if metadata is None:
+            module.metadata = {}
+            metadata = module.metadata
+        metadata["optional_record_presence_concordance"] = tuple(
+            record_presence_receipts
+        )
+
     for function_name, function in functions.items():
         producers = {
             int(instruction.res.id): instruction
@@ -280,6 +405,87 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                     "tie_policy": "incumbent",
                 })
 
+    # Close optional contracts through exact forwarding functions before
+    # rewriting callsites.  A wrapper such as ``return maybe(...)`` has no
+    # local mixed Phi, but it does not erase the callee's presence bit.  Its
+    # physical return is the same payload/presence pair under wrapper-local
+    # ids.  Without this closure, a caller's ``is not None`` sees the absent
+    # payload (zero) as an ordinary scalar and can fold the test to true.
+    forwarded_presence: dict[tuple[str, int], SSAValue] = {}
+    forwarding_changed = True
+    while forwarding_changed:
+        forwarding_changed = False
+        for function_name, function in functions.items():
+            if str(function_name) in contracts:
+                continue
+            producers = {
+                int(instruction.res.id): instruction
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+            }
+            returns = tuple(
+                instruction
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in _RETURN_OPS
+            )
+            if not returns or any(len(ret.args) != 1 for ret in returns):
+                continue
+            payload_ids = {int(ret.args[0].id) for ret in returns}
+            if len(payload_ids) != 1:
+                continue
+            payload_id = next(iter(payload_ids))
+            producer = producers.get(payload_id)
+            if producer is None or producer.op not in {"Call", "call"}:
+                continue
+            callee_contract = contracts.get(str(
+                producer.attributes.get("callee") or ""
+            ))
+            if callee_contract is None:
+                continue
+            payload = returns[0].args[0]
+            payload.dtype = str(callee_contract["dtype"])
+            payload.shape = tuple(callee_contract["shape"])
+            payload.accounting = {
+                **dict(payload.accounting or {}),
+                "ssa_optional_payload": True,
+            }
+            presence = SSAValue(
+                GLOBAL_MONOTONIC_IDS.mint(),
+                dtype="bool",
+                accounting={
+                    "ssa_optional_presence": True,
+                    "ssa_optional_payload_id": payload_id,
+                    "ssa_optional_forwarded_return": True,
+                },
+            )
+            for ret in returns:
+                ret.args = [ret.args[0], presence]
+            layouts = dict(function.metadata.get(
+                "aggregate_return_layouts", (),
+            ))
+            layouts[payload_id] = (payload_id, int(presence.id))
+            function.metadata["aggregate_return_layouts"] = tuple(
+                layouts.items()
+            )
+            receipt = {
+                "function": str(function_name),
+                "payload_value_id": payload_id,
+                "presence_value_id": int(presence.id),
+                "dtype": str(callee_contract["dtype"]),
+                "shape": tuple(callee_contract["shape"]),
+                "priority": "exact_forwarded_optional_return",
+                "tie_policy": "incumbent",
+                "forwarded_callee": str(
+                    producer.attributes.get("callee") or ""
+                ),
+            }
+            contracts[str(function_name)] = receipt
+            forwarded_presence[(str(function_name), payload_id)] = presence
+            receipts.append(receipt)
+            forwarding_changed = True
+
     for caller_name, caller in functions.items():
         producers = {
             int(instruction.res.id): instruction
@@ -306,14 +512,18 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                     **dict(payload.accounting or {}),
                     "ssa_optional_payload": True,
                 }
-                presence = SSAValue(
-                    GLOBAL_MONOTONIC_IDS.mint(),
-                    dtype="bool",
-                    accounting={
-                        "ssa_optional_presence": True,
-                        "ssa_optional_payload_id": int(payload.id),
-                    },
+                presence = forwarded_presence.get(
+                    (str(caller_name), int(payload.id))
                 )
+                if presence is None:
+                    presence = SSAValue(
+                        GLOBAL_MONOTONIC_IDS.mint(),
+                        dtype="bool",
+                        accounting={
+                            "ssa_optional_presence": True,
+                            "ssa_optional_payload_id": int(payload.id),
+                        },
+                    )
                 aggregate = SSAValue(
                     GLOBAL_MONOTONIC_IDS.mint(),
                     dtype="ssa.aggregate",

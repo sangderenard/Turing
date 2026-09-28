@@ -3166,6 +3166,39 @@ class _ControlSSABuilder:
         self.loop_frames[key] = {"carried": carried, "latch": False}
         return key
 
+    def _loop_scope_rebinds(self, loop: Any, carried: Any) -> tuple:
+        """Describe every carried entry without collapsing shared seeds.
+
+        The value triple alone is insufficient source identity: two authored
+        bindings may share an outer value while selecting different updates.
+        Carry the lexical binding receipt into the loop-scope declaration so
+        the concordance can represent those simultaneous possibilities as
+        separate rows.
+        """
+
+        loop_node = getattr(loop, "source_loop_node_id", None)
+        page = self._book().page("loop_carried_binding")
+        binding_scope = (
+            None
+            if self.lexical_read_scope is None or loop_node is None
+            else (self.lexical_read_scope, int(loop_node))
+        )
+        return tuple(
+            (
+                int(initial.id), int(current.id), int(updated.id),
+                int(initial_id), int(updated_id),
+                tuple(
+                    () if binding_scope is None else (
+                        page.latest((
+                            *binding_scope,
+                            int(updated_id), int(initial_id),
+                        )) or ()
+                    )
+                ),
+            )
+            for updated_id, initial_id, initial, updated, current in carried
+        )
+
     def _resolve_read(
         self, value_id: int, bindings: set, reader: str,
     ) -> Any | None:
@@ -4204,6 +4237,33 @@ class _ControlSSABuilder:
     ) -> SSAValue:
         if expression.op == "value":
             return self._control_leaf(expression)
+        if expression.op == "optional_presence":
+            if expression.value_id is None:
+                raise ValueError("optional presence requires a value id")
+            value = self.external_value(
+                int(expression.value_id), dtype="bool"
+            )
+            value.accounting = {
+                **dict(value.accounting or {}),
+                **({
+                    "program_abi_record": expression.program_abi_record,
+                } if expression.program_abi_record is not None else {}),
+                **({
+                    "program_abi_parameter": expression.program_abi_parameter,
+                } if expression.program_abi_parameter is not None else {}),
+                **({
+                    "program_abi_field": expression.program_abi_field,
+                } if expression.program_abi_field is not None else {}),
+                "program_abi_storage": "scalar",
+                "program_abi_optional_presence": True,
+                "program_abi_optional_present_when": True,
+                "physical_dtype": "bool",
+                "physical_dtype_provenance": (
+                    "control_ir_optional_presence"
+                ),
+                "physical_dtype_tie_policy": "incumbent",
+            }
+            return value
         if expression.op == "const":
             result = result_override or self.fresh_value(
                 dtype="bool" if isinstance(expression.literal, bool) else None
@@ -7146,11 +7206,25 @@ class _ControlSSABuilder:
                     and int(initial_id) in self.value_aliases
                 ),
             )
-            updated_value = SSAValue(
-                updated_id,
-                dtype=initial_value.dtype,
-                shape=initial_value.shape,
-            )
+            updated_value = self.external_values.get(updated_id)
+            if updated_value is None:
+                updated_value = SSAValue(
+                    updated_id,
+                    dtype=initial_value.dtype,
+                    shape=initial_value.shape,
+                )
+                self.external_values[updated_id] = updated_value
+            else:
+                # An authored binding may be updated to a value which
+                # already exists before the loop (``last = proposal``).
+                # That value is the exact backedge resident.  Reserving a
+                # second SSA object under the same ProcessGraph id erases
+                # the formal and later misclassifies the binding as an
+                # identity update merely because no body instruction needs
+                # to reproduce the already-dominating value.
+                updated_value.accounting[
+                    "loop_carried_preexisting_update"
+                ] = True
             current_value = self.fresh_value(
                 dtype=initial_value.dtype,
                 shape=initial_value.shape,
@@ -7161,7 +7235,6 @@ class _ControlSSABuilder:
             })
             # Region output extraction will use this exact object as the
             # backedge definition referenced by the Phi below.
-            self.external_values[updated_id] = updated_value
             carried.append(
                 (
                     updated_id,
@@ -7257,15 +7330,7 @@ class _ControlSSABuilder:
             declare_loop_scope(
                 self.function_name, loop.source_loop_node_id,
                 header.name, latch.name, exit_block.name,
-                tuple(
-                    (
-                        int(_initial.id), int(_current.id),
-                        int(_updated.id), int(_initial_id),
-                        int(_updated_id),
-                    )
-                    for _updated_id, _initial_id, _initial, _updated,
-                    _current in carried
-                ),
+                self._loop_scope_rebinds(loop, carried),
             )
         except Exception:
             pass
@@ -7692,6 +7757,13 @@ class _ControlSSABuilder:
         }
         for entry, (updated_id, _initial_id, _initial, updated, _current) in enumerate(carried):
             if id(carried_updates[entry]) not in produced_results:
+                if updated.accounting.get(
+                    "loop_carried_preexisting_update"
+                ):
+                    # Selecting a value which already dominates the loop is
+                    # an authored update even though the body needs no new
+                    # instruction to compute it.
+                    continue
                 declared_outputs = tuple(
                     region_index
                     for region_index, (_feeds, outputs)
@@ -7977,16 +8049,27 @@ class _ControlSSABuilder:
                     and int(initial_id) in self.value_aliases
                 ),
             )
-            updated_value = SSAValue(
-                updated_id,
-                dtype=initial_value.dtype,
-                shape=initial_value.shape,
-            )
+            updated_value = self.external_values.get(updated_id)
+            if updated_value is None:
+                updated_value = SSAValue(
+                    updated_id,
+                    dtype=initial_value.dtype,
+                    shape=initial_value.shape,
+                )
+                self.external_values[updated_id] = updated_value
+            else:
+                # A carried binding can select an already-dominating value
+                # as its authored update.  Keep that exact SSA resident;
+                # manufacturing another object with the same graph id loses
+                # the distinction between this binding and another binding
+                # which merely shares its initial value.
+                updated_value.accounting[
+                    "loop_carried_preexisting_update"
+                ] = True
             current_value = self.fresh_value(
                 dtype=initial_value.dtype,
                 shape=initial_value.shape,
             )
-            self.external_values[updated_id] = updated_value
             carried.append((
                 updated_id, initial_id, initial_value,
                 updated_value, current_value,
@@ -8049,15 +8132,7 @@ class _ControlSSABuilder:
             declare_loop_scope(
                 self.function_name, loop.source_loop_node_id,
                 header.name, latch.name, exit_block.name,
-                tuple(
-                    (
-                        int(_initial.id), int(_current.id),
-                        int(_updated.id), int(_initial_id),
-                        int(_updated_id),
-                    )
-                    for _updated_id, _initial_id, _initial, _updated,
-                    _current in carried
-                ),
+                self._loop_scope_rebinds(loop, carried),
             )
         except Exception:
             pass
@@ -8159,8 +8234,16 @@ class _ControlSSABuilder:
             for instruction in basic_block.instrs
             if instruction.res is not None
         }
-        for entry, (updated_id, _initial_id, _initial, _updated, current) in enumerate(carried):
+        for entry, (updated_id, _initial_id, _initial, updated, current) in enumerate(carried):
             if id(carried_updates[entry]) not in produced_results:
+                if updated.accounting.get(
+                    "loop_carried_preexisting_update"
+                ):
+                    # The update is an input or another value defined before
+                    # the loop, so it correctly dominates the latch without
+                    # a producer in the body.  It is not an untouched carried
+                    # name and must not be replaced by the header Phi.
+                    continue
                 declared_outputs = tuple(
                     region_index
                     for region_index, (_feeds, outputs)
@@ -8448,19 +8531,38 @@ class _ControlSSABuilder:
             return self.external_value(int(value_id))
 
         for name, history in self.named_output_histories.items():
-            value = next((
-                resolved
-                for value_id in reversed(history)
-                for resolved in (existing_value(value_id),)
-                if resolved is not None
-            ), None)
-            if value is None:
+            if self.function_return_edges:
+                # With explicit return edges, source history is the temporal
+                # authority for the still-open lexical fallthrough. Resolve
+                # each version completely before considering an older one: a
+                # newest owned literal (especially ``None``) must not lose to
+                # an already-materialized value from an earlier return.
                 value = next((
                     resolved
                     for value_id in reversed(history)
-                    for resolved in (owned_literal(value_id),)
+                    for resolved in (
+                        existing_value(value_id) or owned_literal(value_id),
+                    )
                     if resolved is not None
                 ), None)
+            else:
+                # In a single-exit conditional, histories contain competing
+                # arm assignments rather than a temporal fallthrough. Prefer
+                # the value materialized by control lowering; only use an
+                # owned literal if no arm/join value exists.
+                value = next((
+                    resolved
+                    for value_id in reversed(history)
+                    for resolved in (existing_value(value_id),)
+                    if resolved is not None
+                ), None)
+                if value is None:
+                    value = next((
+                        resolved
+                        for value_id in reversed(history)
+                        for resolved in (owned_literal(value_id),)
+                        if resolved is not None
+                    ), None)
             if value is None:
                 continue
             # A returned name whose final identity is a LoopResult port means

@@ -1717,6 +1717,30 @@ def _method_parameter_layout(graph: Any) -> tuple[
     return receiver, call_positional, all_parameters
 
 
+def _callsite_parameter_name(
+    role: str,
+    receiver: str | None,
+    positional: tuple[str, ...],
+) -> str | None:
+    """Resolve one call edge through the callee's authored ABI layout.
+
+    A bound-method receiver is an argument edge too.  It is spelled
+    ``operand`` rather than ``arg:N`` in ProcessGraph, so consumers that only
+    decoded positional/keyword roles silently omitted the exact record
+    descriptor for ``self``.  Optional receiver fields were then lowered as
+    always-present payload storage instead of payload/presence pairs.
+    """
+
+    position = _positional_argument_index(str(role))
+    if position is not None and position < len(positional):
+        return str(positional[position])
+    if str(role) == "operand" and receiver is not None:
+        return str(receiver)
+    if str(role).startswith("kw:"):
+        return str(role).split(":", 1)[1]
+    return None
+
+
 def _record_aggregate_ledger_lookup(
     graph: Any, value_id: int, data: Any, attributes: Any, leaves: Any,
 ) -> None:
@@ -2807,6 +2831,23 @@ def _build_shell_hierarchy_plan(
                     collect_caller_projections(projection_path, int(successor))
 
             collect_caller_projections((), int(node_id))
+            # This is the operation that owns the exact relation between a
+            # source call's authored result path and the caller projection
+            # value.  Publish it now.  Later SSA stages must not reconstruct
+            # that relation from target names or from dependency enumeration,
+            # either of which can change when a projection becomes loop state.
+            from .identity_concordance import current_identity_book
+
+            call_result_projection_page = current_identity_book().page(
+                "call_result_projection_concordance"
+            )
+            for projection_path, caller_projection_id in (
+                caller_projection_paths.items()
+            ):
+                call_result_projection_page.concord(
+                    (int(node_id), int(caller_projection_id)),
+                    tuple(map(int, projection_path)),
+                )
             if tuple(child_output_paths) == ((0,),) and not (
                 graph.G.nodes[int(node_id)].get("attributes") or {}
             ).get("authored_return_container"):
@@ -7793,55 +7834,118 @@ def _optional_presence_control_expression(
         and len(expression.comparators) == 1
         and isinstance(expression.comparators[0], ast.Constant)
         and expression.comparators[0].value is None
-        and isinstance(expression.left, ast.Name)
+        and isinstance(expression.left, (ast.Name, ast.Attribute))
     ):
         return None
     histories = graph_obj.graph.get("identity_table") or {}
-    payload_ids = tuple(dict.fromkeys(
-        int(value_id)
-        for value_id in histories.get(expression.left.id, ())
-        if int(value_id) in graph_obj
-    ))
-    if len(payload_ids) != 1:
+    if isinstance(expression.left, ast.Name):
+        payload_ids = tuple(dict.fromkeys(
+            int(value_id)
+            for value_id in histories.get(expression.left.id, ())
+            if int(value_id) in graph_obj
+        ))
+    else:
+        signature = _ast_source_signature(expression.left)
+        payload_ids = tuple(dict.fromkeys(
+            int(node_id)
+            for node_id, data in graph_obj.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.Attribute)
+            and _ast_source_signature(data["expr_obj"]) == signature
+        ))
+    # A spelling's identity history can legitimately contain its default
+    # formal, a selected IfExp arm, and several loads of the same record field.
+    # That is not semantic ambiguity. Resolve every resident GetAttr through
+    # its exact receiver and require the candidates to agree on ONE physical
+    # optional-presence relation. This is stricter than choosing an incumbent
+    # value id and broad enough for ``x = self.x if x is None else x``.
+    relations = []
+    for candidate_id in payload_ids:
+        payload = graph_obj.nodes[candidate_id]
+        if str(
+            payload.get("type") or payload.get("op") or ""
+        ).casefold() != "getattr":
+            continue
+        candidate_field = (payload.get("attributes") or {}).get("attribute")
+        receiver_ids = tuple(dict.fromkeys(
+            int(parent)
+            for parent, role in payload.get("parents") or ()
+            if str(role) in {"value", "object", "base", "receiver"}
+            and int(parent) in graph_obj
+        ))
+        if candidate_field is None or len(receiver_ids) != 1:
+            continue
+        receiver_id = receiver_ids[0]
+        visited: set[int] = set()
+        while receiver_id in graph_obj and receiver_id not in visited:
+            visited.add(receiver_id)
+            receiver = graph_obj.nodes[receiver_id]
+            forwarded = (receiver.get("attributes") or {}).get(
+                "structural_identity_actual_value_id"
+            )
+            if forwarded is None or int(forwarded) not in graph_obj:
+                break
+            receiver_id = int(forwarded)
+        receiver = graph_obj.nodes[receiver_id]
+        candidate_parameter = (receiver.get("attributes") or {}).get(
+            "binding_name"
+        )
+        if candidate_parameter is None:
+            continue
+        presence = tuple(
+            (int(node_id), attributes)
+            for node_id, data in graph_obj.nodes(data=True)
+            for attributes in (data.get("attributes") or {},)
+            if attributes.get("program_abi_optional_presence")
+            and str(attributes.get("program_abi_parameter"))
+            == str(candidate_parameter)
+            and str(attributes.get("program_abi_field"))
+            == str(candidate_field)
+        )
+        if len(presence) != 1:
+            continue
+        candidate_presence_id, candidate_attributes = presence[0]
+        relations.append((
+            int(candidate_id), str(candidate_parameter), str(candidate_field),
+            int(candidate_presence_id), candidate_attributes,
+        ))
+    semantic_relations = {
+        (parameter, field, presence_id)
+        for _payload_id, parameter, field, presence_id, _attributes in relations
+    }
+    if len(semantic_relations) != 1:
         return None
-    payload_id = payload_ids[0]
-    payload = graph_obj.nodes[payload_id]
-    if str(payload.get("type") or payload.get("op") or "").casefold() != "getattr":
-        return None
-    field = (payload.get("attributes") or {}).get("attribute")
-    receiver_ids = tuple(dict.fromkeys(
-        int(parent)
-        for parent, role in payload.get("parents") or ()
-        if str(role) in {"value", "object", "base", "receiver"}
-        and int(parent) in graph_obj
-    ))
-    if field is None or len(receiver_ids) != 1:
-        return None
-    receiver = graph_obj.nodes[receiver_ids[0]]
-    parameter = (receiver.get("attributes") or {}).get("binding_name")
-    if parameter is None:
-        return None
-    presence = tuple(
-        (int(node_id), attributes)
-        for node_id, data in graph_obj.nodes(data=True)
-        for attributes in (data.get("attributes") or {},)
-        if attributes.get("program_abi_optional_presence")
-        and str(attributes.get("program_abi_parameter")) == str(parameter)
-        and str(attributes.get("program_abi_field")) == str(field)
+    parameter, field, presence_id = next(iter(semantic_relations))
+    payload_id, _parameter, _field, _presence_id, attributes = next(
+        relation for relation in reversed(relations)
+        if relation[1:4] == (parameter, field, presence_id)
     )
-    if len(presence) != 1:
-        return None
-    presence_id, attributes = presence[0]
     present_when = bool(attributes.get(
         "program_abi_optional_present_when", True,
     ))
     is_not_none = isinstance(expression.ops[0], ast.IsNot)
     direct = present_when == is_not_none
-    predicate = ControlExpression("value", value_id=presence_id)
+    record = dict(
+        graph_obj.graph.get("parameter_record_abi") or {}
+    ).get(str(parameter), {})
+    predicate = ControlExpression(
+        "optional_presence",
+        value_id=presence_id,
+        program_abi_parameter=str(parameter),
+        program_abi_field=str(field),
+        program_abi_record=(
+            None
+            if record.get("identity") is None
+            else str(record["identity"])
+        ),
+    )
     if not direct:
         predicate = ControlExpression("not", (predicate,), value_id=presence_id)
     receipt = {
-        "name": str(expression.left.id),
+        "name": (
+            str(expression.left.id)
+            if isinstance(expression.left, ast.Name)
+            else ast.unparse(expression.left)
+        ),
         "payload_value_id": int(payload_id),
         "presence_value_id": int(presence_id),
         "parameter": str(parameter),
@@ -7909,7 +8013,21 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
                 effect_span_nodes.setdefault(tuple(span.get(key) for key in
                     ("line", "column", "end_line", "end_column")), set()).add(int(node_id))
     memberships: dict[int, set[tuple[int, str]]] = {}
+    structurally_specialized = frozenset(map(
+        int,
+        graph.G.graph.get(
+            "structurally_specialized_conditional_node_ids", ()
+        ),
+    ))
     for control_id, record in _source_control_records(graph.G).items():
+        if int(control_id) in structurally_specialized:
+            # Structural folding has selected one arm and made its producer
+            # unconditional. Keeping the old branch compartment would withhold
+            # that producer from the topological sweep even though the matching
+            # ControlProgram is deliberately omitted below. A later live
+            # branch can then consume an unavailable value (the selected
+            # ``self.dt_min`` payload in ``pi_update`` exposed this).
+            continue
         expression = record.get("expression")
         if isinstance(expression, ast.If):
             branches = {
@@ -8050,8 +8168,21 @@ def _ordinary_conditional_control_programs(
             is not None
         ),
     )
+    structurally_specialized = frozenset(map(
+        int,
+        graph.G.graph.get(
+            "structurally_specialized_conditional_node_ids", ()
+        ),
+    ))
     programs = []
     for control_id, record in _source_control_records(graph.G).items():
+        if int(control_id) in structurally_specialized:
+            # Structural specialization has already selected one authored arm,
+            # removed the other, and redirected every merge identity to the
+            # selected producer.  Reconstructing this retained source record
+            # would put that producer back behind a runtime branch while its
+            # post-merge consumers remain straight-line.
+            continue
         expression = record.get("expression")
         if not isinstance(expression, (ast.If, ast.IfExp)):
             continue
@@ -8077,15 +8208,19 @@ def _ordinary_conditional_control_programs(
             record.get("predicate_id"),
             expression.test,
         )
-        predicate_expression = None
-        if predicate_id is None:
-            predicate_expression = _optional_presence_control_expression(
-                graph.G, expression.test,
-            )
-            if predicate_expression is None:
-                continue
+        # A retained source comparison may still exist even though its Python
+        # ``None`` operand has no native representation.  Prefer the exact
+        # payload/presence relationship whenever it is available; lowering
+        # the surviving comparison itself would compare the filler payload
+        # and manufacture a constant truth value.
+        predicate_expression = _optional_presence_control_expression(
+            graph.G, expression.test,
+        )
+        if predicate_expression is not None:
             predicate_value_id = int(predicate_expression.value_id)
             predicate_id = predicate_value_id
+        elif predicate_id is None:
+            continue
         else:
             predicate_value_id = int(
                 graph.G.nodes[predicate_id].get("value_id", predicate_id)
@@ -15842,22 +15977,14 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                 continue
             if callee is None:
                 continue
-            _receiver, positional, _all = _method_parameter_layout(callee.G)
+            receiver, positional, _all = _method_parameter_layout(callee.G)
             bound_parameters: set[str] = set()
             for parent, role_value in _expanded_callsite_argument_edges(
                 caller, int(_node_id),
             ):
                 role = str(role_value)
-                position = _positional_argument_index(role)
-                parameter = (
-                    positional[position]
-                    if (
-                        position is not None
-                        and position < len(positional)
-                    )
-                    else role[3:]
-                    if role.startswith("kw:")
-                    else None
+                parameter = _callsite_parameter_name(
+                    role, receiver, positional,
                 )
                 if parameter is None:
                     continue
@@ -16396,7 +16523,7 @@ def _propagate_callsite_tensor_specializations(
     ) -> tuple[dict[str, Any] | None, ...]:
         """Infer the ordered tensor returns of an exact callsite."""
 
-        _receiver, positional, _all = _method_parameter_layout(callee.G)
+        receiver, positional, _all = _method_parameter_layout(callee.G)
         descriptors: dict[str, dict[str, Any]] = {}
         aggregate_descriptors: dict[str, tuple[Any, ...]] = {}
         specializations: dict[str, Any] = {}
@@ -16405,11 +16532,8 @@ def _propagate_callsite_tensor_specializations(
             caller, int(node_id),
         ):
             role = str(role_value)
-            position = _positional_argument_index(role)
-            parameter = (
-                positional[position]
-                if position is not None and position < len(positional)
-                else role[3:] if role.startswith("kw:") else None
+            parameter = _callsite_parameter_name(
+                role, receiver, positional,
             )
             if parameter is None:
                 continue
@@ -16734,16 +16858,13 @@ def _propagate_callsite_tensor_specializations(
                             data["attributes"] = attributes
                             changed = True
                             mutation_counts["structured_returns"] += 1
-                _receiver, positional, _all = _method_parameter_layout(callee.G)
+                receiver, positional, _all = _method_parameter_layout(callee.G)
                 for parent, role_value in _expanded_callsite_argument_edges(
                     caller, int(_node_id),
                 ):
                     role = str(role_value)
-                    position = _positional_argument_index(role)
-                    parameter = (
-                        positional[position]
-                        if position is not None and position < len(positional)
-                        else role[3:] if role.startswith("kw:") else None
+                    parameter = _callsite_parameter_name(
+                        role, receiver, positional,
                     )
                     descriptor = _tensor_descriptor(caller, int(parent))
                     if parameter is not None and descriptor is not None:
@@ -17221,6 +17342,11 @@ class _ProgramABIValueFact:
     # operations may constrain it without inventing extents.
     rank: int | None = None
     value_rank: int | None = None
+    # Optional storage always has a physical payload, but that payload is only
+    # meaningful while its separately owned presence value is true.  Keeping
+    # that distinction on the structural fact prevents ``payload is not
+    # None`` from being folded merely because native storage exists.
+    optional: bool = False
 
 
 def _contains_program_abi_fact(value: Any) -> bool:
@@ -18871,6 +18997,7 @@ def _fold_callsite_structural_values(
                 if field.get("value_rank") is None
                 else int(field["value_rank"])
             ),
+            bool(field.get("optional", False)),
         )
 
     def evaluate(node_id: int, data: Mapping[str, Any]) -> Any:
@@ -19278,6 +19405,8 @@ def _fold_callsite_structural_values(
                 fact = left if isinstance(left, _ProgramABIValueFact) else right
                 if str(fact.python_type) in {"builtins.NoneType", "NoneType"}:
                     return isinstance(comparison_node, ast.Is)
+                if fact.optional:
+                    return unresolved
                 return isinstance(comparison_node, ast.IsNot)
             if isinstance(left, _ProgramABIValueFact) or isinstance(
                 right, _ProgramABIValueFact
@@ -19336,6 +19465,27 @@ def _fold_callsite_structural_values(
         values = tuple(known.get(argument, unresolved) for argument in arguments)
         identity_actual = exact_return_formal_actual(node_id, data)
         if identity_actual is not None:
+            attributes = data.setdefault("attributes", {})
+            attributes["structural_identity_actual_value_id"] = int(
+                identity_actual
+            )
+            receipt = {
+                "call_value_id": int(node_id),
+                "actual_value_id": int(identity_actual),
+                "callee_ref": attributes.get(
+                    "callee_ref", attributes.get("method_ref")
+                ),
+                "priority": "exact_returned_formal",
+                "tie_policy": "incumbent",
+            }
+            concordance = list(graph.G.graph.get(
+                "structural_identity_forwarding_concordance", ()
+            ))
+            if receipt not in concordance:
+                concordance.append(receipt)
+                graph.G.graph[
+                    "structural_identity_forwarding_concordance"
+                ] = tuple(concordance)
             identity_fact = known.get(identity_actual, unresolved)
             if isinstance(identity_fact, _ProgramABIValueFact):
                 return identity_fact
@@ -20505,6 +20655,63 @@ def _fold_callsite_structural_values(
                 # invariant even when the value in the slot is loop-carried.
                 continue
             if isinstance(value, _StructuralValueAlias):
+                alias_expression = data.get("expr_obj")
+                if isinstance(alias_expression, ast.IfExp):
+                    control_signature = _ast_source_signature(alias_expression)
+                    retained_control_ids = tuple(
+                        int(source_id)
+                        for source_id, record in _source_control_records(
+                            graph.G
+                        ).items()
+                        if isinstance(record.get("expression"), ast.IfExp)
+                        and _ast_source_signature(record["expression"])
+                        == control_signature
+                    )
+                    specialized = list(graph.G.graph.get(
+                        "structurally_specialized_conditional_node_ids", ()
+                    ))
+                    specialized.extend((
+                        int(node_id), *retained_control_ids,
+                    ))
+                    graph.G.graph[
+                        "structurally_specialized_conditional_node_ids"
+                    ] = tuple(dict.fromkeys(map(int, specialized)))
+                    parents = {
+                        str(role): int(parent)
+                        for parent, role in data.get("parents") or ()
+                    }
+                    predicate = known.get(parents.get("test"), unresolved)
+                    selected_role = (
+                        "body" if bool(predicate) else "orelse"
+                    )
+                    try:
+                        from .identity_concordance import current_identity_book
+
+                        specialization_page = current_identity_book().page(
+                            "source_control_specialization_concordance"
+                        )
+                        for retained_control_id in (
+                            retained_control_ids or (int(node_id),)
+                        ):
+                            row = (
+                                str(graph.G.graph.get("function_name")),
+                                int(retained_control_id),
+                            )
+                            specialization_page.set(
+                                row,
+                                len(specialization_page.history(row)),
+                                {
+                                    "graph_control_id": int(node_id),
+                                    "source_control_id": int(
+                                        retained_control_id
+                                    ),
+                                    "predicate_value_id": parents.get("test"),
+                                    "selected_role": selected_role,
+                                    "proof": "structural_constant_predicate",
+                                },
+                            )
+                    except Exception:
+                        pass
                 replace_alias(node_id, value.source_id)
                 known.pop(node_id, None)
                 iteration_mutations.append((
@@ -20803,10 +21010,36 @@ def _fold_callsite_structural_values(
                     "structurally_specialized_conditional_node_ids", ()
                 )
             )
-            specialized.append(int(control_id))
+            specialized.extend((
+                int(control_id), int(retained_control_id),
+            ))
             graph.G.graph[
                 "structurally_specialized_conditional_node_ids"
             ] = tuple(dict.fromkeys(map(int, specialized)))
+            try:
+                from .identity_concordance import current_identity_book
+
+                specialization_page = current_identity_book().page(
+                    "source_control_specialization_concordance"
+                )
+                specialization_row = (
+                    str(graph.G.graph.get("function_name")),
+                    int(retained_control_id),
+                )
+                specialization_page.set(
+                    specialization_row,
+                    len(specialization_page.history(specialization_row)),
+                    {
+                        "graph_control_id": int(control_id),
+                        "source_control_id": int(retained_control_id),
+                        "predicate_value_id": int(predicate_id),
+                        "selected_role": str(selected_role),
+                        "rejected_role": str(rejected_role),
+                        "proof": "structural_constant_predicate",
+                    },
+                )
+            except Exception:
+                pass
             for node_id in sorted(rejected_nodes, reverse=True):
                 remove_node(node_id)
             remove_node(int(control_id))
@@ -20903,6 +21136,19 @@ def _fold_callsite_structural_values(
             )
         )
         if int(value_id) in graph.G
+    } | {
+        # A return-site slot is a metadata edge from authored control.  The
+        # value can have no ordinary graph successor when it is returned by
+        # only one arm (``if flag: return limit; return None``), but it is
+        # still a live callee input.  Dropping it here erased ``limit`` from
+        # the callee identity table, so hierarchy planning retained only the
+        # first call argument and the linker grew unrelated zeroed storage.
+        int(value_id)
+        for slots in (
+            graph.G.graph.get("return_slot_values") or {}
+        ).values()
+        for value_id in slots
+        if value_id is not None and int(value_id) in graph.G
     }
     dead_metadata = True
     while dead_metadata:
@@ -20951,7 +21197,7 @@ def _fold_callsite_structural_values(
         if data.get("type") == "Input"
         and (data.get("attributes") or {}).get("binding_kind") == "parameter"
         and graph.G.out_degree(int(node_id)) == 0
-        and int(node_id) not in set(map(int, graph.roots))
+        and int(node_id) not in protected_values
     }
     for node_id in sorted(unused_parameters, reverse=True):
         remove_node(node_id)
@@ -21424,7 +21670,7 @@ def _callsite_specialized_shell_type(
         return fallback
     if original is None:
         return fallback
-    _receiver, positional, _all = _method_parameter_layout(original.G)
+    receiver, positional, _all = _method_parameter_layout(original.G)
     specializations = {}
     tensor_descriptors: dict[str, dict[str, Any]] = {}
     aggregate_descriptors: dict[str, tuple[Any, ...]] = {}
@@ -21470,13 +21716,8 @@ def _callsite_specialized_shell_type(
         caller, int(node_id),
     ):
         role = str(role_value)
-        position = _positional_argument_index(role)
-        parameter = (
-            positional[position]
-            if position is not None and position < len(positional)
-            else role[3:]
-            if role.startswith("kw:")
-            else None
+        parameter = _callsite_parameter_name(
+            role, receiver, positional,
         )
         if parameter is None:
             continue

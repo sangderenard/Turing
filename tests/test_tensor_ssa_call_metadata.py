@@ -156,6 +156,116 @@ def test_settled_formal_restamps_lowered_broadcast_shape_constants():
     )
 
 
+@pytest.mark.parametrize(
+    ("callee", "arguments"),
+    [
+        ("index_assign_double", (0, 2, 3, 4, 5, 1, 6)),
+        ("index_set_double", (0, 7, 2, 3, 4, 5, 1, 6)),
+    ],
+)
+def test_settled_index_store_restamps_value_count(callee, arguments):
+    values = {
+        0: SSAValue(0, "float64", (17,)),
+        1: SSAValue(1, "float64", (17,)),
+        2: SSAValue(2, "int32", (1,)),
+        3: SSAValue(3, "int32"),
+        4: SSAValue(4, "int32", (2,)),
+        5: SSAValue(5, "int32", (17,)),
+        6: SSAValue(6, "int32"),
+        7: SSAValue(7, "float64", (17,)),
+    }
+    shape = Instr(
+        "Const", [], values[2],
+        attributes={"values": (1,), "constant": None},
+    )
+    rank = Instr("Const", [], values[3], attributes={"constant": 1})
+    offsets = Instr(
+        "Const", [], values[4],
+        attributes={"values": (0, 17), "constant": None},
+    )
+    indices = Instr(
+        "Const", [], values[5],
+        attributes={"values": tuple(range(17)), "constant": None},
+    )
+    count = Instr("Const", [], values[6], attributes={"constant": 1})
+    call = Instr(
+        "Call", [values[index] for index in arguments], values[7],
+        attributes={"callee": callee},
+    )
+    function = Function("planned", [values[0], values[1]], {
+        "entry": BasicBlock(
+            "entry", [shape, rank, offsets, indices, count, call]
+        ),
+    })
+    module = IRModule(
+        {function.name: function},
+        tensor_tables={function.name: SSATensorTable()},
+    )
+
+    assert settle_repository_ssa_static_extent_operands(module)
+    assert shape.attributes["values"] == (17,)
+    assert count.attributes["constant"] == 17
+
+
+@pytest.mark.parametrize(("actual_shape", "expected_count"), [
+    ((), 1),
+    ((17,), 17),
+])
+def test_index_store_value_count_follows_exact_region_feed(
+    actual_shape, expected_count,
+):
+    destination = SSAValue(0, "float64", (17,))
+    actual = SSAValue(1, "float64", actual_shape)
+    formal = SSAValue(1, "float64", (17,), accounting={
+        "exact_region_feed_source": ("caller", 1, 1),
+    })
+    shape = SSAValue(2, "int32", (1,))
+    rank = SSAValue(3, "int32")
+    offsets = SSAValue(4, "int32", (2,))
+    indices = SSAValue(5, "int32", (17,))
+    count = SSAValue(6, "int32")
+    region = Function("caller__planned_region_0", [destination, formal], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], shape, attributes={
+                "values": (17,), "constant": None,
+            }),
+            Instr("Const", [], rank, attributes={"constant": 1}),
+            Instr("Const", [], offsets, attributes={
+                "values": (0, 17), "constant": None,
+            }),
+            Instr("Const", [], indices, attributes={
+                "values": tuple(range(17)), "constant": None,
+            }),
+            Instr("Const", [], count, attributes={"constant": 1}),
+            Instr(
+                "Call",
+                [destination, shape, rank, offsets, indices, formal, count],
+                destination,
+                attributes={"callee": "index_assign_double"},
+            ),
+        ]),
+    })
+    caller = Function("caller", [destination, actual], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Call", [destination, actual], None,
+                attributes={"callee": region.name},
+            ),
+        ]),
+    })
+    module = IRModule(
+        {caller.name: caller, region.name: region},
+        tensor_tables={region.name: SSATensorTable()},
+    )
+
+    changed = settle_repository_ssa_static_extent_operands(module)
+
+    assert changed is (expected_count == 17)
+    assert region.blocks["entry"].instrs[4].attributes["constant"] == (
+        expected_count
+    )
+
+
 def test_bool_broadcast_keeps_double_backed_repository_storage():
     source = SSAValue(0, "bool", shape=(1,))
     requested_shape = SSAValue(1, "int32", shape=(1,))

@@ -14,7 +14,16 @@ from src.compiler.vehicle_python_compilation import (
     balloon_tire_managed_extraction_contract,
     balloon_tire_managed_python_compilation_inputs,
 )
-from src.transmogrifier.ssa import BasicBlock, Function, Instr, IRModule, SSAValue
+from src.transmogrifier.ssa import (
+    BasicBlock,
+    Function,
+    Instr,
+    IRModule,
+    SSARecordDescriptor,
+    SSARecordFieldDescriptor,
+    SSARecordTable,
+    SSAValue,
+)
 
 
 def test_scalar_optional_return_and_linked_none_test_split_into_payload_presence():
@@ -103,6 +112,107 @@ def test_nested_optional_phi_presence_flows_into_return_presence():
     assert [value.dtype for value in function.blocks["exit"].instrs[-1].args] == [
         "float64", "bool",
     ]
+
+
+def test_record_descriptor_reconciles_optional_field_frame_lease():
+    payload = SSAValue(1, "float64", accounting={
+        "linked_call_frame_storage": "callee",
+    })
+    presence = SSAValue(2, "bool", accounting={
+        "linked_call_frame_storage": "callee",
+    })
+    function = Function(
+        "root", [payload, presence],
+        {"entry": BasicBlock("entry", [Instr("Ret", [], None)])},
+        metadata={"storage_formals": (
+            {"value_id": 1, "kind": "storage"},
+            {"value_id": 2, "kind": "storage"},
+        )},
+    )
+    record = SSARecordDescriptor(9, "State", (
+        SSARecordFieldDescriptor(
+            "limit", "scalar", value_ids=(1,), dtype="float64",
+        ),
+        SSARecordFieldDescriptor(
+            "limit.__present", "scalar", value_ids=(2,), dtype="bool",
+        ),
+    ))
+    module = IRModule(
+        {function.name: function},
+        record_tables={function.name: SSARecordTable({9: record})},
+    )
+
+    lower_optional_scalar_returns(module)
+
+    for value in (payload, presence):
+        assert "linked_call_frame_storage" not in value.accounting
+        assert value.accounting[
+            "record_descriptor_reconciled_frame_storage"
+        ] == "callee"
+        assert value.accounting["record_descriptor_storage_priority"] == (
+            "exact_record_descriptor"
+        )
+    from src.compiler.identity_concordance import concordance_report
+    assert "conflicting-storage-claims" not in concordance_report(module)
+
+
+def test_optional_presence_closes_through_exact_forwarding_return():
+    absent = SSAValue(1, "none")
+    value = SSAValue(2, "float64")
+    merged = SSAValue(3)
+    leaf = Function("leaf", [], {
+        "present": BasicBlock("present", [Instr("Br", [], None)]),
+        "absent": BasicBlock("absent", [
+            Instr("NoneValue", [], absent), Instr("Br", [], None),
+        ]),
+        "exit": BasicBlock("exit", [
+            Instr("Phi", [value, absent], merged, attributes={
+                "incoming_blocks": ("present", "absent"),
+                "binding": "return_merge",
+            }),
+            Instr("Ret", [merged], None),
+        ]),
+    })
+    forwarded = SSAValue(10)
+    middle_call = Instr(
+        "Call", [], forwarded,
+        attributes={"callee": "leaf", "source_linked": True},
+    )
+    middle = Function("middle", [], {"entry": BasicBlock("entry", [
+        middle_call, Instr("Ret", [forwarded], None),
+    ])})
+    caller_result = SSAValue(20)
+    none = SSAValue(21, "none")
+    compared = SSAValue(22, "bool")
+    root_call = Instr(
+        "Call", [], caller_result,
+        attributes={"callee": "middle", "source_linked": True},
+    )
+    root = Function("root", [], {"entry": BasicBlock("entry", [
+        root_call,
+        Instr("NoneValue", [], none),
+        Instr("Ne", [caller_result, none], compared),
+        Instr("Ret", [compared], None),
+    ])})
+    module = IRModule({"leaf": leaf, "middle": middle, "root": root})
+
+    receipts = lower_optional_scalar_returns(module)
+
+    forwarding = next(
+        receipt for receipt in receipts
+        if receipt.get("function") == "middle"
+        and receipt.get("priority") == "exact_forwarded_optional_return"
+    )
+    assert forwarding["forwarded_callee"] == "leaf"
+    assert len(middle.blocks["entry"].instrs[-1].args) == 2
+    assert middle_call.attributes["ssa_optional_result"] is True
+    assert root_call.attributes["ssa_optional_result"] is True
+    comparison = next(
+        instruction for instruction in root.blocks["entry"].instrs
+        if instruction.res is compared
+    )
+    assert comparison.op == "Cast"
+    assert comparison.args[0].accounting["ssa_optional_presence"] is True
 
 
 def test_energy_limit_exact_helper_has_closed_optional_and_structural_abi():

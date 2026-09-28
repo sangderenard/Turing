@@ -1018,7 +1018,8 @@ def dt_system_contract(entry, columns, batch, participants=1):
 
 
 def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimization="O2",
-                   link="static", piece_mode="link", progress=None):
+                   link="static", piece_mode="link", progress=None,
+                   trace=False, trace_full_values=False):
     """Lower ``dt_system_over`` to ``backend`` and return the compiled artifact.
 
     The pieces are bound by name (``step_i``) and called by name in the
@@ -1099,7 +1100,10 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
         from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 
         progress("emitting linked repository SSA to C")
-        artifact = emit_ssa_module_to_c(module, exports[0])
+        artifact = emit_ssa_module_to_c(
+            module, exports[0], trace=trace,
+            trace_full_values=trace_full_values,
+        )
         if not artifact.complete:
             raise RuntimeError("C emission shortfalls: " + "; ".join(
                 f"{s.operation}: {s.reason}" for s in artifact.shortfalls[:6]))
@@ -1161,14 +1165,30 @@ class NativeSystem:
         """``state`` field name -> root formal value id.
 
         This is the mapping that says which physical buffer carries ``T``, or
-        ``telemetry``, or any other declared field.
+        ``telemetry``, or any other declared field.  A lowered root can carry
+        more than one formal for the same field: the direct ProgramABI slot
+        and callsite-forwarded aliases used while assembling nested regions.
+        The compiler's ABI rule is that the written slot is authoritative,
+        followed by a direct root slot.  Do not let incidental argument order
+        decide which buffer a ctypes host reads back.
         """
-        found = {}
+        candidates = {}
         for argument in self.root.args:
             accounting = dict(argument.accounting or {})
-            if accounting.get("program_abi_parameter") == "state":
-                found[str(accounting.get("program_abi_field"))] = int(argument.id)
-        return found
+            field = accounting.get("program_abi_field")
+            if (accounting.get("program_abi_parameter") != "state"
+                    or field is None):
+                continue
+            priority = (
+                int(bool(accounting.get("program_abi_field_written"))),
+                int(accounting.get("callsite_id") is None),
+            )
+            candidates.setdefault(str(field), []).append(
+                (priority, int(argument.id)))
+        return {
+            field: max(choices, key=lambda choice: choice[0])[1]
+            for field, choices in candidates.items()
+        }
 
     def scalar_ids(self):
         """``round_dt``/``dt_initial``/``dx`` -> root formal value id.
@@ -1212,9 +1232,19 @@ class NativeSystem:
     def prepare(self, state, targets, controller, round_dt, dt_initial, dx):
         """Allocate the public buffers from real values, ready to step."""
         configure_publication_limits(state, targets)
-        return self.artifact.prepare_execution(
-            self.feeds(state, targets, controller, round_dt, dt_initial, dx)
-        )
+        feeds = self.feeds(
+            state, targets, controller, round_dt, dt_initial, dx)
+        prepare = getattr(self.artifact, "prepare_execution", None)
+        if prepare is not None:
+            return prepare(feeds)
+        # LLVMFunctionArtifact deliberately exposes the same pointer-table ABI
+        # as CModuleArtifact, but its allocator is the backend-level function
+        # because the artifact itself stays a plain emission receipt.  Keep
+        # that distinction here rather than making every NativeSystem caller
+        # rediscover which backend it received.
+        from src.compiler.ssa_llvm_backend import prepare_artifact_execution
+
+        return prepare_artifact_execution(self.artifact, feeds)
 
     def layout(self, execution=None):
         """Everything a host needs, as plain data.

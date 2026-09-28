@@ -6,7 +6,6 @@ import pytest
 from src.compiler.ssa_c_backend import emit_ssa_to_c
 from src.transmogrifier.ssa import SSAValue, Instr, Function, BasicBlock, IRModule
 
-
 @pytest.mark.parametrize('copied_operand', [False, True])
 def test_scalar_bool_keeps_its_storage_type_when_helper_also_reads_arrays(tmp_path, copied_operand):
     data = SSAValue(0, 'float64', accounting={'physical_dtype': 'float64'})

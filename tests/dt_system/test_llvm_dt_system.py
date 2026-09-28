@@ -12,6 +12,7 @@ running under the dt system's controller.
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import sympy as sp
@@ -22,9 +23,34 @@ sys.path.insert(0, str(ROOT / "examples"))
 
 from src.compiler.native_package import piece_from_law  # noqa: E402
 from src.compiler.symbolic_equation_compiler import compile_sympy_equations  # noqa: E402
-from llvm_dt_system import dt_system  # noqa: E402
+from llvm_dt_system import NativeSystem, dt_system  # noqa: E402
 
 BATCH = 4
+
+
+def test_native_system_reads_back_authoritative_written_state_slot():
+    def argument(value_id, *, written=False, callsite_id=None):
+        accounting = {
+            "program_abi_parameter": "state",
+            "program_abi_field": "x",
+            "program_abi_field_written": written,
+        }
+        if callsite_id is not None:
+            accounting["callsite_id"] = callsite_id
+        return SimpleNamespace(id=value_id, accounting=accounting)
+
+    root = SimpleNamespace(args=[
+        argument(10),
+        argument(11, written=True),
+        # This alias comes later on purpose: argument order must not replace
+        # the buffer that the compiler marks as the field's mutable output.
+        argument(12, callsite_id=99),
+    ])
+    module = SimpleNamespace(functions={"entry": root})
+    system = NativeSystem(
+        SimpleNamespace(), module, "entry", (), columns=("x",), batch=1)
+
+    assert system.state_field_ids() == {"x": 11}
 
 
 def test_llvm_piece_steps_under_the_dt_system(tmp_path):

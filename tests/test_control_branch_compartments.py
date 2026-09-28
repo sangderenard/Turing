@@ -58,8 +58,9 @@ def test_erased_optional_none_test_uses_exact_presence_slot():
     present = _optional_presence_control_expression(graph, is_present)
     absent = _optional_presence_control_expression(graph, is_absent)
 
-    assert (present.op, present.value_id) == ('value', 3)
+    assert (present.op, present.value_id) == ('optional_presence', 3)
     assert absent.op == 'not'
+    assert absent.operands[0].op == 'optional_presence'
     assert absent.operands[0].value_id == 3
     assert graph.graph['optional_presence_control_receipts'] == ({
         'name': 'limit',
@@ -369,6 +370,20 @@ def test_locationless_ast_helpers_do_not_claim_unrelated_branch_work():
     assert memberships[11] == frozenset({(10, "body")})
     assert (10, "body") not in memberships.get(12, frozenset())
     assert (10, "body") not in memberships.get(13, frozenset())
+
+
+def test_structurally_selected_arm_is_no_longer_a_branch_compartment():
+    conditional = ast.parse(
+        "value = source if enabled else fallback\n"
+    ).body[0].value
+    selected = conditional.body
+
+    graph = nx.DiGraph()
+    graph.add_node(10, expr_obj=conditional)
+    graph.add_node(11, expr_obj=selected)
+    graph.graph["structurally_specialized_conditional_node_ids"] = (10,)
+
+    assert 11 not in _branch_compartments(SimpleNamespace(G=graph))
 
 
 def test_copied_source_and_folded_provenance_require_structural_identity():

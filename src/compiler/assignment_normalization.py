@@ -16,6 +16,8 @@ class AssignmentNormalizationReceipt:
     line: int
     target_count: int
     temporary_names: tuple[str, ...]
+    projections: tuple[tuple[str, int, str], ...] = ()
+    scope: str = "<module>"
 
 
 class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
@@ -28,6 +30,25 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
         )
         self._next_temporary = 0
         self.receipts: list[AssignmentNormalizationReceipt] = []
+        self._scope: list[str] = []
+
+    def _visit_scope(self, node: ast.AST, name: str):
+        self._scope.append(str(name))
+        try:
+            return self.generic_visit(node)
+        finally:
+            self._scope.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef):  # noqa: N802
+        return self._visit_scope(node, node.name)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):  # noqa: N802
+        return self._visit_scope(node, node.name)
+
+    def visit_AsyncFunctionDef(  # noqa: N802
+        self, node: ast.AsyncFunctionDef,
+    ):
+        return self._visit_scope(node, node.name)
 
     def _fresh_name(self) -> str:
         while True:
@@ -80,6 +101,7 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
         *,
         location: ast.AST,
         temporaries: list[str],
+        projections: list[tuple[str, int, str]],
         aggregate_name: str | None = None,
     ) -> Iterator[ast.Assign]:
         """Yield ordinary assignments for one target/value pair."""
@@ -132,6 +154,10 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
             projected_value: ast.expr = self._projection(
                 aggregate_name, projection, binding_target
             )
+            if isinstance(projection, int) and isinstance(binding_target, ast.Name):
+                projections.append((
+                    str(aggregate_name), int(projection), binding_target.id,
+                ))
             if isinstance(element, ast.Starred):
                 # Python always binds a starred assignment target to a new
                 # list, regardless of the source aggregate's concrete type.
@@ -148,6 +174,7 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
                 projected_value,
                 location=location,
                 temporaries=temporaries,
+                projections=projections,
             )
 
     def visit_Assign(self, node: ast.Assign):  # noqa: N802 - ast visitor API
@@ -192,10 +219,12 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
                 line=int(getattr(node, "lineno", -1)),
                 target_count=len(node.targets[0].elts),
                 temporary_names=tuple(temporaries),
+                scope=".".join(self._scope) or "<module>",
             ))
             return normalized
 
         temporaries: list[str] = []
+        projections: list[tuple[str, int, str]] = []
         root_name = self._fresh_name()
         temporaries.append(root_name)
         normalized: list[ast.Assign] = [ast.copy_location(
@@ -216,6 +245,7 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
                     self._load(root_name, target),
                     location=node,
                     temporaries=temporaries,
+                    projections=projections,
                     aggregate_name=root_name,
                 ):
                     normalized.append(assignment)
@@ -237,6 +267,8 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
                 and isinstance(getattr(member, "ctx", None), ast.Store)
             ),
             temporary_names=tuple(temporaries),
+            projections=tuple(projections),
+            scope=".".join(self._scope) or "<module>",
         ))
         return normalized
 

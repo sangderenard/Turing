@@ -1,0 +1,1641 @@
+FUNCTION step_2__advance_pieces__planned_region_1
+  args=[(108, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 110 {'value': 0.0}
+    Const [] -> 2305843010213698969 {}
+    Const [] -> 2305843010213698972 {}
+    Const [] -> 2305843010213698970 {}
+    Const [] -> 2305843010213698971 {}
+    Const [] -> 2305843010213698973 {}
+    Call [108, 2305843010213698969, 2305843010213698972, 2305843010213698970, 2305843010213698971, 110, 2305843010213698973] -> 111 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_2
+  args=[(112, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 114 {'value': 0.0}
+    Const [] -> 2305843010213698974 {}
+    Const [] -> 2305843010213698977 {}
+    Const [] -> 2305843010213698975 {}
+    Const [] -> 2305843010213698976 {}
+    Const [] -> 2305843010213698978 {}
+    Call [112, 2305843010213698974, 2305843010213698977, 2305843010213698975, 2305843010213698976, 114, 2305843010213698978] -> 115 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_3
+  args=[(118, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 120 {'value': 0.0}
+    Const [] -> 2305843010213698979 {}
+    Const [] -> 2305843010213698982 {}
+    Const [] -> 2305843010213698980 {}
+    Const [] -> 2305843010213698981 {}
+    Const [] -> 2305843010213698983 {}
+    Call [118, 2305843010213698979, 2305843010213698982, 2305843010213698980, 2305843010213698981, 120, 2305843010213698983] -> 121 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_4
+  args=[(122, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 124 {'value': 0.0}
+    Const [] -> 2305843010213698984 {}
+    Const [] -> 2305843010213698987 {}
+    Const [] -> 2305843010213698985 {}
+    Const [] -> 2305843010213698986 {}
+    Const [] -> 2305843010213698988 {}
+    Call [122, 2305843010213698984, 2305843010213698987, 2305843010213698985, 2305843010213698986, 124, 2305843010213698988] -> 125 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_5
+  args=[(126, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 128 {'value': 0.0}
+    Const [] -> 2305843010213698989 {}
+    Const [] -> 2305843010213698992 {}
+    Const [] -> 2305843010213698990 {}
+    Const [] -> 2305843010213698991 {}
+    Const [] -> 2305843010213698993 {}
+    Call [126, 2305843010213698989, 2305843010213698992, 2305843010213698990, 2305843010213698991, 128, 2305843010213698993] -> 129 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_6
+  args=[(130, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 132 {'value': 0.0}
+    Const [] -> 2305843010213698994 {}
+    Const [] -> 2305843010213698997 {}
+    Const [] -> 2305843010213698995 {}
+    Const [] -> 2305843010213698996 {}
+    Const [] -> 2305843010213698998 {}
+    Call [130, 2305843010213698994, 2305843010213698997, 2305843010213698995, 2305843010213698996, 132, 2305843010213698998] -> 133 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_7
+  args=[(134, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 136 {'value': 0.0}
+    Const [] -> 2305843010213698999 {}
+    Const [] -> 2305843010213699002 {}
+    Const [] -> 2305843010213699000 {}
+    Const [] -> 2305843010213699001 {}
+    Const [] -> 2305843010213699003 {}
+    Call [134, 2305843010213698999, 2305843010213699002, 2305843010213699000, 2305843010213699001, 136, 2305843010213699003] -> 137 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_8
+  args=[(138, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 140 {'value': 0.0}
+    Const [] -> 2305843010213699004 {}
+    Const [] -> 2305843010213699007 {}
+    Const [] -> 2305843010213699005 {}
+    Const [] -> 2305843010213699006 {}
+    Const [] -> 2305843010213699008 {}
+    Call [138, 2305843010213699004, 2305843010213699007, 2305843010213699005, 2305843010213699006, 140, 2305843010213699008] -> 141 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_9
+  args=[(142, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 144 {'value': 0.0}
+    Const [] -> 2305843010213699009 {}
+    Const [] -> 2305843010213699012 {}
+    Const [] -> 2305843010213699010 {}
+    Const [] -> 2305843010213699011 {}
+    Const [] -> 2305843010213699013 {}
+    Call [142, 2305843010213699009, 2305843010213699012, 2305843010213699010, 2305843010213699011, 144, 2305843010213699013] -> 145 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_10
+  args=[(146, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 148 {'value': 0.0}
+    Const [] -> 2305843010213699014 {}
+    Const [] -> 2305843010213699017 {}
+    Const [] -> 2305843010213699015 {}
+    Const [] -> 2305843010213699016 {}
+    Const [] -> 2305843010213699018 {}
+    Call [146, 2305843010213699014, 2305843010213699017, 2305843010213699015, 2305843010213699016, 148, 2305843010213699018] -> 149 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_11
+  args=[(150, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 152 {'value': 0.0}
+    Const [] -> 2305843010213699019 {}
+    Const [] -> 2305843010213699022 {}
+    Const [] -> 2305843010213699020 {}
+    Const [] -> 2305843010213699021 {}
+    Const [] -> 2305843010213699023 {}
+    Call [150, 2305843010213699019, 2305843010213699022, 2305843010213699020, 2305843010213699021, 152, 2305843010213699023] -> 153 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_12
+  args=[(154, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 156 {'value': 0.0}
+    Const [] -> 2305843010213699024 {}
+    Const [] -> 2305843010213699027 {}
+    Const [] -> 2305843010213699025 {}
+    Const [] -> 2305843010213699026 {}
+    Const [] -> 2305843010213699028 {}
+    Call [154, 2305843010213699024, 2305843010213699027, 2305843010213699025, 2305843010213699026, 156, 2305843010213699028] -> 157 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_13
+  args=[(158, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 160 {'value': 0.0}
+    Const [] -> 2305843010213699029 {}
+    Const [] -> 2305843010213699032 {}
+    Const [] -> 2305843010213699030 {}
+    Const [] -> 2305843010213699031 {}
+    Const [] -> 2305843010213699033 {}
+    Call [158, 2305843010213699029, 2305843010213699032, 2305843010213699030, 2305843010213699031, 160, 2305843010213699033] -> 161 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_14
+  args=[(162, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 164 {'value': 0.0}
+    Const [] -> 2305843010213699034 {}
+    Const [] -> 2305843010213699037 {}
+    Const [] -> 2305843010213699035 {}
+    Const [] -> 2305843010213699036 {}
+    Const [] -> 2305843010213699038 {}
+    Call [162, 2305843010213699034, 2305843010213699037, 2305843010213699035, 2305843010213699036, 164, 2305843010213699038] -> 165 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_15
+  args=[(166, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 168 {'value': 0.0}
+    Const [] -> 2305843010213699039 {}
+    Const [] -> 2305843010213699042 {}
+    Const [] -> 2305843010213699040 {}
+    Const [] -> 2305843010213699041 {}
+    Const [] -> 2305843010213699043 {}
+    Call [166, 2305843010213699039, 2305843010213699042, 2305843010213699040, 2305843010213699041, 168, 2305843010213699043] -> 169 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_16
+  args=[(170, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 172 {'value': 0.0}
+    Const [] -> 2305843010213699044 {}
+    Const [] -> 2305843010213699047 {}
+    Const [] -> 2305843010213699045 {}
+    Const [] -> 2305843010213699046 {}
+    Const [] -> 2305843010213699048 {}
+    Call [170, 2305843010213699044, 2305843010213699047, 2305843010213699045, 2305843010213699046, 172, 2305843010213699048] -> 173 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_17
+  args=[(174, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 176 {'value': 0.0}
+    Const [] -> 2305843010213699049 {}
+    Const [] -> 2305843010213699052 {}
+    Const [] -> 2305843010213699050 {}
+    Const [] -> 2305843010213699051 {}
+    Const [] -> 2305843010213699053 {}
+    Call [174, 2305843010213699049, 2305843010213699052, 2305843010213699050, 2305843010213699051, 176, 2305843010213699053] -> 177 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_18
+  args=[(178, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 180 {'value': 0.0}
+    Const [] -> 2305843010213699054 {}
+    Const [] -> 2305843010213699057 {}
+    Const [] -> 2305843010213699055 {}
+    Const [] -> 2305843010213699056 {}
+    Const [] -> 2305843010213699058 {}
+    Call [178, 2305843010213699054, 2305843010213699057, 2305843010213699055, 2305843010213699056, 180, 2305843010213699058] -> 181 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_19
+  args=[(182, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 184 {'value': 0.0}
+    Const [] -> 2305843010213699059 {}
+    Const [] -> 2305843010213699062 {}
+    Const [] -> 2305843010213699060 {}
+    Const [] -> 2305843010213699061 {}
+    Const [] -> 2305843010213699063 {}
+    Call [182, 2305843010213699059, 2305843010213699062, 2305843010213699060, 2305843010213699061, 184, 2305843010213699063] -> 185 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_20
+  args=[(186, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 188 {'value': 0.0}
+    Const [] -> 2305843010213699064 {}
+    Const [] -> 2305843010213699067 {}
+    Const [] -> 2305843010213699065 {}
+    Const [] -> 2305843010213699066 {}
+    Const [] -> 2305843010213699068 {}
+    Call [186, 2305843010213699064, 2305843010213699067, 2305843010213699065, 2305843010213699066, 188, 2305843010213699068] -> 189 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_21
+  args=[(190, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 192 {'value': 0.0}
+    Const [] -> 2305843010213699069 {}
+    Const [] -> 2305843010213699072 {}
+    Const [] -> 2305843010213699070 {}
+    Const [] -> 2305843010213699071 {}
+    Const [] -> 2305843010213699073 {}
+    Call [190, 2305843010213699069, 2305843010213699072, 2305843010213699070, 2305843010213699071, 192, 2305843010213699073] -> 193 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_22
+  args=[(194, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 196 {'value': 0.0}
+    Const [] -> 2305843010213699074 {}
+    Const [] -> 2305843010213699077 {}
+    Const [] -> 2305843010213699075 {}
+    Const [] -> 2305843010213699076 {}
+    Const [] -> 2305843010213699078 {}
+    Call [194, 2305843010213699074, 2305843010213699077, 2305843010213699075, 2305843010213699076, 196, 2305843010213699078] -> 197 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_23
+  args=[(198, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 200 {'value': 0.0}
+    Const [] -> 2305843010213699079 {}
+    Const [] -> 2305843010213699082 {}
+    Const [] -> 2305843010213699080 {}
+    Const [] -> 2305843010213699081 {}
+    Const [] -> 2305843010213699083 {}
+    Call [198, 2305843010213699079, 2305843010213699082, 2305843010213699080, 2305843010213699081, 200, 2305843010213699083] -> 201 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_24
+  args=[(202, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 204 {'value': 0.0}
+    Const [] -> 2305843010213699084 {}
+    Const [] -> 2305843010213699087 {}
+    Const [] -> 2305843010213699085 {}
+    Const [] -> 2305843010213699086 {}
+    Const [] -> 2305843010213699088 {}
+    Call [202, 2305843010213699084, 2305843010213699087, 2305843010213699085, 2305843010213699086, 204, 2305843010213699088] -> 205 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_25
+  args=[(206, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 208 {'value': 0.0}
+    Const [] -> 2305843010213699089 {}
+    Const [] -> 2305843010213699092 {}
+    Const [] -> 2305843010213699090 {}
+    Const [] -> 2305843010213699091 {}
+    Const [] -> 2305843010213699093 {}
+    Call [206, 2305843010213699089, 2305843010213699092, 2305843010213699090, 2305843010213699091, 208, 2305843010213699093] -> 209 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_26
+  args=[(210, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 212 {'value': 0.0}
+    Const [] -> 2305843010213699094 {}
+    Const [] -> 2305843010213699097 {}
+    Const [] -> 2305843010213699095 {}
+    Const [] -> 2305843010213699096 {}
+    Const [] -> 2305843010213699098 {}
+    Call [210, 2305843010213699094, 2305843010213699097, 2305843010213699095, 2305843010213699096, 212, 2305843010213699098] -> 213 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_27
+  args=[(214, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 216 {'value': 0.0}
+    Const [] -> 2305843010213699099 {}
+    Const [] -> 2305843010213699102 {}
+    Const [] -> 2305843010213699100 {}
+    Const [] -> 2305843010213699101 {}
+    Const [] -> 2305843010213699103 {}
+    Call [214, 2305843010213699099, 2305843010213699102, 2305843010213699100, 2305843010213699101, 216, 2305843010213699103] -> 217 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_28
+  args=[(218, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 220 {'value': 0.0}
+    Const [] -> 2305843010213699104 {}
+    Const [] -> 2305843010213699107 {}
+    Const [] -> 2305843010213699105 {}
+    Const [] -> 2305843010213699106 {}
+    Const [] -> 2305843010213699108 {}
+    Call [218, 2305843010213699104, 2305843010213699107, 2305843010213699105, 2305843010213699106, 220, 2305843010213699108] -> 221 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_29
+  args=[(222, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 224 {'value': 0.0}
+    Const [] -> 2305843010213699109 {}
+    Const [] -> 2305843010213699112 {}
+    Const [] -> 2305843010213699110 {}
+    Const [] -> 2305843010213699111 {}
+    Const [] -> 2305843010213699113 {}
+    Call [222, 2305843010213699109, 2305843010213699112, 2305843010213699110, 2305843010213699111, 224, 2305843010213699113] -> 225 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_30
+  args=[(226, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 228 {'value': 0.0}
+    Const [] -> 2305843010213699114 {}
+    Const [] -> 2305843010213699117 {}
+    Const [] -> 2305843010213699115 {}
+    Const [] -> 2305843010213699116 {}
+    Const [] -> 2305843010213699118 {}
+    Call [226, 2305843010213699114, 2305843010213699117, 2305843010213699115, 2305843010213699116, 228, 2305843010213699118] -> 229 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_31
+  args=[(230, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 232 {'value': 0.0}
+    Const [] -> 2305843010213699119 {}
+    Const [] -> 2305843010213699122 {}
+    Const [] -> 2305843010213699120 {}
+    Const [] -> 2305843010213699121 {}
+    Const [] -> 2305843010213699123 {}
+    Call [230, 2305843010213699119, 2305843010213699122, 2305843010213699120, 2305843010213699121, 232, 2305843010213699123] -> 233 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_32
+  args=[(234, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 236 {'value': 0.0}
+    Const [] -> 2305843010213699124 {}
+    Const [] -> 2305843010213699127 {}
+    Const [] -> 2305843010213699125 {}
+    Const [] -> 2305843010213699126 {}
+    Const [] -> 2305843010213699128 {}
+    Call [234, 2305843010213699124, 2305843010213699127, 2305843010213699125, 2305843010213699126, 236, 2305843010213699128] -> 237 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_33
+  args=[(238, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 240 {'value': 0.0}
+    Const [] -> 2305843010213699129 {}
+    Const [] -> 2305843010213699132 {}
+    Const [] -> 2305843010213699130 {}
+    Const [] -> 2305843010213699131 {}
+    Const [] -> 2305843010213699133 {}
+    Call [238, 2305843010213699129, 2305843010213699132, 2305843010213699130, 2305843010213699131, 240, 2305843010213699133] -> 241 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_34
+  args=[(242, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 244 {'value': 0.0}
+    Const [] -> 2305843010213699134 {}
+    Const [] -> 2305843010213699137 {}
+    Const [] -> 2305843010213699135 {}
+    Const [] -> 2305843010213699136 {}
+    Const [] -> 2305843010213699138 {}
+    Call [242, 2305843010213699134, 2305843010213699137, 2305843010213699135, 2305843010213699136, 244, 2305843010213699138] -> 245 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_35
+  args=[(246, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 248 {'value': 0.0}
+    Const [] -> 2305843010213699139 {}
+    Const [] -> 2305843010213699142 {}
+    Const [] -> 2305843010213699140 {}
+    Const [] -> 2305843010213699141 {}
+    Const [] -> 2305843010213699143 {}
+    Call [246, 2305843010213699139, 2305843010213699142, 2305843010213699140, 2305843010213699141, 248, 2305843010213699143] -> 249 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_36
+  args=[(250, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 252 {'value': 0.0}
+    Const [] -> 2305843010213699144 {}
+    Const [] -> 2305843010213699147 {}
+    Const [] -> 2305843010213699145 {}
+    Const [] -> 2305843010213699146 {}
+    Const [] -> 2305843010213699148 {}
+    Call [250, 2305843010213699144, 2305843010213699147, 2305843010213699145, 2305843010213699146, 252, 2305843010213699148] -> 253 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_37
+  args=[(254, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 256 {'value': 0.0}
+    Const [] -> 2305843010213699149 {}
+    Const [] -> 2305843010213699152 {}
+    Const [] -> 2305843010213699150 {}
+    Const [] -> 2305843010213699151 {}
+    Const [] -> 2305843010213699153 {}
+    Call [254, 2305843010213699149, 2305843010213699152, 2305843010213699150, 2305843010213699151, 256, 2305843010213699153] -> 257 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_38
+  args=[(258, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 260 {'value': 0.0}
+    Const [] -> 2305843010213699154 {}
+    Const [] -> 2305843010213699157 {}
+    Const [] -> 2305843010213699155 {}
+    Const [] -> 2305843010213699156 {}
+    Const [] -> 2305843010213699158 {}
+    Call [258, 2305843010213699154, 2305843010213699157, 2305843010213699155, 2305843010213699156, 260, 2305843010213699158] -> 261 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_39
+  args=[(262, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 264 {'value': 0.0}
+    Const [] -> 2305843010213699159 {}
+    Const [] -> 2305843010213699162 {}
+    Const [] -> 2305843010213699160 {}
+    Const [] -> 2305843010213699161 {}
+    Const [] -> 2305843010213699163 {}
+    Call [262, 2305843010213699159, 2305843010213699162, 2305843010213699160, 2305843010213699161, 264, 2305843010213699163] -> 265 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_40
+  args=[(266, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 268 {'value': 0.0}
+    Const [] -> 2305843010213699164 {}
+    Const [] -> 2305843010213699167 {}
+    Const [] -> 2305843010213699165 {}
+    Const [] -> 2305843010213699166 {}
+    Const [] -> 2305843010213699168 {}
+    Call [266, 2305843010213699164, 2305843010213699167, 2305843010213699165, 2305843010213699166, 268, 2305843010213699168] -> 269 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_41
+  args=[(271, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 273 {'value': 0.0}
+    Const [] -> 2305843010213699169 {}
+    Const [] -> 2305843010213699172 {}
+    Const [] -> 2305843010213699170 {}
+    Const [] -> 2305843010213699171 {}
+    Const [] -> 2305843010213699173 {}
+    Call [271, 2305843010213699169, 2305843010213699172, 2305843010213699170, 2305843010213699171, 273, 2305843010213699173] -> 274 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_42
+  args=[(275, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 277 {'value': 0.0}
+    Const [] -> 2305843010213699174 {}
+    Const [] -> 2305843010213699177 {}
+    Const [] -> 2305843010213699175 {}
+    Const [] -> 2305843010213699176 {}
+    Const [] -> 2305843010213699178 {}
+    Call [275, 2305843010213699174, 2305843010213699177, 2305843010213699175, 2305843010213699176, 277, 2305843010213699178] -> 278 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_43
+  args=[(279, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 281 {'value': 0.0}
+    Const [] -> 2305843010213699179 {}
+    Const [] -> 2305843010213699182 {}
+    Const [] -> 2305843010213699180 {}
+    Const [] -> 2305843010213699181 {}
+    Const [] -> 2305843010213699183 {}
+    Call [279, 2305843010213699179, 2305843010213699182, 2305843010213699180, 2305843010213699181, 281, 2305843010213699183] -> 282 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_44
+  args=[(283, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 285 {'value': 0.0}
+    Const [] -> 2305843010213699184 {}
+    Const [] -> 2305843010213699187 {}
+    Const [] -> 2305843010213699185 {}
+    Const [] -> 2305843010213699186 {}
+    Const [] -> 2305843010213699188 {}
+    Call [283, 2305843010213699184, 2305843010213699187, 2305843010213699185, 2305843010213699186, 285, 2305843010213699188] -> 286 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_45
+  args=[(287, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 289 {'value': 0.0}
+    Const [] -> 2305843010213699189 {}
+    Const [] -> 2305843010213699192 {}
+    Const [] -> 2305843010213699190 {}
+    Const [] -> 2305843010213699191 {}
+    Const [] -> 2305843010213699193 {}
+    Call [287, 2305843010213699189, 2305843010213699192, 2305843010213699190, 2305843010213699191, 289, 2305843010213699193] -> 290 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_46
+  args=[(291, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 293 {'value': 0.0}
+    Const [] -> 2305843010213699194 {}
+    Const [] -> 2305843010213699197 {}
+    Const [] -> 2305843010213699195 {}
+    Const [] -> 2305843010213699196 {}
+    Const [] -> 2305843010213699198 {}
+    Call [291, 2305843010213699194, 2305843010213699197, 2305843010213699195, 2305843010213699196, 293, 2305843010213699198] -> 294 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_47
+  args=[(295, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 297 {'value': 0.0}
+    Const [] -> 2305843010213699199 {}
+    Const [] -> 2305843010213699202 {}
+    Const [] -> 2305843010213699200 {}
+    Const [] -> 2305843010213699201 {}
+    Const [] -> 2305843010213699203 {}
+    Call [295, 2305843010213699199, 2305843010213699202, 2305843010213699200, 2305843010213699201, 297, 2305843010213699203] -> 298 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_48
+  args=[(299, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 301 {'value': 0.0}
+    Const [] -> 2305843010213699204 {}
+    Const [] -> 2305843010213699207 {}
+    Const [] -> 2305843010213699205 {}
+    Const [] -> 2305843010213699206 {}
+    Const [] -> 2305843010213699208 {}
+    Call [299, 2305843010213699204, 2305843010213699207, 2305843010213699205, 2305843010213699206, 301, 2305843010213699208] -> 302 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_49
+  args=[(303, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 305 {'value': 0.0}
+    Const [] -> 2305843010213699209 {}
+    Const [] -> 2305843010213699212 {}
+    Const [] -> 2305843010213699210 {}
+    Const [] -> 2305843010213699211 {}
+    Const [] -> 2305843010213699213 {}
+    Call [303, 2305843010213699209, 2305843010213699212, 2305843010213699210, 2305843010213699211, 305, 2305843010213699213] -> 306 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_50
+  args=[(307, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 309 {'value': 0.0}
+    Const [] -> 2305843010213699214 {}
+    Const [] -> 2305843010213699217 {}
+    Const [] -> 2305843010213699215 {}
+    Const [] -> 2305843010213699216 {}
+    Const [] -> 2305843010213699218 {}
+    Call [307, 2305843010213699214, 2305843010213699217, 2305843010213699215, 2305843010213699216, 309, 2305843010213699218] -> 310 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_51
+  args=[(311, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 313 {'value': 0.0}
+    Const [] -> 2305843010213699219 {}
+    Const [] -> 2305843010213699222 {}
+    Const [] -> 2305843010213699220 {}
+    Const [] -> 2305843010213699221 {}
+    Const [] -> 2305843010213699223 {}
+    Call [311, 2305843010213699219, 2305843010213699222, 2305843010213699220, 2305843010213699221, 313, 2305843010213699223] -> 314 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_52
+  args=[(315, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 317 {'value': 0.0}
+    Const [] -> 2305843010213699224 {}
+    Const [] -> 2305843010213699227 {}
+    Const [] -> 2305843010213699225 {}
+    Const [] -> 2305843010213699226 {}
+    Const [] -> 2305843010213699228 {}
+    Call [315, 2305843010213699224, 2305843010213699227, 2305843010213699225, 2305843010213699226, 317, 2305843010213699228] -> 318 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_53
+  args=[(319, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 321 {'value': 0.0}
+    Const [] -> 2305843010213699229 {}
+    Const [] -> 2305843010213699232 {}
+    Const [] -> 2305843010213699230 {}
+    Const [] -> 2305843010213699231 {}
+    Const [] -> 2305843010213699233 {}
+    Call [319, 2305843010213699229, 2305843010213699232, 2305843010213699230, 2305843010213699231, 321, 2305843010213699233] -> 322 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_54
+  args=[(323, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 325 {'value': 0.0}
+    Const [] -> 2305843010213699234 {}
+    Const [] -> 2305843010213699237 {}
+    Const [] -> 2305843010213699235 {}
+    Const [] -> 2305843010213699236 {}
+    Const [] -> 2305843010213699238 {}
+    Call [323, 2305843010213699234, 2305843010213699237, 2305843010213699235, 2305843010213699236, 325, 2305843010213699238] -> 326 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_55
+  args=[(327, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 329 {'value': 0.0}
+    Const [] -> 2305843010213699239 {}
+    Const [] -> 2305843010213699242 {}
+    Const [] -> 2305843010213699240 {}
+    Const [] -> 2305843010213699241 {}
+    Const [] -> 2305843010213699243 {}
+    Call [327, 2305843010213699239, 2305843010213699242, 2305843010213699240, 2305843010213699241, 329, 2305843010213699243] -> 330 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_56
+  args=[(331, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 333 {'value': 0.0}
+    Const [] -> 2305843010213699244 {}
+    Const [] -> 2305843010213699247 {}
+    Const [] -> 2305843010213699245 {}
+    Const [] -> 2305843010213699246 {}
+    Const [] -> 2305843010213699248 {}
+    Call [331, 2305843010213699244, 2305843010213699247, 2305843010213699245, 2305843010213699246, 333, 2305843010213699248] -> 334 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_57
+  args=[(335, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 337 {'value': 0.0}
+    Const [] -> 2305843010213699249 {}
+    Const [] -> 2305843010213699252 {}
+    Const [] -> 2305843010213699250 {}
+    Const [] -> 2305843010213699251 {}
+    Const [] -> 2305843010213699253 {}
+    Call [335, 2305843010213699249, 2305843010213699252, 2305843010213699250, 2305843010213699251, 337, 2305843010213699253] -> 338 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_58
+  args=[(339, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 341 {'value': 0.0}
+    Const [] -> 2305843010213699254 {}
+    Const [] -> 2305843010213699257 {}
+    Const [] -> 2305843010213699255 {}
+    Const [] -> 2305843010213699256 {}
+    Const [] -> 2305843010213699258 {}
+    Call [339, 2305843010213699254, 2305843010213699257, 2305843010213699255, 2305843010213699256, 341, 2305843010213699258] -> 342 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_59
+  args=[(343, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 345 {'value': 0.0}
+    Const [] -> 2305843010213699259 {}
+    Const [] -> 2305843010213699262 {}
+    Const [] -> 2305843010213699260 {}
+    Const [] -> 2305843010213699261 {}
+    Const [] -> 2305843010213699263 {}
+    Call [343, 2305843010213699259, 2305843010213699262, 2305843010213699260, 2305843010213699261, 345, 2305843010213699263] -> 346 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_60
+  args=[(347, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 349 {'value': 0.0}
+    Const [] -> 2305843010213699264 {}
+    Const [] -> 2305843010213699267 {}
+    Const [] -> 2305843010213699265 {}
+    Const [] -> 2305843010213699266 {}
+    Const [] -> 2305843010213699268 {}
+    Call [347, 2305843010213699264, 2305843010213699267, 2305843010213699265, 2305843010213699266, 349, 2305843010213699268] -> 350 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_61
+  args=[(351, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 353 {'value': 0.0}
+    Const [] -> 2305843010213699269 {}
+    Const [] -> 2305843010213699272 {}
+    Const [] -> 2305843010213699270 {}
+    Const [] -> 2305843010213699271 {}
+    Const [] -> 2305843010213699273 {}
+    Call [351, 2305843010213699269, 2305843010213699272, 2305843010213699270, 2305843010213699271, 353, 2305843010213699273] -> 354 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_62
+  args=[(355, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 357 {'value': 0.0}
+    Const [] -> 2305843010213699274 {}
+    Const [] -> 2305843010213699277 {}
+    Const [] -> 2305843010213699275 {}
+    Const [] -> 2305843010213699276 {}
+    Const [] -> 2305843010213699278 {}
+    Call [355, 2305843010213699274, 2305843010213699277, 2305843010213699275, 2305843010213699276, 357, 2305843010213699278] -> 358 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_63
+  args=[(359, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 361 {'value': 0.0}
+    Const [] -> 2305843010213699279 {}
+    Const [] -> 2305843010213699282 {}
+    Const [] -> 2305843010213699280 {}
+    Const [] -> 2305843010213699281 {}
+    Const [] -> 2305843010213699283 {}
+    Call [359, 2305843010213699279, 2305843010213699282, 2305843010213699280, 2305843010213699281, 361, 2305843010213699283] -> 362 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_64
+  args=[(363, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 365 {'value': 0.0}
+    Const [] -> 2305843010213699284 {}
+    Const [] -> 2305843010213699287 {}
+    Const [] -> 2305843010213699285 {}
+    Const [] -> 2305843010213699286 {}
+    Const [] -> 2305843010213699288 {}
+    Call [363, 2305843010213699284, 2305843010213699287, 2305843010213699285, 2305843010213699286, 365, 2305843010213699288] -> 366 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_65
+  args=[(367, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 369 {'value': 0.0}
+    Const [] -> 2305843010213699289 {}
+    Const [] -> 2305843010213699292 {}
+    Const [] -> 2305843010213699290 {}
+    Const [] -> 2305843010213699291 {}
+    Const [] -> 2305843010213699293 {}
+    Call [367, 2305843010213699289, 2305843010213699292, 2305843010213699290, 2305843010213699291, 369, 2305843010213699293] -> 370 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_66
+  args=[(371, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 373 {'value': 0.0}
+    Const [] -> 2305843010213699294 {}
+    Const [] -> 2305843010213699297 {}
+    Const [] -> 2305843010213699295 {}
+    Const [] -> 2305843010213699296 {}
+    Const [] -> 2305843010213699298 {}
+    Call [371, 2305843010213699294, 2305843010213699297, 2305843010213699295, 2305843010213699296, 373, 2305843010213699298] -> 374 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_67
+  args=[(375, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 377 {'value': 0.0}
+    Const [] -> 2305843010213699299 {}
+    Const [] -> 2305843010213699302 {}
+    Const [] -> 2305843010213699300 {}
+    Const [] -> 2305843010213699301 {}
+    Const [] -> 2305843010213699303 {}
+    Call [375, 2305843010213699299, 2305843010213699302, 2305843010213699300, 2305843010213699301, 377, 2305843010213699303] -> 378 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_68
+  args=[(379, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 381 {'value': 0.0}
+    Const [] -> 2305843010213699304 {}
+    Const [] -> 2305843010213699307 {}
+    Const [] -> 2305843010213699305 {}
+    Const [] -> 2305843010213699306 {}
+    Const [] -> 2305843010213699308 {}
+    Call [379, 2305843010213699304, 2305843010213699307, 2305843010213699305, 2305843010213699306, 381, 2305843010213699308] -> 382 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_69
+  args=[(383, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 385 {'value': 0.0}
+    Const [] -> 2305843010213699309 {}
+    Const [] -> 2305843010213699312 {}
+    Const [] -> 2305843010213699310 {}
+    Const [] -> 2305843010213699311 {}
+    Const [] -> 2305843010213699313 {}
+    Call [383, 2305843010213699309, 2305843010213699312, 2305843010213699310, 2305843010213699311, 385, 2305843010213699313] -> 386 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_70
+  args=[(387, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 389 {'value': 0.0}
+    Const [] -> 2305843010213699314 {}
+    Const [] -> 2305843010213699317 {}
+    Const [] -> 2305843010213699315 {}
+    Const [] -> 2305843010213699316 {}
+    Const [] -> 2305843010213699318 {}
+    Call [387, 2305843010213699314, 2305843010213699317, 2305843010213699315, 2305843010213699316, 389, 2305843010213699318] -> 390 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_71
+  args=[(391, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 393 {'value': 0.0}
+    Const [] -> 2305843010213699319 {}
+    Const [] -> 2305843010213699322 {}
+    Const [] -> 2305843010213699320 {}
+    Const [] -> 2305843010213699321 {}
+    Const [] -> 2305843010213699323 {}
+    Call [391, 2305843010213699319, 2305843010213699322, 2305843010213699320, 2305843010213699321, 393, 2305843010213699323] -> 394 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_72
+  args=[(395, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 397 {'value': 0.0}
+    Const [] -> 2305843010213699324 {}
+    Const [] -> 2305843010213699327 {}
+    Const [] -> 2305843010213699325 {}
+    Const [] -> 2305843010213699326 {}
+    Const [] -> 2305843010213699328 {}
+    Call [395, 2305843010213699324, 2305843010213699327, 2305843010213699325, 2305843010213699326, 397, 2305843010213699328] -> 398 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_73
+  args=[(399, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 401 {'value': 0.0}
+    Const [] -> 2305843010213699329 {}
+    Const [] -> 2305843010213699332 {}
+    Const [] -> 2305843010213699330 {}
+    Const [] -> 2305843010213699331 {}
+    Const [] -> 2305843010213699333 {}
+    Call [399, 2305843010213699329, 2305843010213699332, 2305843010213699330, 2305843010213699331, 401, 2305843010213699333] -> 402 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_74
+  args=[(403, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 405 {'value': 0.0}
+    Const [] -> 2305843010213699334 {}
+    Const [] -> 2305843010213699337 {}
+    Const [] -> 2305843010213699335 {}
+    Const [] -> 2305843010213699336 {}
+    Const [] -> 2305843010213699338 {}
+    Call [403, 2305843010213699334, 2305843010213699337, 2305843010213699335, 2305843010213699336, 405, 2305843010213699338] -> 406 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_75
+  args=[(407, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 409 {'value': 0.0}
+    Const [] -> 2305843010213699339 {}
+    Const [] -> 2305843010213699342 {}
+    Const [] -> 2305843010213699340 {}
+    Const [] -> 2305843010213699341 {}
+    Const [] -> 2305843010213699343 {}
+    Call [407, 2305843010213699339, 2305843010213699342, 2305843010213699340, 2305843010213699341, 409, 2305843010213699343] -> 410 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_76
+  args=[(411, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 413 {'value': 0.0}
+    Const [] -> 2305843010213699344 {}
+    Const [] -> 2305843010213699347 {}
+    Const [] -> 2305843010213699345 {}
+    Const [] -> 2305843010213699346 {}
+    Const [] -> 2305843010213699348 {}
+    Call [411, 2305843010213699344, 2305843010213699347, 2305843010213699345, 2305843010213699346, 413, 2305843010213699348] -> 414 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_77
+  args=[(415, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 417 {'value': 0.0}
+    Const [] -> 2305843010213699349 {}
+    Const [] -> 2305843010213699352 {}
+    Const [] -> 2305843010213699350 {}
+    Const [] -> 2305843010213699351 {}
+    Const [] -> 2305843010213699353 {}
+    Call [415, 2305843010213699349, 2305843010213699352, 2305843010213699350, 2305843010213699351, 417, 2305843010213699353] -> 418 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_78
+  args=[(419, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 421 {'value': 0.0}
+    Const [] -> 2305843010213699354 {}
+    Const [] -> 2305843010213699357 {}
+    Const [] -> 2305843010213699355 {}
+    Const [] -> 2305843010213699356 {}
+    Const [] -> 2305843010213699358 {}
+    Call [419, 2305843010213699354, 2305843010213699357, 2305843010213699355, 2305843010213699356, 421, 2305843010213699358] -> 422 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_79
+  args=[(424, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 426 {'value': 0.0}
+    Const [] -> 2305843010213699359 {}
+    Const [] -> 2305843010213699362 {}
+    Const [] -> 2305843010213699360 {}
+    Const [] -> 2305843010213699361 {}
+    Const [] -> 2305843010213699363 {}
+    Call [424, 2305843010213699359, 2305843010213699362, 2305843010213699360, 2305843010213699361, 426, 2305843010213699363] -> 427 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_80
+  args=[(428, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 430 {'value': 0.0}
+    Const [] -> 2305843010213699364 {}
+    Const [] -> 2305843010213699367 {}
+    Const [] -> 2305843010213699365 {}
+    Const [] -> 2305843010213699366 {}
+    Const [] -> 2305843010213699368 {}
+    Call [428, 2305843010213699364, 2305843010213699367, 2305843010213699365, 2305843010213699366, 430, 2305843010213699368] -> 431 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_81
+  args=[(432, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 434 {'value': 0.0}
+    Const [] -> 2305843010213699369 {}
+    Const [] -> 2305843010213699372 {}
+    Const [] -> 2305843010213699370 {}
+    Const [] -> 2305843010213699371 {}
+    Const [] -> 2305843010213699373 {}
+    Call [432, 2305843010213699369, 2305843010213699372, 2305843010213699370, 2305843010213699371, 434, 2305843010213699373] -> 435 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_82
+  args=[(436, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 438 {'value': 0.0}
+    Const [] -> 2305843010213699374 {}
+    Const [] -> 2305843010213699377 {}
+    Const [] -> 2305843010213699375 {}
+    Const [] -> 2305843010213699376 {}
+    Const [] -> 2305843010213699378 {}
+    Call [436, 2305843010213699374, 2305843010213699377, 2305843010213699375, 2305843010213699376, 438, 2305843010213699378] -> 439 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_83
+  args=[(440, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 442 {'value': 0.0}
+    Const [] -> 2305843010213699379 {}
+    Const [] -> 2305843010213699382 {}
+    Const [] -> 2305843010213699380 {}
+    Const [] -> 2305843010213699381 {}
+    Const [] -> 2305843010213699383 {}
+    Call [440, 2305843010213699379, 2305843010213699382, 2305843010213699380, 2305843010213699381, 442, 2305843010213699383] -> 443 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_84
+  args=[(444, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 446 {'value': 0.0}
+    Const [] -> 2305843010213699384 {}
+    Const [] -> 2305843010213699387 {}
+    Const [] -> 2305843010213699385 {}
+    Const [] -> 2305843010213699386 {}
+    Const [] -> 2305843010213699388 {}
+    Call [444, 2305843010213699384, 2305843010213699387, 2305843010213699385, 2305843010213699386, 446, 2305843010213699388] -> 447 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_85
+  args=[(448, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 450 {'value': 0.0}
+    Const [] -> 2305843010213699389 {}
+    Const [] -> 2305843010213699392 {}
+    Const [] -> 2305843010213699390 {}
+    Const [] -> 2305843010213699391 {}
+    Const [] -> 2305843010213699393 {}
+    Call [448, 2305843010213699389, 2305843010213699392, 2305843010213699390, 2305843010213699391, 450, 2305843010213699393] -> 451 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_86
+  args=[(452, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 454 {'value': 0.0}
+    Const [] -> 2305843010213699394 {}
+    Const [] -> 2305843010213699397 {}
+    Const [] -> 2305843010213699395 {}
+    Const [] -> 2305843010213699396 {}
+    Const [] -> 2305843010213699398 {}
+    Call [452, 2305843010213699394, 2305843010213699397, 2305843010213699395, 2305843010213699396, 454, 2305843010213699398] -> 455 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_87
+  args=[(456, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 458 {'value': 0.0}
+    Const [] -> 2305843010213699399 {}
+    Const [] -> 2305843010213699402 {}
+    Const [] -> 2305843010213699400 {}
+    Const [] -> 2305843010213699401 {}
+    Const [] -> 2305843010213699403 {}
+    Call [456, 2305843010213699399, 2305843010213699402, 2305843010213699400, 2305843010213699401, 458, 2305843010213699403] -> 459 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_88
+  args=[(460, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 462 {'value': 0.0}
+    Const [] -> 2305843010213699404 {}
+    Const [] -> 2305843010213699407 {}
+    Const [] -> 2305843010213699405 {}
+    Const [] -> 2305843010213699406 {}
+    Const [] -> 2305843010213699408 {}
+    Call [460, 2305843010213699404, 2305843010213699407, 2305843010213699405, 2305843010213699406, 462, 2305843010213699408] -> 463 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_89
+  args=[(464, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 466 {'value': 0.0}
+    Const [] -> 2305843010213699409 {}
+    Const [] -> 2305843010213699412 {}
+    Const [] -> 2305843010213699410 {}
+    Const [] -> 2305843010213699411 {}
+    Const [] -> 2305843010213699413 {}
+    Call [464, 2305843010213699409, 2305843010213699412, 2305843010213699410, 2305843010213699411, 466, 2305843010213699413] -> 467 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_90
+  args=[(468, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 470 {'value': 0.0}
+    Const [] -> 2305843010213699414 {}
+    Const [] -> 2305843010213699417 {}
+    Const [] -> 2305843010213699415 {}
+    Const [] -> 2305843010213699416 {}
+    Const [] -> 2305843010213699418 {}
+    Call [468, 2305843010213699414, 2305843010213699417, 2305843010213699415, 2305843010213699416, 470, 2305843010213699418] -> 471 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_91
+  args=[(472, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 474 {'value': 0.0}
+    Const [] -> 2305843010213699419 {}
+    Const [] -> 2305843010213699422 {}
+    Const [] -> 2305843010213699420 {}
+    Const [] -> 2305843010213699421 {}
+    Const [] -> 2305843010213699423 {}
+    Call [472, 2305843010213699419, 2305843010213699422, 2305843010213699420, 2305843010213699421, 474, 2305843010213699423] -> 475 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_92
+  args=[(476, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 478 {'value': 0.0}
+    Const [] -> 2305843010213699424 {}
+    Const [] -> 2305843010213699427 {}
+    Const [] -> 2305843010213699425 {}
+    Const [] -> 2305843010213699426 {}
+    Const [] -> 2305843010213699428 {}
+    Call [476, 2305843010213699424, 2305843010213699427, 2305843010213699425, 2305843010213699426, 478, 2305843010213699428] -> 479 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_93
+  args=[(480, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 482 {'value': 0.0}
+    Const [] -> 2305843010213699429 {}
+    Const [] -> 2305843010213699432 {}
+    Const [] -> 2305843010213699430 {}
+    Const [] -> 2305843010213699431 {}
+    Const [] -> 2305843010213699433 {}
+    Call [480, 2305843010213699429, 2305843010213699432, 2305843010213699430, 2305843010213699431, 482, 2305843010213699433] -> 483 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_94
+  args=[(484, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 486 {'value': 0.0}
+    Const [] -> 2305843010213699434 {}
+    Const [] -> 2305843010213699437 {}
+    Const [] -> 2305843010213699435 {}
+    Const [] -> 2305843010213699436 {}
+    Const [] -> 2305843010213699438 {}
+    Call [484, 2305843010213699434, 2305843010213699437, 2305843010213699435, 2305843010213699436, 486, 2305843010213699438] -> 487 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_95
+  args=[(488, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 490 {'value': 0.0}
+    Const [] -> 2305843010213699439 {}
+    Const [] -> 2305843010213699442 {}
+    Const [] -> 2305843010213699440 {}
+    Const [] -> 2305843010213699441 {}
+    Const [] -> 2305843010213699443 {}
+    Call [488, 2305843010213699439, 2305843010213699442, 2305843010213699440, 2305843010213699441, 490, 2305843010213699443] -> 491 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_96
+  args=[(492, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 494 {'value': 0.0}
+    Const [] -> 2305843010213699444 {}
+    Const [] -> 2305843010213699447 {}
+    Const [] -> 2305843010213699445 {}
+    Const [] -> 2305843010213699446 {}
+    Const [] -> 2305843010213699448 {}
+    Call [492, 2305843010213699444, 2305843010213699447, 2305843010213699445, 2305843010213699446, 494, 2305843010213699448] -> 495 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_97
+  args=[(496, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 498 {'value': 0.0}
+    Const [] -> 2305843010213699449 {}
+    Const [] -> 2305843010213699452 {}
+    Const [] -> 2305843010213699450 {}
+    Const [] -> 2305843010213699451 {}
+    Const [] -> 2305843010213699453 {}
+    Call [496, 2305843010213699449, 2305843010213699452, 2305843010213699450, 2305843010213699451, 498, 2305843010213699453] -> 499 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_98
+  args=[(500, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 502 {'value': 0.0}
+    Const [] -> 2305843010213699454 {}
+    Const [] -> 2305843010213699457 {}
+    Const [] -> 2305843010213699455 {}
+    Const [] -> 2305843010213699456 {}
+    Const [] -> 2305843010213699458 {}
+    Call [500, 2305843010213699454, 2305843010213699457, 2305843010213699455, 2305843010213699456, 502, 2305843010213699458] -> 503 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_99
+  args=[(504, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 506 {'value': 0.0}
+    Const [] -> 2305843010213699459 {}
+    Const [] -> 2305843010213699462 {}
+    Const [] -> 2305843010213699460 {}
+    Const [] -> 2305843010213699461 {}
+    Const [] -> 2305843010213699463 {}
+    Call [504, 2305843010213699459, 2305843010213699462, 2305843010213699460, 2305843010213699461, 506, 2305843010213699463] -> 507 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_100
+  args=[(508, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 510 {'value': 0.0}
+    Const [] -> 2305843010213699464 {}
+    Const [] -> 2305843010213699467 {}
+    Const [] -> 2305843010213699465 {}
+    Const [] -> 2305843010213699466 {}
+    Const [] -> 2305843010213699468 {}
+    Call [508, 2305843010213699464, 2305843010213699467, 2305843010213699465, 2305843010213699466, 510, 2305843010213699468] -> 511 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_101
+  args=[(512, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 514 {'value': 0.0}
+    Const [] -> 2305843010213699469 {}
+    Const [] -> 2305843010213699472 {}
+    Const [] -> 2305843010213699470 {}
+    Const [] -> 2305843010213699471 {}
+    Const [] -> 2305843010213699473 {}
+    Call [512, 2305843010213699469, 2305843010213699472, 2305843010213699470, 2305843010213699471, 514, 2305843010213699473] -> 515 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_102
+  args=[(516, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 518 {'value': 0.0}
+    Const [] -> 2305843010213699474 {}
+    Const [] -> 2305843010213699477 {}
+    Const [] -> 2305843010213699475 {}
+    Const [] -> 2305843010213699476 {}
+    Const [] -> 2305843010213699478 {}
+    Call [516, 2305843010213699474, 2305843010213699477, 2305843010213699475, 2305843010213699476, 518, 2305843010213699478] -> 519 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_103
+  args=[(520, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 522 {'value': 0.0}
+    Const [] -> 2305843010213699479 {}
+    Const [] -> 2305843010213699482 {}
+    Const [] -> 2305843010213699480 {}
+    Const [] -> 2305843010213699481 {}
+    Const [] -> 2305843010213699483 {}
+    Call [520, 2305843010213699479, 2305843010213699482, 2305843010213699480, 2305843010213699481, 522, 2305843010213699483] -> 523 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_104
+  args=[(524, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 526 {'value': 0.0}
+    Const [] -> 2305843010213699484 {}
+    Const [] -> 2305843010213699487 {}
+    Const [] -> 2305843010213699485 {}
+    Const [] -> 2305843010213699486 {}
+    Const [] -> 2305843010213699488 {}
+    Call [524, 2305843010213699484, 2305843010213699487, 2305843010213699485, 2305843010213699486, 526, 2305843010213699488] -> 527 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_105
+  args=[(528, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 530 {'value': 0.0}
+    Const [] -> 2305843010213699489 {}
+    Const [] -> 2305843010213699492 {}
+    Const [] -> 2305843010213699490 {}
+    Const [] -> 2305843010213699491 {}
+    Const [] -> 2305843010213699493 {}
+    Call [528, 2305843010213699489, 2305843010213699492, 2305843010213699490, 2305843010213699491, 530, 2305843010213699493] -> 531 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_106
+  args=[(532, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 534 {'value': 0.0}
+    Const [] -> 2305843010213699494 {}
+    Const [] -> 2305843010213699497 {}
+    Const [] -> 2305843010213699495 {}
+    Const [] -> 2305843010213699496 {}
+    Const [] -> 2305843010213699498 {}
+    Call [532, 2305843010213699494, 2305843010213699497, 2305843010213699495, 2305843010213699496, 534, 2305843010213699498] -> 535 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_107
+  args=[(536, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 538 {'value': 0.0}
+    Const [] -> 2305843010213699499 {}
+    Const [] -> 2305843010213699502 {}
+    Const [] -> 2305843010213699500 {}
+    Const [] -> 2305843010213699501 {}
+    Const [] -> 2305843010213699503 {}
+    Call [536, 2305843010213699499, 2305843010213699502, 2305843010213699500, 2305843010213699501, 538, 2305843010213699503] -> 539 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_108
+  args=[(540, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 542 {'value': 0.0}
+    Const [] -> 2305843010213699504 {}
+    Const [] -> 2305843010213699507 {}
+    Const [] -> 2305843010213699505 {}
+    Const [] -> 2305843010213699506 {}
+    Const [] -> 2305843010213699508 {}
+    Call [540, 2305843010213699504, 2305843010213699507, 2305843010213699505, 2305843010213699506, 542, 2305843010213699508] -> 543 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_109
+  args=[(544, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 546 {'value': 0.0}
+    Const [] -> 2305843010213699509 {}
+    Const [] -> 2305843010213699512 {}
+    Const [] -> 2305843010213699510 {}
+    Const [] -> 2305843010213699511 {}
+    Const [] -> 2305843010213699513 {}
+    Call [544, 2305843010213699509, 2305843010213699512, 2305843010213699510, 2305843010213699511, 546, 2305843010213699513] -> 547 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_110
+  args=[(548, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 550 {'value': 0.0}
+    Const [] -> 2305843010213699514 {}
+    Const [] -> 2305843010213699517 {}
+    Const [] -> 2305843010213699515 {}
+    Const [] -> 2305843010213699516 {}
+    Const [] -> 2305843010213699518 {}
+    Call [548, 2305843010213699514, 2305843010213699517, 2305843010213699515, 2305843010213699516, 550, 2305843010213699518] -> 551 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_111
+  args=[(552, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 554 {'value': 0.0}
+    Const [] -> 2305843010213699519 {}
+    Const [] -> 2305843010213699522 {}
+    Const [] -> 2305843010213699520 {}
+    Const [] -> 2305843010213699521 {}
+    Const [] -> 2305843010213699523 {}
+    Call [552, 2305843010213699519, 2305843010213699522, 2305843010213699520, 2305843010213699521, 554, 2305843010213699523] -> 555 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_112
+  args=[(556, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 558 {'value': 0.0}
+    Const [] -> 2305843010213699524 {}
+    Const [] -> 2305843010213699527 {}
+    Const [] -> 2305843010213699525 {}
+    Const [] -> 2305843010213699526 {}
+    Const [] -> 2305843010213699528 {}
+    Call [556, 2305843010213699524, 2305843010213699527, 2305843010213699525, 2305843010213699526, 558, 2305843010213699528] -> 559 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_113
+  args=[(560, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 562 {'value': 0.0}
+    Const [] -> 2305843010213699529 {}
+    Const [] -> 2305843010213699532 {}
+    Const [] -> 2305843010213699530 {}
+    Const [] -> 2305843010213699531 {}
+    Const [] -> 2305843010213699533 {}
+    Call [560, 2305843010213699529, 2305843010213699532, 2305843010213699530, 2305843010213699531, 562, 2305843010213699533] -> 563 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_114
+  args=[(564, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 566 {'value': 0.0}
+    Const [] -> 2305843010213699534 {}
+    Const [] -> 2305843010213699537 {}
+    Const [] -> 2305843010213699535 {}
+    Const [] -> 2305843010213699536 {}
+    Const [] -> 2305843010213699538 {}
+    Call [564, 2305843010213699534, 2305843010213699537, 2305843010213699535, 2305843010213699536, 566, 2305843010213699538] -> 567 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_115
+  args=[]
+  BLOCK entry successors=[]
+    Const [] -> 589 {'value': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+    Cast [589] -> 590 {}
+    Ret [590] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_116
+  args=[]
+  BLOCK entry successors=[]
+    Const [] -> 606 {'value': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+    Cast [606] -> 607 {}
+    Ret [607] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_117
+  args=[(116, 'float64'), (624, 'int64')]
+  BLOCK entry successors=[]
+    Const [] -> 2305843010213699539 {}
+    Const [] -> 2305843010213699542 {}
+    Const [] -> 2305843010213699540 {}
+    Const [] -> 2305843010213699541 {}
+    Const [] -> 2305843010213699543 {}
+    Cast [624] -> 2305843010213702630 {}
+    Call [116, 2305843010213699539, 2305843010213699542, 2305843010213699540, 2305843010213699541, 2305843010213702630, 2305843010213699543] -> 625 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_118
+  args=[(626, 'float64'), (624, 'int64')]
+  BLOCK entry successors=[]
+    Const [] -> 2305843010213699544 {}
+    Const [] -> 2305843010213699547 {}
+    Const [] -> 2305843010213699545 {}
+    Const [] -> 2305843010213699546 {}
+    Const [] -> 2305843010213699548 {}
+    Cast [624] -> 2305843010213702631 {}
+    Call [626, 2305843010213699544, 2305843010213699547, 2305843010213699545, 2305843010213699546, 2305843010213702631, 2305843010213699548] -> 627 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_119
+  args=[(628, 'float64'), (624, 'int64')]
+  BLOCK entry successors=[]
+    Const [] -> 2305843010213699549 {}
+    Const [] -> 2305843010213699552 {}
+    Const [] -> 2305843010213699550 {}
+    Const [] -> 2305843010213699551 {}
+    Const [] -> 2305843010213699553 {}
+    Cast [624] -> 2305843010213702632 {}
+    Call [628, 2305843010213699549, 2305843010213699552, 2305843010213699550, 2305843010213699551, 2305843010213702632, 2305843010213699553] -> 629 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_120
+  args=[(3, 'float64'), (0, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 2305843010213699554 {}
+    Const [] -> 2305843010213699557 {}
+    Const [] -> 2305843010213699555 {}
+    Const [] -> 2305843010213699556 {}
+    Const [] -> 2305843010213699558 {}
+    Call [3, 2305843010213699554, 2305843010213699557, 2305843010213699555, 2305843010213699556, 0, 2305843010213699558] -> 663 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_121
+  args=[(22, 'float64'), (20, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 2305843010213699559 {}
+    Const [] -> 2305843010213699562 {}
+    Const [] -> 2305843010213699560 {}
+    Const [] -> 2305843010213699561 {}
+    Const [] -> 2305843010213699563 {}
+    Call [22, 2305843010213699559, 2305843010213699562, 2305843010213699560, 2305843010213699561, 20, 2305843010213699563] -> 667 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_122
+  args=[(39, 'float64'), (712, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 2305843010213699564 {}
+    Const [] -> 2305843010213699567 {}
+    Const [] -> 2305843010213699565 {}
+    Const [] -> 2305843010213699566 {}
+    Const [] -> 2305843010213699568 {}
+    Call [39, 2305843010213699564, 2305843010213699567, 2305843010213699565, 2305843010213699566, 712, 2305843010213699568] -> 677 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_123
+  args=[(50, 'float64'), (714, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 2305843010213699569 {}
+    Const [] -> 2305843010213699572 {}
+    Const [] -> 2305843010213699570 {}
+    Const [] -> 2305843010213699571 {}
+    Const [] -> 2305843010213699573 {}
+    Call [50, 2305843010213699569, 2305843010213699572, 2305843010213699570, 2305843010213699571, 714, 2305843010213699573] -> 681 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_124
+  args=[(60, 'float64'), (716, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 2305843010213699574 {}
+    Const [] -> 2305843010213699577 {}
+    Const [] -> 2305843010213699575 {}
+    Const [] -> 2305843010213699576 {}
+    Const [] -> 2305843010213699578 {}
+    Call [60, 2305843010213699574, 2305843010213699577, 2305843010213699575, 2305843010213699576, 716, 2305843010213699578] -> 685 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_125
+  args=[(78, 'float64'), (718, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 2305843010213699579 {}
+    Const [] -> 2305843010213699582 {}
+    Const [] -> 2305843010213699580 {}
+    Const [] -> 2305843010213699581 {}
+    Const [] -> 2305843010213699583 {}
+    Call [78, 2305843010213699579, 2305843010213699582, 2305843010213699580, 2305843010213699581, 718, 2305843010213699583] -> 698 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_126
+  args=[(89, 'float64'), (720, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 2305843010213699584 {}
+    Const [] -> 2305843010213699587 {}
+    Const [] -> 2305843010213699585 {}
+    Const [] -> 2305843010213699586 {}
+    Const [] -> 2305843010213699588 {}
+    Call [89, 2305843010213699584, 2305843010213699587, 2305843010213699585, 2305843010213699586, 720, 2305843010213699588] -> 702 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_127
+  args=[(99, 'float64'), (722, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 2305843010213699589 {}
+    Const [] -> 2305843010213699592 {}
+    Const [] -> 2305843010213699590 {}
+    Const [] -> 2305843010213699591 {}
+    Const [] -> 2305843010213699593 {}
+    Call [99, 2305843010213699589, 2305843010213699592, 2305843010213699590, 2305843010213699591, 722, 2305843010213699593] -> 706 {'callee': 'index_assign_double'}
+    Ret [] -> None {}
+FUNCTION step_2__advance_pieces__planned_region_128
+  args=[(724, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 2305843010213699594 {}
+    Const [] -> 2305843010213699595 {}
+    Const [] -> 2305843010213699596 {}
+    Const [] -> 2305843010213699597 {}
+    Call [724, 708, 2305843010213699594, 2305843010213699595, 2305843010213699596, 2305843010213699597] -> 708 {'callee': 'reduce_dim_double'}
+    Ret [708] -> None {}
+FUNCTION step_2__advance_pieces
+  args=[(0, 'float64'), (2305843010213698836, 'int64'), (2305843010213698839, 'int64'), (2305843010213698842, 'int64'), (2305843010213698845, 'int64'), (2305843010213698848, 'int64'), (2305843010213698851, 'int64'), (2305843010213698854, 'int64'), (2305843010213698857, 'int64'), (2305843010213698860, 'int64'), (2305843010213698863, 'int64'), (2305843010213698866, 'int64'), (2305843010213698869, 'int64'), (2305843010213698872, 'int64'), (2305843010213698875, 'int64'), (2305843010213698878, 'int64'), (2305843010213698881, 'int64'), (2305843010213698884, 'int64'), (2305843010213698887, 'int64'), (108, 'float64'), (112, 'float64'), (118, 'float64'), (122, 'float64'), (126, 'float64'), (130, 'float64'), (134, 'float64'), (138, 'float64'), (142, 'float64'), (146, 'float64'), (116, 'float64'), (3, 'float64'), (13, 'float64'), (14, 'float64'), (15, 'float64'), (16, 'float64'), (17, 'float64'), (18, 'float64'), (22, 'float64'), (20, 'float64'), (34, 'float64'), (35, 'float64'), (36, 'float64'), (37, 'float64'), (38, 'float64'), (73, 'float64'), (74, 'float64'), (75, 'float64'), (76, 'float64'), (614, 'float64'), (615, 'float64')]
+  BLOCK entry successors=[]
+    Const [] -> 616 {'value': True}
+    Const [] -> 624 {'value': 0}
+    Const [] -> 2305843010213698890 {'value': 0}
+    Const [] -> 2305843010213698891 {'value': 0}
+    Const [] -> 2305843010213698893 {'value': 0}
+    Const [] -> 2305843010213698894 {'value': 0}
+    Const [] -> 2305843010213698896 {'value': 0}
+    Const [] -> 2305843010213698897 {'value': 0}
+    Const [] -> 2305843010213698899 {'value': 0}
+    Const [] -> 2305843010213698900 {'value': 0}
+    Const [] -> 2305843010213698902 {'value': 0}
+    Const [] -> 2305843010213698903 {'value': 0}
+    Const [] -> 2305843010213698905 {'value': 0}
+    Const [] -> 2305843010213698906 {'value': 0}
+    Const [] -> 2305843010213698908 {'value': 0}
+    Const [] -> 2305843010213698909 {'value': 0}
+    Const [] -> 2305843010213698911 {'value': 0}
+    Const [] -> 2305843010213698912 {'value': 0}
+    Const [] -> 2305843010213698914 {'value': 0}
+    Const [] -> 2305843010213698915 {'value': 0}
+    Const [] -> 2305843010213698917 {'value': 0}
+    Const [] -> 2305843010213698918 {'value': 0}
+    Const [] -> 2305843010213698920 {'value': 0}
+    Const [] -> 2305843010213698921 {'value': 0}
+    Const [] -> 2305843010213698923 {'value': 0}
+    Const [] -> 2305843010213698924 {'value': 0}
+    Const [] -> 2305843010213698926 {'value': 0}
+    Const [] -> 2305843010213698927 {'value': 0}
+    Const [] -> 2305843010213698929 {'value': 0}
+    Const [] -> 2305843010213698930 {'value': 0}
+    Const [] -> 2305843010213698932 {'value': 0}
+    Const [] -> 2305843010213698933 {'value': 0}
+    Const [] -> 2305843010213698935 {'value': 0}
+    Const [] -> 2305843010213698936 {'value': 0}
+    Const [] -> 2305843010213698938 {'value': 0}
+    Const [] -> 2305843010213698939 {'value': 0}
+    Const [] -> 2305843010213698941 {'value': 0}
+    Const [] -> 2305843010213698942 {'value': 0}
+    Const [] -> 2305843010213698961 {'value': 0}
+    Const [] -> 2305843010213698964 {'value': 0}
+    Const [] -> 2305843010213698967 {'value': 0}
+    Const [] -> 568 {'value': 0.0}
+    Const [] -> 569 {'value': 0.0}
+    Const [] -> 570 {'value': 0.0}
+    Const [] -> 2305843010213700981 {'value': False}
+    Const [] -> 2305843010213700982 {'value': False}
+    Const [] -> 2305843010213700983 {'value': 0}
+    Const [] -> 2305843010213700984 {'value': 0.0}
+    Const [] -> 633 {'value': inf}
+    Const [] -> 2305843010213700985 {'value': True}
+    Const [] -> 2305843010213700986 {'value': 0.0}
+    Const [] -> 2305843010213700987 {'value': 0.0}
+    Const [] -> 2305843010213700988 {'value': False}
+    Const [] -> 2305843010213700990 {'value': False}
+    Const [] -> 2305843010213700991 {'value': 0}
+    GetElementPtr [2305843010213698836, 2305843010213698890] -> 2305843010213698892 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698891, 2305843010213698892] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 589}
+    GetElementPtr [2305843010213698839, 2305843010213698893] -> 2305843010213698895 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698894, 2305843010213698895] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 606}
+    GetElementPtr [2305843010213698842, 2305843010213698896] -> 2305843010213698898 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698897, 2305843010213698898] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 636}
+    GetElementPtr [2305843010213698845, 2305843010213698899] -> 2305843010213698901 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698900, 2305843010213698901] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 639}
+    GetElementPtr [2305843010213698848, 2305843010213698902] -> 2305843010213698904 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698903, 2305843010213698904] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 642}
+    GetElementPtr [2305843010213698851, 2305843010213698905] -> 2305843010213698907 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698906, 2305843010213698907] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 645}
+    GetElementPtr [2305843010213698854, 2305843010213698908] -> 2305843010213698910 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698909, 2305843010213698910] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 648}
+    GetElementPtr [2305843010213698857, 2305843010213698911] -> 2305843010213698913 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698912, 2305843010213698913] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 651}
+    GetElementPtr [2305843010213698860, 2305843010213698914] -> 2305843010213698916 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698915, 2305843010213698916] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 654}
+    GetElementPtr [2305843010213698863, 2305843010213698917] -> 2305843010213698919 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698918, 2305843010213698919] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 657}
+    GetElementPtr [2305843010213698866, 2305843010213698920] -> 2305843010213698922 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698921, 2305843010213698922] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 660}
+    GetElementPtr [2305843010213698869, 2305843010213698923] -> 2305843010213698925 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698924, 2305843010213698925] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 664}
+    GetElementPtr [2305843010213698872, 2305843010213698926] -> 2305843010213698928 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698927, 2305843010213698928] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 674}
+    GetElementPtr [2305843010213698875, 2305843010213698929] -> 2305843010213698931 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698930, 2305843010213698931] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 678}
+    GetElementPtr [2305843010213698878, 2305843010213698932] -> 2305843010213698934 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698933, 2305843010213698934] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 682}
+    GetElementPtr [2305843010213698881, 2305843010213698935] -> 2305843010213698937 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698936, 2305843010213698937] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 695}
+    GetElementPtr [2305843010213698884, 2305843010213698938] -> 2305843010213698940 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698939, 2305843010213698940] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 699}
+    GetElementPtr [2305843010213698887, 2305843010213698941] -> 2305843010213698943 {'binding': 'ssa_local_sequence_length'}
+    Store [2305843010213698942, 2305843010213698943] -> None {'binding': 'ssa_local_sequence_initialize', 'sequence_id': 703}
+    Call [108] -> None {'callee': 'step_2__advance_pieces__planned_region_1', 'region_index': 1, 'feed_ids': (108,), 'output_ids': ()}
+    Call [112] -> None {'callee': 'step_2__advance_pieces__planned_region_2', 'region_index': 2, 'feed_ids': (112,), 'output_ids': ()}
+    Call [118] -> None {'callee': 'step_2__advance_pieces__planned_region_3', 'region_index': 3, 'feed_ids': (118,), 'output_ids': ()}
+    Call [122] -> None {'callee': 'step_2__advance_pieces__planned_region_4', 'region_index': 4, 'feed_ids': (122,), 'output_ids': ()}
+    Call [126] -> None {'callee': 'step_2__advance_pieces__planned_region_5', 'region_index': 5, 'feed_ids': (126,), 'output_ids': ()}
+    Call [130] -> None {'callee': 'step_2__advance_pieces__planned_region_6', 'region_index': 6, 'feed_ids': (130,), 'output_ids': ()}
+    Call [134] -> None {'callee': 'step_2__advance_pieces__planned_region_7', 'region_index': 7, 'feed_ids': (134,), 'output_ids': ()}
+    Call [138] -> None {'callee': 'step_2__advance_pieces__planned_region_8', 'region_index': 8, 'feed_ids': (138,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_9', 'region_index': 9, 'feed_ids': (142,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_10', 'region_index': 10, 'feed_ids': (146,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_11', 'region_index': 11, 'feed_ids': (150,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_12', 'region_index': 12, 'feed_ids': (154,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_13', 'region_index': 13, 'feed_ids': (158,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_14', 'region_index': 14, 'feed_ids': (162,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_15', 'region_index': 15, 'feed_ids': (166,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_16', 'region_index': 16, 'feed_ids': (170,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_17', 'region_index': 17, 'feed_ids': (174,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_18', 'region_index': 18, 'feed_ids': (178,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_19', 'region_index': 19, 'feed_ids': (182,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_20', 'region_index': 20, 'feed_ids': (186,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_21', 'region_index': 21, 'feed_ids': (190,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_22', 'region_index': 22, 'feed_ids': (194,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_23', 'region_index': 23, 'feed_ids': (198,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_24', 'region_index': 24, 'feed_ids': (202,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_25', 'region_index': 25, 'feed_ids': (206,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_26', 'region_index': 26, 'feed_ids': (210,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_27', 'region_index': 27, 'feed_ids': (214,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_28', 'region_index': 28, 'feed_ids': (218,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_29', 'region_index': 29, 'feed_ids': (222,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_30', 'region_index': 30, 'feed_ids': (226,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_31', 'region_index': 31, 'feed_ids': (230,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_32', 'region_index': 32, 'feed_ids': (234,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_33', 'region_index': 33, 'feed_ids': (238,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_34', 'region_index': 34, 'feed_ids': (242,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_35', 'region_index': 35, 'feed_ids': (246,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_36', 'region_index': 36, 'feed_ids': (250,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_37', 'region_index': 37, 'feed_ids': (254,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_38', 'region_index': 38, 'feed_ids': (258,), 'output_ids': ()}
+    Call [108] -> None {'callee': 'step_2__advance_pieces__planned_region_39', 'region_index': 39, 'feed_ids': (262,), 'output_ids': ()}
+    Call [112] -> None {'callee': 'step_2__advance_pieces__planned_region_40', 'region_index': 40, 'feed_ids': (266,), 'output_ids': ()}
+    Call [118] -> None {'callee': 'step_2__advance_pieces__planned_region_41', 'region_index': 41, 'feed_ids': (271,), 'output_ids': ()}
+    Call [122] -> None {'callee': 'step_2__advance_pieces__planned_region_42', 'region_index': 42, 'feed_ids': (275,), 'output_ids': ()}
+    Call [126] -> None {'callee': 'step_2__advance_pieces__planned_region_43', 'region_index': 43, 'feed_ids': (279,), 'output_ids': ()}
+    Call [130] -> None {'callee': 'step_2__advance_pieces__planned_region_44', 'region_index': 44, 'feed_ids': (283,), 'output_ids': ()}
+    Call [134] -> None {'callee': 'step_2__advance_pieces__planned_region_45', 'region_index': 45, 'feed_ids': (287,), 'output_ids': ()}
+    Call [138] -> None {'callee': 'step_2__advance_pieces__planned_region_46', 'region_index': 46, 'feed_ids': (291,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_47', 'region_index': 47, 'feed_ids': (295,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_48', 'region_index': 48, 'feed_ids': (299,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_49', 'region_index': 49, 'feed_ids': (303,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_50', 'region_index': 50, 'feed_ids': (307,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_51', 'region_index': 51, 'feed_ids': (311,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_52', 'region_index': 52, 'feed_ids': (315,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_53', 'region_index': 53, 'feed_ids': (319,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_54', 'region_index': 54, 'feed_ids': (323,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_55', 'region_index': 55, 'feed_ids': (327,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_56', 'region_index': 56, 'feed_ids': (331,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_57', 'region_index': 57, 'feed_ids': (335,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_58', 'region_index': 58, 'feed_ids': (339,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_59', 'region_index': 59, 'feed_ids': (343,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_60', 'region_index': 60, 'feed_ids': (347,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_61', 'region_index': 61, 'feed_ids': (351,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_62', 'region_index': 62, 'feed_ids': (355,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_63', 'region_index': 63, 'feed_ids': (359,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_64', 'region_index': 64, 'feed_ids': (363,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_65', 'region_index': 65, 'feed_ids': (367,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_66', 'region_index': 66, 'feed_ids': (371,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_67', 'region_index': 67, 'feed_ids': (375,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_68', 'region_index': 68, 'feed_ids': (379,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_69', 'region_index': 69, 'feed_ids': (383,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_70', 'region_index': 70, 'feed_ids': (387,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_71', 'region_index': 71, 'feed_ids': (391,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_72', 'region_index': 72, 'feed_ids': (395,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_73', 'region_index': 73, 'feed_ids': (399,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_74', 'region_index': 74, 'feed_ids': (403,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_75', 'region_index': 75, 'feed_ids': (407,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_76', 'region_index': 76, 'feed_ids': (411,), 'output_ids': ()}
+    Call [108] -> None {'callee': 'step_2__advance_pieces__planned_region_77', 'region_index': 77, 'feed_ids': (415,), 'output_ids': ()}
+    Call [112] -> None {'callee': 'step_2__advance_pieces__planned_region_78', 'region_index': 78, 'feed_ids': (419,), 'output_ids': ()}
+    Call [118] -> None {'callee': 'step_2__advance_pieces__planned_region_79', 'region_index': 79, 'feed_ids': (424,), 'output_ids': ()}
+    Call [122] -> None {'callee': 'step_2__advance_pieces__planned_region_80', 'region_index': 80, 'feed_ids': (428,), 'output_ids': ()}
+    Call [126] -> None {'callee': 'step_2__advance_pieces__planned_region_81', 'region_index': 81, 'feed_ids': (432,), 'output_ids': ()}
+    Call [130] -> None {'callee': 'step_2__advance_pieces__planned_region_82', 'region_index': 82, 'feed_ids': (436,), 'output_ids': ()}
+    Call [134] -> None {'callee': 'step_2__advance_pieces__planned_region_83', 'region_index': 83, 'feed_ids': (440,), 'output_ids': ()}
+    Call [138] -> None {'callee': 'step_2__advance_pieces__planned_region_84', 'region_index': 84, 'feed_ids': (444,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_85', 'region_index': 85, 'feed_ids': (448,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_86', 'region_index': 86, 'feed_ids': (452,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_87', 'region_index': 87, 'feed_ids': (456,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_88', 'region_index': 88, 'feed_ids': (460,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_89', 'region_index': 89, 'feed_ids': (464,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_90', 'region_index': 90, 'feed_ids': (468,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_91', 'region_index': 91, 'feed_ids': (472,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_92', 'region_index': 92, 'feed_ids': (476,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_93', 'region_index': 93, 'feed_ids': (480,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_94', 'region_index': 94, 'feed_ids': (484,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_95', 'region_index': 95, 'feed_ids': (488,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_96', 'region_index': 96, 'feed_ids': (492,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_97', 'region_index': 97, 'feed_ids': (496,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_98', 'region_index': 98, 'feed_ids': (500,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_99', 'region_index': 99, 'feed_ids': (504,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_100', 'region_index': 100, 'feed_ids': (508,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_101', 'region_index': 101, 'feed_ids': (512,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_102', 'region_index': 102, 'feed_ids': (516,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_103', 'region_index': 103, 'feed_ids': (520,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_104', 'region_index': 104, 'feed_ids': (524,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_105', 'region_index': 105, 'feed_ids': (528,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_106', 'region_index': 106, 'feed_ids': (532,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_107', 'region_index': 107, 'feed_ids': (536,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_108', 'region_index': 108, 'feed_ids': (540,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_109', 'region_index': 109, 'feed_ids': (544,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_110', 'region_index': 110, 'feed_ids': (548,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_111', 'region_index': 111, 'feed_ids': (552,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_112', 'region_index': 112, 'feed_ids': (556,), 'output_ids': ()}
+    Call [142] -> None {'callee': 'step_2__advance_pieces__planned_region_113', 'region_index': 113, 'feed_ids': (560,), 'output_ids': ()}
+    Call [146] -> None {'callee': 'step_2__advance_pieces__planned_region_114', 'region_index': 114, 'feed_ids': (564,), 'output_ids': ()}
+    Call [116, 624] -> None {'callee': 'step_2__advance_pieces__planned_region_117', 'region_index': 117, 'feed_ids': (116, 624), 'output_ids': ()}
+    Call [116, 624] -> None {'callee': 'step_2__advance_pieces__planned_region_118', 'region_index': 118, 'feed_ids': (626, 624), 'output_ids': ()}
+    Call [116, 624] -> None {'callee': 'step_2__advance_pieces__planned_region_119', 'region_index': 119, 'feed_ids': (628, 624), 'output_ids': ()}
+    Call [3, 0] -> None {'callee': 'step_2__advance_pieces__planned_region_120', 'region_index': 120, 'feed_ids': (3, 0), 'output_ids': ()}
+    Call [13, 14, 15, 16, 17, 18] -> 19 {'callee': 'woodshop_newton_gravity__woodshop_newton_gravity', 'plan_callsite_id': 19}
+    Call [22, 20] -> None {'callee': 'step_2__advance_pieces__planned_region_121', 'region_index': 121, 'feed_ids': (22, 20), 'output_ids': ()}
+    Call [3, 34, 35, 22, 36, 37, 38] -> 670 {'callee': 'woodshop_newton_momentum__woodshop_newton_momentum', 'plan_callsite_id': 670, 'output_ids': (712, 714, 716)}
+    Const [] -> 2305843010213701600 {'value': 0}
+    GetElementPtr [670, 2305843010213701600] -> 2305843010213701601 {}
+    Load [2305843010213701601] -> 712 {'source_output_id': 712}
+    Const [] -> 2305843010213701602 {'value': 1}
+    GetElementPtr [670, 2305843010213701602] -> 2305843010213701603 {}
+    Load [2305843010213701603] -> 714 {'source_output_id': 714}
+    Const [] -> 2305843010213701604 {'value': 2}
+    GetElementPtr [670, 2305843010213701604] -> 2305843010213701605 {}
+    Load [2305843010213701605] -> 716 {'source_output_id': 716}
+    Call [36, 712] -> None {'callee': 'step_2__advance_pieces__planned_region_122', 'region_index': 122, 'feed_ids': (39, 712), 'output_ids': ()}
+    Call [37, 714] -> None {'callee': 'step_2__advance_pieces__planned_region_123', 'region_index': 123, 'feed_ids': (50, 714), 'output_ids': ()}
+    Call [38, 716] -> None {'callee': 'step_2__advance_pieces__planned_region_124', 'region_index': 124, 'feed_ids': (60, 716), 'output_ids': ()}
+    Call [73, 3, 74, 36, 37, 38, 75, 76, 18] -> 690 {'callee': 'woodshop_newton_position__woodshop_newton_position', 'plan_callsite_id': 690, 'output_ids': (718, 720, 722, 724)}
+    Const [] -> 2305843010213701606 {'value': 0}
+    GetElementPtr [690, 2305843010213701606] -> 2305843010213701607 {}
+    Load [2305843010213701607] -> 718 {'source_output_id': 718}
+    Const [] -> 2305843010213701608 {'value': 1}
+    GetElementPtr [690, 2305843010213701608] -> 2305843010213701609 {}
+    Load [2305843010213701609] -> 720 {'source_output_id': 720}
+    Const [] -> 2305843010213701610 {'value': 2}
+    GetElementPtr [690, 2305843010213701610] -> 2305843010213701611 {}
+    Load [2305843010213701611] -> 722 {'source_output_id': 722}
+    Const [] -> 2305843010213701612 {'value': 3}
+    GetElementPtr [690, 2305843010213701612] -> 2305843010213701613 {}
+    Load [2305843010213701613] -> 724 {'source_output_id': 724}
+    Call [75, 718] -> None {'callee': 'step_2__advance_pieces__planned_region_125', 'region_index': 125, 'feed_ids': (78, 718), 'output_ids': ()}
+    Call [76, 720] -> None {'callee': 'step_2__advance_pieces__planned_region_126', 'region_index': 126, 'feed_ids': (89, 720), 'output_ids': ()}
+    Call [18, 722] -> None {'callee': 'step_2__advance_pieces__planned_region_127', 'region_index': 127, 'feed_ids': (99, 722), 'output_ids': ()}
+    Call [724] -> 2305843010213698960 {'callee': 'step_2__advance_pieces__planned_region_128', 'region_index': 128, 'feed_ids': (724,), 'output_ids': (708,)}
+    GetElementPtr [2305843010213698960, 2305843010213698961] -> 2305843010213698962 {'region_index': 128, 'source_output_id': 708}
+    Load [2305843010213698962] -> 708 {'region_index': 128, 'source_output_id': 708}
+    Call [] -> 2305843010213698963 {'callee': 'step_2__advance_pieces__planned_region_115', 'region_index': 115, 'feed_ids': (), 'output_ids': (590,)}
+    GetElementPtr [2305843010213698963, 2305843010213698964] -> 2305843010213698965 {'region_index': 115, 'source_output_id': 590}
+    Load [2305843010213698965] -> 590 {'region_index': 115, 'source_output_id': 590}
+    Call [] -> 2305843010213698966 {'callee': 'step_2__advance_pieces__planned_region_116', 'region_index': 116, 'feed_ids': (), 'output_ids': (607,)}
+    GetElementPtr [2305843010213698966, 2305843010213698967] -> 2305843010213698968 {'region_index': 116, 'source_output_id': 607}
+    Load [2305843010213698968] -> 607 {'region_index': 116, 'source_output_id': 607}
+    Ret [616, 708, 568, 569, 570, 2305843010213700981, 2305843010213700982, 2305843010213700983, 2305843010213700984, 2305843010213700985, 633, 590, 607, 2305843010213700986, 2305843010213700987, 614, 615, 2305843010213700988, 2305843010213700990, 2305843010213700991] -> None {}

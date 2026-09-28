@@ -28,6 +28,8 @@ from src.compiler.loop_composer import (
 )
 from src.compiler.glsl_deployment_strategy import (
     _fold_callsite_structural_values,
+    _branch_compartments,
+    _ordinary_conditional_control_programs,
     _resolve_grounded_method_references,
     propagate_bound_planner_specializations,
     strategize_shell_deployment,
@@ -452,6 +454,14 @@ def test_structural_fold_treats_specialized_scalar_tensor_as_non_none():
         isinstance(data.get("expr_obj"), ast.IfExp)
         for _node_id, data in graph.G.nodes(data=True)
     )
+    assert if_exp_id in graph.G.graph[
+        "structurally_specialized_conditional_node_ids"
+    ]
+    assert not any(
+        int(control_id) == if_exp_id
+        for memberships in _branch_compartments(graph).values()
+        for control_id, _role in memberships
+    )
     assert ref_input_id in graph.G
 
 
@@ -575,6 +585,89 @@ def test_structural_fold_follows_declared_nested_record_schema():
     ]) == 1
     assert any(
         (data.get("attributes") or {}).get("attribute") == "enabled"
+        for _node_id, data in graph.G.nodes(data=True)
+    )
+
+
+def test_structurally_selected_record_arm_is_not_rebuilt_as_runtime_control():
+    graph = _function_graph(
+        "def consume(value):\n"
+        "    return value + 0.0\n\n"
+        "def step(metrics, value):\n"
+        "    dt_next = value + 1.0\n"
+        "    if metrics.dt_limit is not None:\n"
+        "        dt_next = min(dt_next, metrics.dt_limit)\n"
+        "    return consume(dt_next)\n",
+        "step",
+    )
+    graph.G.graph["parameter_record_abi"] = {
+        "metrics": {
+            "identity": "Metrics",
+            "fields": {
+                "dt_limit": {
+                    "storage": "scalar",
+                    "dtype": "float64",
+                    "rank": 0,
+                    "mutable": False,
+                },
+            },
+        },
+    }
+
+    _fold_callsite_structural_values(graph)
+
+    assert len(graph.G.graph[
+        "structurally_specialized_conditional_node_ids"
+    ]) == 1
+    assert _ordinary_conditional_control_programs(graph, (), ()) == ()
+    consume = next(
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and ast.unparse(data["expr_obj"]).startswith("consume(")
+    )
+    (selected_value,) = (
+        int(parent)
+        for parent, role in consume.get("parents", ())
+        if str(role) == "arg:0"
+    )
+    assert isinstance(graph.G.nodes[selected_value].get("expr_obj"), ast.Call)
+    assert ast.unparse(
+        graph.G.nodes[selected_value]["expr_obj"]
+    ).startswith("min(")
+
+
+def test_optional_record_payload_storage_does_not_select_present_arm():
+    graph = _function_graph(
+        "def step(metrics, value):\n"
+        "    dt_next = value + 1.0\n"
+        "    if metrics.dt_limit is not None:\n"
+        "        dt_next = min(dt_next, metrics.dt_limit)\n"
+        "    return dt_next\n",
+        "step",
+    )
+    graph.G.graph["parameter_record_abi"] = {
+        "metrics": {
+            "identity": "Metrics",
+            "fields": {
+                "dt_limit": {
+                    "storage": "scalar",
+                    "dtype": "float64",
+                    "rank": 0,
+                    "mutable": False,
+                    "optional": True,
+                },
+            },
+        },
+    }
+
+    _fold_callsite_structural_values(graph)
+
+    assert not graph.G.graph.get(
+        "structurally_specialized_conditional_node_ids"
+    )
+    assert any(
+        data.get("type") == "If"
         for _node_id, data in graph.G.nodes(data=True)
     )
 

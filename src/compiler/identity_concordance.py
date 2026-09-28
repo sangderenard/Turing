@@ -71,7 +71,7 @@ Findings (each is one concrete disagreement, with the two claims):
 from __future__ import annotations
 
 import contextvars
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from collections.abc import MutableMapping
 from typing import Any, Iterable, Mapping
@@ -632,10 +632,16 @@ class CorrelationTable:
             return []
 
         definitions: dict[int, str] = {}
+        resident_objects: dict[int, list[Any]] = defaultdict(list)
+        for argument in function.args:
+            resident_objects[int(argument.id)].append(argument)
         for block_name, block in function.blocks.items():
             for instruction in block.instrs:
                 if instruction.res is not None:
                     definitions[int(instruction.res.id)] = str(block_name)
+                    resident_objects[int(instruction.res.id)].append(
+                        instruction.res
+                    )
 
         found: list[Finding] = []
         for declaration in declarations:
@@ -643,6 +649,25 @@ class CorrelationTable:
             inside = _blocks_between(function, header, latch)
             if not inside:
                 continue
+            simultaneous: dict[int, list[dict]] = defaultdict(list)
+            for rebind in declaration["rebinds"]:
+                simultaneous[int(rebind["outer"])].append(rebind)
+            for outer, rebinds in simultaneous.items():
+                if len(rebinds) < 2:
+                    continue
+                carried_ids = {
+                    int(rebind["carried"]) for rebind in rebinds
+                }
+                if len(carried_ids) == len(rebinds):
+                    continue
+                found.append(Finding(
+                    "loop-scope-simultaneous-binding-collapse",
+                    name, outer,
+                    f"{len(rebinds)} authored loop bindings share outer "
+                    f"resident {outer} but only {len(carried_ids)} carried "
+                    "identities; bindings with simultaneous future updates "
+                    "must retain distinct header residents",
+                ))
             for rebind in declaration["rebinds"]:
                 outer = rebind["outer"]
                 carried = rebind["carried"]
@@ -685,6 +710,21 @@ class CorrelationTable:
                         if getattr(argument, "id", None) is None:
                             continue
                         if int(argument.id) == inner:
+                            if any(
+                                argument is resident
+                                for resident in resident_objects.get(inner, ())
+                            ):
+                                continue
+                            found.append(Finding(
+                                "loop-scope-inner-private-resident",
+                                name, inner,
+                                f"{header} Phi {carried} takes an SSA object "
+                                f"named {inner} from {latch}, but that object "
+                                "is neither the function formal nor a defined "
+                                "result carrying that id; loop lowering "
+                                "refigured a private resident for an existing "
+                                "source value",
+                            ))
                             continue
                         found.append(Finding(
                             "loop-scope-latch-renamed", name, inner,
@@ -2482,12 +2522,33 @@ def declare_loop_scope(
         (*scope, "boundary"), 0,
         (str(header), str(latch), str(exit_block)),
     )
-    for outer_id, carried_id, inner_id, graph_outer, graph_inner in rebinds:
-        row = (*scope, int(outer_id))
+    rebinds = tuple(rebinds)
+    outer_counts = Counter(int(rebind[0]) for rebind in rebinds)
+    for ordinal, rebind in enumerate(rebinds):
+        (
+            outer_id, carried_id, inner_id, graph_outer, graph_inner,
+            *binding_tail,
+        ) = rebind
+        source_bindings = tuple(binding_tail[0]) if binding_tail else ()
+        # A value id is not a lexical binding identity.  When two carried
+        # names share their preheader resident, retain one concordance row
+        # per name/update instead of letting the later declaration overwrite
+        # the earlier row.  Unique rows retain the historical key shape.
+        row_key = (
+            int(outer_id)
+            if outer_counts[int(outer_id)] == 1
+            else (
+                int(outer_id),
+                source_bindings or ("entry", int(ordinal)),
+            )
+        )
+        row = (*scope, row_key)
         page.set(row, OUTER, int(outer_id))
         page.set(row, CARRIED, int(carried_id))
         page.set(row, INNER, int(inner_id))
         page.set(row, INNER + 1, ("graph", int(graph_outer), int(graph_inner)))
+        if source_bindings:
+            page.set(row, INNER + 2, ("bindings", source_bindings))
 
 
 def rebind_loop_scope_inner(
@@ -2554,12 +2615,20 @@ def loop_scope_declarations(book: Any, function: Any) -> list[dict]:
                 if isinstance(transition, tuple) and transition
                 else declared_inner
             )
-            record["rebinds"].append({
+            rebind = {
                 "outer": int(generations[OUTER]),
                 "carried": int(generations[CARRIED]),
                 "inner": resident_inner,
                 "declared_inner": declared_inner,
-            })
+            }
+            binding_identity = generations.get(INNER + 2)
+            if (
+                isinstance(binding_identity, tuple)
+                and len(binding_identity) == 2
+                and binding_identity[0] == "bindings"
+            ):
+                rebind["source_bindings"] = tuple(binding_identity[1])
+            record["rebinds"].append(rebind)
     return [record for record in scopes.values() if record["boundary"]]
 
 
@@ -2730,6 +2799,97 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
     if receipts:
         getattr(module, "metadata", {})[
             "compiler_frame_formal_reconciliations"
+        ] = tuple(receipts)
+    return tuple(receipts)
+
+
+def concord_program_abi_frame_transitions(module: Any) -> tuple[dict, ...]:
+    """Retire provisional frame leases once a formal has a ProgramABI field.
+
+    Linked-call completion can create an anonymous caller-owned workspace
+    before record-field propagation reaches that level of the call graph.  If
+    the same formal is later proved to be a declared ProgramABI field, keeping
+    both descriptions invents two owners for one physical value.  The field
+    contract is the completed identity; the frame lease was only the means by
+    which the still-anonymous value reached the function.
+
+    This is deliberately an identity transition, not a detector exemption.
+    The obsolete accounting and matching ``storage_formals`` declaration are
+    removed together and the exact before/after fact is written to the shared
+    book.
+    """
+
+    provisional_keys = {
+        "linked_call_frame_storage",
+        "propagated_formal_id",
+        "restored_argument_binding",
+        "split_from_result_storage",
+    }
+    receipts: list[dict] = []
+    book = identity_book(module)
+    page = book.page("program_abi_frame_transition")
+    for function_name, function in (
+        getattr(module, "functions", {}) or {}
+    ).items():
+        retired_ids: set[int] = set()
+        for formal in function.args:
+            accounting = dict(formal.accounting or {})
+            field = accounting.get("program_abi_field")
+            lease = accounting.get("linked_call_frame_storage")
+            if field is None or lease in {None, ""}:
+                continue
+            # Returned-record slots intentionally are caller-provided output
+            # storage.  Their dual role is already explicit and is not this
+            # provisional-input transition.
+            if accounting.get("returned_record_storage") is not None:
+                continue
+            formal_id = int(formal.id)
+            retired = tuple(
+                (key, accounting[key])
+                for key in sorted(provisional_keys)
+                if key in accounting
+            )
+            resolved = {
+                key: value for key, value in accounting.items()
+                if key not in provisional_keys
+            }
+            receipt = {
+                "function": str(function_name),
+                "formal_id": formal_id,
+                "program_abi_record": accounting.get("program_abi_record"),
+                "program_abi_field": str(field),
+                "retired": retired,
+                "reason": "program_abi_field_supersedes_provisional_frame_lease",
+            }
+            row = (str(function_name), formal_id)
+            fact = (
+                accounting.get("program_abi_record"), str(field), retired,
+            )
+            incumbent = page.latest(row)
+            if incumbent is None:
+                page.set(row, 0, fact)
+            elif tuple(incumbent) != fact:
+                raise ValueError(
+                    "ProgramABI/frame transition disagreement for "
+                    f"{row!r}: recorded={incumbent!r}, proposed={fact!r}"
+                )
+            formal.accounting = resolved
+            retired_ids.add(formal_id)
+            receipts.append(receipt)
+        if retired_ids:
+            metadata = function.metadata
+            storage_formals = tuple(metadata.get("storage_formals", ()) or ())
+            metadata["storage_formals"] = tuple(
+                item for item in storage_formals
+                if not (
+                    isinstance(item, Mapping)
+                    and item.get("value_id") is not None
+                    and int(item["value_id"]) in retired_ids
+                )
+            )
+    if receipts:
+        getattr(module, "metadata", {})[
+            "program_abi_frame_transitions"
         ] = tuple(receipts)
     return tuple(receipts)
 

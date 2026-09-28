@@ -1,4 +1,5 @@
 from src.compiler.identity_concordance import (
+    CorrelationTable,
     begin_identity_book,
     concord_loop_scope_latch_residents,
     declare_loop_scope,
@@ -98,6 +99,83 @@ def test_completed_module_concords_latch_projection_with_declared_inner():
             declared_inner.id,
             resident_inner.id,
             "completed_module_latch_projection",
+        )
+    finally:
+        end_identity_book(token)
+
+
+def test_shared_loop_seed_retains_each_authored_binding_row():
+    """Simultaneous future updates are not identified by one incumbent."""
+
+    book, token = begin_identity_book()
+    try:
+        declare_loop_scope(
+            "artifact__root", 7,
+            "loop_header", "loop_latch", "loop_exit",
+            (
+                (10, 11, 12, 100, 101, ("cap",)),
+                (10, 13, 14, 100, 102, ("last",)),
+            ),
+        )
+
+        declaration = loop_scope_declarations(book, "artifact__root")[0]
+        assert declaration["rebinds"] == [
+            {
+                "outer": 10, "carried": 11, "inner": 12,
+                "declared_inner": 12, "source_bindings": ("cap",),
+            },
+            {
+                "outer": 10, "carried": 13, "inner": 14,
+                "declared_inner": 14, "source_bindings": ("last",),
+            },
+        ]
+    finally:
+        end_identity_book(token)
+
+
+def test_concordance_reports_shared_carried_identity_for_distinct_bindings():
+    outer = SSAValue(10, "float64")
+    carried = SSAValue(11, "float64")
+    first_inner = SSAValue(12, "float64")
+    second_inner = SSAValue(14, "float64")
+    function = Function("artifact__root", [outer], {
+        "entry": BasicBlock("entry", [
+            Instr("Br", [], None, attributes={"target": "loop_header"}),
+        ], successors=["loop_header"]),
+        "loop_header": BasicBlock("loop_header", [
+            Instr(
+                "Phi", [outer, first_inner], carried,
+                attributes={
+                    "incoming_blocks": ("entry", "loop_latch"),
+                    "binding": "loop_carried",
+                },
+            ),
+            Instr("Br", [], None, attributes={"target": "loop_latch"}),
+        ], successors=["loop_latch"]),
+        "loop_latch": BasicBlock("loop_latch", [
+            Instr("Copy", [outer], first_inner),
+            Instr("Copy", [outer], second_inner),
+            Instr("Br", [], None, attributes={"target": "loop_header"}),
+        ], successors=["loop_header"]),
+        "loop_exit": BasicBlock("loop_exit", [Instr("Ret", [carried], None)]),
+    })
+    module = IRModule({function.name: function})
+    book, token = begin_identity_book()
+    module.metadata["identity_book"] = book
+    try:
+        declare_loop_scope(
+            function.name, 7,
+            "loop_header", "loop_latch", "loop_exit",
+            (
+                (10, 11, 12, 100, 101, ("cap",)),
+                (10, 11, 14, 100, 102, ("last",)),
+            ),
+        )
+
+        findings = CorrelationTable.build(module).findings(module)
+        assert any(
+            finding.kind == "loop-scope-simultaneous-binding-collapse"
+            for finding in findings
         )
     finally:
         end_identity_book(token)
