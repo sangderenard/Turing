@@ -22232,6 +22232,60 @@ def _class_surface_ssa_program(
                         key, record, attribute, "write",
                         (("indexed-storage", str(source_symbol), int(value_id)),),
                     )
+            # A keyed field's rows are records too.  ``world.items[i]`` is an
+            # Indexed value whose base edge is the GetAttr of that declared
+            # keyed field (the same spine ``indexed_value_candidates`` walks
+            # when the rows are materialized).  Such a ROW HANDLE is what a
+            # caller hands to a callee whose parameter is bound to the
+            # field's ``value_record``; it is no declared parameter value, so
+            # ``record_parameter_value`` cannot name it.  Publish it here, in
+            # the same stage and scope, as a member row of its owning declared
+            # parameter record with the path prefix its leaves live under
+            # (``items[]``).  The forwarding-edge writer joins the call's
+            # actual through this row; the caller's own ``record_member`` row
+            # for the handle (``items[]#<row>``) does not exist yet -- it is
+            # written by the materialization that needs the receipts this
+            # edge produces.
+            record_fields = dict(record.get("fields") or {})
+            for node_id, data in source_graph.nodes(data=True):
+                operation = str(
+                    data.get("type") or data.get("op") or ""
+                ).casefold()
+                if operation != "indexed":
+                    continue
+                base_attributes = tuple(dict.fromkeys(
+                    direct_field_by_value[base_id]
+                    for parent, role in (data.get("parents") or ())
+                    if parent in source_graph
+                    and str(role) in {"value", "base", "operand", "object"}
+                    for base_id in (int(
+                        source_graph.nodes[parent].get("value_id", parent)
+                    ),)
+                    if base_id in direct_field_by_value
+                ))
+                if len(base_attributes) != 1:
+                    continue
+                field_name = base_attributes[0]
+                field = dict(record_fields[field_name])
+                if str(field.get("storage") or "") != "keyed":
+                    continue
+                value_record = field.get("value_record")
+                if value_record is None:
+                    continue
+                row_identity = str(
+                    dict(abi_records.get(str(value_record)) or {})
+                    .get("identity") or value_record
+                )
+                access_book.page("record_parameter_row_handle").concord(
+                    (
+                        access_scope,
+                        (
+                            str(source_symbol),
+                            int(data.get("value_id", node_id)),
+                        ),
+                    ),
+                    (key, f"{field_name}[]", row_identity),
+                )
 
     def declared_record_parameter(key: tuple[str, str]) -> Mapping[str, Any]:
         """The declared ``parameter_record_abi`` layout one key names."""
@@ -22327,6 +22381,42 @@ def _class_surface_ssa_program(
             else function_symbols.get(int(reference))
         )
 
+    # An edge's caller side is either a declared parameter key
+    # ``(symbol, parameter)`` or a row-handle key ``(symbol, parameter,
+    # path prefix)``: the callee's field ``f`` is then the caller's field
+    # ``<prefix>.f`` of that same declared parameter.  Every binding that
+    # names a record on one side but resolves no record on the other is
+    # recorded on ``record_forwarding_unresolved_actual`` with the reason; a
+    # silently dropped edge is exactly how a callee's read once failed to
+    # reach the caller (``probe_row_handle_record_parameter``).
+    record_parameter_row_handle = access_book.page(
+        "record_parameter_row_handle"
+    ).mapping(access_scope)
+    record_forwarding_unresolved = access_book.page(
+        "record_forwarding_unresolved_actual"
+    )
+
+    def forwarding_caller_side(
+        caller_symbol: str, caller_id: int,
+    ) -> tuple[tuple[str, ...] | None, str | None]:
+        """One binding's caller side as an edge key, with its record
+        identity; ``(None, None)`` when the book names no record for it."""
+
+        caller_key = record_parameter_by_value.get(
+            (str(caller_symbol), int(caller_id))
+        )
+        if caller_key is not None:
+            return caller_key, str(
+                declared_record_parameter(caller_key).get("identity")
+            )
+        row_handle = record_parameter_row_handle.get(
+            (str(caller_symbol), int(caller_id))
+        )
+        if row_handle is not None:
+            parameter_key, path_prefix, row_identity = row_handle
+            return (*parameter_key, str(path_prefix)), str(row_identity)
+        return None, None
+
     record_forwarding_edges = access_book.page(
         "record_forwarding_edge"
     ).mapping(access_scope)
@@ -22339,23 +22429,68 @@ def _class_surface_ssa_program(
         if callee_symbol is None:
             continue
         for caller_id, callee_id in planned_call.argument_bindings:
-            caller_key = record_parameter_by_value.get(
-                (str(caller_symbol), int(caller_id))
+            caller_key, caller_identity = forwarding_caller_side(
+                str(caller_symbol), int(caller_id),
             )
             callee_key = record_parameter_by_value.get(
                 (str(callee_symbol), int(callee_id))
             )
-            if caller_key is None or callee_key is None:
+            if caller_key is None and callee_key is None:
                 continue
-            caller_record = declared_record_parameter(caller_key)
+            unresolved_row = (
+                access_scope,
+                (
+                    str(caller_symbol), int(planned_call.callsite_id),
+                    int(caller_id), str(callee_symbol), int(callee_id),
+                ),
+            )
+            if callee_key is None:
+                record_forwarding_unresolved.concord(unresolved_row, (
+                    "callee formal is no declared record parameter value",
+                    caller_key, None,
+                ))
+                continue
+            if caller_key is None:
+                record_forwarding_unresolved.concord(unresolved_row, (
+                    "caller actual is neither a declared record parameter "
+                    "value nor a keyed-field row handle on the book",
+                    None, callee_key,
+                ))
+                continue
             callee_record = declared_record_parameter(callee_key)
-            if str(caller_record.get("identity")) != str(
-                callee_record.get("identity")
-            ):
+            if str(caller_identity) != str(callee_record.get("identity")):
+                record_forwarding_unresolved.concord(unresolved_row, (
+                    "bound record identities differ",
+                    (caller_key, str(caller_identity)),
+                    (callee_key, str(callee_record.get("identity"))),
+                ))
                 continue
             record_forwarding_edges[(caller_key, callee_key)] = (
                 int(planned_call.callsite_id),
             )
+
+    def caller_field_path(
+        caller_key: tuple[str, ...], field_path: str,
+    ) -> str:
+        """The callee's field path spelled from the caller's parameter."""
+
+        return (
+            str(field_path) if len(caller_key) == 2
+            else f"{caller_key[2]}.{field_path}"
+        )
+
+    def callee_field_path(
+        caller_key: tuple[str, ...], field_path: str,
+    ) -> str | None:
+        """The caller's field path spelled from the callee's parameter, or
+        None when it is not under a row-handle edge's prefix."""
+
+        if len(caller_key) == 2:
+            return str(field_path)
+        prefix = f"{caller_key[2]}."
+        if not str(field_path).startswith(prefix):
+            return None
+        return str(field_path)[len(prefix):]
 
     changed = True
     while changed:
@@ -22364,12 +22499,15 @@ def _class_surface_ssa_program(
             callsites = tuple(record_forwarding_edges[
                 (caller_key, callee_key)
             ])
+            caller_parameter_key = tuple(caller_key[:2])
             for access_key, receipts in tuple(record_field_access.items()):
                 parameter_key, field_path, storage_identity = access_key
                 if parameter_key != callee_key:
                     continue
                 caller_access_key = (
-                    caller_key, field_path, storage_identity,
+                    caller_parameter_key,
+                    caller_field_path(caller_key, field_path),
+                    storage_identity,
                 )
                 incumbent = frozenset(record_field_access.get(
                     caller_access_key, frozenset(),
@@ -22402,10 +22540,16 @@ def _class_surface_ssa_program(
             # effects themselves remain directional above.
             for access_key, receipts in tuple(record_field_access.items()):
                 parameter_key, field_path, storage_identity = access_key
-                if parameter_key != caller_key or "sequence" not in receipts:
+                if (
+                    parameter_key != caller_parameter_key
+                    or "sequence" not in receipts
+                ):
+                    continue
+                callee_path = callee_field_path(caller_key, field_path)
+                if callee_path is None:
                     continue
                 callee_access_key = (
-                    callee_key, field_path, storage_identity,
+                    callee_key, callee_path, storage_identity,
                 )
                 incumbent = frozenset(record_field_access.get(
                     callee_access_key, frozenset(),
