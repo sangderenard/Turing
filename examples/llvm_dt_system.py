@@ -834,6 +834,44 @@ def interpret_round(node, *, wrap=None):
     return pieces, node.schedule
 
 
+def instantiate_state(pieces, columns, *, targets, schedule="sequential",
+                      scope="lockstep", subcycles=()):
+    """The instantiation hook: make the dt system's state, once.
+
+    Everything scoped to the state's lifetime happens here and nowhere else:
+    the ``PieceState`` class and ``advance_pieces`` are spelled and bound for
+    exactly these pieces, the wall-cost ledger the step is measured through,
+    the participant registry the laws declare themselves into, and the
+    time-velocity record that accumulates across windows.  A round then only
+    binds columns into the spans and runs.  The caller owns the returned
+    state across rounds and hands it back; in-round rollback is
+    ``copy_shallow``/``restore`` on it, never a replacement.
+    """
+
+    pieces = tuple(pieces)
+    names = column_names_of(pieces)
+    batch = pieces[0].batch
+    ledger = WallCostLedger(str(piece.entry) for piece in pieces)
+    bind_pieces(pieces, wrap=ledger.wrap, schedule=schedule)
+    state = PieceState(
+        *(np.array(columns[name], dtype=np.float64) for name in names),
+        np.zeros((batch,), dtype=np.float64),
+        np.zeros((len(TELEMETRY_FIELDS),), dtype=np.float64),
+    )
+    # The laws declare themselves once, in causal order, and the state carries
+    # the registry so the controller can index the rows the step publishes.
+    state.participants = participant_registry(pieces)
+    state.wall_cost_ledger = ledger
+    # The time-velocity record: every scope a node of the time field, the
+    # measured velocities folded in after every window.  Information only.
+    state.time_velocity = TimeVelocityRecord(scope, pieces, tuple(subcycles))
+    # What this state was spelled for; a later round over other pieces is a
+    # different state, not a rebinding of this one.
+    state.bound_pieces = (tuple(names), str(schedule))
+    configure_publication_limits(state, targets)
+    return state
+
+
 def dt_system_from_graph(root, columns, *, rounds, subcycles=(), state=None):
     """Run ``dt_system`` as the ``dt_graph.RoundNode`` tree ``root`` defines.
 
@@ -873,9 +911,6 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
     """
 
     pieces = load_pieces(piece_files)
-    ledger = WallCostLedger(str(piece.entry) for piece in pieces)
-    bind_pieces(pieces, wrap=ledger.wrap, schedule=schedule)
-    batch = pieces[0].batch
     names = column_names_of(pieces)
     subcycles = tuple(subcycles)
     mine = set(owned_columns(pieces, names))
@@ -899,42 +934,35 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
     # own physical floor passes its own controller and that wins.
     controller = controller or STController(dt_min=float(round_dt) * 1e-6)
     if state is None:
-        # The state is made once.  The containing system owns it across
-        # rounds and hands it back; every later call binds into these spans
-        # instead of building a fresh state and discarding it.  Rollback
-        # inside a round is ``copy_shallow``/``restore``: a backup taken from
-        # this state and written back in place, never a replacement of it.
-        state = PieceState(
-            *(np.array(columns[name], dtype=np.float64) for name in names),
-            np.zeros((batch,), dtype=np.float64),
-            np.zeros((len(TELEMETRY_FIELDS),), dtype=np.float64),
-        )
-        # The laws declare themselves once, in causal order, and the state
-        # carries the registry so the controller can index the rows the step
-        # publishes.
-        state.participants = participant_registry(pieces)
+        # The state is made once, by the instantiation hook.  The containing
+        # system owns it across rounds and hands it back; every later call
+        # binds into its spans instead of building a fresh state and
+        # discarding it.
+        state = instantiate_state(
+            pieces, columns, targets=targets, schedule=schedule, scope=scope,
+            subcycles=subcycles)
     else:
-        missing = [name for name in names if not hasattr(state, name)]
-        if missing:
+        bound = getattr(state, "bound_pieces", None)
+        if bound != (tuple(names), str(schedule)):
             raise ValueError(
-                f"persistent dt state lacks columns {missing}; it was built for "
-                "different pieces")
+                "persistent dt state was instantiated for pieces "
+                f"{bound!r}, not {(tuple(names), str(schedule))!r}; a round "
+                "over other pieces needs its own state")
         for name in names:
             span = getattr(state, name)
             value = columns[name]
             if value is span:
                 continue        # the caller's column already is this span
             span[...] = np.asarray(value, dtype=np.float64)
-    state.wall_cost_ledger = ledger
-    configure_publication_limits(state, targets)
+        # Targets may differ round to round; the limits they set are the
+        # state's, rewritten in place.
+        configure_publication_limits(state, targets)
+    ledger = state.wall_cost_ledger
+    time_record = state.time_velocity
     for sub in subcycles:
         sub.attach(columns)
     for sub in subcycles:
         sub.start()
-    # The time-velocity record: every scope a node of the time field, the
-    # measured velocities folded in after every window.  Information only.
-    time_record = TimeVelocityRecord(scope, pieces, subcycles)
-    state.time_velocity = time_record
     dt = round_dt if dt_initial is None else float(dt_initial)
     world_s = 0.0
     results = []
