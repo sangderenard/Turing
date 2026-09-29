@@ -1817,6 +1817,251 @@ def _lower_consumed_generator_loops(tree):
     return lowered
 
 
+class _ReduceFoldLowerer:
+    """Turn ``functools.reduce(f, iterable, initial)`` into a carried loop.
+
+    ``reduce`` is a left fold: ``acc = initial; for item in iterable: acc =
+    f(acc, item)``.  That is exactly an authored ``for`` with one carried
+    binding, which the reducer and loop composer already lower; the C
+    builtin itself has no source and would otherwise end as a native-
+    extension boundary.  The fold is hoisted before the statement that
+    contains the call and the call is replaced by the accumulator name.
+
+    Only a call whose callee resolves *by identity* to ``functools.reduce``
+    in the definition's Python bindings is rewritten.  A two-parameter
+    lambda is inlined by renaming its parameters to the accumulator and item
+    names (the generator renamer already respects inner shadowing); any other
+    callable is called per iteration.  The two-argument form is rewritten
+    only when the iterable is a literal tuple/list with at least one element
+    (``acc = elts[0]`` over ``elts[1:]``); its general form has no bound
+    accumulator before the loop and is left for the reducer to report.
+    """
+
+    def __init__(self, reserved_names=()):
+        self._reserved_names = set(map(str, reserved_names))
+        self._next_local = 0
+
+    def _local_name(self, role):
+        while True:
+            candidate = f"__turing_reduce_{role}_{self._next_local}"
+            self._next_local += 1
+            if candidate not in self._reserved_names:
+                self._reserved_names.add(candidate)
+                return candidate
+
+    @staticmethod
+    def _is_reduce(call, bindings):
+        import functools
+
+        if not isinstance(call, ast.Call) or call.keywords:
+            return False
+        if len(call.args) not in {2, 3}:
+            return False
+        if any(isinstance(argument, ast.Starred) for argument in call.args):
+            return False
+        try:
+            target = _resolve_ast_parent_reference(call.func, bindings)
+        except Exception:
+            return False
+        return target is functools.reduce
+
+    def _fold(self, call, hoisted):
+        """Append the fold statements for ``call`` and return its value."""
+
+        function, iterable, *initial = call.args
+        accumulator = self._local_name("acc")
+        item = self._local_name("item")
+        if initial:
+            seed = initial[0]
+            domain = iterable
+        elif isinstance(iterable, (ast.Tuple, ast.List)) and iterable.elts:
+            seed = iterable.elts[0]
+            domain = ast.copy_location(
+                type(iterable)(elts=list(iterable.elts[1:]), ctx=ast.Load()),
+                iterable,
+            )
+        else:
+            return None
+        if (
+            isinstance(function, ast.Lambda)
+            and len(function.args.posonlyargs) + len(function.args.args) == 2
+            and not function.args.kwonlyargs
+            and function.args.vararg is None
+            and function.args.kwarg is None
+        ):
+            parameters = [
+                argument.arg
+                for argument in (
+                    *function.args.posonlyargs, *function.args.args,
+                )
+            ]
+            step_value = _GeneratorExpressionRenamer((
+                (parameters[0], accumulator), (parameters[1], item),
+            )).visit(copy.deepcopy(function.body))
+        else:
+            callee = function
+            if not isinstance(function, (ast.Name, ast.Attribute)):
+                # Evaluate the callable expression once, as Python does.
+                callee_name = self._local_name("fn")
+                hoisted.append(ast.copy_location(ast.Assign(
+                    targets=[ast.Name(id=callee_name, ctx=ast.Store())],
+                    value=function,
+                ), call))
+                callee = ast.Name(id=callee_name, ctx=ast.Load())
+            step_value = ast.Call(
+                func=copy.deepcopy(callee),
+                args=[
+                    ast.Name(id=accumulator, ctx=ast.Load()),
+                    ast.Name(id=item, ctx=ast.Load()),
+                ],
+                keywords=[],
+            )
+        hoisted.append(ast.copy_location(ast.Assign(
+            targets=[ast.Name(id=accumulator, ctx=ast.Store())],
+            value=seed,
+        ), call))
+        hoisted.append(ast.copy_location(ast.For(
+            target=ast.Name(id=item, ctx=ast.Store()),
+            iter=domain,
+            body=[ast.copy_location(ast.Assign(
+                targets=[ast.Name(id=accumulator, ctx=ast.Store())],
+                value=step_value,
+            ), call)],
+            orelse=[],
+        ), call))
+        return ast.copy_location(
+            ast.Name(id=accumulator, ctx=ast.Load()), call,
+        )
+
+    def _rewrite_expression(self, expression, bindings, hoisted):
+        lowerer = self
+
+        class Replacer(ast.NodeTransformer):
+            # A nested scope evaluates on its own schedule; a fold inside it
+            # cannot be hoisted to this statement.
+            def _keep(self, node):
+                return node
+
+            visit_FunctionDef = visit_AsyncFunctionDef = _keep
+            visit_ClassDef = visit_Lambda = _keep
+            visit_ListComp = visit_SetComp = _keep
+            visit_DictComp = visit_GeneratorExp = _keep
+
+            def visit_Call(self, node):
+                node = self.generic_visit(node)
+                if not lowerer._is_reduce(node, bindings):
+                    return node
+                replacement = lowerer._fold(node, hoisted)
+                return node if replacement is None else replacement
+
+        return Replacer().visit(expression)
+
+    def _has_other_calls(self, expression, bindings):
+        """True when hoisting a fold could reorder another side effect.
+
+        Python evaluates an expression's children left to right, which is
+        this tree's pre-order.  Hoisting a fold before the statement keeps
+        that order for everything evaluated after the fold and for the
+        fold's own ancestors (they consume its value, so they run after it).
+        The only hazard is an effectful node -- a call, an eagerly evaluated
+        comprehension, an await/yield, a walrus -- that precedes the fold in
+        pre-order without containing it.  A fold's own arguments run inside
+        the loop and are not reordered.
+        """
+
+        hazards = (
+            ast.Call, ast.ListComp, ast.SetComp, ast.DictComp, ast.Await,
+            ast.Yield, ast.YieldFrom, ast.NamedExpr,
+        )
+        order = []
+        ancestors = {}
+
+        def walk(node, path):
+            order.append(node)
+            ancestors[id(node)] = path
+            if isinstance(node, (
+                ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp,
+                ast.GeneratorExp,
+            )):
+                return
+            for child in ast.iter_child_nodes(node):
+                walk(child, path + (id(node),))
+
+        walk(expression, ())
+        folds = [
+            node for node in order
+            if isinstance(node, ast.Call) and self._is_reduce(node, bindings)
+        ]
+        for fold in folds:
+            fold_ancestors = set(ancestors[id(fold)])
+            for node in order:
+                if node is fold:
+                    break
+                if id(node) in fold_ancestors:
+                    continue
+                if isinstance(node, hazards) and not (
+                    isinstance(node, ast.Call)
+                    and self._is_reduce(node, bindings)
+                ):
+                    # Inside an earlier fold's arguments is inside that
+                    # fold's loop, hoisted together with it.
+                    if any(
+                        id(ancestor) in {id(other) for other in folds}
+                        for ancestor in (
+                            order[index]
+                            for index in range(len(order))
+                            if id(order[index]) in ancestors[id(node)]
+                        )
+                    ):
+                        continue
+                    return True
+        return False
+
+    def rewrite_body(self, statements, bindings):
+        rewritten = []
+        for statement in statements:
+            for field in ("body", "orelse", "finalbody"):
+                inner = getattr(statement, field, None)
+                if isinstance(inner, list) and inner and isinstance(
+                    inner[0], ast.stmt,
+                ):
+                    setattr(
+                        statement, field,
+                        self.rewrite_body(inner, bindings),
+                    )
+            for handler in getattr(statement, "handlers", ()) or ():
+                handler.body = self.rewrite_body(handler.body, bindings)
+            for case in getattr(statement, "cases", ()) or ():
+                case.body = self.rewrite_body(case.body, bindings)
+            if isinstance(statement, (
+                ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return,
+                ast.Expr,
+            )) and statement.value is not None and any(
+                self._is_reduce(node, bindings)
+                for node in ast.walk(statement.value)
+            ) and not self._has_other_calls(statement.value, bindings):
+                hoisted = []
+                statement.value = self._rewrite_expression(
+                    statement.value, bindings, hoisted,
+                )
+                rewritten.extend(hoisted)
+            rewritten.append(statement)
+        return rewritten
+
+    def lower_definition(self, definition, bindings):
+        if not isinstance(definition, (
+            ast.FunctionDef, ast.AsyncFunctionDef,
+        )) or not bindings:
+            return
+        self._reserved_names.update(
+            node.id
+            for node in ast.walk(definition)
+            if isinstance(node, ast.Name)
+        )
+        definition.body = self.rewrite_body(definition.body, dict(bindings))
+        ast.fix_missing_locations(definition)
+
+
 def _mark_source_pursuit_active(definition):
     """Commit that ``definition`` is part of the program being compiled."""
 
@@ -2346,7 +2591,13 @@ def _expand_unresolved_ast_parents(
     def definition_calls(definition):
         return lexical_calls(definition)
 
+    reduce_fold_lowerer = _ReduceFoldLowerer()
+
     def install_definition_bindings(definition, definition_bindings):
+        # Fold ``functools.reduce`` into a carried loop here, before this
+        # definition's calls are collected for pursuit, so the C builtin is
+        # never enqueued and never becomes a native-extension boundary.
+        reduce_fold_lowerer.lower_definition(definition, definition_bindings)
         definition._python_bindings = _reducer_facing_bindings(
             definition_bindings
         )
