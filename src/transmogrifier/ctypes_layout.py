@@ -9,6 +9,11 @@ ctypes what it already knows -- ``sizeof``, ``alignment``, each field's
 Nothing here re-derives a layout, parses ``_fields_`` as syntax, or applies a
 layout rule of its own: the numbers are read off the class.
 
+Every row is counted in the one memory schema Python delivers, the host's
+(:func:`host_schema`): a unit of 8 bits and the host's justification.  Nothing
+declares it and no contract may change it; the schema a backend targets is a
+separate contract fact, and absent it the same schema, so nothing converts.
+
 Leaf dtypes are the repository spellings declared in
 :mod:`src.transmogrifier.dtype_layout`.  A ctypes scalar is identified by its
 ``_type_`` code (``'d'`` double, ``'q'`` int64, ...), never by its Python class
@@ -24,11 +29,13 @@ per-backend recipe (storage member + tail padding) is uniform.
 from __future__ import annotations
 
 import ctypes
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .dtype_layout import DTYPES, DTypeLayout
 from .ssa import (
+    SSALayoutSchema,
     SSAStructDescriptor,
     SSAStructFieldDescriptor,
     SSAStructTable,
@@ -39,6 +46,22 @@ from .ssa import (
 
 class CTypesLayoutError(ValueError):
     """A ctypes type that has no exact repository layout."""
+
+
+def host_schema() -> SSALayoutSchema:
+    """The one memory schema Python and ctypes deliver: the host's.
+
+    ctypes counts in 8-bit units; a member narrower than a unit sits at the
+    low end on a little-endian host and the high end on a big-endian one.
+    Offsets run up.  Python cannot say what the cache-ideal spans are, so
+    none are declared.
+    """
+
+    return SSALayoutSchema(
+        unit_bits=8,
+        justification="low" if sys.byteorder == "little" else "high",
+        direction="up",
+    )
 
 
 # ``_type_`` code -> (kind, signed).  Sizes come from ctypes.sizeof, so the
@@ -113,6 +136,7 @@ class CTypesInterception:
     struct_table: SSAStructTable
     union_table: SSAUnionTable
     mint: Callable[[], int]
+    schema: SSALayoutSchema = field(default_factory=host_schema)
     _struct_ids: dict[type, int] = field(default_factory=dict)
     _union_ids: dict[type, int] = field(default_factory=dict)
 
@@ -152,17 +176,29 @@ class CTypesInterception:
             element = element._type_
         if _is_union(element):
             return SSAStructFieldDescriptor(
-                name, offset, ctypes.sizeof(element),
+                name, self._units(offset, owner, name),
+                self._units(ctypes.sizeof(element), owner, name),
                 union_id=self._union_row(element), count=count,
             )
         if _is_struct(element):
             return SSAStructFieldDescriptor(
-                name, offset, ctypes.sizeof(element),
+                name, self._units(offset, owner, name),
+                self._units(ctypes.sizeof(element), owner, name),
                 struct_id=self._struct_row(element), count=count,
             )
         layout = _scalar_layout(element)
         return SSAStructFieldDescriptor(
-            name, offset, layout.byte_size, dtype=layout.name, count=count,
+            name, self._units(offset, owner, name),
+            self._units(layout.byte_size, owner, name),
+            dtype=layout.name, count=count,
+        )
+
+    def _units(self, host_bytes: int, owner: Any, what: str) -> int:
+        """Host bytes counted in the schema's units.  ctypes delivers bytes;
+        the schema divides them, or the type is refused, never rounded."""
+
+        return self.schema.units(
+            int(host_bytes) * 8, f"{type_identity(owner)}.{what}",
         )
 
     def _struct_row(self, ctype: type) -> int:
@@ -174,8 +210,9 @@ class CTypesInterception:
             for name, member_type, *_ in ctype._fields_
         )
         row = SSAStructDescriptor(
-            self.mint(), type_identity(ctype),
-            ctypes.sizeof(ctype), ctypes.alignment(ctype), fields,
+            self.mint(), type_identity(ctype), self.schema,
+            self._units(ctypes.sizeof(ctype), ctype, "sizeof"),
+            self._units(ctypes.alignment(ctype), ctype, "alignment"), fields,
         )
         self.struct_table.register(row, stage=self.STAGE)
         self._struct_ids[ctype] = row.struct_id
@@ -189,9 +226,11 @@ class CTypesInterception:
         existing = self.struct_table.by_identity(identity)
         if existing is not None:
             return existing.struct_id
+        size = self._units(layout.byte_size, union, name)
         row = SSAStructDescriptor(
-            self.mint(), identity, layout.byte_size, layout.alignment,
-            (SSAStructFieldDescriptor(name, 0, layout.byte_size, dtype=layout.name),),
+            self.mint(), identity, self.schema, size,
+            self._units(layout.alignment, union, name),
+            (SSAStructFieldDescriptor(name, 0, size, dtype=layout.name),),
         )
         self.struct_table.register(row, stage=self.STAGE)
         return row.struct_id
@@ -225,7 +264,8 @@ class CTypesInterception:
                 struct_id = self._scalar_member_struct(ctype, name, member_type)
             row = self.struct_table.by_id(struct_id)
             members.append(SSAStructFieldDescriptor(
-                name, int(descriptor.offset), row.byte_size, struct_id=struct_id,
+                name, self._units(descriptor.offset, ctype, name), row.size,
+                struct_id=struct_id,
             ))
             alignments.append(row.alignment)
         strictest = max(alignments)
@@ -234,8 +274,9 @@ class CTypesInterception:
             if alignment == strictest
         )
         row = SSAUnionDescriptor(
-            self.mint(), type_identity(ctype),
-            ctypes.sizeof(ctype), ctypes.alignment(ctype),
+            self.mint(), type_identity(ctype), self.schema,
+            self._units(ctypes.sizeof(ctype), ctype, "sizeof"),
+            self._units(ctypes.alignment(ctype), ctype, "alignment"),
             tuple(members), storage,
         )
         self.union_table.register(row, stage=self.STAGE)
@@ -252,7 +293,7 @@ def member_path_layout(
 ) -> tuple[int, str | None, tuple[str, int] | None, int]:
     """Resolve an attribute path against a row.
 
-    Returns ``(byte_offset, leaf dtype or None, aggregate (kind, id) or None,
+    Returns ``(offset in units, leaf dtype or None, aggregate (kind, id) or None,
     count)``.  Offsets accumulate along the path; a union member adds zero.
     Raises ``CTypesLayoutError`` on an unknown member or a leaf reached early.
     """
@@ -278,7 +319,7 @@ def member_path_layout(
                 f"{table_kind} {identifier} has no member {name!r}"
                 + ("" if row is None else f" (has {[m.name for m in (row.members if table_kind == 'union' else row.fields)]})")
             )
-        offset += member.byte_offset
+        offset += member.offset
         count = member.count
         if member.struct_id is not None:
             current = ("struct", member.struct_id)

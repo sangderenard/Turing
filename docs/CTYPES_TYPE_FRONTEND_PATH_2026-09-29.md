@@ -625,3 +625,34 @@ the mechanism the parked row-handle rule also needs.
    appear as a field of an ordinary contract record (a `layout` storage
    kind at the field level, crossing the ABI as one span), or only as a
    whole parameter for now?
+
+## 7. Decisions (user, 2026-09-29, after this document was written)
+
+Settled, in the user's words or their direct consequence. These override the
+recommendations and questions above where they differ.
+
+- **Scope, ctypes only.** Rows come only from `ctypes.Structure` and
+  `ctypes.Union` (Q4). A laid-out type is a whole parameter only (Q5). What
+  marks a parameter as laid out is the annotation naming a ctypes class
+  present in `python_bindings` (Q1). The class table is left untouched and a
+  concordance page joins by identity (Q3).
+- **SSA does not know bytes (Q2, replaced).** Every size, alignment and offset
+  in a struct or union row is a count of units of the row's
+  `SSALayoutSchema`: a unit of division in bits, which end of a unit a
+  narrower member occupies (justification), the direction offsets run, and
+  advisory cache-ideal spans. The address node therefore carries a UNIT
+  offset plus the schema, never "byte_offset". (The older tensor descriptor's
+  `byte_offset`/`byte_size` predate this and are out of scope.)
+- **Python delivers one schema: the host's.** `ctypes_layout.host_schema()`
+  derives it (8-bit unit, justification from the host byte order, offsets
+  up). Nothing declares it and every ctypes-derived row names it. The layout
+  schema is NOT a source-side contract fact.
+- **The contract's schema is for the BACKEND.** It names the memory system
+  the output is compiled for. Absent, it is the usual one, the same as the
+  host's, so no conversion happens. Any other target is the backend's to
+  realize or to refuse visibly. No `layouts` section exists in the contract
+  today and none is to be built until a second target is needed.
+- **Refuse, never round.** A schema whose unit does not divide a member's
+  offset or size is refused (`SSALayoutSchema.units`), not approximated.
+  Re-declaring an identity under a different schema is a recorded
+  supersession edge like any other layout change.

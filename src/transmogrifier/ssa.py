@@ -626,23 +626,114 @@ class SSARecordTable:
 
 
 # ---------------------------------------------------------------------------
-# Struct and union types: byte layouts recorded once, spelled per backend.
+# Struct and union types: layouts recorded once, spelled per backend.
 #
 # A record (``SSARecordDescriptor``) is decomposed: it names the SSA values
-# that hold its fields and has no bytes of its own.  A struct row is the
-# opposite: it IS a byte layout -- size, alignment, and each field's offset --
-# and a value of that type is a base address into which every field is an
-# offset.  Rows are written from an intercepted ``ctypes.Structure`` /
+# that hold its fields and has no storage of its own.  A struct row is the
+# opposite: it IS a layout -- size, alignment, and each field's offset -- and
+# a value of that type is a base address into which every field is an offset.
+#
+# SSA does not know bytes.  Every number in a row (size, alignment, offset) is
+# a count of UNITS of the row's ``SSALayoutSchema``, the memory system the
+# numbers are counted in: its unit of division in bits, which end of a unit a
+# narrower member occupies, and the direction offsets run.  Python delivers
+# exactly one schema -- the host's -- and every row read from ctypes names it;
+# it is not declared by anyone.  The schema a BACKEND targets is a contract
+# fact for that backend, and absent it is the usual one, so conversion is the
+# identity; another target is the backend's to realize or to refuse visibly.
+#
+# Rows are written from an intercepted ``ctypes.Structure`` /
 # ``ctypes.Union`` subclass (``src/transmogrifier/ctypes_layout.py``): the
 # layout ctypes computed for the eager program is the layout the native
-# program gets, so the two cannot disagree about a byte.  Backends only spell
+# program gets, so the two cannot disagree about a unit.  Backends only spell
 # the row: C as ``struct``/``union`` with ``_Alignas``; LLVM as a named struct
-# type, or bytes at the row's alignment with typed access at the offsets;
+# type, or units at the row's alignment with typed access at the offsets;
 # Fortran as a ``bind(C)`` derived type.  A union is a set of struct members
 # sharing one payload: its ``storage_member`` is the strictest-aligned member
 # (ties by declaration order), the member a backend without unions lays down
-# first and pads to ``byte_size`` (Clang's own lowering of a C union).
+# first and pads to ``size`` (Clang's own lowering of a C union).
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SSALayoutSchema:
+    """The memory system a layout row's numbers are counted in.
+
+    ``unit_bits`` is the unit of division: every size, alignment and offset in
+    a row is a whole number of these.  ``justification`` says which end of a
+    unit a member narrower than the unit occupies (``"low"`` or ``"high"``),
+    which is what decides how a narrow member read through a wider one lands.
+    ``direction`` is the way offsets run from the base.  ``preferred_spans``
+    are the cache-ideal sizes in units: advisory, they never change what a
+    row means, only what a backend may choose for placement.
+    """
+
+    unit_bits: int
+    justification: str = "low"
+    direction: str = "up"
+    preferred_spans: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "unit_bits", int(self.unit_bits))
+        object.__setattr__(self, "justification", str(self.justification))
+        object.__setattr__(self, "direction", str(self.direction))
+        object.__setattr__(
+            self, "preferred_spans", tuple(int(v) for v in self.preferred_spans)
+        )
+        if self.unit_bits <= 0:
+            raise ValueError("layout schema: unit_bits must be positive")
+        if self.justification not in {"low", "high"}:
+            raise ValueError(
+                f"layout schema: justification must be 'low' or 'high', "
+                f"not {self.justification!r}"
+            )
+        if self.direction not in {"up", "down"}:
+            raise ValueError(
+                f"layout schema: direction must be 'up' or 'down', "
+                f"not {self.direction!r}"
+            )
+        if any(span <= 0 for span in self.preferred_spans):
+            raise ValueError("layout schema: preferred_spans must be positive")
+
+    def units(self, bits: int, what: str) -> int:
+        """``bits`` as a whole number of units; refuse rather than round."""
+
+        bits = int(bits)
+        if bits % self.unit_bits:
+            raise ValueError(
+                f"{what}: {bits} bits is not a whole number of "
+                f"{self.unit_bits}-bit units of this layout schema"
+            )
+        return bits // self.unit_bits
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "unit_bits": self.unit_bits,
+            "justification": self.justification,
+            "direction": self.direction,
+            "preferred_spans": list(self.preferred_spans),
+        }
+
+
+def _check_leaf_sizes(
+    identity: str, schema: "SSALayoutSchema", members: tuple,
+) -> None:
+    """A leaf member's size is its dtype's size counted in the schema's
+    units (the dtype authority declares bits; the schema divides them)."""
+
+    for member in members:
+        if member.dtype is None:
+            continue
+        layout = _resolve_dtype_layout(member.dtype)
+        expected = schema.units(
+            layout.byte_size * 8,
+            f"{identity}: member {member.name!r} of dtype {layout.name!r}",
+        )
+        if member.size != expected:
+            raise ValueError(
+                f"{identity}: member {member.name!r}: size {member.size} "
+                f"disagrees with dtype {layout.name!r} ({expected} units)"
+            )
 
 
 @dataclass(frozen=True)
@@ -652,13 +743,14 @@ class SSAStructFieldDescriptor:
     A leaf member has a repository ``dtype``; an aggregate member names the
     nested row through ``struct_id`` or ``union_id`` instead.  ``count`` > 1 is
     a fixed in-line array of ``count`` such elements (``c_double * 3``).
-    ``byte_offset`` is the member's offset inside the containing row -- zero
-    for every member of a union -- and ``byte_size`` the member's whole size.
+    ``offset`` is the member's offset inside the containing row -- zero for
+    every member of a union -- and ``size`` the member's own (per-element)
+    size, both in units of the containing row's schema.
     """
 
     name: str
-    byte_offset: int
-    byte_size: int
+    offset: int
+    size: int
     dtype: str | None = None
     struct_id: int | None = None
     union_id: int | None = None
@@ -666,8 +758,8 @@ class SSAStructFieldDescriptor:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", str(self.name))
-        object.__setattr__(self, "byte_offset", int(self.byte_offset))
-        object.__setattr__(self, "byte_size", int(self.byte_size))
+        object.__setattr__(self, "offset", int(self.offset))
+        object.__setattr__(self, "size", int(self.size))
         object.__setattr__(self, "count", int(self.count))
         if self.struct_id is not None:
             object.__setattr__(self, "struct_id", int(self.struct_id))
@@ -682,15 +774,16 @@ class SSAStructFieldDescriptor:
                 f"struct field {self.name!r} must be exactly one of a leaf "
                 f"dtype, a nested struct or a nested union"
             )
-        if self.byte_offset < 0 or self.byte_size <= 0 or self.count <= 0:
+        if self.offset < 0 or self.size <= 0 or self.count <= 0:
             raise ValueError(
                 f"struct field {self.name!r}: offset/size/count must be "
                 f"non-negative/positive/positive"
             )
         if self.dtype is not None:
             # A leaf's dtype is a spelling the one dtype authority declares
-            # (``dtype_layout``); the row stores the canonical name and the
-            # member's size is that dtype's size.  No local dtype table.
+            # (``dtype_layout``); the row stores the canonical name, and the
+            # container checks the member's size against that dtype's size
+            # in the schema's units.  No local dtype table.
             layout = _resolve_dtype_layout(self.dtype)
             if layout is None:
                 raise ValueError(
@@ -698,17 +791,12 @@ class SSAStructFieldDescriptor:
                     f"declared in dtype_layout"
                 )
             object.__setattr__(self, "dtype", layout.name)
-            if self.byte_size != layout.byte_size:
-                raise ValueError(
-                    f"struct field {self.name!r}: byte_size {self.byte_size} "
-                    f"disagrees with dtype {layout.name!r} ({layout.byte_size} bytes)"
-                )
 
     def to_mapping(self) -> Dict[str, Any]:
         return {
             "name": self.name,
-            "byte_offset": self.byte_offset,
-            "byte_size": self.byte_size,
+            "offset": self.offset,
+            "size": self.size,
             "dtype": self.dtype,
             "struct_id": self.struct_id,
             "union_id": self.union_id,
@@ -718,31 +806,33 @@ class SSAStructFieldDescriptor:
 
 @dataclass(frozen=True)
 class SSAStructDescriptor:
-    """A struct row: a named byte layout."""
+    """A struct row: a named layout, counted in its schema's units."""
 
     struct_id: int
     identity: str
-    byte_size: int
+    schema: SSALayoutSchema
+    size: int
     alignment: int
     fields: tuple[SSAStructFieldDescriptor, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "struct_id", int(self.struct_id))
         object.__setattr__(self, "identity", str(self.identity))
-        object.__setattr__(self, "byte_size", int(self.byte_size))
+        object.__setattr__(self, "size", int(self.size))
         object.__setattr__(self, "alignment", int(self.alignment))
         object.__setattr__(self, "fields", tuple(self.fields))
         names = tuple(field.name for field in self.fields)
         if len(names) != len(set(names)):
             raise ValueError(f"struct {self.identity}: field names must be unique")
-        if self.byte_size <= 0 or self.alignment <= 0:
+        if self.size <= 0 or self.alignment <= 0:
             raise ValueError(f"struct {self.identity}: size and alignment must be positive")
         if self.alignment & (self.alignment - 1):
             raise ValueError(f"struct {self.identity}: alignment must be a power of two")
-        if self.byte_size % self.alignment:
+        if self.size % self.alignment:
             raise ValueError(f"struct {self.identity}: size must be a multiple of alignment")
+        _check_leaf_sizes(f"struct {self.identity}", self.schema, self.fields)
         for field in self.fields:
-            if field.byte_offset + field.byte_size * field.count > self.byte_size:
+            if field.offset + field.size * field.count > self.size:
                 raise ValueError(
                     f"struct {self.identity}: field {field.name!r} overruns the row"
                 )
@@ -757,7 +847,8 @@ class SSAStructDescriptor:
         return {
             "struct_id": self.struct_id,
             "identity": self.identity,
-            "byte_size": self.byte_size,
+            "schema": self.schema.to_mapping(),
+            "size": self.size,
             "alignment": self.alignment,
             "fields": [field.to_mapping() for field in self.fields],
         }
@@ -771,12 +862,14 @@ class SSAUnionDescriptor:
     synthesized at interception, so the recipe is uniform).  ``storage_member``
     names the member a backend without unions lays down as the payload's
     storage type: the strictest-aligned member, ties broken by declaration
-    order.  ``byte_size`` is the largest member rounded up to ``alignment``.
+    order.  ``size`` is the largest member rounded up to ``alignment``, in
+    units of the row's schema.
     """
 
     union_id: int
     identity: str
-    byte_size: int
+    schema: SSALayoutSchema
+    size: int
     alignment: int
     members: tuple[SSAStructFieldDescriptor, ...] = ()
     storage_member: str = ""
@@ -784,7 +877,7 @@ class SSAUnionDescriptor:
     def __post_init__(self) -> None:
         object.__setattr__(self, "union_id", int(self.union_id))
         object.__setattr__(self, "identity", str(self.identity))
-        object.__setattr__(self, "byte_size", int(self.byte_size))
+        object.__setattr__(self, "size", int(self.size))
         object.__setattr__(self, "alignment", int(self.alignment))
         object.__setattr__(self, "members", tuple(self.members))
         object.__setattr__(self, "storage_member", str(self.storage_member))
@@ -799,11 +892,11 @@ class SSAUnionDescriptor:
                     f"union {self.identity}: member {member.name!r} is not a "
                     f"struct row (every union member is a struct)"
                 )
-            if member.byte_offset != 0:
+            if member.offset != 0:
                 raise ValueError(
                     f"union {self.identity}: member {member.name!r} is not at offset 0"
                 )
-            if member.byte_size > self.byte_size:
+            if member.size > self.size:
                 raise ValueError(
                     f"union {self.identity}: member {member.name!r} overruns the payload"
                 )
@@ -812,9 +905,9 @@ class SSAUnionDescriptor:
                 f"union {self.identity}: storage_member {self.storage_member!r} "
                 f"is not a member"
             )
-        if self.byte_size <= 0 or self.alignment <= 0 or (self.alignment & (self.alignment - 1)):
+        if self.size <= 0 or self.alignment <= 0 or (self.alignment & (self.alignment - 1)):
             raise ValueError(f"union {self.identity}: bad size/alignment")
-        if self.byte_size % self.alignment:
+        if self.size % self.alignment:
             raise ValueError(f"union {self.identity}: size must be a multiple of alignment")
 
     def member(self, name: str) -> "SSAStructFieldDescriptor | None":
@@ -827,7 +920,8 @@ class SSAUnionDescriptor:
         return {
             "union_id": self.union_id,
             "identity": self.identity,
-            "byte_size": self.byte_size,
+            "schema": self.schema.to_mapping(),
+            "size": self.size,
             "alignment": self.alignment,
             "members": [member.to_mapping() for member in self.members],
             "storage_member": self.storage_member,
@@ -837,7 +931,7 @@ class SSAUnionDescriptor:
 def _layout_member_claims(
     descriptor: Any, container_kind: str, members: tuple,
 ) -> dict[int, set]:
-    """nested row id -> {(container id, member name, byte offset, role)}.
+    """nested row id -> {(container id, member name, offset, role)}.
 
     The layout analogue of ``record_member_claims``: a struct or union row
     claims every nested row one of its members is laid out from.  Role
@@ -854,7 +948,7 @@ def _layout_member_claims(
         descriptor.struct_id if container_kind == "struct" else descriptor.union_id
     )
     for member in members:
-        base = (container_kind, container_id, member.name, int(member.byte_offset))
+        base = (container_kind, container_id, member.name, int(member.offset))
         if member.struct_id is not None:
             claims.setdefault(int(member.struct_id), set()).add((*base, ("struct",)))
         if member.union_id is not None:
