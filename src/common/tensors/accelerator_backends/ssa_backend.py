@@ -17,6 +17,7 @@ from typing import Any
 
 from ..abstraction import AbstractTensor, register_backend
 from ..abstraction_methods.indexing import lower_basic_index, normalize_index
+from ....transmogrifier.dtype_layout import dtype_byte_size
 from ....transmogrifier.ssa import (
     BasicBlock,
     Function,
@@ -137,13 +138,7 @@ class SSATensorProgram:
 
     @staticmethod
     def _dtype_bytes(dtype: str | None) -> int:
-        return {
-            "bool": 1, "i1": 1,
-            "int8": 1, "uint8": 1,
-            "int16": 2, "uint16": 2,
-            "float32": 4, "float": 4, "int32": 4, "i32": 4,
-            "float64": 8, "double": 8, "int64": 8, "i64": 8,
-        }.get(str(dtype or "float64").lower(), 8)
+        return dtype_byte_size(dtype)
 
     def _tensor(
         self,

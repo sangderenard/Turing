@@ -68,3 +68,7 @@ tools/_precision_benchmark/
 
 # Symbolic law construction cache, rebuilt on demand.
 __lawcache__/
+
+# local virtual environments
+.venv/
+.venv*/

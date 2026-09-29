@@ -15,6 +15,7 @@ from math import prod
 from typing import Any, Mapping
 import re
 
+from ..transmogrifier.dtype_layout import DEFAULT_DTYPE
 from .ssa_aggregate_abi import _constant_integer
 
 
@@ -309,7 +310,7 @@ def module_storage_requirements(
                 str(value.dtype)
                 for value in occurrences
                 if getattr(value, "dtype", None)
-            ), "float64")
+            ), DEFAULT_DTYPE)
             requirements[value_id] = SSAStorageRequirement(
                 value_id=value_id,
                 dtype=dtype,

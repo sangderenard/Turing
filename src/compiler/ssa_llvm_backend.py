@@ -824,6 +824,10 @@ from typing import (
     Any as _Any, Mapping as _Mapping, Sequence as _Sequence,
 )
 
+from ..transmogrifier.dtype_layout import (
+    llvm_type_bytes_table as _llvm_type_bytes_table,
+    llvm_type_for_dtype as _llvm_type_for_dtype,
+)
 from ..transmogrifier.ssa import IRModule as _IRModule, SSAValue as _SSAValue
 
 # Synthetic buffer ids for history watches.  These used to be numeric bases
@@ -929,9 +933,7 @@ def _double_literal(value: _Any) -> str:
 #: Sizing bulk memory as "elements * 8" is only correct while every buffer is
 #: a double. It silently writes FOUR TIMES the allocation for an i32 buffer
 #: and eight times for an i1 one, past the end, into whatever follows.
-_LLVM_TYPE_BYTES: dict[str, int] = {
-    "double": 8, "i64": 8, "ptr": 8, "i32": 4, "i1": 1,
-}
+_LLVM_TYPE_BYTES: dict[str, int] = _llvm_type_bytes_table()
 
 
 def _value_bytes(value: _Any) -> int:
@@ -1014,20 +1016,9 @@ def _value_llvm_type(value: _Any) -> str:
         )
     ):
         return "ptr"
-    dtype = str(
-        accounting.get("physical_dtype")
-        or getattr(value, "dtype", None)
-        or "float64"
-    ).lower()
-    if dtype in {"bool", "i1"}:
-        return "i1"
-    if dtype in {"int", "int32", "i32"}:
-        return "i32"
-    if dtype in {"int64", "i64", "long"}:
-        return "i64"
-    if dtype == "opaque_ref":
-        return "i64"
-    return "double"
+    return _llvm_type_for_dtype(
+        accounting.get("physical_dtype") or getattr(value, "dtype", None)
+    )
 
 
 def _declared_span_rank(value: _Any) -> int:

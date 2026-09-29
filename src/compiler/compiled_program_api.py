@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from ..transmogrifier.dtype_layout import c_abi_type, c_abi_type_table
 from ..transmogrifier.ssa import Function, SSAValue
 
 SCHEMA = "turing-compiled-program-api-v1"
@@ -30,25 +31,9 @@ SCHEMA = "turing-compiled-program-api-v1"
 
 # How an SSA dtype is spelled for a C-ABI caller, alongside the ctypes name a
 # Python caller needs. Both are recorded because a caller in another language
-# needs the first and cannot use the second.
-_C_TYPES: dict[str, tuple[str, str]] = {
-    "uint8": ("uint8_t", "c_uint8"),
-    "u8": ("uint8_t", "c_uint8"),
-    "float": ("float", "c_float"),
-    "float32": ("float", "c_float"),
-    "f32": ("float", "c_float"),
-    "double": ("double", "c_double"),
-    "float64": ("double", "c_double"),
-    "f64": ("double", "c_double"),
-    "int": ("int32_t", "c_int32"),
-    "int32": ("int32_t", "c_int32"),
-    "i32": ("int32_t", "c_int32"),
-    "int64": ("int64_t", "c_int64"),
-    "i64": ("int64_t", "c_int64"),
-    "opaque_ref": ("int64_t", "c_int64"),
-    "bool": ("bool", "c_bool"),
-    "logical": ("bool", "c_bool"),
-}
+# needs the first and cannot use the second.  Declared by the dtype authority
+# (transmogrifier.dtype_layout); this is its C-ABI vocabulary.
+_C_TYPES: dict[str, tuple[str, str]] = c_abi_type_table()
 
 
 @dataclass(frozen=True)
@@ -161,7 +146,7 @@ class CompiledProgramAPI:
 
 
 def _c_type_for(dtype: str | None) -> tuple[str, str]:
-    return _C_TYPES.get(str(dtype or "float64"), ("double", "c_double"))
+    return c_abi_type(dtype)
 
 
 def describe_fortran_function(

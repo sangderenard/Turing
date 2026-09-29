@@ -53,6 +53,7 @@ from ..common.tensors.fused_ir import (
     unroll_feed_axis_reductions,
     view_offset_stride,
 )
+from ..transmogrifier.dtype_layout import wasm_type_table
 from .wasm_binary import (
     OP_F32_CONVERT_I32_S,
     OP_F32_CONVERT_I64_S,
@@ -127,31 +128,20 @@ class WasmShortfall:
         return f"step {self.step_id} ({self.op_name}): {self.reason}"
 
 
-# Numeric types, as (WAT type, element bytes, load, store).
-_TYPES: dict[str, tuple[str, int, str, str]] = {
-    "float64": ("f64", 8, "f64.load", "f64.store"),
-    "f64": ("f64", 8, "f64.load", "f64.store"),
-    "double": ("f64", 8, "f64.load", "f64.store"),
-    "float32": ("f32", 4, "f32.load", "f32.store"),
-    "f32": ("f32", 4, "f32.load", "f32.store"),
-    "float": ("f32", 4, "f32.load", "f32.store"),
-    # Integer working types. Until these existed this module could only
-    # compile a program whose *own* arithmetic was floating point --
-    # integers were supported solely as separate memory buffers to convert
-    # in and out of (``_MEMORY_DTYPE_OPS`` below). That is fine for a
-    # numeric kernel and wrong for a program that is genuinely integral:
-    # a decoder, a register file, a state machine. Such a program has no
-    # meaningful f64 working type -- ``//`` and ``%`` are not float
-    # operations, bit masks are not float operations, and a 64-bit value
-    # does not survive f64's 2**53 exact-integer range. WebAssembly has
-    # native i32/i64 arithmetic; this simply stops pretending it does not.
-    "int64": ("i64", 8, "i64.load", "i64.store"),
-    "i64": ("i64", 8, "i64.load", "i64.store"),
-    "long": ("i64", 8, "i64.load", "i64.store"),
-    "int32": ("i32", 4, "i32.load", "i32.store"),
-    "i32": ("i32", 4, "i32.load", "i32.store"),
-    "int": ("i32", 4, "i32.load", "i32.store"),
-}
+# Numeric types, as (WAT type, element bytes, load, store), declared by the
+# dtype authority (transmogrifier.dtype_layout); this is its WASM vocabulary.
+#
+# It includes the integer working types. Until these existed this module could
+# only compile a program whose *own* arithmetic was floating point --
+# integers were supported solely as separate memory buffers to convert
+# in and out of (``_MEMORY_DTYPE_OPS`` below). That is fine for a
+# numeric kernel and wrong for a program that is genuinely integral:
+# a decoder, a register file, a state machine. Such a program has no
+# meaningful f64 working type -- ``//`` and ``%`` are not float
+# operations, bit masks are not float operations, and a 64-bit value
+# does not survive f64's 2**53 exact-integer range. WebAssembly has
+# native i32/i64 arithmetic; this simply stops pretending it does not.
+_TYPES: dict[str, tuple[str, int, str, str]] = wasm_type_table()
 
 # Which working types are integral. Everything that differs between the two
 # families keys off this rather than re-parsing the type name at each site.

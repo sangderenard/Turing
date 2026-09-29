@@ -17,6 +17,7 @@ from typing import Any, Iterable, Mapping
 
 from ..common.tensors.abstraction_methods.indexing import normalize_basic_index
 from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import c_tensor_opcode
+from ..transmogrifier.dtype_layout import dtype_byte_size
 from ..transmogrifier.ssa import (
     IRModule,
     Instr,
@@ -1006,15 +1007,9 @@ def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
                         for extent in reversed(shape):
                             reverse_strides.append(stride)
                             stride *= int(extent)
-                        dtype_bytes = {
-                            "bool": 1, "i1": 1,
-                            "int8": 1, "uint8": 1,
-                            "int16": 2, "uint16": 2,
-                            "float32": 4, "float": 4,
-                            "int32": 4, "i32": 4,
-                            "float64": 8, "double": 8,
-                            "int64": 8, "i64": 8,
-                        }.get(str(result.dtype or descriptor.dtype).lower(), 8)
+                        dtype_bytes = dtype_byte_size(
+                            str(result.dtype or descriptor.dtype)
+                        )
                         table.tensors[int(result.id)] = dataclasses.replace(
                             descriptor,
                             dtype=str(result.dtype or descriptor.dtype),
@@ -1338,12 +1333,7 @@ def propagate_repository_ssa_call_metadata(
         for extent in reversed(shape):
             reversed_strides.append(stride)
             stride *= int(extent)
-        dtype_bytes = {
-            "bool": 1, "i1": 1, "int8": 1, "uint8": 1,
-            "int16": 2, "uint16": 2,
-            "float32": 4, "float": 4, "int32": 4, "i32": 4,
-            "float64": 8, "double": 8, "int64": 8, "i64": 8,
-        }.get(str(source.dtype or descriptor.dtype).lower(), 8)
+        dtype_bytes = dtype_byte_size(str(source.dtype or descriptor.dtype))
         mutation_page.set(
             (callee_name, int(formal.id), "descriptor.shape"),
             (fixed_point_round, next(mutation_step)),
@@ -2502,12 +2492,7 @@ def lower_tensor_calls_to_repository_ssa(
                     "physical_dtype", value.dtype or "float64"
                 )
             ).lower()
-            dtype_bytes = {
-                "bool": 1, "i1": 1, "int8": 1, "uint8": 1,
-                "int16": 2, "uint16": 2,
-                "float32": 4, "float": 4, "int32": 4, "i32": 4,
-                "float64": 8, "double": 8, "int64": 8, "i64": 8,
-            }.get(physical_dtype, 8)
+            dtype_bytes = dtype_byte_size(physical_dtype)
             element_count = prod(shape) if shape else 1
             # A dynamic descriptor requires all three extent values; a result
             # inheriting a dynamic source's state inherits its extents too

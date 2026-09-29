@@ -17,6 +17,11 @@ import os
 import sys
 from typing import Any, Mapping, Sequence
 
+from ..transmogrifier.dtype_layout import (
+    c_lane_dtype_for_storage,
+    c_lane_numpy_dtype,
+    c_lane_storage_for_llvm_type,
+)
 from ..transmogrifier.ssa import Function, IRModule
 from .output_publication import (
     function_output_publications,
@@ -778,26 +783,15 @@ def _c_numeric_literal(value: bool | int | float, c_type: str) -> str:
 
 
 def _numpy_dtype(dtype) -> str:
-    name = str(dtype or "float64").casefold()
-    if name in {"bool", "i1", "uint8", "u8"}:
-        return "bool"
-    if name in {"int", "int32", "i32"}:
-        return "int32"
-    if name in {"int64", "i64", "long"}:
-        return "int64"
-    return "float64"
+    """numpy dtype this lane allocates for ``dtype`` (transmogrifier.dtype_layout)."""
+
+    return c_lane_numpy_dtype(dtype)
 
 
 def _dtype_for_c_storage(c_type: str) -> str:
     """Repository dtype spelling for an already-solved public C buffer."""
 
-    if c_type == "uint8_t":
-        return "bool"
-    if c_type == "int32_t":
-        return "int32"
-    if c_type == "int64_t":
-        return "int64"
-    return "float64"
+    return c_lane_dtype_for_storage(c_type)
 
 
 @dataclass(slots=True)
@@ -1972,10 +1966,7 @@ def emit_ssa_module_to_c(
         from .ssa_llvm_backend import _value_llvm_type
 
         llvm_type = _value_llvm_type(value)
-        return {
-            "double": "double", "i64": "int64_t", "i32": "int32_t",
-            "i1": "uint8_t", "ptr": "void *",
-        }.get(llvm_type, "double")
+        return c_lane_storage_for_llvm_type(llvm_type)
 
     # Internal repository functions publish through caller-owned output
     # storage, exactly like the LLVM module lane. Authored scalar-return C

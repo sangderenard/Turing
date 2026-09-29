@@ -28,6 +28,7 @@ import math
 import re
 from typing import Any, Iterable, Mapping
 
+from ..transmogrifier.dtype_layout import dtype_is_int64
 from ..transmogrifier.ssa import Function, IRModule
 from .class_emission_plan import plan_class_emission
 from .compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
@@ -288,9 +289,7 @@ def _javascript_performance_labels(
 
 
 def _dtype_is_int64(value: Any) -> bool:
-    return str(getattr(value, "dtype", "") or "").casefold() in {
-        "int64", "i64", "uint64", "u64", "long", "opaque_ref",
-    }
+    return dtype_is_int64(getattr(value, "dtype", ""))
 
 
 def _elementwise_numeric_expression(

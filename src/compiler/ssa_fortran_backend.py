@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from ..transmogrifier.dtype_layout import fortran_kind_table
 from ..transmogrifier.ssa import (
     BasicBlock,
     Function,
@@ -350,21 +351,9 @@ _INTEGER_DTYPES = frozenset(
 
 _LOGICAL_DTYPES = frozenset({"i1", "bool", "logical"})
 
-_DTYPE_KIND: dict[str, str] = {
-    "double": "real(c_double)",
-    "i64": "integer(c_int64_t)",
-    "i32": "integer(c_int32_t)",
-    "i1": "logical(c_bool)",
-    "float64": "real(c_double)",
-    "float32": "real(c_float)",
-    "double": "real(c_double)",
-    "float": "real(c_float)",
-    "int64": "integer(c_int64_t)",
-    "int32": "integer(c_int32_t)",
-    "int": "integer(c_int32_t)",
-    "bool": "logical(c_bool)",
-    "opaque_ref": "integer(c_int64_t)",
-}
+# Declared by the dtype authority (transmogrifier.dtype_layout); this is its
+# Fortran vocabulary.
+_DTYPE_KIND: dict[str, str] = fortran_kind_table()
 
 DEFAULT_DTYPE = "float64"
 
