@@ -41,6 +41,12 @@ from src.compiler.precompile_to_ssa import (
     merge_repository_ssa_modules,
     resolve_sequence_schemas,
 )
+from src.compiler.identity_concordance import (
+    begin_identity_book,
+    commit_sequence_row_layout,
+    end_identity_book,
+    record_proven_shape,
+)
 from src.compiler.ssa_fortran_backend import emit_module
 from src.compiler.ssa_self_check import check_definition_dominance
 from src.compiler.shell_reference_tables import (
@@ -3979,6 +3985,62 @@ def test_fixed_width_sequence_append_passes_every_row_column():
         if instruction.attributes.get("ssa_sequence_operation") == "append"
     )
     assert tuple(value.id for value in append.args[-2:]) == (12, 13)
+
+
+def test_sequence_row_contract_follows_proven_append_value_identity():
+    control = ControlProgram(SequenceBlock((
+        SequenceMutationBlock(ControlSequenceMutation(
+            sequence_value_id=30,
+            operator="append",
+            argument_value_ids=(12,),
+            effect_node_id=40,
+            policy="duplicates",
+        )),
+    )))
+
+    _book, token = begin_identity_book()
+    try:
+        record_proven_shape(
+            "row_sequence", 12, (3,), "float64", level=2,
+        )
+        function, shortfalls = lower_control_program_to_ssa(
+            control,
+            function_name="row_sequence",
+            # This stale stage summary deliberately says scalar/unknown.  The
+            # exact graph proof above is the only row-layout authority.
+            region_value_meta={12: Meta((), "unknown")},
+            sequence_initializations=((30, "duplicates", 1),),
+            sequence_declarations=((30, "duplicates", 1, True),),
+        )
+
+        assert shortfalls == ()
+        descriptor = function.metadata["sequence_table"].sequences[30]
+        assert descriptor.column_shapes == ((3,),)
+        assert descriptor.column_dtypes == ("float64",)
+    finally:
+        end_identity_book(token)
+
+
+def test_declared_sequence_reads_row_layout_from_identity_book():
+    _book, token = begin_identity_book()
+    try:
+        commit_sequence_row_layout(
+            "row_sequence", 30, ((3,),), ("float64",),
+            source="collection value edge",
+        )
+        function, shortfalls = lower_control_program_to_ssa(
+            ControlProgram(SequenceBlock(())),
+            function_name="module__row_sequence__specialized_deadbeef",
+            sequence_initializations=((30, "duplicates", 1),),
+            sequence_declarations=((30, "duplicates", 1, True),),
+        )
+
+        assert shortfalls == ()
+        descriptor = function.metadata["sequence_table"].sequences[30]
+        assert descriptor.column_shapes == ((3,),)
+        assert descriptor.column_dtypes == ("float64",)
+    finally:
+        end_identity_book(token)
 
 
 def test_local_sequence_lifetime_resets_without_erasing_source_sequence():

@@ -4123,6 +4123,38 @@ def _normalize_lexical_values(
                     if isinstance(receiver_value, int)
                     else ()
                 )
+                receiver_class = (
+                    None
+                    if not isinstance(receiver_value, int)
+                    else _resolved_source_value_class(
+                        graph.G, int(receiver_value)
+                    )[0]
+                )
+                if receiver_class is not None:
+                    try:
+                        method_entry = function_table.entry(
+                            f"{receiver_class}.{expression.func.attr}"
+                        )
+                    except KeyError:
+                        method_entry = None
+                    if method_entry is not None:
+                        method_reference = int(
+                            method_entry.reference.address
+                        )
+                        graph.G.nodes[node_id].setdefault(
+                            "attributes", {}
+                        ).update({
+                            "method_ref": method_reference,
+                            "callee_ref": method_reference,
+                        })
+                        accessor_id = id(expression.func)
+                        if accessor_id in graph.G:
+                            graph.G.nodes[accessor_id].setdefault(
+                                "attributes", {}
+                            ).update({
+                                "accessor_kind": "method",
+                                "method_ref": method_reference,
+                            })
                 argument_inputs = tuple(
                     (resolved, f"arg{index}")
                     for index, argument in enumerate(expression.args)
@@ -4711,6 +4743,30 @@ def _normalize_lexical_values(
                 continue
             resolve_expression(child)
         node_id = id(expression)
+        if isinstance(expression, ast.Subscript) and node_id in graph.G:
+            base_id = resolve_expression(expression.value)
+            base_attributes = (
+                graph.G.nodes[base_id].get("attributes") or {}
+                if isinstance(base_id, int) and base_id in graph.G else {}
+            )
+            mapping_value_record = base_attributes.get(
+                "mapping_value_record"
+            )
+            if mapping_value_record is not None:
+                # This is the keyed field's value-record edge, transferred to
+                # the exact Indexed result while lexical values are being
+                # assembled.  It is one concordance fact, not a later cache or
+                # an inference from the surrounding call.
+                graph.G.nodes[node_id].setdefault("attributes", {})[
+                    "result_class_ref"
+                ] = str(mapping_value_record)
+                _concord_source_value_class(
+                    value_class_scope,
+                    int(node_id),
+                    str(mapping_value_record),
+                    precision_limbs=1,
+                    source="keyed value-record edge",
+                )
         if (
             isinstance(expression, (ast.Tuple, ast.List, ast.Set, ast.Dict))
             and node_id in graph.G
@@ -9982,7 +10038,8 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             deleting = isinstance(expression.ctx, ast.Del)
             data["type"] = "DelItem" if deleting else "Indexed"
             data["op"] = "delitem" if deleting else "Indexed"
-            data.setdefault("attributes", {})["source_type"] = "Subscript"
+            attributes = data.setdefault("attributes", {})
+            attributes["source_type"] = "Subscript"
             _replace_inputs(
                 graph,
                 node_id,
@@ -9994,7 +10051,6 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     ),
                 ),
             )
-
             # The AST Tuple only grouped the index components.  Once those
             # components feed Indexed directly, retaining the wrapper would
             # incorrectly schedule a second tuple-producing computation.

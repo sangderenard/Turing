@@ -1187,6 +1187,48 @@ class Builder:
     assert field["attributes"]["mapping_value_optional"] is True
 
 
+def test_mapping_subscript_carries_declared_record_identity():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Row:
+    def vector(self):
+        return (1.0, 2.0, 3.0)
+
+class Builder:
+    def __init__(self):
+        self.items: dict[str, Row] = {}
+
+    def vector_for(self, key: str):
+        return self.items[key].vector()
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("vector_for").graph
+    selected = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Subscript)
+        and ast.unparse(data["expr_obj"]) == "self.items[key]"
+    )
+
+    assert selected["attributes"]["result_class_ref"] == "Row"
+    call = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "vector"
+    )
+    assert call["attributes"]["method_ref"] == graph.function_table.entry(
+        "Row.vector"
+    ).reference.address
+
+
 def test_lazy_class_mapping_initialization_types_phi_and_setdefault():
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(

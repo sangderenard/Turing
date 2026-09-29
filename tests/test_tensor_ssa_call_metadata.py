@@ -596,6 +596,58 @@ def test_raw_full_slice_and_column_normalize_to_one_selection():
     assert result.shape == (4,)
 
 
+def test_dynamic_sequence_column_uses_concorded_row_layout():
+    source = SSAValue(10, "float64", accounting={
+        "sequence_row_shape": (3,),
+    })
+    length = SSAValue(11, "int64", shape=(1,), accounting={
+        "sequence_length_for": 10,
+    })
+    capacity = SSAValue(12, "int64")
+    rows = SSAValue(13)
+    column = SSAValue(14)
+    result = SSAValue(15, "float64")
+    function = Function("dynamic_sequence_column", [
+        source, length, capacity,
+    ], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], rows, attributes={"constant": slice(None)}),
+            Instr("Const", [], column, attributes={"constant": 1}),
+            Instr("Indexed", [source, rows, column], result),
+            Instr("Ret", [result], None),
+        ]),
+    })
+    sequences = SSASequenceTable({
+        10: SSASequenceDescriptor(
+            sequence_id=10,
+            column_value_ids=(10,),
+            length_address_id=11,
+            capacity_value_id=12,
+            column_dtypes=("float64",),
+            column_shapes=((3,),),
+            writable=False,
+        ),
+    })
+    module = IRModule(
+        {function.name: function},
+        sequence_tables={function.name: sequences},
+    )
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference(),
+    ) == ()
+
+    call = next(
+        instruction
+        for instruction in function.blocks["entry"].instrs
+        if instruction.op == "Call"
+    )
+    assert call.attributes["callee"] == "index_select_double"
+    assert source.accounting["tensor_metadata_state"] == "dynamic"
+    assert source.accounting["sequence_row_shape"] == (3,)
+    assert result.shape == ()
+
+
 def test_raw_slice_uses_same_owner_region_tensor_descriptor():
     produced = SSAValue(10, "float64", shape=(4, 3))
     producer = Function("owner__planned_region_0", [], {

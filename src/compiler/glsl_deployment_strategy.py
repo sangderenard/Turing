@@ -17617,7 +17617,15 @@ def _tensor_descriptor(
                 ),
                 "rank": len(settled),
             }
-    except Exception:
+    except Exception as error:
+        if os.environ.get("TURING_DEBUG_SEQUENCE_ROW_LAYOUT"):
+            print(
+                "SEQUENCE-ROW-LAYOUT descriptor preamble failed: "
+                f"function={graph.G.graph.get('function_name')!r} "
+                f"value={int(node_id)} error={type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
         row = None
 
     answer = _tensor_descriptor_rule(graph, node_id, _seen)
@@ -17638,8 +17646,29 @@ def _tensor_descriptor(
                     (answer or {}).get("dtype"),
                     int(_dependency_levels(graph).get(int(node_id), 0)),
                 )
-        except Exception:
-            pass
+            row_shape = (
+                answer.get("sequence_row_shape") if answer else None
+            )
+            if row_shape is not None:
+                from .identity_concordance import (
+                    commit_sequence_row_layout,
+                )
+
+                commit_sequence_row_layout(
+                    row[0], row[1],
+                    (tuple(map(int, row_shape)),),
+                    ((answer or {}).get("dtype"),),
+                    source="tensor descriptor transformation path",
+                )
+        except Exception as error:
+            if os.environ.get("TURING_DEBUG_SEQUENCE_ROW_LAYOUT"):
+                print(
+                    "SEQUENCE-ROW-LAYOUT publication failed: "
+                    f"function={row[0]!r} value={row[1]} "
+                    f"error={type(error).__name__}: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
     return answer
 
 
@@ -18333,22 +18362,35 @@ def _tensor_descriptor_rule(
                 None if source_id is None
                 else _tensor_descriptor(graph, source_id, seen)
             )
-            if source is not None and descriptor_states_a_shape(source):
+            if source is not None:
                 source_shape = tuple(map(int, source.get("shape") or ()))
+                source_rank = int(source.get("rank", len(source_shape)))
+                row_shape = tuple(map(
+                    int, source.get("sequence_row_shape") or (),
+                ))
+                complete_source_shape = descriptor_states_a_shape(source)
+                dynamic_leading_extent = bool(
+                    not complete_source_shape
+                    and str(source.get("metadata_state") or "") == "dynamic"
+                    and source_rank == 1 + len(row_shape)
+                )
+                if not complete_source_shape and not dynamic_leading_extent:
+                    source = None
+            if source is not None:
                 attributes = data.get("attributes") or {}
                 axis = attributes.get("axis", attributes.get("dim"))
                 keepdim = bool(attributes.get(
                     "keepdim", attributes.get("keepdims", False)
                 ))
                 if axis is None:
-                    reduced = (1,) * len(source_shape) if keepdim else ()
+                    reduced = (1,) * source_rank if keepdim else ()
                 else:
                     axes = (
                         tuple(axis)
                         if isinstance(axis, (tuple, list))
                         else (axis,)
                     )
-                    if not source_shape:
+                    if source_rank <= 0:
                         # An explicit reduction axis cannot be normalized
                         # against rank zero.  During callsite specialization
                         # this combination means the local operand descriptor
@@ -18365,12 +18407,23 @@ def _tensor_descriptor_rule(
                         for item in axes
                     ):
                         normalized = tuple(sorted({
-                            int(item) % len(source_shape) for item in axes
+                            int(item) % source_rank for item in axes
                         }))
-                        reduced = tuple(
+                        source_extents = (
+                            (None, *row_shape)
+                            if dynamic_leading_extent else source_shape
+                        )
+                        reduced_extents = tuple(
                             1 if keepdim and index in normalized else extent
-                            for index, extent in enumerate(source_shape)
+                            for index, extent in enumerate(source_extents)
                             if keepdim or index not in normalized
+                        )
+                        reduced = (
+                            tuple(map(int, reduced_extents))
+                            if all(
+                                extent is not None
+                                for extent in reduced_extents
+                            ) else None
                         )
                     else:
                         reduced = None

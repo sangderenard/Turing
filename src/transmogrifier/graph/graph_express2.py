@@ -3561,6 +3561,7 @@ class ProcessGraph:
         source_ast_normalizers=(),
         retained_ast_normalizers=(),
         retain=(),
+        source_record_classes=(),
         source_parameter_records=(),
         profile_verbose=False,
         progress=None,
@@ -3679,47 +3680,64 @@ class ProcessGraph:
             for definition in getattr(tree, "body", ())
             if isinstance(definition, ast.ClassDef)
         }
-        for retained_class in retained:
-            if not inspect.isclass(retained_class):
+        record_classes = () if source_record_classes is None else tuple(
+            source_record_classes
+        )
+        from ...compiler.identity_concordance import current_identity_book
+
+        def ingest_external_class(external_class, *, selected):
+            if not inspect.isclass(external_class):
                 raise TypeError(
-                    "retain expects a class object or an iterable of class objects"
+                    "external source records must be class objects"
                 )
-            identity = retained_class.__name__
-            retained_identities.append(identity)
+            identity = external_class.__name__
+            if selected:
+                retained_identities.append(identity)
+            qualified_identity = (
+                f"{getattr(external_class, '__module__', '')}."
+                f"{getattr(external_class, '__qualname__', identity)}"
+            ).strip(".")
             if identity in existing_classes:
-                continue
-            definition = _source_ast_definition(retained_class)
-            if not isinstance(definition, ast.ClassDef):
-                raise ValueError(
-                    f"cannot ingest retained class {retained_class!r}: "
-                    "source is unavailable"
+                definition = next(
+                    candidate
+                    for candidate in tree.body
+                    if isinstance(candidate, ast.ClassDef)
+                    and candidate.name == identity
                 )
-            definition = _attach_external_methods(retained_class, definition)
+            else:
+                definition = _source_ast_definition(external_class)
+                if not isinstance(definition, ast.ClassDef):
+                    raise ValueError(
+                        f"cannot ingest source record {external_class!r}: "
+                        "source is unavailable"
+                    )
+                definition = _attach_external_methods(
+                    external_class, definition,
+                )
+                if retained_ast_normalizers:
+                    retained_module = ast.Module(
+                        body=[definition], type_ignores=[]
+                    )
+                    for normalize in retained_ast_normalizers:
+                        normalize(retained_module)
+                    ast.fix_missing_locations(retained_module)
+                    definition = retained_module.body[0]
+                tree.body.append(definition)
+                existing_classes.add(identity)
             retained_qualname = str(getattr(
-                retained_class, "__qualname__", retained_class.__name__,
+                external_class, "__qualname__", external_class.__name__,
             ))
-            if retained_ast_normalizers:
-                retained_module = ast.Module(
-                    body=[definition], type_ignores=[]
-                )
-                for normalize in retained_ast_normalizers:
-                    normalize(retained_module)
-                ast.fix_missing_locations(retained_module)
-                definition = retained_module.body[0]
             definition._python_record_identity_keys = (
-                (
-                    f"{getattr(retained_class, '__module__', '')}."
-                    f"{retained_qualname}"
-                ).strip("."),
+                qualified_identity,
                 retained_qualname,
-                str(retained_class.__name__),
+                str(external_class.__name__),
             )
             # A retained class is external source. Its method free names live
             # in the defining module, not in the submitted program's globals.
             # Preserve that exact lexical environment so source pursuit can
             # follow method dependencies instead of leaving helper calls as
             # unresolved tokens. No value is executed or instantiated here.
-            retained_bindings = _ast_definition_bindings(retained_class)
+            retained_bindings = _ast_definition_bindings(external_class)
             definition._python_bindings = _reducer_facing_bindings(
                 retained_bindings
             )
@@ -3728,8 +3746,24 @@ class ProcessGraph:
                     member, (ast.FunctionDef, ast.AsyncFunctionDef)
                 ):
                     member._python_bindings = definition._python_bindings
-            tree.body.append(definition)
-            existing_classes.add(identity)
+            page = current_identity_book().page(
+                "source_record_class_concordance"
+            )
+            row = (qualified_identity,)
+            incumbent = page.latest(row)
+            if incumbent is not None and incumbent is not definition:
+                raise ValueError(
+                    "source record class concordance disagreement for "
+                    f"{qualified_identity!r}"
+                )
+            if incumbent is None:
+                page.set(row, 0, definition)
+            return definition
+
+        for retained_class in retained:
+            ingest_external_class(retained_class, selected=True)
+        for record_class in record_classes:
+            ingest_external_class(record_class, selected=False)
 
         # Program-ABI record bindings are already the authoritative answer to
         # the source-level type of a boundary parameter.  Publish that answer
@@ -3737,26 +3771,6 @@ class ProcessGraph:
         # The value is the exact class AST already present in this graph, so
         # method selection continues through the normal source-method
         # concordance and never constructs a Python object or a stand-in.
-        class_candidates = {}
-        for definition in (
-            node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
-        ):
-            source_identity = getattr(
-                definition, "_python_source_identity", None,
-            )
-            keys = {str(definition.name)}
-            keys.update(map(str, getattr(
-                definition, "_python_record_identity_keys", (),
-            )))
-            if (
-                isinstance(source_identity, tuple)
-                and len(source_identity) == 2
-            ):
-                qualified = ".".join(map(str, source_identity)).strip(".")
-                keys.update((qualified, str(source_identity[1])))
-            for key in filter(None, keys):
-                class_candidates.setdefault(key, []).append(definition)
-
         def qualified_definitions(body, prefix=()):
             for definition in body:
                 if isinstance(definition, ast.ClassDef):
@@ -3769,43 +3783,33 @@ class ProcessGraph:
                     qualified = ".".join((*prefix, definition.name))
                     yield qualified, definition
 
-        parameter_records = tuple(dict(record) for record in (
-            source_parameter_records or ()
-        ))
+        parameter_records = tuple(source_parameter_records or ())
         dependency_seed_definitions = []
+        record_class_page = current_identity_book().page(
+            "source_record_class_concordance"
+        )
         for qualified_name, definition in qualified_definitions(tree.body):
             for record in parameter_records:
                 if not fnmatchcase(
                     qualified_name, str(record.get("function") or ""),
                 ):
                     continue
-                candidates = []
-                for key in (
-                    record.get("record"),
-                    record.get("identity"),
-                    str(record.get("identity") or "").rsplit(".", 1)[-1],
-                ):
-                    candidates.extend(class_candidates.get(str(key), ()))
-                candidates = tuple(dict.fromkeys(candidates))
-                if len(candidates) != 1:
+                owner = record_class_page.latest((str(record["identity"]),))
+                if not isinstance(owner, ast.ClassDef):
                     continue
-                owner = candidates[0]
-                methods = {
-                    str(member.name): member
-                    for member in owner.body
-                    if isinstance(member, (
-                        ast.FunctionDef, ast.AsyncFunctionDef,
-                    ))
-                }
                 parameter = str(record["parameter"])
                 selected = [
-                    methods[call.func.attr]
+                    member
                     for call in ast.walk(definition)
                     if isinstance(call, ast.Call)
                     and isinstance(call.func, ast.Attribute)
                     and isinstance(call.func.value, ast.Name)
                     and call.func.value.id == parameter
-                    and call.func.attr in methods
+                    for member in owner.body
+                    if isinstance(member, (
+                        ast.FunctionDef, ast.AsyncFunctionDef,
+                    ))
+                    and member.name == call.func.attr
                 ]
                 # Follow only same-owner method edges here. The class graph
                 # owns those calls physically; this traversal merely finds
@@ -3819,13 +3823,17 @@ class ProcessGraph:
                     seen_methods.add(id(method))
                     dependency_seed_definitions.append(method)
                     pending.extend(
-                        methods[call.func.attr]
+                        member
                         for call in ast.walk(method)
                         if isinstance(call, ast.Call)
                         and isinstance(call.func, ast.Attribute)
                         and isinstance(call.func.value, ast.Name)
                         and call.func.value.id in {"self", "cls"}
-                        and call.func.attr in methods
+                        for member in owner.body
+                        if isinstance(member, (
+                            ast.FunctionDef, ast.AsyncFunctionDef,
+                        ))
+                        and member.name == call.func.attr
                     )
 
         # Dissolve recognised spans at the seam -- before parent-expansion, IR

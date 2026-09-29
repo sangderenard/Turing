@@ -42219,6 +42219,27 @@ def _lower_ast_source_to_ssa_impl(
         assignment_receipts.extend(receipts)
 
     report("ssa-source: building complete ProcessGraph source closure")
+    program_abi_record_identities = tuple(
+        str(record.identity)
+        for record in extraction_policy.program_abi.records.values()
+    )
+    source_record_candidates = tuple(
+        value
+        for value in (python_bindings or {}).values()
+        if inspect.isclass(value)
+        and (
+            f"{getattr(value, '__module__', '')}."
+            f"{getattr(value, '__qualname__', value.__name__)}"
+        ).strip(".") in program_abi_record_identities
+    )
+    source_record_classes = tuple(
+        candidate
+        for index, candidate in enumerate(source_record_candidates)
+        if all(
+            candidate is not prior
+            for prior in source_record_candidates[:index]
+        )
+    )
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(
             tree,
@@ -42251,6 +42272,7 @@ def _lower_ast_source_to_ssa_impl(
                 if specialized_operator_methods else None,
             ))),
             retain=retain,
+            source_record_classes=source_record_classes,
             source_parameter_records=tuple(
                 {
                     **binding.receipt(),

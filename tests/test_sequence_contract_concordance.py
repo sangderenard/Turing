@@ -27,7 +27,9 @@ from src.compiler.identity_concordance import (
     begin_identity_book,
     concord_sequence_row_dtypes,
     commit_sequence_contract,
+    commit_sequence_row_layout,
     committed_sequence_row_dtypes,
+    committed_sequence_row_layout,
     committed_sequence_contract,
     end_identity_book,
     resolved_concordant_alias_bindings,
@@ -165,6 +167,25 @@ def test_function_alias_publication_commits_transitive_terminal_resident():
         assert published == {64: 58, 69: 58, 71: 86}
         assert function.metadata["value_aliases"] == published
         assert page.latest(("solve", 69)) == 58
+    finally:
+        end_identity_book(token)
+
+
+def test_sequence_row_layout_is_one_direct_identity_book_row():
+    book, token = begin_identity_book()
+    try:
+        committed = commit_sequence_row_layout(
+            "module__rows__specialized_deadbeef",
+            264,
+            ((3,),),
+            ("float64",),
+            source="collection value edge",
+        )
+
+        assert committed_sequence_row_layout("rows", 264) == committed
+        assert book.page("sequence_row_layout_concordance").rows() == (
+            ("rows", 264),
+        )
     finally:
         end_identity_book(token)
 

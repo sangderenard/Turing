@@ -2758,21 +2758,38 @@ def lower_tensor_calls_to_repository_ssa(
                                 tuple(source.shape or ()),
                             ),
                         ))
+                        source_sequence = resident_sequence(source)
+                        resident_row_shape = tuple(
+                            (source_sequence.column_shapes or ((),))[0]
+                        ) if (
+                            source_sequence is not None
+                            and len(source_sequence.column_value_ids) == 1
+                        ) else ()
+                        accounted_row_shape = tuple(map(
+                            int,
+                            (source.accounting or {}).get(
+                                "sequence_row_shape", (),
+                            ),
+                        ))
+                        proven_row_shape = (
+                            accounted_row_shape or resident_row_shape
+                        )
                         declared_source_rank = int(
                             (source.accounting or {}).get(
                                 "program_abi_rank", 0
                             ) or 0
                         )
+                        if not declared_source_rank and proven_row_shape:
+                            # A resident sequence is a dynamic leading axis
+                            # followed by its proven element extents.  That
+                            # rank is already carried by the physical arena's
+                            # concorded row layout; it is not a ProgramABI
+                            # boundary and must not require a second rank map.
+                            declared_source_rank = 1 + len(proven_row_shape)
                         if declared_source_rank > len(source_shape):
-                            source_sequence = resident_sequence(source)
                             row_shape = (
-                                tuple((
-                                    source_sequence.column_shapes
-                                    or ((),)
-                                )[0])
-                                if source_sequence is not None
-                                and len(source_sequence.column_value_ids) == 1
-                                else None
+                                proven_row_shape
+                                if proven_row_shape else None
                             )
                             if (
                                 row_shape == ()
@@ -2913,6 +2930,21 @@ def lower_tensor_calls_to_repository_ssa(
                         source_rank = int(source_accounting.get(
                             "program_abi_rank", 0
                         ) or 0)
+                        source_sequence = resident_sequence(source)
+                        resident_row_shape = tuple(
+                            (source_sequence.column_shapes or ((),))[0]
+                        ) if (
+                            source_sequence is not None
+                            and len(source_sequence.column_value_ids) == 1
+                        ) else ()
+                        proven_row_shape = tuple(map(
+                            int,
+                            source_accounting.get(
+                                "sequence_row_shape", (),
+                            ),
+                        )) or resident_row_shape
+                        if not source_rank and proven_row_shape:
+                            source_rank = 1 + len(proven_row_shape)
                         authored_indices = args[1:]
                         decoded_indices = tuple(
                             constants.get(int(value.id), value)
@@ -2948,7 +2980,6 @@ def lower_tensor_calls_to_repository_ssa(
                                 int(value.id): value
                                 for value in function.args
                             }
-                            source_sequence = resident_sequence(source)
                             if (
                                 (shape_id is None or rank_id is None)
                                 and source_sequence is not None
@@ -2960,9 +2991,7 @@ def lower_tensor_calls_to_repository_ssa(
                                         "sequence_length_for", -1
                                     )) == int(source_sequence.sequence_id)
                                 ), None)
-                                row_shape = tuple(
-                                    (source_sequence.column_shapes or ((),))[0]
-                                )
+                                row_shape = proven_row_shape
                                 if (
                                     not row_shape
                                     and source_rank

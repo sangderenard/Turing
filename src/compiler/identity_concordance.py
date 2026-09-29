@@ -2109,6 +2109,117 @@ class SequenceContract:
     writable: bool
 
 
+@dataclass(frozen=True)
+class SequenceRowLayout:
+    """The element layout proven for one resident sequence identity."""
+
+    column_shapes: tuple[tuple[int, ...], ...]
+    column_dtypes: tuple[str, ...]
+
+
+def committed_sequence_row_layout(
+    scope: Any,
+    sequence_id: int,
+    *,
+    page: IdentityPage | None = None,
+) -> SequenceRowLayout | None:
+    """Read the element layout already proven for this exact sequence."""
+
+    scope = authored_function_name(scope)
+    if page is None:
+        page = current_identity_book().page(
+            "sequence_row_layout_concordance"
+        )
+    fact = page.latest((scope, int(sequence_id)))
+    if fact is None:
+        return None
+    return SequenceRowLayout(
+        column_shapes=tuple(
+            tuple(map(int, shape)) for shape in fact[0]
+        ),
+        column_dtypes=tuple(map(str, fact[1])),
+    )
+
+
+def commit_sequence_row_layout(
+    scope: Any,
+    sequence_id: int,
+    column_shapes: Iterable[Iterable[int]],
+    column_dtypes: Iterable[Any],
+    *,
+    source: str,
+    page: IdentityPage | None = None,
+) -> SequenceRowLayout:
+    """Commit an element layout reached through the transformation graph.
+
+    This is a direct identity-book row, not an id-keyed cache.  Producers
+    publish the layout on the resident sequence identity they proved, and
+    consumers ask for that same row.  An empty column shape is a proven
+    scalar element here; absence of the row is the only unknown shape.
+    """
+
+    scope = authored_function_name(scope)
+    if page is None:
+        page = current_identity_book().page(
+            "sequence_row_layout_concordance"
+        )
+    shapes = tuple(
+        tuple(int(extent) for extent in shape) for shape in column_shapes
+    )
+    dtypes = tuple(
+        _canonical_sequence_row_dtype(dtype) for dtype in column_dtypes
+    )
+    if len(shapes) != len(dtypes) or not shapes:
+        raise ValueError(
+            "sequence row layout requires one dtype for every column: "
+            f"shapes={shapes!r}, dtypes={dtypes!r}"
+        )
+    sid = int(sequence_id)
+    incumbent = committed_sequence_row_layout(scope, sid, page=page)
+    if incumbent is not None and incumbent.column_shapes != shapes:
+        raise ValueError(
+            "sequence row layout concordance disagreement for "
+            f"{scope!r} value {sid}: recorded="
+            f"{incumbent.column_shapes!r}, {source} says {shapes!r}"
+        )
+    resolved_dtypes = dtypes
+    if incumbent is not None:
+        if len(incumbent.column_dtypes) != len(dtypes):
+            raise ValueError(
+                "sequence row layout concordance width disagreement for "
+                f"{scope!r} value {sid}: recorded="
+                f"{incumbent.column_dtypes!r}, {source} says {dtypes!r}"
+            )
+        merged: list[str] = []
+        for recorded, proposed in zip(
+            incumbent.column_dtypes, dtypes, strict=True,
+        ):
+            if (
+                recorded != "unknown"
+                and proposed != "unknown"
+                and recorded != proposed
+            ):
+                raise ValueError(
+                    "sequence row layout dtype disagreement for "
+                    f"{scope!r} value {sid}: recorded="
+                    f"{incumbent.column_dtypes!r}, {source} says {dtypes!r}"
+                )
+            merged.append(
+                proposed if recorded == "unknown" else recorded
+            )
+        resolved_dtypes = tuple(merged)
+    resolved = SequenceRowLayout(shapes, resolved_dtypes)
+    row = (scope, sid)
+    history = page.history(row)
+    column = history[-1][0] + 1 if history else 0
+    page.set(row, column, (
+        resolved.column_shapes,
+        resolved.column_dtypes,
+        str(source),
+    ))
+    return resolved
+
+
 def _canonical_sequence_row_dtype(dtype: Any) -> str:
     spelling = "unknown" if dtype is None else str(dtype)
     return "unknown" if spelling in {"", "None", "unknown"} else spelling
@@ -3021,8 +3132,10 @@ def invalidate_proven_shape(
     )
 
 
-def proven_shape_of(function: Any, value_id: int) -> tuple[int, ...] | None:
-    """The extents proven for this identity, deepest first, or None.
+def proven_shape_contract_of(
+    function: Any, value_id: int,
+) -> tuple[tuple[int, ...], str] | None:
+    """The shape and dtype proven for one exact value identity, or None.
 
     This is the question every store was answering separately.  A row that
     two derivations contradict at the same causal level answers nothing --
@@ -3037,7 +3150,17 @@ def proven_shape_of(function: Any, value_id: int) -> tuple[int, ...] | None:
     deepest = max(recorded, key=lambda entry: int(entry[0]))[1]
     if not isinstance(deepest, tuple) or deepest[0] != "proven":
         return None
-    return tuple(int(extent) for extent in deepest[1])
+    return (
+        tuple(int(extent) for extent in deepest[1]),
+        str(deepest[2]),
+    )
+
+
+def proven_shape_of(function: Any, value_id: int) -> tuple[int, ...] | None:
+    """The extents proven for this exact identity, or None."""
+
+    contract = proven_shape_contract_of(function, value_id)
+    return None if contract is None else contract[0]
 
 
 def shape_store_report(book: Any, stores: Any = None) -> str:

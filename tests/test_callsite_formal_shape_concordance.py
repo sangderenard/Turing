@@ -307,6 +307,41 @@ def test_axis_reduction_keeps_tracked_result_when_operand_rank_is_unsettled():
         end_identity_book(token)
 
 
+def test_leading_axis_reduction_uses_dynamic_sequence_row_shape():
+    """A dynamic row count does not hide the statically known row extents."""
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.graph["function_name"] = "reduce_dynamic_rows"
+    graph.G.add_node(
+        0, type="Input", op="input", value_id=0,
+        tensor={
+            "shape": (),
+            "dtype": "float64",
+            "rank": 2,
+            "metadata_state": "dynamic",
+            "sequence_row_shape": (3,),
+        },
+        attributes={"binding_name": "rows"}, parents=[], children=[
+            (1, "operand"),
+        ],
+    )
+    graph.G.add_node(
+        1, type="mean", op="mean", value_id=1,
+        parents=[(0, "operand")], children=[],
+        attributes={"tensor_candidate": "mean", "dim": 0},
+    )
+    graph.G.add_edge(0, 1)
+
+    _book, token = begin_identity_book()
+    try:
+        assert _tensor_descriptor(graph, 1) == {
+            "shape": (3,), "dtype": "float64", "rank": 1,
+        }
+        assert proven_shape_of("reduce_dynamic_rows", 1) == (3,)
+    finally:
+        end_identity_book(token)
+
+
 def test_dependency_change_invalidates_and_then_reproves_concordance_shape():
     """Clearing a graph cache also withdraws its stale identity-level proof."""
 

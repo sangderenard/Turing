@@ -17,7 +17,9 @@ from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from .id_space import serial_of as _id_serial_of
 from .identity_concordance import (
     IdentityPage,
+    committed_sequence_row_layout,
     concord_sequence_row_dtypes,
+    proven_shape_contract_of,
 )
 from .control_source import (
     CallBlock,
@@ -1493,12 +1495,30 @@ class _ControlSSABuilder:
             column_shapes: list[tuple[int, ...]] = [
                 () for _column in range(int(column_count))
             ]
+            row_layout = committed_sequence_row_layout(
+                function_name, int(sequence_id),
+            )
+            if row_layout is not None:
+                if len(row_layout.column_shapes) != int(column_count):
+                    raise ValueError(
+                        "sequence row layout width disagrees with its "
+                        f"physical contract in {function_name}: sequence "
+                        f"{int(sequence_id)} has "
+                        f"{len(row_layout.column_shapes)} layout column(s) "
+                        f"and {int(column_count)} physical column(s)"
+                    )
+                column_shapes[:] = row_layout.column_shapes
+                for column, dtype in enumerate(row_layout.column_dtypes):
+                    if column_dtypes[column] in {None, "unknown"}:
+                        column_dtypes[column] = dtype
             # A retained comprehension appends the numerical value produced
             # by its body.  That exact mutation edge owns the shape of one
             # resident row; the sequence handle is not the row and must not
-            # inherit the row shape as its complete extent.  Preserve the row
-            # contract on the descriptor so storage and later tensor views can
-            # use ``row_index * row_width`` against the one physical arena.
+            # inherit the row shape as its complete extent.  The shape proof
+            # is an identity-book fact produced by the source transformation
+            # graph.  Do not reconstruct it from ``region_value_meta``: that
+            # id-keyed summary is a stage-local second key and was precisely
+            # how a proven ``(3,)`` reduction result became a scalar row here.
             for mutation in control_mutations:
                 if (
                     int(mutation.sequence_value_id) != int(sequence_id)
@@ -1510,24 +1530,25 @@ class _ControlSSABuilder:
                 for column, argument_id in enumerate(
                     mutation.argument_value_ids
                 ):
-                    meta = self.region_value_meta.get(int(argument_id))
-                    if meta is None:
+                    row_contract = proven_shape_contract_of(
+                        function_name, int(argument_id),
+                    )
+                    if row_contract is None:
                         continue
-                    proposed_shape = tuple(map(int, meta.shape or ()))
-                    if proposed_shape:
-                        incumbent_shape = column_shapes[column]
-                        if incumbent_shape and incumbent_shape != proposed_shape:
-                            self.shortfalls.append(SSALoweringShortfall(
-                                "ssa-sequence", "conflicting-row-shape",
-                                f"{function_name}.sequence_declaration",
-                                f"sequence value {int(sequence_id)} column "
-                                f"{column} receives both {incumbent_shape!r} "
-                                f"and {proposed_shape!r}",
-                            ))
-                            continue
-                        column_shapes[column] = proposed_shape
+                    proposed_shape, proposed_dtype = row_contract
+                    incumbent_shape = column_shapes[column]
+                    if incumbent_shape and incumbent_shape != proposed_shape:
+                        self.shortfalls.append(SSALoweringShortfall(
+                            "ssa-sequence", "conflicting-row-shape",
+                            f"{function_name}.sequence_declaration",
+                            f"sequence value {int(sequence_id)} column "
+                            f"{column} receives both {incumbent_shape!r} "
+                            f"and {proposed_shape!r}",
+                        ))
+                        continue
+                    column_shapes[column] = proposed_shape
                     if column_dtypes[column] in {None, "unknown"}:
-                        column_dtypes[column] = str(meta.dtype)
+                        column_dtypes[column] = str(proposed_dtype)
             for _result_id, query_id, lookup_sequence_id in table_lookups:
                 if int(lookup_sequence_id) != int(sequence_id):
                     continue

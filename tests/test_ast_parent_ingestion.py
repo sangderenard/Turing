@@ -14,6 +14,10 @@ from src.common.tensors.accelerator_backends.aot_compile import (
     _source_dependency_is_not_tensor_primitive,
 )
 from src.compiler.loop_composer import LoopComposer, LoopBackendCapabilities
+from src.compiler.identity_concordance import (
+    begin_identity_book,
+    end_identity_book,
+)
 from src.compiler.process_graph_fusion import extract_clean_process_subgraph
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 from src.transmogrifier.graph.node_special_cases import tensor_operation_name
@@ -47,6 +51,19 @@ class _RetainedMethodDependencyOwner:
 
     def step(self, value):
         return _source_helper(value)
+
+
+class _ABIRecordRow:
+    def vector(self):
+        return (1.0, 2.0, 3.0)
+
+
+class _ABIRecordOwner:
+    def __init__(self):
+        self.rows: dict[str, _ABIRecordRow] = {}
+
+    def vector_for(self, key):
+        return self.rows[key].vector()
 
 
 class _ABIActivatedMethodDependencyOwner:
@@ -181,6 +198,44 @@ def test_record_abi_parameter_activates_retained_method_dependencies():
     )
     assert graph.G.has_edge(helper_id, helper_call_id)
     assert helper_call["attributes"]["resolved_ast_parent"] == helper_id
+
+
+def test_abi_record_class_joins_source_catalogue_through_identity_book():
+    graph = ProcessGraph(materialize_memory=False)
+    book, token = begin_identity_book()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(
+                ast.parse(""),
+                retain=(_ABIRecordOwner,),
+                source_record_classes=(_ABIRecordRow,),
+            )
+        reduce_abstract_tensor_topology(graph)
+
+        qualified = (
+            f"{_ABIRecordRow.__module__}.{_ABIRecordRow.__qualname__}"
+        )
+        record_definition = book.page(
+            "source_record_class_concordance"
+        ).latest((qualified,))
+        assert isinstance(record_definition, ast.ClassDef)
+        assert record_definition.name == "_ABIRecordRow"
+
+        caller = graph.function_table.entry("vector_for").graph.G
+        call = next(
+            data
+            for _node_id, data in caller.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.Call)
+            and isinstance(data["expr_obj"].func, ast.Attribute)
+            and data["expr_obj"].func.attr == "vector"
+        )
+        assert call["attributes"]["callee_ref"] == (
+            graph.function_table.entry(
+                "_ABIRecordRow.vector"
+            ).reference.address
+        )
+    finally:
+        end_identity_book(token)
 
 
 def test_lexical_pursuit_follows_nested_helpers_but_respects_parameter_shadowing():
