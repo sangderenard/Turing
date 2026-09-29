@@ -58,7 +58,7 @@ class _RetainedMethodDependencyOwner:
 
 class _ABIRecordRow:
     def vector(self):
-        return (1.0, 2.0, 3.0)
+        return (_source_helper(1.0), 2.0, 3.0)
 
 
 class _ABIRecordOwner:
@@ -72,6 +72,11 @@ class _ABIRecordOwner:
 class _ABIActivatedMethodDependencyOwner:
     def run(self, value=3):
         return _closed_source_helper()
+
+
+class _ABIActivatedArgumentedDependencyOwner:
+    def run(self, value):
+        return _source_helper(value)
 
 
 class _ConstructorDependencyOwner:
@@ -201,6 +206,88 @@ def test_record_abi_parameter_activates_retained_method_dependencies():
     )
     assert graph.G.has_edge(helper_id, helper_call_id)
     assert helper_call["attributes"]["resolved_ast_parent"] == helper_id
+
+    reduce_abstract_tensor_topology(graph)
+    helper_graph = graph.function_table.entry("_closed_source_helper").graph
+    assert helper_graph.G.graph["source_pursuit_active"] is True
+
+
+def test_record_abi_method_pursues_argumented_module_function_dependency():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            ast.parse(
+                "def entry(owner, value):\n"
+                "    return owner.run(value)\n"
+            ),
+            resolve_unresolved_parents=True,
+            parent_include=_source_dependency_is_not_tensor_primitive,
+            pursuit_roots=("entry",),
+            retain=(_ABIActivatedArgumentedDependencyOwner,),
+            source_parameter_records=({
+                "function": "entry",
+                "parameter": "owner",
+                "record": "Owner",
+                "identity": (
+                    f"{_ABIActivatedArgumentedDependencyOwner.__module__}."
+                    f"{_ABIActivatedArgumentedDependencyOwner.__qualname__}"
+                ),
+            },),
+        )
+
+    helper_id, _helper = _definitions(graph, "_source_helper")[0]
+    helper_call_id, helper_call = next(
+        (node_id, data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Name)
+        and data["expr_obj"].func.id == "_source_helper"
+    )
+    assert graph.G.has_edge(helper_id, helper_call_id)
+    assert helper_call["attributes"]["resolved_ast_parent"] == helper_id
+
+    reduce_abstract_tensor_topology(graph)
+    helper_graph = graph.function_table.entry("_source_helper").graph
+    assert helper_graph.G.graph["source_pursuit_active"] is True
+
+
+def test_nested_abi_record_method_pursues_returned_function_dependency():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            ast.parse(
+                "def entry(owner, key):\n"
+                "    return owner.vector_for(key)\n"
+            ),
+            resolve_unresolved_parents=True,
+            parent_include=_source_dependency_is_not_tensor_primitive,
+            pursuit_roots=("entry",),
+            retain=(_ABIRecordOwner,),
+            source_record_classes=(_ABIRecordRow,),
+            source_parameter_records=({
+                "function": "entry",
+                "parameter": "owner",
+                "record": "Owner",
+                "identity": (
+                    f"{_ABIRecordOwner.__module__}."
+                    f"{_ABIRecordOwner.__qualname__}"
+                ),
+            },),
+        )
+
+    helper_id, _helper = _definitions(graph, "_source_helper")[0]
+    helper_call_id, helper_call = next(
+        (node_id, data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Name)
+        and data["expr_obj"].func.id == "_source_helper"
+    )
+    assert graph.G.has_edge(helper_id, helper_call_id)
+    assert helper_call["attributes"]["resolved_ast_parent"] == helper_id
+    assert not getattr(
+        _helper["expr_obj"], "_source_pursuit_active", False,
+    )
 
 
 def test_abi_record_class_joins_source_catalogue_through_identity_book():

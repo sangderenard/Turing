@@ -1851,6 +1851,7 @@ def _expand_unresolved_ast_parents(
     include=None,
     pursuit_roots=None,
     dependency_seed_definitions=(),
+    latent_dependency_seed_definitions=(),
     tensor_code_references=None,
     source_ast_normalizers=(),
     profile_verbose=False,
@@ -2083,6 +2084,43 @@ def _expand_unresolved_ast_parents(
         Visitor().visit(definition)
         return tuple(calls)
 
+    def lexical_return_calls(definition):
+        """Calls on this definition's returned-value slice."""
+
+        calls = []
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self):
+                self.in_return = False
+
+            def visit_Return(self, node):
+                previous = self.in_return
+                self.in_return = True
+                if node.value is not None:
+                    self.visit(node.value)
+                self.in_return = previous
+
+            def visit_Call(self, node):
+                if self.in_return:
+                    calls.append(node)
+                self.generic_visit(node)
+
+            def visit_FunctionDef(self, node):
+                if node is definition:
+                    for statement in node.body:
+                        self.visit(statement)
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_ClassDef(self, node):
+                return
+
+            def visit_Lambda(self, node):
+                return
+
+        Visitor().visit(definition)
+        return tuple(calls)
+
     def root_definition(identity):
         # ``<locals>`` is Python's durable lexical-name separator, not an AST
         # definition. Accept the same qualified spelling used by FunctionTable
@@ -2133,29 +2171,42 @@ def _expand_unresolved_ast_parents(
             for call in lexical_calls(definition)
         )
         # A retained class body is already present in the graph and its
-        # ``self.method`` edges belong to class dispatch.  A closed lexical
-        # factory call has no runtime actuals from which later call-frame
-        # linking could recover its result, though: its source body is the
-        # value definition.  Seed exactly those zero-argument Python
-        # functions from the ABI-selected method closure without reopening
-        # the whole retained class through the general parent worklist.
-        pending_calls.extend(
+        active_dependency_calls = tuple(
             call
             for definition in dependency_seed_definitions
-            for call in lexical_calls(definition)
+            for call in lexical_return_calls(definition)
             if isinstance(call.func, ast.Name)
-            and not call.args
-            and not call.keywords
             and inspect.isfunction(_resolve_ast_parent_reference(
                 call.func,
                 node_bindings.get(id(call), root_bindings),
             ))
         )
+        pending_calls.extend(active_dependency_calls)
+        # ``self.method`` edges belong to class dispatch.  The returned-value
+        # slice of another ABI record method is nevertheless its public result
+        # definition.  Register those source declarations and their exact
+        # call edges now, but leave liveness to the ordinary call-reachability
+        # fixed point.  Discovery is not execution and must not make every
+        # declared record method live merely because its schema is available.
+        latent_calls = tuple(
+            call
+            for definition in latent_dependency_seed_definitions
+            for call in lexical_return_calls(definition)
+            if isinstance(call.func, ast.Name)
+            and all(call is not active for active in active_dependency_calls)
+            and inspect.isfunction(_resolve_ast_parent_reference(
+                call.func,
+                node_bindings.get(id(call), root_bindings),
+            ))
+        )
+        pending_calls.extend(latent_calls)
+        latent_call_ids = frozenset(id(call) for call in latent_calls)
         active_seed_definitions = root_definitions
     else:
         pending_calls = deque(
             node for node in ast.walk(module) if isinstance(node, ast.Call)
         )
+        latent_call_ids = frozenset()
         active_seed_definitions = tuple(definitions)
     for definition in active_seed_definitions:
         mark_source_pursuit_active(definition)
@@ -2443,7 +2494,8 @@ def _expand_unresolved_ast_parents(
                 )
                 target_bindings[identity] = combined
                 install_definition_bindings(definition, combined)
-                requeue_definition(definition)
+                if id(node) not in latent_call_ids:
+                    requeue_definition(definition)
             continue
         if identity in unavailable_identities:
             continue
@@ -2475,7 +2527,8 @@ def _expand_unresolved_ast_parents(
             # lexical callee's calls had already been queued even when its
             # argument bindings did not change.  Reachable pursuit must enqueue
             # the body exactly when the call first admits the definition.
-            requeue_definition(definition)
+            if id(node) not in latent_call_ids:
+                requeue_definition(definition)
             continue
 
         source_target = identity_target
@@ -2766,7 +2819,8 @@ def _expand_unresolved_ast_parents(
                     target_bindings[member_identity] = constructor_bindings
                     install_definition_bindings(member_definition, constructor_bindings)
                     requeue_definition(member_definition)
-        requeue_definition(source_definition)
+        if id(node) not in latent_call_ids:
+            requeue_definition(source_definition)
         if profile_verbose:
                 print(
                     "[ast-parent-profile] "
@@ -4043,8 +4097,10 @@ class ProcessGraph:
 
         for retained_class in retained:
             ingest_external_class(retained_class, selected=True)
-        for record_class in record_classes:
+        record_definitions = tuple(
             ingest_external_class(record_class, selected=False)
+            for record_class in record_classes
+        )
 
         # Program-ABI record bindings are already the authoritative answer to
         # the source-level type of a boundary parameter.  Publish that answer
@@ -4065,6 +4121,12 @@ class ProcessGraph:
                     yield qualified, definition
 
         parameter_records = tuple(source_parameter_records or ())
+        latent_dependency_seed_definitions = tuple(
+            member
+            for owner in record_definitions
+            for member in owner.body
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
         dependency_seed_definitions = []
         record_class_page = current_identity_book().page(
             "source_record_class_concordance"
@@ -4094,7 +4156,7 @@ class ProcessGraph:
                 ]
                 # Follow only same-owner method edges here. The class graph
                 # owns those calls physically; this traversal merely finds
-                # each reachable method's lexical free-function seeds.
+                # each reachable method's module-level source dependencies.
                 pending = list(selected)
                 seen_methods = set()
                 while pending:
@@ -4151,9 +4213,19 @@ class ProcessGraph:
                     package=getattr(self, "python_package", None),
                     include=parent_include,
                     pursuit_roots=pursuit_roots,
-                    dependency_seed_definitions=tuple(dict.fromkeys(
-                        dependency_seed_definitions
-                    )),
+                    dependency_seed_definitions=tuple(
+                        definition
+                        for index, definition
+                        in enumerate(dependency_seed_definitions)
+                        if all(
+                            definition is not prior
+                            for prior
+                            in dependency_seed_definitions[:index]
+                        )
+                    ),
+                    latent_dependency_seed_definitions=(
+                        latent_dependency_seed_definitions
+                    ),
                     tensor_code_references=tensor_code_references,
                     source_ast_normalizers=source_ast_normalizers,
                     profile_verbose=profile_verbose,
