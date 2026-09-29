@@ -102,6 +102,47 @@ def column_names_of(pieces):
     return tuple(names)
 
 
+#: The API every piece the dt system drives must present.  ``instantiate``
+#: is part of it: the containing system instantiates a piece once, against
+#: the exact spans it will hand it every round, before it ever calls it.
+PIECE_API = (
+    "entry", "argument_names", "output_names", "batch", "instantiate", "__call__",
+)
+#: ``contract`` (BIND/HOLD/DILATE/SUBCYCLE) stays optional: the dt system reads
+#: it with a default, and its absence is itself the statement "no bound".
+
+
+def require_piece(item, where):
+    """Admit ``item`` as a piece or say exactly what it lacks.
+
+    The dt system's interactions with a piece are fixed: instantiate once
+    (``instantiate(columns)``, columns by argument name -- the spans the piece
+    is handed every round), then call it per round with those spans.  A
+    participant that cannot be instantiated is not a piece here, and the
+    refusal names the missing member rather than a later AttributeError.
+    """
+
+    missing = [name for name in PIECE_API if not hasattr(item, name)]
+    if missing:
+        raise TypeError(
+            f"{where}: {type(item).__name__} is not a dt-system piece; it lacks "
+            f"{', '.join(missing)} (the piece API is {', '.join(PIECE_API)})")
+    return item
+
+
+def instantiate_pieces(pieces, state):
+    """The cascade: ask every piece to instantiate against ``state``'s spans.
+
+    This is the one interaction that precedes every call.  Each piece is
+    handed, by argument name, the span object it will receive on each round;
+    what it prepares for its own lifetime (an artifact's public ABI, a nested
+    round's aliased state, a participant's own pieces) is its business.
+    """
+
+    for piece in pieces:
+        piece.instantiate({name: getattr(state, name) for name in piece.argument_names})
+
+
 def state_source(columns, participants=1):
     """Spell ``PieceState`` for these columns: one span field per column,
     the ``dt`` column the step fills, and the window's telemetry span.
@@ -390,9 +431,12 @@ def load_pieces(piece_files):
     declares ``argument_names``/``output_names``) is taken as it is."""
 
     return [
-        item if hasattr(item, "argument_names") and hasattr(item, "output_names")
-        else LLVMPiece.load(item)
-        for item in piece_files
+        require_piece(
+            item if hasattr(item, "argument_names") and hasattr(item, "output_names")
+            else LLVMPiece.load(item),
+            f"load_pieces[{index}]",
+        )
+        for index, item in enumerate(piece_files)
     ]
 
 
@@ -533,6 +577,10 @@ class Subcycle:
         )
         self.state.participants = participant_registry(self.pieces)
         configure_publication_limits(self.state, self.targets)
+        # An independent participant owns its state (it reads the consulting
+        # system lagged, on its own thread), so its pieces instantiate against
+        # its own spans: the same cascade, one level over.
+        instantiate_pieces(self.pieces, self.state)
         self._outbox = {name: getattr(self.state, name).copy() for name in self.owned}
         self._stamp = 0.0
 
@@ -788,11 +836,31 @@ class RoundPiece:
         #: time velocity of the last window: advanced / asked (1.0 when landed)
         self.tau = 1.0
 
+    def instantiate(self, columns):
+        """The nested round's instantiation, from its parent's.
+
+        The columns a nested round advances are its parent's columns: it lands
+        the parent's window over a subset of the parent's state.  So its own
+        state adopts the parent's spans for every column it is handed --
+        views, not copies -- and its rollback (``copy_shallow``/``restore``)
+        then checkpoints and restores exactly those spans, which is the
+        dt_graph rule for a nested round that cannot land.  Then the cascade
+        continues: its pieces instantiate against its (now aliased) state.
+        """
+
+        for name in self.names:
+            if name in columns:
+                setattr(self.state, name, columns[name])
+        instantiate_pieces(self.pieces, self.state)
+
     def __call__(self, *columns):
         *values, dt = columns
         window = float(np.asarray(dt).reshape(-1)[0])
         for name, value in zip(self.names, values):
-            getattr(self.state, name)[...] = value
+            span = getattr(self.state, name)
+            if value is span:
+                continue        # instantiated: the parent's span is ours
+            span[...] = value
         advanced, self.dt_inner, metrics = run_superstep(
             self.state, window, self.dt_inner, self.dx, self.targets,
             self.controller, self._advance)
@@ -823,10 +891,7 @@ def interpret_round(node, *, wrap=None):
         if isinstance(child, RoundNode):
             pieces.append(RoundPiece(child, wrap=wrap))
         elif isinstance(child, AdvanceNode):
-            piece = child.state.state
-            if not (hasattr(piece, "argument_names") and hasattr(piece, "output_names")):
-                raise TypeError(f"AdvanceNode {child.label!r} does not hold a piece")
-            pieces.append(piece)
+            pieces.append(require_piece(child.state.state, f"AdvanceNode {child.label!r}"))
         else:
             raise TypeError(f"RoundNode {node.label!r}: unknown child {type(child).__name__}")
     if not pieces:
@@ -866,18 +931,17 @@ def instantiate_state(pieces, columns, *, targets, schedule="sequential",
     # measured velocities folded in after every window.  Information only.
     state.time_velocity = TimeVelocityRecord(scope, pieces, tuple(subcycles))
     # What this state was spelled for; a later round over other pieces is a
-    # different state, not a rebinding of this one.
+    # different state, not a rebinding of this one.  The state owns the
+    # instantiated pieces themselves: a later round runs these, not a fresh
+    # interpretation of the same graph (a nested round re-interpreted would be
+    # a new, uninstantiated participant every call).
     state.bound_pieces = (tuple(names), str(schedule))
+    state.pieces = pieces
     configure_publication_limits(state, targets)
-    # Instantiation cascades: the containing system asks each participant to
+    # Instantiation cascades: the containing system asks each piece to
     # instantiate against the spans it will be handed every round, so a piece
     # prepares its own lifetime-scoped storage once here and only runs later.
-    # A participant without the hook is left as it is.
-    for piece in pieces:
-        hook = getattr(piece, "instantiate", None)
-        if hook is None:
-            continue
-        hook({name: getattr(state, name) for name in piece.argument_names})
+    instantiate_pieces(pieces, state)
     return state
 
 
@@ -957,6 +1021,9 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
                 "persistent dt state was instantiated for pieces "
                 f"{bound!r}, not {(tuple(names), str(schedule))!r}; a round "
                 "over other pieces needs its own state")
+        # The instantiated participants are the state's; the ones offered on
+        # this call only had to spell the same columns.
+        pieces = state.pieces
         for name in names:
             span = getattr(state, name)
             value = columns[name]
