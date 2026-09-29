@@ -39860,6 +39860,7 @@ def _class_surface_ssa_program(
             )
 
     report("final repository module assembly and aggregate legalization start")
+    layout_type_tables = getattr(compilation, "layout_type_tables", None)
     lowered_module = IRModule(
             all_functions,
             **(
@@ -39867,6 +39868,13 @@ def _class_surface_ssa_program(
                 if source_function_table is not None else {}
             ),
             **({"class_table": class_table} if class_table is not None else {}),
+            **(
+                {
+                    "struct_table": layout_type_tables[0],
+                    "union_table": layout_type_tables[1],
+                }
+                if layout_type_tables is not None else {}
+            ),
             tensor_tables=all_tensor_tables,
             sequence_tables=all_sequence_tables,
             record_tables=all_record_tables,
@@ -41617,6 +41625,7 @@ def _lower_resolved_process_graph_deployment(
         deployment=deployment,
         class_navigation=build_class_navigation_table(graph),
         assignment_normalization=tuple(assignment_normalization),
+        layout_type_tables=graph.G.graph.get("layout_type_tables"),
     )
     report("ssa-source: lowering full planned source to repository SSA")
     artifact_name = _identifier(str(name or entrypoint or "whole_source"))
@@ -43133,6 +43142,37 @@ def _lower_ast_source_to_ssa_impl(
             for prior in source_record_candidates[:index]
         )
     )
+    # Laid-out types.  A ``ctypes.Structure`` / ``ctypes.Union`` class bound by
+    # name is read from the LIVE class -- ctypes already computed its size,
+    # alignment and member offsets for the eager program -- into struct and
+    # union rows on the identity book, counted in the one schema Python
+    # delivers (the host's).  Nothing here parses ``_fields_`` or applies a
+    # layout rule.  The tables travel on the graph's own fact store to module
+    # assembly, exactly as ``class_table`` does.
+    from ..transmogrifier.ctypes_layout import CTypesInterception
+    from ..transmogrifier.ssa import new_layout_tables
+    from .monotonic_ids import GLOBAL_MONOTONIC_IDS
+
+    layout_type_classes = tuple(dict.fromkeys(
+        value
+        for value in (python_bindings or {}).values()
+        if CTypesInterception.is_layout_type(value)
+    ))
+    if layout_type_classes:
+        layout_struct_table, layout_union_table = new_layout_tables()
+        layout_interception = CTypesInterception(
+            layout_struct_table, layout_union_table,
+            GLOBAL_MONOTONIC_IDS.mint,
+        )
+        for layout_type in layout_type_classes:
+            layout_interception.intercept(layout_type)
+        graph.G.graph["layout_type_tables"] = (
+            layout_struct_table, layout_union_table,
+        )
+        report(
+            f"ssa-source: intercepted {len(layout_type_classes)} laid-out "
+            f"type(s) into struct/union rows"
+        )
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(
             tree,

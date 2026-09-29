@@ -367,6 +367,25 @@ def _mint_table_owner(book: Any, label: Any) -> tuple[str, int]:
     return book.mint_scope(label or "table")
 
 
+def new_layout_tables() -> "tuple[SSAStructTable, SSAUnionTable]":
+    """A struct table and a union table sharing one book scope.
+
+    The two tables correlate through their member pages (a union embeds
+    structs), so they must share a scope.  A frontend that meets its layout
+    types before any module exists publishes them into this pair; the module
+    assembled later is handed the same pair, not a copy.
+    """
+
+    from ..compiler.identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    owner = _mint_table_owner(book, "module")
+    return (
+        SSAStructTable(owner=owner, book=book),
+        SSAUnionTable(owner=owner, book=book),
+    )
+
+
 class _BookRows(__import__("collections.abc").abc.MutableMapping):
     """One SSA table's id -> descriptor storage, as rows of a book page.
 
