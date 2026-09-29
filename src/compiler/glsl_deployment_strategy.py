@@ -18372,28 +18372,66 @@ def _tensor_descriptor_rule(
                 tensor["python_type"] = str(boundary["python_type"])
     if "shape" not in tensor:
         operation = descriptor_operation
-        if collection_loop_result:
-            attributes = data.get("attributes") or {}
-            element_sources = tuple(
-                int(parent)
-                for parent, role in data.get("parents") or ()
-                if str(role).casefold() == "value"
-                and int(parent) in graph.G
-            )
-            declared_element_source = attributes.get("value_source_id")
-            if declared_element_source is not None:
-                declared_element_source = int(declared_element_source)
-                if (
-                    element_sources
-                    and element_sources != (declared_element_source,)
-                ):
-                    raise ValueError(
-                        "collection LoopResult value-source identity conflicts "
-                        "with its semantic edge: "
-                        f"declared={declared_element_source}, "
-                        f"edges={element_sources!r}"
+        collection_expression = data.get("expr_obj")
+        uncomposed_comprehension = bool(
+            not collection_loop_result
+            and isinstance(collection_expression, (
+                ast.ListComp, ast.SetComp, ast.GeneratorExp,
+            ))
+        )
+        if collection_loop_result or uncomposed_comprehension:
+            # One collection law for one value: the comprehension node
+            # before loop composition and its collection LoopResult port
+            # after it describe the same sequence.  The port names its
+            # element/iterable/materializer by declared attributes; the
+            # comprehension by its own ``elt`` -> ``generators`` -> ``iter``
+            # edges.  Describing only the port left every query issued
+            # before composition (call-site return specialization included)
+            # with no answer for the comprehension.
+            attributes = dict(data.get("attributes") or {})
+            if uncomposed_comprehension:
+                element_sources = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) == "elt" and int(parent) in graph.G
+                )
+                generator_nodes = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) == "generators" and int(parent) in graph.G
+                )
+                iterables = tuple(
+                    int(parent)
+                    for generator in generator_nodes
+                    for parent, role in (
+                        graph.G.nodes[generator].get("parents") or ()
                     )
-                element_sources = (declared_element_source,)
+                    if str(role) == "iter" and int(parent) in graph.G
+                )
+                if len(generator_nodes) == 1 and len(iterables) == 1:
+                    attributes["collection_iterable_value_id"] = iterables[0]
+                attributes["materializer_node_id"] = int(node_id)
+            else:
+                element_sources = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role).casefold() == "value"
+                    and int(parent) in graph.G
+                )
+                declared_element_source = attributes.get("value_source_id")
+                if declared_element_source is not None:
+                    declared_element_source = int(declared_element_source)
+                    if (
+                        element_sources
+                        and element_sources != (declared_element_source,)
+                    ):
+                        raise ValueError(
+                            "collection LoopResult value-source identity "
+                            "conflicts with its semantic edge: "
+                            f"declared={declared_element_source}, "
+                            f"edges={element_sources!r}"
+                        )
+                    element_sources = (declared_element_source,)
             element = None
             if len(element_sources) == 1:
                 element_node_id = int(element_sources[0])
