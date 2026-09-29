@@ -22952,6 +22952,7 @@ def _class_surface_ssa_program(
                     str, nested_field.get("token_vocabulary") or (),
                 ))
                 physical_ids = []
+                pooled_column_value = None
                 if nested_storage == "table" and row_handle_id is not None:
                     columns = tuple(
                         dict(column)
@@ -23239,11 +23240,17 @@ def _class_surface_ssa_program(
                     nested_storage = "reference"
                     nested_dtype = None
                     nested_rank = 0
-                if nested_storage == "scalar" and row_handle_id is not None:
+                if row_handle_id is not None and (
+                    nested_storage == "scalar"
+                    or (nested_storage == "span" and nested_shape is not None)
+                ):
                     # A field of a keyed value-record is a column selected by
                     # the row handle returned from the keyed lookup.  The row
                     # handle is the existing deterministic node identity; no
-                    # frame-local slot or renumbering is introduced here.
+                    # frame-local slot or renumbering is introduced here.  A
+                    # fixed-shape span leaf is the same column with one row
+                    # every ``prod(shape)`` elements; its row is a view, not
+                    # a load.
                     candidate_ids = tuple(map(int, candidates))
                     producers = {
                         int(instruction.res.id)
@@ -23273,7 +23280,10 @@ def _class_surface_ssa_program(
                                         f"{nested_path}.column"
                                     ),
                                     "program_abi_storage": "span",
-                                    "program_abi_rank": 1,
+                                    "program_abi_rank": 1 + (
+                                        len(nested_shape)
+                                        if nested_storage == "span" else 0
+                                    ),
                                     "program_abi_mutable": mutable,
                                     "program_abi_field_written": False,
                                     "program_abi_row_identity": (
@@ -23287,6 +23297,7 @@ def _class_surface_ssa_program(
                             pooled_scalar_columns[column_key] = column
                             function.args.append(column)
                             values[int(column.id)] = column
+                        pooled_column_value = column
                         row_handle = values.get(int(row_handle_id))
                         if row_handle is not None:
                             result_id = candidate_ids[0]
@@ -23306,14 +23317,21 @@ def _class_surface_ssa_program(
                                     None if nested_dtype is None
                                     else str(nested_dtype)
                                 ),
+                                shape=(
+                                    () if nested_storage == "scalar"
+                                    else tuple(nested_shape)
+                                ),
                                 accounting={
                                     "program_abi_record": schema_identity,
                                     "program_abi_parameter": str(
                                         parameter_name
                                     ),
                                     "program_abi_field": nested_path,
-                                    "program_abi_storage": "scalar",
-                                    "program_abi_rank": 0,
+                                    "program_abi_storage": nested_storage,
+                                    "program_abi_rank": (
+                                        0 if nested_storage == "scalar"
+                                        else len(nested_shape)
+                                    ),
                                     "program_abi_mutable": mutable,
                                     "program_abi_field_written": False,
                                     "program_abi_row_handle": int(
@@ -23324,27 +23342,69 @@ def _class_surface_ssa_program(
                                     ),
                                 },
                             )
-                            setup = [
-                                Instr(
-                                    "GetElementPtr", [column, row_handle],
-                                    pointer,
-                                    attributes={
-                                        "binding": (
-                                            "program_abi_record_column"
-                                        ),
-                                        "program_abi_field": nested_path,
-                                    },
-                                ),
-                                Instr(
-                                    "Load", [pointer], result,
-                                    attributes={
-                                        "binding": (
-                                            "program_abi_record_field"
-                                        ),
-                                        "program_abi_field": nested_path,
-                                    },
-                                ),
-                            ]
+                            if nested_storage == "scalar":
+                                setup = [
+                                    Instr(
+                                        "GetElementPtr", [column, row_handle],
+                                        pointer,
+                                        attributes={
+                                            "binding": (
+                                                "program_abi_record_column"
+                                            ),
+                                            "program_abi_field": nested_path,
+                                        },
+                                    ),
+                                    Instr(
+                                        "Load", [pointer], result,
+                                        attributes={
+                                            "binding": (
+                                                "program_abi_record_field"
+                                            ),
+                                            "program_abi_field": nested_path,
+                                        },
+                                    ),
+                                ]
+                            else:
+                                row_extent = 1
+                                for extent in nested_shape:
+                                    row_extent *= int(extent)
+                                row_stride = SSAValue(
+                                    GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+                                )
+                                row_offset = SSAValue(
+                                    GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+                                )
+                                setup = [
+                                    Instr(
+                                        "Const", [], row_stride,
+                                        attributes={
+                                            "value": int(row_extent),
+                                            "program_abi_row_stride": (
+                                                nested_path
+                                            ),
+                                        },
+                                    ),
+                                    Instr(
+                                        "Mul", [row_handle, row_stride],
+                                        row_offset,
+                                        attributes={
+                                            "binding": (
+                                                "program_abi_record_row"
+                                            ),
+                                            "program_abi_field": nested_path,
+                                        },
+                                    ),
+                                    Instr(
+                                        "GetElementPtr", [column, row_offset],
+                                        result,
+                                        attributes={
+                                            "binding": (
+                                                "program_abi_record_column"
+                                            ),
+                                            "program_abi_field": nested_path,
+                                        },
+                                    ),
+                                ]
                             predicate_ids: set[int] = set()
                             if token_vocabulary:
                                 aliases = set(candidate_ids)
@@ -23550,10 +23610,160 @@ def _class_surface_ssa_program(
                     ),
                     writable=mutable,
                 ))
+                if pooled_column_value is not None:
+                    # The pooled column is the row field's storage.  Naming
+                    # it as a member of this row record, under the leaf's own
+                    # storage identity, is what lets the frame linker bind it
+                    # to the caller's resident column for the same leaf.
+                    nested_fields.append(SSARecordFieldDescriptor(
+                        f"{nested_name}.column",
+                        SSARecordFieldStorage.SPAN,
+                        storage_identity=f"{schema_identity}.{nested_name}",
+                        value_ids=(int(pooled_column_value.id),),
+                        dtype=(
+                            None if nested_dtype is None
+                            else str(nested_dtype)
+                        ),
+                        writable=mutable,
+                    ))
             if nested_fields and descriptor_id not in table.records:
                 table.register(SSARecordDescriptor(
                     int(descriptor_id), schema_identity, tuple(nested_fields),
                 ))
+
+        def materialize_declared_row_columns(
+            schema_name: str,
+            parameter_name: str,
+            field_path: str,
+            row_count: int | None,
+            active: tuple[str, ...] = (),
+        ) -> int | None:
+            """Own the rows of a declared keyed field where nothing indexes it.
+
+            A function that binds the ProgramABI record but never indexes the
+            mapping (``world.step(...)``) still owns the rows' storage: its
+            callees address each row's fixed-shape leaf as one span per
+            ``(value record, leaf)`` -- ``<field>[].<leaf>.column`` -- selected
+            by the row handle.  Mint exactly those residents here from the
+            declaration, so the callee columns bind to them instead of being
+            leased as anonymous frame storage.  The row record is registered
+            like an indexed row's, and the fact is written to the book.
+            Nested records recurse; other leaf kinds are reported, not
+            silently dropped.
+            """
+
+            if schema_name in active:
+                raise ValueError(
+                    "cyclic nested program ABI record "
+                    f"{' -> '.join((*active, schema_name))}"
+                )
+            try:
+                schema = dict(abi_records[str(schema_name)])
+            except KeyError as error:
+                raise ValueError(
+                    f"unknown nested program ABI record {schema_name!r}"
+                ) from error
+            schema_identity = str(schema.get("identity") or schema_name)
+            row_fields: list[SSARecordFieldDescriptor] = []
+            deferred: list[tuple[str, str]] = []
+            for leaf_name, leaf_field in dict(schema.get("fields") or {}).items():
+                leaf_field = dict(leaf_field)
+                leaf_storage = str(leaf_field.get("storage") or "")
+                leaf_path = f"{field_path}.{leaf_name}"
+                if leaf_storage == "record":
+                    child_schema = str(leaf_field.get("record") or "")
+                    child_id = materialize_declared_row_columns(
+                        child_schema, parameter_name, leaf_path, row_count,
+                        (*active, schema_name),
+                    )
+                    if child_id is not None:
+                        child_receipt = dict(abi_records[child_schema])
+                        row_fields.append(SSARecordFieldDescriptor(
+                            str(leaf_name),
+                            SSARecordFieldStorage.RECORD,
+                            storage_identity=f"{schema_identity}.{leaf_name}",
+                            value_ids=(),
+                            record_id=child_id,
+                            dtype=str(
+                                child_receipt.get("identity") or child_schema
+                            ),
+                            writable=False,
+                        ))
+                    continue
+                leaf_shape = (
+                    None if leaf_field.get("shape") is None
+                    else tuple(map(int, leaf_field["shape"]))
+                )
+                if (
+                    leaf_shape is None
+                    and leaf_storage == "span"
+                    and leaf_field.get("fixed_length") is not None
+                ):
+                    leaf_shape = (int(leaf_field["fixed_length"]),)
+                if leaf_storage == "scalar":
+                    leaf_shape = ()
+                if leaf_storage not in {"scalar", "span"} or leaf_shape is None:
+                    deferred.append((leaf_path, leaf_storage))
+                    continue
+                leaf_dtype = str(leaf_field.get("dtype") or "float64")
+                leaf_mutable = bool(leaf_field.get("mutable", False))
+                column = SSAValue(
+                    GLOBAL_MONOTONIC_IDS.mint(),
+                    dtype=leaf_dtype,
+                    shape=(
+                        () if row_count is None
+                        else (int(row_count), *leaf_shape)
+                    ),
+                    accounting={
+                        "program_abi_record": schema_identity,
+                        "program_abi_parameter": str(parameter_name),
+                        "program_abi_field": f"{leaf_path}.column",
+                        "program_abi_storage": "span",
+                        "program_abi_rank": 1 + len(leaf_shape),
+                        "program_abi_mutable": leaf_mutable,
+                        "program_abi_field_written": False,
+                        "program_abi_row_identity": (
+                            "deterministic_graph_node_id"
+                        ),
+                        "program_abi_token_vocabulary": tuple(map(
+                            str, leaf_field.get("token_vocabulary") or (),
+                        )),
+                        "program_abi_declared_row_column": True,
+                        "physical_dtype": leaf_dtype,
+                        "physical_dtype_provenance": (
+                            "program_abi_declared_row_column"
+                        ),
+                        "physical_dtype_tie_policy": "incumbent",
+                    },
+                )
+                function.args.append(column)
+                values[int(column.id)] = column
+                row_fields.append(SSARecordFieldDescriptor(
+                    str(leaf_name),
+                    SSARecordFieldStorage.SPAN,
+                    storage_identity=f"{schema_identity}.{leaf_name}",
+                    value_ids=(int(column.id),),
+                    dtype=leaf_dtype,
+                    writable=leaf_mutable,
+                ))
+            for leaf_path, leaf_storage in deferred:
+                current_identity_book().page(
+                    "numeral_leaf_materialization_concordance"
+                ).concord(
+                    (str(symbol), str(parameter_name), leaf_path),
+                    f"declared_row_leaf_deferred:{leaf_storage}",
+                )
+                report(
+                    f"record abi: {symbol}: declared row leaf {leaf_path} "
+                    f"({leaf_storage}) has no row-pooled resident yet"
+                )
+            if not row_fields:
+                return None
+            row_record_id = GLOBAL_MONOTONIC_IDS.mint()
+            table.register(SSARecordDescriptor(
+                int(row_record_id), schema_identity, tuple(row_fields),
+            ))
+            return int(row_record_id)
 
         for parameter_name, record in declared_records.items():
             parameter_key = (str(symbol), str(parameter_name))
@@ -23964,6 +24174,13 @@ def _class_surface_ssa_program(
                         part_value = SSAValue(
                             part_id,
                             dtype=part_dtype,
+                            # The declared entry count is the exact extent of
+                            # the keys and values vectors.
+                            shape=(
+                                tuple(map(int, field["shape"]))
+                                if part_rank == 1 and field.get("shape")
+                                else ()
+                            ),
                             accounting={
                                 "program_abi_record": str(record["identity"]),
                                 "program_abi_parameter": str(parameter_name),
@@ -24024,12 +24241,66 @@ def _class_surface_ssa_program(
                             "program_abi_value_identity": value_identity,
                         }
                     if value_record is not None:
-                        for row_id in indexed_value_candidates(set(candidate_ids)):
+                        value_identity_text = str(
+                            dict(abi_records.get(str(value_record)) or {})
+                            .get("identity") or value_record
+                        )
+                        rows_storage_identity = (
+                            f"{record['identity']}.{field_name}[]"
+                        )
+                        row_ids = indexed_value_candidates(set(candidate_ids))
+                        for row_id in row_ids:
                             materialize_nested_record(
                                 str(value_record), {int(row_id)}, int(row_id),
                                 str(parameter_name), f"{field_name}[]",
                                 row_handle_id=int(row_id),
                             )
+                            if int(row_id) in table.records:
+                                # The rows of this keyed field are one nested
+                                # record of the parent on every frame; naming
+                                # them as such lets call linking pair a
+                                # callee's indexed row with the caller's
+                                # resident rows by storage identity.
+                                fields.append(SSARecordFieldDescriptor(
+                                    f"{field_name}[]#{int(row_id)}",
+                                    SSARecordFieldStorage.RECORD,
+                                    storage_identity=rows_storage_identity,
+                                    value_ids=(),
+                                    record_id=int(row_id),
+                                    dtype=value_identity_text,
+                                    writable=False,
+                                ))
+                        if not row_ids:
+                            # This function binds the record but does not
+                            # index the mapping.  It still owns the rows'
+                            # storage for every callee that does.
+                            declared_rows = (
+                                int(field["shape"][0])
+                                if field.get("shape") else None
+                            )
+                            row_record_id = materialize_declared_row_columns(
+                                str(value_record), str(parameter_name),
+                                f"{field_name}[]", declared_rows,
+                            )
+                            if row_record_id is not None:
+                                current_identity_book().page(
+                                    "program_abi_keyed_row_record"
+                                ).concord(
+                                    (
+                                        table.owner, int(record_id),
+                                        f"{record['identity']}.{field_name}",
+                                    ),
+                                    int(row_record_id),
+                                )
+                                fields.append(SSARecordFieldDescriptor(
+                                    f"{field_name}[]",
+                                    SSARecordFieldStorage.RECORD,
+                                    storage_identity=rows_storage_identity,
+                                    value_ids=(),
+                                    record_id=int(row_record_id),
+                                    dtype=value_identity_text,
+                                    writable=False,
+                                ))
                     continue
                 if storage == "table":
                     sequence_table = all_sequence_tables.setdefault(
