@@ -18130,8 +18130,27 @@ def _tensor_descriptor_rule(
             # just like a captured NumPy constant's ``shape``/``dtype`` above.
             # Publishing them here lets rank-changing views and the following
             # matmul inherit one concordance descriptor instead of collapsing
-            # the literal to an untyped structural aggregate.
-            literal_array = np.asarray(literal)
+            # the literal to an untyped structural aggregate.  Only a
+            # rectangular nest of numeric leaves is such a payload; a ragged
+            # or mixed tuple is ordinary Python structure, proven here from
+            # the literal itself rather than by asking NumPy to fail on it.
+            def rectangular_extents(value: Any) -> tuple[int, ...] | None:
+                if isinstance(value, (bool, int, float, complex)):
+                    return ()
+                if not isinstance(value, (list, tuple)) or not value:
+                    return None
+                members = tuple(rectangular_extents(item) for item in value)
+                if members[0] is None or any(
+                    member != members[0] for member in members
+                ):
+                    return None
+                return (len(value), *members[0])
+
+            literal_array = (
+                np.asarray(literal)
+                if rectangular_extents(literal) is not None
+                else np.asarray((), dtype=object)
+            )
             if (
                 literal_array.size
                 and literal_array.dtype.kind in {"b", "i", "u", "f", "c"}

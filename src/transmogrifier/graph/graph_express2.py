@@ -2362,6 +2362,50 @@ def _expand_unresolved_ast_parents(
         for member in ast.walk(definition):
             node_bindings[id(member)] = definition_bindings
 
+    static_table_lookups = []
+
+    def static_loop_target_callables(call, owner, call_bindings):
+        """Callables a loop-bound call name ranges over, when statically known.
+
+        ``call.func`` must be a Name bound as the target of the ``for`` or
+        comprehension that contains the call, and that loop's iterable must
+        resolve in ``call_bindings`` to a tuple/list whose every element is a
+        plain callable.  Anything less proves nothing and returns ``()``.
+        """
+
+        if not isinstance(call.func, ast.Name):
+            return ()
+        name = call.func.id
+        scope = owner or module
+        for loop in ast.walk(scope):
+            if isinstance(loop, (
+                ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp,
+            )):
+                generators = loop.generators
+            elif isinstance(loop, (ast.For, ast.AsyncFor)):
+                generators = (loop,)
+            else:
+                continue
+            for generator in generators:
+                target = generator.target
+                if not (isinstance(target, ast.Name) and target.id == name):
+                    continue
+                if not any(member is call for member in ast.walk(loop)):
+                    continue
+                table = _resolve_ast_parent_reference(
+                    generator.iter, call_bindings,
+                )
+                if (
+                    isinstance(table, (tuple, list))
+                    and table
+                    and all(
+                        inspect.isfunction(item) or inspect.isbuiltin(item)
+                        for item in table
+                    )
+                ):
+                    return tuple(table)
+        return ()
+
     def requeue_definition(definition):
         definition_id = id(definition)
         mark_source_pursuit_active(definition)
@@ -2475,6 +2519,25 @@ def _expand_unresolved_ast_parents(
             definition = lexical_definition(node, owner_definition)
             if definition is not None and id(definition) not in activated_definitions:
                 requeue_definition(definition)
+            for element in static_loop_target_callables(
+                node, owner_definition, call_bindings,
+            ):
+                # ``for f in TABLE: f()`` over a statically bound table calls
+                # each element.  Admit every element through the ordinary
+                # call path with a lookup occurrence that is only a worklist
+                # item (never inserted into the program, never in all_calls),
+                # like the dispatcher entry lookups above.
+                lookup = ast.copy_location(ast.Call(
+                    func=ast.Name(id=element.__name__, ctx=ast.Load()),
+                    args=[], keywords=[],
+                ), node)
+                static_table_lookups.append(lookup)
+                node_bindings[id(lookup)] = {
+                    **call_bindings, element.__name__: element,
+                }
+                call_owners[id(lookup)] = owner_definition
+                call_depths[id(lookup)] = call_depth
+                pending_calls.append(lookup)
             continue
         extraction_decision = (
             include.decide(identity_target)
