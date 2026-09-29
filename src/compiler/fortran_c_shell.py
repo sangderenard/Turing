@@ -36,6 +36,7 @@ import networkx as nx
 from ..common.tensors.accelerator_backends.profiled_c_shell import (
     _C_SOURCE, _C_TRACE_SOURCE,
 )
+from ..transmogrifier.dtype_layout import shell_numpy_dtype_table
 from ..transmogrifier.graph.edge_roles import (
     keyword_argument_name,
     ordered_arguments,
@@ -649,23 +650,11 @@ def _copy_literal_payload(payload: Any) -> Any:
         return payload
 
 
-_NUMPY_DTYPES = {
-    "uint8": np.dtype("uint8"),
-    "u8": np.dtype("uint8"),
-    "bool": np.dtype("bool"),
-    "logical": np.dtype("bool"),
-    "float": np.dtype("float32"),
-    "float32": np.dtype("float32"),
-    "f32": np.dtype("float32"),
-    "double": np.dtype("float64"),
-    "float64": np.dtype("float64"),
-    "f64": np.dtype("float64"),
-    "int": np.dtype("int32"),
-    "int32": np.dtype("int32"),
-    "i32": np.dtype("int32"),
-    "int64": np.dtype("int64"),
-    "i64": np.dtype("int64"),
-    "opaque_ref": np.dtype("int64"),
+# Declared by the dtype authority (transmogrifier.dtype_layout); this is its
+# C-shell vocabulary.  Looked up casefolded; an unknown name is ``None`` and
+# the shell raises on it.
+_NUMPY_DTYPES: dict[str, np.dtype] = {
+    name: np.dtype(spelling) for name, spelling in shell_numpy_dtype_table().items()
 }
 
 

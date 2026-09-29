@@ -43,9 +43,10 @@ part of the record as the byte sizes):
 10. ``fused_program_wasm_backend._TYPES`` -> :func:`wasm_type_table`.
 11. ``ssa_javascript_backend._dtype_is_int64`` -> :func:`dtype_is_int64`.
 12. ``ssa_storage_requirements``'s default ``"float64"`` -> :data:`DEFAULT_DTYPE`.
-
-``fortran_c_shell._NUMPY_DTYPES`` (the numpy dtype table of the shell) is the
-same kind of copy and is left for a follow-up; it is not edited here.
+13. ``fortran_c_shell._NUMPY_DTYPES`` -> :func:`shell_numpy_dtype_table`,
+    :func:`shell_numpy_dtype` (numpy dtype spelling of the C shell's ABI
+    vocabulary; the shell casefolds the name; unknown -> ``None``, which the
+    shell raises on).
 
 This module imports nothing from the repository so that every lane can import
 it.  The nodus codes mirror ``NodusTensorDType`` in nodus' ``tensor_abi.h``
@@ -302,6 +303,18 @@ WASM_NAMES: tuple[str, ...] = (
 )
 _WASM_VOCABULARY = _check_vocabulary(frozenset(WASM_NAMES))
 
+#: ``fortran_c_shell._NUMPY_DTYPES`` keys (declaration order kept).  The same
+#: sixteen names as :data:`C_ABI_NAMES` in the shell's own order.
+SHELL_NUMPY_NAMES: tuple[str, ...] = (
+    "uint8", "u8",
+    "bool", "logical",
+    "float", "float32", "f32",
+    "double", "float64", "f64",
+    "int", "int32", "i32",
+    "int64", "i64", "opaque_ref",
+)
+_SHELL_NUMPY_VOCABULARY = _check_vocabulary(frozenset(SHELL_NUMPY_NAMES))
+
 for _name in LLVM_LANE_TYPES + C_LANE_STORAGE_CLASSES:
     if _name not in DTYPES:
         raise RuntimeError(f"dtype_layout: lane names undeclared dtype {_name!r}")
@@ -464,6 +477,31 @@ def dtype_is_int64(dtype: object) -> bool:
     return layout is not None and layout.kind in ("int", "uint") and layout.byte_size == 8
 
 
+# --------------------------------------------------------------------------
+# 13. fortran_c_shell._NUMPY_DTYPES
+# --------------------------------------------------------------------------
+
+def shell_numpy_dtype_table() -> dict[str, str]:
+    """``{dtype spelling: numpy dtype spelling}`` for the C shell's vocabulary.
+
+    Spellings, not ``numpy.dtype`` objects: this module imports nothing.  The
+    shell wraps each value in ``numpy.dtype`` itself.
+    """
+
+    return {name: str(layout_for(name).numpy_dtype) for name in SHELL_NUMPY_NAMES}
+
+
+def shell_numpy_dtype(dtype: object) -> str | None:
+    """numpy dtype spelling the C shell packs ``dtype`` as; unknown -> ``None``.
+
+    Casefolded (the shell's call site casefolds before the lookup).  ``None``
+    and the empty string are unknown, as they were in the table.
+    """
+
+    layout = _resolve_within(str(dtype).casefold(), _SHELL_NUMPY_VOCABULARY)
+    return None if layout is None else str(layout.numpy_dtype)
+
+
 __all__ = [
     "DEFAULT_DTYPE",
     "DTypeLayout",
@@ -480,6 +518,7 @@ __all__ = [
     "FORTRAN_NAMES",
     "BYTE_SIZE_NAMES",
     "WASM_NAMES",
+    "SHELL_NUMPY_NAMES",
     "c_abi_type_table",
     "c_abi_type",
     "c_lane_dtype_for_storage",
@@ -491,4 +530,6 @@ __all__ = [
     "dtype_byte_size",
     "wasm_type_table",
     "dtype_is_int64",
+    "shell_numpy_dtype_table",
+    "shell_numpy_dtype",
 ]
