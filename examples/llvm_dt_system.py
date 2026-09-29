@@ -965,6 +965,57 @@ def dt_system_from_graph(root, columns, *, rounds, subcycles=(), state=None):
                      dt_initial=float(root.plan.dt_init), state=state)
 
 
+def instantiate_system(root, columns, *, subcycles=()):
+    """Instantiate a dt system from its ``dt_graph.RoundNode`` tree, once.
+
+    The graph is interpreted once, the state made once, and the cascade
+    instantiates every piece.  The state then carries what the engine
+    formerly rebuilt or tracked on every step: the graph's controller,
+    targets and ``dx``, its schedule and scope, its default window
+    (``plan.round_max``) and first attempt (``plan.dt_init``), and the
+    controller's continuation ``dt_next`` -- the first attempt of the next
+    round, which is the dt system's own business, not the engine's.
+    """
+
+    pieces, schedule = interpret_round(root)
+    control = root.controller
+    state = instantiate_state(
+        pieces, columns, targets=control.targets, schedule=schedule,
+        scope=str(root.label), subcycles=subcycles)
+    state.controller = control.ctrl
+    state.targets = control.targets
+    state.dx = float(control.dx)
+    state.scope = str(root.label)
+    state.round_window = float(root.plan.round_max)
+    state.dt_init = float(root.plan.dt_init)
+    state.dt_next = None
+    return state
+
+
+def advance_round(state, window=None, *, subcycles=()):
+    """One round of an instantiated system over its own spans.
+
+    ``window`` is the world time the containing system asks this round to
+    land (default: the graph's ``round_max``).  The first attempt is the
+    continuation the controller left after the previous round, clipped to
+    the window; the round's result becomes the next continuation.  Returns
+    ``(advanced, dt_next, telemetry)`` as ``dt_system`` reports one round.
+    """
+
+    window = state.round_window if window is None else float(window)
+    carried = state.dt_init if state.dt_next is None else float(state.dt_next)
+    initial = min(window, carried)
+    names, schedule = state.bound_pieces
+    _state, _controller, results = dt_system(
+        state.pieces, {name: getattr(state, name) for name in names},
+        rounds=1, round_dt=window, dx=state.dx, targets=state.targets,
+        controller=state.controller, subcycles=subcycles, scope=state.scope,
+        schedule=schedule, dt_initial=initial, state=state)
+    advanced, dt_next, telemetry = results[0]
+    state.dt_next = float(dt_next)
+    return advanced, dt_next, telemetry
+
+
 def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, controller=None,
               subcycles=(), scope="lockstep", schedule="sequential", dt_initial=None,
               state=None):
