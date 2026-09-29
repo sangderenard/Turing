@@ -77,10 +77,17 @@ C_BACKEND = "c"
 LLVM_BACKEND = "llvm"
 FORTRAN_BACKEND = "fortran"
 
+#: ``residual`` is a law's convergence measure (a fixed-point cycle's iterate
+#: change, a constraint solve's violation), reduced by max like the error
+#: measures; ``Metrics`` has no slot for it, so the step publishes it on
+#: ``state.telemetry`` itself (see ``piece_source``).
 METRIC_FIELDS = ("max_vel", "max_flux", "div_inf", "mass_err", "dt_limit",
-                 "energy_j", "power_w", "exchangeable_energy_j")
+                 "energy_j", "power_w", "exchangeable_energy_j", "residual")
+#: Positional: ``publish_window`` writes 0..8 after the window; ``residual``
+#: (appended, index 9) is written by ``advance_pieces`` every attempt.  Read
+#: by name (``TELEMETRY_FIELDS.index``), never by a literal elsewhere.
 TELEMETRY_FIELDS = ("advanced", "dt_next", "max_vel", "max_flux", "div_inf",
-                    "mass_err", "dt_limit", "hard_failure", "tau")
+                    "mass_err", "dt_limit", "hard_failure", "tau", "residual")
 #: The dt system's own per-participant publication spans (the controller reads these).
 PUBLICATION_FIELDS = ("pub_exchange_time", "pub_exchange_time_present", "pub_contract", "pub_dt_limit",
                       "pub_dt_limit_present")
@@ -309,7 +316,7 @@ def piece_source(pieces, schedule="sequential"):
     # it came from -- the rows do.
     lines.append("")
     lines.append("    # the amalgamated report; the rows above are the decision")
-    for name in ("max_vel", "max_flux", "div_inf", "mass_err"):
+    for name in ("max_vel", "max_flux", "div_inf", "mass_err", "residual"):
         terms = [f"m{index}_{name}" for index, piece in enumerate(pieces)
                  if name in set(piece.output_names)]
         lines.append(f"    {name} = " + fold("max", terms, "0.0"))
@@ -320,6 +327,11 @@ def piece_source(pieces, schedule="sequential"):
         terms = " + ".join(f"m{index}_{name}" for index, piece in enumerate(pieces)
                            if name in set(piece.output_names))
         lines.append(f"    {name} = {terms or '0.0'}")
+    # ``residual`` has no ``Metrics`` slot and is no dt channel: the step
+    # publishes the amalgamated maximum on its own telemetry slot, every
+    # attempt (0.0 when no law publishes one), so the last attempt's stands
+    # beside the ``metrics`` that ``run_superstep`` returns for it.
+    lines.append(f"    state.telemetry[{TELEMETRY_FIELDS.index('residual')}] = residual")
     lines.append("    metrics = Metrics(")
     lines.append("        max_vel=max_vel, max_flux=max_flux, div_inf=div_inf,")
     lines.append("        mass_err=mass_err, dt_limit=dt_limit,")
@@ -398,10 +410,21 @@ def dt_system_over(state, targets, controller, round_dt, dt_initial, dx):
     """One round of the dt system over the bound pieces: the function that
     lowers, shaped exactly like the tire's ``balloon_tire_managed_window``.
     The caller owns ``state``/``targets``/``controller`` across rounds; the
-    round's results are published on ``state.telemetry``."""
+    round's results are published on ``state.telemetry``.
+
+    Rollback is the system's declared choice, carried on the state:
+    ``instantiate_system`` records the graph's ``SuperstepPlan.rollback``
+    (and its ``rollback_threshold_multiplier``) there, ``dt_system`` records
+    an explicit ``rollback=`` there, and this function only reads them.  A
+    state that declares nothing runs ``run_superstep``'s no-save, in-place,
+    no-retry lane (``rollback=False``), as this lane always did.  The
+    signature is fixed: it is the lowered unit's entry.
+    """
 
     advanced, dt_next, metrics = run_superstep(
-        state, round_dt, dt_initial, dx, targets, controller, advance_pieces)
+        state, round_dt, dt_initial, dx, targets, controller, advance_pieces,
+        rollback=state.rollback,
+        rollback_threshold_multiplier=state.rollback_threshold_multiplier)
     publish_window(state, advanced, dt_next, metrics, round_dt)
     return advanced, dt_next
 
@@ -413,6 +436,11 @@ def publish_window(state, advanced, dt_next, metrics, round_dt):
     time asked for.  It is 1.0 whenever the window landed, and less only when
     ``run_superstep`` stopped short (``max_iters`` exhausted); it is measured
     here and read by nothing that chooses dt.
+
+    ``residual`` (``TELEMETRY_FIELDS[9]``) is not written here: ``Metrics``
+    has no slot for it, so ``advance_pieces`` publishes the amalgamated
+    maximum on that slot every attempt, and the last attempt's value stands
+    with the ``metrics`` reported here.
     """
 
     state.telemetry[0] = advanced
@@ -863,7 +891,10 @@ class RoundPiece:
             span[...] = value
         advanced, self.dt_inner, metrics = run_superstep(
             self.state, window, self.dt_inner, self.dx, self.targets,
-            self.controller, self._advance)
+            self.controller, self._advance,
+            rollback=bool(self.node.plan.rollback),
+            rollback_threshold_multiplier=float(
+                self.node.plan.rollback_threshold_multiplier))
         publish_window(self.state, advanced, self.dt_inner, metrics, window)
         self.tau = float(advanced) / window if window > 0.0 else 1.0
         if abs(float(advanced) - window) > 1e-12 * max(1.0, window):
@@ -937,6 +968,13 @@ def instantiate_state(pieces, columns, *, targets, schedule="sequential",
     # a new, uninstantiated participant every call).
     state.bound_pieces = (tuple(names), str(schedule))
     state.pieces = pieces
+    # The rollback choice is the system's, declared once and read by
+    # ``dt_system_over`` every round.  Undeclared is ``run_superstep``'s
+    # no-save, in-place, no-retry lane, as this lane always ran;
+    # ``instantiate_system`` overwrites both from the graph's plan and
+    # ``dt_system(rollback=...)`` from an explicit request.
+    state.rollback = False
+    state.rollback_threshold_multiplier = 1.0
     configure_publication_limits(state, targets)
     # Instantiation cascades: the containing system asks each piece to
     # instantiate against the spans it will be handed every round, so a piece
@@ -972,9 +1010,11 @@ def instantiate_system(root, columns, *, subcycles=()):
     instantiates every piece.  The state then carries what the engine
     formerly rebuilt or tracked on every step: the graph's controller,
     targets and ``dx``, its schedule and scope, its default window
-    (``plan.round_max``) and first attempt (``plan.dt_init``), and the
-    controller's continuation ``dt_next`` -- the first attempt of the next
-    round, which is the dt system's own business, not the engine's.
+    (``plan.round_max``) and first attempt (``plan.dt_init``), the plan's
+    rollback choice (``plan.rollback``, ``plan.rollback_threshold_multiplier``
+    -- what ``dt_system_over`` hands ``run_superstep``), and the controller's
+    continuation ``dt_next`` -- the first attempt of the next round, which
+    is the dt system's own business, not the engine's.
     """
 
     pieces, schedule = interpret_round(root)
@@ -988,6 +1028,8 @@ def instantiate_system(root, columns, *, subcycles=()):
     state.scope = str(root.label)
     state.round_window = float(root.plan.round_max)
     state.dt_init = float(root.plan.dt_init)
+    state.rollback = bool(root.plan.rollback)
+    state.rollback_threshold_multiplier = float(root.plan.rollback_threshold_multiplier)
     state.dt_next = None
     return state
 
@@ -1018,9 +1060,15 @@ def advance_round(state, window=None, *, subcycles=()):
 
 def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, controller=None,
               subcycles=(), scope="lockstep", schedule="sequential", dt_initial=None,
-              state=None):
+              state=None, rollback=None):
     """Load the pieces from their files and run ``rounds`` rounds of the dt
     system over them in Python, the way the native unit will be driven.
+
+    ``rollback`` is ``run_superstep``'s save/restore/retry choice.  ``None``
+    (default) is the state's declared choice -- the graph plan's when the
+    state came from ``instantiate_system``, else ``False`` (no-save,
+    in-place, no-retry) as this lane always ran; ``True``/``False`` declares
+    it on the state, where ``dt_system_over`` reads it every round.
 
     ``subcycles`` are independent participants (``Subcycle``).  Each round
     the lockstep system consults them without waiting, reads their owned
@@ -1084,6 +1132,10 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
         # Targets may differ round to round; the limits they set are the
         # state's, rewritten in place.
         configure_publication_limits(state, targets)
+    if rollback is not None:
+        # An explicit request is declared on the state, where
+        # ``dt_system_over`` reads it; ``None`` leaves the state's own choice.
+        state.rollback = bool(rollback)
     ledger = state.wall_cost_ledger
     time_record = state.time_velocity
     for sub in subcycles:
@@ -1151,11 +1203,19 @@ def dt_system_contract(entry, columns, batch, participants=1):
         "storage": "span", "dtype": "float64", "rank": 1,
         "shape": [int(length)], "mutable": True,
     }
+    scalar = lambda dtype, python_type: {  # noqa: E731
+        "storage": "scalar", "dtype": dtype, "rank": 0, "mutable": False,
+        "python_type": python_type,
+    }
     records["PieceState"] = {
         "identity": "llvm_dt_system.PieceState",
         "fields": {
             **{name: span(batch) for name in (*columns, "dt")},
             "telemetry": span(len(TELEMETRY_FIELDS)),
+            # The system's declared rollback choice rides on the state, so the
+            # lowered round reads the same declared field the eager one does.
+            "rollback": scalar("bool", "builtins.bool"),
+            "rollback_threshold_multiplier": scalar("float64", "builtins.float"),
             **{name: span(participants) for name in (*PUBLICATION_FIELDS, *COURANT_FIELDS)},
             **{name: span(participants * len(DT_CHANNEL_NAMES)) for name in
                ("pub_values", "pub_present", "pub_limits", "pub_limits_present")},
