@@ -18089,52 +18089,6 @@ def _tensor_descriptor_rule(
         return None
     seen.add(int(node_id))
     data = graph.G.nodes[int(node_id)]
-    trace_function = str(graph.G.graph.get("function_name"))
-    trace_node = int(data.get("value_id", node_id))
-    if (
-        any(fragment in trace_function for fragment in {
-            "_resolve_pair", "_advance_newton", "edges_between", "step",
-        })
-        and trace_node in {
-            15, 18, 25, 28, 35, 36, 39, 41, 44, 47, 116, 137,
-            154, 162, 163, 169, 172, 174, 175,
-            186, 187, 188, 189, 261, 262, 263, 264,
-        }
-    ):
-        from .identity_concordance import current_identity_book
-
-        trace_page = current_identity_book().page(
-            "temporary_woodshop_descriptor_trace"
-        )
-        trace_fact = (
-                int(data.get("value_id", node_id)),
-                str(data.get("type") or ""),
-                str(data.get("op") or ""),
-                tuple((int(parent), str(role)) for parent, role in (
-                    data.get("parents") or ()
-                )),
-                tuple(sorted(
-                    (str(key), repr(value))
-                    for key, value in (data.get("attributes") or {}).items()
-                    if key in {
-                        "attribute", "binding_name", "result_kind",
-                        "collection_iterable_value_id", "materializer_node_id",
-                        "tensor", "tensor_candidate", "program_abi_field",
-                        "program_abi_record", "program_abi_rank",
-                        "program_abi_storage", "result_class_ref",
-                        "callee_ref", "method_ref", "value_source_id",
-                    }
-                )),
-                repr(data.get("tensor")),
-                repr(data.get("expr_obj")),
-            )
-        trace_row = (trace_function, int(node_id))
-        if trace_page.latest(trace_row) != trace_fact:
-            trace_page.set(
-                trace_row,
-                max(trace_page.columns, default=-1) + 1,
-                trace_fact,
-            )
     tensor = dict(data.get("tensor") or {})
 
     def authored_rectangular_shape(expression: ast.AST) -> tuple[int, ...] | None:

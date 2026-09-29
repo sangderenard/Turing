@@ -19,6 +19,7 @@ import os
 import sys
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import ast
 import inspect
@@ -5204,27 +5205,6 @@ def _graph_sequence_record_abi(graph_obj: Any) -> dict[object, Mapping[str, Any]
                 "mutable": False,
                 "program_abi_table_row": True,
             }
-    if (
-        os.environ.get("TURING_DEBUG_SEQUENCE_RECORD_ABI")
-        and any(fragment in str(
-            graph_obj.graph.get("function_name") or ""
-        ) for fragment in {"part_bounds_xyz", "edges_between"})
-    ):
-        for node_id, data in graph_obj.nodes(data=True):
-            attributes = data.get("attributes") or {}
-            operation = str(data.get("op") or data.get("type") or "")
-            if (
-                operation.casefold() in {"getattr", "indexed", "load", "for"}
-                or attributes.get("program_abi_record_identity") is not None
-                or attributes.get("program_abi_sequence_row_identity") is not None
-            ):
-                print(
-                    "DEBUG-SEQUENCE-ABI",
-                    graph_obj.graph.get("function_name"), node_id,
-                    data.get("value_id"), operation,
-                    attributes, data.get("parents"),
-                    file=sys.stderr, flush=True,
-                )
     for binding_name, annotation in dict(
         graph_obj.graph.get("type_annotations") or {}
     ).items():
