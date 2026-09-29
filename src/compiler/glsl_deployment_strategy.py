@@ -17780,9 +17780,13 @@ def _tensor_descriptor(
     row = None
     page = None
     try:
+        # The post-query block imports the same names locally, which makes
+        # them function locals throughout; bind them here, before first use.
         from .identity_concordance import (
             authored_function_name,
+            concordant_shape_transformation_state,
             current_identity_book,
+            descriptor_from_shape_transformation_state,
         )
 
         data = graph.G.nodes[int(node_id)] if int(node_id) in graph.G else {}
