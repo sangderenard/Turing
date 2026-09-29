@@ -1489,49 +1489,330 @@ def _walk_definitions_with_depth(node, depth=1):
             yield from _walk_definitions_with_depth(child, depth)
 
 
+class _ConsumedGeneratorBreakLowerer(ast.NodeTransformer):
+    """Relay breaks owned by one consumed generator across producer loops."""
+
+    def __init__(self, flag_name):
+        self.flag_name = str(flag_name)
+        self.replaced = 0
+
+    def visit_Break(self, node):
+        self.replaced += 1
+        mark = ast.copy_location(
+            ast.Assign(
+                targets=[ast.Name(id=self.flag_name, ctx=ast.Store())],
+                value=ast.Constant(value=True),
+            ),
+            node,
+        )
+        return [mark, node]
+
+    # A break below any nested loop belongs to that loop, not to the
+    # generator consumer being dissolved.  Nested definitions likewise own
+    # their control independently and are not part of this lexical rewrite.
+    def visit_For(self, node):
+        return node
+
+    def visit_AsyncFor(self, node):
+        return node
+
+    def visit_While(self, node):
+        return node
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
+        return node
+
+    def visit_ClassDef(self, node):
+        return node
+
+    def visit_Lambda(self, node):
+        return node
+
+
+def _generator_target_names(target):
+    if isinstance(target, ast.Name):
+        return (str(target.id),)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return tuple(
+            name
+            for element in target.elts
+            for name in _generator_target_names(element)
+        )
+    if isinstance(target, ast.Starred):
+        return _generator_target_names(target.value)
+    return ()
+
+
+class _GeneratorTargetRenamer(ast.NodeTransformer):
+    """Give one generator clause's bound names compiler-owned identities."""
+
+    def __init__(self, bindings):
+        self.bindings = tuple(bindings)
+
+    def visit_Name(self, node):
+        replacement = next((
+            renamed
+            for authored, renamed in reversed(self.bindings)
+            if authored == node.id
+        ), None)
+        if replacement is None:
+            return node
+        return ast.copy_location(
+            ast.Name(id=replacement, ctx=node.ctx), node,
+        )
+
+
+class _GeneratorExpressionRenamer(ast.NodeTransformer):
+    """Resolve generator-local loads without leaking their authored names."""
+
+    def __init__(self, bindings):
+        self.bindings = tuple(bindings)
+
+    def _without(self, names):
+        names = tuple(map(str, names))
+        return _GeneratorExpressionRenamer(tuple(
+            binding
+            for binding in self.bindings
+            if binding[0] not in names
+        ))
+
+    def visit_Name(self, node):
+        if not isinstance(node.ctx, ast.Load):
+            return node
+        replacement = next((
+            renamed
+            for authored, renamed in reversed(self.bindings)
+            if authored == node.id
+        ), None)
+        if replacement is None:
+            return node
+        return ast.copy_location(
+            ast.Name(id=replacement, ctx=node.ctx), node,
+        )
+
+    def visit_Lambda(self, node):
+        node.args.defaults = [
+            self.visit(value) for value in node.args.defaults
+        ]
+        node.args.kw_defaults = [
+            self.visit(value) if value is not None else None
+            for value in node.args.kw_defaults
+        ]
+        bound = tuple(
+            argument.arg
+            for argument in (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            )
+        ) + tuple(
+            argument.arg
+            for argument in (node.args.vararg, node.args.kwarg)
+            if argument is not None
+        )
+        node.body = self._without(bound).visit(node.body)
+        return node
+
+    def _visit_comprehension_expression(self, node):
+        active = self
+        for generator in node.generators:
+            generator.iter = active.visit(generator.iter)
+            shadowed = _generator_target_names(generator.target)
+            active = active._without(shadowed)
+            generator.ifs = [
+                active.visit(predicate) for predicate in generator.ifs
+            ]
+        if isinstance(node, ast.DictComp):
+            node.key = active.visit(node.key)
+            node.value = active.visit(node.value)
+        else:
+            node.elt = active.visit(node.elt)
+        return node
+
+    def visit_ListComp(self, node):
+        return self._visit_comprehension_expression(node)
+
+    def visit_SetComp(self, node):
+        return self._visit_comprehension_expression(node)
+
+    def visit_DictComp(self, node):
+        return self._visit_comprehension_expression(node)
+
+    def visit_GeneratorExp(self, node):
+        return self._visit_comprehension_expression(node)
+
+
 class _ConsumedGeneratorLoopLowerer(ast.NodeTransformer):
-    """Turn a directly consumed one-clause generator into ordinary control.
+    """Turn a directly consumed synchronous generator into ordinary control.
 
     ``for result in (expr for item in source if predicate): body`` has no
     need for a runtime generator object: its producer and consumer are one
-    lexical loop.  Preserve the filter as an ordinary ``if`` and the yielded
-    expression as an ordinary assignment, leaving all scheduling to the
-    existing retained-loop planner. Multi-clause generators remain explicit
-    until nested-loop break/else ownership is represented.
+    lexical control graph.  Every generator clause becomes one nested loop,
+    every clause filter guards the clauses beneath it, and the yielded
+    expression becomes the consumer-target assignment at the innermost
+    point.  This retains lazy left-to-right evaluation without publishing a
+    second physical collection.
+
+    A consumer-owned ``continue`` already advances the innermost producer,
+    which is exactly the next yielded value.  A consumer-owned ``break`` must
+    terminate every producer clause, so multi-clause generators receive one
+    compiler-owned relay flag.  Propagating that flag through the enclosing
+    producer loops also makes the outer loop's native ``else`` retain the
+    authored consumer-loop semantics.
     """
+
+    def __init__(self, reserved_names=()):
+        super().__init__()
+        self._reserved_names = set(map(str, reserved_names))
+        self._next_break_flag = 0
+        self._next_local_name = 0
+
+    def _break_flag(self):
+        while True:
+            candidate = (
+                "__turing_consumed_generator_break_"
+                f"{self._next_break_flag}"
+            )
+            self._next_break_flag += 1
+            if candidate not in self._reserved_names:
+                self._reserved_names.add(candidate)
+                return candidate
+
+    def _local_name(self, authored):
+        while True:
+            candidate = (
+                "__turing_generator_local_"
+                f"{self._next_local_name}_{authored}"
+            )
+            self._next_local_name += 1
+            if candidate not in self._reserved_names:
+                self._reserved_names.add(candidate)
+                return candidate
 
     def visit_For(self, node):
         node = self.generic_visit(node)
         iterator = node.iter
         if not (
             isinstance(iterator, ast.GeneratorExp)
-            and len(iterator.generators) == 1
-            and not iterator.generators[0].is_async
+            and iterator.generators
+            and not any(
+                generator.is_async for generator in iterator.generators
+            )
         ):
             return node
-        generator = iterator.generators[0]
+
+        bindings = ()
+        clauses = []
+        for generator in iterator.generators:
+            renamed_iter = _GeneratorExpressionRenamer(bindings).visit(
+                copy.deepcopy(generator.iter)
+            )
+            target_names = _generator_target_names(generator.target)
+            authored_names = tuple(
+                name
+                for index, name in enumerate(target_names)
+                if name not in target_names[:index]
+            )
+            clause_bindings = tuple(
+                (name, self._local_name(name)) for name in authored_names
+            )
+            renamed_target = _GeneratorTargetRenamer(
+                clause_bindings
+            ).visit(copy.deepcopy(generator.target))
+            bindings = (*bindings, *clause_bindings)
+            renamed_filters = tuple(
+                _GeneratorExpressionRenamer(bindings).visit(
+                    copy.deepcopy(predicate)
+                )
+                for predicate in generator.ifs
+            )
+            clauses.append((
+                renamed_target,
+                renamed_iter,
+                renamed_filters,
+            ))
+        renamed_element = _GeneratorExpressionRenamer(bindings).visit(
+            copy.deepcopy(iterator.elt)
+        )
+
         assignment = ast.copy_location(
-            ast.Assign(targets=[node.target], value=iterator.elt),
+            ast.Assign(targets=[node.target], value=renamed_element),
             iterator.elt,
         )
-        body = [assignment, *node.body]
-        for predicate in reversed(generator.ifs):
-            body = [ast.copy_location(
-                ast.If(test=predicate, body=body, orelse=[]),
-                predicate,
-            )]
-        lowered = ast.For(
-            target=generator.target,
-            iter=generator.iter,
-            body=body,
-            orelse=node.orelse,
-            type_comment=node.type_comment,
+        leaf_body = [assignment, *node.body]
+
+        break_flag = None
+        if len(clauses) > 1:
+            candidate = self._break_flag()
+            break_lowerer = _ConsumedGeneratorBreakLowerer(candidate)
+            lowered_leaf_body = []
+            for statement in leaf_body:
+                lowered = break_lowerer.visit(statement)
+                if isinstance(lowered, list):
+                    lowered_leaf_body.extend(lowered)
+                else:
+                    lowered_leaf_body.append(lowered)
+            leaf_body = lowered_leaf_body
+            if break_lowerer.replaced:
+                break_flag = candidate
+
+        def producer_clause(index):
+            target, iterable, predicates = clauses[index]
+            if index + 1 == len(clauses):
+                body = leaf_body
+            else:
+                child = producer_clause(index + 1)
+                body = [child]
+                if break_flag is not None:
+                    body.append(ast.copy_location(
+                        ast.If(
+                            test=ast.Name(
+                                id=break_flag, ctx=ast.Load(),
+                            ),
+                            body=[ast.Break()],
+                            orelse=[],
+                        ),
+                        node,
+                    ))
+            for predicate in reversed(predicates):
+                body = [ast.copy_location(
+                    ast.If(test=predicate, body=body, orelse=[]),
+                    predicate,
+                )]
+            return ast.copy_location(
+                ast.For(
+                    target=target,
+                    iter=iterable,
+                    body=body,
+                    orelse=(node.orelse if index == 0 else []),
+                    type_comment=(
+                        node.type_comment if index == 0 else None
+                    ),
+                ),
+                node,
+            )
+
+        lowered = producer_clause(0)
+        if break_flag is None:
+            return lowered
+        initialize = ast.copy_location(
+            ast.Assign(
+                targets=[ast.Name(id=break_flag, ctx=ast.Store())],
+                value=ast.Constant(value=False),
+            ),
+            node,
         )
-        return ast.copy_location(lowered, node)
+        return [initialize, lowered]
 
 
 def _lower_consumed_generator_loops(tree):
-    lowered = _ConsumedGeneratorLoopLowerer().visit(tree)
+    reserved_names = tuple(
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+    )
+    lowered = _ConsumedGeneratorLoopLowerer(reserved_names).visit(tree)
     ast.fix_missing_locations(lowered)
     return lowered
 

@@ -19,7 +19,10 @@ from src.compiler.identity_concordance import (
     end_identity_book,
 )
 from src.compiler.process_graph_fusion import extract_clean_process_subgraph
-from src.transmogrifier.graph.graph_express2 import ProcessGraph
+from src.transmogrifier.graph.graph_express2 import (
+    ProcessGraph,
+    _lower_consumed_generator_loops,
+)
 from src.transmogrifier.graph.node_special_cases import tensor_operation_name
 from src.transmogrifier.function_table import (
     ParameterAccess,
@@ -1172,6 +1175,89 @@ def calls(module):
     guard = loop.body[0]
     assert isinstance(guard, ast.If)
     assert isinstance(guard.body[0], ast.Assign)
+
+
+def test_direct_multiclause_generator_becomes_nested_loop_control():
+    graph = _ingest(
+        """
+def corners():
+    retained = []
+    for signs in (
+        (sx, sy, sz)
+        for sx in (-1, 1)
+        for sy in (-1, 1)
+        for sz in (-1, 1)
+    ):
+        retained.append(signs)
+    return retained
+""",
+        {},
+    )
+
+    assert not any(
+        isinstance(data.get("expr_obj"), (ast.GeneratorExp, ast.comprehension))
+        for _node_id, data in graph.G.nodes(data=True)
+    )
+    loops = tuple(
+        data["expr_obj"]
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    assert len(loops) == 3
+    target_names = tuple(
+        loop.target.id
+        for loop in loops
+        if isinstance(loop.target, ast.Name)
+    )
+    assert len(target_names) == 3
+    assert all(
+        name.startswith("__turing_generator_local_")
+        for name in target_names
+    )
+    assert not {"sx", "sy", "sz"}.intersection(target_names)
+
+
+def test_multiclause_generator_preserves_filter_break_continue_and_else():
+    source = """
+def visit(stop):
+    sx = "outer-sx"
+    retained = []
+    for signs in (
+        (sx, sy, sz)
+        for sx in (-1, 1)
+        if sx <= 1
+        for sy in (-1, 1)
+        for sz in (-1, 1)
+        if not (sx == -1 and sy == -1 and sz == -1)
+    ):
+        if signs == (-1, 1, -1):
+            continue
+        if signs == stop:
+            break
+        retained.append(signs)
+    else:
+        retained.append("exhausted")
+    retained.append(sx)
+    return retained
+"""
+    expected_namespace = {}
+    exec(compile(source, "<generator-baseline>", "exec"), expected_namespace)
+
+    lowered_tree = _lower_consumed_generator_loops(ast.parse(source))
+    assert not any(
+        isinstance(node, (ast.GeneratorExp, ast.comprehension))
+        for node in ast.walk(lowered_tree)
+    )
+    lowered_namespace = {}
+    exec(
+        compile(lowered_tree, "<generator-lowered>", "exec"),
+        lowered_namespace,
+    )
+
+    for stop in ((1, -1, 1), None):
+        assert lowered_namespace["visit"](stop) == (
+            expected_namespace["visit"](stop)
+        )
 
 
 def test_ingestion_keeps_each_definition_globals_lexically_scoped():

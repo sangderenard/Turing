@@ -37,6 +37,7 @@ from src.compiler.glsl_deployment_strategy import (
 from src.compiler.precompile_to_ssa import lower_control_sections_to_ssa
 from src.compiler.loop_ir import (
     IterableAccess,
+    IterableDomain,
     LoopStateEffect,
     LoopStateEffectMode,
 )
@@ -1796,6 +1797,36 @@ def test_generator_yield_is_planner_owned_backpressured_loop_output():
         if role == "value"
     )
     assert publication.value_id == payload_id
+
+
+def test_consumed_multiclause_generator_uses_nested_iterable_domains():
+    graph = _function_graph(
+        "def corners():\n"
+        "    out = []\n"
+        "    for signs in ((sx, sy, sz) for sx in (-1, 1) "
+        "for sy in (-1, 1) for sz in (-1, 1)):\n"
+        "        out.append(signs)\n"
+        "    return out\n",
+        "corners",
+    )
+
+    plans = _glsl_composer().compose(graph)
+    assert len(plans) == 3
+    assert all(
+        plan.semantic is not None
+        and isinstance(plan.semantic.domain, IterableDomain)
+        and plan.semantic.domain.access is not IterableAccess.GENERATOR
+        for plan in plans
+    )
+    reductions = analyze_shader_loop_reductions(
+        graph,
+        plans,
+        tuple(plan.loop.body_nodes for plan in plans),
+    )
+    assert all(
+        "iterable-access=generator" not in reduction.blockers
+        for reduction in reductions
+    )
 
 
 def test_generator_extend_routes_yields_and_filter_into_destination_insert():
