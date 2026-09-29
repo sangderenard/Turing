@@ -1594,6 +1594,7 @@ def materialize_retained_loop_ports(
             read = lexical_read_binding(graph.G, node_id, role, ordinal)
             return read is None or str(read) == str(binding)
 
+        rewired_reads: list[tuple[int, Any, int]] = []
         for node_id, data in graph.G.nodes(data=True):
             if int(node_id) in owned_nodes or int(node_id) == new_value_id:
                 continue
@@ -1609,6 +1610,11 @@ def materialize_retained_loop_ports(
             ):
                 # Every read of the old value here is another binding's.
                 continue
+            rewired_reads.extend(
+                (int(node_id), role, ordinal)
+                for role, ordinal in reads_old
+                if reads_binding(node_id, role, ordinal)
+            )
             data["parents"] = [
                 (
                     new_value_id
@@ -1631,6 +1637,29 @@ def materialize_retained_loop_ports(
             # effect-node edge while B's pending plan still said
             # state_input_id=8).
             _retarget_cached_value_ids(data, old_value_id, (new_value_id,))
+        if rewired_reads:
+            # The rewrite is a morph of each consumer's operand identity.
+            # Record it on the book, then withdraw what those consumers (and
+            # everything below them) derived from the superseded operand, so
+            # the next descriptor query derives from the continuation port
+            # instead of keeping an answer about the pre-loop value.
+            from .identity_concordance import current_identity_book
+            from .glsl_deployment_strategy import (
+                _invalidate_tensor_descriptor_dependents,
+            )
+
+            scope = graph.G.graph.get("function_name")
+            page = current_identity_book().page(
+                "loop_continuation_rewire_concordance"
+            )
+            for consumer, role, ordinal in rewired_reads:
+                page.revise(
+                    (scope, consumer, str(role), int(ordinal)),
+                    (int(old_value_id), int(new_value_id), binding),
+                )
+            _invalidate_tensor_descriptor_dependents(
+                graph, (int(new_value_id),), "loop-continuation-rewired",
+            )
         graph.roots = [
             new_value_id
             if int(root) == old_value_id
