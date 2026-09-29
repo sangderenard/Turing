@@ -161,6 +161,50 @@ class LLVMPiece:
     #: links the piece ingests this def for the call's signature and arity
     #: only; its body is never lowered again -- the link supplies the SSA.
     source: str | None = None
+    #: Runtime binding made by the instantiation hook: the prepared execution
+    #: and the exact spans it was prepared against.  Lives for the state's
+    #: lifetime, is never persisted, and is absent on a freshly loaded piece.
+    _execution: Any = field(default=None, repr=False, compare=False)
+    _bound: Any = field(default=None, repr=False, compare=False)
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_execution"] = None
+        state["_bound"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__dict__.setdefault("_execution", None)
+        self.__dict__.setdefault("_bound", None)
+
+    def instantiate(self, columns):
+        """The instantiation hook: prepare this piece once, against its spans.
+
+        ``columns`` maps each argument name to the span the containing system
+        will hand this piece every round.  The artifact's public ABI -- the
+        output buffers, the pointer table, the per-dtype scalar arena -- is
+        allocated here, once, with the inputs aliasing the given spans.  A
+        column that would have to be copied to become a contiguous float64
+        span is refused: aliasing is the point of instantiating, and a hidden
+        copy would be exactly the per-round marshalling this removes.
+        """
+        from .ssa_llvm_backend import prepare_artifact_execution
+
+        bound = []
+        for name in self.argument_names:
+            given = columns[name]
+            span = np.asarray(given, dtype=np.float64)
+            if span is not given or (span.ndim and not span.flags.c_contiguous):
+                raise TypeError(
+                    f"{self.artifact.name}: column {name!r} is not a contiguous "
+                    "float64 span; the piece cannot alias it")
+            bound.append(span)
+        self._execution = prepare_artifact_execution(self.artifact, {
+            value_id: span for value_id, span in zip(self.argument_ids, bound)
+        })
+        self._bound = tuple(bound)
+        return self._execution
 
     @classmethod
     def from_kernel(cls, kernel: LawKernel) -> "LLVMPiece":
@@ -194,10 +238,21 @@ class LLVMPiece:
             raise TypeError(
                 f"{self.artifact.name}: takes {len(self.argument_names)} "
                 f"columns, got {len(columns)}")
-        execution = prepare_artifact_execution(self.artifact, {
-            value_id: np.asarray(column, dtype=np.float64)
-            for value_id, column in zip(self.argument_ids, columns)
-        })
+        if self._execution is not None and all(
+            column is span for column, span in zip(columns, self._bound)
+        ):
+            # Instantiated against exactly these spans: the ABI is already
+            # bound, the round only runs.  The output buffers are the same
+            # arrays every call; the spelled step assigns them into the
+            # state's spans immediately.
+            execution = self._execution
+        else:
+            # Standalone use, or columns other than the instantiated spans:
+            # the historical per-call preparation.
+            execution = prepare_artifact_execution(self.artifact, {
+                value_id: np.asarray(column, dtype=np.float64)
+                for value_id, column in zip(self.argument_ids, columns)
+            })
         execution.run()
         return tuple(
             execution.buffers[self.output_ids[name]] if name in self.output_ids

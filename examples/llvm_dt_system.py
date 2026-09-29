@@ -869,6 +869,15 @@ def instantiate_state(pieces, columns, *, targets, schedule="sequential",
     # different state, not a rebinding of this one.
     state.bound_pieces = (tuple(names), str(schedule))
     configure_publication_limits(state, targets)
+    # Instantiation cascades: the containing system asks each participant to
+    # instantiate against the spans it will be handed every round, so a piece
+    # prepares its own lifetime-scoped storage once here and only runs later.
+    # A participant without the hook is left as it is.
+    for piece in pieces:
+        hook = getattr(piece, "instantiate", None)
+        if hook is None:
+            continue
+        hook({name: getattr(state, name) for name in piece.argument_names})
     return state
 
 
