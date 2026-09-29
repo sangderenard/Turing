@@ -34,6 +34,7 @@ from ...compiler.loop_ir import (
 )
 from ...transmogrifier.function_table import (
     ExternalFunctionTable,
+    FunctionReference,
     FunctionTable,
     ParameterAccess,
     ParameterContract,
@@ -3649,6 +3650,67 @@ def _normalize_lexical_values(
                     )
                     _redirect_value(graph, node_id, constant_id)
                     return constant_id
+                if (
+                    producer_id is None
+                    and expression.id not in parameter_names
+                    and expression.id in static_bindings
+                    and isinstance(static_value, (tuple, list))
+                    and static_value
+                ):
+                    # A module table of source functions (``CASES = (f, g)``)
+                    # is as static as a table of numbers: each element is a
+                    # FunctionTable address.  The address is found by the
+                    # declared source identity the table was built from
+                    # (``module.qualname``, stamped by source pursuit), so a
+                    # same-named function elsewhere can never be selected.
+                    def table_reference(item: Any) -> Any:
+                        if not isinstance(item, types.FunctionType):
+                            return None
+                        qualified = ".".join(filter(None, (
+                            str(getattr(item, "__module__", "") or ""),
+                            str(getattr(item, "__qualname__", "") or ""),
+                        )))
+                        try:
+                            entry = function_table.entry(qualified)
+                        except KeyError:
+                            return None
+                        if entry.qualified_name != qualified:
+                            return None
+                        return entry.reference
+
+                    references = tuple(
+                        table_reference(item) for item in static_value
+                    )
+                    if any(reference is not None for reference in references) and all(
+                        reference is not None or is_static_literal(item)
+                        for item, reference in zip(static_value, references)
+                    ):
+                        element_ids = tuple(
+                            first_class_function_node(
+                                str(item.__name__), reference,
+                            )
+                            for item, reference in zip(
+                                static_value, references,
+                            )
+                            if reference is not None
+                        )
+                        table = tuple(
+                            FunctionReference(int(reference.address))
+                            if reference is not None else item
+                            for item, reference in zip(
+                                static_value, references,
+                            )
+                        )
+                        constant_id = static_constant(
+                            expression.id,
+                            table if isinstance(static_value, tuple)
+                            else list(table),
+                        )
+                        graph.G.nodes[constant_id].setdefault(
+                            "attributes", {},
+                        )["static_callable_element_ids"] = element_ids
+                        _redirect_value(graph, node_id, constant_id)
+                        return constant_id
                 if producer_id is None:
                     producer_id = input_value(
                         expression.id,
