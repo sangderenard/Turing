@@ -2085,25 +2085,46 @@ def _expand_unresolved_ast_parents(
         return tuple(calls)
 
     def lexical_return_calls(definition):
-        """Calls on this definition's returned-value slice."""
+        """Calls on this definition's local returned-value def-use slice.
 
-        calls = []
+        A returned name is not itself the expression that produced the
+        result.  Walk it back through local assignments before selecting
+        calls, so ``value = helper(); return value`` carries the same source
+        dependency as ``return helper()``.  This remains a value slice: calls
+        in unrelated effect statements do not become pursuit roots merely
+        because their owning record method is present in the ABI.
+        """
+
+        value_roots = []
+        assignments = []
 
         class Visitor(ast.NodeVisitor):
-            def __init__(self):
-                self.in_return = False
-
             def visit_Return(self, node):
-                previous = self.in_return
-                self.in_return = True
                 if node.value is not None:
-                    self.visit(node.value)
-                self.in_return = previous
+                    value_roots.append(node.value)
 
-            def visit_Call(self, node):
-                if self.in_return:
-                    calls.append(node)
+            def visit_Assign(self, node):
+                assignments.append((tuple(node.targets), node.value))
                 self.generic_visit(node)
+
+            def visit_AnnAssign(self, node):
+                if node.value is not None:
+                    assignments.append(((node.target,), node.value))
+                self.generic_visit(node)
+
+            def visit_AugAssign(self, node):
+                assignments.append(((node.target,), node.value))
+                self.generic_visit(node)
+
+            def visit_NamedExpr(self, node):
+                assignments.append(((node.target,), node.value))
+                self.generic_visit(node)
+
+            def visit_For(self, node):
+                assignments.append(((node.target,), node.iter))
+                self.generic_visit(node)
+
+            visit_AsyncFor = visit_For
 
             def visit_FunctionDef(self, node):
                 if node is definition:
@@ -2119,7 +2140,46 @@ def _expand_unresolved_ast_parents(
                 return
 
         Visitor().visit(definition)
-        return tuple(calls)
+
+        required_names = set()
+        selected_node_ids = set()
+
+        def select_value(value):
+            for member in ast.walk(value):
+                selected_node_ids.add(id(member))
+                if isinstance(member, ast.Name) and isinstance(
+                    member.ctx, ast.Load
+                ):
+                    required_names.add(member.id)
+
+        for value in value_roots:
+            select_value(value)
+
+        selected_assignments = set()
+        changed = True
+        while changed:
+            changed = False
+            for index, (targets, value) in enumerate(assignments):
+                if index in selected_assignments:
+                    continue
+                stored_names = {
+                    member.id
+                    for target in targets
+                    for member in ast.walk(target)
+                    if isinstance(member, ast.Name)
+                    and isinstance(member.ctx, ast.Store)
+                }
+                if not stored_names.intersection(required_names):
+                    continue
+                selected_assignments.add(index)
+                before = len(required_names)
+                select_value(value)
+                changed = changed or len(required_names) != before
+
+        return tuple(
+            call for call in lexical_calls(definition)
+            if id(call) in selected_node_ids
+        )
 
     def root_definition(identity):
         # ``<locals>`` is Python's durable lexical-name separator, not an AST

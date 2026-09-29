@@ -881,6 +881,156 @@ def settle_repository_ssa_static_extent_operands(module: IRModule) -> bool:
     return changed
 
 
+def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
+    """Carry settled extents through exact shape-preserving SSA edges.
+
+    Control SSA is built before source-call frames finish linking.  A loop
+    seed can consequently be rank-unknown when its Phi/Cast is created and
+    become shaped only when the linked callee output is installed later.
+    These operators are equality edges for extents: Cast changes dtype, and
+    Phi selects one of its incoming values.  Refine their result only when the
+    non-empty incoming shapes unanimously agree; disagreement remains
+    unresolved instead of selecting an encounter-order winner.
+
+    This walks the SSA graph directly.  It creates no parallel identity map;
+    the values on the instructions and the shared proven-shape page remain
+    the facts consumed by subsequent passes.
+    """
+
+    changed_any = False
+    changed = True
+    while changed:
+        changed = False
+        for function_name, function in module.functions.items():
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    result = instruction.res
+                    if result is None or tuple(result.shape or ()):
+                        continue
+                    operation = str(instruction.op).casefold()
+                    descriptor_operation = None
+                    if operation in {"call"}:
+                        descriptor_operation = str(
+                            instruction.attributes.get("callee") or ""
+                        ).casefold()
+                    if descriptor_operation == "binary_double":
+                        sources = tuple(instruction.args[:2])
+                        shaped = tuple(
+                            tuple(source.shape or ())
+                            for source in sources
+                            if tuple(source.shape or ())
+                        )
+                        if not shaped:
+                            continue
+                        rank = max(map(len, shaped))
+                        padded = tuple(
+                            (1,) * (rank - len(shape)) + shape
+                            for shape in shaped
+                        )
+                        broadcast = []
+                        for extents in zip(*padded):
+                            nonunit = {int(extent) for extent in extents
+                                       if int(extent) != 1}
+                            if len(nonunit) > 1:
+                                broadcast = []
+                                break
+                            broadcast.append(
+                                next(iter(nonunit)) if nonunit else 1
+                            )
+                        if not broadcast:
+                            continue
+                        shapes = {tuple(broadcast)}
+                    elif descriptor_operation in {
+                        "binary_scalar_double", "unary_double",
+                    }:
+                        sources = tuple(instruction.args[:1])
+                        shapes = {
+                            tuple(source.shape)
+                            for source in sources
+                            if tuple(source.shape or ())
+                        }
+                    elif operation in {"cast", "castlike"}:
+                        sources = tuple(instruction.args[:1])
+                        shapes = {
+                            tuple(source.shape)
+                            for source in sources
+                            if tuple(source.shape or ())
+                        }
+                    elif operation == "phi":
+                        sources = tuple(instruction.args)
+                        shapes = {
+                            tuple(source.shape)
+                            for source in sources
+                            if tuple(source.shape or ())
+                        }
+                    else:
+                        continue
+                    if len(shapes) != 1:
+                        continue
+                    shape = next(iter(shapes))
+                    result.shape = shape
+                    result.accounting = {
+                        **dict(result.accounting or {}),
+                        "shape_settlement_provenance": (
+                            "shape_preserving_ssa_edge",
+                            str(function_name),
+                            str(instruction.op),
+                        ),
+                        "shape_settlement_tie_policy": "unanimous",
+                    }
+                    try:
+                        from .identity_concordance import record_proven_shape
+
+                        record_proven_shape(
+                            function_name, int(result.id), shape,
+                            result.dtype or next((
+                                source.dtype for source in sources
+                                if source.dtype is not None
+                            ), None),
+                            None,
+                        )
+                    except Exception:
+                        pass
+                    table = getattr(module, "tensor_tables", {}).get(
+                        function_name
+                    )
+                    descriptor = (
+                        table.by_id(int(result.id))
+                        if table is not None else None
+                    )
+                    if descriptor is not None and tuple(
+                        descriptor.shape or ()
+                    ) != shape:
+                        stride = 1
+                        reverse_strides = []
+                        for extent in reversed(shape):
+                            reverse_strides.append(stride)
+                            stride *= int(extent)
+                        dtype_bytes = {
+                            "bool": 1, "i1": 1,
+                            "int8": 1, "uint8": 1,
+                            "int16": 2, "uint16": 2,
+                            "float32": 4, "float": 4,
+                            "int32": 4, "i32": 4,
+                            "float64": 8, "double": 8,
+                            "int64": 8, "i64": 8,
+                        }.get(str(result.dtype or descriptor.dtype).lower(), 8)
+                        table.tensors[int(result.id)] = dataclasses.replace(
+                            descriptor,
+                            dtype=str(result.dtype or descriptor.dtype),
+                            shape=shape,
+                            strides=tuple(reversed(reverse_strides)),
+                            byte_size=prod(shape) * dtype_bytes,
+                            metadata_state="static",
+                        )
+                    changed = True
+                    changed_any = True
+        if settle_canonical_value_metadata(module):
+            changed = True
+            changed_any = True
+    return changed_any
+
+
 def propagate_repository_ssa_call_metadata(
     module: IRModule, *, authoritative_returns: bool = False,
 ) -> bool:
@@ -992,6 +1142,8 @@ def propagate_repository_ssa_call_metadata(
 
     def enrich(
         function, value_id: int, source: SSAValue, *, authoritative: bool = False,
+        source_function: str | None = None,
+        stage: str = "repository_ssa_enrichment",
     ) -> bool:
         changed = False
         source_accounting = dict(source.accounting or {})
@@ -1107,6 +1259,60 @@ def propagate_repository_ssa_call_metadata(
                     key: source_contract_value,
                 }
                 changed = True
+            from .identity_concordance import record_shape_transformation
+
+            source_rank = int(source_accounting.get(
+                "program_abi_rank", len(source_shape),
+            ) or len(source_shape))
+            target_shape = tuple(value.shape or ())
+            target_accounting = dict(value.accounting or {})
+            target_rank = int(target_accounting.get(
+                "program_abi_rank", len(target_shape),
+            ) or len(target_shape))
+            record_shape_transformation(
+                (
+                    source_function
+                    or function_names_by_id.get(id(function), "?")
+                ),
+                int(source.id),
+                function_names_by_id.get(id(function), "?"),
+                int(value.id),
+                stage=stage,
+                operation="ssa_metadata_transport",
+                source_state={
+                    "shape": source_shape,
+                    "dtype": str(source_dtype or "unknown"),
+                    "rank": source_rank,
+                    "metadata_state": str(source_accounting.get(
+                        "tensor_metadata_state", "static",
+                    )),
+                    **(
+                        {"sequence_row_shape": tuple(source_accounting[
+                            "sequence_row_shape"
+                        ])}
+                        if source_accounting.get(
+                            "sequence_row_shape"
+                        ) is not None else {}
+                    ),
+                },
+                target_state={
+                    "shape": target_shape,
+                    "dtype": str(value.dtype or "unknown"),
+                    "rank": target_rank,
+                    "metadata_state": str(target_accounting.get(
+                        "tensor_metadata_state", "static",
+                    )),
+                    **(
+                        {"sequence_row_shape": tuple(target_accounting[
+                            "sequence_row_shape"
+                        ])}
+                        if target_accounting.get(
+                            "sequence_row_shape"
+                        ) is not None else {}
+                    ),
+                },
+                role="ssa_value",
+            )
         return changed
 
     def settle_specialized_formal_descriptor(
@@ -1729,6 +1935,26 @@ def propagate_repository_ssa_call_metadata(
     return changed_any
 
 
+def settle_repository_ssa_shape_metadata(module: IRModule) -> bool:
+    """Converge local shape laws with exact repository call-edge metadata.
+
+    Either side can expose the next fact needed by the other: a local
+    elementwise result may acquire extents only after its operands settle,
+    while a downstream planned-region formal can acquire those extents only
+    across its exact call edge.  Both passes are monotone on unresolved
+    metadata, and the call-edge pass retains its disagreement and oscillation
+    checks, so alternate them until a complete round reports no change.
+    """
+
+    changed_any = False
+    while True:
+        changed = propagate_repository_ssa_call_metadata(module)
+        changed |= settle_shape_preserving_value_metadata(module)
+        changed_any |= changed
+        if not changed:
+            return changed_any
+
+
 def lower_tensor_calls_to_repository_ssa(
     module: IRModule,
     reference: SSATensorCodeReference,
@@ -1867,6 +2093,31 @@ def lower_tensor_calls_to_repository_ssa(
                             ).removesuffix("_value_id"),
                         },
                     ))
+            # A metadata identity may have been minted inside this planned
+            # region while an earlier lowering attempt was still resolving
+            # its source sequence.  Such an identity is local computation,
+            # not a call-frame value.  Promote it to the ABI only when every
+            # exact incoming call already owns the same identity; otherwise
+            # the operation below reconstructs metadata from the concorded
+            # live sequence length and row layout inside the region.
+            incoming_caller_values = tuple(
+                function_values[str(caller_name)]
+                for caller_name, caller in module.functions.items()
+                if any(
+                    instruction.op in {"Call", "call"}
+                    and instruction.attributes.get("callee") == callee_name
+                    for block in caller.blocks.values()
+                    for instruction in block.instrs
+                )
+            )
+            if incoming_caller_values:
+                metadata_formals = [
+                    formal for formal in metadata_formals
+                    if all(
+                        int(formal.id) in caller_values
+                        for caller_values in incoming_caller_values
+                    )
+                ]
             if not metadata_formals:
                 continue
             callee.args.extend(metadata_formals)
@@ -1927,11 +2178,9 @@ def lower_tensor_calls_to_repository_ssa(
     # reshape result before that result has stated its extents.
     settle_static_repository_view_shapes(module)
     settle_canonical_value_metadata(module)
+    settle_shape_preserving_value_metadata(module)
     wire_repository_ssa_region_products(module)
-    settle_canonical_value_metadata(module)
-    propagate_repository_ssa_call_metadata(module)
-    if settle_canonical_value_metadata(module):
-        propagate_repository_ssa_call_metadata(module)
+    settle_repository_ssa_shape_metadata(module)
 
     # Publish call-edge shapes only after source-linked results and canonical
     # metadata have reached their fixed point.  Recording them earlier stores
@@ -2981,15 +3230,28 @@ def lower_tensor_calls_to_repository_ssa(
                                 for value in function.args
                             }
                             if (
-                                (shape_id is None or rank_id is None)
-                                and source_sequence is not None
-                                and len(source_sequence.column_value_ids) == 1
+                                (
+                                    shape_id is None
+                                    or rank_id is None
+                                    or int(shape_id) not in values_by_id
+                                    or int(rank_id) not in values_by_id
+                                )
+                                and (
+                                    source_sequence is None
+                                    or len(source_sequence.column_value_ids)
+                                    == 1
+                                )
                             ):
+                                sequence_id = int(source_accounting.get(
+                                    "sequence_id",
+                                    -1 if source_sequence is None else
+                                    source_sequence.sequence_id,
+                                ))
                                 length_value = next((
                                     value for value in function.args
                                     if int((value.accounting or {}).get(
                                         "sequence_length_for", -1
-                                    )) == int(source_sequence.sequence_id)
+                                    )) == sequence_id
                                 ), None)
                                 row_shape = proven_row_shape
                                 if (
@@ -3065,7 +3327,7 @@ def lower_tensor_calls_to_repository_ssa(
                                             source_element_count.id
                                         ),
                                         "sequence_id": int(
-                                            source_sequence.sequence_id
+                                            sequence_id
                                         ),
                                         "sequence_row_shape": row_shape,
                                     }
@@ -3574,6 +3836,68 @@ def lower_tensor_calls_to_repository_ssa(
                     and int(argument.id) in constants
                 ]
                 source = data_args[0] if data_args else (args[0] if args else None)
+                constructor_count: SSAValue | None = None
+                constructor_operations = {
+                    "fill", "full", "zeros", "empty", "ones",
+                }
+                if (
+                    operation in constructor_operations
+                    and args
+                    and not tuple(result.shape or ())
+                    and int((result.accounting or {}).get(
+                        "program_abi_rank", 0
+                    ) or 0) == 1
+                ):
+                    # A scalar constructor shape is runtime data, not the
+                    # tensor being filled.  Publish the dependent rank-one
+                    # shape as ordinary SSA before descriptor registration;
+                    # storage-capacity analysis remains free to prove a
+                    # static arena bound through the exact caller edge.
+                    constructor_count = fresh(dtype="int32")
+                    shape_value, shape_definition = int_vector((0,))
+                    rank_value, rank_definition = constant(1, "int32")
+                    zero, zero_definition = constant(0, "int64")
+                    shape_address = fresh(dtype="ptr")
+                    prefix.extend((
+                        Instr(
+                            Handler.Cast.value,
+                            [args[0]], constructor_count,
+                            attributes={
+                                "source_dtype": str(args[0].dtype or "int64"),
+                                "target_dtype": "int32",
+                                "binding": "tensor-constructor-count",
+                            },
+                        ),
+                        shape_definition,
+                        zero_definition,
+                        Instr(
+                            Handler.GetElementPtr.value,
+                            [shape_value, zero], shape_address,
+                            attributes={
+                                "binding": "tensor-constructor-shape",
+                            },
+                        ),
+                        Instr(
+                            Handler.Store.value,
+                            [constructor_count, shape_address], None,
+                            attributes={
+                                "binding": "tensor-constructor-shape",
+                            },
+                        ),
+                        rank_definition,
+                    ))
+                    result.accounting = {
+                        **dict(result.accounting or {}),
+                        "tensor_metadata_state": "dynamic",
+                        "tensor_shape_value_id": int(shape_value.id),
+                        "tensor_rank_value_id": int(rank_value.id),
+                        "tensor_element_count_value_id": int(
+                            constructor_count.id
+                        ),
+                    }
+                    # Constructors have no data-source tensor.  Their first
+                    # operand describes the result shape.
+                    source = None
                 # The broadcast instruction owns its destination extents.
                 # Resolve them before registering the allocation descriptor;
                 # otherwise a provisional singleton shape becomes the ABI
@@ -4092,12 +4416,22 @@ def lower_tensor_calls_to_repository_ssa(
                         fill_value = (
                             None if explicit is None else float(explicit)
                         )
-                    count = need_count(result, _known_count(result))
-                    if fill_value is not None and count is not None:
-                        scalar, scalar_def = constant(fill_value, "float64")
+                    count = (
+                        constructor_count
+                        if constructor_count is not None
+                        else need_count(result, _known_count(result))
+                    )
+                    fill_operand = None
+                    if fill_value is not None:
+                        fill_operand, scalar_def = constant(
+                            fill_value, "float64"
+                        )
                         prefix.append(scalar_def)
+                    elif operation in {"fill", "full"} and len(args) > 1:
+                        fill_operand = args[1]
+                    if fill_operand is not None and count is not None:
                         emitted.append(call(
-                            "fill_double", [result, scalar, count], result,
+                            "fill_double", [result, fill_operand, count], result,
                             instruction, output_argument=0,
                         ))
                 elif operation == "cbrt" and source is not None:
@@ -4375,6 +4709,27 @@ def lower_tensor_calls_to_repository_ssa(
                             result, reduction_instruction,
                             output_argument=1,
                         ))
+                    elif (
+                        axis is not None
+                        and shape_unknown(source)
+                        and operation == "mean"
+                    ):
+                        # A repository sequence has a runtime leading extent
+                        # and a statically known row shape.  Reducing axis zero
+                        # is therefore an ordinary mean_dim over its one
+                        # physical arena, with the sequence extent carried by
+                        # the descriptor's live shape vector.
+                        extents = ensure_dynamic(prefix, source)
+                        dim, dim_def = constant(int(axis), "int32")
+                        prefix.append(dim_def)
+                        emitted.append(call(
+                            "mean_dim",
+                            [
+                                source, result, extents["shape"],
+                                extents["rank"], dim,
+                            ],
+                            result, instruction, output_argument=1,
+                        ))
                     elif axis is not None and shape_unknown(source) and operation in _REDUCTION_CODES:
                         # Symbolic source: shape and rank ride as runtime
                         # extents; the kernel already takes them as operands.
@@ -4386,6 +4741,18 @@ def lower_tensor_calls_to_repository_ssa(
                         emitted.append(call(
                             "reduce_dim_double",
                             [source, result, extents["shape"], extents["rank"], dim, code],
+                            result, instruction, output_argument=1,
+                        ))
+                    elif axis is not None and source.shape and operation == "mean":
+                        rank = len(source.shape)
+                        axis_value = int(axis) % rank
+                        shape_value, shape_def = int_vector(source.shape)
+                        ndim, ndim_def = constant(rank, "int32")
+                        dim, dim_def = constant(axis_value, "int32")
+                        prefix.extend((shape_def, ndim_def, dim_def))
+                        emitted.append(call(
+                            "mean_dim",
+                            [source, result, shape_value, ndim, dim],
                             result, instruction, output_argument=1,
                         ))
                     elif axis is not None and source.shape and operation in _REDUCTION_CODES:
@@ -4805,7 +5172,69 @@ def lower_tensor_calls_to_repository_ssa(
                     left, right = data_args
                     _record_ssa_shape(function_name, left)
                     _record_ssa_shape(function_name, right)
-                    if len(left.shape) == len(right.shape) == 2 and left.shape[1] == right.shape[0]:
+                    if (
+                        len(left.shape) == len(right.shape) == 1
+                        and left.shape[0] == right.shape[0]
+                    ):
+                        m, n, p = 1, int(left.shape[0]), 1
+                        result.shape = ()
+                        dimensions = []
+                        for extent in (m, n, p):
+                            value, definition = constant(extent, "int32")
+                            dimensions.append(value)
+                            prefix.append(definition)
+                        emitted.append(call(
+                            "matmul_double",
+                            [left, right, result, *dimensions], result,
+                            instruction, output_argument=2,
+                        ))
+                    elif (
+                        len(left.shape) == 2
+                        and len(right.shape) == 1
+                        and left.shape[1] == right.shape[0]
+                    ):
+                        # NumPy/Python ``matrix @ vector`` is the existing
+                        # rank-two kernel with a one-column right operand;
+                        # the singleton result axis is semantic only and is
+                        # squeezed from the public result. No vector copy or
+                        # second physical object is needed.
+                        m, n, p = (
+                            int(left.shape[0]), int(left.shape[1]), 1,
+                        )
+                        result.shape = (m,)
+                        dimensions = []
+                        for extent in (m, n, p):
+                            value, definition = constant(extent, "int32")
+                            dimensions.append(value)
+                            prefix.append(definition)
+                        emitted.append(call(
+                            "matmul_double",
+                            [left, right, result, *dimensions], result,
+                            instruction, output_argument=2,
+                        ))
+                    elif (
+                        len(left.shape) == 1
+                        and len(right.shape) == 2
+                        and left.shape[0] == right.shape[0]
+                    ):
+                        m, n, p = (
+                            1, int(left.shape[0]), int(right.shape[1]),
+                        )
+                        result.shape = (p,)
+                        dimensions = []
+                        for extent in (m, n, p):
+                            value, definition = constant(extent, "int32")
+                            dimensions.append(value)
+                            prefix.append(definition)
+                        emitted.append(call(
+                            "matmul_double",
+                            [left, right, result, *dimensions], result,
+                            instruction, output_argument=2,
+                        ))
+                    elif (
+                        len(left.shape) == len(right.shape) == 2
+                        and left.shape[1] == right.shape[0]
+                    ):
                         dimensions = []
                         for extent in (left.shape[0], left.shape[1], right.shape[1]):
                             value, definition = constant(int(extent), "int32")
@@ -5298,11 +5727,12 @@ def lower_tensor_calls_to_repository_ssa(
             module.tensor_tables[name] = reference_table
     if legalize_aggregate_adapters(module):
         settle_canonical_value_metadata(module)
+        settle_shape_preserving_value_metadata(module)
     # Tensor descriptors are created while rewriting functions above.  A
     # producer's final allocation shape can therefore become authoritative
     # only after the whole module has been visited, regardless of whether an
     # aggregate adapter happened to be removed on this invocation.
-    propagate_repository_ssa_call_metadata(module)
+    settle_repository_ssa_shape_metadata(module)
     settle_repository_ssa_static_extent_operands(module)
     legalize_aggregate_output_views(module)
     return tuple(shortfalls)

@@ -733,7 +733,12 @@ def _publication_source_value(output, output_index: int, returned_values):
 
 
 def _flatten_numeric_aggregate(value) -> tuple[bool | int | float, ...]:
-    """Flatten one repository aggregate constant in row-major order."""
+    """Flatten one repository aggregate constant in row-major order.
+
+    Text members are not host strings by the time they enter native SSA.
+    They inhabit the same deterministic token namespace as scalar keyed
+    values, so aggregate keys must use that encoding as well.
+    """
 
     if isinstance(value, (list, tuple)):
         return tuple(
@@ -743,10 +748,20 @@ def _flatten_numeric_aggregate(value) -> tuple[bool | int | float, ...]:
         )
     if isinstance(value, (bool, int, float)):
         return (value,)
+    if isinstance(value, (str, bytes)):
+        return (string_token(value),)
     raise TypeError(
-        "C aggregate constants require bool/int/float elements; "
+        "C aggregate constants require bool/int/float/text elements; "
         f"received {type(value).__name__}"
     )
+
+
+def _aggregate_contains_text(value) -> bool:
+    if isinstance(value, (str, bytes)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return any(_aggregate_contains_text(member) for member in value)
+    return False
 
 
 def _c_numeric_literal(value: bool | int | float, c_type: str) -> str:
@@ -1985,6 +2000,7 @@ def emit_ssa_module_to_c(
         function = module.functions[fn]
         function_return_type = function_return_types[fn]
         tensor_table = getattr(module, "tensor_tables", {}).get(fn)
+        sequence_table = getattr(module, "sequence_tables", {}).get(fn)
         formal_ids = {int(value.id) for value in function.args}
         formal_values_by_id = {
             int(value.id): value for value in function.args
@@ -2611,6 +2627,86 @@ def emit_ssa_module_to_c(
                 return f"*(({buffer_type(value)} *)({home}))"
             return held
 
+        def sequence_extent_parts(source):
+            """Return the live leading extent and static row extents.
+
+            Sequence lowering passes the mutable length cell as an ordinary
+            formal whose ``sequence_length_for`` receipt names the same
+            descriptor as the arena.  Reading that edge is strictly more
+            precise than asking the public-wrapper extent ABI to rediscover
+            private compiler-frame storage.
+            """
+
+            accounting = dict(source.accounting or {})
+            static_length = accounting.get("sequence_static_length")
+            if static_length is not None:
+                return str(int(static_length)), tuple(map(
+                    int, accounting.get("sequence_row_shape") or (),
+                ))
+            direct_length_id = accounting.get("sequence_length_value_id")
+            if direct_length_id is not None:
+                direct_lengths = tuple(
+                    formal for formal in function.args
+                    if int(formal.id) == int(direct_length_id)
+                )
+                if len(direct_lengths) == 1:
+                    length = scalar_operand(direct_lengths[0])
+                    if length is not None:
+                        return length, tuple(map(
+                            int,
+                            accounting.get("sequence_row_shape") or (),
+                        ))
+            descriptors = tuple(
+                descriptor
+                for descriptor in (
+                    sequence_table.sequences.values()
+                    if sequence_table is not None else ()
+                )
+                if (
+                    int(descriptor.sequence_id) == int(source.id)
+                    or int(source.id) in tuple(map(
+                        int, descriptor.column_value_ids
+                    ))
+                )
+            )
+            if len(descriptors) == 1:
+                descriptor = descriptors[0]
+                length_value = values_by_id.get(
+                    int(descriptor.length_address_id)
+                )
+                if length_value is not None:
+                    length = scalar_operand(length_value)
+                    if length is not None:
+                        return length, tuple(map(
+                            int, accounting.get("sequence_row_shape") or (),
+                        ))
+            sequence_ids = {
+                int(candidate)
+                for candidate in (
+                    accounting.get("sequence_id"),
+                    accounting.get("compiler_frame_sequence_id"),
+                    int(source.id),
+                )
+                if candidate is not None
+            }
+            length_values = tuple(
+                formal
+                for formal in function.args
+                if (formal.accounting or {}).get("sequence_length_for")
+                is not None
+                and int((formal.accounting or {})["sequence_length_for"])
+                in sequence_ids
+            )
+            if len(length_values) != 1:
+                return None
+            length = scalar_operand(length_values[0])
+            if length is None:
+                return None
+            row_shape = tuple(map(
+                int, accounting.get("sequence_row_shape") or (),
+            ))
+            return length, row_shape
+
         phi_scalar_cells: set[tuple[int, int]] = set()
 
         def phi_edge_assignments(source_block: str, target_block: str) -> list[str]:
@@ -3005,6 +3101,8 @@ def emit_ssa_module_to_c(
                         addresses[result_id] = f"t{result_id}"
                         continue
                     if isinstance(held, (list, tuple)):
+                        if _aggregate_contains_text(held):
+                            token_value_ids.add(int(instruction.res.id))
                         try:
                             flattened = _flatten_numeric_aggregate(held)
                         except TypeError as error:
@@ -3171,6 +3269,15 @@ def emit_ssa_module_to_c(
                     body.append(f"        goto cleanup_{_c_symbol(fn)};")
                     continue
                 if (
+                    op == "stream_publish"
+                    or instruction.attributes.get("callee")
+                    == "turing_stream_publish"
+                ):
+                    # This C artifact has no text sink.  Match the LLVM
+                    # module lane's sinkless contract: publication is an
+                    # optional observation, not a missing native callee.
+                    continue
+                if (
                     op in {"max", "min", "all", "any"}
                     and instruction.res is not None
                     and len(instruction.args) == 1
@@ -3281,6 +3388,175 @@ def emit_ssa_module_to_c(
                     if _is_integer_dtype(instruction.res.dtype):
                         integer_ids.add(result_id)
                     continue
+                if (
+                    op.casefold() in {"norm", "dot", "argmin"}
+                    and instruction.res is not None
+                ):
+                    operation = op.casefold()
+                    expected_arity = 2 if operation == "dot" else 1
+                    if len(instruction.args) != expected_arity:
+                        shortfalls.append(CEmissionShortfall(
+                            op, f"{operation} has wrong arity in {fn}",
+                        ))
+                        continue
+                    sources = tuple(instruction.args)
+                    source_shapes = tuple(
+                        tuple(source.shape or ()) for source in sources
+                    )
+                    if any(
+                        not shape
+                        or any(not isinstance(extent, int) for extent in shape)
+                        for shape in source_shapes
+                    ):
+                        shortfalls.append(CEmissionShortfall(
+                            op,
+                            f"{operation} requires static source shapes in {fn}",
+                        ))
+                        continue
+                    counts = tuple(math.prod(shape) for shape in source_shapes)
+                    if len(set(counts)) != 1:
+                        shortfalls.append(CEmissionShortfall(
+                            op, f"{operation} operand extents disagree in {fn}",
+                        ))
+                        continue
+                    source_addresses = tuple(
+                        address_operand(source) for source in sources
+                    )
+                    if any(address is None for address in source_addresses):
+                        continue
+                    count = counts[0]
+                    result_id = int(instruction.res.id)
+                    result_type = buffer_type(instruction.res)
+                    left_type = buffer_type(sources[0])
+                    left = (
+                        f"((const {left_type} *)({source_addresses[0]}))"
+                    )
+                    if operation == "argmin":
+                        body.extend((
+                            f"        {result_type} t{result_id} = 0;",
+                            f"        for (ptrdiff_t r{result_id} = 1; "
+                            f"r{result_id} < {count}; ++r{result_id}) "
+                            f"if ({left}[r{result_id}] < "
+                            f"{left}[(ptrdiff_t)t{result_id}]) "
+                            f"t{result_id} = ({result_type})r{result_id};",
+                        ))
+                        integer_ids.add(result_id)
+                    else:
+                        product = f"({left}[r{result_id}] * {left}[r{result_id}])"
+                        if operation == "dot":
+                            right_type = buffer_type(sources[1])
+                            right = (
+                                f"((const {right_type} *)"
+                                f"({source_addresses[1]}))"
+                            )
+                            product = (
+                                f"({left}[r{result_id}] * "
+                                f"{right}[r{result_id}])"
+                            )
+                        body.extend((
+                            f"        {result_type} t{result_id} = 0;",
+                            f"        for (ptrdiff_t r{result_id} = 0; "
+                            f"r{result_id} < {count}; ++r{result_id}) "
+                            f"t{result_id} += {product};",
+                        ))
+                        if operation == "norm":
+                            body.append(
+                                f"        t{result_id} = "
+                                f"({result_type})sqrt((double)t{result_id});"
+                            )
+                    expressions[result_id] = f"t{result_id}"
+                    addresses[result_id] = f"&t{result_id}"
+                    continue
+                if (
+                    op.casefold() == "matmul"
+                    and instruction.res is not None
+                    and len(instruction.args) == 2
+                ):
+                    left_value, right_value = instruction.args
+                    left_shape = tuple(left_value.shape or ())
+                    right_shape = tuple(right_value.shape or ())
+                    if not (
+                        len(left_shape) == len(right_shape) == 2
+                        and all(isinstance(extent, int) for extent in left_shape)
+                        and all(isinstance(extent, int) for extent in right_shape)
+                        and left_shape[1] == right_shape[0]
+                    ):
+                        shortfalls.append(CEmissionShortfall(
+                            op, f"matmul requires agreeing static rank-two shapes in {fn}",
+                        ))
+                        continue
+                    left_address = address_operand(left_value)
+                    right_address = address_operand(right_value)
+                    result_id = int(instruction.res.id)
+                    destination = addresses.get(
+                        result_id, expressions.get(result_id)
+                    )
+                    if left_address is None or right_address is None:
+                        continue
+                    m, n = map(int, left_shape)
+                    p = int(right_shape[1])
+                    result_type = buffer_type(instruction.res)
+                    if destination is None:
+                        destination = activation_array(result_type, m * p)
+                    left_type = buffer_type(left_value)
+                    right_type = buffer_type(right_value)
+                    body.extend((
+                        f"        for (ptrdiff_t mm_i_{result_id} = 0; "
+                        f"mm_i_{result_id} < {m}; ++mm_i_{result_id})",
+                        f"            for (ptrdiff_t mm_j_{result_id} = 0; "
+                        f"mm_j_{result_id} < {p}; ++mm_j_{result_id}) {{",
+                        f"                {result_type} mm_v_{result_id} = 0;",
+                        f"                for (ptrdiff_t mm_k_{result_id} = 0; "
+                        f"mm_k_{result_id} < {n}; ++mm_k_{result_id})",
+                        f"                    mm_v_{result_id} += "
+                        f"((const {left_type} *)({left_address}))"
+                        f"[mm_i_{result_id} * {n} + mm_k_{result_id}] * "
+                        f"((const {right_type} *)({right_address}))"
+                        f"[mm_k_{result_id} * {p} + mm_j_{result_id}];",
+                        f"                (({result_type} *)({destination}))"
+                        f"[mm_i_{result_id} * {p} + mm_j_{result_id}] = "
+                        f"mm_v_{result_id};",
+                        "            }",
+                    ))
+                    expressions[result_id] = destination
+                    addresses[result_id] = destination
+                    address_buffer_types[result_id] = result_type
+                    continue
+                if (
+                    op.casefold() == "full"
+                    and instruction.res is not None
+                    and instruction.args
+                ):
+                    shape = tuple(instruction.res.shape or ())
+                    if not shape or any(
+                        not isinstance(extent, int) for extent in shape
+                    ):
+                        shortfalls.append(CEmissionShortfall(
+                            op, f"full requires a static result shape in {fn}",
+                        ))
+                        continue
+                    fill_value = instruction.args[-1]
+                    fill = scalar_operand(fill_value)
+                    if fill is None:
+                        continue
+                    result_id = int(instruction.res.id)
+                    result_type = buffer_type(instruction.res)
+                    count = math.prod(shape)
+                    destination = addresses.get(
+                        result_id, expressions.get(result_id)
+                    )
+                    if destination is None:
+                        destination = activation_array(result_type, count)
+                    body.append(
+                        f"        for (ptrdiff_t fill_i_{result_id} = 0; "
+                        f"fill_i_{result_id} < {count}; ++fill_i_{result_id}) "
+                        f"(({result_type} *)({destination}))"
+                        f"[fill_i_{result_id}] = ({result_type})({fill});"
+                    )
+                    expressions[result_id] = destination
+                    addresses[result_id] = destination
+                    address_buffer_types[result_id] = result_type
+                    continue
                 if op == "extent" and instruction.res is not None and instruction.args:
                     source = instruction.args[0]
                     descriptor = (
@@ -3332,6 +3608,44 @@ def emit_ssa_module_to_c(
                     kind = str(instruction.attributes.get("extent_kind") or "")
                     result_id = int(instruction.res.id)
                     if dynamic:
+                        sequence_extent = sequence_extent_parts(source)
+                        if sequence_extent is not None:
+                            live_length, row_shape = sequence_extent
+                            sequence_shape = (live_length, *map(str, row_shape))
+                            sequence_rank = 1 + len(row_shape)
+                            if kind == "rank":
+                                expressions[result_id] = str(sequence_rank)
+                                integer_ids.add(result_id)
+                                continue
+                            if kind == "shape":
+                                values = ", ".join(
+                                    f"(int32_t)({item})"
+                                    for item in sequence_shape
+                                )
+                                body.append(
+                                    f"        int32_t t{result_id}[] = "
+                                    f"{{{values}}};"
+                                )
+                                expressions[result_id] = f"t{result_id}"
+                                addresses[result_id] = f"t{result_id}"
+                                continue
+                            if kind == "dim":
+                                axis = int(instruction.attributes.get(
+                                    "axis", 0
+                                ))
+                                if -sequence_rank <= axis < sequence_rank:
+                                    expressions[result_id] = str(
+                                        sequence_shape[axis % sequence_rank]
+                                    )
+                                    integer_ids.add(result_id)
+                                    continue
+                            if kind in {"element_count", "numel"}:
+                                row_width = math.prod(row_shape or (1,))
+                                expressions[result_id] = (
+                                    f"(({live_length}) * {row_width})"
+                                )
+                                integer_ids.add(result_id)
+                                continue
                         rank = (
                             len(tuple(source.shape or ()))
                             or int((source.accounting or {}).get(
@@ -3584,7 +3898,9 @@ def emit_ssa_module_to_c(
                         continue
                     if target is None or callee not in reachable:
                         shortfalls.append(CEmissionShortfall(
-                            op, f"call to unknown function {callee!r}",
+                            op,
+                            f"call to unknown function {callee!r} in {fn}; "
+                            f"attributes={dict(instruction.attributes or {})!r}",
                         ))
                         continue
                     if len(instruction.args) != len(target.args):

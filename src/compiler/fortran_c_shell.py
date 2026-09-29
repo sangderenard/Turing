@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import replace
+from collections import Counter
 from types import SimpleNamespace
 import copy
 from fnmatch import fnmatchcase
@@ -100,6 +101,10 @@ def _concordant_function_aliases(
     """
 
     from .identity_concordance import (
+        authored_function_name,
+        concordant_shape_transformation_state,
+        descriptor_from_shape_transformation_state,
+        record_shape_transformation,
         current_identity_book,
         resolved_concordant_alias_bindings,
     )
@@ -438,6 +443,39 @@ def _publish_concordant_function_aliases(
         resident_id = int(resident_id)
         if page.latest((str(function.name), alias_id)) != resident_id:
             page.bind_alias(str(function.name), alias_id, resident_id)
+        authored_scope = authored_function_name(function.name)
+        source_state = concordant_shape_transformation_state(
+            authored_scope, alias_id,
+        )
+        if source_state is not None:
+            record_shape_transformation(
+                authored_scope, alias_id,
+                authored_scope, resident_id,
+                stage="planning_value_concordance",
+                operation="alias_residency",
+                source_state=source_state,
+                target_state=source_state,
+                role=str(provenance),
+            )
+            descriptor = descriptor_from_shape_transformation_state(
+                source_state
+            )
+            row_shape = (
+                None if descriptor is None
+                else descriptor.get("sequence_row_shape")
+            )
+            if row_shape is not None:
+                from .identity_concordance import commit_sequence_row_layout
+
+                commit_sequence_row_layout(
+                    authored_scope, resident_id,
+                    (tuple(map(int, row_shape)),),
+                    ((descriptor or {}).get("dtype"),),
+                    source=(
+                        "planning concordance transformation "
+                        f"{alias_id}->{resident_id}"
+                    ),
+                )
     if aliases:
         function.metadata["value_aliases"] = aliases
     return aliases
@@ -3470,17 +3508,19 @@ def _prune_unused_callee_formals_once(
                 *metadata.get("named_outputs", ()),
             )
         }
-        protected.update(
+        declared_storage_ids = {
             int(item["value_id"])
             for item in metadata.get("storage_formals", ())
             if item.get("value_id") is not None
-        )
-        protected.update(map(
+        }
+        protected.update(declared_storage_ids)
+        sequence_member_ids = set(map(
             int, metadata.get("sequence_array_argument_ids", ())
         ))
-        protected.update(_live_sequence_member_ids(
+        sequence_member_ids.update(_live_sequence_member_ids(
             callee, (sequence_tables or {}).get(str(callee_name)),
         ))
+        protected.update(sequence_member_ids)
         record_parameter_names = set(map(
             str, dict(metadata.get("parameter_record_abi") or {}),
         ))
@@ -3516,12 +3556,50 @@ def _prune_unused_callee_formals_once(
                 *((instruction.res,) if instruction.res is not None else ()),
             )
         }
+        local_definition_counts = Counter(
+            int(instruction.res.id)
+            for block in callee.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        )
+
+        def superseded_provisional_formal(formal: Any) -> bool:
+            """Whether completed SSA now defines an unaccounted placeholder.
+
+            Control construction can encounter a later region/tensor result
+            before its producer exists and temporarily expose that identity as
+            a formal.  Once the completed function contains exactly one real
+            definition, that placeholder is no longer part of the ABI.  Real
+            parameters and every declared storage kind remain protected.
+            """
+
+            value_id = int(formal.id)
+            accounting = dict(formal.accounting or {})
+            return (
+                local_definition_counts[value_id] == 1
+                and value_id not in declared_storage_ids
+                and value_id not in record_parameter_ids
+                and accounting.get("program_abi_parameter") is None
+                and not any(
+                    accounting.get(key) not in {None, ""}
+                    for key in (
+                        "linked_call_frame_storage",
+                        "returned_record_storage",
+                        "compiler_frame_storage",
+                    )
+                )
+            )
+
         removable_indices = tuple(
             index
             for index, formal in enumerate(callee.args)
-            if int(formal.id) not in referenced
+            if (
+                int(formal.id) not in referenced
+                or superseded_provisional_formal(formal)
+            )
             and (
-                int(formal.id) not in protected
+                superseded_provisional_formal(formal)
+                or int(formal.id) not in protected
                 or (formal.accounting or {}).get("unbound_variant_source_id")
                 is not None
                 or conceptual_record_formal(formal)
@@ -5042,8 +5120,53 @@ def _record_row_physical_columns(
     return tuple(columns)
 
 
-def _graph_sequence_record_abi(graph_obj: Any) -> dict[str, Mapping[str, Any]]:
+def _record_row_sequence_columns(
+    record: Mapping[str, Any],
+) -> tuple[tuple[str, str, tuple[int, ...]], ...]:
+    """Logical SoA columns for one record row, retaining shaped fields."""
+
+    columns: list[tuple[str, str, tuple[int, ...]]] = []
+    for field_name, receipt_value in dict(record.get("fields") or {}).items():
+        receipt = dict(receipt_value)
+        dtype = str(receipt.get("dtype") or "unknown")
+        if bool(receipt.get("optional")):
+            columns.append((f"{field_name}.__present", "bool", ()))
+        storage = str(receipt.get("storage") or "scalar")
+        if storage == "span":
+            shape = receipt.get("shape")
+            if shape is None and receipt.get("fixed_length") is not None:
+                shape = (int(receipt["fixed_length"]),)
+            columns.append((
+                str(field_name), dtype,
+                () if shape is None else tuple(map(int, shape)),
+            ))
+        else:
+            columns.append((str(field_name), dtype, ()))
+    return tuple(columns)
+
+
+def _sequence_record_storage_columns(
+    record: Mapping[str, Any],
+) -> tuple[tuple[str, str, tuple[int, ...]], ...]:
+    """Columns of a record sequence in its declared representation."""
+
+    if bool(record.get("program_abi_table_row")):
+        return _record_row_sequence_columns(record)
+    return tuple(
+        (name, dtype, ())
+        for name, dtype in _record_row_physical_columns(record)
+    )
+
+
+def _graph_sequence_record_abi(graph_obj: Any) -> dict[object, Mapping[str, Any]]:
     """Resolve local/parameter sequence annotations against repository ABI."""
+
+    from .identity_concordance import publish_program_abi_graph_identities
+
+    # Sequence ABI discovery runs after ProgramABI schemas have been
+    # enriched in place.  Republish from that authoritative boundary even
+    # when the graph and schema container identities themselves are stable.
+    publish_program_abi_graph_identities(graph_obj, force=True)
 
     resolved = copy.deepcopy(dict(
         graph_obj.graph.get("sequence_record_abi")
@@ -5053,6 +5176,51 @@ def _graph_sequence_record_abi(graph_obj: Any) -> dict[str, Mapping[str, Any]]:
     repository_records = dict(
         (graph_obj.graph.get("program_abi") or {}).get("records") or {}
     )
+    identities = graph_obj.graph.get("identity_table") or {}
+
+    def schema_named(identity: object) -> tuple[str, Mapping[str, Any]] | None:
+        matches = tuple(
+            (str(name), record)
+            for name, record in repository_records.items()
+            if str(name) == str(identity)
+            or str(record.get("identity") or "") == str(identity)
+        )
+        return matches[0] if len(matches) == 1 else None
+
+    for node_id, data in graph_obj.nodes(data=True):
+        row_identity = (data.get("attributes") or {}).get(
+            "program_abi_sequence_row_identity"
+        )
+        target = None if row_identity is None else schema_named(row_identity)
+        if target is not None:
+            resolved[int(data.get("value_id", node_id))] = {
+                **copy.deepcopy(dict(target[1])),
+                "identity": str(target[1].get("identity") or target[0]),
+                "aggregate_kind": "tuple",
+                "mutable": False,
+                "program_abi_table_row": True,
+            }
+    if (
+        os.environ.get("TURING_DEBUG_SEQUENCE_RECORD_ABI")
+        and any(fragment in str(
+            graph_obj.graph.get("function_name") or ""
+        ) for fragment in {"part_bounds_xyz", "edges_between"})
+    ):
+        for node_id, data in graph_obj.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            operation = str(data.get("op") or data.get("type") or "")
+            if (
+                operation.casefold() in {"getattr", "indexed", "load", "for"}
+                or attributes.get("program_abi_record_identity") is not None
+                or attributes.get("program_abi_sequence_row_identity") is not None
+            ):
+                print(
+                    "DEBUG-SEQUENCE-ABI",
+                    graph_obj.graph.get("function_name"), node_id,
+                    data.get("value_id"), operation,
+                    attributes, data.get("parents"),
+                    file=sys.stderr, flush=True,
+                )
     for binding_name, annotation in dict(
         graph_obj.graph.get("type_annotations") or {}
     ).items():
@@ -5096,6 +5264,27 @@ def _graph_sequence_record_abi(graph_obj: Any) -> dict[str, Mapping[str, Any]]:
             "source_derived": True,
         }
     return resolved
+
+
+def _sequence_record_binding_value_ids(
+    graph_obj: Any, binding: object,
+) -> tuple[int, ...]:
+    """Values owned by one authored-name or exact graph-value row receipt."""
+
+    if isinstance(binding, int):
+        return (int(binding),)
+    identities = graph_obj.graph.get("identity_table") or {}
+    return tuple(dict.fromkeys((
+        *map(int, identities.get(str(binding), ())),
+        *(
+            int(data.get("value_id", node_id))
+            for node_id, data in graph_obj.nodes(data=True)
+            if str(data.get("op") or data.get("type") or "").casefold()
+            == "getattr"
+            and str((data.get("attributes") or {}).get("attribute"))
+            == str(binding)
+        ),
+    )))
 
 
 def _authored_dataclass_record_views(
@@ -7517,22 +7706,10 @@ def _field_slot_ops(
             source=f"authored parameter {parameter_name}: {annotation}",
         )
     for binding_name, record in _graph_sequence_record_abi(graph_obj).items():
-        width = len(_record_row_physical_columns(record))
-        binding_value_ids = set(map(
-            int, identity.get(str(binding_name), ()),
+        width = len(_sequence_record_storage_columns(record))
+        binding_value_ids = set(_sequence_record_binding_value_ids(
+            graph_obj, binding_name,
         ))
-        # Receiver-field annotations are published under their authored field
-        # name.  A GetAttr does not necessarily enter that spelling in the
-        # lexical identity table, but its attribute role is the exact same
-        # source identity.  Follow that graph edge instead of losing the row
-        # contract merely because the value was reached through ``self``.
-        binding_value_ids.update(
-            int(data.get("value_id", node_id))
-            for node_id, data in graph_obj.nodes(data=True)
-            if node_operation(data) == "getattr"
-            and str((data.get("attributes") or {}).get("attribute"))
-            == str(binding_name)
-        )
         for value_id in binding_value_ids:
             annotated_row_widths[int(value_id)] = int(width)
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
@@ -7561,16 +7738,9 @@ def _field_slot_ops(
     for binding_name, sequence_record in _graph_sequence_record_abi(
         graph_obj
     ).items():
-        binding_value_ids = set(map(
-            int, identity.get(str(binding_name), ()),
+        binding_value_ids = set(_sequence_record_binding_value_ids(
+            graph_obj, binding_name,
         ))
-        binding_value_ids.update(
-            int(data.get("value_id", node_id))
-            for node_id, data in graph_obj.nodes(data=True)
-            if node_operation(data) == "getattr"
-            and str((data.get("attributes") or {}).get("attribute"))
-            == str(binding_name)
-        )
         for value_id in binding_value_ids:
             sequence_record_by_value[int(value_id)] = sequence_record
     parameter_record_by_value = {
@@ -7762,7 +7932,9 @@ def _field_slot_ops(
     # columnar arena explicitly so later field projections share one physical
     # descriptor instead of minting anonymous fallback columns.
     for parameter_name, record in _graph_sequence_record_abi(graph_obj).items():
-        history = tuple(map(int, identity.get(str(parameter_name), ())))
+        history = _sequence_record_binding_value_ids(
+            graph_obj, parameter_name,
+        )
         sequence_record_fields = tuple(dict(record.get("fields") or {}))
         if not history or not sequence_record_fields:
             continue
@@ -7773,7 +7945,7 @@ def _field_slot_ops(
         sequence_declarations.append((
             sequence_id,
             "duplicates",
-            len(_record_row_physical_columns(record)),
+            len(_sequence_record_storage_columns(record)),
             bool(record.get("mutable", False)),
         ))
 
@@ -13474,7 +13646,9 @@ def _record_sequence_projection_bindings(
             aliases_by_value[int(value_id)] = aliases
     parameter_by_sequence: dict[int, tuple[str, Mapping[str, Any]]] = {}
     for parameter_name, record in records.items():
-        for value_id in identities.get(str(parameter_name), ()):
+        for value_id in _sequence_record_binding_value_ids(
+            graph_obj, parameter_name,
+        ):
             parameter_by_sequence[int(value_id)] = (
                 str(parameter_name), record,
             )
@@ -13987,7 +14161,9 @@ def _sequence_column_dtype_contracts(
     for binding_name, sequence_record in _graph_sequence_record_abi(
         graph_obj
     ).items():
-        for value_id in identities.get(str(binding_name), ()):
+        for value_id in _sequence_record_binding_value_ids(
+            graph_obj, binding_name,
+        ):
             sequence_record_by_value[int(value_id)] = sequence_record
     for parameter_name, record in dict(
         graph_obj.graph.get("parameter_record_abi") or {}
@@ -14104,12 +14280,15 @@ def _sequence_column_dtype_contracts(
         if len(dtypes) == declared[int(sequence_id)]:
             contracts[int(sequence_id)] = tuple(map(str, dtypes))
     for parameter_name, record in _graph_sequence_record_abi(graph_obj).items():
-        dtypes = tuple(dtype for _name, dtype in _record_row_physical_columns(record))
+        row_columns = _sequence_record_storage_columns(record)
+        dtypes = tuple(dtype for _name, dtype, _shape in row_columns)
         if not dtypes:
             continue
         sequence_id = next((
             int(value_id)
-            for value_id in identities.get(str(parameter_name), ())
+            for value_id in _sequence_record_binding_value_ids(
+                graph_obj, parameter_name,
+            )
             if int(value_id) in declared
         ), None)
         if (
@@ -14117,6 +14296,15 @@ def _sequence_column_dtype_contracts(
             and len(dtypes) == declared[int(sequence_id)]
         ):
             contracts[int(sequence_id)] = dtypes
+            from .identity_concordance import commit_sequence_row_layout
+
+            commit_sequence_row_layout(
+                str(graph_obj.graph.get("function_name") or "<anonymous>"),
+                int(sequence_id),
+                tuple(shape for _name, _dtype, shape in row_columns),
+                dtypes,
+                source="ProgramABI sequence row record",
+            )
     for binding_name, annotation in dict(
         graph_obj.graph.get("type_annotations") or {}
     ).items():
@@ -14324,17 +14512,9 @@ def _sequence_record_identity_contracts(
     ))
     result: dict[int, str] = {}
     for binding_name, record in records.items():
-        binding_ids = tuple(dict.fromkeys((
-            *map(int, identities.get(str(binding_name), ())),
-            *(
-                int(data.get("value_id", node_id))
-                for node_id, data in graph_obj.nodes(data=True)
-                if str(data.get("op") or data.get("type") or "").casefold()
-                == "getattr"
-                and str((data.get("attributes") or {}).get("attribute"))
-                == str(binding_name)
-            ),
-        )))
+        binding_ids = _sequence_record_binding_value_ids(
+            graph_obj, binding_name,
+        )
         sequence_id = next((
             int(value_id)
             for value_id in binding_ids
@@ -14388,6 +14568,9 @@ def _authored_source_sequence_ids(
         if value_id not in declared:
             continue
         attributes = data.get("attributes") or {}
+        if attributes.get("program_abi_sequence_row_identity") is not None:
+            source_ids.add(value_id)
+            continue
         if str(attributes.get("binding_kind") or "") in {
             "parameter", "closure", "external",
         }:
@@ -25676,10 +25859,14 @@ def _class_surface_ssa_program(
         if function is None:
             return
         slots_by_mapping: dict[int, dict[str, int]] = {}
+        static_lengths_by_mapping: dict[int, int] = {}
         for value in function.args:
             accounting = value.accounting or {}
             if accounting.get("program_abi_storage") != "keyed":
                 continue
+            shape = tuple(value.shape or ())
+            if len(shape) == 1 and isinstance(shape[0], int):
+                static_lengths_by_mapping[int(value.id)] = int(shape[0])
             parts = {
                 part: accounting.get(f"program_abi_keyed_{part}")
                 for part in ("length", "keys", "values")
@@ -25698,7 +25885,11 @@ def _class_surface_ssa_program(
             is not None
             for value in function.args
         )
-        if not slots_by_mapping and not has_keyed_parts:
+        if (
+            not slots_by_mapping
+            and not has_keyed_parts
+            and not static_lengths_by_mapping
+        ):
             return
 
         # method -> the slot each successive destructured column selects
@@ -25771,11 +25962,36 @@ def _class_surface_ssa_program(
                 if str(role) in {"operand", "value", "object", "base"}
                 and parent in graph
             ), None)
+            iterable_id = int(data.get("value_id", node_id))
             selected = None if owner is None else mapping_slots(int(owner))
             if selected is None:
+                static_length = (
+                    None if owner is None
+                    else static_lengths_by_mapping.get(int(owner))
+                )
+                if static_length is not None:
+                    for value in function.args:
+                        accounting = dict(value.accounting or {})
+                        if int(accounting.get(
+                            "projected_row_source_id", -1
+                        )) != iterable_id:
+                            continue
+                        value.accounting = {
+                            **accounting,
+                            "sequence_id": iterable_id,
+                            "sequence_static_length": int(static_length),
+                            "tensor_metadata_state": "dynamic",
+                            "program_abi_rank": 1 + len(tuple(
+                                accounting.get("sequence_row_shape") or ()
+                            )),
+                        }
+                    receipts.append((
+                        iterable_id, int(owner), method,
+                        int(static_length),
+                        "declared_keyed_mapping_static_extent",
+                    ))
                 continue
             mapping_id, slots = selected
-            iterable_id = int(data.get("value_id", node_id))
             replacements[iterable_id] = slots[columns[0]]
             receipts.append((
                 iterable_id,
@@ -34225,6 +34441,247 @@ def _class_surface_ssa_program(
                         ),
                         None,
                     )
+                # A row selected from a Sequence[Record] is deliberately not
+                # a second physical object.  Its semantic value is the loop's
+                # induction index and its storage remains the source
+                # sequence's column arenas.  Whole-row consumers (notably an
+                # append into another resident sequence) nevertheless need a
+                # record descriptor so the ordinary record-row ABI expansion
+                # below can enumerate those columns.  Materialize that view
+                # only on demand, from the exact projection binding published
+                # by source/control lowering.  This is index arithmetic over
+                # the existing arenas, not reconstruction of a Python object
+                # or publication of parallel storage.
+                row_projection_diagnostic = None
+                if descriptor is None and abi_record is not None:
+                    row_bindings = tuple(
+                        binding
+                        for binding in function.metadata.get(
+                            "record_sequence_projection_bindings", ()
+                        )
+                        if len(binding) == 4
+                        and int(binding[1]) == int(semantic_id)
+                        and binding[3] == "induction"
+                    )
+                    if not row_bindings and caller_graph is not None:
+                        # Function composition may discard local-lowering
+                        # metadata, but it retains the authoritative source
+                        # graph.  Recover the identical receipt from the
+                        # loop's declared target and iterable edges.
+                        graph_bindings = []
+                        for loop_node, loop_data in caller_graph.nodes(
+                            data=True
+                        ):
+                            attributes = loop_data.get("attributes") or {}
+                            targets = dict(
+                                attributes.get("loop_target_bindings") or {}
+                            )
+                            if int(semantic_id) not in set(map(
+                                int, targets.values()
+                            )):
+                                continue
+                            iterables = tuple(
+                                int(caller_graph.nodes[parent].get(
+                                    "value_id", parent
+                                ))
+                                for parent, role in (
+                                    loop_data.get("parents") or ()
+                                )
+                                if str(role) == "iterable"
+                                and parent in caller_graph
+                            )
+                            if len(iterables) == 1:
+                                graph_bindings.append((
+                                    int(iterables[0]), int(semantic_id),
+                                    str(loop_node), "induction",
+                                ))
+                        row_bindings = tuple(dict.fromkeys(graph_bindings))
+                    sequence_table = all_sequence_tables.get(function_name)
+                    if len(row_bindings) == 1 and sequence_table is not None:
+                        source_sequence_id = int(row_bindings[0][0])
+                        source_sequence = sequence_table.by_id(
+                            source_sequence_id
+                        )
+                        physical_columns = _record_row_physical_columns(
+                            abi_record
+                        )
+                        row_index = current_values.get(int(descriptor_id))
+                        if row_index is None:
+                            row_index = current_values.get(int(semantic_id))
+                        source_arenas = () if source_sequence is None else tuple(
+                            current_values.get(int(value_id))
+                            for value_id in source_sequence.column_value_ids
+                        )
+                        if (
+                            row_index is not None
+                            and source_sequence is not None
+                            and len(source_arenas) == len(physical_columns)
+                            and all(arena is not None for arena in source_arenas)
+                        ):
+                            projected_fields = tuple(
+                                (int(value_id), str(field_name), str(dtype))
+                                for value_id, field_name, dtype
+                                in function.metadata.get(
+                                    "record_sequence_projection_fields", ()
+                                )
+                                if int(value_id) in current_values
+                            )
+                            indexed_values: list[tuple[str, str, int]] = []
+                            projection_instructions = []
+                            for column_index, (
+                                column_name, column_dtype,
+                            ) in enumerate(physical_columns):
+                                existing = tuple(
+                                    value_id
+                                    for value_id, field_name, dtype
+                                    in projected_fields
+                                    if field_name == str(column_name)
+                                    and dtype == str(column_dtype)
+                                    and not any(
+                                        prior_name == str(column_name)
+                                        and prior_id == int(value_id)
+                                        for prior_name, _prior_dtype, prior_id
+                                        in indexed_values
+                                    )
+                                )
+                                if len(existing) == 1:
+                                    projected_id = int(existing[0])
+                                else:
+                                    address = SSAValue(
+                                        GLOBAL_MONOTONIC_IDS.mint(), dtype="ptr"
+                                    )
+                                    projected = SSAValue(
+                                        GLOBAL_MONOTONIC_IDS.mint(),
+                                        dtype=str(column_dtype),
+                                        accounting={
+                                            "record_row_projection": (
+                                                str(expected_identity),
+                                                int(source_sequence_id),
+                                                int(column_index),
+                                                int(semantic_id),
+                                            ),
+                                            "record_row_source_column": int(
+                                                source_arenas[column_index].id
+                                            ),
+                                        },
+                                    )
+                                    projection_instructions.extend((
+                                        Instr(
+                                            "GetElementPtr",
+                                            [
+                                                source_arenas[column_index],
+                                                row_index,
+                                            ],
+                                            address,
+                                            attributes={
+                                                "binding": (
+                                                    "record_sequence_row_column"
+                                                ),
+                                                "record_identity": str(
+                                                    expected_identity
+                                                ),
+                                                "source_sequence_id": int(
+                                                    source_sequence_id
+                                                ),
+                                                "column_index": int(
+                                                    column_index
+                                                ),
+                                            },
+                                        ),
+                                        Instr(
+                                            "Load", [address], projected,
+                                            attributes={
+                                                "binding": (
+                                                    "record_sequence_row_column"
+                                                ),
+                                                "record_identity": str(
+                                                    expected_identity
+                                                ),
+                                                "source_sequence_id": int(
+                                                    source_sequence_id
+                                                ),
+                                                "column_index": int(
+                                                    column_index
+                                                ),
+                                            },
+                                        ),
+                                    ))
+                                    current_values[int(projected.id)] = projected
+                                    projected_id = int(projected.id)
+                                indexed_values.append((
+                                    str(column_name), str(column_dtype),
+                                    int(projected_id),
+                                ))
+                            descriptor_fields = []
+                            for column_name, column_dtype in physical_columns:
+                                if any(
+                                    field.name == str(column_name)
+                                    for field in descriptor_fields
+                                ):
+                                    continue
+                                member_ids = tuple(
+                                    value_id
+                                    for member_name, _member_dtype, value_id
+                                    in indexed_values
+                                    if member_name == str(column_name)
+                                )
+                                descriptor_fields.append(
+                                    SSARecordFieldDescriptor(
+                                        str(column_name),
+                                        (
+                                            SSARecordFieldStorage.SPAN
+                                            if len(member_ids) > 1
+                                            else SSARecordFieldStorage.SCALAR
+                                        ),
+                                        storage_identity=(
+                                            f"{expected_identity}.{column_name}"
+                                        ),
+                                        value_ids=member_ids,
+                                        dtype=str(column_dtype),
+                                        writable=False,
+                                    )
+                                )
+                            if projection_instructions:
+                                insertion_index = block.instrs.index(instruction)
+                                block.instrs[
+                                    insertion_index:insertion_index
+                                ] = projection_instructions
+                            if record_table is None:
+                                record_table = all_record_tables.setdefault(
+                                    function_name,
+                                    SSARecordTable(owner=function_name),
+                                )
+                            descriptor = record_table.register(
+                                SSARecordDescriptor(
+                                    int(descriptor_id),
+                                    str(expected_identity),
+                                    tuple(descriptor_fields),
+                                )
+                            )
+                        else:
+                            row_projection_diagnostic = {
+                                "row_bindings": row_bindings,
+                                "source_sequence_id": (
+                                    None if len(row_bindings) != 1
+                                    else int(row_bindings[0][0])
+                                ),
+                                "sequence_available": (
+                                    source_sequence is not None
+                                ),
+                                "source_columns": tuple(
+                                    None if arena is None else int(arena.id)
+                                    for arena in source_arenas
+                                ),
+                                "expected_columns": tuple(physical_columns),
+                                "row_index_available": row_index is not None,
+                            }
+                    else:
+                        row_projection_diagnostic = {
+                            "row_bindings": row_bindings,
+                            "sequence_table_available": (
+                                sequence_table is not None
+                            ),
+                        }
                 fields_by_name = {
                     str(field.name): field
                     for field in (() if descriptor is None else descriptor.fields)
@@ -34386,7 +34843,11 @@ def _class_surface_ssa_program(
                 )
                 reason = None
                 if descriptor is None:
-                    reason = "record descriptor is unavailable after native linking"
+                    reason = (
+                        "record descriptor is unavailable after native linking; "
+                        "indexed-row projection="
+                        f"{row_projection_diagnostic!r}"
+                    )
                 elif not (
                     str(descriptor.identity) == str(expected_identity)
                     or (
@@ -39034,6 +39495,9 @@ def _class_surface_ssa_program(
             ),
             metadata=module_metadata,
         )
+    from .identity_concordance import publish_projected_iterable_layouts
+
+    publish_projected_iterable_layouts(lowered_module)
     # Whole-program source-call linking above is the first point at which a
     # producer aggregate and a later planned projection adapter coexist in one
     # module.  Legalize that structural handoff here so every downstream
@@ -39047,32 +39511,73 @@ def _class_surface_ssa_program(
         settle_repository_ssa_static_extent_operands,
     )
     if tensor_ssa_reference is not None:
-        late_tensor_functions = {
-            name: function
+        # Projected sequence rows only acquire their physical element shape
+        # after whole-program call linking.  Carry that newly authoritative
+        # metadata across every existing call edge before deciding which
+        # unresolved tensor operations need one final lowering attempt.
+        propagate_repository_ssa_call_metadata(lowered_module)
+
+        # Tensor lowering owns both sides of every repository call edge: a
+        # dynamic operation may add shape/rank/count formals to a planned
+        # region and must add their actuals to its parent call in the same
+        # transaction.  Begin with functions that still contain semantic
+        # tensor work, then close that set backwards over exact Call edges.
+        # This is the graph slice affected by the retry: it includes every
+        # caller whose ABI can change without revisiting unrelated regions
+        # whose tensor contracts have already settled.
+        late_tensor_names = {
+            str(name)
             for name, function in lowered_module.functions.items()
             if any(
                 instruction.attributes.get(
                     "recovered_structural_input_view"
                 )
+                or str(instruction.op) in {"Indexed", "IndexedStore"}
+                or any(
+                    instruction.attributes.get(key) is not None
+                    for key in (
+                        "tensor_operation", "tensor", "tensor_candidate",
+                    )
+                )
                 for block in function.blocks.values()
                 for instruction in block.instrs
             )
         }
+        changed = True
+        while changed:
+            changed = False
+            for caller_name, caller in lowered_module.functions.items():
+                if str(caller_name) in late_tensor_names:
+                    continue
+                if any(
+                    str(instruction.attributes.get("callee") or "")
+                    in late_tensor_names
+                    for block in caller.blocks.values()
+                    for instruction in block.instrs
+                    if str(instruction.op).casefold() == "call"
+                ):
+                    late_tensor_names.add(str(caller_name))
+                    changed = True
         late_tensor_module = IRModule(
-            late_tensor_functions,
+            {
+                name: lowered_module.functions[name]
+                for name in late_tensor_names
+            },
             tensor_tables={
                 name: lowered_module.tensor_tables[name]
-                for name in late_tensor_functions
+                for name in late_tensor_names
                 if name in lowered_module.tensor_tables
             },
         )
         late_tensor_shortfalls = lower_tensor_calls_to_repository_ssa(
             late_tensor_module, tensor_ssa_reference,
         )
-        for name in late_tensor_functions:
-            table = late_tensor_module.tensor_tables.get(name)
-            if table is not None:
-                lowered_module.tensor_tables[name] = table
+        for name, function in late_tensor_module.functions.items():
+            lowered_module.functions.setdefault(name, function)
+        for name, table in late_tensor_module.tensor_tables.items():
+            lowered_module.tensor_tables.setdefault(name, table)
+        propagate_repository_ssa_call_metadata(lowered_module)
+        settle_repository_ssa_static_extent_operands(lowered_module)
         if late_tensor_shortfalls:
             lowered_module.metadata["late_tensor_lowering_shortfalls"] = tuple(
                 {

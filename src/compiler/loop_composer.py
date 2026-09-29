@@ -245,11 +245,11 @@ def planned_collection_bindings(
     graph: Any,
     loop: LoopDescriptor,
     resident_value_ids: frozenset[int] | None = None,
-) -> tuple[tuple[int, int, str, int], ...]:
+) -> tuple[tuple[int, int, str, int | str], ...]:
     """Lower supported loop-state effects to resident indexed writes."""
 
     induction_name = f"iteration_{int(loop.node_id)}"
-    source_start = int(0 if loop.start is None else loop.start)
+    source_start = 0 if loop.start is None else loop.start
     bindings = []
     for effect in loop.state_effects:
         if (
@@ -2836,6 +2836,26 @@ class LoopComposer:
                 "list", "set", "tuple", "bytes", "bytearray", "dict",
             }:
                 return True
+            # A value used as another authored loop's iterable already owns
+            # the resident sequence domain for that loop.  A nested tail such
+            # as ``for other in items[index + 1:]`` must therefore remain a
+            # view of ``items`` with an adjusted start, not become a second
+            # physical collection merely because the value came from a call.
+            # The iterable edge is the proof; no operation name or captured
+            # Python value participates in this decision.
+            if any(
+                int(candidate) != int(node_id)
+                and isinstance(candidate_data.get("expr_obj"), (
+                    ast.For, ast.comprehension,
+                ))
+                and any(
+                    int(parent) == int(value_id)
+                    and str(role) in {"iterable", "iter"}
+                    for parent, role in candidate_data.get("parents") or ()
+                )
+                for candidate, candidate_data in graph.G.nodes(data=True)
+            ):
+                return True
             if str(data.get("type") or data.get("op") or "").casefold() != "getattr":
                 return False
             field_name = str(data_attributes.get("attribute") or "")
@@ -2900,7 +2920,7 @@ class LoopComposer:
                 and str(field.get("storage") or "") == "table"
             )
 
-        resident_tail_start: int | None = None
+        resident_tail_start: int | str | None = None
         resident_tail_domain_nodes: tuple[int, ...] = ()
         if (
             iterator_kind != "arithmetic_sequence"
@@ -2914,20 +2934,46 @@ class LoopComposer:
                 and iterator_expression.slice.step.value == 1
             )
         ):
-            lower = iterator_expression.slice.lower
-            lower_value = 0 if lower is None else (
-                lower.value if isinstance(lower, ast.Constant) else None
-            )
             indexed = graph.G.nodes[int(iterable_node)]
             base_id = next((
                 int(parent)
                 for parent, role in indexed.get("parents") or ()
                 if str(role) == "base" and int(parent) in graph.G
             ), None)
+            slice_id = next((
+                int(parent)
+                for parent, role in indexed.get("parents") or ()
+                if str(role) == "index" and int(parent) in graph.G
+                and isinstance(
+                    graph.G.nodes[int(parent)].get("expr_obj"), ast.Slice,
+                )
+            ), None)
+            lower = iterator_expression.slice.lower
+            lower_value: int | str | None = 0 if lower is None else (
+                int(lower.value)
+                if isinstance(lower, ast.Constant)
+                and isinstance(lower.value, int)
+                and not isinstance(lower.value, bool)
+                else None
+            )
+            if lower_value is None and slice_id is not None:
+                lower_id = next((
+                    int(parent)
+                    for parent, role in (
+                        graph.G.nodes[slice_id].get("parents") or ()
+                    )
+                    if str(role) == "lower" and int(parent) in graph.G
+                ), None)
+                if lower_id is not None:
+                    lower_value = "value_" + str(int(
+                        graph.G.nodes[lower_id].get("value_id", lower_id)
+                    ))
             if (
-                isinstance(lower_value, int)
-                and not isinstance(lower_value, bool)
-                and lower_value >= 0
+                lower_value is not None
+                and (
+                    not isinstance(lower_value, int)
+                    or lower_value >= 0
+                )
                 and base_id is not None
                 and resident_sequence(base_id)
             ):
@@ -2940,7 +2986,7 @@ class LoopComposer:
                     ),
                 )))
                 iterable_node = int(base_id)
-                resident_tail_start = int(lower_value)
+                resident_tail_start = lower_value
 
         # Numeric bounds belong only to source arithmetic sequences.  Graph
         # ingestion may annotate an ordinary iterable loop with the iteration

@@ -560,7 +560,9 @@ class ControlProgram:
     # (per-iteration source value, resident collection value, induction,
     # source start). Backends write the source into an indexed resident range;
     # they never reconstruct a Python list from observed iteration values.
-    collection_bindings: tuple[tuple[int, int, str, int], ...] = ()
+    collection_bindings: tuple[
+        tuple[int, int, str, int | str], ...
+    ] = ()
     # (aggregate value id, target value id, induction, resident source ids).
     # This is a planner identity list, not a reconstructed Python container.
     closure_iterable_bindings: tuple[

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from fnmatch import fnmatchcase
 import hashlib
@@ -247,6 +247,11 @@ class ProgramABIField:
     # under a keyed value record, the deterministic row identity selects a
     # slice from each flattened column arena.
     table_columns: tuple[Mapping[str, Any], ...] | None = None
+    # Exact record schema carried by every row of ``storage: table``.  This is
+    # the columnar counterpart of ``value_record`` on keyed storage: the row
+    # object is a correlation over the record's flattened physical columns,
+    # never an opaque Python object or a second allocation.
+    row_record: str | None = None
     # Optional values cross a native boundary as an explicit Boolean presence
     # cell plus the ordinary typed payload cell.  The payload is never used to
     # infer absence, so zero, NaN, and every finite value remain valid data.
@@ -274,6 +279,7 @@ class ProgramABIField:
             "token_vocabulary",
             "value_identity",
             "columns",
+            "row_record",
             "optional",
             "encoding",
             "scale",
@@ -371,22 +377,33 @@ class ProgramABIField:
                     f"{location}.token_vocabulary contains duplicate tokens"
                 )
         raw_columns = raw.get("columns")
+        row_record = raw.get("row_record")
         table_columns = None
         if storage == "table":
-            if not isinstance(raw_columns, (list, tuple)) or not raw_columns:
+            if row_record is not None:
+                row_record = str(row_record)
+                if not row_record:
+                    raise ExtractionContractError(
+                        f"{location}.row_record must name a record"
+                    )
+            if row_record is None and (
+                not isinstance(raw_columns, (list, tuple)) or not raw_columns
+            ):
                 raise ExtractionContractError(
-                    f"{location}.columns must be a non-empty list for table "
-                    "storage"
+                    f"{location} requires row_record or a non-empty columns "
+                    "list for table storage"
                 )
             columns = []
-            for position, raw_column in enumerate(raw_columns):
+            for position, raw_column in enumerate(raw_columns or ()):
                 column_location = f"{location}.columns[{position}]"
                 if not isinstance(raw_column, Mapping):
                     raise ExtractionContractError(
                         f"{column_location} must be a mapping"
                     )
                 extra_column = sorted(
-                    set(raw_column) - {"name", "dtype", "token_vocabulary"}
+                    set(raw_column) - {
+                        "name", "dtype", "token_vocabulary", "shape", "rank",
+                    }
                 )
                 if extra_column:
                     raise ExtractionContractError(
@@ -410,9 +427,42 @@ class ProgramABIField:
                         f"{column_location}.token_vocabulary must contain "
                         "non-empty strings"
                     )
+                column_shape = raw_column.get("shape")
+                if column_shape is not None and (
+                    not isinstance(column_shape, (list, tuple))
+                    or not all(
+                        isinstance(extent, int)
+                        and not isinstance(extent, bool)
+                        and extent >= 0
+                        for extent in column_shape
+                    )
+                ):
+                    raise ExtractionContractError(
+                        f"{column_location}.shape must contain non-negative "
+                        "integer extents"
+                    )
+                column_rank = raw_column.get(
+                    "rank", len(column_shape or ())
+                )
+                if (
+                    not isinstance(column_rank, int)
+                    or isinstance(column_rank, bool)
+                    or column_rank < 0
+                    or (
+                        column_shape is not None
+                        and column_rank != len(column_shape)
+                    )
+                ):
+                    raise ExtractionContractError(
+                        f"{column_location}.rank disagrees with its shape"
+                    )
                 columns.append({
                     "name": name,
                     "dtype": str(column_dtype),
+                    **({} if column_shape is None else {
+                        "shape": tuple(map(int, column_shape)),
+                        "rank": int(column_rank),
+                    }),
                     **({} if column_vocabulary is None else {
                         "token_vocabulary": tuple(map(str, column_vocabulary)),
                     }),
@@ -422,10 +472,14 @@ class ProgramABIField:
                 raise ExtractionContractError(
                     f"{location}.columns contains duplicate names"
                 )
-            table_columns = tuple(columns)
+            table_columns = tuple(columns) or None
         elif raw_columns is not None:
             raise ExtractionContractError(
                 f"{location}.columns is only valid for table storage"
+            )
+        elif row_record is not None:
+            raise ExtractionContractError(
+                f"{location}.row_record is only valid for table storage"
             )
         rank = raw.get("rank", 0)
         if not isinstance(rank, int) or isinstance(rank, bool) or rank < 0:
@@ -544,6 +598,7 @@ class ProgramABIField:
             token_vocabulary,
             value_identity,
             table_columns,
+            row_record,
             optional,
             encoding,
             scale,
@@ -587,6 +642,8 @@ class ProgramABIField:
                 }
                 for column in self.table_columns
             ]
+        if self.row_record is not None:
+            result["row_record"] = self.row_record
         if self.optional:
             result["optional"] = True
         if self.encoding is not None:
@@ -710,6 +767,104 @@ class ProgramABIContract:
                         f"{record_name}.fields.{field_name}.value_record names "
                         f"unknown record {field.value_record!r}"
                     )
+                if (
+                    field.row_record is not None
+                    and field.row_record not in records
+                ):
+                    raise ExtractionContractError(
+                        "program_abi.records."
+                        f"{record_name}.fields.{field_name}.row_record names "
+                        f"unknown record {field.row_record!r}"
+                    )
+
+        def row_columns(
+            record_name: str,
+            *,
+            prefix: str = "",
+            active: tuple[str, ...] = (),
+        ) -> tuple[Mapping[str, Any], ...]:
+            """Lower one declared row record to logical shaped SoA columns."""
+
+            if record_name in active:
+                raise ExtractionContractError(
+                    "program_abi table row_record cycle: "
+                    + " -> ".join((*active, record_name))
+                )
+            columns: list[Mapping[str, Any]] = []
+            record = records[record_name]
+            for field_name, row_field in record.fields.items():
+                name = f"{prefix}{field_name}"
+                if row_field.optional:
+                    columns.append({"name": f"{name}.__present", "dtype": "bool"})
+                if row_field.storage in {"scalar", "reference"}:
+                    column = {
+                        "name": name,
+                        "dtype": str(row_field.dtype or "opaque_ref"),
+                    }
+                    if row_field.token_vocabulary is not None:
+                        column["token_vocabulary"] = row_field.token_vocabulary
+                    columns.append(column)
+                    continue
+                if row_field.storage == "span":
+                    if row_field.shape is None:
+                        raise ExtractionContractError(
+                            "program_abi table row record "
+                            f"{record_name}.{field_name} requires an exact shape"
+                        )
+                    columns.append({
+                        "name": name,
+                        "dtype": str(row_field.dtype),
+                        "shape": tuple(map(int, row_field.shape)),
+                        "rank": len(row_field.shape),
+                    })
+                    continue
+                if row_field.storage == "record":
+                    columns.extend(row_columns(
+                        str(row_field.record),
+                        prefix=f"{name}.",
+                        active=(*active, record_name),
+                    ))
+                    continue
+                raise ExtractionContractError(
+                    "program_abi table row record "
+                    f"{record_name}.{field_name} uses unsupported "
+                    f"{row_field.storage!r} storage"
+                )
+            names = tuple(str(column["name"]) for column in columns)
+            if len(names) != len(set(names)):
+                raise ExtractionContractError(
+                    f"program_abi table row record {record_name} has duplicate "
+                    "flattened column names"
+                )
+            return tuple(columns)
+
+        # Resolve the schema edge once, at contract construction.  Every
+        # downstream consumer then sees the same row identity and the same
+        # physical column order; none needs a private reconstruction cache.
+        normalized_records: dict[str, ProgramABIRecord] = {}
+        for record_name, record in records.items():
+            fields = {}
+            for field_name, abi_field in record.fields.items():
+                if abi_field.row_record is None:
+                    fields[field_name] = abi_field
+                    continue
+                derived_columns = row_columns(str(abi_field.row_record))
+                if (
+                    abi_field.table_columns is not None
+                    and tuple(abi_field.table_columns) != derived_columns
+                ):
+                    raise ExtractionContractError(
+                        "program_abi.records."
+                        f"{record_name}.fields.{field_name}.columns disagrees "
+                        f"with row_record {abi_field.row_record!r}"
+                    )
+                fields[field_name] = replace(
+                    abi_field, table_columns=derived_columns,
+                )
+            normalized_records[record_name] = ProgramABIRecord(
+                record.identity, fields
+            )
+        records = normalized_records
         raw_bindings = raw.get("bindings", ())
         if not isinstance(raw_bindings, list):
             raise ExtractionContractError("program_abi.bindings must be a list")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import copy
 import logging
+import math
 import os
 import re
 import sys
@@ -1795,7 +1796,9 @@ class _ControlSSABuilder:
                 continue
             from .ir_sequence_tables import lower_sequence_contains
 
-            helper_name = f"ssa_sequence_{int(sequence_id)}_contains"
+            helper_name = self._sequence_helper_name(
+                int(sequence_id), "contains",
+            )
             lowering = lower_sequence_contains(
                 descriptor,
                 function_name=helper_name,
@@ -1880,6 +1883,23 @@ class _ControlSSABuilder:
                 continue
             self._emit_table_delete(effect_id, key_id, sequence_id, storage_identity)
 
+    def _sequence_helper_name(
+        self, sequence_id: int, operation: str, *related_ids: int,
+    ) -> str:
+        """Name function-local sequence storage in the repository namespace.
+
+        Sequence identities are deliberately local to one lowered function.
+        Their helper symbols therefore have to retain that owner identity too;
+        spelling only the numeric id lets an unrelated function's helper
+        overwrite this one when the per-function modules are assembled.
+        """
+
+        suffix = "".join(f"_{int(value_id)}" for value_id in related_ids)
+        return (
+            f"{self.function_name}__ssa_sequence_{int(sequence_id)}_"
+            f"{operation}{suffix}"
+        )
+
     def _table_query_values(
         self, query_ids: int | tuple[int, ...]
     ) -> tuple[SSAValue, ...]:
@@ -1904,10 +1924,9 @@ class _ControlSSABuilder:
         from .ir_sequence_tables import lower_table_lookup
 
         default_literal = self.table_lookup_defaults.get(int(result_id))
-        helper_name = (
-            f"ssa_sequence_{int(sequence_id)}_lookup_or_default"
-            if default_literal is not None
-            else f"ssa_sequence_{int(sequence_id)}_lookup"
+        helper_name = self._sequence_helper_name(
+            int(sequence_id),
+            "lookup_or_default" if default_literal is not None else "lookup",
         )
         lowering = lower_table_lookup(
             descriptor,
@@ -2108,7 +2127,7 @@ class _ControlSSABuilder:
             return
         from .ir_sequence_tables import lower_table_store
 
-        helper_name = f"ssa_sequence_{int(sequence_id)}_store"
+        helper_name = self._sequence_helper_name(int(sequence_id), "store")
         lowering = lower_table_store(
             descriptor,
             function_name=helper_name,
@@ -2249,7 +2268,8 @@ class _ControlSSABuilder:
                 from .ir_sequence_tables import lower_child_table_delete
 
                 helper_name = (
-                    f"ssa_child_table_{int(match.group(1))}_delete"
+                    f"{self.function_name}__ssa_child_table_"
+                    f"{int(match.group(1))}_delete"
                 )
                 lowering = lower_child_table_delete(
                     pool,
@@ -2300,14 +2320,18 @@ class _ControlSSABuilder:
         first_live = isinstance(key_id, tuple) and not key_id
         if first_live:
             from .ir_sequence_tables import lower_table_delete_first
-            helper_name = f"ssa_sequence_{int(sequence_id)}_delete_first"
+            helper_name = self._sequence_helper_name(
+                int(sequence_id), "delete_first",
+            )
             lowering = lower_table_delete_first(
                 descriptor,
                 function_name=helper_name,
                 first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
             )
         else:
-            helper_name = f"ssa_sequence_{int(sequence_id)}_delete"
+            helper_name = self._sequence_helper_name(
+                int(sequence_id), "delete",
+            )
             lowering = lower_table_delete(
                 descriptor,
                 function_name=helper_name,
@@ -2344,7 +2368,7 @@ class _ControlSSABuilder:
             return
         from .ir_sequence_tables import lower_sequence_fill
 
-        helper_name = f"ssa_sequence_{int(sequence_id)}_fill"
+        helper_name = self._sequence_helper_name(int(sequence_id), "fill")
         lowering = lower_sequence_fill(
             descriptor,
             function_name=helper_name,
@@ -2390,7 +2414,9 @@ class _ControlSSABuilder:
             return
         from .ir_sequence_tables import lower_sequence_append_fill
 
-        helper_name = f"ssa_sequence_{int(sequence_id)}_append_fill"
+        helper_name = self._sequence_helper_name(
+            int(sequence_id), "append_fill",
+        )
         lowering = lower_sequence_append_fill(
             descriptor,
             function_name=helper_name,
@@ -2441,9 +2467,8 @@ class _ControlSSABuilder:
             return
         from .ir_sequence_tables import lower_sequence_append_slice
 
-        helper_name = (
-            f"ssa_sequence_{int(destination_id)}_append_slice_"
-            f"{int(source_id)}"
+        helper_name = self._sequence_helper_name(
+            int(destination_id), "append_slice", int(source_id),
         )
         lowering = lower_sequence_append_slice(
             destination,
@@ -2550,8 +2575,8 @@ class _ControlSSABuilder:
             return
         from .ir_sequence_tables import lower_sequence_pack_bits
 
-        helper_name = (
-            f"ssa_sequence_{int(destination_id)}_pack_bits_{int(source_id)}"
+        helper_name = self._sequence_helper_name(
+            int(destination_id), "pack_bits", int(source_id),
         )
         lowering = lower_sequence_pack_bits(
             destination,
@@ -2619,7 +2644,7 @@ class _ControlSSABuilder:
             return
         from .ir_sequence_tables import lower_sequence_prepend
 
-        helper_name = f"ssa_sequence_{int(sequence_id)}_prepend"
+        helper_name = self._sequence_helper_name(int(sequence_id), "prepend")
         lowering = lower_sequence_prepend(
             descriptor,
             function_name=helper_name,
@@ -2667,9 +2692,8 @@ class _ControlSSABuilder:
             return
         from .ir_sequence_tables import lower_sequence_prepend_packed_bytes
 
-        helper_name = (
-            f"ssa_sequence_{int(destination_id)}_prepend_packed_"
-            f"{int(source_id)}"
+        helper_name = self._sequence_helper_name(
+            int(destination_id), "prepend_packed", int(source_id),
         )
         lowering = lower_sequence_prepend_packed_bytes(
             destination,
@@ -2967,12 +2991,52 @@ class _ControlSSABuilder:
         attributes: dict[str, Any],
         claim_provisional_definition: bool = False,
     ) -> SSAValue:
-        address = self.fresh_value(dtype="ptr")
         indices = (
             tuple(index)
             if isinstance(index, (tuple, list))
             else (index,)
         )
+        row_shape = tuple(map(
+            int,
+            (source.accounting or {}).get("sequence_row_shape") or (),
+        ))
+        if row_shape and len(indices) == 1:
+            # A shaped sequence column is one flat arena. Selecting row i is
+            # an address view at i * elements_per_row; it neither loads one
+            # scalar nor materializes a second tensor object.
+            linear_index = indices[0]
+            row_width = math.prod(row_shape)
+            if row_width != 1:
+                offset = self.fresh_value(dtype="int64")
+                self.emit(
+                    Handler.Mul,
+                    [linear_index, self.constant_value(int(row_width))],
+                    offset,
+                    attributes={
+                        **attributes,
+                        "binding": "shaped_sequence_row_offset",
+                        "row_shape": row_shape,
+                    },
+                )
+                linear_index = offset
+            result = self.produced_value(
+                result_id,
+                dtype=str(source.dtype or "unknown"),
+                claim_provisional_definition=claim_provisional_definition,
+            )
+            result.shape = row_shape
+            self.emit(
+                Handler.GetElementPtr,
+                [source, linear_index],
+                result,
+                attributes={
+                    **attributes,
+                    "binding": "shaped_sequence_row_view",
+                    "row_shape": row_shape,
+                },
+            )
+            return result
+        address = self.fresh_value(dtype="ptr")
         self.emit(
             Handler.GetElementPtr,
             [source, *indices],
@@ -3283,7 +3347,7 @@ class _ControlSSABuilder:
         state_page = book.page("loop_entry_state")
         entry_page = book.page("loop_carried_entry")
         key = (str(self.tensor_shape_concordance_scope), int(loop_node))
-        states: dict[int, tuple[set, Any]] = {}
+        states: dict[int, set] = {}
         for entry, (updated_id, initial_id, initial_value, *_rest) in (
             enumerate(carried)
         ):
@@ -3293,9 +3357,7 @@ class _ControlSSABuilder:
             ))
             if bindings is None:
                 continue
-            owned, before = states.setdefault(
-                int(initial_id), (set(), initial_value),
-            )
+            owned = states.setdefault(int(initial_id), set())
             owned.update(bindings)
             # Row ``(control scope, loop, binding)`` -> the carried entry
             # that binding is.  Two bindings seeded from one value
@@ -3303,9 +3365,16 @@ class _ControlSSABuilder:
             # are distinct entries with distinct header Phis.
             for binding in bindings:
                 entry_page.concord((*key, str(binding)), int(entry))
-        for initial_id, (owned, before) in states.items():
+        for initial_id, owned in states.items():
+            # The book records the authored state identity, never a physical
+            # SSAValue from one lowering.  One ControlProgram may be lowered
+            # more than once while specializations settle; retaining the
+            # first lowering's SSA object made the next lowering disagree on
+            # incidental dtype/shape metadata for the same semantic row.
+            # Its concrete pre-loop value is already owned by this builder's
+            # loop frame and is recovered there by _resolve_read.
             state_page.concord(
-                (*key, initial_id), (tuple(sorted(owned)), before),
+                (*key, initial_id), (tuple(sorted(owned)), int(initial_id)),
             )
         self.loop_frames[key] = {"carried": carried, "latch": False}
         return key
@@ -3366,7 +3435,16 @@ class _ControlSSABuilder:
             state = state_page.latest((*key, int(value_id)))
             if state is None:
                 continue
-            carried, before = set(state[0]), state[1]
+            carried = set(state[0])
+            frame = self.loop_frames.get(key)
+            before = None
+            if frame is not None:
+                before = next((
+                    initial
+                    for _updated_id, initial_id, initial, *_rest
+                    in frame["carried"]
+                    if int(initial_id) == int(value_id)
+                ), None)
             if bindings <= carried:
                 entry_value = self._carried_entry_value(
                     key, int(value_id), bindings, reader,
@@ -3384,7 +3462,8 @@ class _ControlSSABuilder:
                     f"as bindings {sorted(bindings, key=repr)!r}, of which "
                     f"the enclosing loop carries only {sorted(carried)!r}"
                 )
-            candidate = before
+            if before is not None:
+                candidate = before
         return candidate
 
     def _carried_entry_value(
@@ -6167,8 +6246,8 @@ class _ControlSSABuilder:
                     return
                 from .ir_sequence_tables import lower_table_lookup
 
-                lookup_name = (
-                    f"ssa_sequence_{destination.sequence_id}_setdefault_lookup"
+                lookup_name = self._sequence_helper_name(
+                    int(destination.sequence_id), "setdefault_lookup",
                 )
                 lookup = lower_table_lookup(
                     destination,
@@ -6313,6 +6392,7 @@ class _ControlSSABuilder:
         call_arguments: tuple[SSAValue, ...]
         deferred_record_row: tuple[int, str, int] | None = None
         deferred_record_slots: tuple[tuple[int, int, str, int], ...] = ()
+        indexed_record_row_source: tuple[int, int, str] | None = None
         if operation in {"append", "add"}:
             expected_columns = len(destination.column_value_ids)
             record_slots = self.sequence_row_record_slots.get(
@@ -6357,11 +6437,47 @@ class _ControlSSABuilder:
                     and len(mutation.argument_value_ids) == 1
                     and expected_columns > 1
                 ):
-                    deferred_record_row = (
-                        int(mutation.argument_value_ids[0]),
-                        str(record_identity),
-                        int(expected_columns),
+                    row_value_id = int(mutation.argument_value_ids[0])
+                    row_sources = tuple(
+                        (
+                            int(iterable_id), int(target_id),
+                            str(induction_name),
+                        )
+                        for iterable_id, target_id, induction_name, projection
+                        in self.program.projected_iterable_bindings
+                        if int(target_id) == row_value_id
+                        and projection == "induction"
                     )
+                    row_source = (
+                        None if len(row_sources) != 1
+                        else self.sequence_descriptors.get(
+                            int(row_sources[0][0])
+                        )
+                    )
+                    source_row_identity = (
+                        None if row_source is None
+                        else self.sequence_record_identities.get(
+                            int(row_source.sequence_id)
+                        )
+                    )
+                    if (
+                        row_source is not None
+                        and len(row_source.column_value_ids)
+                        == int(expected_columns)
+                        and (
+                            source_row_identity is None
+                            or str(source_row_identity) == str(record_identity)
+                            or str(source_row_identity).rsplit(".", 1)[-1]
+                            == str(record_identity).rsplit(".", 1)[-1]
+                        )
+                    ):
+                        indexed_record_row_source = row_sources[0]
+                    else:
+                        deferred_record_row = (
+                            row_value_id,
+                            str(record_identity),
+                            int(expected_columns),
+                        )
                 else:
                     self.shortfalls.append(SSALoweringShortfall(
                         "ssa-sequence", operation, location,
@@ -6394,7 +6510,9 @@ class _ControlSSABuilder:
                 )
                 if singleton_value_id is None and source is None:
                     return
-                count_name = f"ssa_sequence_{destination.sequence_id}_append"
+                count_name = self._sequence_helper_name(
+                    int(destination.sequence_id), "append",
+                )
                 count_lowering = lower_sequence_append(
                     destination,
                     function_name=count_name,
@@ -6410,12 +6528,17 @@ class _ControlSSABuilder:
                     )
                     return
                 self._register_sequence_lowering(count_lowering)
-                flat_name = (
-                    f"ssa_sequence_{joined_flat_id}_append_singleton_"
-                    f"{source_id}"
-                    if singleton_value_id is not None
-                    else f"ssa_sequence_{joined_flat_id}_extend_"
-                    f"{source.sequence_id}"
+                flat_name = self._sequence_helper_name(
+                    int(joined_flat_id),
+                    (
+                        "append_singleton"
+                        if singleton_value_id is not None else "extend"
+                    ),
+                    (
+                        int(source_id)
+                        if singleton_value_id is not None
+                        else int(source.sequence_id)
+                    ),
                 )
                 flat_lowering = (
                     lower_sequence_append(
@@ -6512,8 +6635,8 @@ class _ControlSSABuilder:
                         attributes={"binding": "ssa_sequence_status"},
                     )
                 return
-            function_name = (
-                f"ssa_sequence_{destination.sequence_id}_{operation}"
+            function_name = self._sequence_helper_name(
+                int(destination.sequence_id), str(operation),
             )
             lowering = (
                 lower_sequence_append(
@@ -6545,6 +6668,56 @@ class _ControlSSABuilder:
                     ),
                 )
             )
+            if indexed_record_row_source is not None:
+                source_id, _row_target_id, induction_name = (
+                    indexed_record_row_source
+                )
+                source_descriptor = self.sequence_descriptors[int(source_id)]
+                source_columns = self.sequence_storage_values[int(source_id)][
+                    :len(source_descriptor.column_value_ids)
+                ]
+                row_index = mutation_values[0]
+                indexed_values = []
+                for column_index, (source_column, column_dtype) in enumerate(
+                    zip(
+                        source_columns,
+                        source_descriptor.column_dtypes,
+                        strict=True,
+                    )
+                ):
+                    existing_targets = tuple(
+                        int(target_id)
+                        for (
+                            iterable_id, target_id, projected_induction,
+                            projection,
+                        ) in self.program.projected_iterable_bindings
+                        if int(iterable_id) == int(source_id)
+                        and str(projected_induction) == str(induction_name)
+                        and projection == int(column_index)
+                        and int(target_id) in self.external_values
+                    )
+                    if len(existing_targets) == 1:
+                        projected = self.external_values[existing_targets[0]]
+                    else:
+                        projected = self.indexed_load(
+                            source_column,
+                            row_index,
+                            GLOBAL_MONOTONIC_IDS.mint(),
+                            attributes={
+                                "binding": "record_sequence_row_column",
+                                "record_identity": str(
+                                    self.sequence_record_identities.get(
+                                        int(destination.sequence_id), ""
+                                    )
+                                ),
+                                "source_sequence_id": int(source_id),
+                                "column_index": int(column_index),
+                            },
+                        )
+                    if str(column_dtype) not in {"", "unknown", "None"}:
+                        projected.dtype = str(column_dtype)
+                    indexed_values.append(projected)
+                mutation_values = tuple(indexed_values)
             if deferred_record_row is None and not deferred_record_slots:
                 for mutation_value, element_dtype in zip(
                     mutation_values, destination.column_dtypes
@@ -6640,9 +6813,9 @@ class _ControlSSABuilder:
                         "", "None", "unknown",
                     }:
                         value.dtype = str(dtype)
-            function_name = (
-                f"ssa_sequence_{destination.sequence_id}_{operation}_"
-                f"{source.sequence_id}"
+            function_name = self._sequence_helper_name(
+                int(destination.sequence_id), str(operation),
+                int(source.sequence_id),
             )
             lowering = (lower_sequence_replace if operation == "replace" else lower_sequence_extend)(
                 destination,
@@ -6691,6 +6864,9 @@ class _ControlSSABuilder:
                 **({
                     "ssa_deferred_record_row": deferred_record_row,
                 } if deferred_record_row is not None else {}),
+                **({
+                    "ssa_indexed_record_row": indexed_record_row_source,
+                } if indexed_record_row_source is not None else {}),
                 **({
                     "ssa_deferred_record_slots": (
                         len(call_arguments) - len(mutation.argument_value_ids),
@@ -7671,6 +7847,10 @@ class _ControlSSABuilder:
                     target_dtype = (
                         None if target_meta is None else str(target_meta.dtype)
                     )
+                    target_shape = (
+                        () if target_meta is None
+                        else tuple(map(int, target_meta.shape or ()))
+                    )
                     if (
                         int(target_id) in self.nested_row_target_ids
                         and int(target_id)
@@ -7704,15 +7884,27 @@ class _ControlSSABuilder:
                         source = self.external_value(
                             iterable_id, dtype=target_dtype
                         )
+                        if target_shape:
+                            source.shape = target_shape
                         source.accounting.update({
                             "projected_row_source_id": int(iterable_id),
                             "projected_row_column": int(column_projection),
+                            **(
+                                {"sequence_row_shape": target_shape}
+                                if target_shape else {}
+                            ),
                         })
                     else:
-                        source = self.fresh_value(dtype=target_dtype)
+                        source = self.fresh_value(
+                            dtype=target_dtype, shape=target_shape,
+                        )
                         source.accounting.update({
                             "projected_row_source_id": int(iterable_id),
                             "projected_row_column": int(column_projection),
+                            **(
+                                {"sequence_row_shape": target_shape}
+                                if target_shape else {}
+                            ),
                         })
                         self.arguments.append(source)
                     self.projected_row_columns[column_key] = source
@@ -8075,8 +8267,10 @@ class _ControlSSABuilder:
             if induction_name != loop.induction:
                 continue
             publication_index = induction
-            if int(start):
-                offset = self.constant_value(int(start))
+            if str(start).strip() != "0":
+                offset = self.expression_value(
+                    str(start), location=f"{path}.collection-offset",
+                )
                 publication_index = self.fresh_value(dtype="int")
                 self.emit(
                     Handler.Add,
@@ -14394,6 +14588,25 @@ def lower_control_sections_to_ssa(
                 if len(descriptors) != 1:
                     continue
                 descriptor = next(iter(descriptors.values()))
+                if len(descriptor.column_value_ids) == 1:
+                    # The length cell and the row layout are two parts of one
+                    # sequence descriptor.  Planned regions previously
+                    # received the former while their arena formal lost the
+                    # latter, leaving an exact N-by-W sequence looking like a
+                    # rankless scalar to tensor lowering.  Publish the
+                    # descriptor receipt on that same formal; no new storage
+                    # or reconstructed identity is introduced.
+                    row_shape = tuple(
+                        (descriptor.column_shapes or ((),))[0]
+                    )
+                    argument.accounting = {
+                        **accounting,
+                        "sequence_id": int(descriptor.sequence_id),
+                        "sequence_row_shape": row_shape,
+                        "program_abi_storage": "span",
+                        "program_abi_rank": 1 + len(row_shape),
+                        "tensor_metadata_state": "dynamic",
+                    }
                 length_id = int(descriptor.length_address_id)
                 if length_id in existing_ids:
                     continue

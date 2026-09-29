@@ -79,6 +79,12 @@ class _ABIActivatedArgumentedDependencyOwner:
         return _source_helper(value)
 
 
+class _ABIActivatedLocalDependencyOwner:
+    def run(self, value):
+        prepared = _source_helper(value)
+        return prepared + 1
+
+
 class _ConstructorDependencyOwner:
     def __init__(self):
         self.value = _dependency_middle(3)
@@ -231,6 +237,45 @@ def test_record_abi_method_pursues_argumented_module_function_dependency():
                 "identity": (
                     f"{_ABIActivatedArgumentedDependencyOwner.__module__}."
                     f"{_ABIActivatedArgumentedDependencyOwner.__qualname__}"
+                ),
+            },),
+        )
+
+    helper_id, _helper = _definitions(graph, "_source_helper")[0]
+    helper_call_id, helper_call = next(
+        (node_id, data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Name)
+        and data["expr_obj"].func.id == "_source_helper"
+    )
+    assert graph.G.has_edge(helper_id, helper_call_id)
+    assert helper_call["attributes"]["resolved_ast_parent"] == helper_id
+
+    reduce_abstract_tensor_topology(graph)
+    helper_graph = graph.function_table.entry("_source_helper").graph
+    assert helper_graph.G.graph["source_pursuit_active"] is True
+
+
+def test_record_abi_method_pursues_module_dependency_before_return():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            ast.parse(
+                "def entry(owner, value):\n"
+                "    return owner.run(value)\n"
+            ),
+            resolve_unresolved_parents=True,
+            parent_include=_source_dependency_is_not_tensor_primitive,
+            pursuit_roots=("entry",),
+            retain=(_ABIActivatedLocalDependencyOwner,),
+            source_parameter_records=({
+                "function": "entry",
+                "parameter": "owner",
+                "record": "Owner",
+                "identity": (
+                    f"{_ABIActivatedLocalDependencyOwner.__module__}."
+                    f"{_ABIActivatedLocalDependencyOwner.__qualname__}"
                 ),
             },),
         )

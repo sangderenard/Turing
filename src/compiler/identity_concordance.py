@@ -70,6 +70,7 @@ Findings (each is one concrete disagreement, with the two claims):
 
 from __future__ import annotations
 
+import ast
 import contextvars
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -77,6 +78,651 @@ from collections.abc import MutableMapping
 from typing import Any, Iterable, Mapping
 
 from .id_space import group_by_prefix, label as id_label
+
+
+def publish_program_abi_graph_identities(
+    graph_obj: Any, *, force: bool = False,
+) -> None:
+    """Publish exact record/table identities along source graph edges.
+
+    ProgramABI names the root record.  GetAttr, table indexing, and loop
+    target bindings are the authoritative transformation spine from that
+    root to nested records.  Publishing the result on the graph value lets
+    every later consumer ask the same concordance instead of reconstructing
+    a field identity from a name or a local cache.
+    """
+
+    program_abi_source = graph_obj.graph.get("program_abi")
+    parameter_records_source = graph_obj.graph.get("parameter_record_abi")
+    identities_source = graph_obj.graph.get("identity_table")
+    program_abi = program_abi_source or {}
+    parameter_records = parameter_records_source or {}
+    identities = identities_source or {}
+    receipt = (
+        len(graph_obj),
+        int(graph_obj.number_of_edges()),
+        id(program_abi_source),
+        id(parameter_records_source),
+        id(identities_source),
+    )
+    if not force and graph_obj.graph.get(
+        "program_abi_identity_publication_receipt"
+    ) == receipt:
+        return
+
+    repository_records = dict(program_abi.get("records") or {})
+
+    def schema_named(identity: object):
+        matches = tuple(
+            (str(name), record)
+            for name, record in repository_records.items()
+            if str(name) == str(identity)
+            or str(record.get("identity") or "") == str(identity)
+        )
+        return matches[0] if len(matches) == 1 else None
+
+    for parameter_name, record in dict(
+        parameter_records
+    ).items():
+        record_identity = str(record.get("identity") or "")
+        for value_id in identities.get(str(parameter_name), ()):
+            for node_id, data in graph_obj.nodes(data=True):
+                if int(data.get("value_id", node_id)) == int(value_id):
+                    data.setdefault("attributes", {})[
+                        "program_abi_record_identity"
+                    ] = record_identity
+
+    changed = True
+    while changed:
+        changed = False
+        for node_id, data in graph_obj.nodes(data=True):
+            attributes = data.setdefault("attributes", {})
+            operation = str(
+                data.get("op") or data.get("type") or ""
+            ).casefold()
+            parents = tuple(
+                (parent, str(role))
+                for parent, role in data.get("parents") or ()
+                if parent in graph_obj
+            )
+            expression = data.get("expr_obj")
+            if isinstance(expression, ast.Call):
+                # Resolved calls are respelled to their semantic operation
+                # (``values``, ``tuple``, ...), so their graph operation is
+                # intentionally not the frontend word ``Call``.  Preserve
+                # identities using the exact authored call and parent edges.
+                if (
+                    isinstance(expression.func, ast.Attribute)
+                    and expression.func.attr == "values"
+                ):
+                    incoming = {
+                        identity
+                        for parent, role in parents
+                        if role in {
+                            "operand", "value", "receiver", "callee",
+                            "func", "function", "callable",
+                        }
+                        for identity in ((
+                            graph_obj.nodes[parent].get("attributes") or {}
+                        ).get("program_abi_sequence_row_identity"), (
+                            graph_obj.nodes[parent].get("attributes") or {}
+                        ).get("program_abi_indexed_value_identity"))
+                        if identity is not None
+                    }
+                    if len(incoming) == 1:
+                        row_identity = next(iter(incoming))
+                        if attributes.get(
+                            "program_abi_sequence_row_identity"
+                        ) != row_identity:
+                            attributes[
+                                "program_abi_sequence_row_identity"
+                            ] = row_identity
+                            changed = True
+                if (
+                    isinstance(expression.func, ast.Name)
+                    and expression.func.id in {"list", "tuple", "set"}
+                ):
+                    incoming = {
+                        (graph_obj.nodes[parent].get("attributes") or {}).get(
+                            "program_abi_sequence_row_identity"
+                        )
+                        for parent, role in parents
+                        if str(role).startswith("arg:")
+                        and (graph_obj.nodes[parent].get("attributes") or {}).get(
+                            "program_abi_sequence_row_identity"
+                        ) is not None
+                    }
+                    if len(incoming) == 1:
+                        row_identity = next(iter(incoming))
+                        if attributes.get(
+                            "program_abi_sequence_row_identity"
+                        ) != row_identity:
+                            attributes[
+                                "program_abi_sequence_row_identity"
+                            ] = row_identity
+                            changed = True
+            if operation == "getattr":
+                owner = next((
+                    graph_obj.nodes[parent]
+                    for parent, role in parents
+                    if role in {"value", "object", "base", "receiver"}
+                ), None)
+                owner_identity = (
+                    None if owner is None else
+                    (owner.get("attributes") or {}).get(
+                        "program_abi_record_identity"
+                    )
+                )
+                schema_match = (
+                    None if owner_identity is None
+                    else schema_named(owner_identity)
+                )
+                field_name = str(attributes.get("attribute") or "")
+                field = (
+                    None if schema_match is None else
+                    dict(schema_match[1].get("fields") or {}).get(field_name)
+                )
+                if isinstance(field, Mapping):
+                    storage = str(field.get("storage") or "")
+                    declared_shape = field.get("shape")
+                    if (
+                        declared_shape is None
+                        and storage == "span"
+                        and field.get("fixed_length") is not None
+                    ):
+                        declared_shape = (int(field["fixed_length"]),)
+                    if storage == "span" and declared_shape is not None:
+                        declared_shape = tuple(map(int, declared_shape))
+                        declared_state = {
+                            "shape": declared_shape,
+                            "dtype": str(field.get("dtype") or "float64"),
+                            "rank": int(field.get(
+                                "rank", len(declared_shape),
+                            )),
+                            "metadata_state": "static",
+                        }
+                        record_shape_transformation(
+                            f"ProgramABI:{owner_identity}",
+                            (str(owner_identity), field_name),
+                            graph_obj.graph.get("function_name"),
+                            int(data.get("value_id", node_id)),
+                            stage="program_abi_graph_publication",
+                            operation="getattr",
+                            source_state=declared_state,
+                            target_state=declared_state,
+                            role=field_name,
+                        )
+                    target_name = (
+                        field.get("record") if storage == "record"
+                        else field.get("row_record") if storage == "table"
+                        else field.get("value_record") if storage == "keyed"
+                        else None
+                    )
+                    target = (
+                        None if target_name is None
+                        else schema_named(target_name)
+                    )
+                    key = (
+                        "program_abi_sequence_row_identity"
+                        if storage == "table"
+                        else "program_abi_indexed_value_identity"
+                        if storage == "keyed"
+                        else "program_abi_record_identity"
+                    )
+                    if target is not None:
+                        identity = str(
+                            target[1].get("identity") or target[0]
+                        )
+                        if attributes.get(key) != identity:
+                            attributes[key] = identity
+                            changed = True
+                # ``mapping.values()`` is an identity-preserving view over
+                # the declared value side of that exact keyed field.  Keep
+                # the row identity on the accessor edge so the subsequent
+                # Call and retained comprehension loop do not have to
+                # rediscover it from a binding name or a Python container.
+                if (
+                    field_name == "values"
+                    and owner is not None
+                    and (
+                        owner.get("attributes") or {}
+                    ).get("program_abi_indexed_value_identity") is not None
+                ):
+                    row_identity = (owner.get("attributes") or {})[
+                        "program_abi_indexed_value_identity"
+                    ]
+                    if attributes.get(
+                        "program_abi_sequence_row_identity"
+                    ) != row_identity:
+                        attributes[
+                            "program_abi_sequence_row_identity"
+                        ] = row_identity
+                        changed = True
+            elif operation in {"indexed", "load"}:
+                base = next((
+                    graph_obj.nodes[parent]
+                    for parent, role in parents if role == "base"
+                ), None)
+                row_identity = (
+                    None if base is None else
+                    (
+                        (base.get("attributes") or {}).get(
+                            "program_abi_sequence_row_identity"
+                        )
+                        or (base.get("attributes") or {}).get(
+                            "program_abi_indexed_value_identity"
+                        )
+                    )
+                )
+                if row_identity is not None and attributes.get(
+                    "program_abi_record_identity"
+                ) != row_identity:
+                    attributes["program_abi_record_identity"] = row_identity
+                    changed = True
+            elif operation in {"for", "comprehension"}:
+                iterable = next((
+                    graph_obj.nodes[parent]
+                    for parent, role in parents if role in {"iterable", "iter"}
+                ), None)
+                row_identity = (
+                    None if iterable is None else
+                    (iterable.get("attributes") or {}).get(
+                        "program_abi_sequence_row_identity"
+                    )
+                )
+                if row_identity is not None:
+                    target_ids = set(map(int, dict(attributes.get(
+                        "loop_target_bindings", {}
+                    )).values()))
+                    for target_node in target_ids:
+                        if target_node not in graph_obj:
+                            continue
+                        target_data = graph_obj.nodes[target_node]
+                        target_attributes = target_data.setdefault(
+                            "attributes", {}
+                        )
+                        if target_attributes.get(
+                            "program_abi_record_identity"
+                        ) != row_identity:
+                            target_attributes[
+                                "program_abi_record_identity"
+                            ] = row_identity
+                            changed = True
+            elif isinstance(data.get("expr_obj"), (
+                ast.GeneratorExp, ast.ListComp, ast.SetComp,
+            )):
+                # The comprehension materializer is the same resident
+                # sequence whose row is its exact ``elt`` edge.  Publishing
+                # that edge preserves a record row as a columnar record ABI;
+                # it does not create a Python generator or a parallel object.
+                element = next((
+                    graph_obj.nodes[parent]
+                    for parent, role in parents if role == "elt"
+                ), None)
+                row_identity = (
+                    None if element is None else
+                    (element.get("attributes") or {}).get(
+                        "program_abi_record_identity"
+                    )
+                )
+                if row_identity is not None and attributes.get(
+                    "program_abi_sequence_row_identity"
+                ) != row_identity:
+                    attributes[
+                        "program_abi_sequence_row_identity"
+                    ] = row_identity
+                    changed = True
+            elif (
+                operation == "loopresult"
+                and attributes.get("result_kind") == "collection"
+            ):
+                # Loop composition replaces the comprehension materializer
+                # with this collection port.  Its ``value`` edge is the exact
+                # element that is appended once per iteration, so a record
+                # identity becomes the resident sequence's row identity.
+                incoming = {
+                    (graph_obj.nodes[parent].get("attributes") or {}).get(
+                        "program_abi_record_identity"
+                    )
+                    for parent, role in parents
+                    if role == "value"
+                    and (graph_obj.nodes[parent].get("attributes") or {}).get(
+                        "program_abi_record_identity"
+                    ) is not None
+                }
+                if len(incoming) == 1:
+                    row_identity = next(iter(incoming))
+                    if attributes.get(
+                        "program_abi_sequence_row_identity"
+                    ) != row_identity:
+                        attributes[
+                            "program_abi_sequence_row_identity"
+                        ] = row_identity
+                        changed = True
+            elif operation in {"phi", "boolop"}:
+                for key in (
+                    "program_abi_record_identity",
+                    "program_abi_sequence_row_identity",
+                    "program_abi_indexed_value_identity",
+                ):
+                    incoming = {
+                        (graph_obj.nodes[parent].get("attributes") or {}).get(
+                            key
+                        )
+                        for parent, _role in parents
+                        if (graph_obj.nodes[parent].get("attributes") or {}).get(
+                            key
+                        ) is not None
+                    }
+                    if len(incoming) == 1:
+                        identity = next(iter(incoming))
+                        if attributes.get(key) != identity:
+                            attributes[key] = identity
+                            changed = True
+
+    graph_obj.graph[
+        "program_abi_identity_publication_receipt"
+    ] = receipt
+
+
+def publish_projected_iterable_layouts(module: Any) -> None:
+    """Publish sequence layouts and live lengths along exact SSA call edges.
+
+    A projected row table is the columnar view of one authored iterable.  For
+    a generator call, its source id is also the retained callsite id.  The
+    callee sequence descriptor names the driver or returned materialization,
+    and ``callee_input_ids`` maps that descriptor's length cell back to the
+    caller's actual storage.  Recording that actual on every projected column
+    keeps iteration a live-length loop without inventing another container.
+
+    The same descriptor also owns the physical shape of every row column and
+    the returned sequence identity itself.  Publish those facts through the
+    call instruction's exact result and projected-column receipts.  These are
+    views of the callee's storage contract, not independently inferred tensor
+    objects.
+    """
+
+    functions = getattr(module, "functions", {}) or {}
+    sequence_tables = getattr(module, "sequence_tables", {}) or {}
+    for function_name, function in functions.items():
+        occurrences = (
+            *tuple(function.args),
+            *tuple(
+                value
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                for value in (
+                    *instruction.args,
+                    *((instruction.res,)
+                      if instruction.res is not None else ()),
+                )
+            ),
+        )
+        calls = tuple(
+            instruction
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"Call", "call"}
+        )
+        receipts = []
+        for call in calls:
+            callee_name = str(call.attributes.get("callee") or "")
+            callee = functions.get(callee_name)
+            table = sequence_tables.get(callee_name)
+            if callee is None or table is None:
+                continue
+            returned_ids = {
+                int(value.id)
+                for block in callee.blocks.values()
+                for instruction in block.instrs
+                if str(instruction.op).casefold() in {"ret", "return"}
+                for value in instruction.args
+            }
+            candidates = tuple(
+                descriptor
+                for descriptor in table.sequences.values()
+                if returned_ids.intersection(map(
+                    int, descriptor.column_value_ids
+                ))
+            )
+            if len(candidates) != 1:
+                driver_ids = {
+                    int(row[0])
+                    for row in callee.metadata.get(
+                        "projected_row_tables", ()
+                    )
+                    if len(row) >= 1
+                }
+                candidates = tuple(
+                    descriptor
+                    for descriptor in table.sequences.values()
+                    if int(descriptor.sequence_id) in driver_ids
+                )
+            if len(candidates) != 1:
+                continue
+            descriptor = candidates[0]
+            callee_inputs = tuple(map(
+                int, call.attributes.get("callee_input_ids", ())
+            ))
+            positions = tuple(
+                index for index, value_id in enumerate(callee_inputs)
+                if value_id == int(descriptor.length_address_id)
+            )
+            if len(positions) != 1 or positions[0] >= len(call.args):
+                continue
+            length = call.args[positions[0]]
+            changed = False
+            if call.res is not None:
+                result_id = int(call.res.id)
+                result_contract = tuple(
+                    call.attributes.get("native_result_contract", ())
+                )
+                result_shape = (
+                    tuple(result_contract[0][2])
+                    if len(result_contract) == 1
+                    and len(result_contract[0]) >= 3
+                    else tuple(call.res.shape or ())
+                )
+                result_dtype = (
+                    str(result_contract[0][1])
+                    if len(result_contract) == 1
+                    and len(result_contract[0]) >= 2
+                    and result_contract[0][1] not in {None, "", "unknown"}
+                    else call.res.dtype
+                )
+                for value in occurrences:
+                    if int(value.id) != result_id:
+                        continue
+                    value.shape = result_shape
+                    if result_dtype not in {None, "", "unknown"}:
+                        value.dtype = str(result_dtype)
+                    changed = True
+            source_receipt = call.attributes.get("plan_callsite_id")
+            if source_receipt is None:
+                if changed:
+                    receipts.append((
+                        None, callee_name,
+                        int(descriptor.sequence_id), int(length.id),
+                        None if call.res is None else int(call.res.id),
+                    ))
+                continue
+            source_id = int(source_receipt)
+            projected_rows = tuple(sorted(
+                (
+                    int(row[1]), int(row[2])
+                )
+                for row in function.metadata.get(
+                    "projected_row_tables", ()
+                )
+                if len(row) >= 3 and int(row[0]) == source_id
+            ))
+            physical_rows = tuple(
+                row for row in projected_rows if row[1] != source_id
+            )
+            if len(projected_rows) == len(descriptor.column_value_ids):
+                descriptor_column_by_projection = tuple(
+                    (projection, index)
+                    for index, (projection, _value_id)
+                    in enumerate(projected_rows)
+                )
+            elif len(physical_rows) == len(descriptor.column_value_ids):
+                # A yielded record handle remains a graph identity while its
+                # sibling tensors occupy physical sequence columns.  The row
+                # table marks that handle by retaining the driver id itself;
+                # excluding precisely that receipt aligns the remaining
+                # projections with the callee's physical descriptor.
+                descriptor_column_by_projection = tuple(
+                    (projection, index)
+                    for index, (projection, _value_id)
+                    in enumerate(physical_rows)
+                )
+            else:
+                descriptor_column_by_projection = ()
+
+            def descriptor_column(projection: int) -> int | None:
+                matches = tuple(
+                    index
+                    for candidate, index
+                    in descriptor_column_by_projection
+                    if candidate == int(projection)
+                )
+                return matches[0] if len(matches) == 1 else None
+
+            # Storage-returning collection calls have no SSA result: their
+            # source callsite value is the semantic sequence view.  Publish
+            # the callee's leased arena and live length on that exact value.
+            # A scalar/tensor return has ``call.res`` and is handled by its
+            # native result contract above instead.
+            if call.res is None:
+                row_shape = tuple(
+                    (descriptor.column_shapes or ((),))[0]
+                )
+                column_dtype = (
+                    descriptor.column_dtypes[0]
+                    if descriptor.column_dtypes else None
+                )
+                for value in occurrences:
+                    if int(value.id) != source_id:
+                        continue
+                    if column_dtype not in {None, "", "unknown"}:
+                        value.dtype = str(column_dtype)
+                    value.accounting = {
+                        **dict(value.accounting or {}),
+                        "sequence_id": int(descriptor.sequence_id),
+                        "sequence_length_value_id": int(length.id),
+                        "tensor_metadata_state": "dynamic",
+                        "sequence_row_shape": row_shape,
+                        "program_abi_rank": 1 + len(row_shape),
+                    }
+                    changed = True
+            for value in occurrences:
+                accounting = dict(value.accounting or {})
+                if int(accounting.get(
+                    "projected_row_source_id", -1
+                )) != source_id:
+                    continue
+                projection = int(
+                    accounting.get("projected_row_column") or 0
+                )
+                column = descriptor_column(projection)
+                value.accounting = {
+                    **accounting,
+                    "sequence_id": source_id,
+                    "sequence_length_value_id": int(length.id),
+                    "tensor_metadata_state": "dynamic",
+                }
+                if column is None:
+                    continue
+                row_shape = tuple(
+                    (descriptor.column_shapes or tuple(
+                        () for _ in descriptor.column_value_ids
+                    ))[column]
+                )
+                column_dtype = (
+                    descriptor.column_dtypes[column]
+                    if column < len(descriptor.column_dtypes)
+                    else value.dtype
+                )
+                if column_dtype not in {None, "", "unknown"}:
+                    value.dtype = str(column_dtype)
+                value.accounting = {
+                    **value.accounting,
+                    "sequence_row_shape": row_shape,
+                    "program_abi_rank": 1 + len(row_shape),
+                }
+                changed = True
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if (
+                        instruction.res is None
+                        or str(instruction.op).casefold() != "load"
+                        or instruction.attributes.get("binding")
+                        != "projected_iterable"
+                        or not instruction.args
+                    ):
+                        continue
+                    source = instruction.args[0]
+                    # Projected iteration lowers as column -> GEP -> Load.
+                    # The pointer is intentionally untyped; recover the
+                    # column only through its unique exact producer edge.
+                    producer = next((
+                        candidate
+                        for candidate_block in function.blocks.values()
+                        for candidate in candidate_block.instrs
+                        if candidate.res is not None
+                        and int(candidate.res.id) == int(source.id)
+                    ), None)
+                    if (
+                        producer is not None
+                        and str(producer.op).casefold()
+                        in {"getelementptr", "gep"}
+                        and producer.args
+                    ):
+                        source = producer.args[0]
+                    source_accounting = source.accounting or {}
+                    if int(source_accounting.get(
+                        "projected_row_source_id", -1
+                    )) != source_id:
+                        continue
+                    projection = int(source_accounting.get(
+                        "projected_row_column", 0
+                    ))
+                    column = descriptor_column(projection)
+                    if column is None:
+                        continue
+                    row_shape = tuple(
+                        (descriptor.column_shapes or tuple(
+                            () for _ in descriptor.column_value_ids
+                        ))[column]
+                    )
+                    column_dtype = (
+                        descriptor.column_dtypes[column]
+                        if column < len(descriptor.column_dtypes)
+                        else instruction.res.dtype
+                    )
+                    target_id = int(instruction.res.id)
+                    for value in occurrences:
+                        if int(value.id) != target_id:
+                            continue
+                        value.shape = row_shape
+                        if column_dtype not in {None, "", "unknown"}:
+                            value.dtype = str(column_dtype)
+                        value.accounting = {
+                            **dict(value.accounting or {}),
+                            "sequence_row_shape": row_shape,
+                            "program_abi_rank": len(row_shape),
+                        }
+                    changed = True
+            if changed:
+                receipts.append((
+                    source_id, callee_name,
+                    int(descriptor.sequence_id), int(length.id),
+                    None if call.res is None else int(call.res.id),
+                ))
+        if receipts:
+            function.metadata[
+                "projected_iterable_layout_receipts"
+            ] = tuple(receipts)
 
 
 @dataclass(frozen=True)
@@ -2117,6 +2763,207 @@ class SequenceRowLayout:
     column_dtypes: tuple[str, ...]
 
 
+def shape_transformation_state(descriptor: Any) -> tuple[Any, ...] | None:
+    """Canonical, lossless shape state carried by one transformation edge.
+
+    ``shape=()`` is retained: rank and metadata state distinguish a scalar
+    from a dynamic collection whose leading extent belongs to runtime
+    sequence storage.  ``sequence_row_shape`` is likewise explicit, because
+    it is the geometry of an element-to-collection transformation rather
+    than the complete collection shape.
+    """
+
+    if descriptor is None:
+        return None
+    if isinstance(descriptor, Mapping):
+        shape = tuple(map(int, descriptor.get("shape") or ()))
+        row_shape = descriptor.get("sequence_row_shape")
+        return (
+            shape,
+            str(descriptor.get("dtype") or "unknown"),
+            int(descriptor.get("rank", len(shape))),
+            str(descriptor.get("metadata_state") or "static"),
+            (
+                None if row_shape is None
+                else tuple(map(int, row_shape))
+            ),
+        )
+    if isinstance(descriptor, tuple) and len(descriptor) == 5:
+        shape, dtype, rank, metadata_state, row_shape = descriptor
+        return (
+            tuple(map(int, shape or ())), str(dtype or "unknown"),
+            int(rank), str(metadata_state or "static"),
+            None if row_shape is None else tuple(map(int, row_shape)),
+        )
+    raise TypeError(f"unsupported shape transformation state {descriptor!r}")
+
+
+def descriptor_from_shape_transformation_state(
+    state: Any,
+) -> dict[str, Any] | None:
+    """Reconstitute the descriptor recorded by the shared concordance."""
+
+    state = shape_transformation_state(state)
+    if state is None:
+        return None
+    shape, dtype, rank, metadata_state, row_shape = state
+    descriptor = {
+        "shape": tuple(shape), "dtype": str(dtype), "rank": int(rank),
+    }
+    if str(metadata_state) != "static":
+        descriptor["metadata_state"] = str(metadata_state)
+    if row_shape is not None:
+        descriptor["sequence_row_shape"] = tuple(row_shape)
+    return descriptor
+
+
+def record_shape_transformation(
+    source_scope: Any,
+    source_id: Any,
+    target_scope: Any,
+    target_id: Any,
+    *,
+    stage: Any,
+    operation: Any,
+    source_state: Any,
+    target_state: Any,
+    role: Any = "value",
+) -> tuple[Any, ...] | None:
+    """Append one exact source-to-target shape transformation to the book.
+
+    The edge page is the graph; its monotonically increasing columns are
+    compile time.  The state page is the consulted current projection of
+    that graph and retains every earlier projection as row history.  No
+    caller-local shape cache participates in the decision.
+    """
+
+    source_scope = authored_function_name(source_scope)
+    target_scope = authored_function_name(target_scope)
+    source = shape_transformation_state(source_state)
+    target = shape_transformation_state(target_state)
+    edge_page = current_identity_book().page(
+        "shape_transformation_concordance"
+    )
+    edge_row = (
+        target_scope, target_id, source_scope, source_id,
+        str(stage), str(operation), str(role),
+    )
+    edge_fact = (source, target)
+    if edge_page.latest(edge_row) != edge_fact:
+        edge_page.set(
+            edge_row, max(edge_page.columns, default=-1) + 1, edge_fact,
+        )
+    # The same edge, read from its source end: which targets were derived
+    # from this identity.  A row's first element is the source identity, so
+    # the page answers it directly (``scope_rows``) without a side index.
+    current_identity_book().page("shape_transformation_dependents").set(
+        ((source_scope, source_id), edge_row), 0, True,
+    )
+    state_page = current_identity_book().page(
+        "shape_transformation_state"
+    )
+    state_row = (target_scope, target_id)
+    state_fact = ("resolved", target, edge_row)
+    if state_page.latest(state_row) != state_fact:
+        previous = concordant_shape_transformation_state(
+            target_scope, target_id,
+        )
+        state_page.revise(state_row, state_fact)
+        if previous != target:
+            withdraw_superseded_shape_derivations(
+                target_scope, target_id, target, reason=stage,
+            )
+    return target
+
+
+def withdraw_superseded_shape_derivations(
+    scope: Any, value_id: Any, state: Any, *, reason: Any,
+) -> None:
+    """Carry a changed shape state along every edge derived from it.
+
+    Each edge records the source state its target was derived from.  When
+    the source now says something else, that derivation is superseded: the
+    target's shape state, proven extents and committed sequence row layout
+    are withdrawn in the same causal step, and the withdrawal continues
+    downstream.  The next descriptor query re-derives the target and appends
+    a new generation.  An edge recorded without a source state carries no
+    derivation claim and is left alone.
+    """
+
+    book = current_identity_book()
+    dependents = book.page("shape_transformation_dependents")
+    edge_page = book.page("shape_transformation_concordance")
+    state_page = book.page("shape_transformation_state")
+    pending = [(authored_function_name(scope), value_id,
+                shape_transformation_state(state))]
+    visited: set[tuple[Any, Any]] = set()
+    while pending:
+        source_scope, source_id, current = pending.pop()
+        if (source_scope, source_id) in visited:
+            continue
+        visited.add((source_scope, source_id))
+        for dependent_row in dependents.scope_rows((source_scope, source_id)):
+            edge_row = dependent_row[1]
+            target_scope, target_id = edge_row[0], edge_row[1]
+            if (target_scope, target_id) == (source_scope, source_id):
+                # A transport edge onto the same identity is the state that
+                # was just written, not a derivation downstream of it.
+                continue
+            edge_fact = edge_page.latest(edge_row)
+            if not (isinstance(edge_fact, tuple) and len(edge_fact) == 2):
+                continue
+            derived_from = edge_fact[0]
+            if derived_from is None or derived_from == current:
+                continue
+            target_fact = state_page.latest((target_scope, target_id))
+            if not (
+                isinstance(target_fact, tuple)
+                and target_fact
+                and target_fact[0] == "resolved"
+            ):
+                # Already withdrawn (its dependents went with it) or never
+                # resolved: nothing derived from it remains to supersede.
+                continue
+            if isinstance(target_id, int) and not isinstance(target_id, bool):
+                invalidate_proven_shape(
+                    target_scope, target_id, source_id, reason,
+                )
+                invalidate_sequence_row_layout(
+                    target_scope, target_id, source_id, reason,
+                )
+            else:
+                invalidate_shape_transformation(
+                    target_scope, target_id, source_id, reason,
+                )
+            pending.append((target_scope, target_id, None))
+
+
+def concordant_shape_transformation_state(
+    scope: Any, value_id: Any,
+) -> tuple[Any, ...] | None:
+    """Read the latest causally recorded shape at one graph identity."""
+
+    row = (authored_function_name(scope), value_id)
+    fact = current_identity_book().page(
+        "shape_transformation_state"
+    ).latest(row)
+    if not (isinstance(fact, tuple) and fact and fact[0] == "resolved"):
+        return None
+    return shape_transformation_state(fact[1])
+
+
+def invalidate_shape_transformation(
+    scope: Any, value_id: Any, source_id: Any, reason: Any,
+) -> None:
+    """Record that a target's prior path was superseded upstream."""
+
+    page = current_identity_book().page("shape_transformation_state")
+    row = (authored_function_name(scope), value_id)
+    fact = ("invalidated", source_id, str(reason))
+    if page.latest(row) != fact:
+        page.revise(row, fact)
+
+
 def committed_sequence_row_layout(
     scope: Any,
     sequence_id: int,
@@ -2131,7 +2978,9 @@ def committed_sequence_row_layout(
             "sequence_row_layout_concordance"
         )
     fact = page.latest((scope, int(sequence_id)))
-    if fact is None:
+    if fact is None or (
+        isinstance(fact, tuple) and fact and fact[0] == "invalidated"
+    ):
         return None
     return SequenceRowLayout(
         column_shapes=tuple(
@@ -2139,6 +2988,26 @@ def committed_sequence_row_layout(
         ),
         column_dtypes=tuple(map(str, fact[1])),
     )
+
+
+def invalidate_sequence_row_layout(
+    scope: Any, sequence_id: int, source_id: Any, reason: Any,
+) -> None:
+    """Withdraw a row layout whose deriving shape state was superseded.
+
+    The withdrawal is a row event after the layout it withdraws, so the
+    re-derived layout is a new generation rather than a disagreement with
+    a fact the transformation graph no longer supports.
+    """
+
+    page = current_identity_book().page("sequence_row_layout_concordance")
+    row = (authored_function_name(scope), int(sequence_id))
+    incumbent = page.latest(row)
+    if incumbent is None:
+        return
+    fact = ("invalidated", source_id, str(reason))
+    if incumbent != fact:
+        page.revise(row, fact)
 
 
 def commit_sequence_row_layout(
@@ -2824,23 +3693,30 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
     """
 
     functions = getattr(module, "functions", {}) or {}
-    incoming: dict[tuple[str, int], list[tuple[str, Any]]] = defaultdict(list)
+    book = identity_book(module)
+    incoming_page = book.page("formal_actual_concordance")
     for caller_name, caller in functions.items():
-        for block in caller.blocks.values():
-            for instruction in block.instrs:
+        for block_name, block in caller.blocks.items():
+            for instruction_index, instruction in enumerate(block.instrs):
                 if instruction.op not in {"Call", "call"}:
                     continue
                 callee_name = str(instruction.attributes.get("callee") or "")
                 callee = functions.get(callee_name)
                 if callee is None or len(instruction.args) != len(callee.args):
                     continue
-                for formal, actual in zip(callee.args, instruction.args):
-                    incoming[(callee_name, int(formal.id))].append((
-                        str(caller_name), actual,
-                    ))
+                for position, (formal, actual) in enumerate(zip(
+                    callee.args, instruction.args,
+                )):
+                    incoming_page.concord(
+                        (
+                            callee_name, int(formal.id), str(caller_name),
+                            str(block_name), int(instruction_index),
+                            int(position),
+                        ),
+                        int(actual.id),
+                    )
 
     receipts: list[dict] = []
-    book = identity_book(module)
     for function_name, function in functions.items():
         metadata = function.metadata
         named = {
@@ -2868,9 +3744,7 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                     not constructor_field_value
                     and any(
                         accounting.get(key) not in {None, ""}
-                        for key in (
-                            "program_abi_storage", "program_abi_field",
-                        )
+                        for key in ("program_abi_field",)
                     )
                 )
                 or any(
@@ -2883,15 +3757,38 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                 )
             ):
                 continue
-            sources = incoming.get((str(function_name), formal_id), ())
-            if not sources or not all(
-                (actual.accounting or {}).get("linked_call_frame_storage")
-                or (actual.accounting or {}).get("compiler_frame_storage")
-                for _caller, actual in sources
+            source_rows = tuple(
+                row for row in incoming_page.scope_rows(str(function_name))
+                if int(row[1]) == formal_id
+            )
+            source_facts = tuple(
+                incoming_page.latest(row) for row in source_rows
+            )
+            source_actuals = tuple(
+                functions[str(row[2])].blocks[str(row[3])]
+                .instrs[int(row[4])].args[int(row[5])]
+                for row in source_rows
+            )
+            if (
+                not source_facts
+                or any(
+                    int(actual.id) != int(fact)
+                    for actual, fact in zip(source_actuals, source_facts)
+                )
+                or not all(
+                    (actual.accounting or {}).get(
+                        "linked_call_frame_storage"
+                    )
+                    or (actual.accounting or {}).get(
+                        "compiler_frame_storage"
+                    )
+                    for actual in source_actuals
+                )
             ):
                 continue
             source_receipts = tuple(
-                (caller, int(actual.id)) for caller, actual in sources
+                (str(row[2]), int(fact))
+                for row, fact in zip(source_rows, source_facts)
             )
             formal.accounting = {
                 **accounting,
@@ -3126,9 +4023,16 @@ def invalidate_proven_shape(
     column = max(
         (int(existing) for existing, _fact in recorded), default=-1,
     ) + 1
+    # A transformation source may be a structured identity (a callee return,
+    # a descriptor root), not only a graph value id.
+    if isinstance(source_id, int) or not isinstance(source_id, tuple):
+        source_id = int(source_id)
     page.set(
         row, column,
-        ("invalidated", int(source_id), str(reason)),
+        ("invalidated", source_id, str(reason)),
+    )
+    invalidate_shape_transformation(
+        function, int(value_id), source_id, reason,
     )
 
 
