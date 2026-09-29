@@ -66,6 +66,19 @@ Findings (each is one concrete disagreement, with the two claims):
 ``planning-alias-transition-disagreement``
     a recorded planning refinement does not begin at the resident established
     by the preceding refinement for that exact value.
+``layout-type-unknown``
+    a value's accounting names a struct/union type (``ssa_layout_kind`` /
+    ``ssa_layout_identity``) that no live row of the module's struct or
+    union table declares.
+``layout-member-unknown``
+    a live struct/union row embeds a nested row id no live row holds.
+``layout-redeclaration``
+    one type identity was declared twice with different layouts; the
+    supersession edge on ``layout_supersession`` is reported with the
+    fields that changed.
+``layout-derivation-invalidated``
+    a row laid out from a since-redeclared row has not itself been
+    re-declared (its ``layout_state`` is still ``invalidated``).
 """
 
 from __future__ import annotations
@@ -903,12 +916,29 @@ class CorrelationTable:
             # output page is checked separately below.
             self.claim(name, alias, "output-identity-of", int(target),
                        "metadata.output_identity_aliases")
+        # A value of a named byte-layout type (a struct/union base address)
+        # says so in its accounting; the claim is checked against the
+        # module's struct/union tables by ``_layout_table_findings``.
+        def claim_layout_type(value: Any) -> None:
+            accounting = dict(getattr(value, "accounting", None) or {})
+            kind = accounting.get("ssa_layout_kind")
+            if kind is None:
+                return
+            self.claim(
+                name, value.id, "layout-type",
+                f"{kind}:{accounting.get('ssa_layout_identity')}",
+                "accounting.ssa_layout_kind",
+            )
+
+        for formal in function.args:
+            claim_layout_type(formal)
         for block_name, block in function.blocks.items():
             for index, instruction in enumerate(block.instrs):
                 if instruction.res is not None:
                     row = self.row(name, int(instruction.res.id),
                                    instruction.res.dtype)
                     row.definitions.append((block_name, index, instruction.op))
+                    claim_layout_type(instruction.res)
                 for argument in instruction.args:
                     argument_id = getattr(argument, "id", None)
                     if argument_id is None:
@@ -993,7 +1023,107 @@ class CorrelationTable:
         found.extend(self._callable_identity_findings(module))
         found.extend(self._post_ssa_numeric_identity_findings(module))
         found.extend(self._table_member_findings(module))
+        found.extend(self._layout_table_findings(module))
         found.extend(self._operand_position_orphan_findings(module))
+        return found
+
+    def _layout_table_findings(self, module: Any) -> list[Finding]:
+        """The struct/union tables against the values and rows that name them.
+
+        Four checks, all read from the tables' own book pages:
+        ``layout-type`` claims (a value's ``ssa_layout_kind`` /
+        ``ssa_layout_identity`` accounting) must name a live row; a live
+        row's nested members must name live rows; every edge on
+        ``layout_supersession`` is a re-declaration (two layouts for one
+        identity) and is reported with the fields that changed; a row whose
+        ``layout_state`` is still ``invalidated`` was laid out from a row
+        that changed underneath it and has not been re-declared.
+        """
+
+        tables = tuple(
+            table for table in (
+                getattr(module, "struct_table", None),
+                getattr(module, "union_table", None),
+            )
+            if table is not None
+        )
+        if not tables:
+            return []
+        found: list[Finding] = []
+        live: dict[tuple[str, int], Any] = {}
+        identities: set[tuple[str, str]] = set()
+        for table in tables:
+            for row_id, descriptor in dict(table._rows).items():
+                live[(table.kind, int(row_id))] = descriptor
+                identities.add((table.kind, str(descriptor.identity)))
+        for (name, value_id), row in self.rows.items():
+            for claim in row.claims:
+                if claim.kind != "layout-type":
+                    continue
+                kind, _, identity = claim.key.partition(":")
+                if (kind, identity) in identities:
+                    continue
+                found.append(Finding(
+                    "layout-type-unknown", name, int(value_id),
+                    f"accounting names {kind} type {identity!r}; the module's "
+                    f"{kind} table holds no live row of that identity "
+                    f"(source {claim.source})",
+                ))
+        for (kind, row_id), descriptor in live.items():
+            members = descriptor.fields if kind == "struct" else descriptor.members
+            owner = next(t.owner for t in tables if t.kind == kind)
+            for member in members:
+                for nested_kind, nested_id in (
+                    ("struct", member.struct_id), ("union", member.union_id),
+                ):
+                    if nested_id is None or (nested_kind, int(nested_id)) in live:
+                        continue
+                    found.append(Finding(
+                        "layout-member-unknown", str(owner[0]), int(row_id),
+                        f"{kind} {descriptor.identity!r} member {member.name!r} "
+                        f"is laid out from {nested_kind} row {int(nested_id)}, "
+                        f"which no live row holds",
+                    ))
+        for table in tables:
+            for edge_row, edge_fact in table.supersessions():
+                if not (isinstance(edge_fact, tuple) and len(edge_fact) == 2):
+                    continue
+                incumbent, replacement = edge_fact
+                differing = tuple(sorted(
+                    field_name for field_name in vars(replacement)
+                    if getattr(incumbent, field_name, None)
+                    != getattr(replacement, field_name)
+                ))
+                _owner, kind, target_id, source_id, stage = edge_row
+                found.append(Finding(
+                    "layout-redeclaration", str(table.owner[0]), int(target_id),
+                    f"{kind} {replacement.identity!r} declared again at stage "
+                    f"{stage!r} (row {int(source_id)} -> {int(target_id)}); "
+                    f"differs in: {', '.join(differing) or 'nothing'}; "
+                    + "; ".join(
+                        f"{field_name}: incumbent="
+                        f"{getattr(incumbent, field_name, None)!r} vs "
+                        f"new={getattr(replacement, field_name)!r}"
+                        for field_name in differing
+                    ),
+                ))
+            state_page = table.book.page("layout_state")
+            for state_row in state_page.scope_rows(table.owner):
+                if len(state_row) != 3 or state_row[1] != table.kind:
+                    continue
+                fact = state_page.latest(state_row)
+                if not (isinstance(fact, tuple) and fact and fact[0] == "invalidated"):
+                    continue
+                _owner, kind, row_id = state_row
+                descriptor = live.get((kind, int(row_id)))
+                found.append(Finding(
+                    "layout-derivation-invalidated", str(table.owner[0]),
+                    int(row_id),
+                    f"{kind} row {int(row_id)} "
+                    f"({getattr(descriptor, 'identity', '?')!r}) was laid out "
+                    f"from {fact[1][0]} row {fact[1][1]}, which was re-declared "
+                    f"at stage {fact[2]!r}; this row has not been re-declared",
+                ))
         return found
 
     @staticmethod
@@ -1037,6 +1167,7 @@ class CorrelationTable:
 
         from ..transmogrifier.ssa import (
             record_member_claims, sequence_member_roles,
+            struct_member_claims, union_member_claims,
         )
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
@@ -1045,6 +1176,8 @@ class CorrelationTable:
         for descriptor_page, member_page, claims_of in (
             ("record_descriptor", "record_member", record_member_claims),
             ("sequence_descriptor", "sequence_member", sequence_member_roles),
+            ("struct_descriptor", "struct_member", struct_member_claims),
+            ("union_descriptor", "union_member", union_member_claims),
         ):
             descriptors = pages.get(descriptor_page)
             members = pages.get(member_page)

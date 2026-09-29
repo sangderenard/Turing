@@ -32,6 +32,7 @@ from typing import Any, List, Optional, Dict, Callable, Union
 from enum import Enum
 from collections.abc import Mapping
 from .function_table import FunctionTable
+from .dtype_layout import resolve as _resolve_dtype_layout
 from ..compiler.deployment_frame import DeploymentFrame, DeploymentJoin
 
 # -----------------------------------------------------------------------------
@@ -686,6 +687,22 @@ class SSAStructFieldDescriptor:
                 f"struct field {self.name!r}: offset/size/count must be "
                 f"non-negative/positive/positive"
             )
+        if self.dtype is not None:
+            # A leaf's dtype is a spelling the one dtype authority declares
+            # (``dtype_layout``); the row stores the canonical name and the
+            # member's size is that dtype's size.  No local dtype table.
+            layout = _resolve_dtype_layout(self.dtype)
+            if layout is None:
+                raise ValueError(
+                    f"struct field {self.name!r}: dtype {self.dtype!r} is not "
+                    f"declared in dtype_layout"
+                )
+            object.__setattr__(self, "dtype", layout.name)
+            if self.byte_size != layout.byte_size:
+                raise ValueError(
+                    f"struct field {self.name!r}: byte_size {self.byte_size} "
+                    f"disagrees with dtype {layout.name!r} ({layout.byte_size} bytes)"
+                )
 
     def to_mapping(self) -> Dict[str, Any]:
         return {
@@ -817,68 +834,329 @@ class SSAUnionDescriptor:
         }
 
 
-@dataclass
-class SSAStructTable:
-    """Module-wide struct rows.  A type is one row however many functions use it."""
+def _layout_member_claims(
+    descriptor: Any, container_kind: str, members: tuple,
+) -> dict[int, set]:
+    """nested row id -> {(container id, member name, byte offset, role)}.
 
-    structs: Dict[int, SSAStructDescriptor] = field(default_factory=dict)
+    The layout analogue of ``record_member_claims``: a struct or union row
+    claims every nested row one of its members is laid out from.  Role
+    ``("struct",)`` says the nested id is a struct row, ``("union",)`` a
+    union row (a leaf member claims nothing; it has no row of its own).
+    ``container_kind`` is carried in the claim so one member page can be
+    read back to the row that made the claim.
+    """
 
-    def register(self, descriptor: SSAStructDescriptor) -> SSAStructDescriptor:
-        existing = self.structs.get(int(descriptor.struct_id))
-        if existing is not None and existing != descriptor:
+    claims: dict[int, set] = {}
+    if descriptor is None:
+        return claims
+    container_id = int(
+        descriptor.struct_id if container_kind == "struct" else descriptor.union_id
+    )
+    for member in members:
+        base = (container_kind, container_id, member.name, int(member.byte_offset))
+        if member.struct_id is not None:
+            claims.setdefault(int(member.struct_id), set()).add((*base, ("struct",)))
+        if member.union_id is not None:
+            claims.setdefault(int(member.union_id), set()).add((*base, ("union",)))
+    return claims
+
+
+def struct_member_claims(descriptor: "SSAStructDescriptor | None") -> dict[int, set]:
+    """Every nested-row claim one struct row makes (see ``_layout_member_claims``)."""
+
+    return _layout_member_claims(
+        descriptor, "struct", () if descriptor is None else descriptor.fields,
+    )
+
+
+def union_member_claims(descriptor: "SSAUnionDescriptor | None") -> dict[int, set]:
+    """Every nested-row claim one union row makes (see ``_layout_member_claims``)."""
+
+    return _layout_member_claims(
+        descriptor, "union", () if descriptor is None else descriptor.members,
+    )
+
+
+class _SSALayoutTable:
+    """Module-wide byte-layout rows, stored on the identity book.
+
+    The struct and union tables are the two instances.  Page
+    ``<kind>_descriptor`` holds each row at ``(owner, row id)``; page
+    ``<kind>_member`` holds, at ``(owner, nested row id)``, every claim a live
+    row of this kind makes on a nested row; page ``layout_state`` holds, at
+    ``(owner, kind, row id)``, whether the row's layout is ``resolved`` (with
+    the edge that produced it), ``invalidated`` (a row it is laid out from
+    changed underneath it) or ``superseded`` (its identity moved to another
+    id); page ``layout_supersession`` is the edge page: one row per
+    re-declaration, fact ``(incumbent, replacement)``.  Nothing is kept
+    beside the book.
+
+    A struct row and a union row that contain each other are correlated
+    through the member pages, so the two tables of one module share one
+    ``owner`` scope (``IRModule`` mints it); a table built alone mints its
+    own.
+    """
+
+    kind: str
+    descriptor_page: str
+    member_page: str
+    id_attribute: str
+
+    def __init__(
+        self,
+        rows: Dict[int, Any] | None = None,
+        *,
+        owner: Any = None,
+        book: Any = None,
+    ) -> None:
+        from ..compiler.identity_concordance import current_identity_book
+
+        self.book = current_identity_book() if book is None else book
+        self.owner = (
+            owner if isinstance(owner, tuple)
+            else _mint_table_owner(self.book, owner or "module")
+        )
+        member_page = self.book.page(self.member_page)
+        claims_of = self._member_claims
+        self._rows = _BookRows(
+            self.book, self.descriptor_page, self.owner,
+            lambda old, new: _revise_member_claims(
+                member_page, self.owner, claims_of(old), claims_of(new),
+            ),
+        )
+        for row_id, descriptor in dict(rows or {}).items():
+            self._publish(int(row_id), descriptor, None)
+
+    # -- book pages ---------------------------------------------------------
+
+    @staticmethod
+    def _member_claims(descriptor: Any) -> dict[int, set]:  # pragma: no cover
+        raise NotImplementedError
+
+    def _state_page(self) -> Any:
+        return self.book.page("layout_state")
+
+    def _row_id(self, descriptor: Any) -> int:
+        return int(getattr(descriptor, self.id_attribute))
+
+    def _publish(self, row_id: int, descriptor: Any, edge_row: Any) -> None:
+        self._rows[row_id] = descriptor
+        state_row = (self.owner, self.kind, row_id)
+        fact = ("resolved", descriptor, edge_row)
+        if self._state_page().latest(state_row) != fact:
+            self._state_page().revise(state_row, fact)
+
+    def layout_state(self, row_id: int) -> Any:
+        """The latest ``layout_state`` fact for ``row_id`` (None if never declared)."""
+
+        return self._state_page().latest((self.owner, self.kind, int(row_id)))
+
+    def supersessions(self) -> tuple[tuple[Any, Any], ...]:
+        """Every re-declaration edge this table recorded: ``(edge row, (incumbent, replacement))``."""
+
+        page = self.book.page("layout_supersession")
+        return tuple(
+            (row, page.latest(row))
+            for row in page.scope_rows(self.owner)
+            if len(row) == 5 and row[1] == self.kind
+        )
+
+    def member_claims(self, row_id: int) -> tuple:
+        """Every (container kind, container id, member name, offset, role)
+        naming nested row ``row_id`` from a live row of this kind."""
+
+        return tuple(
+            self.book.page(self.member_page).latest((self.owner, int(row_id)))
+            or ()
+        )
+
+    # -- registration -------------------------------------------------------
+
+    def register(self, descriptor: Any, *, stage: Any = "declaration") -> Any:
+        """Publish ``descriptor``; a re-declaration is an edge, never a rewrite.
+
+        The same row (same id or same identity) declared again with the same
+        layout is a no-op.  Declared again with a different layout, the row is
+        revised (its history stays on the page), one edge is appended to
+        ``layout_supersession`` and every row laid out from it has its
+        ``layout_state`` withdrawn -- ``withdraw_superseded_layout_derivations``,
+        the layout counterpart of ``withdraw_superseded_shape_derivations``.
+        Two different identities under one id is an id collision and raises.
+        """
+
+        row_id = self._row_id(descriptor)
+        incumbent = self._rows.get(row_id)
+        superseded_id = row_id
+        if incumbent is not None and incumbent.identity != descriptor.identity:
             raise ValueError(
-                f"conflicting SSA struct descriptor {descriptor.struct_id} "
-                f"({existing.identity!r} vs {descriptor.identity!r})"
+                f"conflicting SSA {self.kind} descriptor {row_id} "
+                f"({incumbent.identity!r} vs {descriptor.identity!r})"
             )
-        for other in self.structs.values():
-            if other.identity == descriptor.identity and other != descriptor:
-                raise ValueError(
-                    f"struct identity {descriptor.identity!r} already registered "
-                    f"with a different layout"
+        if incumbent is None:
+            incumbent = self.by_identity(descriptor.identity)
+            if incumbent is not None:
+                superseded_id = self._row_id(incumbent)
+        if incumbent is not None and incumbent == descriptor:
+            return incumbent
+        edge_row = None
+        if incumbent is not None:
+            edge_row = self._record_supersession(
+                superseded_id, incumbent, row_id, descriptor, stage,
+            )
+            if superseded_id != row_id:
+                # The identity moved to a new id: the old row is removed (a
+                # ``None`` revision -- its history stays) and its state says
+                # where the identity went.
+                del self._rows[superseded_id]
+                self._state_page().revise(
+                    (self.owner, self.kind, superseded_id),
+                    ("superseded", (self.kind, row_id), str(stage)),
                 )
-        self.structs[int(descriptor.struct_id)] = descriptor
+        self._publish(row_id, descriptor, edge_row)
+        if incumbent is not None:
+            self.withdraw_superseded_layout_derivations(
+                superseded_id, reason=stage,
+            )
         return descriptor
 
-    def by_id(self, struct_id: int) -> SSAStructDescriptor | None:
-        return self.structs.get(int(struct_id))
+    def _record_supersession(
+        self, source_id: int, incumbent: Any, target_id: int, replacement: Any,
+        stage: Any,
+    ) -> tuple:
+        """Append the edge ``incumbent -> replacement`` to ``layout_supersession``.
 
-    def by_identity(self, identity: str) -> SSAStructDescriptor | None:
-        for descriptor in self.structs.values():
+        Columns are compile time (monotonic across the page), as on
+        ``shape_transformation_concordance``.
+        """
+
+        edge_page = self.book.page("layout_supersession")
+        edge_row = (self.owner, self.kind, int(target_id), int(source_id), str(stage))
+        edge_fact = (incumbent, replacement)
+        if edge_page.latest(edge_row) != edge_fact:
+            edge_page.set(
+                edge_row, max(edge_page.columns, default=-1) + 1, edge_fact,
+            )
+        return edge_row
+
+    def withdraw_superseded_layout_derivations(
+        self, row_id: int, *, reason: Any,
+    ) -> None:
+        """Carry a changed layout along every row laid out from it.
+
+        The member pages record which rows embed ``row_id``; each such row's
+        size, alignment and member offsets were derived from the layout that
+        just changed, so its ``layout_state`` is withdrawn (``invalidated``)
+        in the same causal step and the withdrawal continues to the rows that
+        embed those.  The frontend's next declaration of a withdrawn row
+        appends its new generation.
+        """
+
+        state_page = self._state_page()
+        pending = [(self.kind, int(row_id))]
+        visited: set[tuple[str, int]] = set()
+        while pending:
+            kind, nested_id = pending.pop()
+            if (kind, nested_id) in visited:
+                continue
+            visited.add((kind, nested_id))
+            for member_page in ("struct_member", "union_member"):
+                claims = self.book.page(member_page).latest(
+                    (self.owner, nested_id)
+                ) or ()
+                for container_kind, container_id, _name, _offset, role in claims:
+                    if role != (kind,):
+                        continue
+                    state_row = (self.owner, str(container_kind), int(container_id))
+                    fact = state_page.latest(state_row)
+                    if not (isinstance(fact, tuple) and fact and fact[0] == "resolved"):
+                        # Already withdrawn (its dependents went with it) or
+                        # never declared: nothing derived from it remains.
+                        continue
+                    state_page.revise(
+                        state_row, ("invalidated", (kind, nested_id), str(reason)),
+                    )
+                    pending.append((str(container_kind), int(container_id)))
+
+    # -- lookup -------------------------------------------------------------
+
+    def by_id(self, row_id: int) -> Any:
+        return self._rows.get(int(row_id))
+
+    def by_identity(self, identity: str) -> Any:
+        for descriptor in self._rows.values():
             if descriptor.identity == str(identity):
                 return descriptor
         return None
 
+    # -- identity -----------------------------------------------------------
 
-@dataclass
-class SSAUnionTable:
-    """Module-wide union rows; every member points into the struct table."""
+    def __eq__(self, other: Any) -> bool:
+        return type(other) is type(self) and dict(self._rows) == dict(other._rows)
 
-    unions: Dict[int, SSAUnionDescriptor] = field(default_factory=dict)
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(owner={self.owner!r}, rows={self._rows!r})"
 
-    def register(self, descriptor: SSAUnionDescriptor) -> SSAUnionDescriptor:
-        existing = self.unions.get(int(descriptor.union_id))
-        if existing is not None and existing != descriptor:
-            raise ValueError(
-                f"conflicting SSA union descriptor {descriptor.union_id} "
-                f"({existing.identity!r} vs {descriptor.identity!r})"
-            )
-        for other in self.unions.values():
-            if other.identity == descriptor.identity and other != descriptor:
-                raise ValueError(
-                    f"union identity {descriptor.identity!r} already registered "
-                    f"with a different layout"
-                )
-        self.unions[int(descriptor.union_id)] = descriptor
-        return descriptor
+    def __deepcopy__(self, memo: dict) -> "_SSALayoutTable":
+        # A module's struct and union tables share one owner; one deepcopy of
+        # the module copies both, so the scope the first copy mints is kept
+        # in the memo for the second under the old owner.
+        key = ("layout_owner", self.owner)
+        if key not in memo:
+            memo[key] = _mint_table_owner(self.book, self.owner[0])
+        return type(self)(dict(self._rows), owner=memo[key], book=self.book)
 
-    def by_id(self, union_id: int) -> SSAUnionDescriptor | None:
-        return self.unions.get(int(union_id))
+    def __reduce__(self):
+        # The book scope's serial is not content; a pickle carries the label
+        # and the descriptors and is rebuilt on the book current at load.
+        return (type(self), (dict(self._rows),), {"owner": self.owner[0]})
 
-    def by_identity(self, identity: str) -> SSAUnionDescriptor | None:
-        for descriptor in self.unions.values():
-            if descriptor.identity == str(identity):
-                return descriptor
-        return None
+    def __setstate__(self, state: dict) -> None:
+        self.__init__(dict(self._rows), owner=state.get("owner"))
+
+
+class SSAStructTable(_SSALayoutTable):
+    """Module-wide struct rows on the book.  A type is one row however many
+    functions use it.  ``structs`` is the live id -> row view."""
+
+    kind = "struct"
+    descriptor_page = "struct_descriptor"
+    member_page = "struct_member"
+    id_attribute = "struct_id"
+    _member_claims = staticmethod(struct_member_claims)
+
+    @property
+    def structs(self) -> Dict[int, SSAStructDescriptor]:
+        return self._rows
+
+    def register(
+        self, descriptor: SSAStructDescriptor, *, stage: Any = "declaration",
+    ) -> SSAStructDescriptor:
+        if not isinstance(descriptor, SSAStructDescriptor):
+            raise TypeError(f"struct table takes SSAStructDescriptor, not {descriptor!r}")
+        return super().register(descriptor, stage=stage)
+
+
+class SSAUnionTable(_SSALayoutTable):
+    """Module-wide union rows on the book; every member points into the
+    struct table.  ``unions`` is the live id -> row view."""
+
+    kind = "union"
+    descriptor_page = "union_descriptor"
+    member_page = "union_member"
+    id_attribute = "union_id"
+    _member_claims = staticmethod(union_member_claims)
+
+    @property
+    def unions(self) -> Dict[int, SSAUnionDescriptor]:
+        return self._rows
+
+    def register(
+        self, descriptor: SSAUnionDescriptor, *, stage: Any = "declaration",
+    ) -> SSAUnionDescriptor:
+        if not isinstance(descriptor, SSAUnionDescriptor):
+            raise TypeError(f"union table takes SSAUnionDescriptor, not {descriptor!r}")
+        return super().register(descriptor, stage=stage)
 
 
 @dataclass(frozen=True)
@@ -1690,8 +1968,13 @@ class IRModule:
     # alignment, member offsets) intercepted from a ctypes.Structure; a union
     # row is a set of struct members sharing one payload.  One row per type
     # however many functions hold a value of it; backends spell the rows.
-    struct_table: SSAStructTable = field(default_factory=SSAStructTable)
-    union_table: SSAUnionTable = field(default_factory=SSAUnionTable)
+    # Both tables live on the identity book under ONE owner scope minted in
+    # ``__post_init__`` (a struct row and the union that embeds it are
+    # correlated through the shared member pages); ``None`` here means "mint
+    # them", a mapping assigned later is coerced onto the book like
+    # ``call_table``.
+    struct_table: SSAStructTable = None  # type: ignore[assignment]
+    union_table: SSAUnionTable = None  # type: ignore[assignment]
     # Backend-neutral cache of CFG recursion regions.  Keys are function
     # names; region records identify loop headers, latches, Phi values, and
     # the ProcessGraph SCC from which each loop was lowered.
@@ -1739,15 +2022,95 @@ class IRModule:
         # caller assigns to it.
         if name == "call_table" and not isinstance(value, SSACallTable):
             value = SSACallTable(value, owner="module")
+        # So are the struct and union tables: a plain mapping of rows is
+        # published onto the book under the module's layout scope.
+        if name == "struct_table" and value is not None and not isinstance(
+            value, SSAStructTable
+        ):
+            value = SSAStructTable(dict(value), owner=self._layout_owner())
+        if name == "union_table" and value is not None and not isinstance(
+            value, SSAUnionTable
+        ):
+            value = SSAUnionTable(dict(value), owner=self._layout_owner())
         object.__setattr__(self, name, value)
 
+    def _layout_owner(self) -> Any:
+        """The one book scope this module's struct and union rows share.
+
+        Taken from whichever layout table already exists, else a fresh
+        ``("module", n)`` scope on the current book.  ``None`` while neither
+        table exists yet lets the constructor mint one scope for both.
+        """
+
+        for table in (
+            self.__dict__.get("struct_table"), self.__dict__.get("union_table"),
+        ):
+            if table is not None:
+                return table.owner
+        from ..compiler.identity_concordance import current_identity_book
+
+        return _mint_table_owner(current_identity_book(), "module")
+
     def __post_init__(self) -> None:
+        if self.struct_table is None or self.union_table is None:
+            owner = self._layout_owner()
+            book = (self.struct_table or self.union_table)
+            book = None if book is None else book.book
+            if self.struct_table is None:
+                self.struct_table = SSAStructTable(owner=owner, book=book)
+            if self.union_table is None:
+                self.union_table = SSAUnionTable(owner=owner, book=book)
         if not self.deployment_table:
             self.deployment_table = {
                 name: tuple(function.metadata.get("deployment_regions", ()))
                 for name, function in self.functions.items()
                 if function.metadata.get("deployment_regions")
             }
+
+    # -- named byte-layout types ---------------------------------------------
+
+    def declare_struct(
+        self, descriptor: SSAStructDescriptor, *, stage: Any = "declaration",
+    ) -> SSAStructDescriptor:
+        """Publish one struct row on the book (see ``SSAStructTable.register``).
+
+        ``stage`` names the pass declaring it (``"ctypes_interception"``, a
+        frontend's own name); it is written on the supersession edge when the
+        row re-declares an existing layout.
+        """
+
+        return self.struct_table.register(descriptor, stage=stage)
+
+    def declare_union(
+        self, descriptor: SSAUnionDescriptor, *, stage: Any = "declaration",
+    ) -> SSAUnionDescriptor:
+        """Publish one union row on the book (see ``SSAUnionTable.register``)."""
+
+        return self.union_table.register(descriptor, stage=stage)
+
+    def layout_row(
+        self, kind: str, row_id: int,
+    ) -> "SSAStructDescriptor | SSAUnionDescriptor | None":
+        """The live row ``(kind, id)`` names -- ``kind`` is ``"struct"`` or ``"union"``."""
+
+        if kind == "struct":
+            return self.struct_table.by_id(row_id)
+        if kind == "union":
+            return self.union_table.by_id(row_id)
+        raise ValueError(f"layout kind must be 'struct' or 'union', not {kind!r}")
+
+    def layout_row_by_identity(
+        self, identity: str,
+    ) -> "tuple[str, SSAStructDescriptor | SSAUnionDescriptor] | None":
+        """``(kind, row)`` for the authored type spelling ``identity``, or None."""
+
+        row = self.struct_table.by_identity(identity)
+        if row is not None:
+            return ("struct", row)
+        row = self.union_table.by_identity(identity)
+        if row is not None:
+            return ("union", row)
+        return None
 
     def reachable_functions(
         self,

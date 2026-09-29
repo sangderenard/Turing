@@ -103,9 +103,12 @@ class CTypesInterception:
     """Writes struct/union rows for ctypes classes into a module's tables.
 
     ``mint`` issues row ids (the compiler passes its global issuer).  A class
-    seen twice yields the same row; the tables refuse a second, different
-    layout under one identity.
+    seen twice yields the same row; a second, different layout under one
+    identity is recorded by the tables as a supersession edge on the identity
+    book (stage ``"ctypes_interception"``), never silently overwritten.
     """
+
+    STAGE = "ctypes_interception"
 
     struct_table: SSAStructTable
     union_table: SSAUnionTable
@@ -174,7 +177,7 @@ class CTypesInterception:
             self.mint(), type_identity(ctype),
             ctypes.sizeof(ctype), ctypes.alignment(ctype), fields,
         )
-        self.struct_table.register(row)
+        self.struct_table.register(row, stage=self.STAGE)
         self._struct_ids[ctype] = row.struct_id
         return row.struct_id
 
@@ -190,7 +193,7 @@ class CTypesInterception:
             self.mint(), identity, layout.byte_size, layout.alignment,
             (SSAStructFieldDescriptor(name, 0, layout.byte_size, dtype=layout.name),),
         )
-        self.struct_table.register(row)
+        self.struct_table.register(row, stage=self.STAGE)
         return row.struct_id
 
     def _union_row(self, ctype: type) -> int:
@@ -235,7 +238,7 @@ class CTypesInterception:
             ctypes.sizeof(ctype), ctypes.alignment(ctype),
             tuple(members), storage,
         )
-        self.union_table.register(row)
+        self.union_table.register(row, stage=self.STAGE)
         self._union_ids[ctype] = row.union_id
         return row.union_id
 
