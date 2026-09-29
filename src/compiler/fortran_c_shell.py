@@ -398,7 +398,11 @@ def _publish_concordant_function_aliases(
     """
 
     from .identity_concordance import (
+        authored_function_name,
+        concordant_shape_transformation_state,
         current_identity_book,
+        descriptor_from_shape_transformation_state,
+        record_shape_transformation,
         resolved_concordant_alias_bindings,
     )
 
