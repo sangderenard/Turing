@@ -767,7 +767,14 @@ def _aggregate_contains_text(value) -> bool:
 def _c_numeric_literal(value: bool | int | float, c_type: str) -> str:
     if c_type in {"uint8_t", "int32_t", "int64_t", "long long"}:
         return str(int(value))
-    return float(value).hex()
+    numeric = float(value)
+    # ``float.hex`` spells non-finite values as Python text ("inf", "nan"),
+    # which is not C.  Use the same <math.h> spelling as scalar constants.
+    if math.isnan(numeric):
+        return "NAN"
+    if math.isinf(numeric):
+        return "INFINITY" if numeric > 0 else "(-INFINITY)"
+    return numeric.hex()
 
 
 def _numpy_dtype(dtype) -> str:

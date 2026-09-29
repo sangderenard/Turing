@@ -537,6 +537,17 @@ def publish_projected_iterable_layouts(module: Any) -> None:
                     if result_dtype not in {None, "", "unknown"}:
                         value.dtype = str(result_dtype)
                     changed = True
+                state = {
+                    "shape": tuple(result_shape), "rank": len(result_shape),
+                    "dtype": str(result_dtype or "unknown"),
+                }
+                record_shape_transformation(
+                    callee_name, ("return", str(callee_name)),
+                    function.name, result_id,
+                    stage="projected_iterable_layout",
+                    operation="call_result", source_state=state,
+                    target_state=state, role="return",
+                )
             source_receipt = call.attributes.get("plan_callsite_id")
             if source_receipt is None:
                 if changed:
@@ -712,6 +723,22 @@ def publish_projected_iterable_layouts(module: Any) -> None:
                             "sequence_row_shape": row_shape,
                             "program_abi_rank": len(row_shape),
                         }
+                    state = {
+                        "shape": row_shape, "rank": len(row_shape),
+                        "dtype": str(column_dtype or "unknown"),
+                    }
+                    record_shape_transformation(
+                        callee_name,
+                        (
+                            "sequence_column",
+                            int(descriptor.sequence_id), int(column),
+                        ),
+                        function.name, target_id,
+                        stage="projected_iterable_layout",
+                        operation="sequence_row_column",
+                        source_state=state, target_state=state,
+                        role=f"column:{int(column)}",
+                    )
                     changed = True
             if changed:
                 receipts.append((

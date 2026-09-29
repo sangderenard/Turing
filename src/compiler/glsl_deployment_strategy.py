@@ -16666,6 +16666,86 @@ def _propagate_callsite_tensor_specializations(
                             break
                 output_descriptors.append(descriptor)
 
+        # A generator returns no value; its product is the row it yields.
+        # Describe every yield site's tuple members on this exact callsite
+        # specialization, require the sites to agree per column, and publish
+        # the row on the caller's call value through the concordance, so a
+        # ``for a, b, c in gen(...)`` target reads its column in the graph
+        # phase instead of acquiring a shape only after SSA linking.
+        generator_stream = (
+            specialized.G.graph.get("generator_stream")
+            or callee.G.graph.get("generator_stream")
+            or {}
+        )
+        yield_rows: list[tuple[dict[str, Any] | None, ...]] = []
+        for yield_node in generator_stream.get("yield_nodes") or ():
+            if int(yield_node) not in specialized.G or not isinstance(
+                specialized.G.nodes[int(yield_node)].get("expr_obj"),
+                ast.Yield,
+            ):
+                continue
+            yielded = next((
+                int(parent)
+                for parent, role in (
+                    specialized.G.nodes[int(yield_node)].get("parents") or ()
+                )
+                if str(role) in {"value", "operand"}
+                and int(parent) in specialized.G
+            ), None)
+            if yielded is None:
+                continue
+            yielded_data = specialized.G.nodes[yielded]
+            members = (
+                tuple(
+                    int(parent)
+                    for parent, _role in yielded_data.get("parents") or ()
+                    if int(parent) in specialized.G
+                )
+                if isinstance(yielded_data.get("expr_obj"), ast.Tuple)
+                else (yielded,)
+            )
+            yield_rows.append(tuple(
+                _tensor_descriptor(specialized, member) for member in members
+            ))
+        if yield_rows and len({len(row) for row in yield_rows}) == 1:
+            from .identity_concordance import record_shape_transformation
+
+            caller_scope = caller.G.graph.get("function_name")
+            callee_scope = str(callee.G.graph.get("function_name"))
+            call_value = int(
+                caller.G.nodes[int(node_id)].get("value_id", node_id)
+            )
+            for column, members in enumerate(zip(*yield_rows)):
+                # Only a column every yield site states is a fact; a record
+                # handle or a not-yet-described member claims nothing (an
+                # empty shape would read as a proven scalar downstream).
+                if not all(
+                    isinstance(member, Mapping)
+                    and descriptor_states_a_shape(member)
+                    for member in members
+                ):
+                    continue
+                facts = {
+                    (
+                        tuple(map(int, member.get("shape") or ())),
+                        str(member.get("dtype") or "unknown"),
+                    )
+                    for member in members
+                }
+                if len(facts) != 1:
+                    continue
+                shape, dtype = next(iter(facts))
+                state = {"shape": shape, "dtype": dtype, "rank": len(shape)}
+                record_shape_transformation(
+                    callee_scope, ("yield", callee_scope, column),
+                    caller_scope, ("yield_row", call_value, column),
+                    stage="callsite_yield_observation",
+                    operation="yield_row",
+                    source_state=state,
+                    target_state=state,
+                    role=f"column:{column}",
+                )
+
         def any_descriptor(item: Any) -> bool:
             if isinstance(item, tuple):
                 return any(any_descriptor(member) for member in item)
@@ -18334,6 +18414,55 @@ def _tensor_descriptor_rule(
                 # Both projections expose real-valued elements while
                 # preserving the source tensor's storage/rank contract.
                 tensor["dtype"] = "float64"
+    if (
+        "shape" not in tensor
+        and data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_kind") == "loop"
+    ):
+        # A destructured loop target is column k of its iterable's row, k
+        # being its position among the loop's targets (the same order the
+        # loop composer enumerates as projected iterable bindings).  When the
+        # iterable is a generator call, its yielded row columns are on the
+        # concordance as that call's ``yield_row`` states.
+        from .identity_concordance import (
+            concordant_shape_transformation_state,
+            descriptor_from_shape_transformation_state,
+        )
+
+        target_value = int(data.get("value_id", node_id))
+        for loop_id, loop_data in graph.G.nodes(data=True):
+            targets = [
+                int(value) for value in dict(
+                    (loop_data.get("attributes") or {}).get(
+                        "loop_target_bindings"
+                    ) or {}
+                ).values()
+            ]
+            if int(node_id) not in targets and target_value not in targets:
+                continue
+            column = (
+                targets.index(int(node_id))
+                if int(node_id) in targets else targets.index(target_value)
+            )
+            iterable = next((
+                int(parent)
+                for parent, role in loop_data.get("parents") or ()
+                if str(role) in {"iterable", "iter"}
+                and int(parent) in graph.G
+            ), None)
+            if iterable is None:
+                break
+            iterable_value = int(
+                graph.G.nodes[iterable].get("value_id", iterable)
+            )
+            state = concordant_shape_transformation_state(
+                graph.G.graph.get("function_name"),
+                ("yield_row", iterable_value, column),
+            )
+            described = descriptor_from_shape_transformation_state(state)
+            if described is not None:
+                return described
+            break
     if "shape" not in tensor and data.get("type") == "Input":
         binding_name = (data.get("attributes") or {}).get("binding_name")
         # A copy with no caller was told nothing; the formal still has the
