@@ -624,6 +624,263 @@ class SSARecordTable:
         return descriptor
 
 
+# ---------------------------------------------------------------------------
+# Struct and union types: byte layouts recorded once, spelled per backend.
+#
+# A record (``SSARecordDescriptor``) is decomposed: it names the SSA values
+# that hold its fields and has no bytes of its own.  A struct row is the
+# opposite: it IS a byte layout -- size, alignment, and each field's offset --
+# and a value of that type is a base address into which every field is an
+# offset.  Rows are written from an intercepted ``ctypes.Structure`` /
+# ``ctypes.Union`` subclass (``src/transmogrifier/ctypes_layout.py``): the
+# layout ctypes computed for the eager program is the layout the native
+# program gets, so the two cannot disagree about a byte.  Backends only spell
+# the row: C as ``struct``/``union`` with ``_Alignas``; LLVM as a named struct
+# type, or bytes at the row's alignment with typed access at the offsets;
+# Fortran as a ``bind(C)`` derived type.  A union is a set of struct members
+# sharing one payload: its ``storage_member`` is the strictest-aligned member
+# (ties by declaration order), the member a backend without unions lays down
+# first and pads to ``byte_size`` (Clang's own lowering of a C union).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SSAStructFieldDescriptor:
+    """One member of a struct or union row.
+
+    A leaf member has a repository ``dtype``; an aggregate member names the
+    nested row through ``struct_id`` or ``union_id`` instead.  ``count`` > 1 is
+    a fixed in-line array of ``count`` such elements (``c_double * 3``).
+    ``byte_offset`` is the member's offset inside the containing row -- zero
+    for every member of a union -- and ``byte_size`` the member's whole size.
+    """
+
+    name: str
+    byte_offset: int
+    byte_size: int
+    dtype: str | None = None
+    struct_id: int | None = None
+    union_id: int | None = None
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", str(self.name))
+        object.__setattr__(self, "byte_offset", int(self.byte_offset))
+        object.__setattr__(self, "byte_size", int(self.byte_size))
+        object.__setattr__(self, "count", int(self.count))
+        if self.struct_id is not None:
+            object.__setattr__(self, "struct_id", int(self.struct_id))
+        if self.union_id is not None:
+            object.__setattr__(self, "union_id", int(self.union_id))
+        kinds = sum(
+            1 for marker in (self.dtype, self.struct_id, self.union_id)
+            if marker is not None
+        )
+        if kinds != 1:
+            raise ValueError(
+                f"struct field {self.name!r} must be exactly one of a leaf "
+                f"dtype, a nested struct or a nested union"
+            )
+        if self.byte_offset < 0 or self.byte_size <= 0 or self.count <= 0:
+            raise ValueError(
+                f"struct field {self.name!r}: offset/size/count must be "
+                f"non-negative/positive/positive"
+            )
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "byte_offset": self.byte_offset,
+            "byte_size": self.byte_size,
+            "dtype": self.dtype,
+            "struct_id": self.struct_id,
+            "union_id": self.union_id,
+            "count": self.count,
+        }
+
+
+@dataclass(frozen=True)
+class SSAStructDescriptor:
+    """A struct row: a named byte layout."""
+
+    struct_id: int
+    identity: str
+    byte_size: int
+    alignment: int
+    fields: tuple[SSAStructFieldDescriptor, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "struct_id", int(self.struct_id))
+        object.__setattr__(self, "identity", str(self.identity))
+        object.__setattr__(self, "byte_size", int(self.byte_size))
+        object.__setattr__(self, "alignment", int(self.alignment))
+        object.__setattr__(self, "fields", tuple(self.fields))
+        names = tuple(field.name for field in self.fields)
+        if len(names) != len(set(names)):
+            raise ValueError(f"struct {self.identity}: field names must be unique")
+        if self.byte_size <= 0 or self.alignment <= 0:
+            raise ValueError(f"struct {self.identity}: size and alignment must be positive")
+        if self.alignment & (self.alignment - 1):
+            raise ValueError(f"struct {self.identity}: alignment must be a power of two")
+        if self.byte_size % self.alignment:
+            raise ValueError(f"struct {self.identity}: size must be a multiple of alignment")
+        for field in self.fields:
+            if field.byte_offset + field.byte_size * field.count > self.byte_size:
+                raise ValueError(
+                    f"struct {self.identity}: field {field.name!r} overruns the row"
+                )
+
+    def field(self, name: str) -> "SSAStructFieldDescriptor | None":
+        for member in self.fields:
+            if member.name == name:
+                return member
+        return None
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "struct_id": self.struct_id,
+            "identity": self.identity,
+            "byte_size": self.byte_size,
+            "alignment": self.alignment,
+            "fields": [field.to_mapping() for field in self.fields],
+        }
+
+
+@dataclass(frozen=True)
+class SSAUnionDescriptor:
+    """A union row: a set of struct members sharing one payload.
+
+    Every member is a struct row (a scalar alternative is a one-field struct,
+    synthesized at interception, so the recipe is uniform).  ``storage_member``
+    names the member a backend without unions lays down as the payload's
+    storage type: the strictest-aligned member, ties broken by declaration
+    order.  ``byte_size`` is the largest member rounded up to ``alignment``.
+    """
+
+    union_id: int
+    identity: str
+    byte_size: int
+    alignment: int
+    members: tuple[SSAStructFieldDescriptor, ...] = ()
+    storage_member: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "union_id", int(self.union_id))
+        object.__setattr__(self, "identity", str(self.identity))
+        object.__setattr__(self, "byte_size", int(self.byte_size))
+        object.__setattr__(self, "alignment", int(self.alignment))
+        object.__setattr__(self, "members", tuple(self.members))
+        object.__setattr__(self, "storage_member", str(self.storage_member))
+        if not self.members:
+            raise ValueError(f"union {self.identity}: needs at least one member")
+        names = tuple(member.name for member in self.members)
+        if len(names) != len(set(names)):
+            raise ValueError(f"union {self.identity}: member names must be unique")
+        for member in self.members:
+            if member.struct_id is None:
+                raise ValueError(
+                    f"union {self.identity}: member {member.name!r} is not a "
+                    f"struct row (every union member is a struct)"
+                )
+            if member.byte_offset != 0:
+                raise ValueError(
+                    f"union {self.identity}: member {member.name!r} is not at offset 0"
+                )
+            if member.byte_size > self.byte_size:
+                raise ValueError(
+                    f"union {self.identity}: member {member.name!r} overruns the payload"
+                )
+        if self.storage_member not in names:
+            raise ValueError(
+                f"union {self.identity}: storage_member {self.storage_member!r} "
+                f"is not a member"
+            )
+        if self.byte_size <= 0 or self.alignment <= 0 or (self.alignment & (self.alignment - 1)):
+            raise ValueError(f"union {self.identity}: bad size/alignment")
+        if self.byte_size % self.alignment:
+            raise ValueError(f"union {self.identity}: size must be a multiple of alignment")
+
+    def member(self, name: str) -> "SSAStructFieldDescriptor | None":
+        for candidate in self.members:
+            if candidate.name == name:
+                return candidate
+        return None
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "union_id": self.union_id,
+            "identity": self.identity,
+            "byte_size": self.byte_size,
+            "alignment": self.alignment,
+            "members": [member.to_mapping() for member in self.members],
+            "storage_member": self.storage_member,
+        }
+
+
+@dataclass
+class SSAStructTable:
+    """Module-wide struct rows.  A type is one row however many functions use it."""
+
+    structs: Dict[int, SSAStructDescriptor] = field(default_factory=dict)
+
+    def register(self, descriptor: SSAStructDescriptor) -> SSAStructDescriptor:
+        existing = self.structs.get(int(descriptor.struct_id))
+        if existing is not None and existing != descriptor:
+            raise ValueError(
+                f"conflicting SSA struct descriptor {descriptor.struct_id} "
+                f"({existing.identity!r} vs {descriptor.identity!r})"
+            )
+        for other in self.structs.values():
+            if other.identity == descriptor.identity and other != descriptor:
+                raise ValueError(
+                    f"struct identity {descriptor.identity!r} already registered "
+                    f"with a different layout"
+                )
+        self.structs[int(descriptor.struct_id)] = descriptor
+        return descriptor
+
+    def by_id(self, struct_id: int) -> SSAStructDescriptor | None:
+        return self.structs.get(int(struct_id))
+
+    def by_identity(self, identity: str) -> SSAStructDescriptor | None:
+        for descriptor in self.structs.values():
+            if descriptor.identity == str(identity):
+                return descriptor
+        return None
+
+
+@dataclass
+class SSAUnionTable:
+    """Module-wide union rows; every member points into the struct table."""
+
+    unions: Dict[int, SSAUnionDescriptor] = field(default_factory=dict)
+
+    def register(self, descriptor: SSAUnionDescriptor) -> SSAUnionDescriptor:
+        existing = self.unions.get(int(descriptor.union_id))
+        if existing is not None and existing != descriptor:
+            raise ValueError(
+                f"conflicting SSA union descriptor {descriptor.union_id} "
+                f"({existing.identity!r} vs {descriptor.identity!r})"
+            )
+        for other in self.unions.values():
+            if other.identity == descriptor.identity and other != descriptor:
+                raise ValueError(
+                    f"union identity {descriptor.identity!r} already registered "
+                    f"with a different layout"
+                )
+        self.unions[int(descriptor.union_id)] = descriptor
+        return descriptor
+
+    def by_id(self, union_id: int) -> SSAUnionDescriptor | None:
+        return self.unions.get(int(union_id))
+
+    def by_identity(self, identity: str) -> SSAUnionDescriptor | None:
+        for descriptor in self.unions.values():
+            if descriptor.identity == str(identity):
+                return descriptor
+        return None
+
+
 @dataclass(frozen=True)
 class SSATensorDescriptor:
     """Compile-time identity and ABI facts for one logical SSA tensor.
@@ -1429,6 +1686,12 @@ class IRModule:
     # for a plain function module; populated when a class navigation table is
     # lowered, so a backend can emit each method as its own function.
     class_table: SSAClassTable = field(default_factory=SSAClassTable)
+    # Module-wide byte-layout types.  A struct row is a named layout (size,
+    # alignment, member offsets) intercepted from a ctypes.Structure; a union
+    # row is a set of struct members sharing one payload.  One row per type
+    # however many functions hold a value of it; backends spell the rows.
+    struct_table: SSAStructTable = field(default_factory=SSAStructTable)
+    union_table: SSAUnionTable = field(default_factory=SSAUnionTable)
     # Backend-neutral cache of CFG recursion regions.  Keys are function
     # names; region records identify loop headers, latches, Phi values, and
     # the ProcessGraph SCC from which each loop was lowered.
