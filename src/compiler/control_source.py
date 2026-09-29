@@ -2133,11 +2133,9 @@ def compose_region_code(
         if isinstance(block, (ExternalReferenceCallBlock, DispatchBlock)):
             return block
         if isinstance(block, ValidationBlock):
-            if (
-                retained_values is not None
-                and int(block.predicate_value_id) not in retained_values
-            ):
-                return None
+            # Composition substitutes region interiors only; it has no
+            # retained-value set.  Which guards survive is decided by
+            # ``project_control_regions``, before a shell is composed.
             return block
         if isinstance(block, StreamPublishBlock):
             return block
