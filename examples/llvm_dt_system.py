@@ -834,7 +834,7 @@ def interpret_round(node, *, wrap=None):
     return pieces, node.schedule
 
 
-def dt_system_from_graph(root, columns, *, rounds, subcycles=()):
+def dt_system_from_graph(root, columns, *, rounds, subcycles=(), state=None):
     """Run ``dt_system`` as the ``dt_graph.RoundNode`` tree ``root`` defines.
 
     The root's ``plan.round_max`` is the window, its ``plan.dt_init`` the
@@ -842,6 +842,8 @@ def dt_system_from_graph(root, columns, *, rounds, subcycles=()):
     its ``schedule`` the read discipline, its children the causal order and
     its nested rounds the dt system's own subdivision.  ``subcycles`` are the
     independent participants, consulted without waiting as in ``dt_system``.
+    ``state`` is the caller's persistent ``PieceState`` from an earlier call,
+    reused rather than rebuilt (see ``dt_system``).
     """
 
     pieces, schedule = interpret_round(root)
@@ -849,11 +851,12 @@ def dt_system_from_graph(root, columns, *, rounds, subcycles=()):
     return dt_system(pieces, columns, rounds=rounds, round_dt=float(root.plan.round_max),
                      dx=float(control.dx), targets=control.targets, controller=control.ctrl,
                      subcycles=subcycles, scope=str(root.label), schedule=schedule,
-                     dt_initial=float(root.plan.dt_init))
+                     dt_initial=float(root.plan.dt_init), state=state)
 
 
 def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, controller=None,
-              subcycles=(), scope="lockstep", schedule="sequential", dt_initial=None):
+              subcycles=(), scope="lockstep", schedule="sequential", dt_initial=None,
+              state=None):
     """Load the pieces from their files and run ``rounds`` rounds of the dt
     system over them in Python, the way the native unit will be driven.
 
@@ -895,14 +898,33 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
     # failure to report, not progress to keep making.  A caller who knows its
     # own physical floor passes its own controller and that wins.
     controller = controller or STController(dt_min=float(round_dt) * 1e-6)
-    state = PieceState(
-        *(np.array(columns[name], dtype=np.float64) for name in names),
-        np.zeros((batch,), dtype=np.float64),
-        np.zeros((len(TELEMETRY_FIELDS),), dtype=np.float64),
-    )
-    # The laws declare themselves once, in causal order, and the state carries
-    # the registry so the controller can index the rows the step publishes.
-    state.participants = participant_registry(pieces)
+    if state is None:
+        # The state is made once.  The containing system owns it across
+        # rounds and hands it back; every later call binds into these spans
+        # instead of building a fresh state and discarding it.  Rollback
+        # inside a round is ``copy_shallow``/``restore``: a backup taken from
+        # this state and written back in place, never a replacement of it.
+        state = PieceState(
+            *(np.array(columns[name], dtype=np.float64) for name in names),
+            np.zeros((batch,), dtype=np.float64),
+            np.zeros((len(TELEMETRY_FIELDS),), dtype=np.float64),
+        )
+        # The laws declare themselves once, in causal order, and the state
+        # carries the registry so the controller can index the rows the step
+        # publishes.
+        state.participants = participant_registry(pieces)
+    else:
+        missing = [name for name in names if not hasattr(state, name)]
+        if missing:
+            raise ValueError(
+                f"persistent dt state lacks columns {missing}; it was built for "
+                "different pieces")
+        for name in names:
+            span = getattr(state, name)
+            value = columns[name]
+            if value is span:
+                continue        # the caller's column already is this span
+            span[...] = np.asarray(value, dtype=np.float64)
     state.wall_cost_ledger = ledger
     configure_publication_limits(state, targets)
     for sub in subcycles:
