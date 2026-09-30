@@ -184,3 +184,112 @@ before the user says which step to start.
    transformation re-expressed, zero behaviour change), or steps 1-3
    together so the first commit already gives the worked-example field a
    rooted chain?
+
+## 6. Decided (user, 2026-09-30)
+
+1. **Source reference = the full vector of the location.** `Ref = (page,
+   row, column)`. Never a row with an implied column.
+2. **Unsourced is a type, behind a latch.** A writer that cannot name a
+   source posts `Unsourced(reason)`. While the book's latch is OPEN the post
+   is admitted and recorded as unsourced, so the audit lists every offender;
+   when the latch is CLOSED the post is refused. The latch closes once
+   everything is fixed and stays closed. During migration every raw write
+   through an old primitive is auto-tagged `Unsourced("raw primitive")`, so
+   closing the latch is the proof that no writer bypasses the api.
+3. **No strings for runtime decisions.** Pages, stages, transforms, modes,
+   fact kinds and provenance kinds are declared objects (enums / frozen
+   registry entries), never free strings. A page is referenced by its
+   registry object; `book.page(str)` survives only as a read-side lookup
+   into the registry and refuses undeclared names.
+4. **Steps 1-3 are worked together:** the api + registry + latch, the
+   ingestion roots, and the reducer field state land as one movement, so the
+   first commit gives the worked-example field a rooted chain.
+
+### 6.1 Types
+
+```
+class Mode(Enum): CONCORD, REVISE
+class Latch(Enum): OPEN, CLOSED
+
+@dataclass(frozen=True) class Page:      name, row_fields: tuple[RowField, ...], fact_type
+@dataclass(frozen=True) class RowField:  name, kind  (kind in a small Enum: SCOPE, VALUE_ID, NAME, INDEX, LABEL, PAGE_REF)
+@dataclass(frozen=True) class Stage:     name        (registered once, referenced by object)
+@dataclass(frozen=True) class Transform: name, arity (registered once; what a NOVEL post did to its operands)
+
+@dataclass(frozen=True) class Ref:       page: Page, row: tuple, column: int
+
+# provenance: exactly one kind per post
+@dataclass(frozen=True) class Derived:   cells: tuple[Ref, ...]          # non-empty
+@dataclass(frozen=True) class Novel:     transform: Transform, operands: tuple[Ref, ...]
+@dataclass(frozen=True) class Unsourced: reason: Reason                  # latched
+
+# facts
+@dataclass(frozen=True) class Unresolved: reason: Reason, read: tuple[Ref, ...]   # "I looked and could not decide"
+```
+
+`Reason` is itself a registered object, not a string.
+
+### 6.2 The one call
+
+```
+Concordance.post(page: Page, row: tuple, fact, *, stage: Stage,
+                 provenance: Derived | Novel | Unsourced,
+                 mode: Mode) -> Ref
+```
+
+- Validates `row` against `page.row_fields` and `fact` against
+  `page.fact_type` (an `Unresolved` is always admissible).
+- `Derived`: writes the fact cell, then in the same clock tick one edge row
+  per source cell on the private edge page (target ref, source ref, stage)
+  and the reverse index keyed by source ref. Returns the target Ref.
+- `Novel`: `row` carries the sentinel `NEW` where the id goes; `post` mints
+  the id (`compose(serial, MINTED)`), substitutes it, writes the fact and
+  the mint edge (target ref -> transform, operands) in the same tick, and
+  returns the Ref (the minted id is `ref.row[...]`). `GLOBAL_MONOTONIC_IDS`
+  is not reachable any other way once migration completes.
+- `Unsourced`: admitted iff `book.latch is Latch.OPEN`; recorded on the
+  unsourced page with its reason and the caller's stage; refused otherwise.
+- `Mode.REVISE`: admitted iff at least one `Derived` cell has a stamp newer
+  than the row's previous revision (a changed source). Otherwise refused.
+  `Mode.CONCORD`: a different fact for an existing row is refused (as
+  today's `concord`), a `Derived` post with the same fact is a no-op that
+  still records its edge.
+- Every post ticks the shared clock exactly once, so cross-page order is
+  recorded, as today.
+
+### 6.3 Audit
+
+Two generic findings over every registered page: `unsourced-fact` (a
+resolved cell with neither an inbound edge nor a mint edge; while the latch
+is OPEN the auto-tagged raw writes are listed here by page and stage, which
+is the migration worklist) and `unsourced-identity` (a `MINTED` id in any
+function with no mint edge). Existing per-page findings stay.
+
+### 6.4 Steps 1-3, concretely
+
+Step 1 (`src/compiler/identity_concordance.py`, `src/compiler/monotonic_ids.py`):
+the types above, the registry, `Concordance.post`, the latch (OPEN),
+auto-tagging of raw `IdentityPage.set/revise/concord/bind_alias/PageMapping`
+writes as `Unsourced(RAW_PRIMITIVE)`, `record_shape_transformation`
+re-expressed through `post` (its three pages become the generic edge /
+dependents / state pages), the two audit findings. Zero behaviour change.
+
+Step 2 (ingestion roots, `graph_express2.py`, reducer canonical relabel):
+`ssa_identity_tokens` (ingestion id -> canonical id) posted NOVEL per
+canonical id with the ingestion cell as operand; `identity_table`,
+`class_definitions`, `function_parameter_annotations`, `value_kind`,
+`map_ir` object rows posted DERIVED from their AST-span rows (the span row
+itself is the one NOVEL root per source construct). These pages are the
+roots every later edge must reach.
+
+Step 3 (reducer field state): `attribute_value_nodes` /
+`attribute_effect_nodes` -> a field-state page keyed (receiver, field) whose
+writes are DERIVED(receiver row, field row, value row) and whose conditional
+merges are DERIVED(both arm states, test row); `return_slot_values` /
+`return_record_field_states` become DERIVED rows from it; `_set_operands`
+appends post their cause. The dicts become read views of the pages.
+
+Proof for the movement: `probe_annotated_scalar_parameter` and
+`probe_struct_intake` still pass; the audit tool's six cases report the same
+findings plus the new `unsourced-fact` worklist; census 50's field has a
+rooted DERIVED chain from its AST span to its return-site state rows.
