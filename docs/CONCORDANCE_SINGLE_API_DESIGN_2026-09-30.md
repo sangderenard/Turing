@@ -300,3 +300,25 @@ Proof for the movement: `probe_annotated_scalar_parameter` and
 `probe_struct_intake` still pass; the audit tool's six cases report the same
 findings plus the new `unsourced-fact` worklist; census 50's field has a
 rooted DERIVED chain from its AST span to its return-site state rows.
+
+## 7. Decided for steps 4-5 (user, 2026-09-30, plan 80's two questions)
+
+1. **Every callee copy is its own variant.** Specialization records (the
+   literal/default fold of `_propagate_callsite_planner_specializations`) are
+   per copy, in the copy's own scope, always. A copy never carries a literal
+   proven for another caller. How much variant inlining to do is a metric or
+   contract choice made later; it costs almost nothing, and code that would be
+   worse for the compiler ends up compiled as a shared function anyway. The
+   fold itself is honest: `dt_system_over` omitted `rollback`, so under the
+   contract it WAS the default; the retry lane became live when the source
+   passed a state field (bc34adba), not because a fold was wrong.
+2. **Falling up the scope ladder is correct; losing a write is the bug.** An
+   arm that does not assign leaves the value at the enclosing scope's
+   version, and the control builder taking the entered value there is right.
+   The `hard_failure` defect was identity confusion (the write published
+   under the SetAttr id, the arm looked up by the RHS id), fixed by keying
+   arms on cells (steps 2-3). Rule for name-carried arms, identical to lane
+   C's rule for fields: take the entered version when the book records no
+   write in that arm (the arm cell is the entered cell); refuse with
+   `Unresolved(ARM_VERSION_MISSING)` only when the book records a version for
+   the arm and the builder cannot find it. Never refuse the scope ladder.
