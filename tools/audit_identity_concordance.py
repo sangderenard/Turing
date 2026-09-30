@@ -16,6 +16,10 @@ Cases (any subset as arguments; default all):
              through whole-program callsite concordance
   mapping   ``for name, limit in channels.items()`` over a bare keyed
             mapping parameter (repro_loop_dominance)
+  oscillator a Van der Pol oscillator stepped by Runge-Kutta 4 in a
+            data-bounded ``while``, with a Heron square-root loop, a cosine
+            Taylor series over ``range`` and a running peak behind an ``if``:
+            three helpers, nested loops, branches, all scalar
 
 ``--pickle PATH`` audits a pickled SSA module instead (what
 ``TURING_REPRO_SSA=... tools/repro_step_with_dt_control_used.py`` writes).
@@ -269,6 +273,66 @@ def _lower_mapping():
     return module
 
 
+def _lower_oscillator():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    source = (
+        "def accel(mu, x, v):\n"
+        "    return mu * (1.0 - x * x) * v - x\n"
+        "\n"
+        "def heron_sqrt(value):\n"
+        "    guess = value * 0.5 + 0.5\n"
+        "    error = guess * guess - value\n"
+        "    if error < 0.0:\n"
+        "        error = 0.0 - error\n"
+        "    while error > 1e-12:\n"
+        "        guess = 0.5 * (guess + value / guess)\n"
+        "        error = guess * guess - value\n"
+        "        if error < 0.0:\n"
+        "            error = 0.0 - error\n"
+        "    return guess\n"
+        "\n"
+        "def cos_series(x):\n"
+        "    term = 1.0\n"
+        "    total = 1.0\n"
+        "    for k in range(6):\n"
+        "        term = 0.0 - term * x * x / ((2.0 * k + 1.0) * (2.0 * k + 2.0))\n"
+        "        total = total + term\n"
+        "    return total\n"
+        "\n"
+        "def root(mu, x0, v0, dt, steps):\n"
+        "    x = x0\n"
+        "    v = v0\n"
+        "    energy = 0.0\n"
+        "    peak = 0.0\n"
+        "    turns = 0\n"
+        "    while turns < steps:\n"
+        "        a1 = accel(mu, x, v)\n"
+        "        x2 = x + 0.5 * dt * v\n"
+        "        v2 = v + 0.5 * dt * a1\n"
+        "        a2 = accel(mu, x2, v2)\n"
+        "        x3 = x + 0.5 * dt * v2\n"
+        "        v3 = v + 0.5 * dt * a2\n"
+        "        a3 = accel(mu, x3, v3)\n"
+        "        x4 = x + dt * v3\n"
+        "        v4 = v + dt * a3\n"
+        "        a4 = accel(mu, x4, v4)\n"
+        "        x = x + dt * (v + 2.0 * v2 + 2.0 * v3 + v4) / 6.0\n"
+        "        v = v + dt * (a1 + 2.0 * a2 + 2.0 * a3 + a4) / 6.0\n"
+        "        radius = heron_sqrt(x * x + v * v)\n"
+        "        if radius > peak:\n"
+        "            peak = radius\n"
+        "        energy = energy + 0.5 * (x * x + v * v) * dt\n"
+        "        turns = turns + 1\n"
+        "    return energy * cos_series(peak) + peak\n"
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="concordance_oscillator",
+        extraction_contract=CONTRACTS / "program_extraction.yaml",
+    )
+    return module
+
+
 CASES = {
     "view": _lower_view,
     "toplevel": _lower_toplevel,
@@ -276,6 +340,7 @@ CASES = {
     "controller": _lower_controller,
     "controller_untyped": _lower_controller_untyped,
     "mapping": _lower_mapping,
+    "oscillator": _lower_oscillator,
 }
 
 

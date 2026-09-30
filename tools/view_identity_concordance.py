@@ -56,6 +56,10 @@ writes the extracted graph so ``--graph`` reopens it with no compiler import.
     left-drag: turn the sphere (release to coast)   right/middle-drag or
     shift+left-drag: pan   wheel: zoom   arrows: pan
     F: reset zoom/pan   T: reset rotation   click: pick a point
+    M: mass (toggle; ``--mass``)  a released spin no longer decays to a stop:
+        the damping drops out as the speed approaches an inertial floor
+        (``MASS_FLOOR`` radians per frame), only the excess over the floor
+        decays, and the sphere keeps turning at the floor until dragged again
     1 page  2 scope  3 revisions  4 degree  5 time   (colour mode)
     Space: run/stop the time integrator   R: reset layout   B: time background
         ``--drift`` starts with the integrator running (after ``--settle``),
@@ -1096,11 +1100,18 @@ def perspective(fov, aspect, near, far):
     return m
 
 
+COAST_DAMPING = 0.94    # spin kept per frame while coasting
+MASS_FLOOR = 0.0012     # radians per frame the sphere keeps turning at once mass is on (~4 deg/s at 60 fps)
+
+
 class Camera:
     """The camera stays put; dragging turns the sphere itself (trackball, no
-    gimbal), and a released drag coasts."""
+    gimbal), and a released drag coasts.  With ``mass`` on the coast never
+    stops: the damping acts only on the speed above ``MASS_FLOOR``, so it
+    drops out as the spin approaches the floor and the sphere keeps turning."""
 
-    def __init__(self):
+    def __init__(self, mass=False):
+        self.mass = bool(mass)
         self.reset_view()
 
     def reset_view(self):
@@ -1128,10 +1139,15 @@ class Camera:
             self.spin = (axis, angle)
 
     def coast(self):
-        if self.spin is not None:
-            axis, angle = self.spin
-            self.rotate(axis, angle)
-            self.spin = (axis, angle * 0.94) if angle > 1e-4 else None
+        if self.spin is None:
+            return
+        axis, angle = self.spin
+        self.rotate(axis, angle)
+        if self.mass:
+            # only the excess over the floor decays; at or under the floor the spin is kept as it is
+            self.spin = (axis, MASS_FLOOR + (angle - MASS_FLOOR) * COAST_DAMPING if angle > MASS_FLOOR else angle)
+        else:
+            self.spin = (axis, angle * COAST_DAMPING) if angle > 1e-4 else None
 
     def face(self, point):
         """Turn the sphere so ``point`` (a position on it) looks straight at the
@@ -1166,6 +1182,8 @@ def main(argv=None) -> None:
     ap.add_argument("--drift", action="store_true",
                     help="start with the time integrator running (Space toggles it): the points drift and the "
                          "contour background is recomputed live every frame")
+    ap.add_argument("--mass", action="store_true",
+                    help="start with mass on (M toggles it): a released spin keeps an inertial floor instead of stopping")
     ap.add_argument("--turn", type=float, default=0.0, help="start with the sphere turned this many degrees about its axis")
     ap.add_argument("--tilt", type=float, default=0.0, help="start with the sphere tipped this many degrees about the horizontal axis")
     ap.add_argument("--list", metavar="TEXT", help="print the nodes whose label contains TEXT, then exit")
@@ -1321,7 +1339,7 @@ def main(argv=None) -> None:
         gl.glBindTexture(gl.GL_TEXTURE_2D, bg_tex)
         gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32F, field.res, field.res, 0, gl.GL_RGBA, gl.GL_FLOAT, data)
 
-    camera = Camera()
+    camera = Camera(mass=args.mass)
     if args.turn:
         camera.rotate(np.array([0.0, 1.0, 0.0]), math.radians(args.turn))
     if args.tilt:
@@ -1426,6 +1444,7 @@ def main(argv=None) -> None:
         lines = [(f"identity concordance   color: {MODES[state['mode']]}   "
                   f"{int((kind == 0).sum())} rows  {int((kind == 1).sum())} ids  {len(er)} lines   "
                   f"physics {'ON' if state['physics'] else 'off'}  |T-t| {state['error']:.3f}   "
+                  f"mass {'ON' if camera.mass else 'off'}   "
                   f"diffusion {'ON' if state['diffuse'] else 'off'}",
                   (235, 235, 240)),
                  (summary[:200], (190, 200, 215))]
@@ -1474,7 +1493,7 @@ def main(argv=None) -> None:
         if focus:
             draw_focus_labels(surf, w, h, focus)
         if not focus:
-         surf.blit(font.render("drag turns sphere | rmb pan | wheel zoom | F view | T front | 1-5 color | SPACE physics | R reset | B bg | G animate | L P lines/points | PgUp/Dn page | C focus | D diffuse | H hud", True, (150, 150, 160)), (8, h - 22))
+         surf.blit(font.render("drag turns sphere | rmb pan | wheel zoom | F view | T front | M mass | 1-5 color | SPACE physics | R reset | B bg | G animate | L P lines/points | PgUp/Dn page | C focus | D diffuse | H hud", True, (150, 150, 160)), (8, h - 22))
         data = pygame.image.tostring(surf, "RGBA", True)
         gl.glBindTexture(gl.GL_TEXTURE_2D, hud_tex)
         gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
@@ -1701,6 +1720,7 @@ def main(argv=None) -> None:
                 elif k == pygame.K_EQUALS: state["lalpha"] = min(1.0, state["lalpha"] / 0.7)
                 elif k == pygame.K_f: camera.reset_view()
                 elif k == pygame.K_t: camera.front()
+                elif k == pygame.K_m: camera.mass = not camera.mass; state["hud_dirty"] = True
                 elif k == pygame.K_h: state["hud"] = not state["hud"]
                 elif k == pygame.K_c:
                     set_focus(None if state["focus"] else (state["pick"] if state["pick"] >= 0 else None))
