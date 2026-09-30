@@ -21,6 +21,11 @@ Cases (any subset as arguments; default all):
             Taylor series over ``range`` and a running peak behind an ``if``:
             three helpers, nested loops, branches, all scalar
 
+Every case takes ``process_graph_sink=``: a callable handed the resolved
+``ProcessGraph`` of the same lowering (the compiler's own
+``resolved_process_graph_sink``), for viewers that draw the program next
+to its concordance.
+
 ``--pickle PATH`` audits a pickled SSA module instead (what
 ``TURING_REPRO_SSA=... tools/repro_step_with_dt_control_used.py`` writes).
 
@@ -45,7 +50,7 @@ from src.compiler.identity_concordance import concordance_report  # noqa: E402
 CONTRACTS = Path(__file__).resolve().parents[1] / "extraction_contracts"
 
 
-def _lower_view():
+def _lower_view(*, process_graph_sink=None):
     from src.common.tensors import AbstractTensor
     from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
         c_backend_repository_ssa_reference,
@@ -112,11 +117,12 @@ def tick(state, dt):
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         name="concordance_view", runtime_closure_only=True,
         extraction_contract=policy,
+        resolved_process_graph_sink=process_graph_sink,
     )
     return module
 
 
-def _lower_toplevel():
+def _lower_toplevel(*, process_graph_sink=None):
     from src.compiler.extraction_contract import ExtractionContract
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.vehicle_python_compilation import (
@@ -159,11 +165,12 @@ def _lower_toplevel():
     })
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_toplevel", extraction_contract=policy,
+        resolved_process_graph_sink=process_graph_sink,
     )
     return module
 
 
-def _lower_energy():
+def _lower_energy(*, process_graph_sink=None):
     from src.common.dt_system.dt_controller import _energy_time_limit
     from src.common.tensors import AbstractTensor
     from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
@@ -198,11 +205,12 @@ def _lower_energy():
         python_bindings={"AbstractTensor": AbstractTensor},
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         extraction_contract=policy,
+        resolved_process_graph_sink=process_graph_sink,
     )
     return module
 
 
-def _lower_controller(*, declare_root_types: bool = True):
+def _lower_controller(*, declare_root_types: bool = True, process_graph_sink=None):
     from src.common.dt_system.dt_controller import STController, _restore_type
     from src.common.tensors import AbstractTensor
     from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
@@ -248,15 +256,16 @@ def _lower_controller(*, declare_root_types: bool = True):
         python_bindings={"AbstractTensor": AbstractTensor},
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         extraction_contract=policy,
+        resolved_process_graph_sink=process_graph_sink,
     )
     return module
 
 
-def _lower_controller_untyped():
-    return _lower_controller(declare_root_types=False)
+def _lower_controller_untyped(*, process_graph_sink=None):
+    return _lower_controller(declare_root_types=False, process_graph_sink=process_graph_sink)
 
 
-def _lower_mapping():
+def _lower_mapping(*, process_graph_sink=None):
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
     source = (
@@ -269,11 +278,12 @@ def _lower_mapping():
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_mapping",
         extraction_contract=CONTRACTS / "program_extraction.yaml",
+        resolved_process_graph_sink=process_graph_sink,
     )
     return module
 
 
-def _lower_oscillator():
+def _lower_oscillator(*, process_graph_sink=None):
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
     source = (
@@ -329,6 +339,7 @@ def _lower_oscillator():
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_oscillator",
         extraction_contract=CONTRACTS / "program_extraction.yaml",
+        resolved_process_graph_sink=process_graph_sink,
     )
     return module
 

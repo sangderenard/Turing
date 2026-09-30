@@ -72,8 +72,15 @@ def install_bound_spring(
     node_type_mask: Sequence[Sequence[bool]] | None = None,
     node_role_mask: Sequence[Sequence[bool]] | None = None,
     parameters: BoundSpringParameters | None = None,
+    surface: bool = False,
 ) -> None:
-    """Install one legacy-compatible BoundSpring network into world state."""
+    """Install one legacy-compatible BoundSpring network into world state.
+
+    ``surface=True`` puts the network ON its boundary sphere instead of inside
+    it: every step projects each node back to the radius and strips the whole
+    radial velocity, so the network lives on the surface (the shell of a
+    globe) while another network, installed without it, lives in the volume.
+    """
 
     cfg = parameters or BoundSpringParameters()
     position = _tensor(positions, "float32")
@@ -162,6 +169,8 @@ def install_bound_spring(
     )
     state.spring_node_network = _tensor([0] * node_count, "int32")
     state.spring_edge_network = _tensor([0] * edge_count, "int32")
+    state.spring_network_surface = _tensor([bool(surface)] if node_count else [], "bool")
+    state.spring_external_force = AT.zeros_like(position)
     state.validate_sparse_shapes()
 
 
@@ -207,7 +216,7 @@ def append_bound_spring(
     for name in (
         "spring_mass", "spring_rest_length", "spring_base_length",
         "spring_natural_rest_length", "spring_done_growing",
-        "spring_glow_alpha", "spring_glow_radius",
+        "spring_glow_alpha", "spring_glow_radius", "spring_external_force",
     ):
         setattr(state, name, AT.cat([
             getattr(state, name), getattr(incoming, name)
@@ -241,6 +250,9 @@ def append_bound_spring(
     ], dim=0)
     state.spring_boundary_radius = AT.cat([
         state.spring_boundary_radius, incoming.spring_boundary_radius
+    ], dim=0)
+    state.spring_network_surface = AT.cat([
+        state.spring_network_surface, incoming.spring_network_surface
     ], dim=0)
     state.spring_node_count = _tensor(
         [int(state.spring_position.shape[0])], "int64"
@@ -377,6 +389,9 @@ def _forces(
         force = force + (
             cfg.c_repulse * inverse[:, :, None] * displacement
         ).sum(dim=1)
+    # The host's force layer, added before the integrator and before the
+    # causal ceiling, so the dt system admits it like every other force.
+    force = force + state.spring_external_force[:node_count]
     proposed_acceleration = force / state.spring_mass[:node_count].clone().reshape((-1, 1))
     _max_force, max_velocity, _max_displacement = _resolved_caps(state, cfg)
     c_abs = cfg.c_frac * max_velocity
@@ -501,10 +516,17 @@ def advance_bound_spring(
     ).reshape((-1, 1))
     if int(radius.shape[0]):
         normal = radial / (distance + 1.0e-9)
-        escaped = distance > radius
+        # A surface network is projected every step, both ways, and loses its
+        # whole radial velocity; a contained one only when it escapes, and
+        # only the outward part.
+        on_surface = state.spring_network_surface.index_select(
+            0, network_index
+        ).astype("float32").reshape((-1, 1))
+        escaped = ((distance > radius).astype("float32") + on_surface) > 0.5
         projected = center + normal * radius
         outward = (velocity * normal).sum(dim=1, keepdim=True)
-        slipped = velocity - outward.clamp(min=0.0) * normal
+        radial_loss = outward.clamp(min=0.0) * (1.0 - on_surface) + outward * on_surface
+        slipped = velocity - radial_loss * normal
         position = AT.where(escaped, projected, position)
         velocity = AT.where(escaped, slipped, velocity)
     state.spring_position[:node_count] = position
