@@ -45,6 +45,9 @@ REDUCTION = declare_stage("reduction")
 CANONICAL_RELABEL = declare_stage("canonical_relabel")
 FUNCTION_SUBGRAPH = declare_stage("function_subgraph")
 FUNCTION_TABLE = declare_stage("function_table")
+#: ``fork_read_scope``: a graph copy's read-scope rows, each DERIVED from
+#: the cell it was forked from.
+READ_SCOPE_FORK = declare_stage("read_scope_fork")
 
 # -- transforms (roots have no minted id: Novel writes the origin edge only) --
 INGEST_SOURCE = declare_transform("ingest_source", 0)

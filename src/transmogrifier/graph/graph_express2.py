@@ -124,50 +124,135 @@ SIMD_DEFAULT_CONCURRENCY = 4  # default concurrency for SIMD operations
 from collections.abc import Callable
 
 
-def _annotate_visual_source_owners(tree: ast.AST) -> None:
-    """Attach lexical provenance used only by observers and diagnostics.
+def _source_definition_identity(definition):
+    """``(module, qualname)`` of one definition (plan 60, sections 1.1/1.2).
+
+    A definition discovered by pursuit carries its live identity in
+    ``_python_source_identity``.  Otherwise the identity the owner visitor
+    stamped (``_turing_source_module`` / ``_turing_source_qualname``) is
+    the answer: the program's own filename and the lexical scope tuple.
+    """
+
+    identity = getattr(definition, "_python_source_identity", None)
+    if isinstance(identity, tuple) and len(identity) == 2:
+        return str(identity[0]), str(identity[1])
+    module_name = getattr(definition, "_turing_source_module", None)
+    qualname = getattr(definition, "_turing_source_qualname", None)
+    if module_name is None or qualname is None:
+        return None
+    return str(module_name), str(qualname)
+
+
+def _annotate_visual_source_owners(tree: ast.AST, *, module_name=None):
+    """Attach lexical provenance used by observers, diagnostics and the book.
 
     The AST remains the compiler authority.  These annotations let optional
     evolution observers attribute a later graph expansion to the source class
     or function that owned the node without reconstructing lexical scope from
     lossy graph edges.
+
+    Every node is also stamped with its ``source_span`` row
+    ``(module, qualname, path)`` (plan 60, section 1): the module the owning
+    definition lives in, that definition's qualified name and the AST field
+    path from the definition to the node, ``()`` for the definition itself.
+    Positions are never part of the row.  Returns the owner index
+    ``{(module, qualname): definition}`` for the definitions visited (the
+    module itself under ``(module, "")``); it is an in-process index only.
     """
+
+    if module_name is None:
+        module_name = getattr(tree, "_turing_source_module", None)
+    if module_name is None:
+        module_name = "<string>"
+    owners = {}
 
     class OwnerVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.scope: list[str] = []
             self.classes: list[str] = []
+            self.module_name = str(module_name)
+            self.qualname = ""
+            self.path: list = []
+
+        def _stamp(self, node):
+            node._turing_source_scope = tuple(self.scope)
+            node._turing_source_class = (
+                self.classes[-1] if self.classes else None
+            )
+            node._turing_source_span_row = (
+                self.module_name, self.qualname, tuple(self.path),
+            )
 
         def visit(self, node):
             if isinstance(node, ast.AST):
-                node._turing_source_scope = tuple(self.scope)
-                node._turing_source_class = (
-                    self.classes[-1] if self.classes else None
-                )
+                self._stamp(node)
             return super().visit(node)
+
+        def generic_visit(self, node):
+            for field_name, value in ast.iter_fields(node):
+                if isinstance(value, list):
+                    for index, item in enumerate(value):
+                        if isinstance(item, ast.AST):
+                            self.path.append((field_name, index))
+                            self.visit(item)
+                            self.path.pop()
+                elif isinstance(value, ast.AST):
+                    self.path.append((field_name, -1))
+                    self.visit(value)
+                    self.path.pop()
+
+        def _enter_definition(self, node):
+            identity = _source_definition_identity(node)
+            if identity is None:
+                identity = (
+                    self.module_name,
+                    f"{self.qualname}.{node.name}" if self.qualname
+                    else str(node.name),
+                )
+            node._turing_source_module, node._turing_source_qualname = identity
+            node._turing_source_span_row = (*identity, ())
+            owners[identity] = node
+            saved = (self.module_name, self.qualname, self.path)
+            self.module_name, self.qualname = identity
+            self.path = []
+            return saved
+
+        def _leave_definition(self, saved):
+            self.module_name, self.qualname, self.path = saved
+
+        def visit_Module(self, node):
+            owners[(self.module_name, "")] = node
+            node._turing_source_module = self.module_name
+            node._turing_source_qualname = ""
+            self.generic_visit(node)
 
         def visit_ClassDef(self, node: ast.ClassDef):
             node._turing_source_scope = tuple((*self.scope, node.name))
             node._turing_source_class = node.name
+            saved = self._enter_definition(node)
             self.scope.append(node.name)
             self.classes.append(node.name)
             self.generic_visit(node)
             self.classes.pop()
             self.scope.pop()
+            self._leave_definition(saved)
 
         def _visit_function(self, node):
             node._turing_source_scope = tuple((*self.scope, node.name))
             node._turing_source_class = (
                 self.classes[-1] if self.classes else None
             )
+            saved = self._enter_definition(node)
             self.scope.append(node.name)
             self.generic_visit(node)
             self.scope.pop()
+            self._leave_definition(saved)
 
         visit_FunctionDef = _visit_function
         visit_AsyncFunctionDef = _visit_function
 
     OwnerVisitor().visit(tree)
+    return owners
 
 
 @dataclass(frozen=True)
@@ -252,7 +337,10 @@ def _ast_aggregate_kind(value):
 def _class_body_field_values(definition, attribute):
     """Every expression a class body gives to instance field ``attribute``.
 
-    Yields ``(expression, is_annotation)``.  Three spellings state a field:
+    Yields ``(expression, is_annotation, method, statement)``: the lexical
+    method the statement sits in (``None`` for a class-level annotation) and
+    the statement itself, the source construct whose span the resolved
+    field derives from.  Three spellings state a field:
     ``self.x = value`` / ``self.x: T = value`` anywhere in a method,
     ``setattr(self, "x", value)`` with a literal name, and a class-level
     ``x: T`` annotation, whose ``T`` is yielded as an annotation.  ``self``
@@ -265,7 +353,7 @@ def _class_body_field_values(definition, attribute):
         if isinstance(member, ast.AnnAssign):
             target = member.target
             if isinstance(target, ast.Name) and target.id == attribute:
-                yield member.annotation, True, None
+                yield member.annotation, True, None, member
             continue
         if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -281,7 +369,7 @@ def _class_body_field_values(definition, attribute):
                     and target.attr == attribute
                     for target in statement.targets
                 ):
-                    yield statement.value, False, member
+                    yield statement.value, False, member, statement
             elif isinstance(statement, ast.AnnAssign):
                 target = statement.target
                 if (
@@ -291,7 +379,7 @@ def _class_body_field_values(definition, attribute):
                     and target.attr == attribute
                     and statement.value is not None
                 ):
-                    yield statement.value, False, member
+                    yield statement.value, False, member, statement
             elif (
                 isinstance(statement, ast.Call)
                 and isinstance(statement.func, ast.Name)
@@ -302,7 +390,7 @@ def _class_body_field_values(definition, attribute):
                 and isinstance(statement.args[1], ast.Constant)
                 and statement.args[1].value == attribute
             ):
-                yield statement.args[2], False, member
+                yield statement.args[2], False, member, statement
 
 
 def _resolve_class_body_field(
@@ -317,9 +405,13 @@ def _resolve_class_body_field(
 
     values = []
     unresolved = False
-    for expression, is_annotation, scope in _class_body_field_values(
+    declaring_statements = []
+    for expression, is_annotation, scope, statement in _class_body_field_values(
         definition, attribute
     ):
+        declaring_statements.append(
+            (definition if scope is None else scope, statement)
+        )
         # An assignment in ``__init__`` is resolved in that method's lexical
         # environment.  In particular, ``self.registry = registry`` carries
         # the exact class identity stated by ``registry: Registry``.  Reading
@@ -354,7 +446,12 @@ def _resolve_class_body_field(
     # lexical environment and silently lose constructor-parameter types.
     # Publish the exact reference once and require every later lookup to read
     # the same row from the shared concordance.
-    from ...compiler.identity_concordance import current_identity_book
+    from ...compiler.concordance_declarations import (
+        PURSUIT, SOURCE_FIELD_IDENTITY, SYNTHESIZED_NO_SOURCE,
+    )
+    from ...compiler.identity_concordance import (
+        Derived, Mode, Unsourced, current_identity_book,
+    )
 
     source_identity = getattr(definition, "_python_source_identity", None)
     owner_key = owner_identity or (
@@ -362,10 +459,27 @@ def _resolve_class_body_field(
         if source_identity else str(definition.name)
     )
     row = (str(owner_key), str(attribute))
-    page = current_identity_book().page("source_field_identity_concordance")
+    book = current_identity_book()
+    page = book.page(SOURCE_FIELD_IDENTITY)
     incumbent = page.latest(row)
     if incumbent is None:
-        page.set(row, 0, result)
+        # DERIVED from the span of every class-body statement whose value
+        # was resolved (plan 60, section 3.6).
+        cells = tuple(
+            span for span in (
+                post_source_span(owner, statement, stage=PURSUIT)
+                for owner, statement in declaring_statements
+            )
+            if span is not None
+        )
+        book.post(
+            SOURCE_FIELD_IDENTITY, row, result, stage=PURSUIT,
+            provenance=(
+                Derived(cells) if cells
+                else Unsourced(SYNTHESIZED_NO_SOURCE)
+            ),
+            mode=Mode.CONCORD,
+        )
         return result
     if not _same_ast_reference(incumbent, result):
         raise ValueError(
@@ -385,6 +499,15 @@ def _class_field_reference(owner, attribute, seen):
     definition = _source_ast_definition(owner)
     if not isinstance(definition, ast.ClassDef):
         return None
+    # The decompiled body's span rows live in the class's own module under
+    # its live qualified name (plan 60, section 1.1); the definition is not
+    # part of the submitted program, so it carries no
+    # ``_python_source_identity`` and only the span identity is stamped.
+    if _source_definition_identity(definition) is None:
+        definition._turing_source_module = str(getattr(owner, "__module__", ""))
+        definition._turing_source_qualname = str(
+            getattr(owner, "__qualname__", getattr(owner, "__name__", ""))
+        )
     field_bindings = _import_ast_bindings(
         definition,
         _ast_definition_bindings(owner),
@@ -430,7 +553,12 @@ def _source_class_field_reference(definition, attribute, bindings, seen):
         and member.name == attribute
     ), None)
     if method is not None:
-        from ...compiler.identity_concordance import current_identity_book
+        from ...compiler.concordance_declarations import (
+            PURSUIT, SOURCE_METHOD_IDENTITY, SYNTHESIZED_NO_SOURCE,
+        )
+        from ...compiler.identity_concordance import (
+            Derived, Mode, Unsourced, current_identity_book,
+        )
 
         source_identity = getattr(definition, "_python_source_identity", None)
         owner_key = (
@@ -438,13 +566,23 @@ def _source_class_field_reference(definition, attribute, bindings, seen):
             if isinstance(source_identity, tuple)
             else (str(definition.name),)
         )
-        row = (*owner_key, str(attribute))
-        page = current_identity_book().page(
-            "source_method_identity_concordance"
-        )
+        # Row ``(source identity parts, attribute)``: the declared shape
+        # keeps the identity parts as one SCOPE element.
+        row = (owner_key, str(attribute))
+        book = current_identity_book()
+        page = book.page(SOURCE_METHOD_IDENTITY)
         incumbent = page.latest(row)
         if incumbent is None:
-            page.set(row, 0, method)
+            # DERIVED from the method's own span (plan 60, section 3.6).
+            span = post_source_span(definition, method, stage=PURSUIT)
+            book.post(
+                SOURCE_METHOD_IDENTITY, row, method, stage=PURSUIT,
+                provenance=(
+                    Derived((span,)) if span is not None
+                    else Unsourced(SYNTHESIZED_NO_SOURCE)
+                ),
+                mode=Mode.CONCORD,
+            )
             return method
         if not _same_ast_reference(incumbent, method):
             raise ValueError(
@@ -796,18 +934,159 @@ def instance_attribute_slot(attributes, attribute_name):
     return None
 
 
+_SOURCE_DEFINITION_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _source_span_path(owner_definition, node):
+    """The AST field path from ``owner_definition`` to ``node`` (plan 60,
+    section 1.3): ``((field, index), ...)`` over ``ast.iter_fields``, index
+    ``-1`` for a non-list field, ``()`` for the definition itself; ``None``
+    when ``node`` is not under the owner.  Nested definitions own their own
+    nodes and are not descended into.  A transient walk: ``id()`` never
+    reaches a row."""
+
+    if node is owner_definition:
+        return ()
+    pending = [(owner_definition, ())]
+    while pending:
+        current, path = pending.pop()
+        for field_name, value in ast.iter_fields(current):
+            if isinstance(value, list):
+                children = tuple(
+                    (item, (*path, (field_name, index)))
+                    for index, item in enumerate(value)
+                    if isinstance(item, ast.AST)
+                )
+            elif isinstance(value, ast.AST):
+                children = ((value, (*path, (field_name, -1))),)
+            else:
+                continue
+            for child, child_path in children:
+                if child is node:
+                    return child_path
+                if not isinstance(child, _SOURCE_DEFINITION_TYPES):
+                    pending.append((child, child_path))
+    return None
+
+
+def source_span_row(owner_definition, node):
+    """The ``source_span`` row ``(module, qualname, path)`` of ``node``.
+
+    With an owner definition the path is read from the tree as it is now
+    (pursuit rewrites bodies; a stamp made earlier may be stale).  Without
+    one, or when the node is not under the owner, the row the owner visitor
+    stamped (``_turing_source_span_row``) is the answer.  ``None`` when the
+    node has neither: a synthesized node that is no source construct.
+    """
+
+    stamped = getattr(node, "_turing_source_span_row", None)
+    if owner_definition is None:
+        return stamped
+    identity = _source_definition_identity(owner_definition)
+    if identity is None:
+        return stamped
+    path = _source_span_path(owner_definition, node)
+    if path is None:
+        return stamped
+    return (*identity, path)
+
+
+def _span_position(node, name):
+    """One source position as ``node_description`` records it: -1 when the
+    node carries none (``arguments``, an expression context)."""
+
+    value = getattr(node, name, None)
+    return -1 if value is None else int(value)
+
+
+def _span_fact(node):
+    from ...compiler.concordance_declarations import SpanFact
+    import hashlib
+
+    return SpanFact(
+        type(node).__name__,
+        _span_position(node, "lineno"),
+        _span_position(node, "col_offset"),
+        _span_position(node, "end_lineno"),
+        _span_position(node, "end_col_offset"),
+        hashlib.sha256(
+            ast.dump(node, include_attributes=False).encode("utf-8")
+        ).hexdigest(),
+    )
+
+
+def post_source_span(owner_definition, node, *, stage=None):
+    """Post ``node``'s ``source_span`` root and return its cell (plan 60, 1.5).
+
+    The root is ``Novel(INGEST_SOURCE, ())``: a source construct mints no
+    id, its identity IS its row.  The first post of a row owns it; a later
+    post with the same fact is the no-op that re-records the origin.  A
+    later post with a DIFFERENT fact (the tree was rewritten between two
+    stages -- pursuit's fold lowering, the walrus hoist, the ellipsis
+    expansion -- so the construct at this path now has other content or
+    positions) is a revision of the root with the posting stage, never a
+    second row: the row is the construct, the fact is what it says now.
+    Returns ``None`` when ``node`` has no row (see ``source_span_row``).
+    """
+
+    from ...compiler.concordance_declarations import (
+        INGESTION, INGEST_SOURCE, SOURCE_SPAN,
+    )
+    from ...compiler.identity_concordance import (
+        Mode, Novel, current_identity_book,
+    )
+
+    row = source_span_row(owner_definition, node)
+    if row is None:
+        return None
+    book = current_identity_book()
+    fact = _span_fact(node)
+    latest = book.latest_ref(SOURCE_SPAN, row)
+    if latest is not None:
+        page = book.page(SOURCE_SPAN)
+        if page.latest(row) == fact:
+            return latest
+        mode = Mode.REVISE
+    else:
+        mode = Mode.CONCORD
+    return book.post(
+        SOURCE_SPAN, row, fact,
+        stage=INGESTION if stage is None else stage,
+        provenance=Novel(INGEST_SOURCE, ()), mode=mode,
+    )
+
+
 def _class_schema_from_ast(definition):
     """Record only class syntax already being ingested by ``ProcessGraph``.
 
     This is descriptive AST metadata: attributes and direct method definitions
     with source-derived program identifiers.  It deliberately does not infer
     execution, data flow, process edges, or a runtime object model.
+
+    The class, each field and each method are also posted on the book
+    (``class_declaration`` / ``class_field_declaration`` /
+    ``class_method_declaration``, plan 60, section 3.3), DERIVED from the
+    ``source_span`` of the ``ClassDef``, of EVERY statement that declared
+    the field (the dict keeps the first declaration; the row names all of
+    them as cells) and of the method's ``FunctionDef``.  The returned dict
+    is the read view; its ``class_node_id`` / ``ast_node_id`` entries are
+    the span row keys, not addresses.
     """
+
+    from ...compiler.concordance_declarations import (
+        CLASS_DECLARATION, CLASS_FIELD_DECLARATION, CLASS_METHOD_DECLARATION,
+        ClassFact, FieldFact, INGESTION, MethodFact,
+    )
+    from ...compiler.identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
 
     attributes = []
     seen_attributes = set()
+    declaring_statements: dict[str, list] = {}
 
-    def add_attribute(name, annotation, storage):
+    def add_attribute(name, annotation, storage, statement, owner):
+        declaring_statements.setdefault(name, []).append((owner, statement))
         if name in seen_attributes:
             return
         seen_attributes.add(name)
@@ -826,11 +1105,13 @@ def _class_schema_from_ast(definition):
     methods = list(methods_by_name.values())
     for member in definition.body:
         if isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
-            add_attribute(member.target.id, member.annotation, "class")
+            add_attribute(
+                member.target.id, member.annotation, "class", member, definition,
+            )
         elif isinstance(member, ast.Assign):
             for target in member.targets:
                 if isinstance(target, ast.Name):
-                    add_attribute(target.id, None, "class")
+                    add_attribute(target.id, None, "class", member, definition)
     for method in methods:
         for statement in ast.walk(method):
             if isinstance(statement, ast.Assign):
@@ -840,7 +1121,9 @@ def _class_schema_from_ast(definition):
                         and isinstance(target.value, ast.Name)
                         and target.value.id == "self"
                     ):
-                        add_attribute(target.attr, None, "instance")
+                        add_attribute(
+                            target.attr, None, "instance", statement, method,
+                        )
             elif isinstance(statement, ast.AnnAssign):
                 target = statement.target
                 if (
@@ -852,6 +1135,8 @@ def _class_schema_from_ast(definition):
                         target.attr,
                         statement.annotation,
                         "instance",
+                        statement,
+                        method,
                     )
     source_identity = getattr(definition, "_python_source_identity", None)
     class_identity = (
@@ -859,22 +1144,66 @@ def _class_schema_from_ast(definition):
         if source_identity is not None
         else definition.name
     )
-    return {
+    schema = {
         "class_name": definition.name,
         "class_identity": class_identity,
-        "class_node_id": id(definition),
+        "class_node_id": source_span_row(definition, definition),
         "permissions": (),
         "attributes": tuple(attributes),
         "methods": tuple({
             "name": method.name,
             "graph_identity": f"{definition.name}.{method.name}",
-            "ast_node_id": id(method),
+            "ast_node_id": source_span_row(definition, method),
             "parameters": tuple(
                 argument.arg for argument in method.args.args
             ),
             "permissions": (),
         } for method in methods),
     }
+    class_span = post_source_span(definition, definition)
+    if class_span is None:
+        return schema
+    book = current_identity_book()
+    module_name = class_span.row[0]
+    book.post(
+        CLASS_DECLARATION, (module_name, str(class_identity)),
+        ClassFact(str(definition.name), ()),
+        stage=INGESTION, provenance=Derived((class_span,)),
+        mode=Mode.CONCORD,
+    )
+    for attribute in attributes:
+        name = attribute["name"]
+        cells = tuple(
+            span for span in (
+                post_source_span(owner, statement)
+                for owner, statement in declaring_statements.get(name, ())
+            )
+            if span is not None
+        )
+        if not cells:
+            continue
+        book.post(
+            CLASS_FIELD_DECLARATION,
+            (module_name, str(class_identity), str(name)),
+            FieldFact(
+                str(attribute["storage"]),
+                str(attribute["annotation"] or ""),
+                tuple(attribute["permissions"]),
+            ),
+            stage=INGESTION, provenance=Derived(cells), mode=Mode.CONCORD,
+        )
+    for method, entry in zip(methods, schema["methods"]):
+        method_span = post_source_span(definition, method)
+        if method_span is None:
+            continue
+        book.post(
+            CLASS_METHOD_DECLARATION,
+            (module_name, str(class_identity), str(method.name)),
+            MethodFact(entry["graph_identity"], tuple(entry["parameters"])),
+            stage=INGESTION, provenance=Derived((method_span,)),
+            mode=Mode.CONCORD,
+        )
+    return schema
 
 
 def _ast_qualified_name(expression):
@@ -910,7 +1239,7 @@ def _state_machine_schema_from_ast(definition):
         for member in definition.body
         if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
     )
-    return {
+    schema = {
         "class_name": definition.name,
         "identity": definition.name,
         "marker": marker,
@@ -920,8 +1249,29 @@ def _state_machine_schema_from_ast(definition):
             if "transition" in methods
             else None
         ),
-        "ast_node_id": id(definition),
+        "ast_node_id": source_span_row(definition, definition),
     }
+    # The marked class is a declaration DERIVED from its ClassDef span
+    # (plan 60, section 3.3); the dict above is its read view.
+    class_span = post_source_span(definition, definition)
+    if class_span is not None:
+        from ...compiler.concordance_declarations import (
+            INGESTION, STATE_MACHINE_DECLARATION, StateMachineFact,
+        )
+        from ...compiler.identity_concordance import (
+            Derived, Mode, current_identity_book,
+        )
+
+        current_identity_book().post(
+            STATE_MACHINE_DECLARATION,
+            (class_span.row[0], str(definition.name)),
+            StateMachineFact(
+                str(marker), tuple(bases), schema["transition_identity"],
+            ),
+            stage=INGESTION, provenance=Derived((class_span,)),
+            mode=Mode.CONCORD,
+        )
+    return schema
 
 
 def _map_ir_from_ast(tree):
@@ -931,6 +1281,44 @@ def _map_ir_from_ast(tree):
     but no permission declarations. Policy is not guessed from Python naming
     conventions or method bodies.
     """
+
+    from ...compiler.concordance_declarations import (
+        ANNOTATION_DECLARATION, AnnotationFact, INGESTION,
+    )
+    from ...compiler.identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    book = current_identity_book()
+
+    def annotation_entry(statement, owner, identity_prefix=None):
+        """One annotation dict entry, posted DERIVED from the ``AnnAssign``
+        span on ``annotation_declaration`` (plan 60, section 3.3); the
+        ``ast_node_id`` is the span row key."""
+
+        entry = {
+            "name": statement.target.id,
+            **({} if identity_prefix is None else {"identity": (
+                f"{identity_prefix}.{statement.target.id}"
+                if identity_prefix else statement.target.id
+            )}),
+            "annotation": ast.unparse(statement.annotation),
+            "value": (
+                None if statement.value is None
+                else ast.unparse(statement.value)
+            ),
+            "ast_node_id": source_span_row(owner, statement),
+        }
+        span = post_source_span(owner, statement)
+        if span is not None:
+            book.post(
+                ANNOTATION_DECLARATION,
+                (span.row[0], str(span.row[1]), str(statement.target.id)),
+                AnnotationFact(entry["annotation"], entry["value"] or ""),
+                stage=INGESTION, provenance=Derived((span,)),
+                mode=Mode.CONCORD,
+            )
+        return entry
 
     objects = tuple(
         _class_schema_from_ast(definition)
@@ -945,16 +1333,7 @@ def _map_ir_from_ast(tree):
         is not None
     )
     module_annotations = tuple(
-        {
-            "name": statement.target.id,
-            "identity": statement.target.id,
-            "annotation": ast.unparse(statement.annotation),
-            "value": (
-                None if statement.value is None
-                else ast.unparse(statement.value)
-            ),
-            "ast_node_id": id(statement),
-        }
+        annotation_entry(statement, tree, "")
         for statement in getattr(tree, "body", ())
         if isinstance(statement, ast.AnnAssign)
         and isinstance(statement.target, ast.Name)
@@ -963,16 +1342,7 @@ def _map_ir_from_ast(tree):
         {
             "class_name": definition.name,
             "members": tuple(
-                {
-                    "name": statement.target.id,
-                    "identity": f"{definition.name}.{statement.target.id}",
-                    "annotation": ast.unparse(statement.annotation),
-                    "value": (
-                        None if statement.value is None
-                        else ast.unparse(statement.value)
-                    ),
-                    "ast_node_id": id(statement),
-                }
+                annotation_entry(statement, definition, definition.name)
                 for statement in definition.body
                 if isinstance(statement, ast.AnnAssign)
                 and isinstance(statement.target, ast.Name)
@@ -989,15 +1359,7 @@ def _map_ir_from_ast(tree):
                 else function.name
             ),
             "locals": tuple(
-                {
-                    "name": statement.target.id,
-                    "annotation": ast.unparse(statement.annotation),
-                    "value": (
-                        None if statement.value is None
-                        else ast.unparse(statement.value)
-                    ),
-                    "ast_node_id": id(statement),
-                }
+                annotation_entry(statement, function)
                 for statement in ast.walk(function)
                 if isinstance(statement, ast.AnnAssign)
                 and isinstance(statement.target, ast.Name)
@@ -1015,13 +1377,22 @@ def _map_ir_from_ast(tree):
             else ()
         )
     )
+    # Ingestion ids of the schema statements and of every node under them.
+    # These two tuples are the pre-build view; ``build_from_ast`` replaces
+    # them with the ``schema_node`` page's rows once ``ensure_node`` has
+    # posted them (plan 60, section 3.3 (d)).
     schema_roots = tuple(
-        item["ast_node_id"]
-        for item in module_annotations
+        id(statement)
+        for statement in getattr(tree, "body", ())
+        if isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
     ) + tuple(
-        member["ast_node_id"]
-        for record in class_annotations
-        for member in record["members"]
+        id(statement)
+        for definition in getattr(tree, "body", ())
+        if isinstance(definition, ast.ClassDef)
+        for statement in definition.body
+        if isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
     )
     schema_statements = tuple(
         statement
@@ -2062,29 +2433,52 @@ class _ReduceFoldLowerer:
         ast.fix_missing_locations(definition)
 
 
-def _mark_source_pursuit_active(definition):
-    """Commit that ``definition`` is part of the program being compiled."""
+def _mark_source_pursuit_active(definition, *, demand):
+    """Commit that ``definition`` is part of the program being compiled.
 
-    from ...compiler.identity_concordance import current_identity_book
+    Row ``(module, qualname)``: the definition's own span row key without
+    the path (plan 60, section 3.7); never an address.  The fact is DERIVED
+    from ``demand`` -- the cell that made the definition live: the call
+    site's span, the class span that admitted a constructor, a
+    ``contract_demand`` row, or the module's span when every definition is
+    active -- and from the definition's own span.
+    """
 
-    source_identity = getattr(definition, "_python_source_identity", None)
-    identity = (
-        tuple(map(str, source_identity))
-        if isinstance(source_identity, tuple)
-        else (str(getattr(definition, "name", "<definition>")),)
+    from ...compiler.concordance_declarations import (
+        PURSUIT, SOURCE_PURSUIT_ACTIVATION, SYNTHESIZED_NO_SOURCE,
     )
-    row = (*identity, id(definition))
-    page = current_identity_book().page(
-        "source_pursuit_activation_concordance"
+    from ...compiler.identity_concordance import (
+        Derived, Mode, Ref, Unsourced, current_identity_book,
     )
+
+    identity = _source_definition_identity(definition)
+    if identity is None:
+        source_identity = getattr(definition, "_python_source_identity", None)
+        identity = (
+            tuple(map(str, source_identity))
+            if isinstance(source_identity, tuple) and len(source_identity) == 2
+            else ("", str(getattr(definition, "name", "<definition>")))
+        )
+    row = (str(identity[0]), str(identity[1]))
+    book = current_identity_book()
+    page = book.page(SOURCE_PURSUIT_ACTIVATION)
     incumbent = page.latest(row)
     if incumbent is not None and incumbent is not True:
         raise ValueError(
             "source pursuit activation concordance disagreement for "
             f"{row!r}: recorded={incumbent!r}, proposed=True"
         )
-    if incumbent is None:
-        page.set(row, 0, True)
+    span = post_source_span(definition, definition, stage=PURSUIT)
+    cells = tuple(
+        cell for cell in (demand, span) if isinstance(cell, Ref)
+    )
+    book.post(
+        SOURCE_PURSUIT_ACTIVATION, row, True, stage=PURSUIT,
+        provenance=(
+            Derived(cells) if cells else Unsourced(SYNTHESIZED_NO_SOURCE)
+        ),
+        mode=Mode.CONCORD,
+    )
     definition._source_pursuit_active = True
 
 
@@ -2138,6 +2532,11 @@ def _expand_unresolved_ast_parents(
         if progress is not None:
             progress(message)
 
+    # Every node's ``source_span`` row is stamped before pursuit posts
+    # anything: the seed definitions' activation rows derive from their own
+    # spans (plan 60, section 3.7).  Definitions discovered below are
+    # stamped as they are appended.
+    _annotate_visual_source_owners(module)
     root_bindings = _import_ast_bindings(module, bindings, package=package)
     # Built-ins are ordinary lexical fallback bindings in Python.  Put them
     # through the same source/host-code implementation resolver as imports and
@@ -2513,8 +2912,27 @@ def _expand_unresolved_ast_parents(
         )
         latent_call_ids = frozenset()
         active_seed_definitions = tuple(definitions)
-    for definition in active_seed_definitions:
-        mark_source_pursuit_active(definition)
+    # The demand that makes a seed live: its ``contract_demand`` PURSUIT_ROOT
+    # row (posted by ``build_from_ast``), or, when every definition is
+    # active, the module's own span (plan 60, section 3.7).
+    from ...compiler.concordance_declarations import (
+        CONTRACT_DEMAND_PAGE, DemandKind, PURSUIT,
+    )
+    from ...compiler.identity_concordance import current_identity_book
+
+    pursuit_book = current_identity_book()
+
+    def seed_demand(index):
+        if roots:
+            demand = pursuit_book.latest_ref(
+                CONTRACT_DEMAND_PAGE, (DemandKind.PURSUIT_ROOT, roots[index]),
+            )
+            if demand is not None:
+                return demand
+        return post_source_span(module, module, stage=PURSUIT)
+
+    for index, definition in enumerate(active_seed_definitions):
+        mark_source_pursuit_active(definition, demand=seed_demand(index))
     all_calls = list(pending_calls)
     call_owners = {}
     for definition in definitions:
@@ -2523,6 +2941,20 @@ def _expand_unresolved_ast_parents(
             if isinstance(member, ast.Call)
         ):
             call_owners[id(call)] = definition
+
+    def call_demand(call):
+        """The span cell of the call that admitted a definition: the demand
+        an activation row derives from.  A worklist-only lookup occurrence
+        (never inserted into the program) has no span; the owner it was
+        made for is the construct that demanded it."""
+
+        owner = call_owners.get(id(call))
+        if owner is None:
+            owner = module
+        span = post_source_span(owner, call, stage=PURSUIT)
+        if span is None:
+            span = post_source_span(owner, owner, stage=PURSUIT)
+        return span
     binding_revisions = {}
     processed_revisions = {}
     activated_definitions = set()
@@ -2657,9 +3089,9 @@ def _expand_unresolved_ast_parents(
                     return tuple(table)
         return ()
 
-    def requeue_definition(definition):
+    def requeue_definition(definition, *, demand):
         definition_id = id(definition)
-        mark_source_pursuit_active(definition)
+        mark_source_pursuit_active(definition, demand=demand)
         activated_definitions.add(definition_id)
         binding_revisions[definition_id] = (
             binding_revisions.get(definition_id, 0) + 1
@@ -2688,6 +3120,7 @@ def _expand_unresolved_ast_parents(
         definition._python_source_identity = identity
         module.body.append(definition)
         index_lexical_scopes(definition, module)
+        _annotate_visual_source_owners(definition)
         admitted = [definition]
         admitted.extend(
             member
@@ -2764,12 +3197,12 @@ def _expand_unresolved_ast_parents(
             # Visit it now; the reducer later selects the exact class-table
             # callee from the concorded receiver identity.
             if id(identity_target) not in activated_definitions:
-                requeue_definition(identity_target)
+                requeue_definition(identity_target, demand=call_demand(node))
             continue
         if not callable(identity_target):
             definition = lexical_definition(node, owner_definition)
             if definition is not None and id(definition) not in activated_definitions:
-                requeue_definition(definition)
+                requeue_definition(definition, demand=call_demand(node))
             for element in static_loop_target_callables(
                 node, owner_definition, call_bindings,
             ):
@@ -2814,7 +3247,9 @@ def _expand_unresolved_ast_parents(
                 entry_definition = lexical_definition(ast.Call(
                     func=entry_expression, args=[], keywords=[]), owner_definition)
                 if entry_definition is not None and id(entry_definition) not in activated_definitions:
-                    requeue_definition(entry_definition)
+                    requeue_definition(
+                        entry_definition, demand=call_demand(node),
+                    )
         if resolve_python_identity(identity_text) is not None:
             # A declared graph-native identity is already a complete lowering
             # decision.  Retain its extraction receipt on this occurrence,
@@ -2869,7 +3304,7 @@ def _expand_unresolved_ast_parents(
                 target_bindings[identity] = combined
                 install_definition_bindings(definition, combined)
                 if id(node) not in latent_call_ids:
-                    requeue_definition(definition)
+                    requeue_definition(definition, demand=call_demand(node))
             continue
         if identity in unavailable_identities:
             continue
@@ -2902,7 +3337,7 @@ def _expand_unresolved_ast_parents(
             # argument bindings did not change.  Reachable pursuit must enqueue
             # the body exactly when the call first admits the definition.
             if id(node) not in latent_call_ids:
-                requeue_definition(definition)
+                requeue_definition(definition, demand=call_demand(node))
             continue
 
         source_target = identity_target
@@ -3056,6 +3491,7 @@ def _expand_unresolved_ast_parents(
 
         module.body.append(source_definition)
         index_lexical_scopes(source_definition, module)
+        _annotate_visual_source_owners(source_definition)
         emit(
                 f"[ast-parent] discovered definition {getattr(source_definition, 'name', identity)!r} "
                 f"from {identity[1]} work_item={work_items} "
@@ -3192,9 +3628,17 @@ def _expand_unresolved_ast_parents(
                     )
                     target_bindings[member_identity] = constructor_bindings
                     install_definition_bindings(member_definition, constructor_bindings)
-                    requeue_definition(member_definition)
+                    # Constructing the class is what demands its
+                    # constructor: the class's own span is the demand.
+                    requeue_definition(
+                        member_definition,
+                        demand=post_source_span(
+                            source_definition, source_definition,
+                            stage=PURSUIT,
+                        ),
+                    )
         if id(node) not in latent_call_ids:
-            requeue_definition(source_definition)
+            requeue_definition(source_definition, demand=call_demand(node))
         if profile_verbose:
                 print(
                     "[ast-parent-profile] "
@@ -3576,6 +4020,7 @@ class ProcessGraph:
             "_evolution_metagraph",
             "_evolution_graph",
             "_graph_progress",
+            "_source_owner_index",
         ):
             state.pop(name, None)
         return state
@@ -3894,6 +4339,12 @@ class ProcessGraph:
                 children=[])
             self.node_map[nid] = node
             self.observe_evolution_node(nid, self.G.nodes[nid])
+            if isinstance(node, ast.AST):
+                self._post_ingestion_value(
+                    nid, node, semantic_type,
+                    semantic_type if special_case is not None else "",
+                    label,
+                )
 
             # AST nodes are source occurrences.  Two separate attributes,
             # calls, names, or constants may have the same display label and
@@ -3909,6 +4360,69 @@ class ProcessGraph:
                     del self.node_map[nid]
                     return new_nid, True
             return nid, False
+
+    def _post_ingestion_value(self, nid, node, semantic_type, op, label):
+        """Post one ingested AST node's ``ingestion_value`` row DERIVED from
+        its ``source_span`` (plan 60, section 3.1 (c)), and its
+        ``schema_node`` row when the node lies under a schema ``AnnAssign``
+        (a module-level or class-body annotation, section 3.3).
+
+        Rows live in this build's ``ingestion_value_scope``; a build that
+        minted none (``build_from_expression``) posts nothing.  A node the
+        owner visitor did not stamp is no source construct: its row is
+        ``Unsourced(SYNTHESIZED_NO_SOURCE)`` under the latch.
+        """
+
+        scope = self.G.graph.get("ingestion_value_scope")
+        if scope is None:
+            return
+        from ...compiler.concordance_declarations import (
+            INGESTION, INGESTION_VALUE, NodeFact, SCHEMA_NODE,
+            SYNTHESIZED_NO_SOURCE,
+        )
+        from ...compiler.identity_concordance import (
+            Derived, Mode, Unsourced, current_identity_book,
+        )
+
+        book = current_identity_book()
+        span = post_source_span(None, node)
+        book.post(
+            INGESTION_VALUE, (scope, int(nid)),
+            NodeFact(str(semantic_type), str(op), str(label)),
+            stage=INGESTION,
+            provenance=(
+                Derived((span,)) if span is not None
+                else Unsourced(SYNTHESIZED_NO_SOURCE)
+            ),
+            mode=Mode.CONCORD,
+        )
+        if span is None:
+            return
+        module_name, qualname, path = span.row
+        owner = (getattr(self, "_source_owner_index", None) or {}).get(
+            (module_name, qualname)
+        )
+        if (
+            not isinstance(owner, (ast.Module, ast.ClassDef))
+            or not path or path[0][0] != "body" or path[0][1] < 0
+            or path[0][1] >= len(owner.body)
+        ):
+            return
+        statement = owner.body[path[0][1]]
+        if not (
+            isinstance(statement, ast.AnnAssign)
+            and isinstance(statement.target, ast.Name)
+        ):
+            return
+        statement_span = (
+            span if statement is node else post_source_span(None, statement)
+        )
+        if statement_span is None:
+            return
+        book.post(
+            SCHEMA_NODE, (scope, int(nid)), True, stage=INGESTION,
+            provenance=Derived((statement_span,)), mode=Mode.CONCORD,
+        )
 
     def connect(self, src_id, tgt_id, producer_role, consumer_role, store_id=None):
         with self.graph_mutation():
@@ -4379,6 +4893,10 @@ class ProcessGraph:
         # -- the same treatment the walrus gets below, and for the same reason:
         # nothing downstream should have to learn the construct.
         tree = inline_context_managers(tree, _context_definition)
+        # The module every ``source_span`` row of the submitted program's own
+        # definitions lives in: the name Python itself gives the program
+        # (plan 60, section 1.1).  Stored once so every helper reads one value.
+        tree._turing_source_module = str(filename or "<string>")
 
         retained = () if retain is None else (
             (retain,) if inspect.isclass(retain) else tuple(retain)
@@ -4392,7 +4910,53 @@ class ProcessGraph:
         record_classes = () if source_record_classes is None else tuple(
             source_record_classes
         )
-        from ...compiler.identity_concordance import current_identity_book
+        from ...compiler.concordance_declarations import (
+            CONTRACT_DEMAND, CONTRACT_DEMAND_PAGE, DemandFact, DemandKind,
+            INGESTION, SOURCE_RECORD_CLASS,
+        )
+        from ...compiler.identity_concordance import (
+            Derived, Mode, Novel, current_identity_book,
+        )
+
+        book = current_identity_book()
+
+        def post_contract_demand(kind, identity, record=None):
+            """One ``contract_demand`` root: what the extraction contract
+            asked for (plan 60, section 3.3), NOVEL, no minted id."""
+
+            return book.post(
+                CONTRACT_DEMAND_PAGE, (kind, str(identity)), DemandFact(record),
+                stage=INGESTION, provenance=Novel(CONTRACT_DEMAND, ()),
+                mode=Mode.CONCORD,
+            )
+
+        def external_class_identity(external_class):
+            return (
+                f"{getattr(external_class, '__module__', '')}."
+                f"{getattr(external_class, '__qualname__', external_class.__name__)}"
+            ).strip(".")
+
+        retain_demands = {
+            external_class_identity(retained_class): post_contract_demand(
+                DemandKind.RETAIN, external_class_identity(retained_class),
+            )
+            for retained_class in retained if inspect.isclass(retained_class)
+        }
+        record_demands = {
+            external_class_identity(record_class): post_contract_demand(
+                DemandKind.PARAMETER_RECORD,
+                external_class_identity(record_class),
+            )
+            for record_class in record_classes if inspect.isclass(record_class)
+        }
+        for record in tuple(source_parameter_records or ()):
+            post_contract_demand(
+                DemandKind.PARAMETER_RECORD,
+                f"{record.get('function')}.{record.get('parameter')}",
+                dict(record),
+            )
+        for root in dict.fromkeys(map(str, pursuit_roots or ())):
+            post_contract_demand(DemandKind.PURSUIT_ROOT, root)
 
         def ingest_external_class(external_class, *, selected):
             if not inspect.isclass(external_class):
@@ -4402,10 +4966,7 @@ class ProcessGraph:
             identity = external_class.__name__
             if selected:
                 retained_identities.append(identity)
-            qualified_identity = (
-                f"{getattr(external_class, '__module__', '')}."
-                f"{getattr(external_class, '__qualname__', identity)}"
-            ).strip(".")
+            qualified_identity = external_class_identity(external_class)
             if identity in existing_classes:
                 definition = next(
                     candidate
@@ -4441,6 +5002,15 @@ class ProcessGraph:
                 retained_qualname,
                 str(external_class.__name__),
             )
+            # The retained class's span rows live in its defining module
+            # under its live qualified name (plan 60, section 1.1).  Only the
+            # span identity is stamped: ``_python_source_identity`` would
+            # change how pursuit and the class schema key this definition.
+            if _source_definition_identity(definition) is None:
+                definition._turing_source_module = str(
+                    getattr(external_class, "__module__", "")
+                )
+                definition._turing_source_qualname = retained_qualname
             # A retained class is external source. Its method free names live
             # in the defining module, not in the submitted program's globals.
             # Preserve that exact lexical environment so source pursuit can
@@ -4455,9 +5025,7 @@ class ProcessGraph:
                     member, (ast.FunctionDef, ast.AsyncFunctionDef)
                 ):
                     member._python_bindings = definition._python_bindings
-            page = current_identity_book().page(
-                "source_record_class_concordance"
-            )
+            page = book.page(SOURCE_RECORD_CLASS)
             row = (qualified_identity,)
             incumbent = page.latest(row)
             if incumbent is not None and incumbent is not definition:
@@ -4466,7 +5034,21 @@ class ProcessGraph:
                     f"{qualified_identity!r}"
                 )
             if incumbent is None:
-                page.set(row, 0, definition)
+                # DERIVED from the demand that asked for the class (RETAIN
+                # or PARAMETER_RECORD) and the ClassDef's own span (plan
+                # 60, section 3.6).
+                demand = (
+                    retain_demands.get(qualified_identity)
+                    if selected else record_demands.get(qualified_identity)
+                )
+                span = post_source_span(definition, definition)
+                book.post(
+                    SOURCE_RECORD_CLASS, row, definition, stage=INGESTION,
+                    provenance=Derived(tuple(
+                        cell for cell in (demand, span) if cell is not None
+                    )),
+                    mode=Mode.CONCORD,
+                )
             return definition
 
         for retained_class in retained:
@@ -4571,12 +5153,17 @@ class ProcessGraph:
         if not resolve_unresolved_parents:
             # No pursuit runs, so none marks what is being compiled.  With no
             # roots, pursuit's own rule is that every authored definition is
-            # active; a build that does not pursue applies the same rule.
+            # active; a build that does not pursue applies the same rule, and
+            # the demand is the module's own span.
+            from ...compiler.concordance_declarations import PURSUIT
+
+            _annotate_visual_source_owners(tree)
+            module_span = post_source_span(tree, tree, stage=PURSUIT)
             for definition in (
                 node for node in ast.walk(tree)
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             ):
-                _mark_source_pursuit_active(definition)
+                _mark_source_pursuit_active(definition, demand=module_span)
         if resolve_unresolved_parents:
             bindings = dict(getattr(self, "python_bindings", {}) or {})
             bindings.update(parent_bindings or {})
@@ -4642,6 +5229,16 @@ class ProcessGraph:
                 if execution is not None and hasattr(execution, "receipt"):
                     self.G.graph["execution_contract"] = execution.receipt()
 
+        # Pursuit has finished rewriting the tree: stamp every node's span
+        # row and index the owning definitions (plan 60, section 1.5) before
+        # the map IR and the parameter annotations describe it.  The index is
+        # an in-process lookup for ``ensure_node``, never a fact.
+        self._source_owner_index = _annotate_visual_source_owners(tree)
+        # The scope every ``ingestion_value`` row this build posts lives in
+        # (``ensure_node``); ingestion ids are unique across one build.
+        self.G.graph["ingestion_value_scope"] = book.mint_scope(
+            f"ingestion:{tree._turing_source_module}"
+        )
         # Preserve class declarations as schema metadata beside the exact AST
         # nodes ProcessGraph is about to ingest; do not create a second AST
         # ingestion path or infer process topology from them.
@@ -4650,7 +5247,13 @@ class ProcessGraph:
         # Python-callable state.  Preserve their exact AST spellings per
         # lexical function so repository-SSA linking can type a detached
         # callee long after ``python_callable`` has deliberately been removed.
-        function_parameter_annotations = {}
+        # Each is a ``parameter_annotation`` row DERIVED from the ``arg``
+        # span (plan 60, section 3.4); the dict is materialized from the page.
+        from ...compiler.concordance_declarations import (
+            CLASS_DECLARATION, PARAMETER_ANNOTATION,
+        )
+
+        annotation_rows = []
         for definition in getattr(tree, "body", ()):
             functions = (
                 (definition,)
@@ -4680,11 +5283,32 @@ class ProcessGraph:
                     *((arguments.vararg,) if arguments.vararg else ()),
                     *((arguments.kwarg,) if arguments.kwarg else ()),
                 )
-                function_parameter_annotations[str(identity)] = {
-                    str(parameter.arg): ast.unparse(parameter.annotation)
-                    for parameter in parameters
-                    if parameter.annotation is not None
-                }
+                function_span = post_source_span(function, function)
+                module_name = (
+                    function_span.row[0] if function_span is not None
+                    else tree._turing_source_module
+                )
+                annotation_rows.append((str(identity), ()))
+                for parameter in parameters:
+                    if parameter.annotation is None:
+                        continue
+                    row = (module_name, str(identity), str(parameter.arg))
+                    parameter_span = post_source_span(function, parameter)
+                    if parameter_span is None:
+                        continue
+                    book.post(
+                        PARAMETER_ANNOTATION, row,
+                        ast.unparse(parameter.annotation),
+                        stage=INGESTION, provenance=Derived((parameter_span,)),
+                        mode=Mode.CONCORD,
+                    )
+                    annotation_rows.append((str(identity), row))
+        annotation_page = book.page(PARAMETER_ANNOTATION)
+        function_parameter_annotations = {}
+        for identity, row in annotation_rows:
+            parameters = function_parameter_annotations.setdefault(identity, {})
+            if row:
+                parameters[row[2]] = annotation_page.latest(row)
         self.G.graph["function_parameter_annotations"] = (
             function_parameter_annotations
         )
@@ -4697,11 +5321,22 @@ class ProcessGraph:
         # later passes should rediscover (or, absent that, fall through to
         # treating the name as an unresolved external). Publish it here,
         # once, so every later stage that creates or resolves a call to
-        # this name reads the same authoritative answer.
-        self.G.graph["class_definitions"] = frozenset(
-            str(item["class_name"])
-            for item in self.G.graph["map_ir"].get("objects", ())
-        )
+        # this name reads the same authoritative answer: the view is
+        # materialized from the ``class_declaration`` rows the map IR posted.
+        class_page = book.page(CLASS_DECLARATION)
+        class_names = []
+        for item in self.G.graph["map_ir"].get("objects", ()):
+            span_row = item.get("class_node_id")
+            declared = (
+                None if span_row is None else class_page.latest(
+                    (span_row[0], str(item["class_identity"])),
+                )
+            )
+            class_names.append(
+                str(declared.class_name) if declared is not None
+                else str(item["class_name"])
+            )
+        self.G.graph["class_definitions"] = frozenset(class_names)
         from ...compiler.state_machine_ast import plan_marked_state_machines
         state_machine_plans, state_machine_shortfalls = (
             plan_marked_state_machines(tree)
@@ -4738,7 +5373,9 @@ class ProcessGraph:
             **annotate_types(tree),
         }
         tree = ast.fix_missing_locations(tree)
-        _annotate_visual_source_owners(tree)
+        # Re-stamp after the walrus/getattr/ellipsis rewrites: ``ensure_node``
+        # posts each node's ``ingestion_value`` row from the final tree.
+        self._source_owner_index = _annotate_visual_source_owners(tree)
 
         if profile_verbose:
             print(
@@ -4757,6 +5394,22 @@ class ProcessGraph:
                 f"elapsed={time.perf_counter() - build_started:.3f}s",
                 flush=True,
             )
+        # The schema-node view is the ``schema_node`` page's ingestion rows
+        # (posted by ``ensure_node``), replacing the pre-build ``id()`` tuples
+        # (plan 60, section 3.3 (d)); a root is the schema statement itself.
+        from ...compiler.concordance_declarations import SCHEMA_NODE
+
+        schema_rows = book.page(SCHEMA_NODE).scope_rows(
+            self.G.graph["ingestion_value_scope"]
+        )
+        map_ir = self.G.graph["map_ir"]
+        map_ir["schema_node_ids"] = tuple(int(row[1]) for row in schema_rows)
+        map_ir["schema_roots"] = tuple(
+            int(row[1]) for row in schema_rows
+            if isinstance(
+                self.G.nodes.get(row[1], {}).get("expr_obj"), ast.AnnAssign,
+            )
+        )
         # Occurrence policy is attached while the dependency worklist reaches
         # its fixed point. Some call nodes may already have been materialized
         # by an earlier AST walk, so publish the final receipts onto their

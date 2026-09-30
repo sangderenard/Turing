@@ -195,6 +195,7 @@ def _publish_concorded_output_identities(
 
 def _concord_record_return_phi_inputs(
     function_name: str, instruction: Any, candidates: Sequence[Any],
+    *, selection_cells: Sequence[Any] = (),
 ) -> list[Any]:
     """Keep a return-field Phi's predecessor identities distinct from itself.
 
@@ -204,9 +205,15 @@ def _concord_record_return_phi_inputs(
     own result as its operand. The incumbent predecessor is the stronger SSA
     fact. Record both the proposed candidate and retained selection so every
     revisit consumes the same concorded decision.
+
+    ``selection_cells`` (one per position, None where there is none) are the
+    ``record_return_field_selection`` cells the candidates were chosen by.  A
+    changed choice whose selection cell is stamped after the row's prior
+    entry is a revision with a cause and is recorded with that cell as its
+    source; a change with no changed source is still a disagreement.
     """
 
-    from .identity_concordance import current_identity_book
+    from .identity_concordance import Ref, current_identity_book
 
     result = instruction.res
     if result is None:
@@ -214,8 +221,10 @@ def _concord_record_return_phi_inputs(
     incumbents = list(instruction.args)
     if len(incumbents) != len(candidates):
         return list(candidates)
-    page = current_identity_book().page(
-        "record_return_phi_input_concordance"
+    book = current_identity_book()
+    page = book.page("record_return_phi_input_concordance")
+    selection_cells = tuple(selection_cells) + (None,) * (
+        len(candidates) - len(tuple(selection_cells))
     )
     selected = []
     predecessors = tuple((instruction.attributes or {}).get(
@@ -243,13 +252,25 @@ def _concord_record_return_phi_inputs(
             str(function_name), int(result.id), field_name, int(position),
             str(predecessors[position]) if position < len(predecessors) else "",
         )
-        fact = (int(candidate.id), int(chosen.id), reason)
-        prior = page.latest(row)
+        selection = selection_cells[position]
+        fact = (int(candidate.id), int(chosen.id), reason) + (
+            (selection.key,) if isinstance(selection, Ref) else ()
+        )
+        entries = page.history(row)
+        prior = entries[-1][1] if entries else None
         if prior is not None and int(tuple(prior)[1]) != int(chosen.id):
-            raise ValueError(
-                "record return Phi input concordance disagreement: "
-                f"row={row!r}, prior={prior!r}, new={fact!r}"
+            # A different choice is a legal revision only when the selection
+            # cell it derives from changed after the prior entry was written.
+            prior_stamp = page.stamps.get((row, entries[-1][0]), -1)
+            caused = (
+                isinstance(selection, Ref)
+                and book.stamp_of(selection) > prior_stamp
             )
+            if not caused:
+                raise ValueError(
+                    "record return Phi input concordance disagreement: "
+                    f"row={row!r}, prior={prior!r}, new={fact!r}"
+                )
         page.set(
             row, max(page.columns, default=-1) + 1, fact,
         )
@@ -18629,8 +18650,15 @@ def _class_surface_ssa_program(
                     if value is not None:
                         scalar_write_sources.add(int(roles["value"]))
                         scalar_write_effect_ids.add(int(node_id))
+                        # The write's identity is the reducer's WRITTEN
+                        # field-state cell (posted on the SetAttr node);
+                        # the block carries it so control SSA publishes
+                        # the version at that cell.
                         scalar_writes.append(ScalarFieldWriteBlock(
                             field_id, value, str(field["dtype"]), int(node_id),
+                            field_state_cell=(
+                                data.get("attributes") or {}
+                            ).get("field_state_cell"),
                         ))
         # A record produced inside this function (for example a Metrics value
         # returned by ``advance``) has no parameter storage cell, but each
@@ -18663,7 +18691,42 @@ def _class_surface_ssa_program(
                 source_dtype = str(tensor["dtype"])
             if source_shape is None and tensor.get("shape") is not None:
                 source_shape = tuple(map(int, tensor["shape"]))
+            field_state_cell = (data.get("attributes") or {}).get(
+                "field_state_cell"
+            )
             if source_dtype is None or bool(source_shape):
+                # No scalar dtype can be proven for this write, so no SSA
+                # version will be published for its field-state cell.  Say
+                # so at the cell's own version row instead of skipping it
+                # silently (plan 70, S12).
+                if (
+                    field_state_cell is not None
+                    and graph_obj.graph.get("lexical_read_scope") is not None
+                ):
+                    from .concordance_declarations import (
+                        CONTROL_SSA, FIELD_WRITE_DTYPE_UNPROVEN, SSA_FIELD_VERSION,
+                    )
+                    from .identity_concordance import (
+                        Derived, Mode, Unresolved, current_identity_book,
+                    )
+                    book = current_identity_book()
+                    row = (
+                        tuple(graph_obj.graph["lexical_read_scope"]),
+                        field_state_cell,
+                    )
+                    stored = book.pages.get(SSA_FIELD_VERSION.name)
+                    latest = None if stored is None else stored.latest(row)
+                    if not (
+                        isinstance(latest, Unresolved)
+                        and latest.reason == FIELD_WRITE_DTYPE_UNPROVEN
+                    ):
+                        book.post(
+                            SSA_FIELD_VERSION, row,
+                            Unresolved(FIELD_WRITE_DTYPE_UNPROVEN, read=(field_state_cell,)),
+                            stage=CONTROL_SSA,
+                            provenance=Derived((field_state_cell,)),
+                            mode=Mode.REVISE,
+                        )
                 continue
             value = _graph_control_expression(
                 graph_obj, source_id, resident=resident_value_ids,
@@ -18673,6 +18736,7 @@ def _class_surface_ssa_program(
             scalar_write_effect_ids.add(int(node_id))
             scalar_writes.append(ScalarFieldWriteBlock(
                 None, value, str(source_dtype), int(node_id),
+                field_state_cell=field_state_cell,
             ))
         if scalar_writes:
             control, scalar_write_shortfalls = _install_lexical_sequence_mutations(
@@ -25519,13 +25583,50 @@ def _class_surface_ssa_program(
             and (item.attributes or {}).get("record_return_field_conversion")
         }
 
-        def select_return_arguments(receivers, field_name, predecessors, arguments, source_slot_index):
+        # The record-return selection page is keyed by the return-merge
+        # Phi's identity cell; the reduction scope of the source graph is the
+        # function scope every field-state and version row is keyed by.
+        from .concordance_declarations import (
+            RECORD_DESCRIPTORS_DIFFER, RECORD_RETURN_FIELD_SELECTION,
+            RECORD_RETURN_VERSION,
+        )
+        from .identity_concordance import (
+            Mode, Ref, Unresolved, Unsourced, current_identity_book,
+        )
+        selection_scope = (
+            None if source_graph is None
+            else source_graph.graph.get("lexical_read_scope")
+        )
+        selection_scope = (
+            None if selection_scope is None else tuple(selection_scope)
+        )
+
+        def selection_row(phi_cell, field_name, position, predecessor):
+            if selection_scope is None or not isinstance(phi_cell, Ref):
+                return None
+            return (
+                selection_scope, phi_cell, str(field_name), int(position),
+                str(predecessor),
+            )
+
+        def selection_cell(phi_cell, field_name, position, predecessor):
+            row = selection_row(phi_cell, field_name, position, predecessor)
+            if row is None:
+                return None
+            return current_identity_book().latest_ref(
+                RECORD_RETURN_FIELD_SELECTION, row,
+            )
+
+        def select_return_arguments(receivers, field_name, predecessors, arguments,
+                                    source_slot_index, phi_cell=None):
             if return_field_version is None or not (
                 len(receivers) == len(predecessors) == len(arguments)
             ):
                 return arguments
             selected_arguments = []
-            for receiver, predecessor, argument in zip(receivers, predecessors, arguments):
+            for position, (receiver, predecessor, argument) in enumerate(zip(
+                receivers, predecessors, arguments,
+            )):
                 source_receiver = receiver
                 edge = function.blocks.get(predecessor)
                 slots = ((edge.instrs[-1].attributes or {}).get("return_source_value_ids", ())
@@ -25537,11 +25638,26 @@ def _class_surface_ssa_program(
                     if (source_record is None or physical_record is None
                             or source_record.identity != physical_record.identity
                             or source_record.fields != physical_record.fields):
+                        # The descriptor's field value stands as the argument;
+                        # the page says why no version was selected.
+                        row = selection_row(phi_cell, field_name, position, predecessor)
+                        if row is not None:
+                            book = current_identity_book()
+                            fact = Unresolved(RECORD_DESCRIPTORS_DIFFER, read=())
+                            stored = book.pages.get(RECORD_RETURN_FIELD_SELECTION.name)
+                            if stored is None or stored.latest(row) != fact:
+                                book.post(
+                                    RECORD_RETURN_FIELD_SELECTION, row, fact,
+                                    stage=RECORD_RETURN_VERSION,
+                                    provenance=Unsourced(RECORD_DESCRIPTORS_DIFFER),
+                                    mode=Mode.REVISE,
+                                )
                         selected_arguments.append(argument)
                         continue
                 selected = return_field_version(
                     source_receiver, field_name, predecessor, argument,
                     alias_receivers=(receiver,),
+                    phi_cell=phi_cell, position=position,
                 )
                 if selected.dtype != argument.dtype:
                     # Only Boolean-leaf conditional Phi trees qualify. Keep
@@ -25549,6 +25665,12 @@ def _class_surface_ssa_program(
                     key = (predecessor, int(selected.id), argument.dtype)
                     converted = conversions.get(key)
                     if converted is None:
+                        # The Cast's identity should be NOVEL
+                        # (record_return_field_conversion, (selection cell,))
+                        # through the book; no declared page carries a
+                        # VALUE_ID for an SSA Cast, so the id is still minted
+                        # here and only the selection row (above) records
+                        # what the Cast converts.
                         converted = SSAValue(
                             GLOBAL_MONOTONIC_IDS.mint(),
                             dtype=argument.dtype,
@@ -25593,15 +25715,28 @@ def _class_surface_ssa_program(
                         if len(original_arguments) != len(receivers):
                             rebuilt.append(instruction)
                             continue
+                        # The Phi's identity cell on the book, when the pass
+                        # that mints it has posted one (plan 70, S18); the
+                        # selection rows are keyed by it.
+                        phi_cell = attributes.get("identity_cell")
+                        predecessors = tuple(attributes.get("incoming_blocks", ()))
                         selected_arguments = select_return_arguments(
                             receivers,
                             attributes.get("record_field"),
-                            attributes.get("incoming_blocks", ()),
+                            predecessors,
                             original_arguments,
                             attributes.get("return_slot_index"),
+                            phi_cell=phi_cell,
                         )
                         instruction.args = _concord_record_return_phi_inputs(
                             str(symbol), instruction, selected_arguments,
+                            selection_cells=tuple(
+                                selection_cell(
+                                    phi_cell, attributes.get("record_field"),
+                                    position, predecessor,
+                                )
+                                for position, predecessor in enumerate(predecessors)
+                            ),
                         )
                         rebuilt.append(instruction)
                         continue

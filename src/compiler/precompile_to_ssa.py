@@ -17,10 +17,20 @@ import networkx as nx
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from .id_space import serial_of as _id_serial_of
 from .identity_concordance import (
+    Derived,
     IdentityPage,
+    Mode,
+    Ref,
+    Unresolved,
     committed_sequence_row_layout,
     concord_sequence_row_dtypes,
     proven_shape_contract_of,
+)
+from .concordance_declarations import (
+    ARM_VERSION_MISSING,
+    CONTROL_SSA,
+    SSA_FIELD_VERSION,
+    FieldStateKind,
 )
 from .control_source import (
     CallBlock,
@@ -1059,6 +1069,11 @@ class _ControlSSABuilder:
         self.preserved_region_output_ids: set[int] = set()
         self.arguments: list[SSAValue] = []
         self.external_values: dict[int, SSAValue] = {}
+        #: The SSA value object published under each ``ssa_field_version``
+        #: cell this builder posted (keyed by that cell's Ref).  The book row
+        #: is the version's identity; this is the object it names, kept the
+        #: way ``external_values`` keeps the objects graph ids name.
+        self.field_version_values: dict[Any, SSAValue] = {}
         self.scalar_field_effect_destinations: dict[int, tuple[int, str]] = {}
 
         def index_scalar_field_effects(block: ControlBlock) -> None:
@@ -3321,6 +3336,108 @@ class _ControlSSABuilder:
 
         return current_identity_book()
 
+    # ------------------------------------------------- field-state versions
+    # A scalar field write and a conditional field merge each ARE one
+    # ``reducer_field_state`` cell (plan 70, sections 4-5).  The SSA value
+    # this builder emits for such a cell is published on ``ssa_field_version``
+    # at ``(function scope, cell)``; the conditional merge reads each arm's
+    # version at the arm's own cell.  ``external_values[<graph id>]`` stays
+    # as a read view, never as the source of an arm.
+
+    def _field_version_row(self, cell: Any) -> tuple | None:
+        if self.lexical_read_scope is None or not isinstance(cell, Ref):
+            return None
+        return (self.lexical_read_scope, cell)
+
+    def _publish_field_version(
+        self, cell: Any, value: SSAValue, sources: tuple[Any, ...],
+    ) -> Any:
+        """Post ``value`` as the SSA version of field-state ``cell``.
+
+        ``sources`` are the cells the version derives from (the field-state
+        cell itself for a write; the arm versions and the merged cell for a
+        merge).  Returns the version cell's Ref, or None when the function
+        has no reduction scope to key the row by.
+        """
+        row = self._field_version_row(cell)
+        if row is None:
+            return None
+        ref = self._book().post(
+            SSA_FIELD_VERSION, row, int(value.id),
+            stage=CONTROL_SSA,
+            provenance=Derived(tuple(
+                source for source in sources if isinstance(source, Ref)
+            )),
+            mode=Mode.CONCORD,
+        )
+        self.field_version_values[ref] = value
+        return ref
+
+    def _field_state_kind(self, cell: Ref) -> Any:
+        """The ``FieldStateKind`` recorded at a ``reducer_field_state`` cell."""
+        page = self._book().pages.get(cell.page.name)
+        fact = None if page is None else page.cells.get((cell.row, cell.column))
+        return getattr(fact, "kind", None)
+
+    def _carried_field_arm(
+        self,
+        arm_cell: Any,
+        other_arm_cell: Any,
+        snapshot: SSAValue,
+        *,
+        path: str,
+    ) -> tuple[SSAValue, Any]:
+        """The SSA value a field-carried merge takes from one arm.
+
+        Returns ``(value, source)`` where ``source`` is the cell the merged
+        version derives from for this arm: the arm's ``ssa_field_version``
+        cell when the arm wrote, or the arm cell itself when the arm did not
+        write (the arm cell IS the pre-branch cell -- an OBSERVED state, or
+        the same cell as the other arm -- so the snapshot is its value).  An
+        arm cell that names a write or a merge with no version posted is
+        recorded as ``Unresolved(ARM_VERSION_MISSING)`` at its row and a
+        shortfall is raised; the snapshot then stands in for the emitted Phi
+        but is never posted as the arm.
+        """
+        book = self._book()
+        row = self._field_version_row(arm_cell)
+        if row is None:
+            return snapshot, None
+        version_ref = book.latest_ref(SSA_FIELD_VERSION, row)
+        if version_ref is not None:
+            fact = book.pages[SSA_FIELD_VERSION.name].latest(row)
+            value = self.field_version_values.get(version_ref)
+            if value is None and isinstance(fact, int):
+                # The version was posted by another builder over this scope;
+                # the row's fact IS the SSA identity, so name it directly.
+                value = SSAValue(
+                    int(fact), dtype=snapshot.dtype, shape=snapshot.shape,
+                )
+            if value is not None:
+                return value, version_ref
+        kind = self._field_state_kind(arm_cell)
+        if arm_cell == other_arm_cell or kind in {
+            FieldStateKind.OBSERVED, FieldStateKind.ARM_SELECTED,
+            FieldStateKind.LOOP_EXIT,
+        }:
+            # The arm did not write: its cell is the state the branch was
+            # entered with, whose SSA value is the snapshot.
+            return snapshot, arm_cell
+        missing = book.post(
+            SSA_FIELD_VERSION, row,
+            Unresolved(ARM_VERSION_MISSING, read=(arm_cell,)),
+            stage=CONTROL_SSA,
+            provenance=Derived((arm_cell,)),
+            mode=Mode.REVISE,
+        )
+        self.shortfalls.append(SSALoweringShortfall(
+            "control", "carried-field-arm-missing", path,
+            "a field-carried conditional arm names a field-state cell with "
+            f"no ssa_field_version: row={missing.row!r} "
+            f"(recorded {ARM_VERSION_MISSING.name})",
+        ))
+        return snapshot, None
+
     def _operand_bindings(self, operands: Any) -> set:
         """The bindings read by ``(consumer, role, ordinal)`` operands."""
 
@@ -5138,12 +5255,20 @@ class _ControlSSABuilder:
                     "source_effect_node_id": block.effect_node_id,
                     "binding": "scalar_record_field_assignment",
                 })
-            # A graph SetAttr is also the authored version identity for the
-            # scalar value just committed to resident field storage.  Publish
-            # that identity at the lexical write site so later conditional or
-            # loop carried aliases consume the written value.  Local returned
-            # records have no destination cell here; their later record-return
-            # materialization consumes this same field-state version.
+            # The write IS one ``reducer_field_state`` cell (its WRITTEN
+            # revision).  The emitted value is that cell's SSA version: post
+            # it on ``ssa_field_version`` at (function scope, cell) so the
+            # conditional merge and the record-return selection read the
+            # version at the cell the reducer's merge named, not under a
+            # graph id.  Local returned records have no destination cell
+            # here; their record-return materialization consumes this same
+            # version.
+            if block.field_state_cell is not None:
+                self._publish_field_version(
+                    block.field_state_cell, value, (block.field_state_cell,),
+                )
+            # Read view during migration: the SetAttr id still resolves to
+            # the written value for readers that key by graph id.
             self.external_values[int(block.effect_node_id)] = value
             return
         if isinstance(block, SequenceQueryBlock):
@@ -7096,6 +7221,24 @@ class _ControlSSABuilder:
             for true_id, _false_id, initial_id, _merged_id
             in conditional.carried_aliases
         }
+        # Field-carried merges name their arms as ``reducer_field_state``
+        # cells; the arm's value is the version posted AT that cell, never a
+        # graph-id lookup that may miss and default to the snapshot.
+        carried_field_cells = tuple(conditional.carried_field_cells)
+        carried_field_cells += (None,) * (
+            len(conditional.carried_aliases) - len(carried_field_cells)
+        )
+        carried_field_sources: dict[int, list[Any]] = {}
+        for alias, cells in zip(conditional.carried_aliases, carried_field_cells):
+            if cells is None:
+                continue
+            initial_id = int(alias[2])
+            true_value, true_source = self._carried_field_arm(
+                cells[0], cells[1], carried_snapshots[initial_id],
+                path=f"{path}.body",
+            )
+            true_carried[initial_id] = true_value
+            carried_field_sources[initial_id] = [true_source]
         true_results = {
             int(result_id): self.external_value(int(true_id))
             for true_id, _false_id, result_id in conditional.result_aliases
@@ -7143,6 +7286,16 @@ class _ControlSSABuilder:
             for _true_id, false_id, initial_id, _merged_id
             in conditional.carried_aliases
         }
+        for alias, cells in zip(conditional.carried_aliases, carried_field_cells):
+            if cells is None:
+                continue
+            initial_id = int(alias[2])
+            false_value, false_source = self._carried_field_arm(
+                cells[1], cells[0], carried_snapshots[initial_id],
+                path=f"{path}.orelse",
+            )
+            false_carried[initial_id] = false_value
+            carried_field_sources.setdefault(initial_id, []).append(false_source)
         for _true_id, false_id, initial_id, merged_id in (
             conditional.carried_sequence_aliases
         ):
@@ -7183,7 +7336,7 @@ class _ControlSSABuilder:
             )
         for (
             true_value_id, false_value_id, initial_value_id, merged_value_id,
-        ) in conditional.carried_aliases:
+        ), field_cells in zip(conditional.carried_aliases, carried_field_cells):
             initial = carried_snapshots[int(initial_value_id)]
             true_value = true_carried[int(initial_value_id)]
             false_value = false_carried[int(initial_value_id)]
@@ -7218,6 +7371,21 @@ class _ControlSSABuilder:
                     "initial_value_id": int(initial_value_id),
                 },
             )
+            # The merge IS the reducer's MERGED cell: publish the Phi as that
+            # cell's SSA version, derived from the two arm sources (each arm's
+            # version cell, or the arm cell itself when it did not write) and
+            # the merged cell.  An arm recorded ARM_VERSION_MISSING has no
+            # source; the merge then posts nothing rather than post a
+            # snapshot as an arm.
+            if field_cells is not None and field_cells[2] is not None:
+                sources = carried_field_sources.get(int(initial_value_id), [])
+                if len(sources) == 2 and all(
+                    isinstance(source, Ref) for source in sources
+                ):
+                    self._publish_field_version(
+                        field_cells[2], merged,
+                        (sources[0], sources[1], field_cells[2]),
+                    )
             # Every source identity participating in this join denotes the
             # merged version in the lexical continuation.  A later region may
             # legitimately define one of the arm ids again; lowering that

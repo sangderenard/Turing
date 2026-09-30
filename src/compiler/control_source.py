@@ -122,6 +122,13 @@ class ConditionalBlock:
     # (``exchange_time_bound``: ``binding.any()`` scheduled after the ``if``
     # whose test reads it).
     predicate_region_indices: tuple[int, ...] = ()
+    # Aligned with ``carried_aliases``: for a field-carried merge, the
+    # ``reducer_field_state`` cells (``Ref``) the reducer's merge named --
+    # (true-arm cell, false-arm cell, merged cell); None for a name-carried
+    # alias or when the reducer posted no cells.  Lowering reads each arm's
+    # SSA version at its cell instead of looking a graph id up by hand.
+    # Last field on purpose: positional constructions above never reach it.
+    carried_field_cells: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -448,6 +455,11 @@ class ScalarFieldWriteBlock:
     value_expression: ControlExpression
     dtype: str
     effect_node_id: int
+    # The ``reducer_field_state`` cell (a ``Ref``) this write IS: the WRITTEN
+    # revision the reducer posted for the SetAttr.  Control SSA publishes the
+    # emitted value under this cell on ``ssa_field_version``; None when the
+    # reducer has not posted one for the effect node.
+    field_state_cell: Any = None
 
 
 @dataclass(frozen=True)
@@ -2274,6 +2286,20 @@ def project_control_regions(
                 orelse_callsite_ids=block.orelse_callsite_ids,
                 result_aliases=block.result_aliases,
                 predicate_region_indices=block.predicate_region_indices,
+                # Filtered in lockstep with ``carried_aliases`` above so the
+                # index alignment between the two survives the projection.
+                carried_field_cells=tuple(
+                    cells
+                    for carried, cells in zip(
+                        block.carried_aliases,
+                        tuple(block.carried_field_cells) + (None,) * (
+                            len(block.carried_aliases)
+                            - len(block.carried_field_cells)
+                        ),
+                    )
+                    if all(value_survives_projection(value_id)
+                           for value_id in carried)
+                ),
             )
         if isinstance(block, LoopBlock):
             body = project(block.body)

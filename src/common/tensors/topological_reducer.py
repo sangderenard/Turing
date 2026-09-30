@@ -24,6 +24,53 @@ from ...compiler.native_compiler_accelerators import (
     lexicographical_topological_order,
 )
 from ...compiler.identity_concordance import current_identity_book
+# Step 2 (plan 60): the ingestion-root vocabulary this module posts with.
+from ...compiler.identity_concordance import Unsourced as _Unsourced
+from ...compiler.concordance_declarations import (
+    BindingFact as _BindingFact,
+    CALLABLE_IDENTITY as _CALLABLE_IDENTITY,
+    FUNCTION_ADDRESS as _FUNCTION_ADDRESS,
+    FUNCTION_SUBGRAPH as _FUNCTION_SUBGRAPH,
+    HELPER_CALLER_UNROUTED as _HELPER_CALLER_UNROUTED,
+    INGESTION_VALUE as _INGESTION_VALUE,
+    NAME_BINDING as _NAME_BINDING,
+    NodeFact as _NodeFact,
+    PARAMETER_ANNOTATION as _PARAMETER_ANNOTATION,
+    READ_SCOPE_FORK as _READ_SCOPE_FORK,
+    REDUCTION as _REDUCTION,
+    SCALAR_PARAMETER as _SCALAR_PARAMETER,
+    SCHEMA_NODE as _SCHEMA_NODE,
+    SOURCE_VALUE_CLASS as _SOURCE_VALUE_CLASS,
+    SYNTHESIZED_NO_SOURCE as _SYNTHESIZED_NO_SOURCE,
+    ValueKind as _ValueKind,
+)
+from ...compiler.identity_concordance import (
+    Derived as _Derived,
+    Mode as _Mode,
+    Ref as _Ref,
+    RowFieldKind as _RowFieldKind,
+    Transform as _Transform,
+    Unresolved as _Unresolved,
+)
+from ...compiler.concordance_declarations import (
+    CANONICAL_RELABEL as _CANONICAL_RELABEL_STAGE,
+    CANONICAL_VALUE as _CANONICAL_VALUE,
+    CLASS_FIELD_DECLARATION as _CLASS_FIELD_DECLARATION,
+    ContainerKind as _ContainerKind,
+    FIELD_STATE_UNRESOLVED_AT_RETURN as _FIELD_STATE_UNRESOLVED_AT_RETURN,
+    FieldState as _FieldState,
+    FieldStateKind as _FieldStateKind,
+    LOOP_EXIT_FIELD_STATE_UNMERGED as _LOOP_EXIT_FIELD_STATE_UNMERGED,
+    REDUCER_FIELD_MERGE as _REDUCER_FIELD_MERGE,
+    REDUCER_FIELD_STATE as _REDUCER_FIELD_STATE,
+    REDUCER_FIELD_WRITE as _REDUCER_FIELD_WRITE,
+    REDUCER_RETURN as _REDUCER_RETURN,
+    RETURN_SITE_CONTAINER as _RETURN_SITE_CONTAINER,
+    RETURN_SITE_FIELD_STATE as _RETURN_SITE_FIELD_STATE,
+    RETURN_SITE_SLOT as _RETURN_SITE_SLOT,
+    RETURN_SLOT_NOT_A_VALUE as _RETURN_SLOT_NOT_A_VALUE,
+    STATIC_ATTRIBUTE_STATE as _STATIC_ATTRIBUTE_STATE,
+)
 from .abstract_nn.token_encoder import encode_identity_tokens
 from .abstract_nn.token_lexicon import structural_context_tokens
 
@@ -325,10 +372,25 @@ def _concord_source_value_class(
     *,
     precision_limbs: int = 1,
     source: str,
+    provenance: Any = None,
 ) -> tuple[str, int]:
-    """Commit the class and precision width carried by a source value."""
+    """Commit the class and precision width carried by a source value.
 
-    page = current_identity_book().page("source_value_class_concordance")
+    ``provenance`` is the ``Derived`` cells the caller read (plan 60,
+    section 3.9): the ingestion-side writers pass them; a caller that has
+    not yet routed its cells posts ``Unsourced(HELPER_CALLER_UNROUTED)``
+    under the latch, which lists it by enclosing function as the worklist.
+    The ``source`` free string stays in the fact until every caller carries
+    an edge.
+    """
+
+    from ...compiler.concordance_declarations import (
+        HELPER_CALLER_UNROUTED, REDUCTION, SOURCE_VALUE_CLASS,
+    )
+    from ...compiler.identity_concordance import Derived, Mode, Unsourced
+
+    book = current_identity_book()
+    page = book.page(SOURCE_VALUE_CLASS)
     row = (str(scope), int(value_id))
     proposed = (str(class_identity), max(int(precision_limbs or 1), 1))
     incumbent = page.latest(row)
@@ -342,7 +404,14 @@ def _concord_source_value_class(
                 f"{source} says {proposed!r}"
             )
         return recorded
-    page.set(row, 0, (*proposed, str(source)))
+    book.post(
+        SOURCE_VALUE_CLASS, row, (*proposed, str(source)), stage=REDUCTION,
+        provenance=(
+            provenance if isinstance(provenance, Derived)
+            else Unsourced(HELPER_CALLER_UNROUTED)
+        ),
+        mode=Mode.CONCORD,
+    )
     return proposed
 
 
@@ -357,6 +426,142 @@ def _source_numeric_scope(graph: Any, fallback: str = "<module>") -> str:
     name = str(metadata.get("function_name") or fallback)
     owner = metadata.get("method_owner")
     return name if owner is None else f"{owner}.{name}"
+
+
+def _post_source_span(node: Any, stage: Any = None) -> Any:
+    """The ``source_span`` cell of an authored AST node, by its stamped row
+    (``graph_express2.post_source_span``); ``None`` for anything that is
+    not a stamped source construct."""
+
+    if not isinstance(node, ast.AST):
+        return None
+    from ...transmogrifier.graph.graph_express2 import post_source_span
+
+    return post_source_span(None, node, stage=stage)
+
+
+def _parameter_argument(statement: Any, name: str) -> ast.arg | None:
+    """The ``ast.arg`` of parameter ``name`` on one definition, or None."""
+
+    arguments = getattr(statement, "args", None)
+    if arguments is None:
+        return None
+    for argument in (
+        *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+        *((arguments.vararg,) if arguments.vararg else ()),
+        *((arguments.kwarg,) if arguments.kwarg else ()),
+    ):
+        if argument.arg == name:
+            return argument
+    return None
+
+
+def _parameter_default_expression(statement: Any, name: str) -> ast.AST | None:
+    """The authored default expression of parameter ``name``, or None."""
+
+    arguments = getattr(statement, "args", None)
+    if arguments is None:
+        return None
+    positional = (*arguments.posonlyargs, *arguments.args)
+    defaults = arguments.defaults
+    for argument, default in zip(
+        positional[len(positional) - len(defaults):], defaults,
+    ):
+        if argument.arg == name:
+            return default
+    for argument, default in zip(arguments.kwonlyargs, arguments.kw_defaults):
+        if argument.arg == name and default is not None:
+            return default
+    return None
+
+
+def post_scalar_parameter(
+    graph: Any, node_id: int, name: str, statement: Any,
+) -> Any:
+    """One ``scalar_parameter`` row for Input ``node_id`` of parameter
+    ``name`` (plan 60, section 3.5): DERIVED from (i) the parameter's
+    ``parameter_annotation`` row when the annotation named a scalar type,
+    else (ii) the span of its scalar literal default, and always the
+    Input's own identity cell.  The row lives in the scope of that cell."""
+
+    book = current_identity_book()
+    input_cell = node_identity_cell(graph, int(node_id))
+    annotation_cell = None
+    statement_row = getattr(statement, "_turing_source_span_row", None)
+    if isinstance(statement_row, tuple):
+        annotation_cell = book.latest_ref(
+            _PARAMETER_ANNOTATION,
+            (statement_row[0], _source_numeric_scope(graph), str(name)),
+        )
+    default_span = (
+        None if annotation_cell is not None
+        else _post_source_span(_parameter_default_expression(statement, name))
+    )
+    return book.post(
+        _SCALAR_PARAMETER, (input_cell.row[0], int(node_id)),
+        _ValueKind.SCALAR, stage=_FUNCTION_SUBGRAPH,
+        provenance=_Derived(tuple(
+            cell for cell in (annotation_cell, default_span, input_cell)
+            if cell is not None
+        )),
+        mode=_Mode.CONCORD,
+    )
+
+
+def node_identity_cell(graph: Any, node_id: int) -> Any:
+    """The cell that identifies graph node ``node_id`` (plan 60, seam 1).
+
+    After the canonical relabel it is the node's ``canonical_value`` row
+    cell (scope ``lexical_read_scope``); before it, the node's
+    ``ingestion_value`` row cell -- posted by ``new_node`` in this
+    reduction's ingestion scope (``operand_position_scope``) or by
+    ``ProcessGraph.ensure_node`` in the build's ``ingestion_value_scope``.
+    A node with no row yet gets its ``ingestion_value`` row posted
+    ``Unsourced(SYNTHESIZED_NO_SOURCE)`` at stage REDUCTION, and that cell
+    is returned; the E-edits of plan 60 make this path rare.
+    """
+
+    from ...compiler.concordance_declarations import (
+        CANONICAL_VALUE, INGESTION_VALUE, NodeFact, REDUCTION,
+        SYNTHESIZED_NO_SOURCE,
+    )
+    from ...compiler.identity_concordance import Mode, Unsourced
+
+    book = current_identity_book()
+    metadata = getattr(getattr(graph, "G", graph), "graph", {}) or {}
+    node_id = int(node_id)
+    if metadata.get("canonical_value_ids"):
+        scope = metadata.get("lexical_read_scope")
+        if scope is not None:
+            cell = book.latest_ref(CANONICAL_VALUE, (scope, node_id))
+            if cell is not None:
+                return cell
+    scopes = tuple(
+        scope for scope in (
+            metadata.get("operand_position_scope"),
+            metadata.get("ingestion_value_scope"),
+        )
+        if scope is not None
+    )
+    for scope in scopes:
+        cell = book.latest_ref(INGESTION_VALUE, (scope, node_id))
+        if cell is not None:
+            return cell
+    if not scopes:
+        raise ValueError(
+            f"node {node_id} has no ingestion scope: the graph was neither "
+            "built by build_from_ast nor entered lexical normalization"
+        )
+    data = getattr(graph, "G", graph).nodes.get(node_id) or {}
+    return book.post(
+        INGESTION_VALUE, (scopes[0], node_id),
+        NodeFact(
+            str(data.get("type") or ""), str(data.get("op") or ""),
+            str(data.get("label") or ""),
+        ),
+        stage=REDUCTION, provenance=Unsourced(SYNTHESIZED_NO_SOURCE),
+        mode=Mode.CONCORD,
+    )
 
 
 def specialize_python_precision_widths(graph: Any) -> bool:
@@ -2056,11 +2261,19 @@ def _set_operands(
     node_id: Any,
     parents: Any,
     *,
-    cause: str,
+    cause: str | _Transform,
     same: Mapping[Any, Any] | None = None,
     fork_from: Mapping[tuple[Any, int], tuple[Any, ...]] | None = None,
 ) -> None:
     """The one writer of a node's operand list, recorded on the book.
+
+    ``cause`` names the rewrite that changed the list: a registered
+    ``Transform`` (its name is recorded) or, for callers not yet migrated,
+    the legacy string.  Plan 70 section 3 has every append/move/retire/fork
+    posted through ``IdentityBook.post`` on page ``identity_transition``;
+    that page is not declared in ``concordance_declarations`` (only the
+    ``OPERAND_*`` transforms and the ``operand_position`` stage are), so the
+    revise writes below stay raw until it is -- see the step-3 report.
 
     Facts keyed by an operand position (the binding one operand read, see
     ``_OPERAND_POSITION_ROW_PAGES``) must name the same operand after any
@@ -2132,6 +2345,7 @@ def _set_operands(
         source == target for source, target in moves.items()
     ):
         return
+    cause = cause.name if isinstance(cause, _Transform) else str(cause)
     book = current_identity_book()
     transition_page = book.page("identity_transition")
     for (role, ordinal), target in moves.items():
@@ -2206,14 +2420,31 @@ def fork_read_scope(graph: Any, cause: str) -> None:
     source = tuple(source)
     book = current_identity_book()
     forked = book.mint_scope(f"{source[0]}|fork")
+    # A forked row on a declared page is DERIVED from the cell it copies
+    # (stage READ_SCOPE_FORK, same fact); a page the registry does not
+    # declare can only be copied through the raw primitive, tagged under
+    # the latch until it is declared.
+    registered = book.registry.pages
+    private = book.registry.private_pages
     for page in tuple(book.pages.values()):
+        if page.name in private:
+            continue
+        declared = registered.get(page.name)
         for row in page.scope_rows(source):
             if page.name == "identity_transition" and row[1:] == ("scope",):
                 # A scope's origin is its own fact, not inherited.
                 continue
             fact = page.latest(row)
-            if fact is not None:
+            if fact is None:
+                continue
+            if declared is None:
                 page.set((forked, *row[1:]), 0, fact)
+                continue
+            book.post(
+                declared, (forked, *row[1:]), fact, stage=_READ_SCOPE_FORK,
+                provenance=_Derived((book.latest_ref(declared, row),)),
+                mode=_Mode.CONCORD,
+            )
     book.page("identity_transition").concord(
         (forked, "scope"), ("fork", source, str(cause)),
     )
@@ -2480,6 +2711,298 @@ def _redirect_value(
     _remove_node(graph, old_id)
 
 
+# --------------------------------------------------------------------------
+# Step 3 (plan 70): the reducer's field state lives on the book.  The four
+# private dicts ``_normalize_lexical_values`` used to keep are read views over
+# the pages below; the reducer's only private state is a cursor of cells.
+# --------------------------------------------------------------------------
+
+
+def _cell_node_id(cell: Any) -> int | None:
+    """The graph node id a node identity cell names: its VALUE_ID row element.
+
+    A node identity cell is a row on whichever page identifies nodes
+    (``ingestion_value`` before the canonical relabel, ``canonical_value``
+    after); the id is read from the row through the page's declared shape,
+    never by position.
+    """
+
+    if not isinstance(cell, _Ref):
+        return None
+    for declared, item in zip(cell.page.row_fields, cell.row):
+        if declared.kind is _RowFieldKind.VALUE_ID and isinstance(item, int):
+            return int(item)
+    return None
+
+
+def _cell_fact(book: Any, cell: Any) -> Any:
+    """The fact stored at ``cell``, or None when the cell does not exist."""
+
+    if not isinstance(cell, _Ref):
+        return None
+    page = book.pages.get(cell.page.name)
+    if page is None:
+        return None
+    return page.cells.get((cell.row, cell.column))
+
+
+class _FieldStateView(Mapping):
+    """``(receiver, field) -> node id`` over the reducer's field-state cursor.
+
+    ``member`` selects ``FieldState.value`` (the ``attribute_value_nodes``
+    view) or ``FieldState.effect`` (``attribute_effect_nodes``).  Iteration
+    is the cursor's recorded order, which is the order the old dicts had.  A
+    cursor cell whose fact is ``Unresolved`` is absent: readers see absence.
+    Read-only: a stray write raises at its site instead of being tagged.
+    """
+
+    __slots__ = ("_cursor", "_member")
+
+    def __init__(self, cursor: dict, member: str) -> None:
+        self._cursor = cursor
+        self._member = member
+
+    def _node(self, key: Any) -> int | None:
+        cell = self._cursor.get(key)
+        fact = _cell_fact(current_identity_book(), cell)
+        if not isinstance(fact, _FieldState):
+            return None
+        return _cell_node_id(getattr(fact, self._member))
+
+    def __getitem__(self, key: Any) -> int:
+        try:
+            node = self._node(key)
+        except TypeError:
+            raise KeyError(key) from None
+        if node is None:
+            raise KeyError(key)
+        return node
+
+    def __iter__(self):
+        for key in tuple(self._cursor):
+            if self._node(key) is not None:
+                yield key
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    def __repr__(self) -> str:
+        return f"_FieldStateView({self._member!r}, {dict(self)!r})"
+
+    def __reduce__(self):
+        return (dict, (dict(self),))
+
+
+class _ReturnSiteView(Mapping):
+    """``return span -> legacy receipt`` over one return-site page.
+
+    The page rows are keyed by the return site's node identity cell; the
+    legacy receipts (``return_slot_values``, ``return_record_field_states``,
+    ``return_container_kinds``) were keyed by the returned expression's
+    source span, so ``spans`` maps each site cell to the span it was posted
+    for.  Rows are read under the graph's current operand-position scope
+    (the ingestion scope while reducing, the canonical scope after
+    ``_relabel_field_state_pages``), so the same view follows the relabel.
+    Read-only; pickles as the plain dict it presents.
+    """
+
+    __slots__ = ("_graph", "_page", "_spans", "_project")
+
+    def __init__(self, graph: Any, page: Any, spans: dict, project: Any) -> None:
+        self._graph = graph
+        self._page = page
+        self._spans = spans
+        self._project = project
+
+    def _rows_by_site(self) -> dict:
+        scope = _operand_position_scope(self._graph)
+        stored = current_identity_book().pages.get(self._page.name)
+        if scope is None or stored is None:
+            return {}
+        by_site: dict = {}
+        for row in stored.scope_rows(scope):
+            by_site.setdefault(row[1], []).append(row)
+        return by_site
+
+    def _items(self):
+        book = current_identity_book()
+        stored = book.pages.get(self._page.name)
+        for site, rows in self._rows_by_site().items():
+            span = self._spans.get(site)
+            if span is None:
+                continue
+            yield span, self._project(
+                book, tuple((row, stored.latest(row)) for row in rows)
+            )
+
+    def __getitem__(self, key: Any):
+        for span, receipt in self._items():
+            if span == key:
+                return receipt
+        raise KeyError(key)
+
+    def __iter__(self):
+        for span, _receipt in self._items():
+            yield span
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self._items())
+
+    def __repr__(self) -> str:
+        return f"_ReturnSiteView({self._page.name!r}, {dict(self)!r})"
+
+    def __reduce__(self):
+        return (dict, (dict(self),))
+
+
+def _return_slot_receipt(book: Any, rows: tuple) -> tuple:
+    """``return_slot_values`` receipt: node id per slot, None when Unresolved."""
+
+    slots = sorted(rows, key=lambda item: int(item[0][2]))
+    return tuple(_cell_node_id(fact) for _row, fact in slots)
+
+
+def _return_field_state_receipt(book: Any, rows: tuple) -> tuple:
+    """``return_record_field_states`` receipt: ``(receiver, field, value id)``
+    per field-state cell the site carries; an Unresolved state is absent."""
+
+    receipt = []
+    for row, fact in rows:
+        state = _cell_fact(book, fact)
+        if not isinstance(state, _FieldState):
+            continue
+        value = _cell_node_id(state.value)
+        if value is None:
+            continue
+        receipt.append((int(row[2]), str(row[3]), value))
+    return tuple(receipt)
+
+
+def _return_container_receipt(book: Any, rows: tuple) -> Any:
+    """``return_container_kinds`` receipt: the container kind's name."""
+
+    for _row, fact in rows:
+        if isinstance(fact, _ContainerKind):
+            return fact.value
+    return None
+
+
+def _relabel_field_state_pages(book: Any, read_scope: Any, mapping: Any) -> None:
+    """Re-post this reduction's field-state and return-site rows under the
+    canonical scope ``read_scope`` (plan 70, sections 1.3 S10 and 2).
+
+    Rows were posted under ``(read_scope, "ingestion")`` with ingestion ids
+    and node identity cells in the ingestion id space.  Each is posted again
+    under ``read_scope`` with the receiver's canonical id and every node
+    cell re-pointed at its ``canonical_value`` cell, DERIVED(the ingestion
+    cell, those canonical cells) at the canonical-relabel stage.  Nothing is
+    rewritten in place; the ingestion rows remain the history.  A revision
+    whose node left the graph before the relabel (no canonical id) is not
+    re-posted, which is what the in-place comprehensions this replaces did.
+    """
+
+    ingestion_scope = (read_scope, "ingestion")
+    stage = _CANONICAL_RELABEL_STAGE
+
+    def canonical_cell(cell: Any) -> Any:
+        node_id = _cell_node_id(cell)
+        if node_id is None or node_id not in mapping:
+            return None
+        return book.latest_ref(_CANONICAL_VALUE, (read_scope, mapping[node_id]))
+
+    # ingestion field-state cell -> its canonical re-post, so return-site
+    # rows and Unresolved ``read`` tuples can name the canonical cells.
+    relabeled: dict = {}
+    field_page = book.pages.get(_REDUCER_FIELD_STATE.name)
+    if field_page is not None:
+        for row in field_page.scope_rows(ingestion_scope):
+            receiver = row[1]
+            if receiver not in mapping:
+                continue
+            canonical_row = (read_scope, mapping[receiver], row[2])
+            for column, fact in field_page.history(row):
+                source = _Ref(_REDUCER_FIELD_STATE, row, column)
+                if isinstance(fact, _Unresolved):
+                    read = tuple(relabeled.get(cell, cell) for cell in fact.read)
+                    new_fact: Any = _Unresolved(fact.reason, read)
+                    cells: tuple = (source,)
+                elif isinstance(fact, _FieldState):
+                    value = canonical_cell(fact.value)
+                    effect = canonical_cell(fact.effect)
+                    if value is None or effect is None:
+                        continue
+                    new_fact = _FieldState(fact.kind, value, effect)
+                    cells = (source, value, effect)
+                else:
+                    continue
+                relabeled[source] = book.post(
+                    _REDUCER_FIELD_STATE, canonical_row, new_fact,
+                    stage=stage, provenance=_Derived(cells), mode=_Mode.REVISE,
+                )
+    static_page = book.pages.get(_STATIC_ATTRIBUTE_STATE.name)
+    if static_page is not None:
+        for row in static_page.scope_rows(ingestion_scope):
+            for column, fact in static_page.history(row):
+                source = _Ref(_STATIC_ATTRIBUTE_STATE, row, column)
+                value = canonical_cell(fact)
+                if value is None:
+                    continue
+                book.post(
+                    _STATIC_ATTRIBUTE_STATE, (read_scope, *row[1:]), value,
+                    stage=stage, provenance=_Derived((source, value)),
+                    mode=_Mode.REVISE,
+                )
+    slot_page = book.pages.get(_RETURN_SITE_SLOT.name)
+    if slot_page is not None:
+        for row in slot_page.scope_rows(ingestion_scope):
+            column, fact = slot_page.history(row)[-1]
+            source = _Ref(_RETURN_SITE_SLOT, row, column)
+            value = canonical_cell(fact)
+            if value is None:
+                new_fact = _Unresolved(_RETURN_SLOT_NOT_A_VALUE, (source,))
+                cells = (source,)
+            else:
+                new_fact = value
+                cells = (source, value)
+            book.post(
+                _RETURN_SITE_SLOT, (read_scope, *row[1:]), new_fact,
+                stage=stage, provenance=_Derived(cells), mode=_Mode.CONCORD,
+            )
+    container_page = book.pages.get(_RETURN_SITE_CONTAINER.name)
+    if container_page is not None:
+        for row in container_page.scope_rows(ingestion_scope):
+            column, fact = container_page.history(row)[-1]
+            source = _Ref(_RETURN_SITE_CONTAINER, row, column)
+            book.post(
+                _RETURN_SITE_CONTAINER, (read_scope, *row[1:]), fact,
+                stage=stage, provenance=_Derived((source,)), mode=_Mode.CONCORD,
+            )
+    site_page = book.pages.get(_RETURN_SITE_FIELD_STATE.name)
+    if site_page is not None:
+        for row in site_page.scope_rows(ingestion_scope):
+            receiver = row[2]
+            if receiver not in mapping:
+                continue
+            column, fact = site_page.history(row)[-1]
+            source = _Ref(_RETURN_SITE_FIELD_STATE, row, column)
+            canonical_row = (read_scope, row[1], mapping[receiver], row[3])
+            if isinstance(fact, _Unresolved):
+                read = tuple(relabeled.get(cell, cell) for cell in fact.read)
+                book.post(
+                    _RETURN_SITE_FIELD_STATE, canonical_row,
+                    _Unresolved(fact.reason, read), stage=stage,
+                    provenance=_Derived((source,)), mode=_Mode.CONCORD,
+                )
+                continue
+            state = relabeled.get(fact)
+            if state is None:
+                continue
+            book.post(
+                _RETURN_SITE_FIELD_STATE, canonical_row, state, stage=stage,
+                provenance=_Derived((source, state)), mode=_Mode.CONCORD,
+            )
+
+
 def _normalize_lexical_values(
     function_graph: Any,
     statement: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -2517,17 +3040,34 @@ def _normalize_lexical_values(
     first_class_function_nodes: dict[int, int] = {}
     materialized_attribute_nodes: dict[int, int] = {}
     static_constant_nodes: dict[str, int] = {}
-    static_attribute_values: dict[tuple[int, str], int] = {}
+    # The reducer's field state is on the book (page ``reducer_field_state``,
+    # one row per ``(scope, receiver, field)``, one revision per write or
+    # merge; plan 70 section 1).  The only private state kept here is the
+    # CURSOR: for every field row this reduction has touched, the cell that
+    # is the field's current state at this program point.  The book is
+    # append-only, so an arm's revisions stay on the row as history; the
+    # cursor is captured at a conditional's entry and reset at each arm's
+    # boundary, and the merge names the arm cells by their captured Refs.
+    field_state_cursor: dict[tuple[int, str], _Ref] = {}
     # The most recent node that mutated ``(receiver_node_id, attr)`` --
     # a whole-attribute ``SetAttr`` or an element-wise ``obj.field[i, j] =``
     # ``IndexedStore``.  A later bare read of the same field consults this so
     # the read is ordered after the write instead of depending only on the
     # unchanged receiver node (see the read side in ``resolve_expression``).
-    attribute_effect_nodes: dict[tuple[int, str], int] = {}
+    # Read view over ``FieldState.effect`` of the cursor cells.
+    attribute_effect_nodes: Mapping[tuple[int, str], int] = _FieldStateView(
+        field_state_cursor, "effect",
+    )
     # Current field value, separate from the ordered write event. Explicit
-    # GetAttr nodes remain in the graph for record-ABI projection; this ledger
+    # GetAttr nodes remain in the graph for record-ABI projection; this view
     # only supplies exact incoming values when source control joins a write.
-    attribute_value_nodes: dict[tuple[int, str], int] = {}
+    # Read view over ``FieldState.value`` of the cursor cells.
+    attribute_value_nodes: Mapping[tuple[int, str], int] = _FieldStateView(
+        field_state_cursor, "value",
+    )
+    # Return-site receipts are pages keyed by the return site's node cell;
+    # the legacy receipts were keyed by source span.  Site cell -> span.
+    return_site_spans: dict[_Ref, tuple[int, int, int, int]] = {}
     parameter_names = set(function_parameter_names(statement))
     static_parameter_bindings = dict(static_parameter_bindings or {})
     value_class_scope = _source_numeric_scope(
@@ -2545,6 +3085,100 @@ def _normalize_lexical_values(
     # Operand-position facts are keyed in the ingestion scope until canonical
     # renumbering; ``_set_operands`` moves them with every operand rewrite.
     graph.G.graph["operand_position_scope"] = ingestion_read_scope
+    field_state_book = current_identity_book()
+    # The legacy return receipts are read views over the return-site pages,
+    # keyed by span through ``return_site_spans`` and read under the graph's
+    # current operand-position scope (plan 70, section 2).
+    graph.G.graph["return_slot_values"] = _ReturnSiteView(
+        graph, _RETURN_SITE_SLOT, return_site_spans, _return_slot_receipt,
+    )
+    graph.G.graph["return_record_field_states"] = _ReturnSiteView(
+        graph, _RETURN_SITE_FIELD_STATE, return_site_spans,
+        _return_field_state_receipt,
+    )
+    graph.G.graph["return_container_kinds"] = _ReturnSiteView(
+        graph, _RETURN_SITE_CONTAINER, return_site_spans,
+        _return_container_receipt,
+    )
+
+    def field_state_row(receiver: int, attr: str) -> tuple:
+        return (ingestion_read_scope, int(receiver), str(attr))
+
+    def receiver_class_identity(receiver: int) -> str | None:
+        """The receiver's class as the source-value class concordance holds
+        it, else as its ``result_class_ref`` graph view names it."""
+
+        fact = field_state_book.page(
+            "source_value_class_concordance"
+        ).latest((value_class_scope, int(receiver)))
+        if isinstance(fact, tuple) and fact:
+            return str(fact[0])
+        if receiver in graph.G:
+            attributes = graph.G.nodes[receiver].get("attributes") or {}
+            for key in ("result_class_ref", "class_ref"):
+                if attributes.get(key) is not None:
+                    return str(attributes[key])
+        return None
+
+    def field_schema_cell(receiver: int, attr: str) -> _Ref | None:
+        """The ``class_field_declaration`` cell for the receiver's class and
+        ``attr`` when the class is known and step 2 posted the row."""
+
+        class_identity = receiver_class_identity(receiver)
+        if class_identity is None:
+            return None
+        page = field_state_book.pages.get(_CLASS_FIELD_DECLARATION.name)
+        if page is None:
+            return None
+        for row in page.rows():
+            if (
+                len(row) == 3 and row[2] == str(attr)
+                and str(row[1]) == class_identity
+                and page.latest(row) is not None
+            ):
+                return field_state_book.latest_ref(_CLASS_FIELD_DECLARATION, row)
+        return None
+
+    def field_state_sources(receiver: int, attr: str, *cells: Any) -> tuple:
+        """DERIVED cells for a field-state post: the receiver's node cell,
+        the field schema cell when it exists (else the receiver's cell
+        again, which dedups), then ``cells`` in order."""
+
+        receiver_cell = node_identity_cell(graph, int(receiver))
+        schema = field_schema_cell(receiver, attr) or receiver_cell
+        ordered: list = []
+        for cell in (receiver_cell, schema, *cells):
+            if isinstance(cell, _Ref) and cell not in ordered:
+                ordered.append(cell)
+        return tuple(ordered)
+
+    def post_field_state(
+        receiver: int,
+        attr: str,
+        kind: Any,
+        value_id: int,
+        effect_id: int,
+        *,
+        sources: tuple,
+        stage: Any,
+    ) -> _Ref:
+        """One REVISE on the field's row; the cursor moves to the new cell."""
+
+        cell = field_state_book.post(
+            _REDUCER_FIELD_STATE, field_state_row(receiver, attr),
+            _FieldState(
+                kind,
+                node_identity_cell(graph, int(value_id)),
+                node_identity_cell(graph, int(effect_id)),
+            ),
+            stage=stage, provenance=_Derived(sources), mode=_Mode.REVISE,
+        )
+        field_state_cursor[(int(receiver), str(attr))] = cell
+        return cell
+
+    def field_state_at(cell: Any) -> Any:
+        return _cell_fact(field_state_book, cell)
+
     #: A bare ``return name`` has no consumer edge: its value becomes a root.
     #: The bindings each returned root value was returned under.
     return_root_bindings: dict[int, set[str]] = {}
@@ -2801,7 +3435,12 @@ def _normalize_lexical_values(
         attributes: dict[str, Any] | None = None,
         parents: tuple[tuple[int, str], ...] = (),
         source: Any = None,
+        source_cell: Any = None,
     ) -> int:
+        # ``source_cell``: the cell of the authored construct this node
+        # stands for when that construct must not become the node's
+        # lexical ``source_span`` (an Input for an ``ast.arg``); it names
+        # the ``ingestion_value`` row's provenance only.
         # Value ids are identities: never hand out an id freed by an earlier
         # removal.  The per-graph watermark only moves forward (see
         # src.compiler.process_graph_value_ids for the shared rule).
@@ -2853,7 +3492,67 @@ def _normalize_lexical_values(
             graph.G.nodes[parent_id].setdefault("children", []).append(
                 (node_id, role)
             )
+        # Every reducer-synthesized node is an ``ingestion_value`` row in
+        # this reduction's ingestion scope (plan 60, section 3.1 (c)):
+        # DERIVED from the span of the authored ``source`` it stands for,
+        # else Unsourced(SYNTHESIZED_NO_SOURCE) under the latch -- the
+        # latch lists every caller that passes no source (Phis, captured
+        # Inputs, static constants) as step 3's worklist.
+        span = (
+            source_cell if isinstance(source_cell, _Ref)
+            else _post_source_span(source)
+        )
+        current_identity_book().post(
+            _INGESTION_VALUE, (ingestion_read_scope, int(node_id)),
+            _NodeFact(str(node_type), str(node_type.lower()), str(label)),
+            stage=_REDUCTION,
+            provenance=(
+                _Derived((span,)) if span is not None
+                else _Unsourced(_SYNTHESIZED_NO_SOURCE)
+            ),
+            mode=_Mode.CONCORD,
+        )
         return node_id
+
+    def parameter_argument(name: str) -> ast.arg | None:
+        """The ``ast.arg`` of parameter ``name`` on the reduced definition."""
+
+        return _parameter_argument(statement, name)
+
+    def post_name_binding(
+        name: str, value: int, *, authored: bool, span_positions: tuple,
+        context_sha256: str, cells: tuple,
+    ) -> Any:
+        """One ``name_binding`` row ``(ingestion scope, name, version)`` for
+        the binding ``identity_bindings`` just recorded (plan 60, section
+        3.2): ``version`` is the value's position in that name's list --
+        exactly the ``enumerate`` the identity table uses -- and the row is
+        DERIVED from the value's ``ingestion_value`` cell and ``cells``."""
+
+        versions = identity_bindings.get(str(name), ())
+        version = len(versions)
+        for index in range(len(versions) - 1, -1, -1):
+            if versions[index] == value:
+                version = index
+                break
+        row = (ingestion_read_scope, str(name), int(version))
+        book = current_identity_book()
+        existing = book.latest_ref(_NAME_BINDING, row)
+        if existing is not None:
+            return existing
+        sources: list = [node_identity_cell(graph, int(value))]
+        for cell in cells:
+            if isinstance(cell, _Ref) and cell not in sources:
+                sources.append(cell)
+        return book.post(
+            _NAME_BINDING, row,
+            _BindingFact(
+                int(value), bool(authored), tuple(span_positions),
+                str(context_sha256),
+            ),
+            stage=_REDUCTION, provenance=_Derived(tuple(sources)),
+            mode=_Mode.CONCORD,
+        )
 
     def input_value(name: str, *, binding_kind: str) -> int:
         value = environment.get(name)
@@ -2894,14 +3593,47 @@ def _normalize_lexical_values(
                 ),
                 "sequence_writable": aggregate_kind not in {"tuple", "bytes"},
             })
+        scalar_parameters = tuple(
+            graph.G.graph.get("scalar_parameters") or ()
+        )
+        if name in scalar_parameters:
+            # The read view of the ``scalar_parameter`` row posted below.
+            attributes["value_kind"] = "scalar"
+        # The Input stands for the authored ``ast.arg``: its
+        # ``ingestion_value`` row derives from that span (a captured or
+        # external name has no arg and stays Unsourced under the latch).
+        argument = parameter_argument(name)
+        argument_span = _post_source_span(argument)
         value = new_node(
             "Input",
             name,
             attributes=attributes,
+            source_cell=argument_span,
         )
         environment[name] = value
         identity_bindings.setdefault(name, []).append(value)
         ingestion_definitions.setdefault(name, []).append((value, {}))
+        # The Input's ``name_binding`` row: DERIVED from its own
+        # ``ingestion_value`` cell and the ``ast.arg`` span (plan 60, 3.2).
+        input_cell = node_identity_cell(graph, int(value))
+        post_name_binding(
+            name, value, authored=True, span_positions=(None,) * 4,
+            context_sha256="", cells=(argument_span,),
+        )
+        # The parameter's ``parameter_annotation`` row (``build_from_ast``
+        # posted it for a top-level function or class member).
+        annotation_cell = None
+        statement_row = getattr(statement, "_turing_source_span_row", None)
+        if isinstance(statement_row, tuple):
+            annotation_cell = current_identity_book().latest_ref(
+                _PARAMETER_ANNOTATION,
+                (statement_row[0], str(value_class_scope), str(name)),
+            )
+        if name in scalar_parameters:
+            # (i) a scalar annotation: DERIVED from the annotation row;
+            # (ii) a scalar literal default: DERIVED from the default's
+            # span (plan 60, section 3.5).  The Input's own cell always.
+            post_scalar_parameter(graph, int(value), name, statement)
         if class_identity is not None:
             _concord_source_value_class(
                 value_class_scope,
@@ -2912,6 +3644,10 @@ def _normalize_lexical_values(
                     if numeric_descriptor is not None else 1
                 ),
                 source=f"parameter annotation {name}",
+                provenance=_Derived(tuple(
+                    cell for cell in (annotation_cell, input_cell, argument_span)
+                    if cell is not None
+                )),
             )
         return value
 
@@ -3022,6 +3758,13 @@ def _normalize_lexical_values(
             "source_span": source_span,
         }
         context_tokens = structural_context_tokens(context)
+        context_sha256 = hashlib.sha256(
+            json.dumps(context, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        # The token payload stays here for the ``ingestion_identity_table``
+        # view (``BindingFact`` carries the sha, not the tokens); the binding
+        # itself is the ``name_binding`` row posted below, DERIVED from the
+        # value's ``ingestion_value`` cell and the target's span.
         ingestion_definitions.setdefault(str(name), []).append((
             int(value), {
                 **source_span,
@@ -3031,11 +3774,18 @@ def _normalize_lexical_values(
                     encode_identity_tokens({"token": token})
                     for token in context_tokens
                 ),
-                "context_sha256": hashlib.sha256(
-                    json.dumps(context, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                ).hexdigest(),
+                "context_sha256": context_sha256,
             },
         ))
+        post_name_binding(
+            str(name), int(value), authored=True,
+            span_positions=(
+                source_span["line"], source_span["column"],
+                source_span["end_line"], source_span["end_column"],
+            ),
+            context_sha256=context_sha256,
+            cells=(_post_source_span(target),),
+        )
 
     def static_constant(name: str, value: Any) -> int:
         existing = static_constant_nodes.get(name)
@@ -3178,16 +3928,43 @@ def _normalize_lexical_values(
                 "reference_kind": "function_subgraph",
             },
         )
-        current_identity_book().page("callable_identity_concordance").set(
-            (
-                _source_numeric_scope(graph),
-                int(node_id),
-            ),
-            0,
-            int(address),
-        )
+        # The node IS the function's address: DERIVED from the table's
+        # ``function_address`` row and the node's own cell (plan 60, 3.8).
+        post_callable_identity(int(node_id), address)
         first_class_function_nodes[address] = node_id
         return node_id
+
+    def post_callable_identity(node_id: int, address: int) -> None:
+        """One CONCORD ``callable_identity_concordance`` row ``(numeric
+        scope, node) -> address``; a repeat is the same fact and records
+        its edge.  A table entry the address does not name (declared on
+        another table) leaves the row Unsourced(HELPER_CALLER_UNROUTED)."""
+
+        book = current_identity_book()
+        address_cell = None
+        try:
+            entry = function_table.entry(int(address))
+        except KeyError:
+            entry = None
+        if entry is not None:
+            address_cell = book.latest_ref(
+                _FUNCTION_ADDRESS, (str(entry.qualified_name),),
+            )
+        cells = tuple(
+            cell for cell in (
+                address_cell, node_identity_cell(graph, int(node_id)),
+            )
+            if cell is not None
+        )
+        book.post(
+            _CALLABLE_IDENTITY, (_source_numeric_scope(graph), int(node_id)),
+            int(address), stage=_REDUCTION,
+            provenance=(
+                _Derived(cells) if address_cell is not None
+                else _Unsourced(_HELPER_CALLER_UNROUTED)
+            ),
+            mode=_Mode.CONCORD,
+        )
 
     def bind_loop_target(target: ast.AST) -> None:
         if isinstance(target, ast.Name):
@@ -3204,6 +3981,13 @@ def _normalize_lexical_values(
                 )
                 loop_target_bindings_by_ast[target_identity] = value
                 identity_bindings.setdefault(target.id, []).append(value)
+                # The loop target's ``name_binding`` row: DERIVED from the
+                # Input's own node cell and the target's span (plan 60, 3.2).
+                post_name_binding(
+                    target.id, value, authored=False,
+                    span_positions=(None,) * 4, context_sha256="",
+                    cells=(_post_source_span(target),),
+                )
             if target_identity in scalar_loop_target_ast_ids:
                 scalar_loop_binding_ids.add(value)
             environment[target.id] = value
@@ -3748,8 +4532,14 @@ def _normalize_lexical_values(
             else:
                 receiver = resolve_expression(expression.value)
             if isinstance(receiver, _StaticPythonReference):
-                attribute_key = (id(receiver.value), expression.attr)
-                assigned_value = static_attribute_values.get(attribute_key)
+                # A compile-time receiver's field, assigned earlier in this
+                # reduction: page ``static_attribute_state`` row (scope,
+                # receiver path, field) holds the RHS node's identity cell.
+                assigned_cell = field_state_book.latest_ref(
+                    _STATIC_ATTRIBUTE_STATE,
+                    (ingestion_read_scope, receiver.path, expression.attr),
+                )
+                assigned_value = _cell_node_id(field_state_at(assigned_cell))
                 if assigned_value is not None:
                     _redirect_value(graph, id(expression), assigned_value)
                     return assigned_value
@@ -3847,31 +4637,32 @@ def _normalize_lexical_values(
                                 "first_class_function_ref"
                             )
                             if function_ref is not None:
-                                page = current_identity_book().page(
-                                    "callable_identity_concordance"
+                                # Scope spelled as every other numeric fact
+                                # (``_source_numeric_scope``): the bare
+                                # function name dropped the method owner and
+                                # could give one value two rows.  One
+                                # CONCORD post: a different address is the
+                                # disagreement; the same one records the
+                                # edge, no second column (plan 60, 3.8).
+                                post_callable_identity(
+                                    int(field_value), int(function_ref),
                                 )
-                                row = (
-                                    str(graph.G.graph.get("function_name")
-                                        or "<module>"),
-                                    int(field_value),
-                                )
-                                recorded = page.latest(row)
-                                if recorded is None:
-                                    page.set(row, 0, int(function_ref))
-                                elif int(recorded) != int(function_ref):
-                                    raise ValueError(
-                                        "callable identity concordance "
-                                        f"disagrees for {row!r}: "
-                                        f"{recorded!r} != {function_ref!r}"
-                                    )
-                                page.set(row, 1, int(function_ref))
                             _redirect_value(
                                 graph, int(attribute_id), int(field_value)
                             )
                             return int(field_value)
                 read_inputs: list[tuple[int, str]] = [(receiver, "value")]
-                last_write = attribute_effect_nodes.get(
-                    (receiver, expression.attr)
+                # The cursor cell's effect, when that cell is a write or a
+                # merge: an OBSERVED cell's effect is a read, and a read is
+                # never ordered after another read.
+                current_state = field_state_at(
+                    field_state_cursor.get((int(receiver), str(expression.attr)))
+                )
+                last_write = (
+                    _cell_node_id(current_state.effect)
+                    if isinstance(current_state, _FieldState)
+                    and current_state.kind is not _FieldStateKind.OBSERVED
+                    else None
                 )
                 # Order this read after the most recent recorded write to the
                 # same field -- a whole-attribute ``SetAttr`` or an
@@ -4143,12 +4934,22 @@ def _normalize_lexical_values(
                 # correctly but never reported back that it did, severing
                 # the receiver as a dependency for anything built from this
                 # expression (a method call, a chained attribute, ...).
-                # Observation does not assign a new field version. Preserve
-                # the last RHS/merge in the ledger while keeping this read's
-                # own node and effect dependency for lexical scheduling.
-                attribute_value_nodes.setdefault(
-                    (receiver, expression.attr), int(attribute_id)
-                )
+                # Observation does not assign a new field version.  The
+                # first observation of a field with no state yet is the
+                # row's first revision, OBSERVED, whose value and effect are
+                # this read's own node (plan 70, S3); a later read posts
+                # nothing and the ``after_write`` operand above was ordered
+                # after the cursor cell's effect.
+                if (int(receiver), str(expression.attr)) not in field_state_cursor:
+                    post_field_state(
+                        receiver, expression.attr, _FieldStateKind.OBSERVED,
+                        int(attribute_id), int(attribute_id),
+                        sources=field_state_sources(
+                            receiver, expression.attr,
+                            node_identity_cell(graph, int(attribute_id)),
+                        ),
+                        stage=_REDUCER_FIELD_WRITE,
+                    )
                 return attribute_id
 
         if isinstance(expression, ast.Call):
@@ -5045,11 +5846,38 @@ def _normalize_lexical_values(
                 ),
             )
             if static_receiver is not None:
-                static_attribute_values[
-                    (id(static_receiver.value), target.attr)
-                ] = value
-            attribute_effect_nodes[(receiver, target.attr)] = node_id
-            attribute_value_nodes[(receiver, target.attr)] = int(value)
+                # A compile-time receiver's field takes the RHS node: page
+                # ``static_attribute_state`` keyed by the reference's path
+                # (plan 70, section 1.2), DERIVED(receiver node cell, RHS
+                # node cell).
+                field_state_book.post(
+                    _STATIC_ATTRIBUTE_STATE,
+                    (ingestion_read_scope, static_receiver.path, str(target.attr)),
+                    node_identity_cell(graph, int(value)),
+                    stage=_REDUCER_FIELD_WRITE,
+                    provenance=_Derived(tuple(dict.fromkeys((
+                        node_identity_cell(graph, int(receiver)),
+                        node_identity_cell(graph, int(value)),
+                    )))),
+                    mode=_Mode.REVISE,
+                )
+            # The write is the field's next version: WRITTEN, value = the
+            # RHS node, effect = this SetAttr (plan 70, S4).  The written
+            # cell is stamped on the SetAttr so a consumer names the cell,
+            # never the RHS id or the SetAttr id.
+            written_cell = post_field_state(
+                receiver, target.attr, _FieldStateKind.WRITTEN,
+                int(value), int(node_id),
+                sources=field_state_sources(
+                    receiver, target.attr,
+                    node_identity_cell(graph, int(value)),
+                    node_identity_cell(graph, int(node_id)),
+                ),
+                stage=_REDUCER_FIELD_WRITE,
+            )
+            node_data.setdefault("attributes", {})["field_state_cell"] = (
+                written_cell
+            )
             # A plain-named receiver (``counter.value = ...``) gets its own
             # identity binding the same way a bare ``ast.Name`` target does
             # above -- the field write is already a real, correctly wired
@@ -5177,12 +6005,22 @@ def _normalize_lexical_values(
                 # bare read of ``obj.field`` can depend on this write.
                 outer_receiver = resolve_expression(target.value.value)
                 if isinstance(outer_receiver, int):
-                    attribute_effect_nodes[
-                        (outer_receiver, target.value.attr)
-                    ] = node_id
-                    attribute_value_nodes[
-                        (outer_receiver, target.value.attr)
-                    ] = node_id
+                    # ELEMENT_WRITTEN: value and effect are both the store
+                    # (plan 70, section 1.3), DERIVED(outer receiver cell,
+                    # field schema cell, IndexedStore cell).
+                    element_cell = post_field_state(
+                        outer_receiver, target.value.attr,
+                        _FieldStateKind.ELEMENT_WRITTEN,
+                        int(node_id), int(node_id),
+                        sources=field_state_sources(
+                            outer_receiver, target.value.attr,
+                            node_identity_cell(graph, int(node_id)),
+                        ),
+                        stage=_REDUCER_FIELD_WRITE,
+                    )
+                    node_data.setdefault("attributes", {})[
+                        "field_state_cell"
+                    ] = element_cell
             return
         if isinstance(target, (ast.Tuple, ast.List)):
             if isinstance(value, _StaticPythonReference):
@@ -5444,6 +6282,24 @@ def _normalize_lexical_values(
             )
             resolved = []
             slot_values: list[int | None] = []
+            # The return site's identity is the returned expression's node
+            # cell and the construct's is the Return statement's; both are
+            # read before the slot expressions resolve, since resolving a
+            # ``Name`` redirects and removes its occurrence node.
+            return_site_cell = (
+                node_identity_cell(graph, id(returned))
+                if returned is not None and id(returned) in graph.G else None
+            )
+            return_construct_cell = (
+                node_identity_cell(graph, id(body_statement))
+                if id(body_statement) in graph.G else return_site_cell
+            )
+            slot_expression_cells = tuple(
+                node_identity_cell(graph, id(expression))
+                if expression is not None and id(expression) in graph.G
+                else None
+                for expression in expressions
+            )
             for index, expression in enumerate(expressions):
                 value = resolve_expression(expression)
                 slot_values.append(value if isinstance(value, int) else None)
@@ -5463,6 +6319,11 @@ def _normalize_lexical_values(
                     identity_bindings.setdefault(
                         str(output_names[index]), []
                     ).append(value)
+                    post_name_binding(
+                        str(output_names[index]), int(value), authored=False,
+                        span_positions=(None,) * 4, context_sha256="",
+                        cells=(),
+                    )
             # Every return statement names its OWN value per output slot.
             # The identity history above is a single chain per slot, so any
             # consumer reading ``history[-1]`` sees only the last return;
@@ -5478,30 +6339,81 @@ def _normalize_lexical_values(
                     int(getattr(returned, "end_lineno", -1)),
                     int(getattr(returned, "end_col_offset", -1)),
                 )
-                graph.G.graph.setdefault("return_slot_values", {})[
-                    return_span
-                ] = tuple(slot_values)
-                # Record correlation alone does not describe the field state
-                # at this return. Keep the exact receiver/value identities;
-                # the linker may use only values physically available on the
-                # corresponding return edge, never the final global ledger.
-                graph.G.graph.setdefault("return_record_field_states", {})[
-                    return_span
-                ] = tuple(
-                    (int(receiver), str(field), int(value))
-                    for (receiver, field), value in attribute_value_nodes.items()
-                    if receiver in slot_values
-                )
+                # Three return-site pages (plan 70, section 2), all keyed by
+                # the site cell; the legacy span-keyed receipts are read
+                # views over them (``return_site_spans`` joins the two).
+                return_site_spans[return_site_cell] = return_span
+                slot_cells: dict[int, _Ref] = {}
+                for index, slot_value in enumerate(slot_values):
+                    slot_row = (ingestion_read_scope, return_site_cell, index)
+                    if slot_value is None:
+                        # The slot's expression resolved to a non-value.
+                        slot_cells[index] = field_state_book.post(
+                            _RETURN_SITE_SLOT, slot_row,
+                            _Unresolved(
+                                _RETURN_SLOT_NOT_A_VALUE, (return_construct_cell,),
+                            ),
+                            stage=_REDUCER_RETURN,
+                            provenance=_Derived((return_construct_cell,)),
+                            mode=_Mode.CONCORD,
+                        )
+                        continue
+                    slot_cells[index] = field_state_book.post(
+                        _RETURN_SITE_SLOT, slot_row,
+                        node_identity_cell(graph, int(slot_value)),
+                        stage=_REDUCER_RETURN,
+                        provenance=_Derived(tuple(dict.fromkeys(
+                            cell for cell in (
+                                slot_expression_cells[index],
+                                return_construct_cell,
+                            ) if cell is not None
+                        ))),
+                        mode=_Mode.CONCORD,
+                    )
                 # Physical output slots alone cannot distinguish `return x`
                 # from `return (x,)`. Preserve authored container semantics
                 # beside the same exact return-site receipt before flattening.
-                graph.G.graph.setdefault("return_container_kinds", {})[
-                    return_span
-                ] = (
-                    "tuple" if isinstance(returned, ast.Tuple)
-                    else "list" if isinstance(returned, ast.List)
-                    else "value"
+                field_state_book.post(
+                    _RETURN_SITE_CONTAINER,
+                    (ingestion_read_scope, return_site_cell),
+                    _ContainerKind.TUPLE if isinstance(returned, ast.Tuple)
+                    else _ContainerKind.LIST if isinstance(returned, ast.List)
+                    else _ContainerKind.VALUE,
+                    stage=_REDUCER_RETURN,
+                    provenance=_Derived((return_construct_cell,)),
+                    mode=_Mode.CONCORD,
                 )
+                # Record correlation alone does not describe the field state
+                # at this return.  For every field row whose receiver is a
+                # returned slot, the site names the cursor cell current here,
+                # DERIVED(that cell, the slot cell carrying the receiver); the
+                # linker may use only values physically available on the
+                # corresponding return edge, never the final global ledger.
+                for (receiver, field), state_cell in tuple(
+                    field_state_cursor.items()
+                ):
+                    if receiver not in slot_values:
+                        continue
+                    slot_cell = slot_cells[slot_values.index(receiver)]
+                    site_row = (
+                        ingestion_read_scope, return_site_cell,
+                        int(receiver), str(field),
+                    )
+                    state = field_state_at(state_cell)
+                    field_state_book.post(
+                        _RETURN_SITE_FIELD_STATE, site_row,
+                        _Unresolved(
+                            _FIELD_STATE_UNRESOLVED_AT_RETURN, (state_cell,),
+                        ) if isinstance(state, _Unresolved) else state_cell,
+                        stage=_REDUCER_RETURN,
+                        provenance=_Derived((state_cell, slot_cell)),
+                        mode=_Mode.CONCORD,
+                    )
+                for construct_id in {id(body_statement), id(returned)}:
+                    if construct_id in graph.G:
+                        graph.G.nodes[construct_id].setdefault(
+                            "attributes", {}
+                        )["return_site_cell"] = return_site_cell
             if len(expressions) == 1:
                 value = resolved[0] if resolved else None
                 if value is not None:
@@ -5590,39 +6502,31 @@ def _normalize_lexical_values(
             # Reduce lexical occurrences within each arm without pretending
             # that either arm executed unconditionally.
             before = dict(environment)
-            before_attribute_effects = dict(attribute_effect_nodes)
-            before_attribute_values = dict(attribute_value_nodes)
+            # Field state: the book is append-only, so an arm's revisions
+            # stay on their rows; what is captured and reset at each arm
+            # boundary is the CURSOR (which cell is current per field row).
+            before_field_cells = dict(field_state_cursor)
             body_environment = dict(before)
             environment.clear()
             environment.update(body_environment)
-            attribute_effect_nodes.clear()
-            attribute_effect_nodes.update(before_attribute_effects)
-            attribute_value_nodes.clear()
-            attribute_value_nodes.update(before_attribute_values)
             body_result = None
             for nested in body_statement.body:
                 body_result = reduce_statement(nested)
             body_environment = dict(environment)
-            body_attribute_effects = dict(attribute_effect_nodes)
-            body_attribute_values = dict(attribute_value_nodes)
+            body_field_cells = dict(field_state_cursor)
             environment.clear()
             environment.update(before)
-            attribute_effect_nodes.clear()
-            attribute_effect_nodes.update(before_attribute_effects)
-            attribute_value_nodes.clear()
-            attribute_value_nodes.update(before_attribute_values)
+            field_state_cursor.clear()
+            field_state_cursor.update(before_field_cells)
             else_result = None
             for nested in body_statement.orelse:
                 else_result = reduce_statement(nested)
             else_environment = dict(environment)
-            else_attribute_effects = dict(attribute_effect_nodes)
-            else_attribute_values = dict(attribute_value_nodes)
+            else_field_cells = dict(field_state_cursor)
             environment.clear()
             environment.update(before)
-            attribute_effect_nodes.clear()
-            attribute_effect_nodes.update(before_attribute_effects)
-            attribute_value_nodes.clear()
-            attribute_value_nodes.update(before_attribute_values)
+            field_state_cursor.clear()
+            field_state_cursor.update(before_field_cells)
 
             def terminal_branch(statements: list[ast.stmt]) -> bool:
                 if not statements:
@@ -5660,18 +6564,50 @@ def _normalize_lexical_values(
             # that no execution ever actually produces on that edge, which
             # a downstream backend then has no real producer for.  Skip the
             # merge and let the single reachable arm's environment stand.
+            conditional_cell = (
+                node_identity_cell(graph, id(body_statement))
+                if id(body_statement) in graph.G
+                else node_identity_cell(graph, int(test_value))
+                if isinstance(test_value, int) else None
+            )
+
+            def select_live_arm(arm_cells: dict) -> None:
+                """The one reachable arm's field state stands after the
+                conditional: for every field row whose live-arm cell differs
+                from the pre-branch cell, ARM_SELECTED with that arm's value
+                and effect, DERIVED(live arm cell, conditional cell) (plan
+                70, S8).  The terminal arm's last state is not lost: it is
+                the cell the terminal arm's own return row derived from."""
+
+                for field_key, live_cell in arm_cells.items():
+                    if before_field_cells.get(field_key) == live_cell:
+                        field_state_cursor[field_key] = live_cell
+                        continue
+                    live_state = field_state_at(live_cell)
+                    if not isinstance(live_state, _FieldState):
+                        # An unresolved arm state stays the cursor cell; the
+                        # return site that reads it records the absence.
+                        field_state_cursor[field_key] = live_cell
+                        continue
+                    receiver_id, attribute_name = field_key
+                    post_field_state(
+                        receiver_id, attribute_name,
+                        _FieldStateKind.ARM_SELECTED,
+                        _cell_node_id(live_state.value),
+                        _cell_node_id(live_state.effect),
+                        sources=tuple(dict.fromkeys(
+                            cell for cell in (live_cell, conditional_cell)
+                            if cell is not None
+                        )),
+                        stage=_REDUCER_FIELD_MERGE,
+                    )
+
             if body_terminal and not else_terminal:
                 environment.update(else_environment)
-                attribute_effect_nodes.clear()
-                attribute_effect_nodes.update(else_attribute_effects)
-                attribute_value_nodes.clear()
-                attribute_value_nodes.update(else_attribute_values)
+                select_live_arm(else_field_cells)
             elif else_terminal and not body_terminal:
                 environment.update(body_environment)
-                attribute_effect_nodes.clear()
-                attribute_effect_nodes.update(body_attribute_effects)
-                attribute_value_nodes.clear()
-                attribute_value_nodes.update(body_attribute_values)
+                select_live_arm(body_field_cells)
             else:
                 for name in set(before) | set(body_environment) | set(
                     else_environment
@@ -5740,6 +6676,11 @@ def _normalize_lexical_values(
                         identity_bindings.setdefault(name, []).append(
                             merged_value
                         )
+                        post_name_binding(
+                            name, int(merged_value), authored=False,
+                            span_positions=(None,) * 4, context_sha256="",
+                            cells=(),
+                        )
 
                 # A record field is state just as a local name is.  Its
                 # explicit GetAttr projection is the incoming SSA value, while
@@ -5747,23 +6688,45 @@ def _normalize_lexical_values(
                 # First observation in an arm still names the receiver's
                 # physical field. Seed the other edge from that projection,
                 # never from an invented scalar Input or a read-history Phi.
-                for field_key in (body_attribute_values.keys() | else_attribute_values.keys()):
-                    if field_key in before_attribute_values:
+                # Every arm state below is a CELL of the field's row, so the
+                # merge names the arm's version, never an id that a later
+                # lowering could confuse with another node's.
+                def arm_effect_cell(arm_cells: dict, field_key: tuple) -> Any:
+                    """The arm's cell when the arm CHANGED the field (a write,
+                    a merge, a selected arm); None when the arm left the
+                    pre-branch cell in place or only observed the field."""
+
+                    cell = arm_cells.get(field_key)
+                    if cell is None or cell == before_field_cells.get(field_key):
+                        return None
+                    state = field_state_at(cell)
+                    if (
+                        isinstance(state, _FieldState)
+                        and state.kind is _FieldStateKind.OBSERVED
+                    ):
+                        return None
+                    return cell
+
+                def arm_effect_node(arm_cells: dict, field_key: tuple) -> int | None:
+                    state = field_state_at(arm_effect_cell(arm_cells, field_key))
+                    return (
+                        _cell_node_id(state.effect)
+                        if isinstance(state, _FieldState) else None
+                    )
+
+                for field_key in tuple(dict.fromkeys(
+                    (*body_field_cells, *else_field_cells)
+                )):
+                    if field_key in before_field_cells:
                         continue
                     receiver_id, attribute_name = field_key
-                    receiver_fact = current_identity_book().page(
-                        "source_value_class_concordance"
-                    ).latest((value_class_scope, int(receiver_id)))
-                    receiver_class = (
-                        str(receiver_fact[0])
-                        if isinstance(receiver_fact, tuple) else None
-                    )
+                    receiver_class = receiver_class_identity(receiver_id)
                     if receiver_class is None:
                         effect_classes = {
                             str(slot[0])
                             for effect_id in (
-                                body_attribute_effects.get(field_key),
-                                else_attribute_effects.get(field_key),
+                                arm_effect_node(body_field_cells, field_key),
+                                arm_effect_node(else_field_cells, field_key),
                             )
                             if effect_id is not None
                             and int(effect_id) in graph.G
@@ -5824,36 +6787,74 @@ def _normalize_lexical_values(
                         parents=((int(receiver_id), "value"),),
                         source=body_statement,
                     )
-                    before_attribute_values[field_key] = initial
-                    for branch_values, branch_effects in (
-                        (body_attribute_values, body_attribute_effects),
-                        (else_attribute_values, else_attribute_effects),
-                    ):
-                        if field_key not in branch_effects:
-                            branch_values[field_key] = initial
-                for field_key, initial_value in (
-                    before_attribute_values.items()
-                ):
-                    body_value = body_attribute_values.get(
-                        field_key, initial_value
+                    # The seeded pre-branch state: OBSERVED at the synthesized
+                    # projection, DERIVED(receiver cell, field schema cell,
+                    # the initial's own node cell).  It becomes the cursor
+                    # cell too, since the pre-branch cursor is what the
+                    # merge below reads as "before".
+                    seeded_cell = post_field_state(
+                        receiver_id, attribute_name, _FieldStateKind.OBSERVED,
+                        int(initial), int(initial),
+                        sources=field_state_sources(
+                            receiver_id, attribute_name,
+                            node_identity_cell(graph, int(initial)),
+                        ),
+                        stage=_REDUCER_FIELD_MERGE,
                     )
-                    else_value = else_attribute_values.get(
-                        field_key, initial_value
-                    )
-                    if body_value == else_value:
-                        attribute_value_nodes[field_key] = int(body_value)
+                    before_field_cells[field_key] = seeded_cell
+                    for arm_cells in (body_field_cells, else_field_cells):
+                        if arm_effect_cell(arm_cells, field_key) is None:
+                            arm_cells[field_key] = seeded_cell
+                for field_key, initial_cell in tuple(before_field_cells.items()):
+                    body_cell = body_field_cells.get(field_key, initial_cell)
+                    else_cell = else_field_cells.get(field_key, initial_cell)
+                    if body_cell == else_cell:
+                        # Both arms end at the same cell: the row's state IS
+                        # that cell; nothing new to post.
+                        field_state_cursor[field_key] = body_cell
                         continue
                     if not isinstance(test_value, int):
+                        # A compile-time test: no runtime merge exists.  The
+                        # state stays at the pre-branch cell, as today (the
+                        # Unresolved reason plan 70 spells for this case is
+                        # not declared; see the step-3 report).
+                        field_state_cursor[field_key] = initial_cell
                         continue
                     receiver_id, attribute_name = field_key
+                    initial_state = field_state_at(initial_cell)
+                    body_state = field_state_at(body_cell)
+                    else_state = field_state_at(else_cell)
+                    if not all(
+                        isinstance(state, _FieldState)
+                        for state in (initial_state, body_state, else_state)
+                    ):
+                        # An arm (or the pre-branch state) is Unresolved -- a
+                        # loop exit inside the arm -- so no version can be
+                        # merged; the unresolved cell stays current and the
+                        # return site that reads it records the absence.
+                        field_state_cursor[field_key] = next(
+                            cell for cell, state in (
+                                (body_cell, body_state), (else_cell, else_state),
+                                (initial_cell, initial_state),
+                            ) if not isinstance(state, _FieldState)
+                        )
+                        continue
+                    initial_value = _cell_node_id(initial_state.value)
+                    body_value = _cell_node_id(body_state.value)
+                    else_value = _cell_node_id(else_state.value)
                     branch_effect_ids = tuple(
                         int(effect_id)
                         for effect_id in (
-                            body_attribute_effects.get(field_key),
-                            else_attribute_effects.get(field_key),
+                            arm_effect_node(body_field_cells, field_key),
+                            arm_effect_node(else_field_cells, field_key),
                         )
                         if effect_id is not None and int(effect_id) in graph.G
                     )
+                    if body_value == else_value:
+                        # Two versions holding one value node: no runtime
+                        # choice exists, exactly as the id comparison decided.
+                        field_state_cursor[field_key] = body_cell
+                        continue
                     authored_field_names = {
                         f"{effect.value.id}.{effect.attr}"
                         for effect_id in branch_effect_ids
@@ -5911,8 +6912,33 @@ def _normalize_lexical_values(
                     identity_bindings.setdefault(binding_name, []).append(
                         merged_value
                     )
-                    attribute_value_nodes[field_key] = merged_value
-                    attribute_effect_nodes[field_key] = merged_value
+                    post_name_binding(
+                        binding_name, int(merged_value), authored=False,
+                        span_positions=(None,) * 4, context_sha256="",
+                        cells=(),
+                    )
+                    # MERGED: value and effect are the Phi, DERIVED(body arm
+                    # cell, else arm cell, test node cell, the Phi's own node
+                    # cell) (plan 70, S5-S7).  The Phi carries the merged
+                    # cell and its three arm/test cells, so the arm a
+                    # lowering reads is a CELL of this row -- the SetAttr-id
+                    # versus RHS-id mismatch of census 50 cannot recur.
+                    test_cell = node_identity_cell(graph, int(test_value))
+                    merged_cell = post_field_state(
+                        receiver_id, attribute_name, _FieldStateKind.MERGED,
+                        int(merged_value), int(merged_value),
+                        sources=tuple(dict.fromkeys(
+                            cell for cell in (
+                                body_cell, else_cell, test_cell,
+                                node_identity_cell(graph, int(merged_value)),
+                            ) if cell is not None
+                        )),
+                        stage=_REDUCER_FIELD_MERGE,
+                    )
+                    graph.G.nodes[merged_value].setdefault("attributes", {}).update({
+                        "field_state_cell": merged_cell,
+                        "field_state_arms": (body_cell, else_cell, test_cell),
+                    })
 
             if (
                 isinstance(test_value, int)
@@ -6179,11 +7205,35 @@ def _normalize_lexical_values(
                 # Snapshotting before this resolution silently lost genuine
                 # body updates such as ``data = data[0] if data else []``.
                 before_loop = dict(environment)
+            before_loop_field_cells = dict(field_state_cursor)
             for nested in body_statement.body:
                 reduce_statement(nested)
             for nested in body_statement.orelse:
                 reduce_statement(nested)
             loop_id = id(body_statement)
+            # Loop exit (plan 70, section 1.3, decision held for the user):
+            # the reducer merges no field state at a loop, so for every
+            # field row the body moved, the post-loop state is recorded as
+            # Unresolved(LOOP_EXIT_FIELD_STATE_UNMERGED) reading the
+            # pre-loop cell, the body-exit cell and the loop construct cell,
+            # instead of letting the body's last write stand as fact.
+            loop_cell = (
+                node_identity_cell(graph, loop_id) if loop_id in graph.G else None
+            )
+            for field_key, exit_cell in tuple(field_state_cursor.items()):
+                entry_cell = before_loop_field_cells.get(field_key)
+                if entry_cell == exit_cell:
+                    continue
+                read_cells = tuple(dict.fromkeys(
+                    cell for cell in (entry_cell, exit_cell, loop_cell)
+                    if cell is not None
+                ))
+                field_state_cursor[field_key] = field_state_book.post(
+                    _REDUCER_FIELD_STATE, field_state_row(*field_key),
+                    _Unresolved(_LOOP_EXIT_FIELD_STATE_UNMERGED, read_cells),
+                    stage=_REDUCER_FIELD_MERGE,
+                    provenance=_Derived(read_cells), mode=_Mode.REVISE,
+                )
             if loop_id in graph.G:
                 body_member_ids = {
                     id(member)
@@ -6510,6 +7560,11 @@ def _normalize_lexical_values(
                 ):
                     environment[name] = updated
                     identity_bindings.setdefault(name, []).append(updated)
+                    post_name_binding(
+                        name, int(updated), authored=False,
+                        span_positions=(None,) * 4, context_sha256="",
+                        cells=(),
+                    )
                 # A discarded bound-method call is retained here only as a
                 # source effect fact.  Its Python return value is not the
                 # mutated state, and no synthetic state transition belongs in
@@ -6949,22 +8004,118 @@ def _normalize_lexical_values(
     # Renumbering changes the id space; a watermark from the AST-id
     # ingestion graph must not leak into canonical allocation.
     ordered_graph.graph.pop("value_id_watermark", None)
+    # The canonical relabel is DERIVED rows, never an in-place renumbering
+    # (plan 60, section 3.1): one ``canonical_value`` row per entry of
+    # ``mapping``, new id <- the node's ``ingestion_value`` cell, the token
+    # chain as the fact.  ``graph.G`` is still the ingestion graph here, so
+    # ``node_identity_cell`` answers with ingestion cells; a node no writer
+    # gave a row (a non-AST ingestion object) gets one Unsourced under the
+    # latch, which is what the audit's worklist lists.
+    book = current_identity_book()
+    canonical_cells: dict[int, Any] = {}
+    for node_id in ordered:
+        canonical_cells[node_id] = book.post(
+            _CANONICAL_VALUE, (read_scope, mapping[node_id]),
+            tuple(node_token_chains[node_id]),
+            stage=_CANONICAL_RELABEL_STAGE,
+            provenance=_Derived((node_identity_cell(graph, node_id),)),
+            mode=_Mode.CONCORD,
+        )
+    canonical_page = book.page(_CANONICAL_VALUE)
     ordered_graph.graph["ssa_identity_tokens"] = {
-        mapping[node_id]: node_token_chains[node_id]
-        for node_id in ordered
+        int(row[1]): canonical_page.latest(row)
+        for row in canonical_page.scope_rows(read_scope)
     }
+    # Every binding ``identity_bindings`` holds has its ``name_binding`` row
+    # in the ingestion scope before the relabel (plan 60, section 3.2):
+    # ``input_value`` and ``record_ingestion_definition`` post theirs as
+    # they bind; a binding site that has not yet posted (a loop target, a
+    # return slot, a conditional or loop-carried merge) gets its row here,
+    # DERIVED from the value's ingestion cell, ``authored=False``.
+    binding_page = book.page(_NAME_BINDING)
+    ingestion_binding_cells: dict[tuple[str, int], Any] = {}
+    for name, value_ids in identity_bindings.items():
+        for version, value_id in enumerate(value_ids):
+            row = (ingestion_read_scope, str(name), int(version))
+            cell = book.latest_ref(_NAME_BINDING, row)
+            if cell is None:
+                cell = book.post(
+                    _NAME_BINDING, row,
+                    _BindingFact(int(value_id), False, (None,) * 4, ""),
+                    stage=_REDUCTION,
+                    provenance=_Derived(
+                        (node_identity_cell(graph, int(value_id)),)
+                    ),
+                    mode=_Mode.CONCORD,
+                )
+            ingestion_binding_cells[(str(name), int(version))] = cell
+    build_scope = ordered_graph.graph.get("ingestion_value_scope")
     map_ir = dict(ordered_graph.graph.get("map_ir") or {})
-    map_ir["schema_node_ids"] = tuple(
-        mapping[node_id]
-        for node_id in map_ir.get("schema_node_ids", ())
-        if node_id in mapping
-    )
-    map_ir["schema_roots"] = tuple(
-        mapping[node_id]
-        for node_id in map_ir.get("schema_roots", ())
-        if node_id in mapping
-    )
+    if build_scope is None:
+        # A graph no ``build_from_ast`` posted rows for keeps its ids.
+        map_ir["schema_node_ids"] = tuple(
+            mapping[node_id]
+            for node_id in map_ir.get("schema_node_ids", ())
+            if node_id in mapping
+        )
+        map_ir["schema_roots"] = tuple(
+            mapping[node_id]
+            for node_id in map_ir.get("schema_roots", ())
+            if node_id in mapping
+        )
+    else:
+        # ``schema_node`` canonical rows DERIVED(ingestion row); the two
+        # tuples are the canonical scope's rows (plan 60, section 3.3 (e)).
+        schema_page = book.page(_SCHEMA_NODE)
+        schema_roots = set(map_ir.get("schema_roots", ()))
+        canonical_schema_ids: list[int] = []
+        canonical_schema_roots: list[int] = []
+        for row in schema_page.scope_rows(build_scope):
+            if row[1] not in mapping:
+                continue
+            book.post(
+                _SCHEMA_NODE, (read_scope, mapping[row[1]]), True,
+                stage=_CANONICAL_RELABEL_STAGE,
+                provenance=_Derived((book.latest_ref(_SCHEMA_NODE, row),)),
+                mode=_Mode.CONCORD,
+            )
+            canonical_schema_ids.append(mapping[row[1]])
+            if row[1] in schema_roots:
+                canonical_schema_roots.append(mapping[row[1]])
+        map_ir["schema_node_ids"] = tuple(canonical_schema_ids)
+        map_ir["schema_roots"] = tuple(canonical_schema_roots)
     ordered_graph.graph["map_ir"] = map_ir
+    # ``scalar_parameter`` canonical rows DERIVED(ingestion row) (plan 60,
+    # section 3.5 (e)); the node attribute travels with the relabel.
+    scalar_page = book.page(_SCALAR_PARAMETER)
+    for scope in dict.fromkeys(
+        scope for scope in (ingestion_read_scope, build_scope)
+        if scope is not None
+    ):
+        for row in scalar_page.scope_rows(scope):
+            if row[1] not in mapping:
+                continue
+            book.post(
+                _SCALAR_PARAMETER, (read_scope, mapping[row[1]]),
+                _ValueKind.SCALAR, stage=_CANONICAL_RELABEL_STAGE,
+                provenance=_Derived((book.latest_ref(_SCALAR_PARAMETER, row),)),
+                mode=_Mode.CONCORD,
+            )
+    # ``callable_identity_concordance`` rows were written at ingestion ids
+    # and never moved (the audit read rows the linker could no longer
+    # join); their canonical rows are DERIVED(ingestion row) (plan 60,
+    # section 3.8 (e)).
+    callable_page = book.page(_CALLABLE_IDENTITY)
+    numeric_scope = _source_numeric_scope(graph)
+    for row in tuple(callable_page.scope_rows(numeric_scope)):
+        if row[1] not in mapping or mapping[row[1]] == row[1]:
+            continue
+        book.post(
+            _CALLABLE_IDENTITY, (numeric_scope, mapping[row[1]]),
+            callable_page.latest(row), stage=_CANONICAL_RELABEL_STAGE,
+            provenance=_Derived((book.latest_ref(_CALLABLE_IDENTITY, row),)),
+            mode=_Mode.REVISE,
+        )
     for value_id in range(len(mapping)):
         ordered_graph.add_node(value_id, **relabeled.nodes[value_id])
     ordered_graph.add_edges_from(relabeled.edges(data=True))
@@ -6977,30 +8128,66 @@ def _normalize_lexical_values(
         for node_id, level in graph.levels.items()
         if node_id in mapping
     }
+    # Canonical ``name_binding`` rows: DERIVED(ingestion row, the value's
+    # ``canonical_value`` row), one per (name, version) whose value
+    # survived; ``identity_table`` is the canonical scope's rows, a name
+    # whose every value left the graph keeps its empty tuple as before.
+    for (name, version), cell in ingestion_binding_cells.items():
+        fact = binding_page.latest(cell.row)
+        value_id = int(fact.value_id)
+        if value_id not in mapping:
+            continue
+        book.post(
+            _NAME_BINDING, (read_scope, name, version),
+            _BindingFact(
+                int(mapping[value_id]), fact.authored, fact.span_positions,
+                fact.context_sha256,
+            ),
+            stage=_CANONICAL_RELABEL_STAGE,
+            provenance=_Derived((cell, canonical_cells[value_id])),
+            mode=_Mode.CONCORD,
+        )
+    canonical_bindings: dict[str, list[tuple[int, Any]]] = {}
+    for row in binding_page.scope_rows(read_scope):
+        canonical_bindings.setdefault(str(row[1]), []).append(
+            (int(row[2]), binding_page.latest(row))
+        )
+    for entries in canonical_bindings.values():
+        entries.sort(key=lambda entry: entry[0])
     graph.G.graph["identity_table"] = {
         name: tuple(
-            mapping[value_id]
-            for value_id in value_ids
-            if value_id in mapping
+            int(fact.value_id)
+            for _version, fact in canonical_bindings.get(str(name), ())
         )
-        for name, value_ids in identity_bindings.items()
+        for name in identity_bindings
     }
     # Class facts this function committed while its values still had
     # ingestion ids follow those values into the canonical id space, exactly
     # as the identity table does; the concordance answers by canonical id.
-    class_page = current_identity_book().page(
-        "source_value_class_concordance"
-    )
+    # One DERIVED post per row, its cells every column of the ingestion row
+    # (plan 60, section 3.1 (e)); the ingestion row stays as history.
+    class_page = book.page(_SOURCE_VALUE_CLASS)
     for row in tuple(class_page.rows()):
         if (
             isinstance(row, tuple) and len(row) == 2
             and row[0] == value_class_scope and row[1] in mapping
             and mapping[row[1]] != row[1]
         ):
-            for column, fact in class_page.history(row):
-                class_page.set(
-                    (value_class_scope, mapping[row[1]]), column, fact,
-                )
+            history = class_page.history(row)
+            book.post(
+                _SOURCE_VALUE_CLASS, (value_class_scope, mapping[row[1]]),
+                history[-1][1], stage=_CANONICAL_RELABEL_STAGE,
+                provenance=_Derived(tuple(
+                    _Ref(_SOURCE_VALUE_CLASS, row, column)
+                    for column, _fact in history
+                )),
+                mode=_Mode.REVISE,
+            )
+    # The reducer field-state and return-site pages (plan 70) follow the
+    # same relabel once their canonical node cells exist.
+    relabel_field_state_pages = globals().get("_relabel_field_state_pages")
+    if relabel_field_state_pages is not None:
+        relabel_field_state_pages(book, read_scope, mapping)
     # The per-read bindings follow their consumers into canonical ids.  A
     # scope reduced again revises its canonical rows rather than keeping a
     # previous reduction's facts.
@@ -7018,54 +8205,58 @@ def _normalize_lexical_values(
             )
     graph.G.graph["lexical_read_scope"] = read_scope
     graph.G.graph["operand_position_scope"] = read_scope
-    # Per-return slot values are ids in the pre-canonical space too.
-    graph.G.graph["return_slot_values"] = {
-        span: tuple(
-            None if value_id is None or value_id not in mapping
-            else mapping[value_id]
-            for value_id in slot_ids
-        )
-        for span, slot_ids in (
-            graph.G.graph.get("return_slot_values") or {}
-        ).items()
-    }
-    # Ingestion spelling and SSA definition numbering are separate domains.
-    graph.G.graph["return_record_field_states"] = {
-        span: tuple(
-            (mapping[receiver], field, mapping[value])
-            for receiver, field, value in states
-            if receiver in mapping and value in mapping
-        )
-        for span, states in (
-            graph.G.graph.get("return_record_field_states") or {}
-        ).items()
-    }
+    # The return-site receipts (``return_slot_values``,
+    # ``return_record_field_states``, ``return_container_kinds``) are read
+    # views over the return-site pages (plan 70, section 2); they follow the
+    # scope just set, and their canonical rows were posted by
+    # ``_relabel_field_state_pages`` above.  Nothing is renumbered in place.
     # ``identity_table`` remains the compact compatibility map used by older
     # lowering code.  This ledger preserves the original common spelling and
     # its authored rebinding version before any SSA-only phi/capture/temp
     # values are introduced.
-    graph.G.graph["ingestion_identity_table"] = {
-        str(name): tuple(
-            {
+    # Materialized from the canonical ``name_binding`` rows (the authored
+    # ones); the token payload joins from ``ingestion_definitions`` because
+    # ``BindingFact`` carries the context sha, not the tokens.
+    ingestion_identity_table: dict[str, tuple] = {}
+    for name, definitions in ingestion_definitions.items():
+        authored = [
+            fact for _version, fact in canonical_bindings.get(str(name), ())
+            if fact.authored
+        ]
+        entries = []
+        for version, (value_id, source) in enumerate(definitions):
+            if value_id not in mapping:
+                continue
+            fact = next(
+                (
+                    candidate for candidate in authored
+                    if int(candidate.value_id) == mapping[value_id]
+                ),
+                None,
+            )
+            if fact is None:
+                raise ValueError(
+                    f"name_binding has no canonical authored row for "
+                    f"{name!r} version {version}"
+                )
+            authored.remove(fact)
+            entries.append({
                 "spelling": str(name),
                 "version": version,
-                "value_id": mapping[value_id],
-                "source_span": {
-                    key: source.get(key)
-                    for key in ("line", "column", "end_line", "end_column")
-                },
+                "value_id": int(fact.value_id),
+                "source_span": dict(zip(
+                    ("line", "column", "end_line", "end_column"),
+                    fact.span_positions,
+                )),
                 **({
                     "context": source["context"],
                     "context_tokens": source["context_tokens"],
                     "context_token_ids": source["context_token_ids"],
                     "context_sha256": source["context_sha256"],
                 } if "context" in source else {}),
-            }
-            for version, (value_id, source) in enumerate(definitions)
-            if value_id in mapping
-        )
-        for name, definitions in ingestion_definitions.items()
-    }
+            })
+        ingestion_identity_table[str(name)] = tuple(entries)
+    graph.G.graph["ingestion_identity_table"] = ingestion_identity_table
     for value_id, data in graph.G.nodes(data=True):
         data["value_id"] = value_id
         attributes = data.get("attributes") or {}
@@ -8206,6 +9397,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         reference = function_table.declare(
             function_name,
             qualified_name=qualified_name,
+            source=_post_source_span(statement),
             metadata={
                 "source_type": type(statement).__name__,
                 "source_node": node_id,
@@ -8287,6 +9479,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         reference = function_table.declare(
             local_name,
             qualified_name=f"host-ssa.{host_root}",
+            source=_post_source_span(expression),
             metadata={
                 "host_ssa_module": host_module,
                 "host_ssa_root": str(host_root),
@@ -10909,9 +12102,22 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     member_data.get("attributes") or {}
                 ).get("binding_name") in scalar_parameter_names
             ):
+                # A ``scalar_parameter`` row for the ingested Input (plan
+                # 60, section 3.5): DERIVED from (i) the parameter's
+                # ``parameter_annotation`` row or (ii) the span of its
+                # scalar literal default, and the Input's own cell.  The
+                # attribute is the row's read view.  The Inputs
+                # ``_normalize_lexical_values`` mints for the same names
+                # post their rows in ``input_value``; the relabel tail
+                # posts the canonical rows.
                 member_data.setdefault("attributes", {})[
                     "value_kind"
                 ] = "scalar"
+                post_scalar_parameter(
+                    function_graph, member,
+                    str(member_data["attributes"]["binding_name"]),
+                    statement,
+                )
             _set_operands(function_graph, member, [
                 (parent, role)
                 for parent, role in member_data.get("parents", ())
@@ -10987,16 +12193,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 "flow_control": "downstream_capacity",
                 "execution_owner": "planner_shell",
             }
-        for _member, member_data in function_graph.G.nodes(data=True):
-            if (
-                member_data.get("type") == "Input"
-                and (
-                    member_data.get("attributes") or {}
-                ).get("binding_name") in scalar_parameter_names
-            ):
-                member_data.setdefault("attributes", {})[
-                    "value_kind"
-                ] = "scalar"
+        # The canonical ``scalar_parameter`` rows (and the ``value_kind``
+        # attribute on the Inputs ``input_value`` minted) are the relabel
+        # tail's job (plan 60, section 3.5 (c)); no second write here.
         if hasattr(statement, "_python_bindings"):
             delattr(statement, "_python_bindings")
         if hasattr(statement, "_python_aggregate_binding_kinds"):

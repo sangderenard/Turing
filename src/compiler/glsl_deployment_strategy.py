@@ -8576,6 +8576,12 @@ def _ordinary_conditional_control_programs(
         # attribute assignments, used to confuse SetAttr event ids with the
         # values they store.
         carried = []
+        # Aligned with ``carried``: the reducer's field-state cells for a
+        # field-carried merge, read from the Phi node's own attributes
+        # (``field_state_arms`` = (true-arm cell, false-arm cell, test cell),
+        # ``field_state_cell`` = the MERGED cell) so the lowering names the
+        # cells the merge derived from instead of copying graph ids.
+        carried_field_cells = []
         direct_phi_bindings: set[str] = set()
         direct_phi_record_fields: set[tuple[int, str]] = set()
         for phi_node_id, phi_data in graph.G.nodes(data=True):
@@ -8624,6 +8630,16 @@ def _ordinary_conditional_control_programs(
                 int(phi_attributes["initial_value_id"]),
                 merged_id,
             ))
+            field_state_arms = phi_attributes.get("field_state_arms")
+            carried_field_cells.append(
+                (
+                    field_state_arms[0], field_state_arms[1],
+                    phi_attributes.get("field_state_cell"),
+                )
+                if isinstance(field_state_arms, (tuple, list))
+                and len(field_state_arms) >= 2
+                else None
+            )
             if binding_name is not None:
                 direct_phi_bindings.add(str(binding_name))
             direct_phi_record_fields.update(
@@ -8691,6 +8707,7 @@ def _ordinary_conditional_control_programs(
                 int(predicate_value_id), body, orelse,
                 predicate_expression=predicate_expression,
                 carried_aliases=tuple(carried),
+                carried_field_cells=tuple(carried_field_cells),
                 source_node_id=int(control_id),
                 # Call nodes lexically inside each arm: the callsite
                 # scheduler anchors a planned call on numerical regions,

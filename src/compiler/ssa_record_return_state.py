@@ -1354,9 +1354,136 @@ def scalar_return_field_versions(function, source_graph, functions=None):
     complete mutable-record lowering. In particular, it does not select
     dictionary handles, infer call aliases, or synthesize loop-header state.
     """
+    from .concordance_declarations import (
+        INTERVENING_CALL_NOT_READONLY,
+        INTERVENING_STORE,
+        NO_RETURN_FIELD_RECEIPTS,
+        PREDECESSOR_BLOCK_EMPTY,
+        PREDECESSOR_NOT_A_RETURN_EDGE,
+        RECORD_RETURN_FIELD_SELECTION,
+        RECORD_RETURN_VERSION,
+        RETURN_SITE_FIELD_STATE,
+        SITES_DISAGREE_ON_VERSION,
+        SITE_WITHOUT_FIELD_STATE,
+        SSA_FIELD_VERSION,
+        VERSION_DOES_NOT_DOMINATE_RETURN,
+        VERSION_IS_FORMAL_SHAPED_OR_MISTYPED,
+        VERSION_NOT_CONST_OR_CARRIED_PHI,
+        VERSION_NOT_UNIQUELY_DEFINED,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Ref, Unresolved, Unsourced, current_identity_book,
+    )
+
+    # Every exit of the lookup is a statement on ``record_return_field_selection``
+    # at row (function scope, return-merge Phi cell, field, position,
+    # predecessor): the selected ``ssa_field_version`` cell on success, else
+    # ``Unresolved(reason, read=<the cells that were read>)``.  A row can be
+    # keyed only when the caller names the Phi's identity cell and the graph
+    # carries its reduction scope; without those the lookup decides as it
+    # always did and the book records nothing (plan 70, section 6).
+    scope = source_graph.graph.get('lexical_read_scope')
+    scope = None if scope is None else tuple(scope)
+
+    def return_site_cell(span):
+        """The return construct's site cell for the receipt keyed by ``span``."""
+        if span is None or not hasattr(source_graph, 'nodes'):
+            return None
+        for _node_id, data in source_graph.nodes(data=True):
+            cell = (data.get('attributes') or {}).get('return_site_cell')
+            if cell is None:
+                continue
+            for candidate in (data.get('expr_obj'), getattr(data.get('expr_obj'), 'value', None)):
+                if candidate is None or getattr(candidate, 'lineno', None) is None:
+                    continue
+                candidate_span = (
+                    int(candidate.lineno), int(getattr(candidate, 'col_offset', -1)),
+                    int(getattr(candidate, 'end_lineno', -1)),
+                    int(getattr(candidate, 'end_col_offset', -1)),
+                )
+                if candidate_span == tuple(span):
+                    return cell
+        return None
+
+    def site_state_cells(sites, receiver, field):
+        """The ``return_site_field_state`` cells for ``(receiver, field)`` at
+        each site, in site order; a site with no such row contributes none."""
+        if scope is None:
+            return ()
+        book = current_identity_book()
+        cells = []
+        for span in sites:
+            site = return_site_cell(span)
+            if site is None:
+                continue
+            ref = book.latest_ref(
+                RETURN_SITE_FIELD_STATE, (scope, site, int(receiver), str(field)),
+            )
+            if ref is not None:
+                cells.append(ref)
+        return tuple(cells)
+
+    def version_cells(state_cells):
+        """The ``ssa_field_version`` cell posted for each return-site state's
+        field-state cell (the site row's fact), when it exists."""
+        if scope is None:
+            return ()
+        book = current_identity_book()
+        cells = []
+        for state_cell in state_cells:
+            stored = book.pages.get(state_cell.page.name)
+            field_state = None if stored is None else stored.latest(state_cell.row)
+            if not isinstance(field_state, Ref):
+                continue
+            ref = book.latest_ref(SSA_FIELD_VERSION, (scope, field_state))
+            if ref is not None:
+                cells.append(ref)
+        return tuple(cells)
+
+    def decide(reason, value, read, *, field, predecessor, phi_cell, position):
+        """Return ``value`` after posting the decision that produced it.
+
+        ``reason`` None is success: ``read`` is (site state cell, version
+        cell) and the fact is that version cell.  Otherwise the fact is
+        ``Unresolved(reason, read)`` derived from what was read, or
+        ``Unsourced(reason)`` when nothing on the book was read.
+        """
+        if scope is None or not isinstance(phi_cell, Ref) or position is None:
+            return value
+        row = (scope, phi_cell, str(field), int(position), str(predecessor))
+        read = tuple(cell for cell in read if isinstance(cell, Ref))
+        if reason is None:
+            versions = [cell for cell in read if cell.page == SSA_FIELD_VERSION]
+            if len(read) < 2 or not versions:
+                # The lookup found a version through the graph's receipt view
+                # but the book holds no site row or version cell to derive
+                # it from; nothing can be posted as a sourced selection.
+                return value
+            fact = versions[-1]
+        else:
+            fact = Unresolved(reason, read=read)
+        book = current_identity_book()
+        stored = book.pages.get(RECORD_RETURN_FIELD_SELECTION.name)
+        if stored is not None and stored.latest(row) == fact:
+            return value
+        book.post(
+            RECORD_RETURN_FIELD_SELECTION, row, fact,
+            stage=RECORD_RETURN_VERSION,
+            provenance=Derived(read) if read else Unsourced(reason),
+            mode=Mode.REVISE,
+        )
+        return value
+
     receipts = source_graph.graph.get('return_record_field_states') or {}
     if not receipts:
-        return lambda receiver, field, predecessor, fallback, *, alias_receivers=(): fallback
+        def no_receipts(receiver, field, predecessor, fallback, *,
+                        alias_receivers=(), phi_cell=None, position=None):
+            return decide(
+                NO_RETURN_FIELD_RECEIPTS, fallback, (),
+                field=field, predecessor=predecessor,
+                phi_cell=phi_cell, position=position,
+            )
+        return no_receipts
     function.metadata['record_return_state_receipts'] = tuple(
         (span, tuple((source_graph.graph.get('return_slot_values') or {}).get(span, ())), tuple(states))
         for span, states in receipts.items()
@@ -1440,13 +1567,20 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         return all(boolean_phi_tree(argument, visiting | {value_id})
                    for argument in instruction.args)
 
-    def lookup(receiver, field, predecessor, fallback, *, alias_receivers=()):
+    def lookup(receiver, field, predecessor, fallback, *, alias_receivers=(),
+               phi_cell=None, position=None):
+        def exit_with(reason, read=()):
+            return decide(
+                reason, fallback, read, field=field, predecessor=predecessor,
+                phi_cell=phi_cell, position=position,
+            )
+
         block = function.blocks.get(predecessor)
         if block is None or not block.instrs:
-            return fallback
+            return exit_with(PREDECESSOR_BLOCK_EMPTY)
         slots = (block.instrs[-1].attributes or {}).get('return_source_value_ids')
         if slots is None:
-            return fallback
+            return exit_with(PREDECESSOR_NOT_A_RETURN_EDGE)
         sites = [span for span, values in
                  (source_graph.graph.get('return_slot_values') or {}).items()
                  if tuple(values) == tuple(slots)]
@@ -1455,24 +1589,26 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         states = [dict(((int(r), str(f)), int(v)) for r, f, v in receipts.get(span, ()))
                   for span in sites]
         key = (int(receiver), str(field))
+        state_cells = site_state_cells(sites, receiver, field)
         if not states or any(key not in state for state in states):
-            return fallback
+            return exit_with(SITE_WITHOUT_FIELD_STATE, state_cells)
         candidates = {state[key] for state in states}
         if len(candidates) != 1:
-            return fallback
+            return exit_with(SITES_DISAGREE_ON_VERSION, state_cells)
+        read = (*state_cells, *version_cells(state_cells))
         candidates = definitions.get(next(iter(candidates)), ())
         if len(candidates) != 1:
-            return fallback
+            return exit_with(VERSION_NOT_UNIQUELY_DEFINED, read)
         owner, value = candidates[0]
         definition = instructions[int(value.id)]
         if not (definition.op == 'Const' or (
                 definition.op == 'Phi'
                 and (definition.attributes or {}).get('binding') == 'conditional_carried')):
-            return fallback
+            return exit_with(VERSION_NOT_CONST_OR_CARRIED_PHI, read)
         if (int(value.id) in formal_ids or value.shape
                 or (value.dtype != fallback.dtype and not (
                     fallback.dtype == 'bool' and boolean_phi_tree(value, set())))):
-            return fallback
+            return exit_with(VERSION_IS_FORMAL_SHAPED_OR_MISTYPED, read)
         current = predecessor
         while current in dominators:
             if current == owner:
@@ -1520,17 +1656,22 @@ def scalar_return_field_versions(function, source_graph, functions=None):
                                            for index, arg in enumerate(operation.args)
                                            if int(arg.id) in aliases | record_aliases or
                                            (arg.accounting or {}).get('ssa_storage_alias') in aliases | record_aliases)):
-                                return fallback
+                                return exit_with(INTERVENING_CALL_NOT_READONLY, read)
                         store_target = (operation.args[1:] if operation.op == 'Store'
                                         and len(operation.args) == 2 else operation.args)
                         if writes_slot or (('store' in operation.op.lower() or 'atomic' in operation.op.lower())
                                            and any(int(arg.id) in aliases | record_aliases for arg in store_target)):
-                            return fallback
-                return value
+                            return exit_with(INTERVENING_STORE, read)
+                # Success: the selection IS the version cell, derived from
+                # the return-site state that named it and that version cell.
+                return decide(
+                    None, value, read, field=field, predecessor=predecessor,
+                    phi_cell=phi_cell, position=position,
+                )
             parent = dominators[current]
             if parent == current:
                 break
             current = parent
-        return fallback
+        return exit_with(VERSION_DOES_NOT_DOMINATE_RETURN, read)
 
     return lookup

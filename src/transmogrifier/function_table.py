@@ -169,8 +169,19 @@ class FunctionTable:
         parameter_contracts: (
             Iterable[ParameterContract | Mapping[str, Any]] | None
         ) = None,
+        source: Any = None,
     ) -> FunctionReference:
-        """Declare a function or return its existing stable reference."""
+        """Declare a function or return its existing stable reference.
+
+        A new declaration is recorded on the identity book as one
+        ``function_address`` row ``(qualified,) -> address`` (plan 60,
+        section 3.8): DERIVED from ``source`` -- the cell of the definition's
+        ``source_span`` -- when the caller names one; otherwise Unsourced
+        under the latch, ``EXTERNAL_DECLARATION`` for an external handoff
+        and ``HELPER_CALLER_UNROUTED`` for a caller that has not yet routed
+        its provenance.  Addresses stay the dense counter: they are dict
+        keys and ``function_ref`` ints throughout, not minted ids.
+        """
 
         local_name = str(name)
         qualified = str(qualified_name or local_name)
@@ -195,6 +206,7 @@ class FunctionTable:
                 ),
             )
             self._qualified[qualified] = reference
+            self._post_function_address(qualified, reference, source, external)
         else:
             entry = self._entries[reference]
             entry.metadata.update(dict(metadata or {}))
@@ -206,6 +218,29 @@ class FunctionTable:
                 )
         self._bindings[local_name] = reference
         return reference
+
+    @staticmethod
+    def _post_function_address(
+        qualified: str, reference: FunctionReference, source: Any, external: bool,
+    ) -> None:
+        from ..compiler.concordance_declarations import (
+            EXTERNAL_DECLARATION, FUNCTION_ADDRESS, FUNCTION_TABLE,
+            HELPER_CALLER_UNROUTED,
+        )
+        from ..compiler.identity_concordance import (
+            Derived, Mode, Ref, Unsourced, current_identity_book,
+        )
+
+        if isinstance(source, Ref):
+            provenance = Derived((source,))
+        elif external:
+            provenance = Unsourced(EXTERNAL_DECLARATION)
+        else:
+            provenance = Unsourced(HELPER_CALLER_UNROUTED)
+        current_identity_book().post(
+            FUNCTION_ADDRESS, (qualified,), int(reference.address),
+            stage=FUNCTION_TABLE, provenance=provenance, mode=Mode.CONCORD,
+        )
 
     def set_parameter_contracts(
         self,
