@@ -1203,9 +1203,8 @@ def dt_system_contract(entry, columns, batch, participants=1):
         "storage": "span", "dtype": "float64", "rank": 1,
         "shape": [int(length)], "mutable": True,
     }
-    scalar = lambda dtype, python_type: {  # noqa: E731
+    scalar = lambda dtype: {  # noqa: E731
         "storage": "scalar", "dtype": dtype, "rank": 0, "mutable": False,
-        "python_type": python_type,
     }
     records["PieceState"] = {
         "identity": "llvm_dt_system.PieceState",
@@ -1214,8 +1213,8 @@ def dt_system_contract(entry, columns, batch, participants=1):
             "telemetry": span(len(TELEMETRY_FIELDS)),
             # The system's declared rollback choice rides on the state, so the
             # lowered round reads the same declared field the eager one does.
-            "rollback": scalar("bool", "builtins.bool"),
-            "rollback_threshold_multiplier": scalar("float64", "builtins.float"),
+            "rollback": scalar("bool"),
+            "rollback_threshold_multiplier": scalar("float64"),
             **{name: span(participants) for name in (*PUBLICATION_FIELDS, *COURANT_FIELDS)},
             **{name: span(participants * len(DT_CHANNEL_NAMES)) for name in
                ("pub_values", "pub_present", "pub_limits", "pub_limits_present")},
