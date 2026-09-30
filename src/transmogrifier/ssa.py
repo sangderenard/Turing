@@ -367,6 +367,31 @@ def _mint_table_owner(book: Any, label: Any) -> tuple[str, int]:
     return book.mint_scope(label or "table")
 
 
+def _table_post(
+    book: Any, page_name: str, row: tuple, fact: Any, *,
+    sources: tuple, stage: Any, mode: Any = None,
+) -> Any:
+    """Write one table cell through ``IdentityBook.post`` (plan 90, E8.2).
+
+    The sourced path of every table writer: ``fact`` lands on the declared
+    page named ``page_name`` DERIVED from ``sources`` (the caller's cells),
+    under ``stage`` (``TABLE_REGISTRATION`` when the caller names none), in
+    ``mode`` (REVISE when the caller names none).  Returns the cell's Ref.
+    A caller that passes no sources never reaches this; its raw write is
+    tagged by the latch as it is today.
+    """
+
+    from ..compiler.identity_concordance import Derived, Mode
+    from ..compiler.concordance_declarations import TABLE_REGISTRATION
+
+    return book.post(
+        book.registry.page(page_name), row, fact,
+        stage=TABLE_REGISTRATION if stage is None else stage,
+        provenance=Derived(tuple(sources)),
+        mode=Mode.REVISE if mode is None else mode,
+    )
+
+
 def new_layout_tables() -> "tuple[SSAStructTable, SSAUnionTable]":
     """A struct table and a union table sharing one book scope.
 
@@ -391,7 +416,14 @@ class _BookRows(__import__("collections.abc").abc.MutableMapping):
 
     Row ``(owner, id)`` holds the descriptor; every write is a revision and a
     removal is a ``None`` revision, so the page is the storage and its whole
-    history.  ``on_change(old, new)`` keeps the member page in step.
+    history.  ``on_change(old, new, cell, stage)`` keeps the member page in
+    step; ``cell`` is the descriptor cell just posted when the write named
+    its sources (so the member rows derive from it), else ``None``.
+
+    ``assign`` / ``remove`` take ``sources`` (the caller's cells) and post
+    DERIVED through ``IdentityBook.post``; the mapping syntax cannot carry
+    sources, so ``rows[id] = descriptor`` / ``del rows[id]`` stay raw
+    writes, tagged by the latch, until every caller passes cells.
     """
 
     def __init__(self, book: Any, page: str, owner: Any, on_change: Callable):
@@ -412,19 +444,45 @@ class _BookRows(__import__("collections.abc").abc.MutableMapping):
             raise KeyError(key)
         return fact
 
-    def __setitem__(self, key: Any, value: Any) -> None:
+    def _write(
+        self, key: Any, value: Any, *, sources: tuple, stage: Any,
+    ) -> Any:
         row = (self._owner, int(key))
         old = self._page.latest(row)
-        self._page.revise(row, value)
-        self._on_change(old, value)
+        cell = None
+        if sources:
+            cell = _table_post(
+                self._book, self._page.name, row, value,
+                sources=sources, stage=stage,
+            )
+        else:
+            self._page.revise(row, value)
+        self._on_change(old, value, cell, stage)
+        return cell
+
+    def assign(
+        self, key: Any, value: Any, *, sources: tuple = (), stage: Any = None,
+    ) -> Any:
+        """Set ``key``'s descriptor; with ``sources`` the revision is posted
+        DERIVED from them and its Ref is returned (``None`` for a raw write)."""
+
+        return self._write(key, value, sources=tuple(sources), stage=stage)
+
+    def remove(
+        self, key: Any, *, sources: tuple = (), stage: Any = None,
+    ) -> Any:
+        """Remove ``key`` (a ``None`` revision); ``sources`` name the cell
+        that superseded it."""
+
+        if self._page.latest((self._owner, int(key))) is None:
+            raise KeyError(key)
+        return self._write(key, None, sources=tuple(sources), stage=stage)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self.assign(key, value)
 
     def __delitem__(self, key: Any) -> None:
-        row = (self._owner, int(key))
-        old = self._page.latest(row)
-        if old is None:
-            raise KeyError(key)
-        self._page.revise(row, None)
-        self._on_change(old, None)
+        self.remove(key)
 
     def __iter__(self):
         for row in self._page.scope_rows(self._owner):
@@ -440,12 +498,15 @@ class _BookRows(__import__("collections.abc").abc.MutableMapping):
 
 def _revise_member_claims(
     page: Any, owner: Any, old: dict[int, set], new: dict[int, set],
+    cell: Any = None, stage: Any = None,
 ) -> None:
     """Move one descriptor's member claims from ``old`` to ``new``.
 
     Row ``(owner, member id)`` holds every claim live descriptors make on
     that value; a value can be a member of several records (record SSA
-    versions share unchanged field storage).
+    versions share unchanged field storage).  When ``cell`` names the
+    descriptor cell whose revision changed the claims, each member row is
+    posted DERIVED from it; otherwise the write stays raw.
     """
 
     for member in set(old) | set(new):
@@ -455,7 +516,13 @@ def _revise_member_claims(
             continue
         row = (owner, int(member))
         claims = (set(page.latest(row) or ()) - before) | after
-        page.revise(row, tuple(sorted(claims, key=repr)))
+        fact = tuple(sorted(claims, key=repr))
+        if cell is not None:
+            _table_post(
+                page.book, page.name, row, fact, sources=(cell,), stage=stage,
+            )
+        else:
+            page.revise(row, fact)
 
 
 def record_member_claims(
@@ -515,9 +582,10 @@ class SSARecordTable:
         member_page = self.book.page("record_member")
         self.records = _BookRows(
             self.book, "record_descriptor", self.owner,
-            lambda old, new: _revise_member_claims(
+            lambda old, new, cell=None, stage=None: _revise_member_claims(
                 member_page, self.owner,
                 record_member_claims(old), record_member_claims(new),
+                cell, stage,
             ),
         )
         for record_id, descriptor in dict(records or {}).items():
@@ -553,8 +621,26 @@ class SSARecordTable:
     def __setstate__(self, state: dict) -> None:
         self.__init__(dict(self.records), owner=state.get("owner"))
 
-    def register(self, descriptor: SSARecordDescriptor) -> SSARecordDescriptor:
+    def register(
+        self, descriptor: SSARecordDescriptor, *,
+        sources: tuple = (), stage: Any = None,
+    ) -> SSARecordDescriptor:
+        """Publish ``descriptor`` under its record id.
+
+        ``sources`` are the caller's cells (the field value identity cells,
+        the abi field declaration cells, a callee's descriptor cell...).
+        With sources the descriptor revision is posted DERIVED from them;
+        a complementary-view merge first posts one
+        ``record_descriptor_merge`` row DERIVED from the incumbent
+        descriptor cell and ``sources``, and the merged descriptor derives
+        from that row (the supersession edge, as ``_SSALayoutTable`` records
+        it for layouts).  Without sources the write is raw, as today.
+        """
+
+        sources = tuple(sources)
         existing = self.records.get(descriptor.record_id)
+        incoming = descriptor
+        merged = False
         if existing is not None and existing != descriptor:
             compatible_identity = existing.identity == descriptor.identity
             existing_fields = {field.name: field for field in existing.fields}
@@ -619,6 +705,7 @@ class SSARecordTable:
                     ),
                     existing.instance_pool or descriptor.instance_pool,
                 )
+                merged = True
             else:
                 overlap_diagnostics = {
                     name: {
@@ -640,7 +727,46 @@ class SSARecordTable:
                     f"existing_instance_pool={existing.instance_pool!r} "
                     f"incoming_instance_pool={descriptor.instance_pool!r}"
                 )
-        self.records[descriptor.record_id] = descriptor
+        if not sources:
+            self.records[descriptor.record_id] = descriptor
+            return descriptor
+        record_id = int(descriptor.record_id)
+        row = (self.owner, record_id)
+        if existing is not None and existing == descriptor and not merged:
+            # The same statement again: not a revision (the api admits a
+            # REVISE only for a changed or different source), so no cell.
+            return existing
+        cells = sources
+        if merged:
+            from ..compiler.identity_concordance import Mode
+            from ..compiler.concordance_declarations import RecordMergeFact
+
+            incumbent_cell = self.book.latest_ref(
+                self.book.registry.page("record_descriptor"), row,
+            )
+            incoming_fields = {field.name: field for field in incoming.fields}
+            widened = tuple(
+                resident.name for resident in existing.fields
+                if resident.name in incoming_fields
+                and not bool(resident.writable)
+                and bool(incoming_fields[resident.name].writable)
+            )
+            merge_cell = _table_post(
+                self.book, "record_descriptor_merge",
+                (self.owner, record_id, len(self.book.page("record_descriptor").history(row))),
+                RecordMergeFact(
+                    incumbent=existing, incoming=incoming, merged=descriptor,
+                    widened_fields=widened,
+                    adopted_pool=(
+                        existing.instance_pool is None
+                        and incoming.instance_pool is not None
+                    ),
+                ),
+                sources=(incumbent_cell, *sources), stage=stage,
+                mode=Mode.CONCORD,
+            )
+            cells = (merge_cell,)
+        self.records.assign(record_id, descriptor, sources=cells, stage=stage)
         return descriptor
 
 
@@ -1034,8 +1160,9 @@ class _SSALayoutTable:
         claims_of = self._member_claims
         self._rows = _BookRows(
             self.book, self.descriptor_page, self.owner,
-            lambda old, new: _revise_member_claims(
+            lambda old, new, cell=None, stage=None: _revise_member_claims(
                 member_page, self.owner, claims_of(old), claims_of(new),
+                cell, stage,
             ),
         )
         for row_id, descriptor in dict(rows or {}).items():
@@ -1658,9 +1785,10 @@ class SSASequenceTable:
         member_page = self.book.page("sequence_member")
         self.sequences = _BookRows(
             self.book, "sequence_descriptor", self.owner,
-            lambda old, new: _revise_member_claims(
+            lambda old, new, cell=None, stage=None: _revise_member_claims(
                 member_page, self.owner,
                 sequence_member_roles(old), sequence_member_roles(new),
+                cell, stage,
             ),
         )
         for sequence_id, descriptor in dict(sequences or {}).items():
@@ -1685,20 +1813,45 @@ class SSASequenceTable:
             )
         ]
 
-    def register(self, descriptor: SSASequenceDescriptor) -> SSASequenceDescriptor:
+    def register(
+        self, descriptor: SSASequenceDescriptor, *,
+        sources: tuple = (), stage: Any = None,
+    ) -> SSASequenceDescriptor:
+        """Publish ``descriptor``; ``sources`` are the proposing site's cells.
+
+        With sources the column claim and the descriptor revision are posted
+        DERIVED from them (a claim re-offered from the same unchanged cells
+        is recorded ``Unsourced(SEQUENCE_CLAIM_UNCHANGED)``, since every
+        attempt is kept).  Without sources both writes are raw, as today.
+        """
+
+        sources = tuple(sources)
         sequence_id = int(descriptor.sequence_id)
         existing = self.sequences.get(sequence_id)
         # Every attempt, not just the winner: a conflict report that shows
         # only incumbent-vs-newcomer cannot distinguish two sites that
         # stably disagree from a sequence of sites that flip a value back
         # and forth, and those need opposite fixes.
-        self.book.page("sequence_column_claims").revise(
-            (self.owner, sequence_id, "column_dtypes"),
-            (
-                tuple(descriptor.column_dtypes),
-                tuple(descriptor.key_columns),
-            ),
+        claim_row = (self.owner, sequence_id, "column_dtypes")
+        claim = (
+            tuple(descriptor.column_dtypes),
+            tuple(descriptor.key_columns),
         )
+        if sources:
+            from ..compiler.identity_concordance import _post_or_unsourced
+            from ..compiler.concordance_declarations import (
+                SEQUENCE_CLAIM_UNCHANGED,
+                SEQUENCE_COLUMN_CLAIMS,
+                TABLE_REGISTRATION,
+            )
+
+            _post_or_unsourced(
+                self.book, SEQUENCE_COLUMN_CLAIMS, claim_row, claim,
+                TABLE_REGISTRATION if stage is None else stage,
+                sources, SEQUENCE_CLAIM_UNCHANGED,
+            )
+        else:
+            self.book.page("sequence_column_claims").revise(claim_row, claim)
         if existing is not None and existing != descriptor:
             # Name the id the way a reader can act on -- ``minted#1000013548``
             # rather than 2305843010213707500 -- and say WHICH fields the two
@@ -1722,7 +1875,14 @@ class SSASequenceTable:
                 + (f" [{detail}]" if detail else "")
                 + f" dtypes offered in order: {offered}"
             )
-        self.sequences[sequence_id] = descriptor
+        if not sources:
+            self.sequences[sequence_id] = descriptor
+        elif existing is None:
+            self.sequences.assign(
+                sequence_id, descriptor, sources=sources, stage=stage,
+            )
+        # ``existing == descriptor`` with sources: the same statement again
+        # is not a revision; the claim above recorded the attempt.
         return descriptor
 
     def by_id(self, sequence_id: int) -> SSASequenceDescriptor | None:
@@ -1851,22 +2011,30 @@ class _BookCallList(__import__("collections.abc").abc.MutableSequence):
     def _records(self) -> tuple:
         return tuple(self._page.latest(self._row) or ())
 
-    def _commit(self, records: Any) -> None:
+    def _commit(
+        self, records: Any, *, sources: tuple = (), stage: Any = None,
+    ) -> Any:
+        """Revise the row to ``records``; with ``sources`` (the cells the
+        changed record was built from) the revision is posted DERIVED from
+        them and its Ref returned, else the write is raw, as today."""
+
+        if sources:
+            return _table_post(
+                self._page.book, self._page.name, self._row, tuple(records),
+                sources=tuple(sources), stage=stage,
+            )
         self._page.revise(self._row, tuple(records))
+        return None
 
     def __getitem__(self, index: Any) -> Any:
         records = self._records()
         return list(records[index]) if isinstance(index, slice) else records[index]
 
     def __setitem__(self, index: Any, value: Any) -> None:
-        records = list(self._records())
-        records[index] = value
-        self._commit(records)
+        self.replace(index, value)
 
     def __delitem__(self, index: Any) -> None:
-        records = list(self._records())
-        del records[index]
-        self._commit(records)
+        self.remove_at(index)
 
     def __len__(self) -> int:
         return len(self._records())
@@ -1875,6 +2043,29 @@ class _BookCallList(__import__("collections.abc").abc.MutableSequence):
         records = list(self._records())
         records.insert(index, value)
         self._commit(records)
+
+    # -- sourced mutators (plan 90, E8.3): the list syntax cannot carry
+    # the cells a record was built from; these can.
+    def append(
+        self, value: Any, *, sources: tuple = (), stage: Any = None,
+    ) -> Any:
+        records = list(self._records())
+        records.append(value)
+        return self._commit(records, sources=sources, stage=stage)
+
+    def replace(
+        self, index: Any, value: Any, *, sources: tuple = (), stage: Any = None,
+    ) -> Any:
+        records = list(self._records())
+        records[index] = value
+        return self._commit(records, sources=sources, stage=stage)
+
+    def remove_at(
+        self, index: Any, *, sources: tuple = (), stage: Any = None,
+    ) -> Any:
+        records = list(self._records())
+        del records[index]
+        return self._commit(records, sources=sources, stage=stage)
 
     def sort(self, *, key: Any = None, reverse: bool = False) -> None:
         self._commit(sorted(self._records(), key=key, reverse=reverse))
@@ -1930,17 +2121,48 @@ class SSACallTable(__import__("collections.abc").abc.MutableMapping):
             raise KeyError(caller)
         return _BookCallList(self._page, row) if self.mutable else records
 
-    def __setitem__(self, caller: Any, records: Any) -> None:
+    def assign(
+        self, caller: Any, records: Any, *,
+        sources: tuple = (), stage: Any = None,
+    ) -> Any:
+        """Set ``caller``'s records; with ``sources`` (the cells the changed
+        records were built from) the revision is posted DERIVED from them
+        and its Ref returned, else the write is raw, as today."""
+
         row = (self.owner, str(caller))
         records = tuple(records)
-        if self._page.latest(row) != records:
-            self._page.revise(row, records)
+        if self._page.latest(row) == records:
+            return None
+        if sources:
+            return _table_post(
+                self.book, self._page.name, row, records,
+                sources=tuple(sources), stage=stage,
+            )
+        self._page.revise(row, records)
+        return None
 
-    def __delitem__(self, caller: Any) -> None:
+    def remove(
+        self, caller: Any, *, sources: tuple = (), stage: Any = None,
+    ) -> Any:
+        """Remove ``caller`` (a ``None`` revision); ``sources`` name what
+        superseded its records."""
+
         row = (self.owner, str(caller))
         if self._page.latest(row) is None:
             raise KeyError(caller)
+        if sources:
+            return _table_post(
+                self.book, self._page.name, row, None,
+                sources=tuple(sources), stage=stage,
+            )
         self._page.revise(row, None)
+        return None
+
+    def __setitem__(self, caller: Any, records: Any) -> None:
+        self.assign(caller, records)
+
+    def __delitem__(self, caller: Any) -> None:
+        self.remove(caller)
 
     def __iter__(self):
         for row in self._page.scope_rows(self.owner):

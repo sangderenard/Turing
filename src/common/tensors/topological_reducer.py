@@ -2419,15 +2419,23 @@ def fork_read_scope(graph: Any, cause: str) -> None:
         return
     source = tuple(source)
     book = current_identity_book()
-    forked = book.mint_scope(f"{source[0]}|fork")
+    forked = book.mint_scope(f"{source[0]}|fork", _READ_SCOPE_FORK)
     # A forked row on a declared page is DERIVED from the cell it copies
     # (stage READ_SCOPE_FORK, same fact); a page the registry does not
     # declare can only be copied through the raw primitive, tagged under
     # the latch until it is declared.
     registered = book.registry.pages
     private = book.registry.private_pages
+    # Every callee copy is its own variant (design section 7.1): the
+    # planner's specialization rows -- the literal / default fold and the
+    # tensor descriptors proven for the SOURCE graph's callers -- are not
+    # inherited.  The copy's writers post its own rows under the forked
+    # scope from ITS callsite; a copy never carries a literal proven for
+    # another caller.  The forked scope is therefore the copy's own
+    # specialization scope.
+    per_copy_pages = {"planner_specialization", "planner_tensor_descriptor"}
     for page in tuple(book.pages.values()):
-        if page.name in private:
+        if page.name in private or page.name in per_copy_pages:
             continue
         declared = registered.get(page.name)
         for row in page.scope_rows(source):
@@ -2437,7 +2445,15 @@ def fork_read_scope(graph: Any, cause: str) -> None:
             fact = page.latest(row)
             if fact is None:
                 continue
-            if declared is None:
+            # A declared page whose writer still writes raw facts of another
+            # shape (``identity_transition`` tuples before ``_set_operands``
+            # posts ``OperandTransition``) is copied through the raw
+            # primitive too: ``post`` would refuse the fact, and the row
+            # belongs to the writer's migration, not to the fork.
+            if declared is None or not (
+                isinstance(fact, _Unresolved)
+                or isinstance(fact, declared.fact_type)
+            ):
                 page.set((forked, *row[1:]), 0, fact)
                 continue
             book.post(

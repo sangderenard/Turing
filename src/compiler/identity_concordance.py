@@ -3324,9 +3324,9 @@ class PageMapping(MutableMapping):
         return (dict, (dict(self),))
 
 
-def mint_scope(label: Any) -> tuple[str, int]:
+def mint_scope(label: Any, stage: Any = None) -> tuple[str, int]:
     """A fresh scope on the active compile's book (see ``IdentityBook``)."""
-    return current_identity_book().mint_scope(label)
+    return current_identity_book().mint_scope(label, stage)
 
 
 class IdentityBook:
@@ -3626,17 +3626,30 @@ class IdentityBook:
             for row in unsourced.rows()
         )
 
-    def mint_scope(self, label: Any) -> tuple[str, int]:
+    def mint_scope(
+        self, label: Any, stage: Stage | None = None,
+    ) -> tuple[str, int]:
         """A fresh scope, numbered by this book in causal order.
 
         Page ``scope_registry`` row ``(label, serial)`` records every scope
         minted under ``label``; the next serial is how many exist.  The
         numbering is the compile's own, never a process-wide counter.
+
+        The row is a NOVEL root (``MINT_SCOPE``, no operands; plan 80 N5):
+        the scope IS the row, so it mints no id.  ``stage`` is the caller's
+        stage; a caller not yet migrated leaves it and the post is recorded
+        under ``RAW_STAGE``.
         """
-        page = self.page("scope_registry")
+        from .concordance_declarations import MINT_SCOPE, SCOPE_REGISTRY
+
+        page = self.page(SCOPE_REGISTRY)
         label = str(label)
         scope = (label, page.scope_row_count(label))
-        page.concord(scope, True)
+        self.post(
+            SCOPE_REGISTRY, scope, True,
+            stage=RAW_STAGE if stage is None else stage,
+            provenance=Novel(MINT_SCOPE, ()), mode=Mode.CONCORD,
+        )
         return scope
 
     def latest_by_page(self, row: Any) -> dict[str, Any]:

@@ -566,9 +566,17 @@ def plan_region_to_ssa_instrs(
 
 @dataclass(frozen=True)
 class HierarchyValueTable:
-    """Collision-free IDs for values whose local IDs live in many shells."""
+    """Collision-free IDs for values whose local IDs live in many shells.
+
+    ``scope`` is the hierarchy scope ``assign_hierarchy_ids`` minted for
+    this table: its ``hierarchy_value`` rows ``(scope, closure, local)`` on
+    the book hold the same correlations, each DERIVED from the local
+    value's identity cell (plan 80, A2.5).  A scope tuple, never a Ref, so
+    the table stays picklable as before.
+    """
 
     correlations: tuple[tuple[int, int, int], ...]
+    scope: tuple | None = None
 
     @cached_property
     def _global_ids(self) -> dict[tuple[int, int], int]:
@@ -670,6 +678,8 @@ def reduce_hierarchy_identities(
 def assign_hierarchy_ids(
     root: PlanClosure,
     previous: HierarchyValueTable | None = None,
+    *,
+    shell: Any = None,
 ) -> tuple[PlanClosure, HierarchyValueTable]:
     """Assign dense IDs from deterministic scoped-identity token ordering.
 
@@ -678,6 +688,16 @@ def assign_hierarchy_ids(
     used by every later compiler stage.  ``previous`` is accepted for API
     compatibility but never influences the result: unchanged plan structure
     always produces the same dense IDs without a cache or dispenser.
+
+    ``shell`` is the deployment whose plan ``root`` is.  With it, the
+    correlation is put on the book (plan 80, A2.5): a hierarchy scope is
+    minted, one ``hierarchy_value`` row per ``(closure, local)`` key is
+    posted DERIVED from the local value's identity cell in its function's
+    graph (a region closure's values are its enclosing function's; a
+    ``PlanCall``'s callee is ``shell.callsite_function_shells[callsite]``),
+    and one ``hierarchy_global_value`` row per equivalence class DERIVED
+    from its members' cells.  Global ids are dense ``enumerate`` positions
+    consumed dense: DERIVED, not minted.
     """
 
     next_closure = 0
@@ -782,7 +802,81 @@ def assign_hierarchy_ids(
         root_key = find((closure_id, local_id))
         global_id = root_ids[root_key]
         correlations.append((closure_id, local_id, global_id))
-    return planned, HierarchyValueTable(tuple(correlations))
+    scope = None
+    if shell is not None:
+        scope = _post_hierarchy_values(planned, shell, correlations, find)
+    return planned, HierarchyValueTable(tuple(correlations), scope)
+
+
+def _closure_graphs(planned: PlanClosure, shell: Any) -> dict[int, Any]:
+    """closure id -> the process graph whose values that closure names."""
+
+    graphs: dict[int, Any] = {}
+
+    def visit(closure: PlanClosure, owner: Any) -> None:
+        graph = getattr(owner, "process_graph", None)
+        if graph is not None:
+            graphs[int(closure.closure_id)] = graph
+        children = getattr(owner, "callsite_function_shells", {}) or {}
+        for item in closure.items:
+            if isinstance(item, PlanCall):
+                child = children.get(int(item.callsite_id))
+                visit(item.callee, child if child is not None else owner)
+            elif isinstance(item, PlanClosure):
+                # A region closure's values are its function's.
+                visit(item, owner)
+
+    visit(planned, shell)
+    return graphs
+
+
+def _post_hierarchy_values(
+    planned: PlanClosure, shell: Any, correlations: list, find: Any,
+) -> tuple:
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        HIERARCHY_GLOBAL_VALUE, HIERARCHY_VALUE, PLANNER_HIERARCHY,
+        PLANNER_SCOPE, SYNTHESIZED_NO_SOURCE,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Unsourced, current_identity_book,
+    )
+
+    book = current_identity_book()
+    scope = book.mint_scope("hierarchy", PLANNER_SCOPE)
+    graphs = _closure_graphs(planned, shell)
+    members: dict[int, list] = {}
+    for closure_id, local_id, global_id in correlations:
+        row = (scope, int(closure_id), int(local_id))
+        graph = graphs.get(int(closure_id))
+        cell = None
+        if graph is not None and int(local_id) in graph.G:
+            try:
+                cell = node_identity_cell(graph, int(local_id))
+            except ValueError:
+                cell = None
+        if cell is None:
+            # A planner-minted value with no row of its own (a projection
+            # leaf, an expanded identity body): the correlation is recorded
+            # and the audit lists which writer still mints without a row
+            # (plan 80, R4).
+            ref = book.post(
+                HIERARCHY_VALUE, row, int(global_id), stage=PLANNER_HIERARCHY,
+                provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+            )
+        else:
+            ref = book.post(
+                HIERARCHY_VALUE, row, int(global_id), stage=PLANNER_HIERARCHY,
+                provenance=Derived((cell,)), mode=Mode.CONCORD,
+            )
+        members.setdefault(int(global_id), []).append(ref)
+    for global_id, refs in members.items():
+        book.post(
+            HIERARCHY_GLOBAL_VALUE, (scope, int(global_id)), tuple(refs),
+            stage=PLANNER_HIERARCHY, provenance=Derived(tuple(refs)),
+            mode=Mode.CONCORD,
+        )
+    return scope
 
 
 def render_plan_ascii(root: PlanClosure) -> str:

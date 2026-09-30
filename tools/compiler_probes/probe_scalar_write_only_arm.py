@@ -248,7 +248,14 @@ def main() -> int:
         return 1
 
     check("the program lowers", True)
-    step = next(iter(module.functions.values()))
+    # The retained ``if bool(m.hard_failure)`` guard owns one planned region
+    # (its predicate cast), which the module lists before the root function;
+    # select ``step`` by name, not by position.
+    step = next(
+        (function for name, function in module.functions.items()
+         if str(name) == f"{NAME}__step"),
+        next(iter(module.functions.values())),
+    )
     field_formal = formal_for_field(step, FIELD)
     predicate = predicate_formal(step)
     check(f"the {FIELD!r} field formal is declared", field_formal is not None)

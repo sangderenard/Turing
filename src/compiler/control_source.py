@@ -1420,15 +1420,48 @@ def place_loop_carried_region_producers(
         membership_page = current_identity_book().page("loop_region_membership")
 
     def owned_regions(block: ControlBlock) -> frozenset[int] | None:
-        """The regions the composer recorded for this loop, if any."""
+        """The regions the composer recorded for this loop, if any.
+
+        The fact is a tuple of ``deployment_region`` cells (their region
+        ordinal is ``ref.row[1]``) or, for a graph planned without a
+        planning scope, the ordinals themselves.  A loop with no row falls
+        back to the marker regions of its body; that fallback is recorded
+        first as ``Unresolved(REGION_OWNERSHIP_UNKNOWN)`` reading the loop's
+        cell (plan 80, A2.4 / E14).
+        """
 
         loop_node = getattr(block, "source_loop_node_id", None)
         if membership_page is None or loop_node is None:
             return None
-        owned = membership_page.latest(
-            (tuple(lexical_read_scope), int(loop_node))
+        from .identity_concordance import Unresolved as Unresolved_
+
+        row = (tuple(lexical_read_scope), int(loop_node))
+        owned = membership_page.latest(row)
+        if owned is None:
+            from .concordance_declarations import (
+                CANONICAL_VALUE, LOOP_COMPOSER, LOOP_REGION_MEMBERSHIP,
+                REGION_OWNERSHIP_UNKNOWN,
+            )
+            from .identity_concordance import (
+                Derived, Mode, Unresolved, current_identity_book,
+            )
+
+            book = current_identity_book()
+            loop_cell = book.latest_ref(CANONICAL_VALUE, row)
+            if loop_cell is not None:
+                book.post(
+                    LOOP_REGION_MEMBERSHIP, row,
+                    Unresolved(REGION_OWNERSHIP_UNKNOWN, read=(loop_cell,)),
+                    stage=LOOP_COMPOSER, provenance=Derived((loop_cell,)),
+                    mode=Mode.REVISE,
+                )
+            return None
+        if isinstance(owned, Unresolved_):
+            return None
+        return frozenset(
+            int(item) if isinstance(item, int) else int(item.row[1])
+            for item in owned
         )
-        return None if owned is None else frozenset(map(int, owned))
 
     def append_to_body(block: ControlBlock, additions: tuple[ControlBlock, ...]):
         body = block.body

@@ -1445,6 +1445,49 @@ def _synthetic_device_scalar_shell(graph: Any, predicate_id: int) -> Any:
     wrapper.add_edges_from(graph.edges(data=True))
     wrapper.graph["function_outputs"] = ("result",)
     wrapper.graph["identity_table"] = {"result": (call_id,)}
+    # The wrapper is a scratch graph: its three nodes get ``canonical_value``
+    # rows under a scratch scope, NOVEL from the predicate node's cell, and
+    # its one binding a ``name_binding`` row DERIVED from the call's row, so
+    # the verdict this wrapper produces is traceable if it ever fires
+    # (plan 80, A2.7).
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        BindingFact, CANONICAL_VALUE, NAME_BINDING, PLANNER_SCOPE,
+        PLANNER_STRUCTURAL_FOLD, SYNTHESIZED_NO_SOURCE,
+        SYNTHETIC_DEVICE_SCALAR_PREDICATE,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Novel, Unsourced, current_identity_book,
+    )
+
+    book = current_identity_book()
+    scope = book.mint_scope("synthetic_device_scalar", PLANNER_SCOPE)
+    wrapper.graph["lexical_read_scope"] = scope
+    wrapper.graph["canonical_value_ids"] = True
+    try:
+        predicate_cell = node_identity_cell(graph, int(predicate_id))
+    except ValueError:
+        predicate_cell = None
+    rows = {}
+    for synthetic_id in (input_id, item_id, call_id):
+        node = wrapper.nodes[synthetic_id]
+        fact = (str(node.get("type") or ""), str(node.get("op") or ""), "")
+        rows[synthetic_id] = book.post(
+            CANONICAL_VALUE, (scope, int(synthetic_id)), fact,
+            stage=PLANNER_STRUCTURAL_FOLD,
+            provenance=(
+                Novel(SYNTHETIC_DEVICE_SCALAR_PREDICATE, (predicate_cell,))
+                if predicate_cell is not None
+                else Unsourced(SYNTHESIZED_NO_SOURCE)
+            ),
+            mode=Mode.CONCORD,
+        )
+    book.post(
+        NAME_BINDING, (scope, "result", 0),
+        BindingFact(int(call_id), False, (None,) * 4, ""),
+        stage=PLANNER_STRUCTURAL_FOLD, provenance=Derived((rows[call_id],)),
+        mode=Mode.CONCORD,
+    )
     return SimpleNamespace(process_graph=SimpleNamespace(G=wrapper))
 
 
@@ -6895,12 +6938,32 @@ def _dispatch_metadata_node_classifier(graph: Any):
     Obtain a new classifier after changing the graph's structure.
     """
 
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        EXECUTABLE_NODE, ExecutionKind, MetadataRule, NodeExecution,
+        PLANNER_DISPATCH_CLASSIFICATION, PLANNER_SCOPE, SCALAR_PARAMETER,
+        SYNTHESIZED_NO_SOURCE,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Unsourced, current_identity_book,
+    )
+
     G = graph.G
     fingerprint = (_DISPATCH_METADATA_CACHE_SCHEMA,
                    G.number_of_nodes(), G.number_of_edges())
     cache = G.graph.get("_dispatch_metadata_cache")
+    book = current_identity_book()
     if cache is None or cache.get("__fingerprint__") != fingerprint:
+        # A new pass over a changed graph classifies again under a new
+        # planning scope (plan 80, A2.3): every verdict of this pass is a row
+        # ``executable_node (planning scope, node)`` and the cache below is
+        # that scope's read view.  Readers take the scope from
+        # ``graph.G.graph["planning_scope"]``, never join rows of two passes
+        # by node id (R2).
+        planning_scope = book.mint_scope("plan", PLANNER_SCOPE)
+        G.graph["planning_scope"] = planning_scope
         cache = {"__fingerprint__": fingerprint,
+                 "__scope__": planning_scope,
                  "__carried_initials__": frozenset(
                      int(initial)
                      for _, data in G.nodes(data=True)
@@ -6909,16 +6972,78 @@ def _dispatch_metadata_node_classifier(graph: Any):
                      ).values()
                  )}
         G.graph["_dispatch_metadata_cache"] = cache
+    planning_scope = cache["__scope__"]
+
+    def post_verdict(node_id: int, rule: MetadataRule) -> None:
+        kind = (
+            ExecutionKind.EXECUTABLE
+            if rule in _EXECUTABLE_RULES
+            else ExecutionKind.DISPATCH_METADATA
+        )
+        fact = NodeExecution(kind, rule)
+        row = (planning_scope, int(node_id))
+        try:
+            cell = node_identity_cell(graph, int(node_id))
+        except ValueError:
+            # A graph the reducer never scoped (a synthetic wrapper): the
+            # verdict is recorded, its source is not.
+            book.post(
+                EXECUTABLE_NODE, row, fact,
+                stage=PLANNER_DISPATCH_CLASSIFICATION,
+                provenance=Unsourced(SYNTHESIZED_NO_SOURCE),
+                mode=Mode.CONCORD,
+            )
+            return
+        cells = [cell]
+        if rule is MetadataRule.COORDINATOR_NODE_TYPE:
+            # An Input the reducer declared scalar: the rule read that row.
+            scalar = book.latest_ref(SCALAR_PARAMETER, (cell.row[0], int(node_id)))
+            if scalar is not None:
+                cells.append(scalar)
+        book.post(
+            EXECUTABLE_NODE, row, fact,
+            stage=PLANNER_DISPATCH_CLASSIFICATION,
+            provenance=Derived(tuple(cells)), mode=Mode.CONCORD,
+        )
+
     def classify(node_id: int) -> bool:
         key = int(node_id)
         cached = cache.get(key)
         if cached is not None:
             return cached
-        result = _is_dispatch_metadata_node_impl(graph, node_id)
+        rule = _dispatch_metadata_rule(graph, node_id)
+        result = rule not in _EXECUTABLE_RULES
+        post_verdict(key, rule)
         cache[key] = result
         return result
 
     return classify
+
+
+def _executable_rules():
+    from .concordance_declarations import MetadataRule
+
+    return frozenset((
+        MetadataRule.PRECISION_OPERATOR, MetadataRule.CATALOGUED_BUILTIN_CALL,
+        MetadataRule.GROUNDED_TENSOR_PROPERTY, MetadataRule.SCALAR_INTRINSIC,
+        MetadataRule.NUMERICAL_WORK,
+    ))
+
+
+class _ExecutableRules:
+    """The ``MetadataRule`` members whose verdict is EXECUTABLE (the
+    ``return False`` branches of the classifier and "no rule fired"),
+    resolved on first use so the declarations import stays lazy."""
+
+    _rules = None
+
+    def __contains__(self, rule: Any) -> bool:
+        if self._rules is None:
+            type(self)._rules = _executable_rules()
+        return rule in self._rules
+
+
+_EXECUTABLE_RULES = _ExecutableRules()
 
 
 def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
@@ -6927,6 +7052,18 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
 
 
 def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
+    return _dispatch_metadata_rule(graph, node_id) not in _EXECUTABLE_RULES
+
+
+def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
+    """Which rule classifies ``node_id``: a ``MetadataRule`` member, one per
+    ``return`` (or disjunct of the final ``return``) of the classifier, in
+    evaluation order.  ``NUMERICAL_WORK`` when no rule fires.  The verdict
+    is a function of the rule: ``_EXECUTABLE_RULES`` are EXECUTABLE, every
+    other member is DISPATCH_METADATA."""
+
+    from .concordance_declarations import MetadataRule as Rule
+
     data = graph.G.nodes[node_id]
     precision_operator = (data.get("attributes") or {}).get(
         "python_precision_operator"
@@ -6936,21 +7073,21 @@ def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
         # already made this a repository precision operator. It is numerical
         # region work, not a coordinator call. Its detached Attribute node is
         # separately marked ``*-selector`` and remains metadata.
-        return False
+        return Rule.PRECISION_OPERATOR
     if isinstance(precision_operator, str) and precision_operator.endswith(
         "-selector"
     ):
-        return True
+        return Rule.PRECISION_SELECTOR
     if (data.get("attributes") or {}).get("authored_call_result_projection"):
         # Specialization publishes typed leaves of a callee's tuple return.
         # Their tensor descriptors describe the payload, not a tensor gather
         # to dispatch. Keep the projection at its owning call/branch; a free
         # numerical region here escapes the loop that produces the return.
-        return True
+        return Rule.CALL_RESULT_PROJECTION
     if (data.get("attributes") or {}).get("bound_method_ref") is not None:
-        return True
+        return Rule.BOUND_METHOD
     if (data.get("attributes") or {}).get("conditional_result_of") is not None:
-        return True
+        return Rule.CONDITIONAL_RESULT
     node_type = str(data.get("type"))
     expression = data.get("expr_obj")
     parents = tuple(data.get("parents") or ())
@@ -7158,7 +7295,7 @@ def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
             for name in ("callee_ref", "method_ref", "class_ref")
         )
     ):
-        return False
+        return Rule.CATALOGUED_BUILTIN_CALL
     if (
         str(data.get("op") or node_type).casefold() == "getattr"
         and str(attributes.get("tensor") or "")
@@ -7173,133 +7310,148 @@ def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
         # despite retaining its authored Attribute syntax.  The source
         # candidate plus the exact receiver tensor descriptor is the proof;
         # an ordinary object field with the same name never reaches here.
-        return False
+        return Rule.GROUNDED_TENSOR_PROPERTY
     if node_type == "BitLength" and bool(
         (data.get("attributes") or {}).get("python_scalar_intrinsic")
     ):
-        return False
-    return (
-        bool(
-            (data.get("attributes") or {}).get(
-                "coordinator_short_circuit"
-            )
+        return Rule.SCALAR_INTRINSIC
+    # The disjuncts of the former single ``return``, in their order: the
+    # first that holds names the rule.
+    if bool(
+        (data.get("attributes") or {}).get(
+            "coordinator_short_circuit"
         )
-        or any(
-            (data.get("attributes") or {}).get(name) is not None
-            for name in (
-                "callee_ref",
-                "method_ref",
-                "class_ref",
-            )
+    ):
+        return Rule.COORDINATOR_SHORT_CIRCUIT
+    if any(
+        (data.get("attributes") or {}).get(name) is not None
+        for name in (
+            "callee_ref",
+            "method_ref",
+            "class_ref",
         )
-        or (
-            (data.get("attributes") or {}).get(
-                "static_python_reference"
-            ) is not None
-            and (
-                node_type not in abstract_tensor_funcs
-                or (data.get("attributes") or {}).get(
-                    "operator_reference_node"
-                ) is None
-            )
+    ):
+        return Rule.LINKED_REFERENCE
+    if (
+        (data.get("attributes") or {}).get(
+            "static_python_reference"
+        ) is not None
+        and (
+            node_type not in abstract_tensor_funcs
+            or (data.get("attributes") or {}).get(
+                "operator_reference_node"
+            ) is None
         )
-        or
-        node_type in {
-            "Input",
-            "input",
-            "Const",
-            "const",
-            "Constant",
-            "Store",
-            "store",
-            "Output",
-            "output",
-            "Return",
-            "return",
-            "Call",
-            "StaticReference",
-            "SetAttr",
-            "DelAttr",
-            "DelItem",
-            "Phi",
-            "LoopExit",
-            "LoopStateTransition",
-            "LoopResult",
-            "LoopStatePort",
-            "LoopAggregateResult",
-            "Yield",
-            "YieldFrom",
-            "no_grad",
-        }
-        or
+    ):
+        return Rule.STATIC_PYTHON_REFERENCE
+    if node_type in {
+        "Input",
+        "input",
+        "Const",
+        "const",
+        "Constant",
+        "Store",
+        "store",
+        "Output",
+        "output",
+        "Return",
+        "return",
+        "Call",
+        "StaticReference",
+        "SetAttr",
+        "DelAttr",
+        "DelItem",
+        "Phi",
+        "LoopExit",
+        "LoopStateTransition",
+        "LoopResult",
+        "LoopStatePort",
+        "LoopAggregateResult",
+        "Yield",
+        "YieldFrom",
+        "no_grad",
+    }:
+        return Rule.COORDINATOR_NODE_TYPE
+    if (
+        isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and (
+            node_type not in abstract_tensor_funcs
+            or ungrounded_tensor_method
+        )
+    ):
+        return Rule.METHOD_CALL
+    if bool(
+        (data.get("attributes") or {}).get(
+            "contextual_requirement"
+        )
+    ):
+        return Rule.CONTEXTUAL_REQUIREMENT
+    if _is_ast_metadata_node(graph, node_id):
+        return Rule.AST_METADATA
+    if isinstance(
+        expression,
         (
-            isinstance(data.get("expr_obj"), ast.Call)
-            and isinstance(data["expr_obj"].func, ast.Attribute)
-            and (
-                node_type not in abstract_tensor_funcs
-                or ungrounded_tensor_method
-            )
-        )
-        or
-        bool(
-            (data.get("attributes") or {}).get(
-                "contextual_requirement"
-            )
-        )
-        or
-        _is_ast_metadata_node(graph, node_id)
-        or isinstance(
-            expression,
-            (
-                ast.expr_context,
-                ast.operator,
-                ast.unaryop,
-                ast.boolop,
-                ast.cmpop,
-                ast.Slice,
-                ast.With,
-                ast.withitem,
-                ast.If,
-                ast.Raise,
-                ast.Assert,
-                ast.Pass,
-                ast.Break,
-                ast.Continue,
-                ast.Try,
-                ast.ExceptHandler,
-                ast.For,
-                ast.While,
-                ast.comprehension,
-                ast.ListComp,
-                ast.SetComp,
-                ast.DictComp,
-                ast.GeneratorExp,
-                ast.JoinedStr,
-                ast.FormattedValue,
-                ast.IfExp,
-                ast.BoolOp,
-                ast.Lambda,
-                ast.Starred,
-                ast.Tuple,
-                ast.List,
-                ast.Set,
-                ast.Dict,
-            ),
-        )
-        or isinstance(expression, ast.Attribute)
-        or python_routing_index
-        or python_shape_index
-        or compares_none
-        or non_numeric_constant_operand
-        or coordinator_accessor
-        or coordinator_boolean_not
-        or chained_comparison
-        or loop_target_initializer
-        or (
-            data.get("type") == "Load"
-            and (data.get("attributes") or {}).get("source_type") == "Name"
-        )
-    )
+            ast.expr_context,
+            ast.operator,
+            ast.unaryop,
+            ast.boolop,
+            ast.cmpop,
+            ast.Slice,
+            ast.With,
+            ast.withitem,
+            ast.If,
+            ast.Raise,
+            ast.Assert,
+            ast.Pass,
+            ast.Break,
+            ast.Continue,
+            ast.Try,
+            ast.ExceptHandler,
+            ast.For,
+            ast.While,
+            ast.comprehension,
+            ast.ListComp,
+            ast.SetComp,
+            ast.DictComp,
+            ast.GeneratorExp,
+            ast.JoinedStr,
+            ast.FormattedValue,
+            ast.IfExp,
+            ast.BoolOp,
+            ast.Lambda,
+            ast.Starred,
+            ast.Tuple,
+            ast.List,
+            ast.Set,
+            ast.Dict,
+        ),
+    ):
+        return Rule.PYTHON_SYNTAX
+    if isinstance(expression, ast.Attribute):
+        return Rule.ATTRIBUTE
+    if python_routing_index:
+        return Rule.PYTHON_ROUTING_INDEX
+    if python_shape_index:
+        return Rule.PYTHON_SHAPE_INDEX
+    if compares_none:
+        return Rule.COMPARES_NONE
+    if non_numeric_constant_operand:
+        return Rule.NON_NUMERIC_CONSTANT_OPERAND
+    if coordinator_accessor:
+        return Rule.COORDINATOR_ACCESSOR
+    if coordinator_boolean_not:
+        return Rule.COORDINATOR_BOOLEAN_NOT
+    if chained_comparison:
+        return Rule.CHAINED_COMPARISON
+    if loop_target_initializer:
+        return Rule.LOOP_TARGET_INITIALIZER
+    if (
+        data.get("type") == "Load"
+        and (data.get("attributes") or {}).get("source_type") == "Name"
+    ):
+        return Rule.NAME_LOAD
+    return Rule.NUMERICAL_WORK
 
 
 def _subgraph_reduction_digest(subgraph: Any) -> str:
@@ -7481,6 +7633,7 @@ def _dispatch_subgraph(
     required_outputs: frozenset[int] = frozenset(),
     inert_nodes: frozenset[int] = frozenset(),
     schedule_preference: str = "asap",
+    region_index: int | None = None,
 ) -> Any:
     """Return the planned dispatch as an independent ProcessGraph subgraph.
 
@@ -7491,6 +7644,14 @@ def _dispatch_subgraph(
 
     ``inert_nodes`` names lookups nobody reads.  They are not consumers, so
     they never turn a shader-local intermediate into a published output.
+
+    ``region_index`` is the planner's ordinal for this subgraph.  With it
+    the region is posted on the book under the graph's planning scope
+    (plan 80, A2.4): ``deployment_region`` DERIVED from every member's
+    ``executable_node`` cell, one ``deployment_region_member`` per node
+    (INPUT / NODE / OUTPUT) and one ``dispatch_store`` per Store node,
+    NOVEL from the OUTPUT member it stores.  The five ``subgraph.G.graph``
+    tuples stay as the read views the emitters consume.
     """
 
     selected = set(node_ids)
@@ -7678,7 +7839,95 @@ def _dispatch_subgraph(
     subgraph.G.graph["deployment_nodes"] = tuple(
         node_id for node_id in node_ids if node_id in subgraph.G
     )
+    if region_index is not None:
+        _post_deployment_region(graph, subgraph, int(region_index))
     return subgraph
+
+
+def _post_deployment_region(graph: Any, subgraph: Any, region_index: int) -> None:
+    """The book rows of one carved region (plan 80, A2.4)."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        DEPLOYMENT_REGION, DEPLOYMENT_REGION_MEMBER, DISPATCH_STORE,
+        DISPATCH_STORE_PAGE, EXECUTABLE_NODE, MemberRole,
+        PLANNER_REGION_CARVE, RegionFact,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Novel, current_identity_book,
+    )
+
+    planning_scope = graph.G.graph.get("planning_scope")
+    if planning_scope is None:
+        return
+    book = current_identity_book()
+    metadata = subgraph.G.graph
+    inputs = tuple(map(int, metadata.get("deployment_inputs", ())))
+    outputs = tuple(map(int, metadata.get("deployment_outputs", ())))
+    nodes = tuple(map(int, metadata.get("deployment_nodes", ())))
+    members = tuple(dict.fromkeys((*inputs, *nodes, *outputs)))
+
+    def member_cell(node_id: int) -> Any:
+        # The classifier's verdict for this node under this planning scope;
+        # a boundary node the pass never classified is named by its identity.
+        cell = book.latest_ref(EXECUTABLE_NODE, (planning_scope, node_id))
+        if cell is not None:
+            return cell
+        try:
+            return node_identity_cell(graph, node_id)
+        except ValueError:
+            return None
+
+    member_cells = {
+        node_id: cell for node_id in members
+        for cell in (member_cell(node_id),) if cell is not None
+    }
+    if not member_cells:
+        return
+    region_row = (planning_scope, int(region_index))
+    fact = RegionFact(
+        str(metadata.get("compartment_schedule_preference") or "asap"),
+        len(outputs), len(metadata.get("deployment_store_nodes", ())),
+    )
+    if book.latest_ref(DEPLOYMENT_REGION, region_row) is not None:
+        # The same ordinal carved twice in one planning scope (a re-plan of
+        # this graph without a new classifier pass) restates the region.
+        book.post(
+            DEPLOYMENT_REGION, region_row, fact, stage=PLANNER_REGION_CARVE,
+            provenance=Derived(tuple(member_cells.values())),
+            mode=Mode.CONCORD,
+        )
+        return
+    region_cell = book.post(
+        DEPLOYMENT_REGION, region_row, fact, stage=PLANNER_REGION_CARVE,
+        provenance=Derived(tuple(member_cells.values())), mode=Mode.CONCORD,
+    )
+    output_member_cells: dict[int, Any] = {}
+    for node_id, cell in member_cells.items():
+        role = (
+            MemberRole.OUTPUT if node_id in outputs
+            else MemberRole.INPUT if node_id in inputs
+            else MemberRole.NODE
+        )
+        member_ref = book.post(
+            DEPLOYMENT_REGION_MEMBER, (planning_scope, int(region_index), node_id),
+            role, stage=PLANNER_REGION_CARVE,
+            provenance=Derived((cell, region_cell)), mode=Mode.CONCORD,
+        )
+        if role is MemberRole.OUTPUT:
+            output_member_cells[node_id] = member_ref
+    for output_id, store_id in zip(
+        outputs, metadata.get("deployment_store_nodes", ()),
+    ):
+        member_ref = output_member_cells.get(int(output_id))
+        if member_ref is None:
+            continue
+        book.post(
+            DISPATCH_STORE_PAGE,
+            (planning_scope, int(region_index), int(output_id)), int(store_id),
+            stage=PLANNER_REGION_CARVE,
+            provenance=Novel(DISPATCH_STORE, (member_ref,)), mode=Mode.CONCORD,
+        )
 
 
 def _ast_source_location(expression: ast.AST) -> tuple[Any, ...]:
@@ -8214,6 +8463,7 @@ def _ordinary_conditional_control_programs(
         ),
     ))
     programs = []
+    program_expressions: list[tuple[int, ast.AST]] = []
     for control_id, record in _source_control_records(graph.G).items():
         if int(control_id) in structurally_specialized:
             # Structural specialization has already selected one authored arm,
@@ -8547,6 +8797,33 @@ def _ordinary_conditional_control_programs(
                 for member in ast.walk(statement)
             )
         )
+        # The reducer's field-state merge for THIS conditional is a
+        # retention reason on its own.  ``if rejected: m.hard_failure =
+        # True`` (tools/compiler_probes/probe_scalar_write_only_arm.py): the
+        # arm holds nothing but a scalar record-field write, so it has no
+        # numerical region, no callsite, no terminal control and no result
+        # alias, and ``rejected`` is a bare formal with no predicate region.
+        # Every term below was false and the conditional was dropped; the
+        # ScalarFieldWriteBlock then landed in the ENCLOSING arm and the
+        # MERGED cell of this merge never received a version
+        # (``carried-field-arm-missing``).  The Phi the reducer posted for
+        # this conditional -- ``source_conditional_id`` equal to it, with
+        # ``field_state_arms`` -- says the conditional owns a field-state
+        # merge; consuming that record here (before the ``continue``) builds
+        # the ConditionalBlock whose ``carried_field_cells`` the control
+        # builder already reads, and the mutation pass then finds the arm.
+        field_state_merge = any(
+            str(phi_data.get("type") or phi_data.get("op") or "")
+            .casefold() == "phi"
+            and int((phi_data.get("attributes") or {}).get(
+                "source_conditional_id", -1
+            )) == int(control_id)
+            and isinstance(
+                (phi_data.get("attributes") or {}).get("field_state_arms"),
+                (tuple, list),
+            )
+            for _phi_node_id, phi_data in graph.G.nodes(data=True)
+        )
         if (
             not body_regions
             and not else_regions
@@ -8556,6 +8833,7 @@ def _ordinary_conditional_control_programs(
             and not else_callsites
             and not result_aliases
             and not (predicate_regions and has_structural_branch_effect)
+            and not field_state_merge
         ):
             if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
                 print(
@@ -8747,7 +9025,162 @@ def _ordinary_conditional_control_programs(
             # on a later shell reconstruction to happen to rebuild this branch.
             anchor_region=anchor_region,
         ))
-    return tuple(programs)
+        program_expressions.append((int(control_id), expression))
+    return _nest_region_less_conditionals(
+        graph, tuple(programs), tuple(program_expressions), subgraphs,
+    )
+
+
+def _nest_region_less_conditionals(
+    graph: Any,
+    programs: tuple[ControlProgram, ...],
+    program_expressions: tuple[tuple[int, ast.AST], ...],
+    subgraphs: tuple[Any, ...],
+) -> tuple[ControlProgram, ...]:
+    """Place a region-less conditional inside the arm that lexically owns it.
+
+    The overlay (``overlay_scheduled_control``) embeds a nested control by
+    replacing the region markers it owns inside its parent's arm.  A
+    conditional with no region of its own has no marker; the overlay then
+    places it before its anchor region "within this root, or appends it",
+    and the root of a conditional program is ``(prefix..., ConditionalBlock)``
+    -- so a region-less guard nested in an arm was appended AFTER its parent
+    conditional, as a sibling.  For ``if bool(m.hard_failure): ... else: if
+    rejected: m.hard_failure = True`` (the single-exit form of
+    probe_scalar_write_only_arm.py) the reducer's outer merge names the
+    inner MERGED field-state cell as its orelse arm; a sibling inner
+    conditional is lowered after the outer merge, which then finds no
+    version for that arm (``ARM_VERSION_MISSING``) and the inner conditional
+    later disagrees with it.  The planner knows both source constructs, so
+    it nests here: the innermost containing retained conditional's arm, at
+    the lexical position among that arm's region markers (before the first
+    region whose earliest source line follows the child; before a trailing
+    terminal control; else at the end).  Children with regions keep the
+    overlay's marker embedding, which this does not touch.
+    """
+
+    from .control_source import ConditionalBlock, LoopControlBlock
+
+    if len(programs) < 2:
+        return programs
+
+    def span(expression: ast.AST) -> tuple[int, int]:
+        start = int(getattr(expression, "lineno", -1))
+        return start, int(getattr(expression, "end_lineno", start))
+
+    def arm_statements(expression: ast.AST, arm: str):
+        statements = getattr(expression, arm)
+        return statements if isinstance(statements, list) else [statements]
+
+    def owning_arm(parent: ast.AST, child: ast.AST):
+        child_signature = _ast_source_signature(child)
+        for arm in ("body", "orelse"):
+            if any(
+                _ast_source_signature(member) == child_signature
+                for statement in arm_statements(parent, arm)
+                for member in ast.walk(statement)
+            ):
+                return arm
+        return None
+
+    region_lines: dict[int, int | None] = {}
+
+    def earliest_region_line(region_index: int) -> int | None:
+        if region_index in region_lines:
+            return region_lines[region_index]
+        lines = []
+        if region_index < len(subgraphs):
+            for node_id in subgraphs[region_index].G.graph.get(
+                "deployment_nodes", ()
+            ):
+                node = graph.G.nodes.get(int(node_id)) or {}
+                line = (node.get("source_span") or {}).get("line")
+                if line is None:
+                    line = getattr(node.get("expr_obj"), "lineno", None)
+                if line is not None and int(line) >= 0:
+                    lines.append(int(line))
+        region_lines[region_index] = min(lines) if lines else None
+        return region_lines[region_index]
+
+    def insert_in_arm(arm: SequenceBlock | None, child_blocks, child_line):
+        blocks = list(arm.blocks) if isinstance(arm, SequenceBlock) else (
+            [] if arm is None else [arm]
+        )
+        position = len(blocks)
+        for index, block in enumerate(blocks):
+            if (
+                isinstance(block, StatementBlock)
+                and len(block.lines) == 1
+                and block.lines[0].startswith("__scheduled_region_")
+            ):
+                region_index = int(block.lines[0][len("__scheduled_region_"):-2])
+                line = earliest_region_line(region_index)
+                if line is not None and line > child_line:
+                    position = index
+                    break
+        if position == len(blocks) and blocks and isinstance(
+            blocks[-1], LoopControlBlock,
+        ):
+            position = len(blocks) - 1
+        return SequenceBlock((
+            *blocks[:position], *child_blocks, *blocks[position:],
+        ))
+
+    remaining = {index: program for index, program in enumerate(programs)}
+    expressions = dict(enumerate(expression for _id, expression in program_expressions))
+    # Innermost children first, so a grandchild joins its parent before that
+    # parent joins its own.
+    region_less = sorted(
+        (
+            index for index, program in remaining.items()
+            if not program.region_indices
+        ),
+        key=lambda index: (
+            span(expressions[index])[1] - span(expressions[index])[0],
+            span(expressions[index])[0],
+        ),
+    )
+    for child_index in region_less:
+        child = remaining.get(child_index)
+        if child is None:
+            continue
+        child_expression = expressions[child_index]
+        candidates = []
+        for parent_index, parent in remaining.items():
+            if parent_index == child_index:
+                continue
+            parent_expression = expressions[parent_index]
+            arm = owning_arm(parent_expression, child_expression)
+            if arm is not None:
+                start, end = span(parent_expression)
+                candidates.append((end - start, parent_index, arm))
+        if not candidates:
+            continue
+        _extent, parent_index, arm = min(candidates)
+        parent = remaining[parent_index]
+        conditional_position = next((
+            index for index, block in enumerate(parent.root.blocks)
+            if isinstance(block, ConditionalBlock)
+        ), None)
+        if conditional_position is None:
+            continue
+        conditional = parent.root.blocks[conditional_position]
+        child_line = span(child_expression)[0]
+        if arm == "body":
+            conditional = replace(conditional, body=insert_in_arm(
+                conditional.body, child.root.blocks, child_line,
+            ))
+        else:
+            conditional = replace(conditional, orelse=insert_in_arm(
+                conditional.orelse, child.root.blocks, child_line,
+            ))
+        remaining[parent_index] = replace(parent, root=SequenceBlock((
+            *parent.root.blocks[:conditional_position],
+            conditional,
+            *parent.root.blocks[conditional_position + 1:],
+        )))
+        del remaining[child_index]
+    return tuple(program for _index, program in sorted(remaining.items()))
 
 
 def _repair_missing_phi_initial_identities(graph_obj):
@@ -15780,63 +16213,639 @@ def _compile_whole_process_graph(
 _FORMAL_LITERAL_CONFLICT = object()
 
 
-def _publish_formal_literal(
-    function: str, parameter: str, value: Any, caller: str,
+def _post_if_changed(
+    page: Any, row: tuple, fact: Any, *, stage: Any, cells: tuple,
+) -> Any:
+    """One REVISE post on ``page`` unless the row's latest cell already
+    states ``fact`` from exactly these source cells.
+
+    The planner's fixed points re-derive the same fact from the same cells
+    on every round; ``post`` refuses such a revision (no changed source) and
+    plan 80 R5 places the check at the writer, never in a ``try``.  A
+    changed fact, or the same fact from a different cell set (a new
+    callsite), is a revision with a cause and is posted.  Returns the Ref of
+    the row's latest cell (the existing one when nothing was posted).
+    """
+
+    from .identity_concordance import Derived, Mode, current_identity_book
+
+    book = current_identity_book()
+    latest = book.latest_ref(page, row)
+    if latest is not None:
+        incumbent = book.pages[page.name].latest(row)
+        if incumbent == fact and {
+            source.key for source, _stage in book.edges_into(latest)
+        } == {cell.key for cell in cells}:
+            return latest
+    return book.post(
+        page, row, fact, stage=stage, provenance=Derived(tuple(cells)),
+        mode=Mode.REVISE,
+    )
+
+
+def _argument_identity_cells(graph: Any, node_id: int) -> tuple:
+    """The cells that identify one call argument as source data: the node's
+    identity cell; for an authored literal its ``source_span`` cell; for a
+    folded Constant the ``proven_literal`` cell the fold posted (the cause
+    that turned a dynamic argument into a literal); for an aggregate literal
+    the cells of its members."""
+
+    from ..common.tensors.topological_reducer import (
+        _post_source_span, node_identity_cell,
+    )
+    from .concordance_declarations import PROVEN_LITERAL
+    from .identity_concordance import current_identity_book
+
+    node_id = int(node_id)
+    if node_id not in graph.G:
+        return ()
+    data = graph.G.nodes[node_id]
+    cells: list = [node_identity_cell(graph, node_id)]
+    expression = data.get("expr_obj")
+    if isinstance(expression, ast.Constant):
+        span = _post_source_span(expression)
+        if span is not None:
+            cells.append(span)
+    literal = current_identity_book().latest_ref(
+        PROVEN_LITERAL,
+        (str(graph.G.graph.get("function_name")), int(data.get("value_id", node_id))),
+    )
+    if literal is not None:
+        cells.append(literal)
+    if isinstance(expression, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
+        for parent, _role in data.get("parents") or ():
+            cells.extend(_argument_identity_cells(graph, int(parent)))
+    return tuple(dict.fromkeys(cells))
+
+
+def _formal_identity_cells(callee: Any, parameter: str) -> tuple:
+    """The cells that identify a callee formal bound to its signature
+    default: the Input node's identity cell and its ``scalar_parameter``
+    row when the reducer posted one (that row derives from the default's
+    span; the def statement itself is not kept on the graph)."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import SCALAR_PARAMETER
+    from .identity_concordance import current_identity_book
+
+    cells: list = []
+    book = current_identity_book()
+    for node_id, data in callee.G.nodes(data=True):
+        if data.get("type") != "Input" or str(
+            (data.get("attributes") or {}).get("binding_name") or ""
+        ) != str(parameter):
+            continue
+        cell = node_identity_cell(callee, int(node_id))
+        cells.append(cell)
+        scalar = book.latest_ref(SCALAR_PARAMETER, (cell.row[0], int(node_id)))
+        if scalar is not None:
+            cells.append(scalar)
+    return tuple(dict.fromkeys(cells))
+
+
+def _post_planner_specialization(
+    callee: Any, parameter: str, fact: Any, cells: tuple, *, stage: Any = None,
+) -> Any:
+    """One ``planner_specialization`` row for ``callee``'s formal under the
+    callee graph's own read scope (per copy, design 7.1); None when the
+    graph has no scope (nothing to key the row by) or no cell proves it."""
+
+    from .concordance_declarations import (
+        PLANNER_SPECIALIZATION, PLANNER_SPECIALIZATION_PAGE,
+    )
+
+    scope = callee.G.graph.get("lexical_read_scope")
+    if scope is None or not cells:
+        return None
+    return _post_if_changed(
+        PLANNER_SPECIALIZATION_PAGE, (tuple(scope), str(parameter)), fact,
+        stage=PLANNER_SPECIALIZATION if stage is None else stage, cells=cells,
+    )
+
+
+def _post_call_binding(
+    graph: Any, node_id: int, reference: int, resolution: str,
+) -> Any:
+    """One ``call_binding`` row (caller read scope, call node) ->
+    ``CallBinding(callee, resolution)`` DERIVED from the call node's identity
+    cell and the callee's ``function_address`` cell (plan 80, A2.8).  None
+    when the caller graph has no read scope; a callee with no address row
+    derives from the call cell alone."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        CALL_BINDING, CallBinding, CallResolution, FUNCTION_ADDRESS,
+        PLANNER_CALL_BINDING,
+    )
+    from .identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is None or int(node_id) not in graph.G:
+        return None
+    book = current_identity_book()
+    try:
+        cells = [node_identity_cell(graph, int(node_id))]
+    except ValueError:
+        return None
+    table = getattr(graph, "function_table", None)
+    if table is not None:
+        try:
+            entry = table.entry(int(reference))
+        except (KeyError, TypeError, ValueError):
+            entry = None
+        if entry is not None:
+            address = book.latest_ref(
+                FUNCTION_ADDRESS, (str(entry.qualified_name),),
+            )
+            if address is not None:
+                cells.append(address)
+    row = (tuple(scope), int(node_id))
+    fact = CallBinding(int(reference), CallResolution(resolution))
+    page = book.pages.get(CALL_BINDING.name)
+    if page is not None and page.latest(row) is not None and page.latest(row) != fact:
+        # A call re-resolved to another callee (a receiver class proven
+        # later): a revision with the new address as its cause.
+        return book.post(
+            CALL_BINDING, row, fact, stage=PLANNER_CALL_BINDING,
+            provenance=Derived(tuple(cells)), mode=Mode.REVISE,
+        )
+    return book.post(
+        CALL_BINDING, row, fact, stage=PLANNER_CALL_BINDING,
+        provenance=Derived(tuple(cells)), mode=Mode.CONCORD,
+    )
+
+
+def _post_callsite_activation(
+    identity_row: tuple, activation_fact: tuple, binding_cell: Any,
 ) -> None:
-    """Record that a callsite proved one literal for one formal."""
+    """The ``source_callsite_activation_concordance`` row DERIVED from the
+    call's ``call_binding`` cell; raw (tagged) when there is none."""
+
+    from .concordance_declarations import (
+        PLANNER_CALL_BINDING, SOURCE_CALLSITE_ACTIVATION,
+    )
+    from .identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    book = current_identity_book()
+    if binding_cell is None:
+        book.page(SOURCE_CALLSITE_ACTIVATION).set(identity_row, 0, activation_fact)
+        return
+    book.post(
+        SOURCE_CALLSITE_ACTIVATION, identity_row, activation_fact,
+        stage=PLANNER_CALL_BINDING, provenance=Derived((binding_cell,)),
+        mode=Mode.CONCORD,
+    )
+
+
+def _post_control_specialization(
+    graph: Any, control_id: int, record: dict, predicate_id: Any, *,
+    predicate_known: bool,
+) -> tuple:
+    """One ``source_control_specialization_concordance`` row (function,
+    retained control): the fold record DERIVED from the test's
+    ``proven_literal`` cell (when the fold posted one) and the control node's
+    identity cell; ``Unresolved(PREDICATE_NOT_KNOWN)`` reading the control
+    cell when the test was not in ``known``.  Returns the cells posted."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        PLANNER_STRUCTURAL_FOLD, PREDICATE_NOT_KNOWN, PROVEN_LITERAL,
+        SOURCE_CONTROL_SPECIALIZATION,
+    )
+    from .identity_concordance import (
+        Mode, RAW_PRIMITIVE, Unresolved, Unsourced, current_identity_book,
+    )
+
+    book = current_identity_book()
+    function_name = str(graph.G.graph.get("function_name"))
+    row = (function_name, int(control_id))
+    cells: list = []
+    try:
+        if int(control_id) in graph.G:
+            cells.append(node_identity_cell(graph, int(control_id)))
+        elif int(record.get("graph_control_id", -1)) in graph.G:
+            cells.append(node_identity_cell(
+                graph, int(record["graph_control_id"]),
+            ))
+    except ValueError:
+        pass
+    if predicate_id is not None and int(predicate_id) in graph.G:
+        literal = book.latest_ref(PROVEN_LITERAL, (
+            function_name,
+            int(graph.G.nodes[int(predicate_id)].get("value_id", predicate_id)),
+        ))
+        if literal is not None:
+            cells.append(literal)
+    fact: Any = (
+        record if predicate_known
+        else Unresolved(PREDICATE_NOT_KNOWN, read=tuple(cells))
+    )
+    if cells:
+        return (_post_if_changed(
+            SOURCE_CONTROL_SPECIALIZATION, row, fact,
+            stage=PLANNER_STRUCTURAL_FOLD, cells=tuple(cells),
+        ),)
+    page = book.pages.get(SOURCE_CONTROL_SPECIALIZATION.name)
+    if page is not None and page.latest(row) == fact:
+        return ()
+    return (book.post(
+        SOURCE_CONTROL_SPECIALIZATION, row, fact, stage=PLANNER_STRUCTURAL_FOLD,
+        provenance=Unsourced(RAW_PRIMITIVE), mode=Mode.REVISE,
+    ),)
+
+
+def _post_pruned_return_sites(
+    graph: Any, selected_sites: Mapping[Any, Any], control_id: int,
+) -> None:
+    """The structural fold proved one top-level arm terminal and kept only
+    its return site: every other site's ``return_site_slot`` rows revise to
+    ``Unresolved(RETURN_SITE_UNREACHABLE)`` reading the previous slot cell
+    and the folded control's identity cell (plan 80, A2.7; plan 70, 4)."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        PLANNER_STRUCTURAL_FOLD, RETURN_SITE_SLOT, RETURN_SITE_UNREACHABLE,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Ref, Unresolved, current_identity_book,
+    )
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is None:
+        return
+    book = current_identity_book()
+    slots = book.pages.get(RETURN_SITE_SLOT.name)
+    if slots is None:
+        return
+    try:
+        control_cell = (
+            node_identity_cell(graph, int(control_id))
+            if int(control_id) in graph.G else None
+        )
+    except ValueError:
+        control_cell = None
+    selected_spans = {
+        tuple(site) for site in selected_sites if isinstance(site, tuple)
+    }
+    for row in tuple(slots.scope_rows(tuple(scope))):
+        fact = slots.latest(row)
+        if not isinstance(fact, Ref):
+            continue
+        site = row[1]
+        # The return-site key is the ``source_span`` row of the returned
+        # expression (a PAGE_REF); the ledger keys sites by its positions.
+        if not isinstance(site, Ref) or site.page.name != "source_span":
+            continue
+        site_page = book.pages.get(site.page.name)
+        span = None if site_page is None else site_page.latest(site.row)
+        if span is None:
+            continue
+        positions = tuple(
+            getattr(span, name, None) for name in (
+                "lineno", "col_offset", "end_lineno", "end_col_offset",
+            )
+        )
+        if positions in selected_spans:
+            continue
+        previous = book.latest_ref(RETURN_SITE_SLOT, row)
+        cells = tuple(cell for cell in (previous, control_cell) if cell is not None)
+        book.post(
+            RETURN_SITE_SLOT, row,
+            Unresolved(RETURN_SITE_UNREACHABLE, read=cells),
+            stage=PLANNER_STRUCTURAL_FOLD, provenance=Derived(cells),
+            mode=Mode.REVISE,
+        )
+
+
+def _fold_literal_source_cells(graph: Any, node_id: int) -> tuple:
+    """The cells a structural fold of ``node_id`` evaluated: the node's own
+    identity cell, each operand's identity cell, and the
+    ``planner_specialization`` cell of an operand Input the planner fed."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import PLANNER_SPECIALIZATION_PAGE
+    from .identity_concordance import current_identity_book
+
+    if node_id not in graph.G:
+        return ()
+    book = current_identity_book()
+    scope = graph.G.graph.get("lexical_read_scope")
+    cells: list = []
+
+    def specialization_cell(data: Any) -> Any:
+        binding = (data.get("attributes") or {}).get("binding_name")
+        if data.get("type") != "Input" or binding is None or scope is None:
+            return None
+        return book.latest_ref(
+            PLANNER_SPECIALIZATION_PAGE, (tuple(scope), str(binding)),
+        )
 
     try:
-        from .identity_concordance import current_identity_book
+        cells.append(node_identity_cell(graph, node_id))
+        # The node itself may be the planner-fed Input (``rollback`` folded
+        # to its literal): its own specialization cell is the cause.
+        own = specialization_cell(graph.G.nodes[node_id])
+        if own is not None:
+            cells.append(own)
+        for parent, _role in graph.G.nodes[node_id].get("parents") or ():
+            if int(parent) not in graph.G:
+                continue
+            cells.append(node_identity_cell(graph, int(parent)))
+            specialization = specialization_cell(graph.G.nodes[int(parent)])
+            if specialization is not None:
+                cells.append(specialization)
+    except ValueError:
+        return ()
+    return tuple(dict.fromkeys(cells))
 
-        page = current_identity_book().page("formal_literal")
-        row = (str(function), str(parameter))
-        previous = page.latest(row)
-        if previous is None:
-            page.set(row, 0, ("proven", value, caller))
-            return
-        if previous[0] == "conflicting":
-            return
-        try:
-            agrees = bool(previous[1] == value)
-        except Exception:
-            agrees = False
-        if not agrees:
-            # Genuinely parametric: two callsites, two values.
-            page.set(
-                row, len(page.history(row)),
-                ("conflicting", (previous[1], value), caller),
+
+def _post_identity_table_mutation(
+    graph: Any, *, removed: Iterable[int] = (),
+    aliases: Mapping[int, int] | None = None, cause_cells: tuple = (),
+    stage: Any = None,
+) -> None:
+    """Record a post-reduction ``identity_table`` mutation on ``name_binding``
+    (plan 80, A2.7; plan 60 R1).
+
+    The reducer materialized the dict from the canonical ``name_binding``
+    rows; every planner rewrite of the dict is a REVISE of the rows it
+    changes, so the page and the dict stay one record:
+
+    - a version whose value node was REMOVED revises to
+      ``Unresolved(BINDING_VERSION_REMOVED)`` reading its previous cell and
+      the removed node's ``canonical_value`` cell (the view skips
+      ``Unresolved`` rows, which is today's filtered tuple);
+    - a version whose value was ALIASED to another node revises to a
+      ``BindingFact`` naming the alias source, DERIVED from its previous
+      cell, the source node's identity cell and ``cause_cells`` (the
+      ``identity_transition`` cells ``_set_operands`` wrote, when declared).
+
+    A return slot (``return_site_slot``) whose value was aliased revises to
+    the source's cell the same way.  The dict rewrite itself stays with the
+    caller: unmigrated writers (the loop composer's port versions, the fold's
+    output-slot rebinding) still write it raw, so the dict is not yet
+    materialized from the page alone.
+    """
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        BINDING_VERSION_REMOVED, BindingFact, CANONICAL_VALUE, NAME_BINDING,
+        PLANNER_STRUCTURAL_FOLD, RETURN_SITE_SLOT,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Ref, Unresolved, current_identity_book,
+    )
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is None:
+        return
+    scope = tuple(scope)
+    removed = {int(node_id) for node_id in removed}
+    aliases = {int(old): int(new) for old, new in (aliases or {}).items()}
+    if not removed and not aliases:
+        return
+    stage = PLANNER_STRUCTURAL_FOLD if stage is None else stage
+    book = current_identity_book()
+    page = book.pages.get(NAME_BINDING.name)
+    if page is None:
+        return
+    source_cells: dict[int, Any] = {}
+
+    def source_cell(node_id: int) -> Any:
+        if node_id not in source_cells:
+            try:
+                source_cells[node_id] = (
+                    node_identity_cell(graph, node_id)
+                    if node_id in graph.G else
+                    book.latest_ref(CANONICAL_VALUE, (scope, node_id))
+                )
+            except ValueError:
+                source_cells[node_id] = None
+        return source_cells[node_id]
+
+    for row in tuple(page.scope_rows(scope)):
+        fact = page.latest(row)
+        if not isinstance(fact, BindingFact):
+            continue
+        value_id = int(fact.value_id)
+        previous = book.latest_ref(NAME_BINDING, row)
+        if value_id in removed:
+            cells = tuple(
+                cell for cell in (previous, source_cell(value_id))
+                if cell is not None
             )
+            book.post(
+                NAME_BINDING, row,
+                Unresolved(BINDING_VERSION_REMOVED, read=cells),
+                stage=stage, provenance=Derived(cells), mode=Mode.REVISE,
+            )
+        elif value_id in aliases:
+            replacement = aliases[value_id]
+            new_fact = BindingFact(
+                replacement, fact.authored, fact.span_positions,
+                fact.context_sha256,
+            )
+            cells = tuple(dict.fromkeys(
+                cell for cell in (
+                    previous, source_cell(replacement), *cause_cells,
+                ) if cell is not None
+            ))
+            book.post(
+                NAME_BINDING, row, new_fact, stage=stage,
+                provenance=Derived(cells), mode=Mode.REVISE,
+            )
+    if aliases:
+        slots = book.pages.get(RETURN_SITE_SLOT.name)
+        for row in tuple(slots.scope_rows(scope)) if slots is not None else ():
+            fact = slots.latest(row)
+            if not isinstance(fact, Ref) or fact.page is not CANONICAL_VALUE:
+                continue
+            old_value = fact.row[1]
+            if not isinstance(old_value, int) or old_value not in aliases:
+                continue
+            replacement_cell = source_cell(aliases[old_value])
+            if replacement_cell is None:
+                continue
+            previous = book.latest_ref(RETURN_SITE_SLOT, row)
+            cells = tuple(dict.fromkeys(
+                cell for cell in (previous, replacement_cell, *cause_cells)
+                if cell is not None
+            ))
+            book.post(
+                RETURN_SITE_SLOT, row, replacement_cell, stage=stage,
+                provenance=Derived(cells), mode=Mode.REVISE,
+            )
+
+
+def _post_copy_planner_specializations(
+    specialized: Any, specializations: Mapping[str, Any],
+    specialization_cells: Mapping[str, tuple],
+) -> None:
+    """The rows of one callee COPY: a literal argument of its callsite
+    (``SpecializationFact(value, LITERAL)`` from the argument cells the
+    caller collected) or the signature default of an omitted argument
+    (``DEFAULT``, from the copy's own formal cells); then the dict is the
+    page's read view."""
+
+    from .concordance_declarations import (
+        SpecializationFact, SpecializationSource,
+    )
+
+    for parameter, value in specializations.items():
+        cells = tuple(specialization_cells.get(str(parameter)) or ())
+        source = SpecializationSource.LITERAL
+        if not cells:
+            cells = _formal_identity_cells(specialized, str(parameter))
+            source = SpecializationSource.DEFAULT
+        _post_planner_specialization(
+            specialized, str(parameter), SpecializationFact(value, source),
+            cells,
+        )
+    _materialize_planner_specializations(specialized)
+
+
+def _materialize_planner_specializations(graph: Any) -> None:
+    """Rebuild ``G.graph["planner_specializations"]`` as the read view of
+    the graph's ``planner_specialization`` rows (latest fact per formal,
+    ``Unresolved`` skipped).  A key only an unmigrated writer set survives:
+    the page's facts win where both speak."""
+
+    from .concordance_declarations import (
+        PLANNER_SPECIALIZATION_PAGE, SpecializationFact,
+    )
+    from .identity_concordance import current_identity_book
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is None:
+        return
+    page = current_identity_book().pages.get(PLANNER_SPECIALIZATION_PAGE.name)
+    if page is None:
+        return
+    view = dict(graph.G.graph.get("planner_specializations") or {})
+    for row in page.scope_rows(tuple(scope)):
+        fact = page.latest(row)
+        if isinstance(fact, SpecializationFact):
+            view[str(row[1])] = fact.value
+    graph.G.graph["planner_specializations"] = view
+
+
+def _publish_formal_literal(
+    function: str, parameter: str, value: Any, caller: str, cells: tuple = (),
+) -> None:
+    """Record that a callsite proved one literal for one formal.
+
+    Page ``formal_literal`` row ``(authored function, parameter)``: the
+    first callsite posts ``("proven", value, caller)`` DERIVED from the
+    argument cells that proved it; a later callsite with another value
+    revises the row to ``Unresolved(FORMAL_LITERAL_CONFLICT)`` reading both
+    -- genuinely parametric, two callsites, two values.  A caller with no
+    cells posts ``Unsourced(RAW_PRIMITIVE)`` under the latch.
+    """
+
+    from .concordance_declarations import (
+        FORMAL_LITERAL, FORMAL_LITERAL_CONFLICT, PLANNER_SPECIALIZATION,
+    )
+    from .identity_concordance import (
+        Derived, Mode, RAW_PRIMITIVE, Unresolved, Unsourced,
+        current_identity_book,
+    )
+
+    book = current_identity_book()
+    row = (str(function), str(parameter))
+    previous = book.latest_ref(FORMAL_LITERAL, row)
+    cells = tuple(cells)
+    provenance = Derived(cells) if cells else Unsourced(RAW_PRIMITIVE)
+    if previous is None:
+        book.post(
+            FORMAL_LITERAL, row, ("proven", value, caller),
+            stage=PLANNER_SPECIALIZATION, provenance=provenance,
+            mode=Mode.REVISE,
+        )
+        return
+    incumbent = book.pages[FORMAL_LITERAL.name].latest(row)
+    if isinstance(incumbent, Unresolved):
+        return
+    try:
+        agrees = bool(incumbent[1] == value)
     except Exception:
-        pass
+        agrees = False
+    if agrees:
+        return
+    read = (previous, *cells)
+    book.post(
+        FORMAL_LITERAL, row, Unresolved(FORMAL_LITERAL_CONFLICT, read=read),
+        stage=PLANNER_SPECIALIZATION,
+        provenance=Derived(read) if cells else Unsourced(RAW_PRIMITIVE),
+        mode=Mode.REVISE,
+    )
 
 
 def _publish_formal_shape(
     function: str, parameter: str, descriptor: Any, caller: str,
+    cells: tuple = (),
 ) -> bool:
-    """Record that a callsite proved one shape for one formal."""
+    """Record that a callsite proved one shape for one formal.
 
-    try:
-        from .identity_concordance import (
-            authored_function_name,
-            current_identity_book,
+    Mirrors ``_publish_formal_literal``: ``("proven", extents, dtype,
+    caller)`` DERIVED from the argument cells; a differing extent revises to
+    ``Unresolved(FORMAL_SHAPE_CONFLICT)``.  A third caller's shape is a
+    revision with a changed source, no longer lost.
+    """
+
+    from .concordance_declarations import (
+        FORMAL_SHAPE, FORMAL_SHAPE_CONFLICT, PLANNER_TENSOR_SPECIALIZATION,
+    )
+    from .identity_concordance import (
+        Derived, Mode, RAW_PRIMITIVE, Unresolved, Unsourced,
+        authored_function_name, current_identity_book,
+    )
+
+    extents = tuple(int(e) for e in (descriptor.get("shape") or ()))
+    dtype = str(descriptor.get("dtype") or "float64")
+    book = current_identity_book()
+    row = (authored_function_name(function), str(parameter))
+    previous = book.latest_ref(FORMAL_SHAPE, row)
+    cells = tuple(cells)
+    if previous is None:
+        book.post(
+            FORMAL_SHAPE, row, ("proven", extents, dtype, caller),
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+            provenance=Derived(cells) if cells else Unsourced(RAW_PRIMITIVE),
+            mode=Mode.REVISE,
         )
-
-        extents = tuple(int(e) for e in (descriptor.get("shape") or ()))
-        dtype = str(descriptor.get("dtype") or "float64")
-        page = current_identity_book().page("formal_shape")
-        row = (authored_function_name(function), str(parameter))
-        previous = page.latest(row)
-        if previous is None:
-            page.set(row, 0, ("proven", extents, dtype, caller))
-            return True
-        elif previous[0] == "proven" and tuple(previous[1]) != extents:
-            page.set(
-                row, len(page.history(row)),
-                ("conflicting", extents, dtype, caller),
-            )
-            return True
-    except Exception:
-        return False
+        return True
+    incumbent = book.pages[FORMAL_SHAPE.name].latest(row)
+    read = (previous, *cells)
+    if isinstance(incumbent, Unresolved):
+        # Already parametric.  A third caller is a revision only when it is
+        # a new source (its cells are not the ones already read); the same
+        # caller on a later fixed-point round is not.
+        if not cells or {cell.key for cell in read} == {
+            source.key for source, _stage in book.edges_into(previous)
+        }:
+            return False
+        book.post(
+            FORMAL_SHAPE, row, Unresolved(FORMAL_SHAPE_CONFLICT, read=read),
+            stage=PLANNER_TENSOR_SPECIALIZATION, provenance=Derived(read),
+            mode=Mode.REVISE,
+        )
+        return True
+    if (
+        isinstance(incumbent, tuple)
+        and incumbent[0] == "proven"
+        and tuple(incumbent[1]) != extents
+    ):
+        book.post(
+            FORMAL_SHAPE, row, Unresolved(FORMAL_SHAPE_CONFLICT, read=read),
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+            provenance=Derived(read) if cells else Unsourced(RAW_PRIMITIVE),
+            mode=Mode.REVISE,
+        )
+        return True
     return False
 
 
@@ -15859,7 +16868,8 @@ def _proven_formal_shape(graph: Any, name: Any) -> Any:
         proven = page.latest(row)
     except Exception:
         return None
-    if proven is None or proven[0] != "proven":
+    # ``Unresolved(FORMAL_SHAPE_CONFLICT)`` is the conflicting fact.
+    if not isinstance(proven, tuple) or proven[0] != "proven":
         return None
     return {
         "shape": tuple(proven[1]),
@@ -15881,7 +16891,8 @@ def _proven_formal_literal(graph: Any, name: Any) -> Any:
         proven = page.latest(row)
     except Exception:
         return _FORMAL_LITERAL_CONFLICT
-    if proven is None or proven[0] != "proven":
+    # ``Unresolved(FORMAL_LITERAL_CONFLICT)`` is the conflicting fact.
+    if not isinstance(proven, tuple) or proven[0] != "proven":
         return _FORMAL_LITERAL_CONFLICT
     return proven[1]
 
@@ -16019,8 +17030,17 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
     graphs.extend(
         entry.graph for entry in function_table if entry.graph is not None
     )
-    candidates: dict[tuple[int, str], list[Any]] = {}
+    from .concordance_declarations import (
+        SPECIALIZATION_CALLSITES_DISAGREE, SPECIALIZATION_DYNAMIC_ARGUMENT,
+        SPECIALIZATION_NOT_SOURCE_STATIC, SpecializationFact,
+        SpecializationSource,
+    )
+    from .identity_concordance import Unresolved
+
+    # Per candidate: (value, the cells that prove it, omitted-argument?).
+    candidates: dict[tuple[int, str], list[tuple[Any, tuple, bool]]] = {}
     dynamic_argument = object()
+    not_source_static = object()
     for caller in graphs:
         for _node_id, data in caller.G.nodes(data=True):
             attributes = data.get("attributes") or {}
@@ -16050,12 +17070,14 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                     try:
                         value = _source_static_literal(caller, int(parent))
                     except ValueError:
-                        value = dynamic_argument
+                        value = not_source_static
                 else:
                     value = dynamic_argument
                 candidates.setdefault(
                     (int(reference), parameter), []
-                ).append(value)
+                ).append((
+                    value, _argument_identity_cells(caller, int(parent)), False,
+                ))
             # Omitted arguments are just as exact as authored literal
             # arguments: Python binds them to the signature default before
             # the body starts. Include them in the same consistency proof so
@@ -16069,9 +17091,40 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                 if parameter not in bound_parameters:
                     candidates.setdefault(
                         (int(reference), parameter), []
-                    ).append(copy.deepcopy(default))
-    for (reference, parameter), values in candidates.items():
-        if not values or any(value is dynamic_argument for value in values):
+                    ).append((
+                        copy.deepcopy(default),
+                        _formal_identity_cells(callee, parameter), True,
+                    ))
+    # Every candidate is a row on ``planner_specialization`` (callee scope,
+    # parameter): the agreed literal / default as a ``SpecializationFact``,
+    # or the reason no literal exists -- a dynamic argument, an argument that
+    # is source data but not a literal, or callsites that disagree -- so a
+    # later ``_source_static_value`` miss is visible on the book instead of
+    # a silent ``continue`` (plan 80, A2.1).  Rows are DERIVED from the
+    # argument cells of every contributing callsite; the dict the readers
+    # consult is the page's read view.
+    touched: list[Any] = []
+    for (reference, parameter), contributions in candidates.items():
+        try:
+            callee = function_table.entry(reference).graph
+        except (KeyError, TypeError, ValueError):
+            continue
+        if callee is None or not contributions:
+            continue
+        values = [value for value, _cells, _omitted in contributions]
+        cells = tuple(dict.fromkeys(
+            cell for _value, cell_group, _omitted in contributions
+            for cell in cell_group
+        ))
+        if any(value is not_source_static for value in values):
+            _post_planner_specialization(callee, parameter, Unresolved(
+                SPECIALIZATION_NOT_SOURCE_STATIC, read=cells,
+            ), cells)
+            continue
+        if any(value is dynamic_argument for value in values):
+            _post_planner_specialization(callee, parameter, Unresolved(
+                SPECIALIZATION_DYNAMIC_ARGUMENT, read=cells,
+            ), cells)
             continue
         first = values[0]
         try:
@@ -16079,12 +17132,24 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
         except (TypeError, ValueError):
             consistent = False
         if not consistent:
+            _post_planner_specialization(callee, parameter, Unresolved(
+                SPECIALIZATION_CALLSITES_DISAGREE, read=cells,
+            ), cells)
             continue
-        callee = function_table.entry(reference).graph
-        if callee is not None:
-            callee.G.graph.setdefault(
-                "planner_specializations", {}
-            )[parameter] = first
+        source = (
+            SpecializationSource.DEFAULT
+            if all(omitted for _value, _cells, omitted in contributions)
+            else SpecializationSource.LITERAL
+        )
+        _post_planner_specialization(
+            callee, parameter, SpecializationFact(first, source), cells,
+        )
+        callee.G.graph.setdefault(
+            "planner_specializations", {}
+        )[parameter] = first
+        touched.append(callee)
+    for callee in {id(item): item for item in touched}.values():
+        _materialize_planner_specializations(callee)
 
 
 def _source_fallthrough_predicate_facts(graph: Any, controls, predicate_fact):
@@ -16583,6 +17648,7 @@ def _propagate_callsite_tensor_specializations(
         descriptors: dict[str, dict[str, Any]] = {}
         aggregate_descriptors: dict[str, tuple[Any, ...]] = {}
         specializations: dict[str, Any] = {}
+        specialization_cells: dict[str, tuple] = {}
         bound_parameters: set[str] = set()
         for parent, role_value in _expanded_callsite_argument_edges(
             caller, int(node_id),
@@ -16618,6 +17684,10 @@ def _propagate_callsite_tensor_specializations(
                     )
                 except ValueError:
                     pass
+                else:
+                    specialization_cells[parameter] = (
+                        _argument_identity_cells(caller, int(parent))
+                    )
         for parameter, default in (
             callee.G.graph.get("parameter_defaults") or {}
         ).items():
@@ -16628,6 +17698,10 @@ def _propagate_callsite_tensor_specializations(
         specialized = extract_clean_process_subgraph(callee, callee.G)
         specialized.G.graph["planner_specializations"] = copy.deepcopy(
             specializations
+        )
+        # This propagation copy's own rows, under its forked scope (7.1).
+        _post_copy_planner_specializations(
+            specialized, specializations, specialization_cells,
         )
         specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
             descriptors
@@ -17496,28 +18570,36 @@ def propagate_bound_planner_specializations(
     if reference is None:
         return
 
-    def resolve(node: ast.AST, environment: Mapping[str, Any]) -> Any:
+    def resolve(
+        node: ast.AST, environment: Mapping[str, Any], used: set | None = None,
+    ) -> Any:
+        # ``used`` collects the caller bindings this expression read, so the
+        # callee's row can derive from the caller's rows for exactly them.
         if isinstance(node, ast.Constant):
             return node.value
         if isinstance(node, ast.Name) and node.id in environment:
+            if used is not None:
+                used.add(str(node.id))
             return environment[node.id]
         if isinstance(node, ast.Attribute) and not node.attr.startswith("_"):
-            return getattr(resolve(node.value, environment), node.attr)
+            return getattr(resolve(node.value, environment, used), node.attr)
         if isinstance(node, ast.Subscript):
-            return resolve(node.value, environment)[
-                resolve(node.slice, environment)
+            return resolve(node.value, environment, used)[
+                resolve(node.slice, environment, used)
             ]
         if isinstance(node, ast.Tuple):
-            return tuple(resolve(item, environment) for item in node.elts)
+            return tuple(resolve(item, environment, used) for item in node.elts)
         if isinstance(node, ast.List):
-            return [resolve(item, environment) for item in node.elts]
+            return [resolve(item, environment, used) for item in node.elts]
         if isinstance(node, ast.Dict):
             return {
-                resolve(key, environment): resolve(value, environment)
+                resolve(key, environment, used): resolve(value, environment, used)
                 for key, value in zip(node.keys, node.values)
             }
         if isinstance(node, ast.Call):
-            args = [resolve(argument, environment) for argument in node.args]
+            args = [
+                resolve(argument, environment, used) for argument in node.args
+            ]
             if isinstance(node.func, ast.Name) and node.func.id in {
                 "tuple", "list", "range", "enumerate", "zip"
             }:
@@ -17531,7 +18613,7 @@ def propagate_bound_planner_specializations(
                 and not node.keywords
                 and not args
             ):
-                owner = resolve(node.func.value, environment)
+                owner = resolve(node.func.value, environment, used)
                 if isinstance(owner, Mapping):
                     return getattr(owner, node.func.attr)()
         raise ValueError("expression is not a safe structural binding")
@@ -17576,17 +18658,60 @@ def propagate_bound_planner_specializations(
     if mutable_descriptors:
         _apply_callsite_tensor_descriptors(entry, mutable_descriptors)
 
-    queue: list[tuple[Any, dict[str, Any]]] = [(
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        EXTERNAL_DECLARATION, PLANNER_SPECIALIZATION,
+        PLANNER_SPECIALIZATION_PAGE, SpecializationFact,
+        SpecializationSource,
+    )
+    from .identity_concordance import (
+        Mode, Unsourced, current_identity_book,
+    )
+
+    book = current_identity_book()
+
+    def post_bound(graph_obj: Any, environment: Mapping[str, Any],
+                   sources: Mapping[str, tuple]) -> None:
+        """One ``SpecializationFact(value, BOUND)`` row per forwarded
+        binding under ``graph_obj``'s scope: DERIVED from the call node's
+        cell and the caller's rows the binding was resolved from; the
+        entrypoint's own bindings come from the caller of the compile (no
+        cell on the book) and are posted ``Unsourced(EXTERNAL_DECLARATION)``
+        under the latch."""
+
+        scope = graph_obj.G.graph.get("lexical_read_scope")
+        if scope is None:
+            return
+        for name, value in environment.items():
+            fact = SpecializationFact(value, SpecializationSource.BOUND)
+            cells = tuple(sources.get(str(name)) or ())
+            if cells:
+                _post_planner_specialization(graph_obj, str(name), fact, cells)
+                continue
+            row = (tuple(scope), str(name))
+            if book.pages.get(PLANNER_SPECIALIZATION_PAGE.name) is not None and (
+                book.pages[PLANNER_SPECIALIZATION_PAGE.name].latest(row) == fact
+            ):
+                continue
+            book.post(
+                PLANNER_SPECIALIZATION_PAGE, row, fact,
+                stage=PLANNER_SPECIALIZATION,
+                provenance=Unsourced(EXTERNAL_DECLARATION), mode=Mode.REVISE,
+            )
+        _materialize_planner_specializations(graph_obj)
+
+    queue: list[tuple[Any, dict[str, Any], dict[str, tuple]]] = [(
         entry,
         {
             str(name): value
             for name, value in bindings.items()
             if str(name) not in mutable
         },
+        {},
     )]
     visited: set[tuple[int, tuple[str, ...]]] = set()
     while queue:
-        current, environment = queue.pop(0)
+        current, environment, sources = queue.pop(0)
         key = (id(current), tuple(sorted(environment)))
         if key in visited:
             continue
@@ -17594,6 +18719,24 @@ def propagate_bound_planner_specializations(
         current.G.graph.setdefault("planner_specializations", {}).update(
             environment
         )
+        post_bound(current, environment, sources)
+        current_scope = current.G.graph.get("lexical_read_scope")
+
+        def caller_cells(node_id: int, used: set) -> tuple:
+            """The call node's identity cell plus the caller's rows for the
+            bindings the argument expression read."""
+
+            cells = [node_identity_cell(current, int(node_id))]
+            if current_scope is not None:
+                for name in sorted(used):
+                    cell = book.latest_ref(
+                        PLANNER_SPECIALIZATION_PAGE,
+                        (tuple(current_scope), str(name)),
+                    )
+                    if cell is not None:
+                        cells.append(cell)
+            return tuple(cells)
+
         for _node_id, data in current.G.nodes(data=True):
             attributes = data.get("attributes") or {}
             callee_reference = attributes.get(
@@ -17610,33 +18753,45 @@ def propagate_bound_planner_specializations(
                 continue
             receiver, positional, _all = _method_parameter_layout(callee.G)
             resolved: dict[str, Any] = {}
+            resolved_sources: dict[str, tuple] = {}
             if receiver is not None and isinstance(expression.func, ast.Attribute):
+                used: set = set()
                 try:
                     resolved[receiver] = resolve(
-                        expression.func.value, environment
+                        expression.func.value, environment, used,
                     )
                 except (AttributeError, KeyError, TypeError, ValueError):
                     pass
+                else:
+                    resolved_sources[receiver] = caller_cells(_node_id, used)
             for position, argument in enumerate(expression.args):
                 if position >= len(positional):
                     break
+                used = set()
                 try:
                     resolved[positional[position]] = resolve(
-                        argument, environment
+                        argument, environment, used,
                     )
                 except (AttributeError, KeyError, TypeError, ValueError):
                     continue
+                resolved_sources[positional[position]] = caller_cells(
+                    _node_id, used,
+                )
             for keyword in expression.keywords:
                 if keyword.arg is None:
                     continue
+                used = set()
                 try:
                     resolved[str(keyword.arg)] = resolve(
-                        keyword.value, environment
+                        keyword.value, environment, used,
                     )
                 except (AttributeError, KeyError, TypeError, ValueError):
                     continue
+                resolved_sources[str(keyword.arg)] = caller_cells(
+                    _node_id, used,
+                )
             if resolved:
-                queue.append((callee, resolved))
+                queue.append((callee, resolved, resolved_sources))
 
 
 _CALLSITE_SHELL_TYPE_CACHE: dict[tuple[object, ...], type] = {}
@@ -17869,6 +19024,7 @@ def _tensor_descriptor(
 ) -> dict[str, Any] | None:
     """The compiler-owned shape query, with its answer recorded."""
 
+    from .identity_concordance import Unresolved as _Unresolved
     from .identity_concordance import publish_program_abi_graph_identities
 
     publish_program_abi_graph_identities(graph.G)
@@ -17945,11 +19101,8 @@ def _tensor_descriptor(
                 ),
                 binding_name,
             ))
-            formal_conflict = bool(
-                isinstance(formal_fact, tuple)
-                and formal_fact
-                and formal_fact[0] == "conflicting"
-            )
+            # The conflicting fact is ``Unresolved(FORMAL_SHAPE_CONFLICT)``.
+            formal_conflict = isinstance(formal_fact, _Unresolved)
         # Once two exact call edges disagree on any formal, this authored
         # function has no single descriptor graph.  Every intermediate in a
         # callsite-specialized copy must then be derived from that copy's
@@ -17964,9 +19117,7 @@ def _tensor_descriptor(
                 isinstance(formal_row, tuple)
                 and len(formal_row) >= 2
                 and authored_function_name(formal_row[0]) == authored_owner
-                and isinstance(formal_page.latest(formal_row), tuple)
-                and formal_page.latest(formal_row)
-                and formal_page.latest(formal_row)[0] == "conflicting"
+                and isinstance(formal_page.latest(formal_row), _Unresolved)
                 for formal_row in formal_page.rows()
             )
         )
@@ -20464,6 +21615,12 @@ def _fold_callsite_structural_values(
         source_attributes = data.get("attributes") or {}
         if isinstance(data.get("expr_obj"), ast.AST):
             data.setdefault("authored_expr_obj", data["expr_obj"])
+        # The cells the fold's ``known`` held for this node: its operands'
+        # identity cells and, for an Input fed by the planner, its
+        # ``planner_specialization`` cell.  Collected before the parent
+        # edges are cut, so the ``proven_literal`` row below can derive from
+        # them (plan 80, A1.2).
+        literal_sources = _fold_literal_source_cells(graph, int(node_id))
         for parent, _role in tuple(data.get("parents") or ()):
             if graph.G.has_edge(int(parent), int(node_id)):
                 graph.G.remove_edge(int(parent), int(node_id))
@@ -20527,24 +21684,36 @@ def _fold_callsite_structural_values(
         # that happened to fold it.  Several planned shells share one function
         # name, each with its own copy, so a fact folded in one is invisible
         # to a call edge that names another.  The book is keyed by identity,
-        # which is what makes it readable from any of them.
-        try:
-            from .identity_concordance import current_identity_book
+        # which is what makes it readable from any of them.  The row is
+        # DERIVED from the operand cells the fold evaluated (and the node's
+        # own identity cell); a fold with no cell to name posts
+        # ``Unsourced(RAW_PRIMITIVE)`` under the latch.
+        if isinstance(value, (int, float, bool, str, tuple)):
+            from .concordance_declarations import (
+                PLANNER_STRUCTURAL_FOLD, PROVEN_LITERAL,
+            )
+            from .identity_concordance import (
+                Mode, RAW_PRIMITIVE, Unsourced, current_identity_book,
+            )
 
-            if isinstance(value, (int, float, bool, str, tuple)):
-                literal_page = current_identity_book().page("proven_literal")
-                literal_row = (
-                    str(graph.G.graph.get("function_name")),
-                    int(data.get("value_id", node_id)),
-                )
-                if literal_page.latest(literal_row) != value:
-                    literal_page.set(
-                        literal_row,
-                        len(literal_page.history(literal_row)),
-                        value,
-                    )
-        except Exception:
-            pass
+            literal_row = (
+                str(graph.G.graph.get("function_name")),
+                int(data.get("value_id", node_id)),
+            )
+            book = current_identity_book()
+            literal_page = book.pages.get(PROVEN_LITERAL.name)
+            if literal_page is None or literal_page.latest(literal_row) != value:
+                if literal_sources:
+                    round_cells.append(_post_if_changed(
+                        PROVEN_LITERAL, literal_row, value,
+                        stage=PLANNER_STRUCTURAL_FOLD, cells=literal_sources,
+                    ))
+                else:
+                    round_cells.append(book.post(
+                        PROVEN_LITERAL, literal_row, value,
+                        stage=PLANNER_STRUCTURAL_FOLD,
+                        provenance=Unsourced(RAW_PRIMITIVE), mode=Mode.REVISE,
+                    ))
 
     def remove_node(node_id: int) -> None:
         nonlocal topology_changed
@@ -20579,6 +21748,9 @@ def _fold_callsite_structural_values(
             for history in identities.values()
             for value_id in history
         ):
+            # Each ``name_binding`` version naming the removed node revises
+            # to ``Unresolved(BINDING_VERSION_REMOVED)`` (plan 80, A2.7).
+            _post_identity_table_mutation(graph, removed=(node_id,))
             graph.G.graph["identity_table"] = {
                 str(name): tuple(
                     int(value_id) for value_id in history
@@ -20615,6 +21787,9 @@ def _fold_callsite_structural_values(
                 if (int(successor), str(role)) not in children:
                     children.append((int(successor), str(role)))
         identities = graph.G.graph.get("identity_table") or {}
+        # Each ``name_binding`` version naming the alias revises to the
+        # source's identity (plan 80, A2.7); return slots naming it follow.
+        _post_identity_table_mutation(graph, aliases={node_id: source_id})
         graph.G.graph["identity_table"] = {
             str(name): tuple(dict.fromkeys(
                 source_id if int(value_id) == node_id else int(value_id)
@@ -20773,9 +21948,14 @@ def _fold_callsite_structural_values(
 
     fixed_point_iteration = 0
     seen_fixed_point_states: dict[str, int] = {}
+    #: The book cells this round's folds posted (``proven_literal``,
+    #: ``source_control_specialization_concordance``); the round record
+    #: derives from them.
+    round_cells: list = []
     changed = True
     while changed:
         fixed_point_iteration += 1
+        round_cells = []
         iteration_mutations: list[Any] = []
         tensor_state_before = {
             int(node_id): copy.deepcopy(data.get("tensor"))
@@ -21543,34 +22723,31 @@ def _fold_callsite_structural_values(
                     selected_role = (
                         "body" if bool(predicate) else "orelse"
                     )
-                    try:
-                        from .identity_concordance import current_identity_book
-
-                        specialization_page = current_identity_book().page(
-                            "source_control_specialization_concordance"
-                        )
-                        for retained_control_id in (
-                            retained_control_ids or (int(node_id),)
-                        ):
-                            row = (
-                                str(graph.G.graph.get("function_name")),
-                                int(retained_control_id),
-                            )
-                            specialization_page.set(
-                                row,
-                                len(specialization_page.history(row)),
-                                {
-                                    "graph_control_id": int(node_id),
-                                    "source_control_id": int(
-                                        retained_control_id
-                                    ),
-                                    "predicate_value_id": parents.get("test"),
-                                    "selected_role": selected_role,
-                                    "proof": "structural_constant_predicate",
-                                },
-                            )
-                    except Exception:
-                        pass
+                    # The row is the record of this fold: DERIVED from the
+                    # test's ``proven_literal`` cell and the control cell.
+                    # A test absent from ``known`` is recorded as
+                    # ``Unresolved(PREDICATE_NOT_KNOWN)`` -- the truthy
+                    # sentinel no longer records ``selected_role = "body"``
+                    # as a proof.  Whether that absence should also stop
+                    # the fold is held for the user (plan 80, A9.2); the
+                    # fold below still selects as before.
+                    for retained_control_id in (
+                        retained_control_ids or (int(node_id),)
+                    ):
+                        round_cells.extend(_post_control_specialization(
+                            graph, int(retained_control_id),
+                            {
+                                "graph_control_id": int(node_id),
+                                "source_control_id": int(
+                                    retained_control_id
+                                ),
+                                "predicate_value_id": parents.get("test"),
+                                "selected_role": selected_role,
+                                "proof": "structural_constant_predicate",
+                            },
+                            parents.get("test"),
+                            predicate_known=predicate is not unresolved,
+                        ))
                 replace_alias(node_id, value.source_id)
                 known.pop(node_id, None)
                 iteration_mutations.append((
@@ -21645,21 +22822,83 @@ def _fold_callsite_structural_values(
         seen_fixed_point_states.setdefault(
             fixed_point_digest, fixed_point_iteration
         )
-        from .identity_concordance import current_identity_book
+        # The round record: row (function, round), DERIVED from the
+        # ``proven_literal`` / control-specialization cells posted in this
+        # round; a round with no posts derives from the previous round's
+        # cell, and a first round with none has no source to name.
+        from .concordance_declarations import (
+            PLANNER_STRUCTURAL_FOLD, STRUCTURAL_SPECIALIZATION_FIXED_POINT,
+        )
+        from .identity_concordance import (
+            Derived, Mode, RAW_PRIMITIVE, Unsourced, current_identity_book,
+        )
 
-        fixed_point_page = current_identity_book().page(
-            "structural_specialization_fixed_point"
+        fixed_point_book = current_identity_book()
+        fixed_point_row = (
+            str(graph.G.graph.get("function_name") or ""),
+            int(fixed_point_iteration),
         )
-        fixed_point_row = str(graph.G.graph.get("function_name") or "")
-        fixed_point_page.set(
-            fixed_point_row,
-            len(fixed_point_page.history(fixed_point_row)),
-            (
-                fixed_point_digest,
-                bool(changed),
-                tuple(net_tensor_mutations),
-            ),
+        fixed_point_sources = tuple(dict.fromkeys(round_cells))
+        if not fixed_point_sources and fixed_point_iteration > 1:
+            previous_round = fixed_point_book.latest_ref(
+                STRUCTURAL_SPECIALIZATION_FIXED_POINT,
+                (fixed_point_row[0], fixed_point_iteration - 1),
+            )
+            if previous_round is not None:
+                fixed_point_sources = (previous_round,)
+        if not fixed_point_sources:
+            # A first round that folded nothing: the record is about this
+            # function's graph and nothing else on the book changed, so it
+            # derives from the function's ``function_address`` cell.
+            from .concordance_declarations import FUNCTION_ADDRESS
+
+            for candidate in (
+                graph.G.graph.get("qualified_name"),
+                graph.G.graph.get("function_name"),
+            ):
+                if candidate is None:
+                    continue
+                address = fixed_point_book.latest_ref(
+                    FUNCTION_ADDRESS, (str(candidate),),
+                )
+                if address is not None:
+                    fixed_point_sources = (address,)
+                    break
+        fixed_point_fact = (
+            fixed_point_digest,
+            bool(changed),
+            tuple(net_tensor_mutations),
         )
+        previous_record = fixed_point_book.latest_ref(
+            STRUCTURAL_SPECIALIZATION_FIXED_POINT, fixed_point_row,
+        )
+        if previous_record is not None and fixed_point_sources:
+            previous_sources = {
+                source.key
+                for source, _stage in fixed_point_book.edges_into(previous_record)
+            }
+            if previous_sources == {cell.key for cell in fixed_point_sources}:
+                # The fold ran again on this graph.  The same digest from the
+                # same cells is not a new record; a different digest from the
+                # same cells (node data changed with no cell of its own --
+                # a raw tensor annotation) has no cause the book can name and
+                # is recorded under the latch.
+                fixed_point_sources = ()
+                if fixed_point_book.pages[
+                    STRUCTURAL_SPECIALIZATION_FIXED_POINT.name
+                ].latest(fixed_point_row) == fixed_point_fact:
+                    previous_record = False
+        if previous_record is not False:
+            fixed_point_book.post(
+                STRUCTURAL_SPECIALIZATION_FIXED_POINT, fixed_point_row,
+                fixed_point_fact,
+                stage=PLANNER_STRUCTURAL_FOLD,
+                provenance=(
+                    Derived(fixed_point_sources) if fixed_point_sources
+                    else Unsourced(RAW_PRIMITIVE)
+                ),
+                mode=Mode.REVISE,
+            )
         if _progress is not None and (
             fixed_point_iteration <= 3
             or repeated_iteration is not None
@@ -21875,30 +23114,18 @@ def _fold_callsite_structural_values(
             graph.G.graph[
                 "structurally_specialized_conditional_node_ids"
             ] = tuple(dict.fromkeys(map(int, specialized)))
-            try:
-                from .identity_concordance import current_identity_book
-
-                specialization_page = current_identity_book().page(
-                    "source_control_specialization_concordance"
-                )
-                specialization_row = (
-                    str(graph.G.graph.get("function_name")),
-                    int(retained_control_id),
-                )
-                specialization_page.set(
-                    specialization_row,
-                    len(specialization_page.history(specialization_row)),
-                    {
-                        "graph_control_id": int(control_id),
-                        "source_control_id": int(retained_control_id),
-                        "predicate_value_id": int(predicate_id),
-                        "selected_role": str(selected_role),
-                        "rejected_role": str(rejected_role),
-                        "proof": "structural_constant_predicate",
-                    },
-                )
-            except Exception:
-                pass
+            round_cells.extend(_post_control_specialization(
+                graph, int(retained_control_id),
+                {
+                    "graph_control_id": int(control_id),
+                    "source_control_id": int(retained_control_id),
+                    "predicate_value_id": int(predicate_id),
+                    "selected_role": str(selected_role),
+                    "rejected_role": str(rejected_role),
+                    "proof": "structural_constant_predicate",
+                },
+                int(predicate_id), predicate_known=True,
+            ))
             for node_id in sorted(rejected_nodes, reverse=True):
                 remove_node(node_id)
             remove_node(int(control_id))
@@ -21968,6 +23195,17 @@ def _fold_callsite_structural_values(
                     }
                     if selected_sites:
                         graph.G.graph["return_slot_values"] = selected_sites
+                        _post_pruned_return_sites(
+                            graph, selected_sites, int(retained_control_id),
+                        )
+            # Versions whose nodes the arm removal took revise to
+            # ``Unresolved(BINDING_VERSION_REMOVED)`` (plan 80, A2.7).
+            _post_identity_table_mutation(graph, removed=(
+                int(value_id)
+                for history in identities.values()
+                for value_id in history
+                if int(value_id) not in graph.G
+            ))
             graph.G.graph["identity_table"] = {
                 str(name): tuple(
                     int(value_id) for value_id in history
@@ -22062,6 +23300,12 @@ def _fold_callsite_structural_values(
         remove_node(node_id)
     if unused_parameters:
         identities = graph.G.graph.get("identity_table") or {}
+        _post_identity_table_mutation(graph, removed=(
+            int(value_id)
+            for history in identities.values()
+            for value_id in history
+            if int(value_id) not in graph.G
+        ))
         graph.G.graph["identity_table"] = {
             str(name): tuple(
                 int(value_id) for value_id in history
@@ -22264,6 +23508,13 @@ def _alias_projection_to_member(
         ):
             graph.G.remove_node(index_id)
     identities = graph.G.graph.get("identity_table") or {}
+    # The projection's ``name_binding`` versions (and the return slots that
+    # named it) revise to the member's identity (plan 80, A2.7).
+    from .concordance_declarations import PLANNER_PROJECTION_ALIAS
+
+    _post_identity_table_mutation(
+        graph, aliases={projection: leaf_id}, stage=PLANNER_PROJECTION_ALIAS,
+    )
     graph.G.graph["identity_table"] = {
         str(key): tuple(
             leaf_id if int(value_id) == projection else int(value_id)
@@ -22537,6 +23788,9 @@ def _callsite_specialized_shell_type(
     # What each argument is, as the caller's concordance states it.  The
     # specialization's parameters are exactly these values.
     parameter_classes: dict[str, tuple[str, int]] = {}
+    #: Per literal parameter: the caller argument cells that proved it; the
+    #: copy's ``planner_specialization`` rows derive from them.
+    specialization_cells: dict[str, tuple] = {}
     from ..common.tensors.topological_reducer import _source_numeric_scope
     from .identity_concordance import current_identity_book
 
@@ -22634,11 +23888,17 @@ def _callsite_specialized_shell_type(
             except ValueError:
                 pass
             else:
+                # The cells of THIS callsite's argument prove the copy's
+                # literal (design 7.1) and the authored formal's literal.
+                specialization_cells[parameter] = _argument_identity_cells(
+                    caller, int(parent),
+                )
                 _publish_formal_literal(
                     str(original.G.graph.get("function_name")),
                     parameter,
                     specializations[parameter],
                     str(caller.G.graph.get("function_name")),
+                    specialization_cells[parameter],
                 )
         proven_descriptor = tensor_descriptors.get(parameter)
         if proven_descriptor is not None and tuple(
@@ -22649,6 +23909,7 @@ def _callsite_specialized_shell_type(
                 parameter,
                 proven_descriptor,
                 str(caller.G.graph.get("function_name")),
+                _argument_identity_cells(caller, int(parent))[:1],
             )
 
     # Nested functions receive enclosing values through closure identities,
@@ -22727,6 +23988,10 @@ def _callsite_specialized_shell_type(
 
     key = (
         id(function_table),
+        # A planned shell's rows were posted on the book of the compile that
+        # built it; a later compile (a new book) must plan again so its own
+        # book holds them (plan 80, R3).
+        id(current_identity_book()),
         int(reference),
         tuple(sorted(
             (name, stable(value))
@@ -22821,6 +24086,13 @@ def _callsite_specialized_shell_type(
     # to survive into a later tensor-valued occurrence of the same parameter.
     specialized.G.graph["planner_specializations"] = copy.deepcopy(
         specializations
+    )
+    # The copy's own ``planner_specialization`` rows, under the read scope
+    # ``fork_read_scope`` just minted for it (which inherited none of the
+    # shared callee's rows): each literal DERIVED from this callsite's
+    # argument cells, each default from the formal it binds (design 7.1).
+    _post_copy_planner_specializations(
+        specialized, specializations, specialization_cells,
     )
     specialized.G.graph["planner_parameter_classes"] = dict(
         parameter_classes
@@ -23519,7 +24791,19 @@ class ProcessGraphGLSLDeployment:
                         f"resolved={activation_fact!r}"
                     )
                 if incumbent_reference is None:
-                    callsite_identity.set(identity_row, 0, activation_fact)
+                    # The call's ``call_binding`` row (caller scope, call
+                    # node) DERIVED from the call node's cell and the
+                    # callee's ``function_address`` cell; the activation
+                    # record DERIVED from that binding (plan 80, A2.8).  The
+                    # recursion unit stays in the fact tuple (R6).
+                    binding_cell = _post_call_binding(
+                        owner.process_graph, int(node_id), reference,
+                        "constructor" if attributes.get("constructor_ref")
+                        is not None else "callsite_shell",
+                    )
+                    _post_callsite_activation(
+                        identity_row, activation_fact, binding_cell,
+                    )
                 if recursive_unit is not None:
                     # The compilation-unit planner has already proven this
                     # edge belongs to one recursive SCC.  Its call remains in
@@ -23617,7 +24901,8 @@ class ProcessGraphGLSLDeployment:
                 function_shell.hierarchy_plan,
                 function_shell.hierarchy_value_table,
             ) = assign_hierarchy_ids(
-                _build_shell_hierarchy_plan(function_shell)
+                _build_shell_hierarchy_plan(function_shell),
+                shell=function_shell,
             )
         if self._callsite_planning_deferred:
             self.callsite_function_shells = {}
@@ -23631,7 +24916,7 @@ class ProcessGraphGLSLDeployment:
         (
             self.hierarchy_plan,
             self.hierarchy_value_table,
-        ) = assign_hierarchy_ids(_build_shell_hierarchy_plan(self))
+        ) = assign_hierarchy_ids(_build_shell_hierarchy_plan(self), shell=self)
         _attach_profiler(
             self,
             self._profiler,
@@ -23930,7 +25215,7 @@ class ProcessGraphGLSLDeployment:
         (
             self.hierarchy_plan,
             self.hierarchy_value_table,
-        ) = assign_hierarchy_ids(_build_shell_hierarchy_plan(self))
+        ) = assign_hierarchy_ids(_build_shell_hierarchy_plan(self), shell=self)
         return self.hierarchy_plan
 
     def prepare_graph_precompile(
@@ -24379,6 +25664,7 @@ class ProcessGraphGLSLDeployment:
                 self,
             ),
             self.hierarchy_value_table,
+            shell=self,
         )
         return self
 
@@ -24563,6 +25849,7 @@ class ProcessGraphGLSLDeployment:
                         target,
                     ),
                     target.hierarchy_value_table,
+                    shell=target,
                 )
                 target._profiler.trace(
                     path=target.profile_path,
@@ -27394,6 +28681,10 @@ def strategize_shell_deployment(
             if node_ids
         ),
     )
+    # The region ordinal every later reader uses is the subgraph's position
+    # in this tuple; post the rows under that ordinal (plan 80, A2.4).
+    for region_index, subgraph in enumerate(dispatch_subgraphs):
+        _post_deployment_region(graph, subgraph, int(region_index))
     for subgraph, dispatch in zip(
         dispatch_subgraphs,
         dispatch_plan.dispatches,

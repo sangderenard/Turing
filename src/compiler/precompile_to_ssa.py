@@ -17,20 +17,91 @@ import networkx as nx
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from .id_space import serial_of as _id_serial_of
 from .identity_concordance import (
+    NEW,
+    ConcordanceRefusal,
     Derived,
     IdentityPage,
     Mode,
+    Novel,
     Ref,
     Unresolved,
+    Unsourced,
     committed_sequence_row_layout,
     concord_sequence_row_dtypes,
     proven_shape_contract_of,
 )
 from .concordance_declarations import (
+    ADDRESS,
     ARM_VERSION_MISSING,
+    BINDING_WITHDRAWN,
+    CALLSITE_ARGUMENT,
+    CANONICAL_VALUE,
+    CARRIED_ENTRY_NOT_ATTRIBUTED,
+    CARRIED_PORT_VALUE,
+    CARRIED_SNAPSHOT,
+    CELL_SET,
+    CONTROL_CAST,
+    CONTROL_CONST,
+    CONTROL_EXPRESSION,
+    CONTROL_FUNCTION_ROOT,
+    CONTROL_PREDICATE,
     CONTROL_SSA,
+    CONTROL_SSA_CONDITIONAL,
+    CONTROL_SSA_ENTRY,
+    CONTROL_SSA_FINISH,
+    CONTROL_SSA_LOOP,
+    CONTROL_SSA_REGION,
+    CONTROL_UNIFORM_DTYPE,
+    CONTROL_VALUE_ALIAS,
+    CONTROL_VALUE_BINDING,
+    CONTROL_VALUE_CONCORDANCE,
+    DECLARED_PARAMETER,
+    DESCRIPTOR_CELL,
+    FIELD_SLOT_ACCESS,
+    FUNCTION_OUTPUT,
+    FUNCTION_PARAMETER,
+    GRAPH_ID_WITHOUT_CANONICAL_CELL,
+    LEXICAL_READ_BINDING,
+    LOAD,
+    LOOP_CARRIED_BINDING,
+    LOOP_CARRIED_ENTRY,
+    LOOP_ENTRY_STATE,
+    LOOP_RESULT_PORT_BINDING,
+    LOOP_RESULT_VERSION,
+    NAME_ARM_VERSION_MISSING,
+    NAME_BINDING,
+    NO_PRODUCER_AT_USE,
+    PHI_CONDITIONAL,
+    PHI_LOOP_EXIT,
+    PHI_LOOP_HEADER,
+    PHI_RETURN_MERGE,
+    REGION_CALL_RESULT,
+    REGION_CAPTURE_BINDING,
+    REGION_FEED_CONSUMER,
+    REGION_FEED_NO_OPERAND_ROW,
+    REGION_FORMAL_SPLIT,
+    REGION_SIGNATURE,
+    REGION_VALUE_DTYPE,
+    RETURN_SLOT_UNRESOLVED_ON_EDGE,
+    ROW_COLUMN_PROJECTION,
+    SCALAR_ITEM_MERGE,
+    SEQUENCE_LENGTH_CELL,
     SSA_FIELD_VERSION,
+    SSA_VALUE,
+    TABLE_LOOKUP,
+    TENSOR_SHAPE_CONCORDANCE,
+    VERSIONED_WRITE,
+    WHILE_CARRIED_TEST,
+    WHILE_TEST_NO_READ_EXPRESSION,
+    AliasFact,
+    AliasKind,
+    BindingKind,
+    ControlBinding,
     FieldStateKind,
+    ParameterDeclaration,
+    RegionSignature,
+    SSAValueFact,
+    SSAValueOrigin,
 )
 from .control_source import (
     CallBlock,
@@ -970,9 +1041,13 @@ class _ControlSSABuilder:
             int(value_id): int(rank)
             for value_id, rank in (region_value_ranks or {}).items()
         }
-        self.tensor_shape_concordance_scope = str(
-            tensor_shape_concordance_scope or function_name
-        )
+        if tensor_shape_concordance_scope is None:
+            # A lowering with no control scope handed in (the unit-level
+            # entry point, a synthetic function): number one on the book so
+            # two lowerings of one name never share their rows.
+            _label, serial = self._book().mint_scope(f"control:{function_name}")
+            tensor_shape_concordance_scope = f"{function_name}@control:{serial}"
+        self.tensor_shape_concordance_scope = str(tensor_shape_concordance_scope)
         # The source graph's reduction scope on the identity book: per-read
         # bindings, per-loop carried bindings and per-region capture reads
         # are read from its pages, never passed in as tables.
@@ -1123,6 +1198,15 @@ class _ControlSSABuilder:
                     super().__setitem__(key, value)
 
             self.external_values = _TracedExternals()
+        #: ssa id -> the SSAValue object the book's ``ssa_value`` row names
+        #: (plan 80 B2.1): the one private structure the builder keeps,
+        #: because emitted instructions hold the objects and mutate them.
+        self.ssa_value_objects: dict[int, SSAValue] = {}
+        #: The function-root ``cell_set`` cell, posted on first need.
+        self._root_cell: Ref | None = None
+        #: The stage posts are made under until a construct's lowering
+        #: sets its own (conditional, loop, region, finish).
+        self.active_stage: Any = CONTROL_SSA_ENTRY
         self.declared_parameter_only_ids: set[int] = set()
         self.validation_contracts: list[dict[str, object]] = []
         self.control_identity_receipts: list[tuple[int, int, str]] = []
@@ -1299,7 +1383,15 @@ class _ControlSSABuilder:
                 dtype=str(uniform.dtype),
             )
             self.uniform_values[str(uniform.name)] = value
-            self.external_values[int(uniform.value_id)] = value
+            # UNIFORM: the control program's declared dtype for the uniform
+            # (``control_uniform_dtype``, posted at entry) is the cause.
+            self._bind(
+                int(uniform.value_id), value, BindingKind.UNIFORM,
+                self._declared_cell(
+                    CONTROL_UNIFORM_DTYPE.name,
+                    (str(self.tensor_shape_concordance_scope), int(uniform.value_id)),
+                ),
+            )
             self.arguments.append(value)
         # A source parameter is part of the authored function ABI even when
         # its only consumer is a PlanCall that will be materialized after all
@@ -1317,9 +1409,20 @@ class _ControlSSABuilder:
             if value_id in self.external_values:
                 continue
             value = self._value_from_meta(value_id)
-            self.external_values[value_id] = value
+            # PARAMETER_SEED: the parameter's version-0 ``name_binding`` cell
+            # is the cause; the seed is declared CALL_ONLY until a use.
+            binding_cell = (
+                None if self.lexical_read_scope is None
+                else self._book().latest_ref(
+                    NAME_BINDING, (self.lexical_read_scope, str(name), 0),
+                )
+            )
+            self._bind(value_id, value, BindingKind.PARAMETER_SEED, binding_cell)
             self.arguments.append(value)
             self.declared_parameter_only_ids.add(value_id)
+            self._declare_parameter(
+                value_id, ParameterDeclaration.CALL_ONLY, binding_cell,
+            )
         signature_ids = {
             value_id
             for feeds, outputs in self.region_signatures.values()
@@ -1359,7 +1462,8 @@ class _ControlSSABuilder:
             self.variant_projected_target_ids - projected_variant_targets
         ):
             row = self.fresh_value(
-                dtype=str(self._value_from_meta(value_id).dtype or "unknown")
+                dtype=str(self._value_from_meta(value_id).dtype or "unknown"),
+                transform=ROW_COLUMN_PROJECTION, operands=(int(value_id),),
             )
             row.accounting.update({
                 "unbound_variant_source_id": int(value_id),
@@ -1615,17 +1719,17 @@ class _ControlSSABuilder:
         for sequence_id, descriptor in sorted(self.sequence_descriptors.items()):
             if not descriptor.writable or int(sequence_id) in retained_residents:
                 continue
-            zero_index = self.constant_value(0)
-            zero_length = self.constant_value(0)
-            length_address = self.fresh_value(dtype="ptr")
+            length_cell = self.sequence_storage_values[int(sequence_id)][
+                len(descriptor.column_value_ids)
+            ]
+            zero_index = self.constant_value(0, length_cell)
+            zero_length = self.constant_value(0, length_cell)
+            length_address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS, operands=(length_cell,),
+            )
             self.emit(
                 Handler.GetElementPtr,
-                [
-                    self.sequence_storage_values[int(sequence_id)][
-                        len(descriptor.column_value_ids)
-                    ],
-                    zero_index,
-                ],
+                [length_cell, zero_index],
                 length_address,
                 attributes={"binding": "ssa_local_sequence_length"},
             )
@@ -1639,7 +1743,12 @@ class _ControlSSABuilder:
         for sequence_id in sorted(self.joined_sequence_ids):
             if int(sequence_id) not in self.sequence_descriptors:
                 continue
-            flat_sequence_id = GLOBAL_MONOTONIC_IDS.mint()
+            # The flat view's sequence id is a compiler-minted identity: mint
+            # it through the book from the joined sequence's own cell.
+            flat_sequence_id = int(self.fresh_value(
+                dtype="int", transform=DESCRIPTOR_CELL,
+                operands=(int(sequence_id), self._sequence_contract_cell(int(sequence_id))),
+            ).id)
             flat = self._sequence_descriptor(
                 flat_sequence_id,
                 policy="duplicates",
@@ -1653,10 +1762,12 @@ class _ControlSSABuilder:
             flat_length = self.sequence_storage_values[flat_sequence_id][
                 len(flat.column_value_ids)
             ]
-            flat_length_address = self.fresh_value(dtype="ptr")
+            flat_length_address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS, operands=(flat_length,),
+            )
             self.emit(
                 Handler.GetElementPtr,
-                [flat_length, self.constant_value(0)],
+                [flat_length, self.constant_value(0, flat_length)],
                 flat_length_address,
                 attributes={"binding": "ssa_joined_sequence_length"},
             )
@@ -1703,17 +1814,17 @@ class _ControlSSABuilder:
             )
             if descriptor is None:
                 continue
-            zero = self.constant_value(0)
-            zero_index = self.constant_value(0)
-            length_address = self.fresh_value(dtype="ptr")
+            length_cell = self.sequence_storage_values[int(sequence_id)][
+                len(descriptor.column_value_ids)
+            ]
+            zero = self.constant_value(0, length_cell)
+            zero_index = self.constant_value(0, length_cell)
+            length_address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS, operands=(length_cell,),
+            )
             self.emit(
                 Handler.GetElementPtr,
-                [
-                    self.sequence_storage_values[int(sequence_id)][
-                        len(descriptor.column_value_ids)
-                    ],
-                    zero_index,
-                ],
+                [length_cell, zero_index],
                 length_address,
                 attributes={"binding": "ssa_sequence_length"},
             )
@@ -1734,24 +1845,26 @@ class _ControlSSABuilder:
                     ))
                     continue
                 for offset, row in enumerate(rows):
-                    index = self.constant_value(int(offset))
+                    index = self.constant_value(int(offset), length_cell)
                     for column, literal in enumerate(tuple(row)):
-                        address = self.fresh_value(dtype="ptr")
+                        column_cell = self.sequence_storage_values[
+                            int(sequence_id)
+                        ][column]
+                        address = self.fresh_value(
+                            dtype="ptr", transform=ADDRESS,
+                            operands=(column_cell, index),
+                        )
                         self.emit(
                             Handler.GetElementPtr,
-                            [
-                                self.sequence_storage_values[
-                                    int(sequence_id)
-                                ][column],
-                                index,
-                            ],
+                            [column_cell, index],
                             address,
                             attributes={
                                 "binding": "ssa_sequence_literal_table"
                             },
                         )
                         value = self.fresh_value(
-                            dtype=descriptor.column_dtypes[column]
+                            dtype=descriptor.column_dtypes[column],
+                            transform=CONTROL_CONST, operands=(address,),
                         )
                         self.emit(
                             Handler.Const, [], value,
@@ -1765,23 +1878,29 @@ class _ControlSSABuilder:
                         )
                 self.emit(
                     Handler.Store,
-                    [self.constant_value(len(rows)), length_address],
+                    [self.constant_value(len(rows), length_cell), length_address],
                     attributes={
                         "binding": "ssa_sequence_literal_table_length"
                     },
                 )
             elif str(policy).startswith("literal_bytes="):
                 payload = bytes.fromhex(str(policy).split("=", 1)[1])
+                byte_column = self.sequence_storage_values[int(sequence_id)][0]
                 for offset, byte in enumerate(payload):
-                    index = self.constant_value(int(offset))
-                    address = self.fresh_value(dtype="ptr")
+                    index = self.constant_value(int(offset), byte_column)
+                    address = self.fresh_value(
+                        dtype="ptr", transform=ADDRESS,
+                        operands=(byte_column, index),
+                    )
                     self.emit(
                         Handler.GetElementPtr,
-                        [self.sequence_storage_values[int(sequence_id)][0], index],
+                        [byte_column, index],
                         address,
                         attributes={"binding": "ssa_sequence_literal_bytes"},
                     )
-                    value = self.fresh_value(dtype="int")
+                    value = self.fresh_value(
+                        dtype="int", transform=CONTROL_CONST, operands=(address,),
+                    )
                     self.emit(
                         Handler.Const,
                         [],
@@ -1821,12 +1940,19 @@ class _ControlSSABuilder:
             )
             self._register_sequence_lowering(lowering)
             query = self.external_value(int(query_id))
+            contract_cell = self._sequence_contract_cell(int(sequence_id))
             call_result = (
-                self.fresh_value(dtype="bool")
+                self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(query, contract_cell),
+                )
                 if negate else SSAValue(int(result_id), dtype="bool")
             )
             if not negate:
-                self.external_values[int(result_id)] = call_result
+                self._bind(
+                    int(result_id), call_result, BindingKind.SEQUENCE_RESULT,
+                    query, contract_cell,
+                )
             self.emit(
                 Handler.Call,
                 [*self.sequence_storage_values[int(sequence_id)], query],
@@ -1840,7 +1966,10 @@ class _ControlSSABuilder:
             )
             if negate:
                 result = SSAValue(int(result_id), dtype="bool")
-                self.external_values[int(result_id)] = result
+                self._bind(
+                    int(result_id), result, BindingKind.SEQUENCE_RESULT,
+                    call_result,
+                )
                 self.emit(Handler.LNot, [call_result], result)
         scheduled_table_operations = {
             (
@@ -1897,6 +2026,7 @@ class _ControlSSABuilder:
             if ("delete", (effect_id, key_id, sequence_id, storage_identity)) in scheduled_table_operations:
                 continue
             self._emit_table_delete(effect_id, key_id, sequence_id, storage_identity)
+        self.active_stage = CONTROL_SSA
 
     def _sequence_helper_name(
         self, sequence_id: int, operation: str, *related_ids: int,
@@ -1956,8 +2086,13 @@ class _ControlSSABuilder:
             and not pool.key_columns
             and len(pool.column_value_ids) == 1
         )
+        contract_cell = self._sequence_contract_cell(int(sequence_id))
+        query_values = self._table_query_values(query_id)
         result = (
-            self.fresh_value(dtype="int")
+            self.fresh_value(
+                dtype="int", transform=TABLE_LOOKUP,
+                operands=(contract_cell, *query_values),
+            )
             if tensor_child
             else SSAValue(
                 int(result_id),
@@ -1974,7 +2109,10 @@ class _ControlSSABuilder:
             )
         )
         if not tensor_child:
-            self.external_values[int(result_id)] = result
+            self._bind(
+                int(result_id), result, BindingKind.SEQUENCE_RESULT,
+                contract_cell, *query_values,
+            )
         default_operands: tuple[SSAValue, ...] = ()
         if default_literal is not None:
             value_columns = tuple(
@@ -1986,7 +2124,10 @@ class _ControlSSABuilder:
                 descriptor.column_dtypes[value_columns[0]]
                 if len(value_columns) == 1 else "unknown"
             )
-            default_value = self.fresh_value(dtype=str(default_dtype))
+            default_value = self.fresh_value(
+                dtype=str(default_dtype), transform=CONTROL_CONST,
+                operands=(contract_cell, *query_values),
+            )
             self.emit(
                 Handler.Const, [], default_value,
                 attributes={"value": default_literal},
@@ -1997,7 +2138,7 @@ class _ControlSSABuilder:
             [
                 *self.sequence_storage_values[int(sequence_id)],
                 self.sequence_status_values[int(sequence_id)],
-                *self._table_query_values(query_id),
+                *query_values,
                 *default_operands,
             ],
             result,
@@ -2021,15 +2162,20 @@ class _ControlSSABuilder:
             # handle and pool identities are both present. No backend should
             # reconstruct a Python mapping or guess which arena the handle
             # selects.
-            offset = self.fresh_value(dtype="int64")
+            row_stride = self.external_value(pool.row_stride_value_id)
+            offset = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(result, row_stride),
+            )
             row_base = self.produced_value(
                 int(result_id),
                 dtype=str(pool.column_dtypes[0] or "unknown"),
                 claim_provisional_definition=True,
+                cause=(result, offset),
             )
             self.emit(
                 Handler.Mul,
-                [result, self.external_value(pool.row_stride_value_id)],
+                [result, row_stride],
                 offset,
                 attributes={"binding": "keyed_tensor_row_offset"},
             )
@@ -2048,14 +2194,26 @@ class _ControlSSABuilder:
                     f"keyed Tensor sequence {sequence_id} has no concorded "
                     "shape/rank child-pool contract"
                 )
-            shape_offset = self.fresh_value(dtype="int64")
-            shape_address = self.fresh_value(dtype="int32")
-            rank_address = self.fresh_value(dtype="int32")
-            rank = self.fresh_value(dtype="int32")
-            element_count = self.fresh_value(dtype="int32")
+            shape_stride = self.external_value(pool.shape_stride_value_id)
+            shape_offset = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(result, shape_stride),
+            )
+            shape_address = self.fresh_value(
+                dtype="int32", transform=ADDRESS, operands=(shape_offset,),
+            )
+            rank_address = self.fresh_value(
+                dtype="int32", transform=ADDRESS, operands=(result,),
+            )
+            rank = self.fresh_value(
+                dtype="int32", transform=LOAD, operands=(rank_address,),
+            )
+            element_count = self.fresh_value(
+                dtype="int32", transform=LOAD, operands=(result,),
+            )
             self.emit(
                 Handler.Mul,
-                [result, self.external_value(pool.shape_stride_value_id)],
+                [result, shape_stride],
                 shape_offset,
                 attributes={"binding": "keyed_tensor_shape_offset"},
             )
@@ -2077,7 +2235,9 @@ class _ControlSSABuilder:
                 rank,
                 attributes={"binding": "keyed_tensor_row_rank"},
             )
-            length_address = self.fresh_value(dtype="int32")
+            length_address = self.fresh_value(
+                dtype="int32", transform=ADDRESS, operands=(result,),
+            )
             self.emit(
                 Handler.GetElementPtr,
                 [self.external_value(pool.length_value_id), result],
@@ -2106,16 +2266,9 @@ class _ControlSSABuilder:
             # identities.  Commit the complete contract under the authored
             # result identity so the planned numerical occurrence can recover
             # it without rediscovering shape from flat storage.
-            from .identity_concordance import current_identity_book
-            shape_page = current_identity_book().page(
-                "tensor_shape_concordance"
-            )
-            shape_row = (
-                self.tensor_shape_concordance_scope, int(result_id)
-            )
-            shape_page.set(
-                shape_row,
-                max(shape_page.columns, default=-1) + 1,
+            # DERIVED(the lookup's ``ssa_value`` cell and the cells it names).
+            self._post_tensor_shape_contract(
+                int(result_id),
                 {
                     "program_abi_storage": "span",
                     "program_abi_rank": int(
@@ -2127,8 +2280,33 @@ class _ControlSSABuilder:
                     "tensor_element_count_value_id": int(element_count.id),
                     "source": "control-keyed-tensor-lookup",
                 },
+                result, shape_address, rank, element_count,
             )
-            self.external_values[int(result_id)] = row_base
+            self._bind(
+                int(result_id), row_base, BindingKind.SEQUENCE_RESULT,
+                result, offset,
+            )
+
+    def _post_tensor_shape_contract(
+        self, value_id: int, contract: dict, *cells: Any,
+    ) -> Ref:
+        """``tensor_shape_concordance`` row ``(control scope, value)``: a
+        REVISE DERIVED from ``cells`` (and the incumbent, when the new
+        contract is merged over one), replacing the silent page-wide
+        column write."""
+
+        book = self._book()
+        row = (str(self.tensor_shape_concordance_scope), int(value_id))
+        incumbent = book.latest_ref(TENSOR_SHAPE_CONCORDANCE, row)
+        sources = self._cells(incumbent, *cells, self._canonical_cell(value_id))
+        if not sources:
+            sources = (self._function_root(),)
+        return book.post(
+            TENSOR_SHAPE_CONCORDANCE, row, dict(contract),
+            stage=self.active_stage,
+            provenance=Derived(sources),
+            mode=Mode.REVISE,
+        )
     def _emit_table_store(
         self, _effect_id: int, key_id: int | tuple[int, ...],
         value_id: int, sequence_id: int
@@ -2177,7 +2355,9 @@ class _ControlSSABuilder:
         length_cell = self.sequence_storage_values[int(sequence_id)][
             len(descriptor.column_value_ids)
         ]
-        length = self.fresh_value(dtype="int64")
+        length = self.fresh_value(
+            dtype="int64", transform=LOAD, operands=(length_cell,),
+        )
         self.emit(
             Handler.Load, [length_cell], length,
             attributes={
@@ -2185,9 +2365,11 @@ class _ControlSSABuilder:
                 "sequence_id": int(sequence_id),
             },
         )
-        normalized = self.fresh_value(dtype="int64")
+        normalized = self.fresh_value(
+            dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
+        )
         self.emit(
-            Handler.Add, [length, self.constant_value(int(literal))], normalized,
+            Handler.Add, [length, self.constant_value(int(literal), length)], normalized,
             attributes={
                 "binding": "ssa_sequence_negative_index",
                 "sequence_id": int(sequence_id),
@@ -2244,10 +2426,13 @@ class _ControlSSABuilder:
         for column, (column_id, value_id) in enumerate(zip(
             descriptor.column_value_ids, row_value_ids
         )):
-            address = self.fresh_value(dtype="ptr")
+            column_value = self.external_value(int(column_id))
+            address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS, operands=(column_value, index),
+            )
             self.emit(
                 Handler.GetElementPtr,
-                [self.external_value(int(column_id)), index],
+                [column_value, index],
                 address,
                 attributes={
                     "binding": "ssa_sequence_row_store",
@@ -2264,8 +2449,10 @@ class _ControlSSABuilder:
                     "column": int(column),
                 },
             )
-        self.external_values[int(result_id)] = self.external_value(
-            int(sequence_id)
+        self._bind(
+            int(result_id), self.external_value(int(sequence_id)),
+            BindingKind.SEQUENCE_RESULT,
+            self._sequence_contract_cell(int(sequence_id)), index,
         )
 
     def _emit_table_delete(
@@ -2390,9 +2577,16 @@ class _ControlSSABuilder:
             first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
         )
         self._register_sequence_lowering(lowering)
-        value = self.fresh_value(dtype=str(descriptor.column_dtypes[0]))
+        contract_cell = self._sequence_contract_cell(int(sequence_id))
+        value = self.fresh_value(
+            dtype=str(descriptor.column_dtypes[0]), transform=CONTROL_CONST,
+            operands=(contract_cell,),
+        )
         self.emit(Handler.Const, [], value, attributes={"value": literal})
-        status = self.fresh_value(dtype="int")
+        status = self.fresh_value(
+            dtype="int", transform=REGION_CALL_RESULT,
+            operands=(contract_cell, value),
+        )
         self.emit(
             Handler.Call,
             [
@@ -2438,9 +2632,16 @@ class _ControlSSABuilder:
             first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
         )
         self._register_sequence_lowering(lowering)
-        value = self.fresh_value(dtype=str(descriptor.column_dtypes[0]))
+        contract_cell = self._sequence_contract_cell(int(sequence_id))
+        value = self.fresh_value(
+            dtype=str(descriptor.column_dtypes[0]), transform=CONTROL_CONST,
+            operands=(contract_cell,),
+        )
         self.emit(Handler.Const, [], value, attributes={"value": literal})
-        status = self.fresh_value(dtype="int")
+        status = self.fresh_value(
+            dtype="int", transform=REGION_CALL_RESULT,
+            operands=(contract_cell, value),
+        )
         self.emit(
             Handler.Call,
             [
@@ -2511,22 +2712,30 @@ class _ControlSSABuilder:
         # A whole-sequence extend (``resident += other``) has no authored
         # bounds: 0 and a beyond-any-length constant span the source, and
         # the helper's Python-slice clipping does the rest.
+        source_cell = self._sequence_contract_cell(int(source_id))
         if lower_id is None:
-            lower_value = self.fresh_value(dtype="int")
+            lower_value = self.fresh_value(
+                dtype="int", transform=CONTROL_CONST, operands=(source_cell,),
+            )
             self.emit(
                 Handler.Const, [], lower_value, attributes={"value": 0}
             )
         else:
             lower_value = self.external_value(int(lower_id), dtype="int")
         if upper_id is None:
-            upper_value = self.fresh_value(dtype="int")
+            upper_value = self.fresh_value(
+                dtype="int", transform=CONTROL_CONST, operands=(source_cell,),
+            )
             self.emit(
                 Handler.Const, [], upper_value,
                 attributes={"value": 2 ** 31 - 1},
             )
         else:
             upper_value = self.external_value(int(upper_id), dtype="int")
-        status = self.fresh_value(dtype="int")
+        status = self.fresh_value(
+            dtype="int", transform=REGION_CALL_RESULT,
+            operands=(*storage, lower_value, upper_value),
+        )
         self.emit(
             Handler.Call,
             [
@@ -2562,9 +2771,11 @@ class _ControlSSABuilder:
                 f"sequence {sequence_id} has no resident descriptor",
             ))
             return
-        zero = self.fresh_value(dtype="int64")
-        self.emit(Handler.Const, [], zero, attributes={"value": 0})
         length_address = storage[len(descriptor.column_value_ids)]
+        zero = self.fresh_value(
+            dtype="int64", transform=CONTROL_CONST, operands=(length_address,),
+        )
+        self.emit(Handler.Const, [], zero, attributes={"value": 0})
         self.emit(
             Handler.Store, [zero, length_address],
             attributes={
@@ -2615,9 +2826,13 @@ class _ControlSSABuilder:
                 *self.sequence_storage_values[int(source_id)],
             )
         }.values())
-        status = self.fresh_value(dtype="int")
+        status = self.fresh_value(
+            dtype="int", transform=REGION_CALL_RESULT, operands=tuple(storage),
+        )
         if width_literal:
-            width = self.fresh_value(dtype="int")
+            width = self.fresh_value(
+                dtype="int", transform=CONTROL_CONST, operands=tuple(storage),
+            )
             self.emit(
                 Handler.Const, [], width,
                 attributes={"value": int(width_id)},
@@ -2666,7 +2881,10 @@ class _ControlSSABuilder:
             first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
         )
         self._register_sequence_lowering(lowering)
-        status = self.fresh_value(dtype="int")
+        status = self.fresh_value(
+            dtype="int", transform=REGION_CALL_RESULT,
+            operands=(self._sequence_contract_cell(int(sequence_id)),),
+        )
         self.emit(
             Handler.Call,
             [
@@ -2724,12 +2942,17 @@ class _ControlSSABuilder:
                 *self.sequence_storage_values[int(source_id)],
             )
         }.values())
-        width_value = self.fresh_value(dtype="int")
+        width_value = self.fresh_value(
+            dtype="int", transform=CONTROL_CONST, operands=tuple(storage),
+        )
         self.emit(
             Handler.Const, [], width_value,
             attributes={"value": int(byte_width)},
         )
-        status = self.fresh_value(dtype="int")
+        status = self.fresh_value(
+            dtype="int", transform=REGION_CALL_RESULT,
+            operands=(*storage, width_value),
+        )
         self.emit(
             Handler.Call,
             [
@@ -2834,19 +3057,6 @@ class _ControlSSABuilder:
                 if instruction.res is not None
             )
 
-    def fresh_value(
-        self,
-        *,
-        dtype: str | None = None,
-        shape: tuple[int, ...] = (),
-    ) -> SSAValue:
-        value = SSAValue(
-            GLOBAL_MONOTONIC_IDS.mint(),
-            dtype=dtype,
-            shape=shape,
-        )
-        return value
-
     def external_value(
         self,
         value_id: int,
@@ -2863,8 +3073,13 @@ class _ControlSSABuilder:
                 # incumbent value in the same resident field.  This matters
                 # when an in-place update uses one graph identity for both the
                 # pre-branch and written versions.
-                self.external_values[value_id] = self.external_value(
-                    field_value_id, dtype=field_dtype,
+                incumbent = self.external_value(field_value_id, dtype=field_dtype)
+                # FIELD_INCUMBENT: the incumbent's own binding cell is the
+                # cause (its ``ssa_field_version`` cell when lane C posted
+                # one is reached through that binding).
+                self._bind(
+                    value_id, incumbent, BindingKind.FIELD_INCUMBENT,
+                    self._binding_cell(field_value_id),
                 )
         sequence_id = self.sequence_length_values.get(value_id)
         if sequence_id is not None and value_id not in self.external_values:
@@ -2881,17 +3096,26 @@ class _ControlSSABuilder:
                         "sequence_id": int(sequence_id),
                     },
                 )
-                self.external_values[value_id] = value
+                # SEQUENCE_LENGTH: the sequence's contract cell is the cause.
+                self._bind(
+                    value_id, value, BindingKind.SEQUENCE_LENGTH,
+                    self._sequence_contract_cell(int(sequence_id)), length_cell,
+                )
         if follow_aliases:
             seen: set[int] = set()
             while value_id in self.value_aliases and value_id not in seen:
                 seen.add(value_id)
                 value_id = int(self.value_aliases[value_id])
-        self.declared_parameter_only_ids.discard(value_id)
+        if value_id in self.declared_parameter_only_ids:
+            self.declared_parameter_only_ids.discard(value_id)
+            self._declare_parameter(value_id, ParameterDeclaration.USED)
         value = self.external_values.get(value_id)
         if value is None:
             value = self._value_from_meta(value_id, dtype=dtype)
-            self.external_values[value_id] = value
+            # PROVISIONAL_ARGUMENT: a value minted from absence -- no region
+            # has published the id yet -- is recorded as unresolved; the
+            # producer's later claim is the revision that resolves it.
+            self._bind_unresolved(value_id, NO_PRODUCER_AT_USE, value=value)
             self.arguments.append(value)
         elif dtype is not None and str(value.dtype or "unknown") != str(dtype):
             # A structural control use can carry a stronger contract than an
@@ -2904,12 +3128,40 @@ class _ControlSSABuilder:
                 device=value.device,
                 accounting=dict(value.accounting),
             )
-            self.external_values[value_id] = refined
+            # REFINED: the value's row is revised to the demanded dtype and
+            # the binding derives from that revision.
+            previous_binding = self._binding_cell(value_id)
+            self.ssa_value_objects[int(refined.id)] = refined
+            revised = self._revise_value(refined, previous_binding)
+            self._bind(
+                value_id, refined, BindingKind.REFINED, previous_binding, revised,
+            )
             self.arguments[:] = [
                 refined if item is value else item for item in self.arguments
             ]
             value = refined
         return value
+
+    def _sequence_contract_cell(self, sequence_id: int) -> Ref | None:
+        """The ``sequence_contract_concordance`` cell of a resident sequence
+        under this function's scopes, if committed."""
+
+        book = self._book()
+        page = book.pages.get("sequence_contract_concordance")
+        if page is None:
+            return None
+        for scope in (
+            self.function_name, str(self.tensor_shape_concordance_scope),
+            self.lexical_read_scope,
+        ):
+            if scope is None:
+                continue
+            cell = self._declared_cell(
+                "sequence_contract_concordance", (scope, int(sequence_id)),
+            )
+            if cell is not None:
+                return cell
+        return None
 
     def _value_from_meta(
         self, value_id: int, *, dtype: str | None = None
@@ -2942,9 +3194,20 @@ class _ControlSSABuilder:
         *,
         dtype: str | None = None,
         claim_provisional_definition: bool = False,
+        cause: tuple = (),
     ) -> SSAValue:
+        """The SSA value a definition of graph id ``value_id`` writes.
+
+        ``cause`` names the cells of the definition being emitted (its
+        operands): a claim that resolves a provisional binding derives from
+        them, so the resolution has the cause the api asks for.
+        """
+
         value_id = int(value_id)
         value = self.external_values.get(value_id)
+        # The region that publishes this id, when one does: its
+        # ``region_signature`` cell is the cause of a produced binding.
+        producer = self._cells(self._producing_region_cell(value_id), *cause)
         if value is not None:
             if value in self.arguments:
                 if (
@@ -2963,15 +3226,24 @@ class _ControlSSABuilder:
                     self.arguments.remove(value)
                     if dtype is not None:
                         value.dtype = str(dtype)
+                    # REGION_RESULT: the claim resolves the PROVISIONAL row.
+                    revised = self._revise_value(value, *producer)
+                    self._bind(
+                        value_id, value, BindingKind.REGION_RESULT,
+                        *producer, revised,
+                    )
                     return value
                 # A preallocated arena is commonly both the initial value
                 # entering control and the destination published by a later
                 # region.  SSA versions the write; it is not an identity
                 # conflict.  The source value ID stays in accounting so the
                 # public arena-address policy can rotate the two versions.
+                previous = value
                 value = self.fresh_value(
                     dtype=dtype or value.dtype,
                     shape=tuple(value.shape),
+                    transform=VERSIONED_WRITE,
+                    operands=(self._binding_cell(value_id), previous),
                 )
                 value.accounting.update({
                     **dict(self.external_values[value_id].accounting or {}),
@@ -2981,14 +3253,33 @@ class _ControlSSABuilder:
                         if value_id in self.inout_value_ids else {}
                     ),
                 })
-                self.external_values[value_id] = value
+                self._bind(
+                    value_id, value, BindingKind.VERSIONED_WRITE, *producer,
+                )
             return value
         value = self._value_from_meta(value_id, dtype=dtype)
-        self.external_values[value_id] = value
+        self._bind(value_id, value, BindingKind.REGION_RESULT, *producer)
         return value
 
-    def constant_value(self, literal: int) -> SSAValue:
-        value = self.fresh_value(dtype="int")
+    def _producing_region_cell(self, value_id: int) -> Ref | None:
+        """The ``region_signature`` cell of the region whose outputs name
+        ``value_id``, when one is on the book."""
+
+        for region_index, (_feeds, outputs) in self.region_signatures.items():
+            if int(value_id) in outputs:
+                return self._declared_cell(
+                    REGION_SIGNATURE.name, (self._scope(), int(region_index)),
+                )
+        return None
+
+    def constant_value(self, literal: int, *operands: Any) -> SSAValue:
+        """An int literal the builder needs: CONTROL_CONST from ``operands``
+        (the cells of what the literal indexes or bounds; a bare literal has
+        no identity cell of its own and names the function root)."""
+
+        value = self.fresh_value(
+            dtype="int", transform=CONTROL_CONST, operands=operands,
+        )
         self.emit(
             Handler.Const,
             [],
@@ -3022,10 +3313,13 @@ class _ControlSSABuilder:
             linear_index = indices[0]
             row_width = math.prod(row_shape)
             if row_width != 1:
-                offset = self.fresh_value(dtype="int64")
+                offset = self.fresh_value(
+                    dtype="int64", transform=CONTROL_EXPRESSION,
+                    operands=(linear_index, source),
+                )
                 self.emit(
                     Handler.Mul,
-                    [linear_index, self.constant_value(int(row_width))],
+                    [linear_index, self.constant_value(int(row_width), source)],
                     offset,
                     attributes={
                         **attributes,
@@ -3038,8 +3332,10 @@ class _ControlSSABuilder:
                 result_id,
                 dtype=str(source.dtype or "unknown"),
                 claim_provisional_definition=claim_provisional_definition,
+                cause=(source, linear_index),
             )
             result.shape = row_shape
+            self._revise_value(result, source)
             self.emit(
                 Handler.GetElementPtr,
                 [source, linear_index],
@@ -3051,7 +3347,9 @@ class _ControlSSABuilder:
                 },
             )
             return result
-        address = self.fresh_value(dtype="ptr")
+        address = self.fresh_value(
+            dtype="ptr", transform=ADDRESS, operands=(source, *indices),
+        )
         self.emit(
             Handler.GetElementPtr,
             [source, *indices],
@@ -3071,6 +3369,7 @@ class _ControlSSABuilder:
             result_id,
             dtype=dtype,
             claim_provisional_definition=claim_provisional_definition,
+            cause=(address,),
         )
         self.emit(Handler.Load, [address], result, attributes=attributes)
         return result
@@ -3099,8 +3398,12 @@ class _ControlSSABuilder:
         if selected_sequence:
             handle = source
         else:
-            handle_address = self.fresh_value(dtype="ptr")
-            handle = self.fresh_value(dtype="int")
+            handle_address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS, operands=(source, induction),
+            )
+            handle = self.fresh_value(
+                dtype="int", transform=LOAD, operands=(handle_address,),
+            )
             handle_attributes = {
                 **attributes, "binding": "nested_row_handle"
             }
@@ -3120,8 +3423,14 @@ class _ControlSSABuilder:
         child_data, _child_lengths, sequence_stride, row_stride = child
         row_index = induction
         if selected_sequence:
-            sequence_offset = self.fresh_value(dtype="int")
-            row_index = self.fresh_value(dtype="int")
+            sequence_offset = self.fresh_value(
+                dtype="int", transform=CONTROL_EXPRESSION,
+                operands=(handle, sequence_stride),
+            )
+            row_index = self.fresh_value(
+                dtype="int", transform=CONTROL_EXPRESSION,
+                operands=(sequence_offset, induction),
+            )
             self.emit(
                 Handler.Mul,
                 [handle, sequence_stride],
@@ -3138,8 +3447,14 @@ class _ControlSSABuilder:
                     **attributes, "binding": "nested_sequence_row"
                 },
             )
-        offset = self.fresh_value(dtype="int")
-        row_base = self.fresh_value(dtype=str(child_data.dtype or "unknown"))
+        offset = self.fresh_value(
+            dtype="int", transform=CONTROL_EXPRESSION,
+            operands=(row_index if selected_sequence else handle, row_stride),
+        )
+        row_base = self.fresh_value(
+            dtype=str(child_data.dtype or "unknown"),
+            transform=ROW_COLUMN_PROJECTION, operands=(child_data, offset),
+        )
         row_base.accounting["source_value_id"] = int(target_id)
         self.emit(
             Handler.Mul,
@@ -3153,7 +3468,10 @@ class _ControlSSABuilder:
             row_base,
             attributes={**attributes, "binding": "nested_row_base"},
         )
-        self.external_values[int(target_id)] = row_base
+        self._bind(
+            int(target_id), row_base, BindingKind.SEQUENCE_RESULT,
+            child_data, offset,
+        )
         return row_base
 
     def _nested_child_storage(
@@ -3164,12 +3482,21 @@ class _ControlSSABuilder:
         child = self.nested_child_rows.get(child_key)
         if child is None:
             target_meta = self.region_value_meta.get(int(target_id))
+            # The child arena's four formals descend from the nested source
+            # (``child_key[1]``, a graph id) and the target they serve.
+            child_operands = (int(child_key[1]), int(target_id))
             child_data = self.fresh_value(dtype=(
                 None if target_meta is None else str(target_meta.dtype)
-            ))
-            child_lengths = self.fresh_value(dtype="int")
-            sequence_stride = self.fresh_value(dtype="int")
-            row_stride = self.fresh_value(dtype="int")
+            ), transform=DESCRIPTOR_CELL, operands=child_operands)
+            child_lengths = self.fresh_value(
+                dtype="int", transform=DESCRIPTOR_CELL, operands=(child_data,),
+            )
+            sequence_stride = self.fresh_value(
+                dtype="int", transform=DESCRIPTOR_CELL, operands=(child_data,),
+            )
+            row_stride = self.fresh_value(
+                dtype="int", transform=DESCRIPTOR_CELL, operands=(child_data,),
+            )
             child_data.accounting.update({
                 "nested_row_source_kind": str(child_key[0]),
                 "nested_row_source_id": int(child_key[1]),
@@ -3193,19 +3520,34 @@ class _ControlSSABuilder:
         carried machinery did not map it to the current iteration.
         """
 
-        try:
-            from .identity_concordance import current_identity_book
-
-            page = current_identity_book().page("callsite_argument")
-            for position, (graph_id, value) in enumerate(
-                zip(argument_ids, arguments)
+        book = self._book()
+        for position, (graph_id, value) in enumerate(
+            zip(argument_ids, arguments)
+        ):
+            row = (str(self.function_name), int(callsite_id), position)
+            fact = (int(graph_id), int(value.id), bool(self.loop_targets))
+            # DERIVED(the ``call_argument_operand`` cell of this position,
+            # the resolved binding cell of the argument).
+            sources = self._cells(
+                self._declared_cell(
+                    "call_argument_operand",
+                    (self.lexical_read_scope, int(callsite_id), int(position)),
+                ) if self.lexical_read_scope is not None else None,
+                self._binding_cell(int(graph_id)), value,
+            )
+            latest = book.latest_ref(CALLSITE_ARGUMENT, row)
+            if latest is not None and (
+                book.pages[CALLSITE_ARGUMENT.name].cells.get(
+                    (row, latest.column)
+                ) == fact
             ):
-                row = (str(self.function_name), int(callsite_id), position)
-                page.set(row, len(page.history(row)), (
-                    int(graph_id), int(value.id), bool(self.loop_targets),
-                ))
-        except Exception:
-            pass
+                continue
+            book.post(
+                CALLSITE_ARGUMENT, row, fact,
+                stage=self.active_stage,
+                provenance=Derived(sources),
+                mode=Mode.REVISE,
+            )
 
     def emit_plan_callsite(self, callsite_id: int, *, location: str) -> None:
         """Lower a scheduled call statement to a placeholder Call.
@@ -3272,7 +3614,10 @@ class _ControlSSABuilder:
             # latch operand the loop machinery must see produced.  The
             # placeholder projections own the result objects by identity;
             # frame linking rebinds the linked call's projections onto them.
-            aggregate = self.fresh_value(dtype="ssa.aggregate")
+            aggregate = self.fresh_value(
+                dtype="ssa.aggregate", transform=REGION_CALL_RESULT,
+                operands=tuple(arguments),
+            )
             self.emit(
                 Handler.Call,
                 arguments,
@@ -3289,16 +3634,18 @@ class _ControlSSABuilder:
                     "aggregate_index": int(output_index),
                     "source_output_id": int(output_id),
                 }
-                address = self.fresh_value(dtype="ptr")
+                address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS, operands=(aggregate,),
+                )
                 self.emit(
                     Handler.GetElementPtr,
-                    [aggregate, self.constant_value(output_index)],
+                    [aggregate, self.constant_value(output_index, aggregate)],
                     address,
                     attributes=projection_attributes,
                 )
                 # The projection's dtype/shape are the region-declared facts
                 # of the caller result, not the aggregate handle's dtype.
-                result = self.produced_value(int(output_id))
+                result = self.produced_value(int(output_id), cause=(address,))
                 self.emit(
                     Handler.Load, [address], result,
                     attributes=projection_attributes,
@@ -3311,7 +3658,10 @@ class _ControlSSABuilder:
             result = self.external_values.get(primary)
             if result is None:
                 result = self._value_from_meta(primary)
-                self.external_values[primary] = result
+                # CALL_RESULT: the callsite's argument cells are the cause.
+                self._bind(
+                    primary, result, BindingKind.CALL_RESULT, *arguments,
+                )
         self.emit(
             Handler.Call,
             arguments,
@@ -3335,6 +3685,438 @@ class _ControlSSABuilder:
         from .identity_concordance import current_identity_book
 
         return current_identity_book()
+
+    # ------------------------------------------- the book's api, step 5
+    # Every SSA value this builder mints is a NOVEL ``ssa_value`` row; every
+    # graph id it binds is a ``control_value_binding`` revision DERIVED from
+    # the cells that caused it (plan 80, part B).  ``external_values`` and
+    # ``ssa_value_objects`` are the read views: the dict readers keep, and
+    # the object table the emitted instructions hold (objects are mutated
+    # in place after creation, so the book holds facts and the table holds
+    # the objects, keyed by the book's id).
+
+    def _scope(self) -> Any:
+        """The function scope the builder's pages are keyed by: the control
+        scope of THIS lowering (book-numbered by ``mint_scope``).
+
+        Not the graph's ``lexical_read_scope``: one ControlProgram is lowered
+        more than once while specializations settle (see
+        ``_enter_loop_state``), and rows whose facts are this lowering's
+        physical cells (``carried_snapshot``, ``function_output``, ...) must
+        not be concorded against another lowering's.  Graph-side cells
+        (``canonical_value``, ``name_binding``) are read under
+        ``lexical_read_scope`` as before.
+        """
+
+        return str(self.tensor_shape_concordance_scope)
+
+    def _stage(self, stage: Any = None) -> Any:
+        return stage if stage is not None else self.active_stage
+
+    def _function_root(self) -> Ref:
+        """The one root row of this lowering: ``cell_set`` row ``(scope, 0)``
+        posted NOVEL(CONTROL_FUNCTION_ROOT) with no NEW, so it mints nothing
+        and carries only its origin edge.  A mint that has no more specific
+        cell to name (a literal, a function the reducer never saw) names it.
+        """
+
+        if self._root_cell is None:
+            self._root_cell = self._book().post(
+                CELL_SET, (self._scope(), 0), (),
+                stage=CONTROL_SSA_ENTRY,
+                provenance=Novel(CONTROL_FUNCTION_ROOT, ()),
+                mode=Mode.CONCORD,
+            )
+        return self._root_cell
+
+    def _cell_set(self, cells: tuple, stage: Any = None) -> Ref:
+        """One ``cell_set`` row DERIVED from every cell in ``cells``; its
+        fact repeats them as keys.  The operand of a mint made from several
+        cells (the api's transforms take one operand)."""
+
+        book = self._book()
+        scope = self._scope()
+        ordinal = book.page(CELL_SET).scope_row_count(scope) + 1
+        return book.post(
+            CELL_SET, (scope, ordinal), tuple(cell.key for cell in cells),
+            stage=self._stage(stage),
+            provenance=Derived(tuple(cells)),
+            mode=Mode.CONCORD,
+        )
+
+    def _canonical_cell(self, graph_id: Any) -> Ref | None:
+        """The ``canonical_value`` cell of graph id ``graph_id``, if the
+        reducer saw this function."""
+
+        if self.lexical_read_scope is None or graph_id is None:
+            return None
+        return self._book().latest_ref(
+            CANONICAL_VALUE, (self.lexical_read_scope, int(graph_id)),
+        )
+
+    def _declared_cell(self, page_name: str, row: tuple) -> Ref | None:
+        """Read-side lookup of a cell on a page another lane declares
+        (``item_operand``, ``consumer_operand``, ...): None until the page
+        is declared and the cell exists."""
+
+        book = self._book()
+        page = book.registry.pages.get(page_name)
+        if page is None:
+            return None
+        return book.latest_ref(page, row)
+
+    def _cells(self, *items: Any) -> tuple[Ref, ...]:
+        """Cells named loosely -- a Ref, an SSAValue (its ``ssa_value``
+        cell), a graph id (its ``canonical_value`` cell) or None -- as the
+        distinct Refs that exist."""
+
+        found: list[Ref] = []
+        for item in items:
+            if item is None:
+                continue
+            if isinstance(item, Ref):
+                cell = item
+            elif isinstance(item, SSAValue):
+                cell = self._value_cell(item)
+            elif isinstance(item, int) and not isinstance(item, bool):
+                cell = self._canonical_cell(item)
+            else:
+                continue
+            if cell is not None and cell not in found:
+                found.append(cell)
+        return tuple(found)
+
+    def _value_cell(
+        self, value: SSAValue, *cells: Any, stage: Any = None,
+    ) -> Ref:
+        """The ``ssa_value`` cell of ``value``.
+
+        A value the builder minted has its row already.  A value whose id
+        IS a graph id (``_value_from_meta``, a region's declared value) is
+        adopted on first sight: its row is DERIVED from the id's
+        ``canonical_value`` cell (and ``cells``), or posted
+        ``Unsourced(GRAPH_ID_WITHOUT_CANONICAL_CELL)`` when the reducer
+        never saw this function (plan 80 B6 R8).
+        """
+
+        book = self._book()
+        row = (self._scope(), int(value.id))
+        ref = book.latest_ref(SSA_VALUE, row)
+        if ref is not None:
+            # The object most recently seen under the id is the one the
+            # emitted instructions hold (a produced value replaces the
+            # object its mint handed out).
+            self.ssa_value_objects[int(value.id)] = value
+            return ref
+        fact = SSAValueFact(
+            value.dtype, tuple(value.shape or ()),
+            SSAValueOrigin.ADOPTED_GRAPH_ID,
+        )
+        sources = self._cells(self._canonical_cell(value.id), *cells)
+        ref = book.post(
+            SSA_VALUE, row, fact,
+            stage=self._stage(stage),
+            provenance=(
+                Derived(sources) if sources
+                else Unsourced(GRAPH_ID_WITHOUT_CANONICAL_CELL)
+            ),
+            mode=Mode.REVISE,
+        )
+        self.ssa_value_objects[int(value.id)] = value
+        return ref
+
+    def fresh_value(
+        self,
+        *,
+        dtype: str | None = None,
+        shape: tuple[int, ...] = (),
+        transform: Any,
+        operands: tuple = (),
+        stage: Any = None,
+    ) -> SSAValue:
+        """Mint one SSA value through the book: NOVEL(``transform``,
+        operand) on ``ssa_value`` row ``(scope, NEW)``.
+
+        ``operands`` name what the value was made from (Refs, SSAValues or
+        graph ids, see ``_cells``); several cells become one ``cell_set``
+        row, none becomes the function root.  The id is the book's.
+        """
+
+        stage = self._stage(stage)
+        cells = self._cells(*operands)
+        if len(cells) == 1:
+            operand = cells[0]
+        elif cells:
+            operand = self._cell_set(cells, stage)
+        else:
+            operand = self._function_root()
+        ref = self._book().post(
+            SSA_VALUE, (self._scope(), NEW),
+            SSAValueFact(dtype, tuple(shape), SSAValueOrigin.MINTED),
+            stage=stage,
+            provenance=Novel(transform, (operand,)),
+            mode=Mode.REVISE,
+        )
+        value = SSAValue(int(ref.row[1]), dtype=dtype, shape=shape)
+        self.ssa_value_objects[int(value.id)] = value
+        return value
+
+    def _revise_value(
+        self, value: SSAValue, *cells: Any, stage: Any = None,
+    ) -> Ref | None:
+        """Record an in-place dtype/shape change of ``value`` as a REVISE
+        of its ``ssa_value`` row DERIVED(previous cell, ``cells``)."""
+
+        book = self._book()
+        row = (self._scope(), int(value.id))
+        previous = book.latest_ref(SSA_VALUE, row)
+        if previous is None:
+            return self._value_cell(value, *cells, stage=stage)
+        recorded = book.pages[SSA_VALUE.name].cells.get((row, previous.column))
+        origin = getattr(recorded, "origin", SSAValueOrigin.ADOPTED_GRAPH_ID)
+        fact = SSAValueFact(value.dtype, tuple(value.shape or ()), origin)
+        if fact == recorded:
+            return previous
+        return book.post(
+            SSA_VALUE, row, fact,
+            stage=self._stage(stage),
+            provenance=Derived(self._cells(previous, *cells)),
+            mode=Mode.REVISE,
+        )
+
+    def _binding_cell(self, graph_id: Any) -> Ref | None:
+        return self._book().latest_ref(
+            CONTROL_VALUE_BINDING, (self._scope(), int(graph_id)),
+        )
+
+    def _binding_fact(self, graph_id: Any) -> Any:
+        cell = self._binding_cell(graph_id)
+        if cell is None:
+            return None
+        page = self._book().pages.get(CONTROL_VALUE_BINDING.name)
+        return None if page is None else page.cells.get((cell.row, cell.column))
+
+    def _binding(self, graph_id: Any) -> SSAValue | None:
+        """The SSA value bound to ``graph_id`` (the read view)."""
+
+        return self.external_values.get(int(graph_id))
+
+    def _bind(
+        self,
+        graph_id: Any,
+        value: SSAValue,
+        kind: BindingKind,
+        *cells: Any,
+        stage: Any = None,
+    ) -> Ref | None:
+        """Bind graph id ``graph_id`` to ``value``: one REVISE row on
+        ``control_value_binding`` DERIVED(the id's ``canonical_value`` cell,
+        the value's ``ssa_value`` cell, ``cells``), then the read view.
+
+        Rebinding the same value is a no-op (no post); a function the
+        reducer never saw binds with kind UNSCOPED (R8).
+        """
+
+        graph_id = int(graph_id)
+        self.external_values[graph_id] = value
+        if value is None:
+            return None
+        book = self._book()
+        value_cell = self._value_cell(value, stage=stage)
+        row = (self._scope(), graph_id)
+        latest = book.latest_ref(CONTROL_VALUE_BINDING, row)
+        if latest is not None:
+            recorded = book.pages[CONTROL_VALUE_BINDING.name].cells.get(
+                (row, latest.column)
+            )
+            if (
+                isinstance(recorded, ControlBinding)
+                and recorded.ssa_value == value_cell
+            ):
+                return latest
+        if self.lexical_read_scope is None:
+            kind = BindingKind.UNSCOPED
+        sources = self._cells(self._canonical_cell(graph_id), value_cell, *cells)
+        return book.post(
+            CONTROL_VALUE_BINDING, row, ControlBinding(value_cell, kind),
+            stage=self._stage(stage),
+            provenance=Derived(sources),
+            mode=Mode.REVISE,
+        )
+
+    def _bind_unresolved(
+        self,
+        graph_id: Any,
+        reason: Any,
+        *cells: Any,
+        value: SSAValue | None = None,
+        stage: Any = None,
+    ) -> Ref | None:
+        """Record that ``graph_id`` has no resolvable binding here:
+        ``Unresolved(reason, read=cells)`` on its binding row, DERIVED from
+        what was read.  ``value`` (a stand-in) goes to the read view only."""
+
+        graph_id = int(graph_id)
+        if value is not None:
+            self.external_values[graph_id] = value
+        read = self._cells(self._canonical_cell(graph_id), *cells)
+        if value is not None:
+            read = self._cells(*read, self._value_cell(value, stage=stage))
+        if not read:
+            return None
+        return self._book().post(
+            CONTROL_VALUE_BINDING, (self._scope(), graph_id),
+            Unresolved(reason, read=read),
+            stage=self._stage(stage),
+            provenance=Derived(read),
+            mode=Mode.REVISE,
+        )
+
+    def _declare_parameter(
+        self, graph_id: Any, declaration: ParameterDeclaration, *cells: Any,
+    ) -> Ref | None:
+        """``declared_parameter`` row ``(scope, graph id)``: CALL_ONLY
+        DERIVED(the parameter's version-0 ``name_binding`` cell, its binding
+        cell); USED DERIVED(the previous declaration, the use's cell)."""
+
+        graph_id = int(graph_id)
+        book = self._book()
+        row = (self._scope(), graph_id)
+        previous = book.latest_ref(DECLARED_PARAMETER, row)
+        if previous is not None:
+            recorded = book.pages[DECLARED_PARAMETER.name].cells.get(
+                (row, previous.column)
+            )
+            if recorded is declaration:
+                return previous
+        sources = self._cells(
+            previous, *cells, self._binding_cell(graph_id),
+            self._canonical_cell(graph_id),
+        )
+        if not sources:
+            return None
+        return book.post(
+            DECLARED_PARAMETER, row, declaration,
+            stage=self.active_stage,
+            provenance=Derived(sources),
+            mode=Mode.REVISE,
+        )
+
+    def _rebind_view(
+        self, values: Mapping[int, SSAValue], kind: BindingKind, *cells: Any,
+    ) -> None:
+        """Rebind every id in ``values`` whose current view differs (the
+        ``update(...)`` writers: restores and merges)."""
+
+        for graph_id, value in values.items():
+            if self.external_values.get(int(graph_id)) is value:
+                continue
+            self._bind(int(graph_id), value, kind, *cells)
+
+    def _withdraw(self, graph_id: Any, previous: SSAValue | None, *cells: Any) -> None:
+        """``pop`` then ``[...] = previous``: the saved value is rebound
+        RESTORED; with no previous the binding is withdrawn with an
+        ``Unresolved(BINDING_WITHDRAWN)`` revision, never an erasure."""
+
+        graph_id = int(graph_id)
+        current = self.external_values.pop(graph_id, None)
+        if previous is None:
+            if current is not None:
+                self._bind_unresolved(
+                    graph_id, BINDING_WITHDRAWN, *cells, self._value_cell(current),
+                )
+            return
+        self._bind(graph_id, previous, BindingKind.RESTORED, *cells)
+
+    def _construct_cell(self, node_id: Any) -> Ref | None:
+        """The identity cell of a control construct's source graph node."""
+
+        return self._canonical_cell(node_id)
+
+    def _restore_view(self, saved: Mapping[int, SSAValue], *cells: Any) -> None:
+        """Make the read view equal ``saved`` again (an arm that leaves
+        through its own edge): every id the arm added is withdrawn, every
+        id it rebound is RESTORED.  Each change is a revision, never an
+        erasure."""
+
+        for graph_id in tuple(self.external_values):
+            if int(graph_id) not in saved:
+                self._withdraw(int(graph_id), None, *cells)
+        for graph_id, value in saved.items():
+            if self.external_values.get(int(graph_id)) is not value:
+                self._bind(int(graph_id), value, BindingKind.RESTORED, *cells)
+
+    def _post_carried_snapshots(
+        self, conditional_cell: Ref | None, snapshots: Mapping[int, SSAValue],
+    ) -> dict[int, Ref]:
+        """One ``carried_snapshot`` row per snapshotted initial id: the
+        binding cell current at branch entry, DERIVED from that cell and
+        the conditional construct's cell.  Returns initial id -> the cell
+        that stands for the snapshot (the row's cell; the binding cell when
+        the conditional has no identity cell to key the row by)."""
+
+        book = self._book()
+        cells: dict[int, Ref] = {}
+        for initial_id, value in snapshots.items():
+            initial_id = int(initial_id)
+            binding_cell = self._binding_cell(initial_id)
+            if binding_cell is None:
+                binding_cell = self._value_cell(value)
+            if conditional_cell is None:
+                cells[initial_id] = binding_cell
+                continue
+            row = (self._scope(), conditional_cell, initial_id)
+            existing = book.latest_ref(CARRIED_SNAPSHOT, row)
+            if existing is not None:
+                cells[initial_id] = existing
+                continue
+            cells[initial_id] = book.post(
+                CARRIED_SNAPSHOT, row, binding_cell,
+                stage=CONTROL_SSA_CONDITIONAL,
+                provenance=Derived(self._cells(binding_cell, conditional_cell)),
+                mode=Mode.CONCORD,
+            )
+        return cells
+
+    def _carried_name_arm(
+        self,
+        arm_id: Any,
+        initial_id: Any,
+        snapshot: SSAValue,
+        snapshot_cell: Ref | None,
+        *,
+        path: str,
+    ) -> tuple[SSAValue, Any]:
+        """The SSA value a name-carried merge takes from one arm, and the
+        cell it derives from (decision 7.2 of the design).
+
+        The arm id equal to the initial id: the arm did not rebind the name,
+        the entered version (the snapshot) is the arm and the snapshot cell
+        is its source.  A different arm id with a binding: that binding (the
+        version the book records for the arm).  A different arm id with no
+        binding: the graph records a version the builder cannot find --
+        ``Unresolved(NAME_ARM_VERSION_MISSING)`` is posted at the arm id, a
+        ``carried-name-arm-missing`` shortfall is appended, and the snapshot
+        stands in for the emitted Phi without being posted as the arm.
+        """
+
+        arm_id = int(arm_id)
+        if arm_id == int(initial_id):
+            return snapshot, snapshot_cell
+        value = self.external_values.get(arm_id)
+        if value is not None:
+            source = self._binding_cell(arm_id)
+            return value, source if source is not None else self._value_cell(value)
+        missing = self._bind_unresolved(
+            arm_id, NAME_ARM_VERSION_MISSING, snapshot_cell,
+        )
+        self.shortfalls.append(SSALoweringShortfall(
+            "control", "carried-name-arm-missing", path,
+            "a name-carried conditional arm names a version with no "
+            f"binding in this lowering: arm={arm_id} initial={int(initial_id)}"
+            + ("" if missing is None else f" (recorded {NAME_ARM_VERSION_MISSING.name})"),
+        ))
+        return snapshot, None
 
     # ------------------------------------------------- field-state versions
     # A scalar field write and a conditional field merge each ARE one
@@ -3439,13 +4221,32 @@ class _ControlSSABuilder:
         return snapshot, None
 
     def _operand_bindings(self, operands: Any) -> set:
-        """The bindings read by ``(consumer, role, ordinal)`` operands."""
+        """The bindings read by ``(consumer, role, ordinal)`` operands.
 
-        page = self._book().page("lexical_read_binding")
-        return {
-            page.latest((self.lexical_read_scope, consumer, role, ordinal))
+        An ``Unresolved`` revision (a withdrawn position) reads as absence.
+        """
+
+        page = self._book().page(LEXICAL_READ_BINDING)
+        found = set()
+        for consumer, role, ordinal in operands:
+            fact = page.latest((self.lexical_read_scope, consumer, role, ordinal))
+            found.add(None if isinstance(fact, Unresolved) else fact)
+        return found
+
+    def _read_binding_cells(self, operands: Any) -> tuple[Ref, ...]:
+        """The ``lexical_read_binding`` cells at ``(consumer, role,
+        ordinal)`` operand positions that have one."""
+
+        if self.lexical_read_scope is None:
+            return ()
+        book = self._book()
+        return self._cells(*(
+            book.latest_ref(
+                LEXICAL_READ_BINDING,
+                (self.lexical_read_scope, consumer, role, ordinal),
+            )
             for consumer, role, ordinal in operands
-        }
+        ))
 
     def _enter_loop_state(self, loop: Any, carried: Any) -> Any:
         """Commit this loop's entry state; return its key for the stack.
@@ -3460,28 +4261,40 @@ class _ControlSSABuilder:
         if self.lexical_read_scope is None or loop_node is None:
             return None
         book = self._book()
-        carried_page = book.page("loop_carried_binding")
-        state_page = book.page("loop_entry_state")
-        entry_page = book.page("loop_carried_entry")
+        loop_cell = self._construct_cell(loop_node)
         key = (str(self.tensor_shape_concordance_scope), int(loop_node))
         states: dict[int, set] = {}
+        state_sources: dict[int, list] = {}
         for entry, (updated_id, initial_id, initial_value, *_rest) in (
             enumerate(carried)
         ):
-            bindings = carried_page.latest((
+            binding_row = (
                 self.lexical_read_scope, int(loop_node),
                 int(updated_id), int(initial_id),
-            ))
-            if bindings is None:
+            )
+            binding_cell = book.latest_ref(LOOP_CARRIED_BINDING, binding_row)
+            bindings = book.page(LOOP_CARRIED_BINDING).latest(binding_row)
+            if bindings is None or isinstance(bindings, Unresolved):
+                # A carried pair the book does not attribute: recorded, not
+                # silently kept as the header rebinding (plan 80 B2.4).
+                self._bind_unresolved(
+                    int(initial_id), CARRIED_ENTRY_NOT_ATTRIBUTED,
+                    self._binding_cell(int(updated_id)), loop_cell,
+                )
                 continue
             owned = states.setdefault(int(initial_id), set())
             owned.update(bindings)
+            state_sources.setdefault(int(initial_id), []).append(binding_cell)
             # Row ``(control scope, loop, binding)`` -> the carried entry
             # that binding is.  Two bindings seeded from one value
             # (``second = value; third = value``) share an initial id but
-            # are distinct entries with distinct header Phis.
+            # are distinct entries with distinct header Phis.  DERIVED(the
+            # ``loop_carried_binding`` cell it read).
             for binding in bindings:
-                entry_page.concord((*key, str(binding)), int(entry))
+                self._post_concord(
+                    LOOP_CARRIED_ENTRY, (*key, str(binding)), int(entry),
+                    binding_cell, loop_cell, stage=CONTROL_SSA_LOOP,
+                )
         for initial_id, owned in states.items():
             # The book records the authored state identity, never a physical
             # SSAValue from one lowering.  One ControlProgram may be lowered
@@ -3489,12 +4302,33 @@ class _ControlSSABuilder:
             # first lowering's SSA object made the next lowering disagree on
             # incidental dtype/shape metadata for the same semantic row.
             # Its concrete pre-loop value is already owned by this builder's
-            # loop frame and is recovered there by _resolve_read.
-            state_page.concord(
-                (*key, initial_id), (tuple(sorted(owned)), int(initial_id)),
+            # loop frame and is recovered there by _resolve_read.  DERIVED(
+            # the same cells, the pre-loop binding cell of the initial).
+            self._post_concord(
+                LOOP_ENTRY_STATE, (*key, initial_id),
+                (tuple(sorted(owned)), int(initial_id)),
+                *state_sources.get(initial_id, ()),
+                self._binding_cell(initial_id), loop_cell,
+                stage=CONTROL_SSA_LOOP,
             )
         self.loop_frames[key] = {"carried": carried, "latch": False}
         return key
+
+    def _post_concord(
+        self, page: Any, row: tuple, fact: Any, *cells: Any, stage: Any = None,
+    ) -> Ref:
+        """One CONCORD post DERIVED from ``cells`` (the function root when
+        none exists), replacing a raw ``concord`` on a declared page."""
+
+        sources = self._cells(*cells)
+        if not sources:
+            sources = (self._function_root(),)
+        return self._book().post(
+            page, row, fact,
+            stage=self._stage(stage),
+            provenance=Derived(sources),
+            mode=Mode.CONCORD,
+        )
 
     def _loop_scope_rebinds(self, loop: Any, carried: Any) -> tuple:
         """Describe every carried entry without collapsing shared seeds.
@@ -3723,17 +4557,17 @@ class _ControlSSABuilder:
                 else self.external_value(int(operand_id))
             )
             if not tuple(source.shape or ()):
-                book.page("identity_transition").revise(
-                    (str(self.tensor_shape_concordance_scope), int(value_id)),
-                    ("merge", int(source.id), "scalar_item"),
-                )
+                # The rank-0 merge is one ``scalar_item_merge`` row (plan 80
+                # B1.3), no longer a raw ``identity_transition`` revise.
+                self._post_scalar_item_merge(int(value_id), source)
                 return source
         if self.lexical_read_scope is None or not self.enclosing_loop_states:
             return self.external_value(int(value_id))
-        consumers = book.page("region_feed_consumer").latest((
+        feed_row = (
             str(self.tensor_shape_concordance_scope), int(region_index),
             int(value_id),
-        )) or ()
+        )
+        consumers = book.page(REGION_FEED_CONSUMER).latest(feed_row) or ()
         operand_page = book.page("consumer_operand")
         operands = []
         for consumer in consumers:
@@ -3752,6 +4586,13 @@ class _ControlSSABuilder:
                     ) or ())
                 )
             if not positions:
+                # No ``consumer_operand`` row: recorded before the fallback
+                # (plan 80 B2.5), DERIVED(the feed's consumer cell).
+                self._bind_unresolved(
+                    int(value_id), REGION_FEED_NO_OPERAND_ROW,
+                    book.latest_ref(REGION_FEED_CONSUMER, feed_row),
+                    self._canonical_cell(consumer),
+                )
                 operands.append((int(consumer), None, 0))
                 continue
             operands.extend(
@@ -3820,8 +4661,16 @@ class _ControlSSABuilder:
                 feeds, storage_arguments,
             ))
         ]
+        # REGION_CALL_RESULT: the region's signature cell (posted where the
+        # signature was built) and the storage arguments it is fed.
+        signature_cell = self._declared_cell(
+            REGION_SIGNATURE.name, (self._scope(), int(region_index)),
+        )
         aggregate = (
-            self.fresh_value(dtype="ssa.aggregate")
+            self.fresh_value(
+                dtype="ssa.aggregate", transform=REGION_CALL_RESULT,
+                operands=(signature_cell, *storage_arguments),
+            )
             if outputs
             else None
         )
@@ -3841,14 +4690,17 @@ class _ControlSSABuilder:
         )
         if aggregate is not None:
             for output_index, output_id in enumerate(outputs):
-                index = self.constant_value(output_index)
+                index = self.constant_value(output_index, aggregate)
                 attributes = {
                     "region_index": region_index,
                     "aggregate_index": output_index,
                     "source_output_id": output_id,
                 }
                 if int(output_id) in self.preserved_region_output_ids:
-                    address = self.fresh_value(dtype="ptr")
+                    address = self.fresh_value(
+                        dtype="ptr", transform=ADDRESS,
+                        operands=(aggregate, index),
+                    )
                     self.emit(
                         Handler.GetElementPtr,
                         [aggregate, index],
@@ -3859,6 +4711,7 @@ class _ControlSSABuilder:
                     scratch = self.fresh_value(
                         dtype=contract.dtype,
                         shape=contract.shape,
+                        transform=LOAD, operands=(address,),
                     )
                     self.emit(
                         Handler.Load, [address], scratch,
@@ -4075,6 +4928,7 @@ class _ControlSSABuilder:
         completed = self.fresh_value(
             dtype=str(candidate.dtype or incumbent.dtype or "unknown"),
             shape=tuple(candidate.shape or incumbent.shape),
+            transform=PHI_LOOP_HEADER, operands=tuple(incoming_values),
         )
         self.emit(
             Handler.Phi,
@@ -4158,6 +5012,7 @@ class _ControlSSABuilder:
                 completed = self.fresh_value(
                     dtype=str(candidate.dtype or incumbent.dtype or "unknown"),
                     shape=tuple(candidate.shape or incumbent.shape),
+                    transform=PHI_LOOP_HEADER, operands=tuple(incoming_values),
                 )
                 self.emit(
                     Handler.Phi,
@@ -4186,7 +5041,11 @@ class _ControlSSABuilder:
                 )
             carried_phis[index].args[1] = completed
             carried_updates[index] = completed
-            self.external_values[int(updated_id)] = completed
+            # LOOP_LATCH: the body's binding of the update is the cause.
+            self._bind(
+                int(updated_id), completed, BindingKind.LOOP_LATCH,
+                candidate, incumbent,
+            )
             source_loop_node_id = carried_phis[index].attributes.get(
                 "source_loop_node_id"
             )
@@ -4360,7 +5219,10 @@ class _ControlSSABuilder:
                 length_cell = self.sequence_storage_values[resident_id][
                     len(resident.column_value_ids)
                 ]
-                extent = self.fresh_value(dtype="int64")
+                extent = self.fresh_value(
+                    dtype="int64", transform=LOAD,
+                    operands=(length_cell, iterable_id),
+                )
                 self.emit(
                     Handler.Load, [length_cell], extent,
                     attributes={
@@ -4373,11 +5235,17 @@ class _ControlSSABuilder:
             child_selection = self.child_table_selections.get(iterable_id)
             if child_selection is not None:
                 pool, handle = child_selection
-                length_address = self.fresh_value(dtype="ptr")
-                extent = self.fresh_value(dtype="int")
+                pool_length = self.external_value(pool.length_value_id)
+                length_address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS,
+                    operands=(pool_length, handle),
+                )
+                extent = self.fresh_value(
+                    dtype="int", transform=LOAD, operands=(length_address,),
+                )
                 self.emit(
                     Handler.GetElementPtr,
-                    [self.external_value(pool.length_value_id), handle],
+                    [pool_length, handle],
                     length_address,
                     attributes={"binding": "child_table_length"},
                 )
@@ -4393,8 +5261,13 @@ class _ControlSSABuilder:
                     self._nested_child_storage(child_key, nested_target_id)
                 )
                 handle = self.external_value(iterable_id, dtype="int")
-                length_address = self.fresh_value(dtype="ptr")
-                extent = self.fresh_value(dtype="int")
+                length_address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS,
+                    operands=(child_lengths, handle),
+                )
+                extent = self.fresh_value(
+                    dtype="int", transform=LOAD, operands=(length_address,),
+                )
                 self.emit(
                     Handler.GetElementPtr,
                     [child_lengths, handle],
@@ -4407,7 +5280,9 @@ class _ControlSSABuilder:
                 )
                 return extent
             source = self.external_value(iterable_id)
-            extent = self.fresh_value(dtype="int")
+            extent = self.fresh_value(
+                dtype="int", transform=CONTROL_EXPRESSION, operands=(source,),
+            )
             self.emit(
                 Handler.Call,
                 [source],
@@ -4436,7 +5311,7 @@ class _ControlSSABuilder:
             lowered = self._control_arithmetic_value(spelling)
             if lowered is not None:
                 return lowered
-            value = self.fresh_value(dtype="int")
+            value = self.fresh_value(dtype="int", transform=LOAD)
             self.emit(
                 Handler.Load,
                 [],
@@ -4453,7 +5328,7 @@ class _ControlSSABuilder:
                 )
             )
             return value
-        value = self.fresh_value(dtype="int")
+        value = self.fresh_value(dtype="int", transform=CONTROL_CONST)
         self.emit(
             Handler.Const,
             [],
@@ -4494,7 +5369,8 @@ class _ControlSSABuilder:
                 value = self.fresh_value(
                     dtype="bool" if isinstance(node.value, bool)
                     else "int" if isinstance(node.value, int)
-                    else "float64"
+                    else "float64",
+                    transform=CONTROL_CONST,
                 )
                 self.emit(
                     Handler.Const, [], value,
@@ -4522,6 +5398,7 @@ class _ControlSSABuilder:
                 result = self.fresh_value(
                     dtype=operand.dtype,
                     shape=operand.shape,
+                    transform=CONTROL_EXPRESSION, operands=(operand,),
                 )
                 self.emit(Handler.Neg, [operand], result)
                 return result
@@ -4536,6 +5413,7 @@ class _ControlSSABuilder:
                 result = self.fresh_value(
                     dtype=left.dtype or right.dtype,
                     shape=left.shape or right.shape,
+                    transform=CONTROL_EXPRESSION, operands=(left, right),
                 )
                 self.emit(
                     handler,
@@ -4606,7 +5484,8 @@ class _ControlSSABuilder:
             return value
         if expression.op == "const":
             result = result_override or self.fresh_value(
-                dtype="bool" if isinstance(expression.literal, bool) else None
+                dtype="bool" if isinstance(expression.literal, bool) else None,
+                transform=CONTROL_CONST, operands=(expression.value_id,),
             )
             self.emit(
                 Handler.Const, [], result,
@@ -4631,7 +5510,10 @@ class _ControlSSABuilder:
             length_address = self.sequence_storage_values[sequence_id][
                 len(descriptor.column_value_ids)
             ]
-            length = self.fresh_value(dtype="int")
+            length = self.fresh_value(
+                dtype="int", transform=LOAD,
+                operands=(length_address, self._sequence_contract_cell(sequence_id)),
+            )
             self.emit(
                 Handler.Load,
                 [length_address],
@@ -4641,8 +5523,10 @@ class _ControlSSABuilder:
                     "sequence_value_id": sequence_id,
                 },
             )
-            zero = self.constant_value(0)
-            result = result_override or self.fresh_value(dtype="bool")
+            zero = self.constant_value(0, length)
+            result = result_override or self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE, operands=(length, zero),
+            )
             self.emit(
                 Handler.Gt,
                 [length, zero],
@@ -4664,18 +5548,30 @@ class _ControlSSABuilder:
             if not source.shape:
                 if expression.value_id is not None:
                     source_id = int(expression.value_id)
-                    self.external_values[source_id] = source
+                    # A rank-0 operand IS the item's value: the merge is one
+                    # ``scalar_item_merge`` row and the item id's binding.
+                    self._post_scalar_item_merge(source_id, source)
+                    self._bind(
+                        source_id, source, BindingKind.CONTROL_EXPRESSION,
+                        self._book().latest_ref(
+                            SCALAR_ITEM_MERGE, (self._scope(), source_id),
+                        ),
+                    )
                     self.control_identity_receipts.append((
                         source_id, int(source.id), "scalar_item_identity",
                     ))
                 return source
-            index = self.constant_value(0)
-            address = self.fresh_value(dtype="ptr")
+            index = self.constant_value(0, source)
+            address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS, operands=(source, index),
+            )
             self.emit(
                 Handler.GetElementPtr, [source, index], address,
                 attributes={"binding": "control_scalar_item"},
             )
-            result = result_override or self.fresh_value(dtype=source.dtype)
+            result = result_override or self.fresh_value(
+                dtype=source.dtype, transform=LOAD, operands=(address,),
+            )
             self.emit(
                 Handler.Load, [address], result,
                 attributes={"binding": "control_scalar_item"},
@@ -4708,15 +5604,49 @@ class _ControlSSABuilder:
                     "lt", "le", "gt", "ge", "eq", "ne",
                     "and", "or", "not",
                 } else operand_values[0].dtype
-            )
+            ),
+            transform=CONTROL_EXPRESSION,
+            operands=(*operand_values, expression.value_id),
         )
         self.emit(handler, operand_values, result, attributes={
             "binding": "control_expression",
             "source_value_id": expression.value_id,
         })
         if expression.value_id is not None:
-            self.external_values[int(expression.value_id)] = result
+            # CONTROL_EXPRESSION: the operand bindings are the cause.
+            self._bind(
+                int(expression.value_id), result,
+                BindingKind.CONTROL_EXPRESSION, *operand_values,
+            )
         return result
+
+    def _post_scalar_item_merge(self, item_id: int, source: SSAValue) -> Ref:
+        """``scalar_item_merge`` row ``(function scope, item)`` -> the
+        merged source's ``ssa_value`` cell, DERIVED(the ``item_operand``
+        cell when the planner declared it, the operand's binding cell)."""
+
+        book = self._book()
+        row = (self._scope(), int(item_id))
+        source_cell = self._value_cell(source)
+        latest = book.latest_ref(SCALAR_ITEM_MERGE, row)
+        if latest is not None and (
+            book.pages[SCALAR_ITEM_MERGE.name].cells.get((row, latest.column))
+            == source_cell
+        ):
+            return latest
+        sources = self._cells(
+            self._declared_cell(
+                "item_operand", (self.lexical_read_scope, int(item_id)),
+            ) if self.lexical_read_scope is not None else None,
+            self._binding_cell(int(source.id)), source_cell,
+            self._canonical_cell(item_id),
+        )
+        return book.post(
+            SCALAR_ITEM_MERGE, row, source_cell,
+            stage=self.active_stage,
+            provenance=Derived(sources),
+            mode=Mode.CONCORD,
+        )
 
     def lower(self, block: ControlBlock, *, path: str = "root") -> None:
         if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
@@ -5165,7 +6095,10 @@ class _ControlSSABuilder:
                 "extraction_identity": "turing.dispatch." + str(block.operation),
             })
             if result is not None:
-                self.external_values[int(result.id)] = result
+                # CALL_RESULT: the dispatch's argument cells are the cause.
+                self._bind(
+                    int(result.id), result, BindingKind.CALL_RESULT, *arguments,
+                )
             return
         if isinstance(block, ExternalReferenceCallBlock):
             arguments = [
@@ -5203,7 +6136,11 @@ class _ControlSSABuilder:
                     "extraction_identity": str(block.identity),
                 },
             )
-            self.external_values[int(block.result_value_id)] = result
+            # CALL_RESULT: the external call's argument cells are the cause.
+            self._bind(
+                int(block.result_value_id), result, BindingKind.CALL_RESULT,
+                *arguments,
+            )
             return
         if isinstance(block, ValidationBlock):
             self.validation_contracts.append({
@@ -5263,13 +6200,17 @@ class _ControlSSABuilder:
             # graph id.  Local returned records have no destination cell
             # here; their record-return materialization consumes this same
             # version.
+            version_cell = None
             if block.field_state_cell is not None:
-                self._publish_field_version(
+                version_cell = self._publish_field_version(
                     block.field_state_cell, value, (block.field_state_cell,),
                 )
-            # Read view during migration: the SetAttr id still resolves to
-            # the written value for readers that key by graph id.
-            self.external_values[int(block.effect_node_id)] = value
+            # FIELD_WRITE: the SetAttr id resolves to the written value; the
+            # version cell lane C posts is its cause.
+            self._bind(
+                int(block.effect_node_id), value, BindingKind.FIELD_WRITE,
+                version_cell, block.field_state_cell,
+            )
             return
         if isinstance(block, SequenceQueryBlock):
             self.lower_sequence_query(block, path=path)
@@ -5508,6 +6449,9 @@ class _ControlSSABuilder:
             # float dtype assigned when a structural constant first entered
             # the control value map.
             data.dtype = str(first_dtype)
+        # Every storage cell of the descriptor descends from the data arena
+        # (the authored sequence's value) and its contract cell.
+        descriptor_operands = (data, self._sequence_contract_cell(int(value_id)))
         extra_columns = tuple(
             self.fresh_value(dtype=_canonicalize_column(
                 (
@@ -5516,7 +6460,7 @@ class _ControlSSABuilder:
                     else concorded_column_dtypes[index + 1]
                 ),
                 index + 1,
-            ))
+            ), transform=DESCRIPTOR_CELL, operands=descriptor_operands)
             for index in range(max(0, int(column_count) - 1))
         )
         for index, column in enumerate(extra_columns, start=1):
@@ -5540,18 +6484,24 @@ class _ControlSSABuilder:
         # _storage_values in ir_sequence_tables.py) -- both sides of that
         # shared value must declare the same width or the Fortran call
         # fails with a real ABI type mismatch, not a cosmetic one.
-        length_address = self.fresh_value(dtype="int64", shape=(1,))
-        capacity = self.fresh_value(dtype="int64")
+        def storage_cell(dtype: str, shape: tuple = ()) -> SSAValue:
+            return self.fresh_value(
+                dtype=dtype, shape=shape, transform=DESCRIPTOR_CELL,
+                operands=descriptor_operands,
+            )
+
+        length_address = storage_cell("int64", (1,))
+        capacity = storage_cell("int64")
         requires_status = bool(writable) or policy == "unique"
         status_address = (
-            self.fresh_value(dtype="int", shape=(1,))
+            storage_cell("int", (1,))
             if requires_status else None
         )
         self.arguments.extend((length_address, capacity))
         if status_address is not None:
             self.arguments.append(status_address)
         live_flags = (
-            self.fresh_value(dtype="bool") if retains_deleted_rows else None
+            storage_cell("bool") if retains_deleted_rows else None
         )
         if live_flags is not None:
             self.arguments.append(live_flags)
@@ -5561,25 +6511,23 @@ class _ControlSSABuilder:
             child_keys = (
                 None
                 if nested_tensor
-                else self.fresh_value(dtype="unknown")
+                else storage_cell("unknown")
             )
-            child_values = self.fresh_value(
-                dtype=nested_value_dtype or "unknown"
-            )
-            child_lengths = self.fresh_value(dtype="int")
-            child_capacity = self.fresh_value(dtype="int")
-            child_stride = self.fresh_value(dtype="int")
+            child_values = storage_cell(nested_value_dtype or "unknown")
+            child_lengths = storage_cell("int")
+            child_capacity = storage_cell("int")
+            child_stride = storage_cell("int")
             child_shapes = (
-                self.fresh_value(dtype="int32") if nested_tensor else None
+                storage_cell("int32") if nested_tensor else None
             )
             child_ranks = (
-                self.fresh_value(dtype="int32") if nested_tensor else None
+                storage_cell("int32") if nested_tensor else None
             )
             child_shape_stride = (
-                self.fresh_value(dtype="int64") if nested_tensor else None
+                storage_cell("int64") if nested_tensor else None
             )
-            child_status = self.fresh_value(dtype="int")
-            child_live = self.fresh_value(dtype="bool")
+            child_status = storage_cell("int")
+            child_live = storage_cell("bool")
             child_columns = (
                 (child_values,) if child_keys is None
                 else (child_keys, child_values)
@@ -5592,9 +6540,13 @@ class _ControlSSABuilder:
                 child_status, child_live,
             )
             self.arguments.extend(child_pool_values)
-            self.external_values.update(
-                (int(value.id), value) for value in child_pool_values
-            )
+            # The pool cells are bound under their own (minted) ids: the
+            # sequence contract is their cause.
+            for pool_value in child_pool_values:
+                self._bind(
+                    int(pool_value.id), pool_value,
+                    BindingKind.SEQUENCE_RESULT, *descriptor_operands,
+                )
             child_table_pool = SSAChildTablePoolDescriptor(
                 handle_column=1,
                 column_value_ids=tuple(
@@ -5667,8 +6619,10 @@ class _ControlSSABuilder:
         return descriptor
 
     def _sequence_status_address(self, status_arena: SSAValue) -> SSAValue:
-        zero = self.constant_value(0)
-        address = self.fresh_value(dtype="ptr")
+        zero = self.constant_value(0, status_arena)
+        address = self.fresh_value(
+            dtype="ptr", transform=ADDRESS, operands=(status_arena, zero),
+        )
         self.emit(
             Handler.GetElementPtr,
             [status_arena, zero],
@@ -5737,7 +6691,9 @@ class _ControlSSABuilder:
             "source_call_node_id": query.source_call_node_id,
             "extraction_identity": query.extraction_identity,
         }
-        length = self.fresh_value(dtype="int64")
+        length = self.fresh_value(
+            dtype="int64", transform=LOAD, operands=(length_address,),
+        )
         self.emit(Handler.Load, [length_address], length, attributes=attributes)
         if query.operation == "maximum":
             value_dtype = str(storage[0].dtype or "unknown")
@@ -5755,7 +6711,10 @@ class _ControlSSABuilder:
                 selected = self.new_block("sequence_maximum_selected")
                 retained = self.new_block("sequence_maximum_retained")
                 complete = self.new_block("sequence_maximum_merge")
-                greater = self.fresh_value(dtype="bool")
+                greater = self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(candidate, incumbent),
+                )
                 self.emit(
                     Handler.Gt,
                     [candidate, incumbent],
@@ -5768,7 +6727,10 @@ class _ControlSSABuilder:
                 self.current = retained
                 self.branch(complete)
                 self.current = complete
-                merged = self.fresh_value(dtype=value_dtype)
+                merged = self.fresh_value(
+                    dtype=value_dtype, transform=PHI_CONDITIONAL,
+                    operands=(candidate, incumbent, greater),
+                )
                 self.emit(
                     Handler.Phi,
                     [candidate, incumbent],
@@ -5796,14 +6758,22 @@ class _ControlSSABuilder:
             retained = self.new_block("sequence_maximum_loop_retained")
             latch = self.new_block("sequence_maximum_latch")
             exit_block = self.new_block("sequence_maximum_exit")
-            zero = self.constant_value(0)
-            one = self.constant_value(1)
-            next_index = self.fresh_value(dtype="int64")
-            next_accumulator = self.fresh_value(dtype=value_dtype)
+            zero = self.constant_value(0, length)
+            one = self.constant_value(1, length)
+            next_index = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
+            )
+            next_accumulator = self.fresh_value(
+                dtype=value_dtype, transform=PHI_CONDITIONAL,
+                operands=(accumulator, storage[0]),
+            )
             self.branch(header)
 
             self.current = header
-            index = self.fresh_value(dtype="int64")
+            index = self.fresh_value(
+                dtype="int64", transform=PHI_LOOP_HEADER,
+                operands=(zero, next_index),
+            )
             self.emit(
                 Handler.Phi,
                 [zero, next_index],
@@ -5814,7 +6784,10 @@ class _ControlSSABuilder:
                     "binding": "ssa_sequence_maximum_index",
                 },
             )
-            current_accumulator = self.fresh_value(dtype=value_dtype)
+            current_accumulator = self.fresh_value(
+                dtype=value_dtype, transform=PHI_LOOP_HEADER,
+                operands=(accumulator, next_accumulator),
+            )
             self.emit(
                 Handler.Phi,
                 [accumulator, next_accumulator],
@@ -5825,21 +6798,31 @@ class _ControlSSABuilder:
                     "binding": "ssa_sequence_maximum_accumulator",
                 },
             )
-            has_item = self.fresh_value(dtype="bool")
+            has_item = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(index, length),
+            )
             self.emit(Handler.Lt, [index, length], has_item, attributes=attributes)
             self.conditional_branch(has_item, body, exit_block)
 
             self.current = body
-            address = self.fresh_value(dtype="ptr")
+            address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS, operands=(storage[0], index),
+            )
             self.emit(
                 Handler.GetElementPtr,
                 [storage[0], index],
                 address,
                 attributes=attributes,
             )
-            candidate = self.fresh_value(dtype=value_dtype)
+            candidate = self.fresh_value(
+                dtype=value_dtype, transform=LOAD, operands=(address,),
+            )
             self.emit(Handler.Load, [address], candidate, attributes=attributes)
-            greater = self.fresh_value(dtype="bool")
+            greater = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(candidate, current_accumulator),
+            )
             self.emit(
                 Handler.Gt,
                 [candidate, current_accumulator],
@@ -5882,6 +6865,7 @@ class _ControlSSABuilder:
                 int(query.result_value_id),
                 dtype=value_dtype,
                 claim_provisional_definition=True,
+                cause=(accumulator,),
             )
             self.emit(
                 Handler.Cast,
@@ -5889,29 +6873,28 @@ class _ControlSSABuilder:
                 result,
                 attributes={**attributes, "target_dtype": value_dtype},
             )
-            self.external_values[int(query.result_value_id)] = result
-            for alias_id in query.result_alias_ids:
-                self.external_values[int(alias_id)] = result
+            self._bind_sequence_query_result(query, result, accumulator)
             return
         if query.operation in {"length", "truth"}:
             result = self.produced_value(
                 int(query.result_value_id),
                 dtype="bool" if query.operation == "truth" else "int64",
                 claim_provisional_definition=True,
+                cause=(length,),
             )
             self.emit(
                 Handler.Gt if query.operation == "truth" else Handler.Cast,
-                [length, self.constant_value(0)] if query.operation == "truth" else [length],
+                [length, self.constant_value(0, length)] if query.operation == "truth" else [length],
                 result,
                 attributes={**attributes, "target_dtype": result.dtype},
             )
-            self.external_values[int(query.result_value_id)] = result
-            for alias_id in query.result_alias_ids:
-                self.external_values[int(alias_id)] = result
+            self._bind_sequence_query_result(query, result, length)
             return
 
-        zero = self.constant_value(0)
-        nonempty = self.fresh_value(dtype="bool")
+        zero = self.constant_value(0, length)
+        nonempty = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE, operands=(length, zero),
+        )
         self.emit(Handler.Gt, [length, zero], nonempty, attributes=attributes)
         selected = self.new_block("sequence_query_selected")
         defaulted = self.new_block("sequence_query_defaulted")
@@ -5919,7 +6902,9 @@ class _ControlSSABuilder:
         self.conditional_branch(nonempty, selected, defaulted)
 
         self.current = selected
-        address = self.fresh_value(dtype="ptr")
+        address = self.fresh_value(
+            dtype="ptr", transform=ADDRESS, operands=(storage[0], zero),
+        )
         self.emit(
             Handler.GetElementPtr,
             [storage[0], zero],
@@ -5927,14 +6912,15 @@ class _ControlSSABuilder:
             attributes=attributes,
         )
         selected_value = self.fresh_value(
-            dtype=("int" if query.row_handle else storage[0].dtype)
+            dtype=("int" if query.row_handle else storage[0].dtype),
+            transform=LOAD, operands=(address,),
         )
         self.emit(Handler.Load, [address], selected_value, attributes=attributes)
         self.branch(complete)
 
         self.current = defaulted
         default_value = (
-            self.constant_value(-1)
+            self.constant_value(-1, storage[0])
             if query.row_handle
             else self.external_value(int(query.default_value_id))
         )
@@ -5945,6 +6931,7 @@ class _ControlSSABuilder:
             int(query.result_value_id),
             dtype=str(selected_value.dtype or default_value.dtype or "unknown"),
             claim_provisional_definition=True,
+            cause=(selected_value, default_value, nonempty),
         )
         self.emit(
             Handler.Phi,
@@ -5955,9 +6942,26 @@ class _ControlSSABuilder:
                 "incoming_blocks": (selected.name, defaulted.name),
             },
         )
-        self.external_values[int(query.result_value_id)] = result
+        self._bind_sequence_query_result(
+            query, result, selected_value, default_value,
+        )
+
+    def _bind_sequence_query_result(
+        self, query: Any, result: SSAValue, *cells: Any,
+    ) -> None:
+        """Bind a sequence query's result id and its alias ids to ``result``
+        (SEQUENCE_RESULT, from the sequence's contract cell and ``cells``)."""
+
+        contract_cell = self._sequence_contract_cell(int(query.sequence_value_id))
+        self._bind(
+            int(query.result_value_id), result, BindingKind.SEQUENCE_RESULT,
+            contract_cell, *cells,
+        )
         for alias_id in query.result_alias_ids:
-            self.external_values[int(alias_id)] = result
+            self._bind(
+                int(alias_id), result, BindingKind.SEQUENCE_RESULT,
+                contract_cell, *cells,
+            )
 
     def ensure_plan_callsite_result(
         self, value_id: int, *, location: str,
@@ -6065,15 +7069,19 @@ class _ControlSSABuilder:
                     ),
                 } if mutation.extraction_identity is not None else {}),
             }
-            length = self.fresh_value(dtype="int64")
+            length = self.fresh_value(
+                dtype="int64", transform=LOAD, operands=(length_address,),
+            )
             self.emit(
                 Handler.Load, [length_address], length,
                 attributes=attributes,
             )
-            nonempty = self.fresh_value(dtype="bool")
+            nonempty = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE, operands=(length,),
+            )
             self.emit(
                 Handler.Gt,
-                [length, self.constant_value(0)],
+                [length, self.constant_value(0, length)],
                 nonempty,
                 attributes=attributes,
             )
@@ -6094,14 +7102,18 @@ class _ControlSSABuilder:
             self.branch(selected)
 
             self.current = selected
-            new_length = self.fresh_value(dtype="int64")
+            new_length = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
+            )
             self.emit(
                 Handler.Sub,
-                [length, self.constant_value(1)],
+                [length, self.constant_value(1, length)],
                 new_length,
                 attributes=attributes,
             )
-            address = self.fresh_value(dtype="ptr")
+            address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS, operands=(storage[0], new_length),
+            )
             self.emit(
                 Handler.GetElementPtr,
                 [storage[0], new_length],
@@ -6112,6 +7124,7 @@ class _ControlSSABuilder:
                 int(mutation.effect_node_id),
                 dtype=str(storage[0].dtype or "unknown"),
                 claim_provisional_definition=True,
+                cause=(address,),
             )
             self.emit(
                 Handler.Load, [address], result,
@@ -6122,7 +7135,10 @@ class _ControlSSABuilder:
                 [new_length, length_address],
                 attributes=attributes,
             )
-            self.external_values[int(mutation.effect_node_id)] = result
+            self._bind(
+                int(mutation.effect_node_id), result,
+                BindingKind.SEQUENCE_RESULT, address,
+            )
             return
 
         if operation == "remove" and not mutation.argument_kind.startswith(
@@ -6163,10 +7179,12 @@ class _ControlSSABuilder:
                 "sequence_id": int(destination.sequence_id),
                 "source_effect_node_id": int(mutation.effect_node_id),
             }
-            length = self.fresh_value(dtype="int64")
+            length = self.fresh_value(
+                dtype="int64", transform=LOAD, operands=(length_address,),
+            )
             self.emit(Handler.Load, [length_address], length, attributes=attributes)
-            zero = self.constant_value(0)
-            one = self.constant_value(1)
+            zero = self.constant_value(0, length)
+            one = self.constant_value(1, length)
             scan_header = self.new_block("sequence_remove_scan")
             scan_body = self.new_block("sequence_remove_compare")
             scan_latch = self.new_block("sequence_remove_next")
@@ -6180,8 +7198,13 @@ class _ControlSSABuilder:
             self.branch(scan_header)
 
             self.current = scan_header
-            scan_index = self.fresh_value(dtype="int64")
-            next_scan = self.fresh_value(dtype="int64")
+            next_scan = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
+            )
+            scan_index = self.fresh_value(
+                dtype="int64", transform=PHI_LOOP_HEADER,
+                operands=(zero, next_scan),
+            )
             self.emit(
                 Handler.Phi, [zero, next_scan], scan_index,
                 attributes={
@@ -6189,7 +7212,10 @@ class _ControlSSABuilder:
                     "incoming_blocks": (scan_entry.name, scan_latch.name),
                 },
             )
-            scanning = self.fresh_value(dtype="bool")
+            scanning = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(scan_index, length),
+            )
             self.emit(Handler.Lt, [scan_index, length], scanning,
                       attributes=attributes)
             self.conditional_branch(scanning, scan_body, absent)
@@ -6197,11 +7223,18 @@ class _ControlSSABuilder:
             self.current = scan_body
             matches = None
             for column, query in enumerate(queries):
-                address = self.fresh_value(dtype="ptr")
-                existing = self.fresh_value(
-                    dtype=str(destination.column_dtypes[column])
+                address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS,
+                    operands=(storage[column], scan_index),
                 )
-                equal = self.fresh_value(dtype="bool")
+                existing = self.fresh_value(
+                    dtype=str(destination.column_dtypes[column]),
+                    transform=LOAD, operands=(address,),
+                )
+                equal = self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(existing, query),
+                )
                 self.emit(
                     Handler.GetElementPtr,
                     [storage[column], scan_index], address,
@@ -6214,7 +7247,10 @@ class _ControlSSABuilder:
                 if matches is None:
                     matches = equal
                 else:
-                    combined = self.fresh_value(dtype="bool")
+                    combined = self.fresh_value(
+                        dtype="bool", transform=CONTROL_PREDICATE,
+                        operands=(matches, equal),
+                    )
                     self.emit(Handler.LAnd, [matches, equal], combined,
                               attributes=attributes)
                     matches = combined
@@ -6225,12 +7261,21 @@ class _ControlSSABuilder:
                       attributes=attributes)
             self.branch(scan_header)
 
-            new_length = self.fresh_value(dtype="int64")
+            new_length = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(length, one),
+            )
             self.current = shift_header
             self.emit(Handler.Sub, [length, one], new_length,
                       attributes=attributes)
-            shift_index = self.fresh_value(dtype="int64")
-            next_shift = self.fresh_value(dtype="int64")
+            next_shift = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(scan_index, one),
+            )
+            shift_index = self.fresh_value(
+                dtype="int64", transform=PHI_LOOP_HEADER,
+                operands=(scan_index, next_shift),
+            )
             self.emit(
                 Handler.Phi, [scan_index, next_shift], shift_index,
                 attributes={
@@ -6238,19 +7283,33 @@ class _ControlSSABuilder:
                     "incoming_blocks": (scan_body.name, shift_latch.name),
                 },
             )
-            shifting = self.fresh_value(dtype="bool")
+            shifting = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(shift_index, new_length),
+            )
             self.emit(Handler.Lt, [shift_index, new_length], shifting,
                       attributes=attributes)
             self.conditional_branch(shifting, shift_body, store_length)
 
             self.current = shift_body
-            source_index = self.fresh_value(dtype="int64")
+            source_index = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(shift_index, one),
+            )
             self.emit(Handler.Add, [shift_index, one], source_index,
                       attributes=attributes)
             for column, dtype in enumerate(destination.column_dtypes):
-                source_address = self.fresh_value(dtype="ptr")
-                destination_address = self.fresh_value(dtype="ptr")
-                value = self.fresh_value(dtype=str(dtype))
+                source_address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS,
+                    operands=(storage[column], source_index),
+                )
+                destination_address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS,
+                    operands=(storage[column], shift_index),
+                )
+                value = self.fresh_value(
+                    dtype=str(dtype), transform=LOAD, operands=(source_address,),
+                )
                 self.emit(
                     Handler.GetElementPtr,
                     [storage[column], source_index], source_address,
@@ -6380,7 +7439,13 @@ class _ControlSSABuilder:
                     first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
                 )
                 self._register_sequence_lowering(lookup)
-                lookup_handle = self.fresh_value(dtype="int")
+                lookup_handle = self.fresh_value(
+                    dtype="int", transform=TABLE_LOOKUP,
+                    operands=(
+                        self._sequence_contract_cell(int(destination.sequence_id)),
+                        *mutation.argument_value_ids[:key_count],
+                    ),
+                )
                 key_ids = tuple(map(
                     int, mutation.argument_value_ids[:key_count]
                 ))
@@ -6403,20 +7468,23 @@ class _ControlSSABuilder:
                         "sequence_id": int(destination.sequence_id),
                     },
                 )
-                status = self.fresh_value(dtype="int")
+                status_cell = self._sequence_status_address(
+                    self.sequence_status_values[int(destination.sequence_id)]
+                )
+                status = self.fresh_value(
+                    dtype="int", transform=LOAD, operands=(status_cell,),
+                )
                 self.emit(
                     Handler.Load,
-                    [self._sequence_status_address(
-                        self.sequence_status_values[
-                            int(destination.sequence_id)
-                        ]
-                    )],
+                    [status_cell],
                     status,
                     attributes={"binding": "ssa_mapping_setdefault_status"},
                 )
-                found = self.fresh_value(dtype="bool")
+                found = self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE, operands=(status,),
+                )
                 self.emit(
-                    Handler.Gt, [status, self.constant_value(0)], found,
+                    Handler.Gt, [status, self.constant_value(0, status)], found,
                     attributes={"binding": "ssa_mapping_setdefault_found"},
                 )
                 found_block = self.new_block("mapping_setdefault_found")
@@ -6431,46 +7499,55 @@ class _ControlSSABuilder:
                 outer_length_address = self.sequence_storage_values[
                     int(destination.sequence_id)
                 ][len(destination.column_value_ids)]
-                outer_length = self.fresh_value(dtype="int64")
+                outer_length = self.fresh_value(
+                    dtype="int64", transform=LOAD, operands=(outer_length_address,),
+                )
                 self.emit(
                     Handler.Load, [outer_length_address], outer_length,
                     attributes={"binding": "ssa_mapping_setdefault_handle"},
                 )
-                new_handle = self.fresh_value(dtype="int")
+                new_handle = self.fresh_value(
+                    dtype="int", transform=CONTROL_CAST, operands=(outer_length,),
+                )
                 self.emit(
                     Handler.Cast, [outer_length], new_handle,
                     attributes={"target_dtype": "int"},
                 )
-                self.external_values[int(new_handle.id)] = new_handle
-                child_length_address = self.fresh_value(dtype="ptr")
+                self._bind(
+                    int(new_handle.id), new_handle, BindingKind.SEQUENCE_RESULT,
+                    outer_length,
+                )
+                pool_length = self.external_value(int(pool.length_value_id))
+                child_length_address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS,
+                    operands=(pool_length, new_handle),
+                )
                 self.emit(
                     Handler.GetElementPtr,
-                    [
-                        self.external_value(int(pool.length_value_id)),
-                        new_handle,
-                    ],
+                    [pool_length, new_handle],
                     child_length_address,
                     attributes={"binding": "ssa_child_table_length"},
                 )
                 self.emit(
                     Handler.Store,
-                    [self.constant_value(0), child_length_address],
+                    [self.constant_value(0, child_length_address), child_length_address],
                     attributes={"binding": "ssa_child_table_initialize"},
                 )
                 if pool.status_value_id is not None:
-                    child_status_address = self.fresh_value(dtype="ptr")
+                    pool_status = self.external_value(int(pool.status_value_id))
+                    child_status_address = self.fresh_value(
+                        dtype="ptr", transform=ADDRESS,
+                        operands=(pool_status, new_handle),
+                    )
                     self.emit(
                         Handler.GetElementPtr,
-                        [
-                            self.external_value(int(pool.status_value_id)),
-                            new_handle,
-                        ],
+                        [pool_status, new_handle],
                         child_status_address,
                         attributes={"binding": "ssa_child_table_status"},
                     )
                     self.emit(
                         Handler.Store,
-                        [self.constant_value(0), child_status_address],
+                        [self.constant_value(0, child_status_address), child_status_address],
                         attributes={"binding": "ssa_child_table_initialize"},
                     )
                 self._emit_table_store(
@@ -6484,6 +7561,7 @@ class _ControlSSABuilder:
                     int(mutation.effect_node_id),
                     dtype="int",
                     claim_provisional_definition=True,
+                    cause=(lookup_handle, new_handle, found),
                 )
                 self.emit(
                     Handler.Phi,
@@ -6496,7 +7574,10 @@ class _ControlSSABuilder:
                         "binding": "ssa_mapping_setdefault_result",
                     },
                 )
-                self.external_values[int(mutation.effect_node_id)] = result
+                self._bind(
+                    int(mutation.effect_node_id), result,
+                    BindingKind.SEQUENCE_RESULT, lookup_handle, new_handle,
+                )
                 self.child_table_selections[int(mutation.effect_node_id)] = (
                     pool, result
                 )
@@ -6689,14 +7770,18 @@ class _ControlSSABuilder:
                     )
                     return
                 self._register_sequence_lowering(flat_lowering)
-                count_status = self.fresh_value(dtype="int")
+                destination_storage = self.sequence_storage_values[
+                    destination.sequence_id
+                ]
+                count_status = self.fresh_value(
+                    dtype="int", transform=REGION_CALL_RESULT,
+                    operands=tuple(destination_storage),
+                )
                 self.emit(
                     Handler.Call,
                     [
-                        *self.sequence_storage_values[
-                            destination.sequence_id
-                        ],
-                        self.constant_value(0),
+                        *destination_storage,
+                        self.constant_value(0, *destination_storage),
                     ],
                     count_status,
                     attributes={
@@ -6707,7 +7792,6 @@ class _ControlSSABuilder:
                         "source_effect_node_id": int(mutation.effect_node_id),
                     },
                 )
-                flat_status = self.fresh_value(dtype="int")
                 joined_call_values = {
                     int(value.id): value
                     for value in (
@@ -6721,6 +7805,10 @@ class _ControlSSABuilder:
                         ),
                     )
                 }
+                flat_status = self.fresh_value(
+                    dtype="int", transform=REGION_CALL_RESULT,
+                    operands=tuple(joined_call_values.values()),
+                )
                 self.emit(
                     Handler.Call,
                     list(joined_call_values.values()),
@@ -6827,7 +7915,11 @@ class _ControlSSABuilder:
                         projected = self.indexed_load(
                             source_column,
                             row_index,
-                            GLOBAL_MONOTONIC_IDS.mint(),
+                            int(self.fresh_value(
+                                dtype=str(source_column.dtype or "unknown"),
+                                transform=ROW_COLUMN_PROJECTION,
+                                operands=(source_column, row_index),
+                            ).id),
                             attributes={
                                 "binding": "record_sequence_row_column",
                                 "record_identity": str(
@@ -6975,7 +8067,10 @@ class _ControlSSABuilder:
             return
         self._register_sequence_lowering(lowering)
         callee = lowering.functions[-1].name
-        status = self.fresh_value(dtype="int")
+        status = self.fresh_value(
+            dtype="int", transform=REGION_CALL_RESULT,
+            operands=tuple(call_arguments),
+        )
         self.emit(
             Handler.Call,
             list(call_arguments),
@@ -7022,10 +8117,14 @@ class _ControlSSABuilder:
         predicate_sequence_id = None
         if conditional.entry_record_projections:
             handle_id = int(conditional.entry_record_projections[0][1])
-            predicate = self.fresh_value(dtype="bool")
+            handle_value = self.external_value(handle_id, dtype="int")
+            predicate = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(handle_value,),
+            )
             self.emit(
                 Handler.Ge,
-                [self.external_value(handle_id, dtype="int"), self.constant_value(0)],
+                [handle_value, self.constant_value(0, handle_value)],
                 predicate,
                 attributes={
                     "binding": "optional_record_present",
@@ -7051,8 +8150,13 @@ class _ControlSSABuilder:
             length_cell = self.sequence_storage_values[
                 predicate_sequence_id
             ][len(descriptor.column_value_ids)]
-            length = self.fresh_value(dtype="int64")
-            predicate = self.fresh_value(dtype="bool")
+            length = self.fresh_value(
+                dtype="int64", transform=LOAD,
+                operands=(length_cell, predicate_sequence_id),
+            )
+            predicate = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE, operands=(length,),
+            )
             self.emit(
                 Handler.Load,
                 [length_cell],
@@ -7064,7 +8168,7 @@ class _ControlSSABuilder:
             )
             self.emit(
                 Handler.Gt,
-                [length, self.constant_value(0)],
+                [length, self.constant_value(0, length)],
                 predicate,
                 attributes={
                     "binding": "resident_sequence_truthiness",
@@ -7077,10 +8181,13 @@ class _ControlSSABuilder:
                 f"__iterable_extent_{predicate_source_id}__",
                 location=f"{path}.truthiness",
             )
-            predicate = self.fresh_value(dtype="bool")
+            predicate = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(length, predicate_source_id),
+            )
             self.emit(
                 Handler.Gt,
-                [length, self.constant_value(0)],
+                [length, self.constant_value(0, length)],
                 predicate,
                 attributes={
                     "binding": "resident_iterable_truthiness",
@@ -7169,6 +8276,15 @@ class _ControlSSABuilder:
                     and value_id not in carried_snapshots
                 ):
                     carried_snapshots[value_id] = self.external_value(value_id)
+        # One ``carried_snapshot`` row per snapshotted id: the binding cell
+        # current at branch entry, DERIVED from that cell and the
+        # conditional construct's identity cell (plan 80 B2.3).
+        conditional_cell = self._construct_cell(conditional.source_node_id)
+        snapshot_cells = self._post_carried_snapshots(
+            conditional_cell, carried_snapshots,
+        )
+        stage_before = self.active_stage
+        self.active_stage = CONTROL_SSA_CONDITIONAL
 
         self.current = true_block
         for (
@@ -7214,13 +8330,20 @@ class _ControlSSABuilder:
             not self.current.successors
             or merge_block.name in self.current.successors
         )
-        true_carried = {
-            int(initial_id): self.external_values.get(
-                int(true_id), carried_snapshots[int(initial_id)],
+        # Name-carried arms (decision 7.2): an arm that did not rebind the
+        # name takes the entered version; an arm whose version the builder
+        # cannot find is refused with ``Unresolved(NAME_ARM_VERSION_MISSING)``.
+        true_carried = {}
+        carried_name_sources: dict[int, list[Any]] = {}
+        for true_id, _false_id, initial_id, _merged_id in (
+            conditional.carried_aliases
+        ):
+            arm_value, arm_source = self._carried_name_arm(
+                true_id, initial_id, carried_snapshots[int(initial_id)],
+                snapshot_cells.get(int(initial_id)), path=f"{path}.body",
             )
-            for true_id, _false_id, initial_id, _merged_id
-            in conditional.carried_aliases
-        }
+            true_carried[int(initial_id)] = arm_value
+            carried_name_sources[int(initial_id)] = [arm_source]
         # Field-carried merges name their arms as ``reducer_field_state``
         # cells; the arm's value is the version posted AT that cell, never a
         # graph-id lookup that may miss and default to the snapshot.
@@ -7258,14 +8381,18 @@ class _ControlSSABuilder:
         if not true_exit.successors:
             self.branch(merge_block)
         if not body_falls_through:
-            self.external_values.clear()
-            self.external_values.update(values_before_body)
+            self._restore_view(values_before_body, conditional_cell)
 
         # Each arm starts with the same incumbent versions.  Retain the true
         # arm's exact values above, then restore these identities before
         # lowering the false arm so in-place SetAttr effects cannot leak across
-        # the branch boundary.
-        self.external_values.update(carried_snapshots)
+        # the branch boundary.  RESTORED, from the snapshot cells.
+        for snapshot_id, snapshot_value in carried_snapshots.items():
+            if self.external_values.get(int(snapshot_id)) is not snapshot_value:
+                self._bind(
+                    int(snapshot_id), snapshot_value, BindingKind.RESTORED,
+                    snapshot_cells.get(int(snapshot_id)), conditional_cell,
+                )
         self.current = false_block
         values_before_orelse = dict(self.external_values)
         if conditional.orelse is not None:
@@ -7273,19 +8400,21 @@ class _ControlSSABuilder:
         if self.current.successors and (
             merge_block.name not in self.current.successors
         ):
-            self.external_values.clear()
-            self.external_values.update(values_before_orelse)
+            self._restore_view(values_before_orelse, conditional_cell)
         false_results = {
             int(result_id): self.external_value(int(false_id))
             for _true_id, false_id, result_id in conditional.result_aliases
         }
-        false_carried = {
-            int(initial_id): self.external_values.get(
-                int(false_id), carried_snapshots[int(initial_id)],
+        false_carried = {}
+        for _true_id, false_id, initial_id, _merged_id in (
+            conditional.carried_aliases
+        ):
+            arm_value, arm_source = self._carried_name_arm(
+                false_id, initial_id, carried_snapshots[int(initial_id)],
+                snapshot_cells.get(int(initial_id)), path=f"{path}.orelse",
             )
-            for _true_id, false_id, initial_id, _merged_id
-            in conditional.carried_aliases
-        }
+            false_carried[int(initial_id)] = arm_value
+            carried_name_sources.setdefault(int(initial_id), []).append(arm_source)
         for alias, cells in zip(conditional.carried_aliases, carried_field_cells):
             if cells is None:
                 continue
@@ -7317,6 +8446,7 @@ class _ControlSSABuilder:
             false_value = false_results[int(result_id)]
             merged = self.produced_value(
                 int(result_id), claim_provisional_definition=True,
+                cause=(true_value, false_value, predicate),
             )
             if merged.dtype in {None, "unknown"}:
                 merged.dtype = true_value.dtype or false_value.dtype
@@ -7327,6 +8457,7 @@ class _ControlSSABuilder:
             ):
                 merged.shape = tuple(true_value.shape)
                 merged.device = true_value.device
+            self._revise_value(merged, true_value, false_value)
             self.emit(
                 Handler.Phi, [true_value, false_value], merged,
                 attributes={
@@ -7340,6 +8471,14 @@ class _ControlSSABuilder:
             initial = carried_snapshots[int(initial_value_id)]
             true_value = true_carried[int(initial_value_id)]
             false_value = false_carried[int(initial_value_id)]
+            # The Phi's operands on the book: each arm's source cell (its
+            # binding, or the snapshot cell when it did not write) and the
+            # snapshot cell -- PHI_CONDITIONAL (plan 80 B2.3).
+            phi_operands = (
+                *carried_name_sources.get(int(initial_value_id), ()),
+                snapshot_cells.get(int(initial_value_id)),
+                true_value, false_value, predicate,
+            )
             if int(merged_value_id) in {
                 int(true_value.id), int(false_value.id),
             }:
@@ -7350,6 +8489,7 @@ class _ControlSSABuilder:
                 # instead of emitting a self-referential Phi.
                 merged = self.fresh_value(
                     dtype=initial.dtype, shape=initial.shape,
+                    transform=PHI_CONDITIONAL, operands=phi_operands,
                 )
                 merged.accounting.update({
                     "source_value_id": int(merged_value_id),
@@ -7361,6 +8501,9 @@ class _ControlSSABuilder:
                     dtype=initial.dtype,
                     shape=initial.shape,
                 )
+                # The join adopts the graph's merge id; its row derives from
+                # the same operands the Phi is made from.
+                self._value_cell(merged, *phi_operands)
             self.emit(
                 Handler.Phi,
                 [true_value, false_value],
@@ -7420,12 +8563,19 @@ class _ControlSSABuilder:
                     file=sys.stderr,
                     flush=True,
                 )
-            self.external_values.update(published)
+            # CONDITIONAL_MERGE: every published id derives from the Phi.
+            self._rebind_view(
+                published, BindingKind.CONDITIONAL_MERGE, merged, conditional_cell,
+            )
         for _true_id, _false_id, initial_id, merged_id in (
             conditional.carried_sequence_aliases
         ):
             resident = self.external_value(int(initial_id))
-            self.external_values[int(merged_id)] = resident
+            self._bind(
+                int(merged_id), resident, BindingKind.CONDITIONAL_MERGE,
+                self._binding_cell(int(initial_id)), conditional_cell,
+            )
+        self.active_stage = stage_before
 
     def _publish_loop_result_ports(
         self,
@@ -7486,6 +8636,50 @@ class _ControlSSABuilder:
                     f"loop {loop_node} entries {owners!r}"
                 )
             return (owners[0], carried[owners[0]][4]) if owners else None
+
+        def port_cells(port_id: int) -> tuple:
+            """The port's ``loop_result_port_binding`` and
+            ``loop_carried_entry`` cells, when the book has them."""
+
+            if self.lexical_read_scope is None or loop_node is None:
+                return ()
+            port_binding = book.latest_ref(
+                LOOP_RESULT_PORT_BINDING, (self.lexical_read_scope, int(port_id)),
+            )
+            binding = book.page(LOOP_RESULT_PORT_BINDING).latest(
+                (self.lexical_read_scope, int(port_id))
+            )
+            entry_cell = None if binding is None else book.latest_ref(
+                LOOP_CARRIED_ENTRY,
+                (str(self.tensor_shape_concordance_scope), int(loop_node), str(binding)),
+            )
+            return (port_binding, entry_cell)
+
+        def publish_port(port_id: int, port: SSAValue, *cells: Any) -> None:
+            """LOOP_RESULT_PORT binding plus the ``carried_port_value`` row:
+            the exit Phi's ``ssa_value`` cell, DERIVED(the port's binding
+            row, its carried entry, the Phi cell)."""
+
+            sources = self._cells(*port_cells(port_id), port, *cells)
+            row = (self._scope(), int(port_id))
+            phi_cell = self._value_cell(port)
+            existing = book.latest_ref(CARRIED_PORT_VALUE, row)
+            if existing is None or (
+                book.pages[CARRIED_PORT_VALUE.name].cells.get(
+                    (row, existing.column)
+                ) != phi_cell
+            ):
+                book.post(
+                    CARRIED_PORT_VALUE, row, phi_cell,
+                    stage=CONTROL_SSA_LOOP,
+                    provenance=Derived(sources),
+                    mode=Mode.REVISE,
+                )
+            self._bind(
+                int(port_id), port, BindingKind.LOOP_RESULT_PORT,
+                book.latest_ref(CARRIED_PORT_VALUE, row), *cells,
+            )
+            port_values[int(port_id)] = port
         carried_ports = getattr(self, "_carried_port_groups", None)
         if carried_ports is None:
             carried_ports = {}
@@ -7519,6 +8713,7 @@ class _ControlSSABuilder:
                 int(port_id),
                 dtype=str(normal_value.dtype or "unknown"),
                 claim_provisional_definition=True,
+                cause=tuple(incoming_values),
             )
             existing_definition = next((
                 (block.name, instruction_index)
@@ -7536,9 +8731,12 @@ class _ControlSSABuilder:
                 # below. Only a producerless provisional formal is claimed in
                 # place by produced_value above.
                 previous_id = int(port.id)
+                previous_port = port
                 port = self.fresh_value(
                     dtype=str(normal_value.dtype or port.dtype or "unknown"),
                     shape=tuple(normal_value.shape or port.shape),
+                    transform=LOOP_RESULT_VERSION,
+                    operands=(previous_port, normal_value),
                 )
                 port.accounting.update({
                     "source_value_id": int(port_id),
@@ -7547,9 +8745,13 @@ class _ControlSSABuilder:
                     "versioned_from_definition": existing_definition,
                     "tie_policy": "incumbent_body_definition",
                 })
-                self.external_values[int(port_id)] = port
+                self._bind(
+                    int(port_id), port, BindingKind.LOOP_RESULT_PORT,
+                    previous_port, normal_value,
+                )
             port.shape = tuple(normal_value.shape)
             port.device = normal_value.device
+            self._revise_value(port, normal_value)
             self.emit(
                 Handler.Phi,
                 incoming_values,
@@ -7577,8 +8779,7 @@ class _ControlSSABuilder:
             # retained an inner port id cannot bypass the outer zero-trip
             # path and consume a non-dominating inner Phi.
             for equivalent_port_id in group:
-                self.external_values[int(equivalent_port_id)] = port
-                port_values[int(equivalent_port_id)] = port
+                publish_port(int(equivalent_port_id), port, *incoming_values)
         # A break-bound name: zero-trip / fall-through exits keep the
         # pre-loop value; each break edge carries the value its site bound.
         for bound_index, (port_id, initial_id) in enumerate(break_bound):
@@ -7595,6 +8796,7 @@ class _ControlSSABuilder:
                 int(port_id),
                 dtype=str(normal_value.dtype or "unknown"),
                 claim_provisional_definition=True,
+                cause=tuple(incoming_values),
             )
             self.emit(
                 Handler.Phi,
@@ -7608,8 +8810,7 @@ class _ControlSSABuilder:
                     "updated_value_id": int(initial_id),
                 },
             )
-            self.external_values[int(port_id)] = port
-            port_values[int(port_id)] = port
+            publish_port(int(port_id), port, *incoming_values)
 
     def _bind_loop_result_ports_inside_body(
         self, loop: LoopBlock | WhileBlock,
@@ -7653,18 +8854,66 @@ class _ControlSSABuilder:
                     spelling in self.value_aliases,
                     self.value_aliases.get(spelling),
                 ))
-                self.value_aliases[spelling] = updated_id
+                # LOOP_BODY_SPELLING: DERIVED(the port's binding row, the
+                # loop construct cell).
+                self._post_alias(
+                    spelling, updated_id, AliasKind.LOOP_BODY_SPELLING,
+                    self._declared_cell(
+                        LOOP_RESULT_PORT_BINDING.name,
+                        (self.lexical_read_scope, int(port_id)),
+                    ) if self.lexical_read_scope is not None else None,
+                    self._construct_cell(getattr(loop, "source_loop_node_id", None)),
+                    stage=CONTROL_SSA_LOOP,
+                )
         return tuple(saved)
 
     def _restore_loop_result_port_aliases(
         self, saved: tuple[tuple[int, bool, int | None], ...],
+        loop: Any = None,
     ) -> None:
+        loop_cell = self._construct_cell(getattr(loop, "source_loop_node_id", None))
         for port_id, existed, previous in saved:
-            if existed:
-                assert previous is not None
-                self.value_aliases[int(port_id)] = int(previous)
-            else:
-                self.value_aliases.pop(int(port_id), None)
+            # RESTORED: the undo is an edge from the saved PLANNING cell and
+            # the loop cell, never an erasure.
+            self._post_alias(
+                int(port_id), None if not existed else int(previous),
+                AliasKind.RESTORED, loop_cell, stage=CONTROL_SSA_LOOP,
+            )
+
+    def _post_alias(
+        self, alias: Any, source_id: Any, kind: AliasKind, *cells: Any,
+        stage: Any = None,
+    ) -> Ref | None:
+        """``control_value_alias`` row ``(scope, alias)``: a REVISE with
+        ``AliasFact(source, kind)`` DERIVED from ``cells`` (and the previous
+        revision), then the ``value_aliases`` read view."""
+
+        alias = int(alias)
+        if source_id is None:
+            self.value_aliases.pop(alias, None)
+        else:
+            self.value_aliases[alias] = int(source_id)
+        book = self._book()
+        row = (self._scope(), alias)
+        previous = book.latest_ref(CONTROL_VALUE_ALIAS, row)
+        fact = AliasFact(None if source_id is None else int(source_id), kind)
+        if previous is not None and (
+            book.pages[CONTROL_VALUE_ALIAS.name].cells.get((row, previous.column))
+            == fact
+        ):
+            return previous
+        sources = self._cells(
+            previous, *cells, self._canonical_cell(alias),
+            None if source_id is None else self._canonical_cell(source_id),
+        )
+        if not sources:
+            sources = (self._function_root(),)
+        return book.post(
+            CONTROL_VALUE_ALIAS, row, fact,
+            stage=self._stage(stage),
+            provenance=Derived(sources),
+            mode=Mode.REVISE,
+        )
 
     def lower_loop(self, loop: LoopBlock, *, path: str) -> None:
         recursion_region_id = loop.recursion_region_id
@@ -7708,12 +8957,19 @@ class _ControlSSABuilder:
             seed_id = int(seed_id)
             if seed_id in self.external_values:
                 continue
-            seed_value = self.fresh_value(dtype="float64")
+            seed_value = self.fresh_value(
+                dtype="float64", transform=CONTROL_CONST,
+                operands=(seed_id, loop.source_loop_node_id),
+            )
             self.emit(
                 Handler.Const, [], seed_value,
                 attributes={"value": float(seed_literal)},
             )
-            self.external_values[seed_id] = seed_value
+            # LOOP_SEED: the folded seed's own identity cell is the cause.
+            self._bind(
+                seed_id, seed_value, BindingKind.LOOP_SEED,
+                self._construct_cell(loop.source_loop_node_id),
+            )
         carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]] = []
         for updated_id, initial_id in loop.carried_aliases:
             updated_id = int(updated_id)
@@ -7740,7 +8996,12 @@ class _ControlSSABuilder:
                     dtype=initial_value.dtype,
                     shape=initial_value.shape,
                 )
-                self.external_values[updated_id] = updated_value
+                # LOOP_SEED: the reserved backedge slot, from the pre-loop
+                # binding of the initial and the loop construct.
+                self._bind(
+                    updated_id, updated_value, BindingKind.LOOP_SEED,
+                    initial_value, self._construct_cell(loop.source_loop_node_id),
+                )
             else:
                 # An authored binding may be updated to a value which
                 # already exists before the loop (``last = proposal``).
@@ -7755,6 +9016,8 @@ class _ControlSSABuilder:
             current_value = self.fresh_value(
                 dtype=initial_value.dtype,
                 shape=initial_value.shape,
+                transform=PHI_LOOP_HEADER,
+                operands=(initial_value, updated_value),
             )
             current_value.accounting.update({
                 "source_value_id": initial_id,
@@ -7802,8 +9065,15 @@ class _ControlSSABuilder:
             self.emit_deployment_boundary(Handler.Deploy, record)
         self.branch(header)
 
-        induction = self.fresh_value(dtype="int")
-        next_induction = self.fresh_value(dtype="int")
+        loop_cell = self._construct_cell(loop.source_loop_node_id)
+        induction = self.fresh_value(
+            dtype="int", transform=PHI_LOOP_HEADER,
+            operands=(start, stop, step, loop_cell),
+        )
+        next_induction = self.fresh_value(
+            dtype="int", transform=CONTROL_EXPRESSION,
+            operands=(induction, step),
+        )
         self.current = header
         self.emit(
             Handler.Phi,
@@ -7844,7 +9114,12 @@ class _ControlSSABuilder:
             )
             carried_phis[entry] = self.current.instrs[-1]
             if initial_id not in bound_initial_ids:
-                self.external_values[initial_id] = current_value
+                # LOOP_HEADER: the header Phi is the body's value of the
+                # initial; its cause is the Phi cell and the loop construct.
+                self._bind(
+                    initial_id, current_value, BindingKind.LOOP_HEADER,
+                    loop_cell,
+                )
                 bound_initial_ids.add(initial_id)
         # Declare the loop as an evolving scope.  The rebind table is
         # exactly what ``carried`` already holds; what was missing is any
@@ -7870,7 +9145,10 @@ class _ControlSSABuilder:
             if int(updated_id) == int(initial_id)
         }
         result_port_aliases = self._bind_loop_result_ports_inside_body(loop)
-        condition = self.fresh_value(dtype="bool")
+        condition = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE,
+            operands=(induction, stop),
+        )
         self.emit(
             Handler.Lt if loop.comparison == "lt" else Handler.Gt,
             [induction, stop],
@@ -7924,13 +9202,24 @@ class _ControlSSABuilder:
             child_selection = self.child_table_selections.get(int(iterable_id))
             if child_selection is not None:
                 pool, handle = child_selection
-                base_offset = self.fresh_value(dtype="int")
-                offset = self.fresh_value(dtype="int")
-                address = self.fresh_value(dtype="ptr")
-                target = self.produced_value(int(target_id), dtype="unknown")
+                row_stride = self.external_value(pool.row_stride_value_id)
+                base_offset = self.fresh_value(
+                    dtype="int", transform=CONTROL_EXPRESSION,
+                    operands=(handle, row_stride),
+                )
+                offset = self.fresh_value(
+                    dtype="int", transform=CONTROL_EXPRESSION,
+                    operands=(base_offset, induction),
+                )
+                address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS, operands=(offset,),
+                )
+                target = self.produced_value(
+                    int(target_id), dtype="unknown", cause=(address,),
+                )
                 self.emit(
                     Handler.Mul,
-                    [handle, self.external_value(pool.row_stride_value_id)],
+                    [handle, row_stride],
                     base_offset,
                     attributes={"binding": "child_table_offset"},
                 )
@@ -7939,8 +9228,12 @@ class _ControlSSABuilder:
                     attributes={"binding": "child_table_offset"},
                 )
                 if pool.live_flags_value_id is not None:
-                    live_address = self.fresh_value(dtype="ptr")
-                    live = self.fresh_value(dtype="bool")
+                    live_address = self.fresh_value(
+                        dtype="ptr", transform=ADDRESS, operands=(offset,),
+                    )
+                    live = self.fresh_value(
+                        dtype="bool", transform=LOAD, operands=(live_address,),
+                    )
                     active = self.new_block("child_table_live")
                     self.emit(
                         Handler.GetElementPtr,
@@ -7993,7 +9286,11 @@ class _ControlSSABuilder:
                 int(target_id)
             )
             if projection == "induction":
-                self.external_values[int(target_id)] = induction
+                # LOOP_CONTROL: the induction Phi is the target's value.
+                self._bind(
+                    int(target_id), induction, BindingKind.LOOP_CONTROL,
+                    loop_cell, int(iterable_id),
+                )
                 continue
             projection_index = induction
             column_projection = projection
@@ -8065,6 +9362,8 @@ class _ControlSSABuilder:
                     else:
                         source = self.fresh_value(
                             dtype=target_dtype, shape=target_shape,
+                            transform=ROW_COLUMN_PROJECTION,
+                            operands=(int(iterable_id), int(target_id)),
                         )
                         source.accounting.update({
                             "projected_row_source_id": int(iterable_id),
@@ -8080,7 +9379,10 @@ class _ControlSSABuilder:
                     scalar_source = source
                     handle_source = self.variant_handle_columns.get(column_key)
                     if handle_source is None:
-                        handle_source = self.fresh_value(dtype="int")
+                        handle_source = self.fresh_value(
+                            dtype="int", transform=ROW_COLUMN_PROJECTION,
+                            operands=(int(iterable_id), scalar_source),
+                        )
                         handle_source.accounting.update({
                             "projected_variant_source_id": int(iterable_id),
                             "projected_variant_column": int(column_projection),
@@ -8115,7 +9417,10 @@ class _ControlSSABuilder:
                         self.external_values[int(target_id)]
                     )
                     # Scalar regions continue to consume the scalar column.
-                    self.external_values[int(target_id)] = scalar_value
+                    self._bind(
+                        int(target_id), scalar_value, BindingKind.LOOP_CONTROL,
+                        loop_cell,
+                    )
                     continue
             if (
                 projection is not None
@@ -8154,7 +9459,9 @@ class _ControlSSABuilder:
             base = self.external_values.get(int(base_id))
             if base is None:
                 continue
-            column_value = self.fresh_value(dtype="int")
+            column_value = self.fresh_value(
+                dtype="int", transform=CONTROL_CONST, operands=(base,),
+            )
             self.emit(
                 Handler.Const, [], column_value,
                 attributes={"value": int(column)},
@@ -8179,7 +9486,10 @@ class _ControlSSABuilder:
             restored_values[int(target_id)] = self.external_values.get(
                 int(target_id)
             )
-            aggregate = self.fresh_value(dtype="ssa.aggregate")
+            aggregate = self.fresh_value(
+                dtype="ssa.aggregate", transform=CONTROL_CONST,
+                operands=(int(iterable_id), loop_cell),
+            )
             self.emit(
                 Handler.Const,
                 [],
@@ -8215,10 +9525,16 @@ class _ControlSSABuilder:
             restored_values[int(target_id)] = self.external_values.get(
                 int(target_id)
             )
-            aggregate = self.fresh_value(dtype="ssa.aggregate")
+            closure_sources = [
+                self.external_value(value_id) for value_id in source_ids
+            ]
+            aggregate = self.fresh_value(
+                dtype="ssa.aggregate", transform=CONTROL_EXPRESSION,
+                operands=(*closure_sources, int(aggregate_id)),
+            )
             self.emit(
                 Handler.Const,
-                [self.external_value(value_id) for value_id in source_ids],
+                closure_sources,
                 aggregate,
                 attributes={
                     "binding": "closure_iterable",
@@ -8415,7 +9731,10 @@ class _ControlSSABuilder:
                     current = carried_phis[entry].args[0]
                     carried_phis[entry].args[1] = current
                     carried_updates[entry] = current
-                    self.external_values[updated_id] = current
+                    # LOOP_LATCH: the resident pointer crosses the latch.
+                    self._bind(
+                        updated_id, current, BindingKind.LOOP_LATCH, loop_cell,
+                    )
                     current.accounting["ssa_storage_identity_backedge"] = True
                     continue
                 self.shortfalls.append(
@@ -8439,18 +9758,25 @@ class _ControlSSABuilder:
                 offset = self.expression_value(
                     str(start), location=f"{path}.collection-offset",
                 )
-                publication_index = self.fresh_value(dtype="int")
+                publication_index = self.fresh_value(
+                    dtype="int", transform=CONTROL_EXPRESSION,
+                    operands=(induction, offset),
+                )
                 self.emit(
                     Handler.Add,
                     [induction, offset],
                     publication_index,
                     attributes={"binding": "collection_offset"},
                 )
-            address = self.fresh_value(dtype="ptr")
+            collection = self.external_value(collection_id)
+            address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS,
+                operands=(collection, publication_index),
+            )
             self.emit(
                 Handler.GetElementPtr,
                 [
-                    self.external_value(collection_id),
+                    collection,
                     publication_index,
                 ],
                 address,
@@ -8506,20 +9832,22 @@ class _ControlSSABuilder:
                 "backedge": (latch.name, header.name),
             })
         for target_id, previous in restored_values.items():
-            if previous is None:
-                self.external_values.pop(target_id, None)
-            else:
-                self.external_values[target_id] = previous
+            # RESTORED (or withdrawn): the loop targets leave scope.
+            self._withdraw(target_id, previous, loop_cell)
         if previous_induction is None:
             self.local_control_values.pop(loop.induction, None)
         else:
             self.local_control_values[loop.induction] = previous_induction
         settled_initial_ids: set[int] = set()
         for updated_id, initial_id, _initial, _updated, current in carried:
+            # LOOP_HEADER: after the loop every carried spelling denotes
+            # the converged header Phi.
             if initial_id not in settled_initial_ids:
-                self.external_values[initial_id] = current
+                self._bind(
+                    initial_id, current, BindingKind.LOOP_HEADER, loop_cell,
+                )
                 settled_initial_ids.add(initial_id)
-            self.external_values[updated_id] = current
+            self._bind(updated_id, current, BindingKind.LOOP_HEADER, loop_cell)
         for missing_site in sorted(
             set(exit_context["expected_sites"]) - exit_context["sites_seen"]
         ):
@@ -8531,7 +9859,7 @@ class _ControlSSABuilder:
                 f"source break/continue at graph node {missing_site} was "
                 "never placed in the loop body",
             ))
-        self._restore_loop_result_port_aliases(result_port_aliases)
+        self._restore_loop_result_port_aliases(result_port_aliases, loop)
         self._publish_loop_result_ports(
             loop,
             header=header,
@@ -8546,6 +9874,7 @@ class _ControlSSABuilder:
 
     def lower_while(self, loop: WhileBlock, *, path: str) -> None:
         recursion_region_id = loop.recursion_region_id
+        loop_cell = self._construct_cell(loop.source_loop_node_id)
         constant_predicate = (
             bool(loop.predicate_expression.literal)
             if (
@@ -8562,7 +9891,10 @@ class _ControlSSABuilder:
             if loop.predicate_expression is not None
             else self.external_value(loop.predicate_value_id, dtype="bool")
         )
-        next_predicate = self.fresh_value(dtype="bool")
+        next_predicate = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE,
+            operands=(initial_predicate, loop_cell),
+        )
 
         # A carried seed whose graph node was folded to a constant must enter
         # as that literal; external_value would otherwise invent a
@@ -8571,12 +9903,19 @@ class _ControlSSABuilder:
             seed_id = int(seed_id)
             if seed_id in self.external_values:
                 continue
-            seed_value = self.fresh_value(dtype="float64")
+            seed_value = self.fresh_value(
+                dtype="float64", transform=CONTROL_CONST,
+                operands=(seed_id, loop.source_loop_node_id),
+            )
             self.emit(
                 Handler.Const, [], seed_value,
                 attributes={"value": float(seed_literal)},
             )
-            self.external_values[seed_id] = seed_value
+            # LOOP_SEED: the folded seed's own identity cell is the cause.
+            self._bind(
+                seed_id, seed_value, BindingKind.LOOP_SEED,
+                self._construct_cell(loop.source_loop_node_id),
+            )
         carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]] = []
         for updated_id, initial_id in loop.carried_aliases:
             updated_id = int(updated_id)
@@ -8601,7 +9940,12 @@ class _ControlSSABuilder:
                     dtype=initial_value.dtype,
                     shape=initial_value.shape,
                 )
-                self.external_values[updated_id] = updated_value
+                # LOOP_SEED: the reserved backedge slot, from the pre-loop
+                # binding of the initial and the loop construct.
+                self._bind(
+                    updated_id, updated_value, BindingKind.LOOP_SEED,
+                    initial_value, self._construct_cell(loop.source_loop_node_id),
+                )
             else:
                 # A carried binding can select an already-dominating value
                 # as its authored update.  Keep that exact SSA resident;
@@ -8614,6 +9958,8 @@ class _ControlSSABuilder:
             current_value = self.fresh_value(
                 dtype=initial_value.dtype,
                 shape=initial_value.shape,
+                transform=PHI_LOOP_HEADER,
+                operands=(initial_value, updated_value),
             )
             carried.append((
                 updated_id, initial_id, initial_value,
@@ -8628,7 +9974,10 @@ class _ControlSSABuilder:
         self.branch(header)
 
         self.current = header
-        current_predicate = self.fresh_value(dtype="bool")
+        current_predicate = self.fresh_value(
+            dtype="bool", transform=PHI_LOOP_HEADER,
+            operands=(initial_predicate, next_predicate),
+        )
         self.emit(
             Handler.Phi,
             [initial_predicate, next_predicate],
@@ -8641,7 +9990,11 @@ class _ControlSSABuilder:
                 "source_loop_node_id": loop.source_loop_node_id,
             },
         )
-        self.external_values[int(loop.predicate_value_id)] = current_predicate
+        # LOOP_CONTROL: the predicate id denotes the header Phi in the body.
+        self._bind(
+            int(loop.predicate_value_id), current_predicate,
+            BindingKind.LOOP_CONTROL, loop_cell,
+        )
         carried_phis: dict[int, Instr] = {}
         bound_initial_ids: set[int] = set()
         for entry, (updated_id, initial_id, initial, updated, current) in enumerate(carried):
@@ -8664,7 +10017,10 @@ class _ControlSSABuilder:
             )
             carried_phis[entry] = self.current.instrs[-1]
             if initial_id not in bound_initial_ids:
-                self.external_values[initial_id] = current
+                # LOOP_HEADER: the header Phi is the body's value.
+                self._bind(
+                    initial_id, current, BindingKind.LOOP_HEADER, loop_cell,
+                )
                 bound_initial_ids.add(initial_id)
         # Declare the loop as an evolving scope.  The rebind table is
         # exactly what ``carried`` already holds; what was missing is any
@@ -8803,7 +10159,10 @@ class _ControlSSABuilder:
                     # placeholder reserved for a possible real update.
                     carried_phis[entry].args[1] = current
                     carried_updates[entry] = current
-                    self.external_values[updated_id] = current
+                    # LOOP_LATCH: the header Phi is the identity backedge.
+                    self._bind(
+                        updated_id, current, BindingKind.LOOP_LATCH, loop_cell,
+                    )
                     current.accounting["ssa_identity_backedge"] = True
                     continue
                 self.shortfalls.append(SSALoweringShortfall(
@@ -8840,8 +10199,10 @@ class _ControlSSABuilder:
             latch_restore.append(
                 (initial_id, self.external_values.get(initial_id))
             )
-            self.external_values[initial_id] = self.external_values.get(
-                updated_id, updated
+            # LOOP_LATCH: at the latch the carried name is the body's update.
+            self._bind(
+                initial_id, self.external_values.get(updated_id, updated),
+                BindingKind.LOOP_LATCH, self._binding_cell(updated_id), loop_cell,
             )
         # A retained numeric condition and its explicit scalar expression can
         # both publish the predicate. They must not define the same SSA id.
@@ -8861,20 +10222,45 @@ class _ControlSSABuilder:
             # the carried binding the test reads (``loop_carried_entry``
             # names its entry).  The latch neither re-runs the pre-loop
             # condition regions nor re-publishes the predicate id for it.
-            self._book().page("while_carried_test").concord(
-                loop_state,
-                tuple(sorted(map(str, self._operand_bindings(
+            # DERIVED(the ``lexical_read_binding`` cells the predicate read);
+            # a bare predicate id with no read position is recorded as
+            # ``Unresolved(WHILE_TEST_NO_READ_EXPRESSION)``.
+            predicate_cell = self._canonical_cell(
+                loop.predicate_expression.value_id
+            )
+            if loop.predicate_expression.read is not None:
+                read_cells = self._read_binding_cells(
+                    (tuple(loop.predicate_expression.read),)
+                )
+                test_fact: Any = tuple(sorted(map(str, self._operand_bindings(
                     (tuple(loop.predicate_expression.read),)
                 ))))
-                if loop.predicate_expression.read is not None
-                else int(loop.predicate_expression.value_id),
+                test_sources = self._cells(*read_cells, predicate_cell, loop_cell)
+            else:
+                test_fact = Unresolved(
+                    WHILE_TEST_NO_READ_EXPRESSION,
+                    read=self._cells(predicate_cell),
+                )
+                test_sources = self._cells(predicate_cell, loop_cell)
+            if not test_sources:
+                test_sources = (self._function_root(),)
+            self._book().post(
+                WHILE_CARRIED_TEST, loop_state, test_fact,
+                stage=self.active_stage,
+                provenance=Derived(test_sources),
+                mode=Mode.CONCORD,
             )
         if not carried_test:
             # A carried test's id is its binding's initial, which the latch
             # has just rebound to the body's update; that is the next test.
-            self.external_values[int(loop.predicate_value_id)] = (
-                self.fresh_value(dtype="bool")
-                if loop.predicate_expression is not None else next_predicate
+            self._bind(
+                int(loop.predicate_value_id),
+                self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(current_predicate, loop_cell),
+                )
+                if loop.predicate_expression is not None else next_predicate,
+                BindingKind.LOOP_CONTROL, loop_cell,
             )
         preserved_before = set(self.preserved_region_output_ids)
         self.preserved_region_output_ids.update(
@@ -8917,10 +10303,8 @@ class _ControlSSABuilder:
         # Post-loop consumers read the converged header phi, not the last
         # body update: restore the loop-wide binding before leaving.
         for initial_id, previous in latch_restore:
-            if previous is None:
-                self.external_values.pop(initial_id, None)
-            else:
-                self.external_values[initial_id] = previous
+            # RESTORED: post-loop consumers read the header Phi again.
+            self._withdraw(initial_id, previous, loop_cell)
         if latch_leaf is None and not any(
             instruction.res is next_predicate
             for instruction in self.current.instrs
@@ -8956,11 +10340,18 @@ class _ControlSSABuilder:
             })
         settled_initial_ids: set[int] = set()
         for updated_id, initial_id, _initial, _updated, current in carried:
+            # LOOP_HEADER: after the loop every carried spelling denotes
+            # the converged header Phi.
             if initial_id not in settled_initial_ids:
-                self.external_values[initial_id] = current
+                self._bind(
+                    initial_id, current, BindingKind.LOOP_HEADER, loop_cell,
+                )
                 settled_initial_ids.add(initial_id)
-            self.external_values[updated_id] = current
-        self.external_values[int(loop.predicate_value_id)] = current_predicate
+            self._bind(updated_id, current, BindingKind.LOOP_HEADER, loop_cell)
+        self._bind(
+            int(loop.predicate_value_id), current_predicate,
+            BindingKind.LOOP_CONTROL, loop_cell,
+        )
         for missing_site in sorted(
             set(exit_context["expected_sites"]) - exit_context["sites_seen"]
         ):
@@ -8972,7 +10363,7 @@ class _ControlSSABuilder:
                 f"source break/continue at graph node {missing_site} was "
                 "never placed in the loop body",
             ))
-        self._restore_loop_result_port_aliases(result_port_aliases)
+        self._restore_loop_result_port_aliases(result_port_aliases, loop)
         self._publish_loop_result_ports(
             loop,
             header=header,
@@ -9003,7 +10394,10 @@ class _ControlSSABuilder:
                 case_value,
                 location=f"{path}.case[{index}]",
             )
-            condition = self.fresh_value(dtype="bool")
+            condition = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(state, literal),
+            )
             self.emit(Handler.Eq, [state, literal], condition)
             self.conditional_branch(condition, case, otherwise)
             self.current = case
@@ -9592,13 +10986,27 @@ def _canonicalize_non_dominating_loop_result_uses(
                             current_identity_book,
                         )
 
-                        page = current_identity_book().page(
-                            "loop_result_reconciliation"
-                        )
+                        book = current_identity_book()
                         row = (
                             str(function.name), int(argument.id),
                         )
-                        page.set(row, len(page.history(row)), (
+                        # DERIVED(the ``carried_port_value`` cell it read,
+                        # when the lowering posted one for this port).
+                        scope = str(function.metadata.get(
+                            "tensor_shape_concordance_scope"
+                        ) or function.name)
+                        sources = tuple(
+                            cell for cell in (
+                                book.latest_ref(
+                                    CARRIED_PORT_VALUE, (scope, int(argument.id)),
+                                ),
+                                book.latest_ref(
+                                    CONTROL_VALUE_BINDING, (scope, int(argument.id)),
+                                ),
+                            )
+                            if cell is not None
+                        )
+                        book.post(LOOP_RESULT_RECONCILIATION, row, (
                             outcome,
                             f"{block_name}#{instruction_index}",
                             str(instruction.op),

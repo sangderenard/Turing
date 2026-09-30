@@ -309,6 +309,142 @@ class LoopBackendCapabilities:
     unroll_limit: int = 8
 
 
+def _post_planner_node_row(
+    graph: Any, node_id: int, transform_name: str, operand_node: int,
+    operand_cell: Any = None,
+) -> Any:
+    """The ``canonical_value`` row of a node the planner added after the
+    canonical relabel (a loop port, an unrolled constant): NOVEL under the
+    named transform from ``operand_cell`` (else the identity cell of
+    ``operand_node``, the loop construct), on a row with no ``NEW`` because
+    the id is the graph's dense ``next_process_value_id`` (plan 80, A2.6).
+    Returns the Ref, or None when the graph has no canonical scope."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import CANONICAL_VALUE, LOOP_COMPOSER
+    from .identity_concordance import (
+        Mode, Novel, current_identity_book,
+    )
+
+    read_scope = graph.G.graph.get("lexical_read_scope")
+    if read_scope is None or not graph.G.graph.get("canonical_value_ids"):
+        return None
+    book = current_identity_book()
+    transform = book.registry.transforms[transform_name]
+    if operand_cell is None:
+        try:
+            operand_cell = node_identity_cell(graph, int(operand_node))
+        except ValueError:
+            return None
+    data = graph.G.nodes[int(node_id)]
+    return book.post(
+        CANONICAL_VALUE, (tuple(read_scope), int(node_id)),
+        (str(data.get("type") or ""), str(data.get("op") or ""),
+         str(data.get("label") or "")),
+        stage=LOOP_COMPOSER, provenance=Novel(transform, (operand_cell,)),
+        mode=Mode.CONCORD,
+    )
+
+
+def _post_loop_carried_binding(
+    graph: Any, loop_id: int, updated: int, initial: int, names: tuple,
+) -> Any:
+    """Row (read scope, loop, updated, initial) -> binding names, DERIVED
+    from the ``name_binding`` cells of the initial and the updated version
+    of each name and the loop construct's identity cell (plan 80, A2.6)."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        BindingFact, LOOP_CARRIED_BINDING, LOOP_COMPOSER, NAME_BINDING,
+    )
+    from .identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    book = current_identity_book()
+    scope = tuple(graph.G.graph.get("lexical_read_scope"))
+    row = (scope, int(loop_id), int(updated), int(initial))
+    fact = tuple(names)
+    page = book.pages.get(LOOP_CARRIED_BINDING.name)
+    if page is not None and page.latest(row) is not None:
+        # ``concord`` semantics: the first statement owns the row.
+        if page.latest(row) != fact:
+            raise ValueError(
+                f"loop_carried_binding disagreement for {row!r}: "
+                f"recorded={page.latest(row)!r}, proposed={fact!r}"
+            )
+        return book.latest_ref(LOOP_CARRIED_BINDING, row)
+    cells: list = []
+    bindings = book.pages.get(NAME_BINDING.name)
+    if bindings is not None:
+        wanted = {int(initial), int(updated)}
+        for binding_row in bindings.scope_rows(scope):
+            if str(binding_row[1]) not in names:
+                continue
+            binding_fact = bindings.latest(binding_row)
+            if (
+                isinstance(binding_fact, BindingFact)
+                and int(binding_fact.value_id) in wanted
+            ):
+                cells.append(book.latest_ref(NAME_BINDING, binding_row))
+    try:
+        if int(loop_id) in graph.G:
+            cells.append(node_identity_cell(graph, int(loop_id)))
+    except ValueError:
+        pass
+    if not cells:
+        book.page(LOOP_CARRIED_BINDING).concord(row, fact)
+        return book.latest_ref(LOOP_CARRIED_BINDING, row)
+    return book.post(
+        LOOP_CARRIED_BINDING, row, fact, stage=LOOP_COMPOSER,
+        provenance=Derived(tuple(dict.fromkeys(cells))), mode=Mode.CONCORD,
+    )
+
+
+def _post_loop_region_membership(
+    graph: Any, loop_id: int, region_indices: tuple,
+) -> None:
+    """Row (read scope, loop) -> the regions this loop owns: the
+    ``deployment_region`` cells of ``region_indices`` under the graph's
+    planning scope when those rows exist (else the ordinals), DERIVED from
+    those cells and the loop construct's identity cell (plan 80, A2.4).
+    ``place_loop_carried_region_producers.owned_regions`` reads either."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        DEPLOYMENT_REGION, LOOP_COMPOSER, LOOP_REGION_MEMBERSHIP,
+    )
+    from .glsl_deployment_strategy import _post_if_changed
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    scope = tuple(graph.G.graph.get("lexical_read_scope"))
+    row = (scope, int(loop_id))
+    planning_scope = graph.G.graph.get("planning_scope")
+    region_cells = []
+    if planning_scope is not None:
+        for index in region_indices:
+            cell = book.latest_ref(DEPLOYMENT_REGION, (planning_scope, int(index)))
+            if cell is None:
+                region_cells = []
+                break
+            region_cells.append(cell)
+    fact = tuple(region_cells) if region_cells else tuple(region_indices)
+    cells = list(region_cells)
+    try:
+        if int(loop_id) in graph.G:
+            cells.append(node_identity_cell(graph, int(loop_id)))
+    except ValueError:
+        pass
+    if not cells:
+        book.page(LOOP_REGION_MEMBERSHIP).revise(row, fact)
+        return
+    _post_if_changed(
+        LOOP_REGION_MEMBERSHIP, row, fact, stage=LOOP_COMPOSER,
+        cells=tuple(cells),
+    )
+
+
 def _rebuild_graph_edges(graph: Any) -> None:
     """Make NetworkX edges and cached parent/child tables agree."""
 
@@ -819,6 +955,13 @@ def evaporate_unrolled_loops(
                 "value": value,
                 "unrolled_induction_of": int(loop_id),
             },
+        )
+        # The constant is a planner-made node: its ``canonical_value`` row
+        # is NOVEL from the loop construct it unrolls (plan 80, A2.6), so
+        # ``node_identity_cell`` finds a sourced row instead of minting an
+        # Unsourced one.
+        _post_planner_node_row(
+            graph, constant_id, "loop_composer_constant", int(loop_id),
         )
         return constant_id
 
@@ -1404,6 +1547,17 @@ def evaporate_unrolled_loops(
         )
         _rebuild_graph_edges(graph)
         identities = graph.G.graph.get("identity_table") or {}
+        # Versions whose nodes evaporated revise to
+        # ``Unresolved(BINDING_VERSION_REMOVED)`` (plan 80, A2.7).
+        from .concordance_declarations import LOOP_COMPOSER
+        from .glsl_deployment_strategy import _post_identity_table_mutation
+
+        _post_identity_table_mutation(graph, removed=(
+            int(value_id)
+            for value_ids in identities.values()
+            for value_id in value_ids
+            if int(value_id) not in graph.G
+        ), stage=LOOP_COMPOSER)
         graph.G.graph["identity_table"] = {
             str(name): tuple(
                 int(value_id)
@@ -1518,6 +1672,61 @@ def materialize_retained_loop_ports(
         ).items()
     }
     materialized_plans = []
+    from .concordance_declarations import (
+        BindingFact, CANONICAL_VALUE, LOOP_CARRIED_BINDING, LOOP_COMPOSER,
+        LOOP_RESULT_PORT_BINDING, NAME_BINDING,
+    )
+    from .identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    book = current_identity_book()
+    read_scope = graph.G.graph.get("lexical_read_scope")
+    read_scope = None if read_scope is None else tuple(read_scope)
+    #: port id -> its ``canonical_value`` Ref (posted by ``add_port``).
+    port_rows: dict[int, Any] = {}
+
+    def carried_cell(loop_id: int, updated: int) -> Any:
+        """The ``loop_carried_binding`` cell of the binding a port continues."""
+
+        page = book.pages.get(LOOP_CARRIED_BINDING.name)
+        if page is None or read_scope is None:
+            return None
+        for row in page.scope_rows(read_scope):
+            if int(row[1]) == int(loop_id) and int(row[2]) == int(updated):
+                return book.latest_ref(LOOP_CARRIED_BINDING, row)
+        return None
+
+    def post_port_version(name: str, port_id: int) -> None:
+        """The port's version of ``name`` on ``name_binding``: row (scope,
+        name, its position in the identity table), DERIVED from the port's
+        ``canonical_value`` row (plan 80, A2.7)."""
+
+        port_row = port_rows.get(int(port_id))
+        if port_row is None or read_scope is None:
+            return
+        versions = identities.get(str(name), [])
+        version = len(versions) - 1
+        while version >= 0 and int(versions[version]) != int(port_id):
+            version -= 1
+        if version < 0:
+            return
+        row = (read_scope, str(name), int(version))
+        fact = BindingFact(int(port_id), False, (None,) * 4, "")
+        existing = book.pages.get(NAME_BINDING.name)
+        if existing is not None and existing.latest(row) is not None:
+            if existing.latest(row) == fact:
+                return
+            book.post(
+                NAME_BINDING, row, fact, stage=LOOP_COMPOSER,
+                provenance=Derived((book.latest_ref(NAME_BINDING, row), port_row)),
+                mode=Mode.REVISE,
+            )
+            return
+        book.post(
+            NAME_BINDING, row, fact, stage=LOOP_COMPOSER,
+            provenance=Derived((port_row,)), mode=Mode.CONCORD,
+        )
 
     def add_port(
         node_type: str,
@@ -1557,21 +1766,53 @@ def materialize_retained_loop_ports(
             attributes=port_attributes,
             tensor=port_tensor,
         )
+        # The port is a planner-made node after the canonical relabel: its
+        # ``canonical_value`` row is NOVEL (``LOOP_RESULT_PORT`` /
+        # ``LOOP_STATE_PORT``) from the ``loop_carried_binding`` cell of the
+        # binding it continues, else from the loop construct's cell (a state
+        # port, an aggregate result, a break-bound result) -- plan 80, A2.6.
+        loop_id = attributes.get("loop_id")
+        continued = next(
+            (int(parent) for parent, role in parents
+             if str(role) in {"value", "state"}), None,
+        )
+        operand_cell = (
+            carried_cell(int(loop_id), int(continued))
+            if loop_id is not None and continued is not None else None
+        )
+        port_row = _post_planner_node_row(
+            graph, node_id,
+            "loop_result_port" if node_type in {"LoopResult", "LoopAggregateResult"}
+            else "loop_state_port",
+            int(loop_id) if loop_id is not None else int(node_id),
+            operand_cell,
+        )
+        if port_row is not None:
+            port_rows[int(node_id)] = port_row
         # A LoopResult continues exactly one authored binding; that is its
         # identity on the book, which the exit lowering joins against the
-        # loop's carried bindings instead of matching value ids.
-        read_scope = graph.G.graph.get("lexical_read_scope")
+        # loop's carried bindings instead of matching value ids.  DERIVED
+        # from the port's row and the carried cell it continues.
         if (
             node_type == "LoopResult"
             and read_scope is not None
             and attributes.get("binding_name") is not None
         ):
-            from .identity_concordance import current_identity_book
-
-            current_identity_book().page("loop_result_port_binding").concord(
-                (tuple(read_scope), int(node_id)),
-                str(attributes["binding_name"]),
+            binding_row = (read_scope, int(node_id))
+            binding_fact = str(attributes["binding_name"])
+            cells = tuple(
+                cell for cell in (port_row, operand_cell) if cell is not None
             )
+            if cells:
+                book.post(
+                    LOOP_RESULT_PORT_BINDING, binding_row, binding_fact,
+                    stage=LOOP_COMPOSER, provenance=Derived(cells),
+                    mode=Mode.CONCORD,
+                )
+            else:
+                book.page(LOOP_RESULT_PORT_BINDING).concord(
+                    binding_row, binding_fact,
+                )
         return node_id
 
     def rewire_continuation(
@@ -1615,7 +1856,7 @@ def materialize_retained_loop_ports(
                 for role, ordinal in reads_old
                 if reads_binding(node_id, role, ordinal)
             )
-            data["parents"] = [
+            rewired_parents = [
                 (
                     new_value_id
                     if int(parent) == old_value_id
@@ -1625,6 +1866,20 @@ def materialize_retained_loop_ports(
                 )
                 for role, ordinal, parent in positions
             ]
+            if reads_old:
+                # The operand rewrite goes through the one writer of a
+                # node's operand list so ``identity_transition`` records the
+                # move (plan 80, A2.6); ``same`` pairs the old parent with
+                # the port at the same position.
+                from ..common.tensors.topological_reducer import _set_operands
+
+                _set_operands(
+                    graph, int(node_id), rewired_parents,
+                    cause="loop_continuation_rewire",
+                    same={int(old_value_id): int(new_value_id)},
+                )
+            else:
+                data["parents"] = rewired_parents
             # Every cached copy of an id this edge rewrite touches -- a
             # port's `value_source_id`, the leaf ledgers, and a not-yet
             # materialized loop node's own carried/initial/state-effect
@@ -1643,20 +1898,57 @@ def materialize_retained_loop_ports(
             # everything below them) derived from the superseded operand, so
             # the next descriptor query derives from the continuation port
             # instead of keeping an answer about the pre-loop value.
-            from .identity_concordance import current_identity_book
+            from .concordance_declarations import (
+                LOOP_CONTINUATION_REWIRE as _REWIRE_STAGE,
+            )
             from .glsl_deployment_strategy import (
                 _invalidate_tensor_descriptor_dependents,
             )
 
-            scope = graph.G.graph.get("function_name")
-            page = current_identity_book().page(
+            # Keyed by the read scope (not the function name): row (scope,
+            # consumer, role, ordinal) DERIVED from the consumer's
+            # ``lexical_read_binding`` cell at that position, the port's
+            # ``canonical_value`` row and the ``identity_transition`` cell
+            # the rewrite posted, when each is on the book.
+            rewire_page = book.registry.pages.get(
                 "loop_continuation_rewire_concordance"
             )
+            read_page = book.registry.pages.get("lexical_read_binding")
+            transition_page = book.registry.pages.get("identity_transition")
+            port_row = port_rows.get(int(new_value_id))
             for consumer, role, ordinal in rewired_reads:
-                page.revise(
-                    (scope, consumer, str(role), int(ordinal)),
-                    (int(old_value_id), int(new_value_id), binding),
-                )
+                fact = (int(old_value_id), int(new_value_id), binding)
+                if read_scope is None or rewire_page is None:
+                    book.page("loop_continuation_rewire_concordance").revise(
+                        (graph.G.graph.get("function_name"), consumer,
+                         str(role), int(ordinal)),
+                        fact,
+                    )
+                    continue
+                cells = []
+                if read_page is not None:
+                    cell = book.latest_ref(
+                        read_page, (read_scope, int(consumer), role, int(ordinal)),
+                    )
+                    if cell is not None:
+                        cells.append(cell)
+                if port_row is not None:
+                    cells.append(port_row)
+                if transition_page is not None:
+                    cell = book.latest_ref(
+                        transition_page,
+                        (read_scope, int(consumer), role, int(ordinal)),
+                    )
+                    if cell is not None:
+                        cells.append(cell)
+                row = (read_scope, int(consumer), role, int(ordinal))
+                if cells:
+                    book.post(
+                        rewire_page, row, fact, stage=_REWIRE_STAGE,
+                        provenance=Derived(tuple(cells)), mode=Mode.REVISE,
+                    )
+                else:
+                    book.page(rewire_page).revise(row, fact)
             _invalidate_tensor_descriptor_dependents(
                 graph, (int(new_value_id),), "loop-continuation-rewired",
             )
@@ -1741,6 +2033,7 @@ def materialize_retained_loop_ports(
                 int(updated), result_id, owned_nodes, str(name),
             )
             identities.setdefault(str(name), []).append(result_id)
+            post_port_version(str(name), result_id)
             carried_results[str(name)] = result_id
         for name, initial, continuation in loop.break_bindings:
             if str(name) in carried_results:
@@ -1763,6 +2056,7 @@ def materialize_retained_loop_ports(
                 int(continuation), result_id, owned_nodes, str(name),
             )
             identities.setdefault(str(name), []).append(result_id)
+            post_port_version(str(name), result_id)
             carried_results[str(name)] = result_id
 
         planned_iteration_outputs = []
@@ -1974,6 +2268,7 @@ def materialize_retained_loop_ports(
                     identities.setdefault(
                         str(effect.state_name), []
                     ).append(aggregate_id)
+                    post_port_version(str(effect.state_name), aggregate_id)
                 continue
             state_port = add_port(
                 "LoopStatePort",
@@ -2009,6 +2304,7 @@ def materialize_retained_loop_ports(
             identities.setdefault(
                 str(effect.state_name), []
             ).append(result_id)
+            post_port_version(str(effect.state_name), result_id)
             effects.append({
                 "state_name": str(effect.state_name),
                 "operator": str(effect.operator),
@@ -4583,11 +4879,8 @@ def analyze_shader_loop_reductions(
         # versions of one in-place arena share.
         membership_scope = graph.G.graph.get("lexical_read_scope")
         if membership_scope is not None:
-            from .identity_concordance import current_identity_book
-
-            current_identity_book().page("loop_region_membership").revise(
-                (tuple(membership_scope), int(loop.node_id)),
-                tuple(sorted(map(int, region_indices))),
+            _post_loop_region_membership(
+                graph, int(loop.node_id), tuple(sorted(map(int, region_indices))),
             )
         sequence_mutations = []
         expression_nodes = {
@@ -4972,17 +5265,14 @@ def analyze_shader_loop_reductions(
         # it or share its initial (``second = value``).
         read_scope = graph.G.graph.get("lexical_read_scope")
         if read_scope is not None:
-            from .identity_concordance import current_identity_book
-
             carried_names: dict[tuple[int, int], set[str]] = {}
             for name, initial, updated in loop.carried_bindings:
                 carried_names.setdefault(
                     (int(updated), int(initial)), set()
                 ).add(str(name))
-            carried_page = current_identity_book().page("loop_carried_binding")
             for (updated, initial), names in carried_names.items():
-                carried_page.concord(
-                    (tuple(read_scope), int(loop.node_id), updated, initial),
+                _post_loop_carried_binding(
+                    graph, int(loop.node_id), updated, initial,
                     tuple(sorted(names)),
                 )
         carried_aliases = tuple(dict.fromkeys(

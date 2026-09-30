@@ -94,6 +94,15 @@ def link_process_graph_functions(
                 callee_ref=references[binding_name],
                 callee_resolution="linked-process-graph",
             )
+            # The attributes are the read view of the ``call_binding`` row
+            # (plan 80, A2.8): DERIVED from the call node's identity cell and
+            # the linked callee's ``function_address`` cell.
+            from .glsl_deployment_strategy import _post_call_binding
+
+            _post_call_binding(
+                graph, int(node_id), references[binding_name],
+                "linked_process_graph",
+            )
             if graph.G.has_edge(callee_id, node_id):
                 graph.G.remove_edge(callee_id, node_id)
             children = graph.G.nodes[callee_id].get("children") or []

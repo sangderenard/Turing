@@ -42,6 +42,19 @@ their latest fact and revision history), with nothing recomputed:
                carrying the MINTED flag) plus write-order inference
                (``causal_edges``) as a weaker HEURISTIC class.  The row->id
                lines stay as a second, dimmer layer.
+  cell_ref     a fact that holds a ``Ref(page, row, column)`` (FieldState
+               value/effect, Ref facts, ``Unresolved.read``) is an edge from
+               the referenced row to the holding row, timed by the holding
+               cell's stamp; REAL like DERIVED.  A Ref's row ints are never
+               read as loose ids.
+  pin          each core (ProcessGraph) node is pinned to the shell row of its
+               identity cell -- ``node_identity_cell``'s lookup, read only:
+               ``canonical_value (lexical_read_scope, id)`` after the canonical
+               relabel, else ``ingestion_value`` in ``operand_position_scope``
+               / ``ingestion_value_scope``.  Drawn dim with the core (K), the
+               picked node's pin bright; picking a core node selects its row
+               (so D diffuses the book from that node's identity cell).
+               ``--focus core#N`` does the same in batch.
 
 The layout starts as a plan: pages on a ring, each page's rows a disc around
 its slot, identities pulled to the centroid of the rows that name them.  That
@@ -144,8 +157,8 @@ MAX_ATOMS = 32          # ids taken from one row + fact, so a fat fact cannot fa
 ID_SCALE = 1.9          # identity points draw larger than row points
 
 # causal edge classes (graph["cedge_kind"]) and node provenance (graph["node_prov"])
-EDGE_DERIVED, EDGE_MINT, EDGE_HEURISTIC = 0, 1, 2
-EDGE_KIND_NAMES = ("derived", "mint", "heuristic")
+EDGE_DERIVED, EDGE_MINT, EDGE_HEURISTIC, EDGE_CELL_REF = 0, 1, 2, 3
+EDGE_KIND_NAMES = ("derived", "mint", "heuristic", "cell_ref")   # cell_ref: a fact holds a Ref to another cell
 PROV_NONE, PROV_MINT, PROV_UNSOURCED = 0, 1, 2
 EDGE_PATH_API = "book-api"                       # book.registry / edges_into / mint_of / unsourced_rows
 EDGE_PATH_PAGES = "book-pages+write-order"       # exact edge pages the book keeps today + causal_edges
@@ -305,22 +318,47 @@ class _CausalSink:
         while len(self.prov) < n:
             self.prov.append(PROV_NONE)
 
-def _atoms(obj, out, depth=0):
-    """Integers (ids) and strings inside a row or fact, in order."""
-    if len(out) >= MAX_ATOMS or depth > 5:
+def _is_ref(obj):
+    """A concordance cell reference (``identity_concordance.Ref(page, row,
+    column)``), duck-typed so a pickled book reads without the class."""
+    page = getattr(obj, "page", None)
+    return (page is not None and hasattr(page, "name") and hasattr(obj, "row")
+            and hasattr(obj, "column") and not isinstance(obj, type))
+
+
+def _atoms(obj, out, refs=None, depth=0):
+    """Integers (ids) and strings inside a row or fact, in order.
+
+    Dataclass facts (NodeFact, SpanFact, BindingFact, FieldState, ...) are
+    descended field by field; an Enum member is its name.  A ``Ref`` is a
+    cell reference, not a set of ids: it is appended to ``refs`` (when given)
+    and NOT descended, so its row ints are never read as loose identities."""
+    import dataclasses
+    import enum
+    if depth > 5 or obj is None or isinstance(obj, bool) or (refs is None and len(out) >= MAX_ATOMS):
         return
-    if isinstance(obj, bool) or obj is None:
+    if _is_ref(obj):
+        if refs is not None:
+            refs.append(obj)
         return
-    if isinstance(obj, int):
-        out.append(int(obj))
+    if isinstance(obj, enum.Enum):
+        if len(out) < MAX_ATOMS:
+            out.append(str(obj.name)[:80])
+    elif isinstance(obj, int):
+        if len(out) < MAX_ATOMS:
+            out.append(int(obj))
     elif isinstance(obj, str):
-        out.append(obj[:80])
+        if len(out) < MAX_ATOMS:
+            out.append(obj[:80])
     elif isinstance(obj, dict):
         for value in obj.values():
-            _atoms(value, out, depth + 1)
+            _atoms(value, out, refs, depth + 1)
     elif isinstance(obj, (tuple, list, set, frozenset)):
         for item in obj:
-            _atoms(item, out, depth + 1)
+            _atoms(item, out, refs, depth + 1)
+    elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        for f in dataclasses.fields(obj):
+            _atoms(getattr(obj, f.name, None), out, refs, depth + 1)
 
 
 def extract_graph(book, infer_edges="auto") -> dict:
@@ -341,6 +379,7 @@ def extract_graph(book, infer_edges="auto") -> dict:
     id_keys: list[tuple[int, int]] = []
     edges: list[tuple[int, int, float]] = []       # (row node, id key slot, weight)
     row_node: dict[tuple[str, object], int] = {}   # (page name, row) -> row node
+    held_refs: list[tuple] = []                    # (holding node, page, row, column, Ref)
 
     def scope_index(name):
         return scopes.setdefault(name, len(scopes))
@@ -351,9 +390,17 @@ def extract_graph(book, infer_edges="auto") -> dict:
             node = len(kind)
             row_node[(page_name, row)] = node
             key_atoms, fact_atoms = [], []
-            _atoms(row, key_atoms)
             history = page.history(row)
+            key_refs = []
+            _atoms(row, key_atoms, key_refs)
             _atoms(history[-1][1] if history else None, fact_atoms)
+            # every cell's Refs (FieldState.value/.effect, Ref facts, Unresolved.read):
+            # each is a cell_ref edge into this row at that cell's clock stamp
+            for c_index, (column, fact) in enumerate(history):
+                refs = list(key_refs) if c_index == 0 else []
+                _atoms(fact, [], refs)
+                for ref in refs:
+                    held_refs.append((node, page_name, row, column, ref))
             scope = next((a for a in key_atoms if isinstance(a, str)), page_name)
             scope_id = scope_index(scope)
             kind.append(0); page_of.append(page_index); scope_of.append(scope_id)
@@ -398,6 +445,17 @@ def extract_graph(book, infer_edges="auto") -> dict:
     edge_path = _api_causal(book, concordance, row_node, lookup_id, cell_time, sink)
     if edge_path is None:
         edge_path = _page_causal(book, row_node, lookup_id, cell_time, sink)
+    # Refs held inside facts: the referenced row -> the holding row (REAL edges)
+    seen_refs = set()
+    for target, page_name, row, column, ref in held_refs:
+        try:
+            source = row_node.get((_named(ref.page), ref.row))
+        except TypeError:                         # an unhashable row cannot be a book row
+            source = None
+        if source is None or (source, target) in seen_refs:
+            continue
+        seen_refs.add((source, target))
+        sink.edge(source, target, EDGE_CELL_REF, page_name, cell_time(page_name, row, column))
     sink.grow(n_rows + len(id_keys))
 
     scope_names = [None] * len(scopes)
@@ -445,7 +503,54 @@ def extract_graph(book, infer_edges="auto") -> dict:
     }
     if infer_edges == "on" or (infer_edges == "auto" and not (edge_path == EDGE_PATH_API and sink.latch == "CLOSED")):
         add_heuristic_edges(graph)
+    graph["_row_node"] = row_node                  # private: popped by load_graph (not saved)
     return graph
+
+
+def core_identity_rows(pg, book, row_node) -> np.ndarray:
+    """Per ProcessGraph node (``process_graph_arrays`` order): the shell row
+    node of its identity cell, -1 if the book has none.
+
+    The lookup order is ``node_identity_cell``'s (topological_reducer), read
+    only: after the canonical relabel the ``canonical_value`` row
+    ``(lexical_read_scope, node_id)``; else the ``ingestion_value`` row in
+    ``operand_position_scope`` then ``ingestion_value_scope``.  Nothing is
+    posted: a node with no row stays unpinned."""
+    from src.compiler.concordance_declarations import CANONICAL_VALUE, INGESTION_VALUE
+    metadata = getattr(pg.G, "graph", {}) or {}
+    canonical = CANONICAL_VALUE.name
+    ingestion = INGESTION_VALUE.name
+    lexical = metadata.get("lexical_read_scope") if metadata.get("canonical_value_ids") else None
+    scopes = tuple(s for s in (metadata.get("operand_position_scope"),
+                               metadata.get("ingestion_value_scope")) if s is not None)
+
+    def has_row(page_name, row):
+        page = book.pages.get(page_name)
+        try:
+            return page is not None and bool(page.history(row))
+        except (KeyError, TypeError):
+            return False
+
+    out = np.full(len(pg.G.nodes), -1, np.int64)
+    for i, node in enumerate(pg.G.nodes):
+        try:
+            node_id = int(node)
+        except (TypeError, ValueError):
+            continue
+        candidates = ([(canonical, (lexical, node_id))] if lexical is not None else []) + \
+                     [(ingestion, (scope, node_id)) for scope in scopes]
+        for page_name, row in candidates:
+            if has_row(page_name, row):
+                out[i] = row_node.get((page_name, row), -1)
+                break
+    return out
+
+
+def ensure_core_row(graph) -> None:
+    """A graph without pins (``--book``, or an npz saved before them) gets
+    ``core_row`` = -1 for every core node."""
+    if "core_row" not in graph:
+        graph["core_row"] = np.full(len(graph.get("core_t", ())), -1, np.int64)
 
 
 def add_heuristic_edges(graph) -> None:
@@ -497,7 +602,8 @@ def causal_summary(graph) -> str:
     listed = int(graph.get("unsourced_listed", 0))
     return (f"edges: {graph['edge_path']}   latch {graph['latch']}   "
             f"derived {counts['derived']}  mint {counts['mint']} ({int((prov == PROV_MINT).sum())} mint nodes)  "
-            f"unsourced {int((prov == PROV_UNSOURCED).sum())} ({listed} listed)  heuristic {counts['heuristic']}   "
+            f"unsourced {int((prov == PROV_UNSOURCED).sum())} ({listed} listed)  cell_ref {counts['cell_ref']}  "
+            f"heuristic {counts['heuristic']}   "
             f"stages: {', '.join(stage_tags) or '-'}   transforms: {', '.join(transform_tags) or '-'}")
 
 
@@ -564,21 +670,23 @@ def load_graph(args) -> dict:
         with np.load(args.graph, allow_pickle=False) as data:
             graph = {key: data[key] for key in data.files}
         ensure_causal(graph)
+        ensure_core_row(graph)
         return graph
     from src.compiler.identity_concordance import IdentityBook, identity_book
+    graphs = []
     if args.book:
         import pickle
         obj = pickle.loads(Path(args.book).read_bytes())
         book = obj if isinstance(obj, IdentityBook) else identity_book(obj)
-        graph_core = None
     else:
         import audit_identity_concordance as audit
-        graphs = []
         book = identity_book(audit.CASES[args.case](process_graph_sink=graphs.append))
-        graph_core = process_graph_arrays(graphs[-1]) if graphs else None
     graph = extract_graph(book, args.infer_edges)
-    if graph_core is not None:
-        graph.update(graph_core)
+    row_node = graph.pop("_row_node")
+    if graphs:
+        graph.update(process_graph_arrays(graphs[-1]))
+        graph["core_row"] = core_identity_rows(graphs[-1], book, row_node)
+    ensure_core_row(graph)
     return graph
 
 
@@ -1090,6 +1198,14 @@ def causal_reach(src, dst, n, focus, depth):
 def resolve_focus(graph, spec):
     """Node indices a ``--focus`` / ``--list`` selector names."""
     n = len(graph["kind"])
+    if spec.startswith("core#"):                    # a process-graph node: its pinned identity row
+        core_row = graph.get("core_row", np.zeros(0, np.int64))
+        index = int(spec[5:])
+        if not 0 <= index < len(core_row):
+            raise SystemExit(f"no core node {spec}: the core has {len(core_row)} nodes")
+        if core_row[index] < 0:
+            raise SystemExit(f"core node {spec} ({graph['core_label'][index]}) has no identity row on the shell")
+        return [int(core_row[index])]
     if spec.startswith("#"):
         index = int(spec[1:])
         if not 0 <= index < n:
@@ -1140,8 +1256,9 @@ CONSEQUENCE_RGB = np.array([1.00, 0.58, 0.12], np.float32)   # what it caused
 NEUTRAL_RGB = np.array([0.40, 0.40, 0.46], np.float32)       # no flow reaches it
 UNSOURCED_RGB = np.array([1.00, 0.10, 0.16], np.float32)     # hard: flow dies here
 MINT_RING_RGB = np.array([0.35, 1.00, 0.45], np.float32)     # ring on a minted row / id
-KIND_WEIGHT = np.array([1.0, 1.0, 0.6], np.float32)          # derived, mint, heuristic
-KIND_TINT = np.array([(0.85, 0.92, 1.00), (0.35, 1.00, 0.45), (0.5, 0.5, 0.55)], np.float32)
+KIND_WEIGHT = np.array([1.0, 1.0, 0.6, 1.0], np.float32)     # derived, mint, heuristic, cell_ref
+KIND_TINT = np.array([(0.85, 0.92, 1.00), (0.35, 1.00, 0.45), (0.5, 0.5, 0.55), (1.00, 0.80, 0.35)], np.float32)
+PIN_RGB = np.array([0.80, 0.55, 1.00], np.float32)          # core node -> its identity row on the shell
 CLOCK_TAU = 0.25          # heat falls by 1/e across a quarter of the compilation clock
 DIFFUSE_STEPS, DIFFUSE_DECAY = 6, 0.7
 
@@ -1465,13 +1582,23 @@ def main(argv=None) -> None:
         np.savez_compressed(args.save_graph, **graph)
     kind, page_of = graph["kind"], graph["page_of"]
     n = len(kind)
+    ensure_core_row(graph)
+    core_row = np.asarray(graph["core_row"], np.int64)
+    core_label = graph.get("core_label", np.zeros(0, dtype="U"))
     if args.list is not None:
         found = resolve_focus(graph, args.list)
         for i in found[:200]:
             print(describe_node(graph, i))
         print(f"{len(found)} node(s)" + (" (first 200 shown)" if len(found) > 200 else ""), flush=True)
+        needle = args.list.lower()
+        core_found = [i for i in range(len(core_label)) if needle in str(core_label[i]).lower()]
+        for i in core_found[:200]:
+            pin = f"-> #{int(core_row[i])}  {graph['label'][core_row[i]]}" if core_row[i] >= 0 else "-> (unpinned)"
+            print(f"core#{i:<5d} {str(core_label[i])[:40]:40s} {pin}")
+        if core_found:
+            print(f"{len(core_found)} core node(s)" + (" (first 200 shown)" if len(core_found) > 200 else ""), flush=True)
         return
-    focus_jobs = []
+    focus_jobs, focus_core = [], {}
     for spec in args.focus or ():
         found = resolve_focus(graph, spec)
         if len(found) != 1:
@@ -1479,6 +1606,8 @@ def main(argv=None) -> None:
             for i in found[:15]:
                 print("  " + describe_node(graph, i))
             raise SystemExit(2)
+        if spec.startswith("core#"):
+            focus_core[len(focus_jobs)] = int(spec[5:])
         focus_jobs.append(found[0])
     if args.settle is None:
         args.settle = 600 if focus_jobs else 0
@@ -1530,10 +1659,15 @@ def main(argv=None) -> None:
         print(f"settled {args.settle} world frames in {time.perf_counter() - settle_started:.1f}s "
               f"(world time {world.t:.2f}s)", flush=True)
     degree = (np.bincount(er, minlength=n) + np.bincount(ei, minlength=n)).astype(np.float32)
+    if len(core_row) != world.n_core:                    # a saved graph whose core and pins disagree
+        core_row = np.full(world.n_core, -1, np.int64)
+    pinned = np.flatnonzero((core_row >= 0) & (core_row < n))
+    n_pinned = len(pinned)
     summary = causal_summary(graph)
     print(f"graph: {int((kind == 0).sum())} rows, {int((kind == 1).sum())} ids, "
           f"{len(er)} lines, {len(csrc)} causal edges, {len(graph['pages'])} pages; "
-          f"core: {world.n_core} process-graph nodes, {len(world.core_src)} edges "
+          f"core: {world.n_core} process-graph nodes, {len(world.core_src)} edges, "
+          f"pinned {n_pinned}/{world.n_core} "
           f"({time.perf_counter() - started:.1f}s)", flush=True)
     print(summary, flush=True)
 
@@ -1588,6 +1722,7 @@ def main(argv=None) -> None:
     core_line_vao, core_line_vbo = make_vao(7)
     pick_point_vao, pick_point_vbo = make_vao(12)
     pick_line_vao, pick_line_vbo = make_vao(7)
+    pin_line_vao, pin_line_vbo = make_vao(7)
     scale = np.where(kind == 1, ID_SCALE, 1.0).astype(np.float32)
 
     # HUD: a pygame-rendered surface on a screen quad, as SpeciesHud does
@@ -1636,7 +1771,7 @@ def main(argv=None) -> None:
     state = dict(mode=0, isolate=-1, lines=True, points=True, psize=7.0, lalpha=0.35,
                  hud=True, bg=True, physics=bool(args.drift), error=0.0, pick=-1, dirty=True, hud_dirty=True, drag=None, moved=False, last_motion=0.0,
                  anim=args.anim, anim_t0=time.time(), speed=1.0, front=-1, focus=None, diffuse=bool(args.diffuse),
-                 order=True, core=True)
+                 order=True, core=True, pick_core=-1)
     world.set_flow(args.anim == "flow")
     if args.bare:
         state["lines"] = state["points"] = False
@@ -1725,12 +1860,37 @@ def main(argv=None) -> None:
                                 (1.6 + 2.0 * glow)[:, None]], axis=1)
         paint = np.repeat(paint[:, None, :], 4, axis=1)
         upload(core_line_vbo, np.concatenate([seg, paint], axis=2).reshape((-1, 7)))
+        rebuild_pins()
+
+    def rebuild_pins():
+        """Core node -> its identity row on the shell: straight chords, dim; the
+        picked core node's pin (or the pins onto the picked row) bright."""
+        if not n_pinned:
+            return
+        pa = core_pos[pinned].astype(np.float32)
+        pb = pos[core_row[pinned]].astype(np.float32)
+        mid = (pa + pb) / 2
+        seg = np.stack([pa, mid, mid, pb], axis=1)
+        bright = (pinned == state["pick_core"]) | ((state["pick"] >= 0) & (core_row[pinned] == state["pick"]))
+        rgb = np.where(bright[:, None], np.array([1.0, 0.92, 1.0], np.float32), PIN_RGB)
+        alpha = np.where(bright, 3.0, 0.22).astype(np.float32)
+        paint = np.repeat(np.concatenate([rgb, alpha[:, None]], axis=1)[:, None, :], 4, axis=1)
+        upload(pin_line_vbo, np.concatenate([seg, paint], axis=2).reshape((-1, 7)))
 
     def rebuild_pick():
-        p = state["pick"]
+        nonlocal pick_points
+        p, c = state["pick"], state["pick_core"]
+        marks = []
+        if p >= 0:
+            marks.append([*pos[p], 1, 1, 1, 1, 2.2, 0, 0, 0, 0])
+        if 0 <= c < world.n_core and state["core"]:
+            marks.append([*core_pos[c], 1, 0.92, 1, 1, 2.2, *PIN_RGB, 1.0])
+        pick_points = len(marks)
+        if marks:
+            upload(pick_point_vbo, np.array(marks, np.float32))
+        rebuild_pins()
         if p < 0:
             return 0
-        upload(pick_point_vbo, np.array([[*pos[p], 1, 1, 1, 1, 2.2, 0, 0, 0, 0]], np.float32))
         mask = (er == p) | (ei == p)
         cmask = ((csrc == p) | (cdst == p)) & (ckind != EDGE_HEURISTIC)
         seg = np.concatenate([SphereMap.segments(pos, er[mask], ei[mask]),
@@ -1758,6 +1918,7 @@ def main(argv=None) -> None:
         state["dirty"] = state["hud_dirty"] = True
 
     pick_edges = 0
+    pick_points = 0
     pages = list(graph["pages"])
     page_rgb = _hue_table(len(pages))
 
@@ -1771,7 +1932,8 @@ def main(argv=None) -> None:
                   (235, 235, 240)),
                  (f"world [{world.backend_name()}]: t {world.t:6.2f}s   last frame {world.accepted} admitted dt, {world.rejected} rejected   "
                   f"order force {'ON' if state['order'] and args.order_gain > 0 else 'off'} (gain {args.order_gain:g}, mean |F| {world.ext_mean:.3f})   "
-                  f"core {world.n_core} nodes {len(world.core_src)} edges {'shown' if state['core'] else 'hidden'}   "
+                  f"core {world.n_core} nodes {len(world.core_src)} edges {'shown' if state['core'] else 'hidden'}, "
+                  f"core pinned {n_pinned}/{world.n_core}   "
                   f"group {world.active_group()}/{FLOW_GROUPS}",
                   (200, 225, 235)),
                  (summary[:200], (190, 200, 215))]
@@ -1787,6 +1949,11 @@ def main(argv=None) -> None:
             rgb = tuple(int(c * 255 * (0.35 if dim else 1)) for c in page_rgb[i])
             count = int((page_of == i).sum())
             lines.append((f"  {name}  ({count})", rgb))
+        if 0 <= state["pick_core"] < world.n_core:
+            c = state["pick_core"]
+            pin = "pinned to its identity row" if core_row[c] >= 0 else "no identity row on the shell"
+            lines.append(("", (0, 0, 0)))
+            lines.append((f"core#{c}  {str(core_label[c])[:90]}   {pin}", tuple(int(255 * v) for v in PIN_RGB)))
         if state["pick"] >= 0:
             p = state["pick"]
             lines.append(("", (0, 0, 0)))
@@ -1810,7 +1977,12 @@ def main(argv=None) -> None:
                           f"{int((hops > 0).sum())} built on it   t={graph['t'][focus['node']]:.3f}")
             lines = [(f"{mode_name}   {graph['label'][focus['node']][:100]}", (255, 255, 255)),
                      (counts, (200, 205, 215)),
-                     (summary[:200], (190, 200, 215))]
+                     (summary[:200], (190, 200, 215)),
+                     (f"core pinned {n_pinned}/{world.n_core}", (200, 225, 235))]
+            c = state["pick_core"]
+            if 0 <= c < world.n_core and core_row[c] == focus["node"]:
+                lines.append((f"seeded from core#{c}  {str(core_label[c])[:90]}  (its identity cell)",
+                              tuple(int(255 * v) for v in PIN_RGB)))
         y = 6
         for text, color in lines:
             if not text:
@@ -1912,9 +2084,22 @@ def main(argv=None) -> None:
         colors_alpha = node_colors(graph, 0, degree, state["isolate"])[:, 3]
         dist2 = np.where(ok & (colors_alpha > 0.02), dist2, np.inf)
         near = np.flatnonzero(dist2 < 16 ** 2)
-        if not len(near):
-            return -1
-        return int(near[np.argmin(clip[near, 3])])            # the one nearest the camera
+        best, best_w = -1, math.inf
+        if len(near):
+            best = int(near[np.argmin(clip[near, 3])])        # the one nearest the camera
+            best_w = float(clip[best, 3])
+        if state["core"] and world.n_core:                    # a core node: select its identity row
+            cclip = np.concatenate([core_pos, np.ones((world.n_core, 1), np.float32)], axis=1) @ mvp.T.astype(np.float32)
+            cok = cclip[:, 3] > 1e-6
+            cndc = cclip[:, :2] / np.where(cok, cclip[:, 3], 1.0)[:, None]
+            csx, csy = (cndc[:, 0] * 0.5 + 0.5) * w, (1 - (cndc[:, 1] * 0.5 + 0.5)) * h
+            cd2 = np.where(cok, (csx - mx) ** 2 + (csy - my) ** 2, np.inf)
+            cnear = np.flatnonzero(cd2 < 16 ** 2)
+            if len(cnear):
+                c = int(cnear[np.argmin(cclip[cnear, 3])])
+                if float(cclip[c, 3]) < best_w or best < 0:
+                    return int(core_row[c]), c
+        return best, -1
 
     clock = pygame.time.Clock()
     frame_count = 0
@@ -1979,6 +2164,10 @@ def main(argv=None) -> None:
             use(prog_point, psize=state["psize"])
             gl.glBindVertexArray(core_point_vao)
             gl.glDrawArrays(gl.GL_POINTS, 0, world.n_core)
+            if n_pinned:                                # core -> shell identity pins
+                use(prog_line, lalpha=1.0)
+                gl.glBindVertexArray(pin_line_vao)
+                gl.glDrawArrays(gl.GL_LINES, 0, 4 * n_pinned)
         if state["lines"]:
             use(prog_line, lalpha=state["lalpha"])
             gl.glBindVertexArray(line_vao); gl.glBindBuffer(gl.GL_ARRAY_BUFFER, line_vbo)
@@ -1991,10 +2180,10 @@ def main(argv=None) -> None:
             use(prog_point, psize=state["psize"])
             gl.glBindVertexArray(point_vao)
             gl.glDrawArrays(gl.GL_POINTS, 0, n)
-        if state["pick"] >= 0:
+        if state["pick"] >= 0 or state["pick_core"] >= 0:
             use(prog_point, psize=state["psize"])
             gl.glBindVertexArray(pick_point_vao)
-            gl.glDrawArrays(gl.GL_POINTS, 0, 1)
+            gl.glDrawArrays(gl.GL_POINTS, 0, pick_points)
         if state["hud"]:
             if state["hud_dirty"]:
                 draw_hud(w, h); state["hud_dirty"] = False
@@ -2008,7 +2197,8 @@ def main(argv=None) -> None:
         out_dir = Path(args.out)
         out_dir.mkdir(parents=True, exist_ok=True)
         camera.spin = None
-        for node in focus_jobs:
+        for job, node in enumerate(focus_jobs):
+            state["pick_core"] = focus_core.get(job, -1)   # a core# job: its pin drawn bright
             set_focus(node)
             update_scene()
             w, h = pygame.display.get_window_size()
@@ -2016,7 +2206,8 @@ def main(argv=None) -> None:
             state["hud_dirty"] = True
             draw_scene(w, h)
             slug = re.sub(r"[^A-Za-z0-9]+", "_", str(graph["label"][node]))[:48].strip("_")
-            path = out_dir / f"{'diffuse' if state['diffuse'] else 'focus'}_{node}_{slug}.png"
+            core_tag = f"core{focus_core[job]}_" if job in focus_core else ""
+            path = out_dir / f"{'diffuse' if state['diffuse'] else 'focus'}_{core_tag}{node}_{slug}.png"
             buf = gl.glReadPixels(0, 0, w, h, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE)
             image = pygame.image.frombuffer(buf, (w, h), "RGBA")
             pygame.image.save(pygame.transform.flip(image, False, True), str(path))
@@ -2082,7 +2273,7 @@ def main(argv=None) -> None:
                 camera.spin = None
             if ev.type == MOUSEBUTTONUP and ev.button in (1, 2, 3):
                 if ev.button == 1 and state["drag"] == "orbit" and not state["moved"]:
-                    state["pick"] = pick_at(ev.pos[0], ev.pos[1], mvp, w, h)
+                    state["pick"], state["pick_core"] = pick_at(ev.pos[0], ev.pos[1], mvp, w, h)
                     pick_edges = rebuild_pick(); state["hud_dirty"] = True
                 if time.time() - state["last_motion"] > 0.06:
                     camera.spin = None                        # released while still: no coast
