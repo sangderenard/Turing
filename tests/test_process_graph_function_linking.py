@@ -4914,8 +4914,13 @@ def test_callable_dataclass_field_preserves_function_identity():
         "callable_identity_concordance"
     )
     rows = page.rows()
-    assert len(rows) == 1
-    assert tuple(fact for _column, fact in page.history(rows[0])) == (0, 0)
+    # Step 2 (2026-09-30): the callable identity is posted once at ingestion
+    # and once more under the canonical scope by the relabel (DERIVED from the
+    # ingestion row), so there are two rows, each with one revision, instead
+    # of one row written twice.  Not run here (pytest is not part of the gate).
+    assert len(rows) == 2
+    for row in rows:
+        assert tuple(fact for _column, fact in page.history(row)) == (0,)
 
 
 def _default_identity_child(value=None):

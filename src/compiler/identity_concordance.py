@@ -3802,13 +3802,10 @@ def record_shape_transformation(
         # written, the edge derives from it; otherwise the cause is not on
         # the book and the edge is posted unsourced, which the audit lists.
         source_ref = book.latest_ref(SHAPE_STATE_PAGE, (source_scope, source_id))
-        if source_ref is not None and _newer_than_row(book, source_ref, edge_ref):
-            provenance: Derived | Unsourced = Derived((source_ref,))
-        else:
-            provenance = Unsourced(SHAPE_SOURCE_NOT_ON_BOOK)
-        edge_ref = book.post(
-            SHAPE_EDGE_PAGE, edge_row, edge_fact,
-            stage=stage_object, provenance=provenance, mode=Mode.REVISE,
+        edge_ref = _post_or_unsourced(
+            book, SHAPE_EDGE_PAGE, edge_row, edge_fact, stage_object,
+            () if source_ref is None else (source_ref,),
+            SHAPE_SOURCE_NOT_ON_BOOK,
         )
     # The same edge, read from its source end: which targets were derived
     # from this identity.  A row's first element is the source identity, so
@@ -3825,23 +3822,42 @@ def record_shape_transformation(
         previous = concordant_shape_transformation_state(
             target_scope, target_id,
         )
-        # The projection derives from its edge when the edge changed since
-        # the row's previous revision; a re-resolution over an unchanged
-        # edge (the row was withdrawn or re-pointed in between) has its
-        # cause off the book and is posted unsourced.
-        if _newer_than_row(book, edge_ref, state_ref):
-            provenance = Derived((edge_ref,))
-        else:
-            provenance = Unsourced(SHAPE_STATE_REDERIVED)
-        book.post(
-            SHAPE_STATE_PAGE, state_row, state_fact,
-            stage=stage_object, provenance=provenance, mode=Mode.REVISE,
+        # The projection derives from its edge.  A re-resolution after a
+        # withdrawal derives from the same edge cell but from a DIFFERENT
+        # cell set than the withdrawal did, so the api admits it as a
+        # revision with a cause; only a state that changes over the same
+        # edge with nothing changed is causeless and is posted unsourced.
+        _post_or_unsourced(
+            book, SHAPE_STATE_PAGE, state_row, state_fact, stage_object,
+            (edge_ref,), SHAPE_STATE_REDERIVED,
         )
         if previous != target:
             withdraw_superseded_shape_derivations(
                 target_scope, target_id, target, reason=stage,
             )
     return target
+
+
+def _post_or_unsourced(
+    book: IdentityBook, page: Page, row: tuple, fact: Any, stage: Stage,
+    cells: tuple[Ref, ...], reason: Reason,
+) -> Ref:
+    """Post ``fact`` DERIVED from ``cells``; when the api refuses the revision
+    because nothing in ``cells`` changed and the cell set is the previous
+    revision's (or there are no cells), post it ``Unsourced(reason)`` so the
+    causeless statement is listed by the audit instead of hidden."""
+    if cells:
+        try:
+            return book.post(
+                page, row, fact, stage=stage,
+                provenance=Derived(cells), mode=Mode.REVISE,
+            )
+        except ConcordanceRefusal:
+            pass
+    return book.post(
+        page, row, fact, stage=stage,
+        provenance=Unsourced(reason), mode=Mode.REVISE,
+    )
 
 
 def _newer_than_row(book: IdentityBook, source: Ref, latest: Ref | None) -> bool:
