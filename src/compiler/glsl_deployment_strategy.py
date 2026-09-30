@@ -7034,61 +7034,61 @@ def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
         except (TypeError, ValueError):
             non_numeric_constant_operand = True
             break
-    def is_scalar_value(candidate: int, visiting=frozenset()) -> bool:
-        if candidate in visiting or candidate not in graph.G:
-            return False
-        if candidate in (graph.G.graph.get("_dispatch_metadata_cache") or {}).get(
-            "__carried_initials__", ()
-        ):
-            # A literal seed is a runtime loop value after the first iteration.
-            return False
-        candidate_data = graph.G.nodes[candidate]
-        candidate_expression = candidate_data.get("expr_obj")
-        candidate_type = str(candidate_data.get("type"))
-        candidate_op = str(
-            candidate_data.get("op") or candidate_type
-        )
-        if candidate_op in ACCESSOR_OPERATORS:
-            return True
-        if candidate_type in {"Const", "const", "Constant"}:
-            return True
-        if candidate_type in {"Input", "input"}:
-            return (
-                (candidate_data.get("attributes") or {}).get("value_kind")
-                == "scalar"
-            )
-        if not isinstance(
-            candidate_expression,
-            (ast.BinOp, ast.UnaryOp, ast.Compare, ast.IfExp),
-        ):
-            return False
-        candidate_parents = tuple(
-            candidate_data.get("parents") or ()
-        )
-        return bool(candidate_parents) and all(
-            is_scalar_value(
-                parent,
-                visiting | {candidate},
-            )
-            for parent, _role in candidate_parents
-        )
-
-    static_scalar_expression = (
-        isinstance(expression, (ast.BinOp, ast.UnaryOp, ast.Compare))
-        and bool(parents)
-        and all(
-            is_scalar_value(parent)
-            for parent, _role in parents
-        )
-    )
+    # REMOVED 2026-09-30: the ``static_scalar_expression`` deferral.
+    #
+    # Until this date a BinOp/UnaryOp/Compare whose operands were ALL scalars
+    # (constants, accessors, or an Input marked ``value_kind == "scalar"``) was
+    # classified as dispatch metadata: coordinator bookkeeping, left out of
+    # every region and expected to be evaluated in place by whichever consumer
+    # read it (an index, a condition).  It arrived 2026-07-28 with commit
+    # 87a867ea ("Enforce complete demo execution inside AST root") and stated
+    # no reason beyond sitting in this list of Python-syntax constructs.
+    #
+    # What it did wrong.  A scalar Input is marked by the reducer for a
+    # parameter annotated bool/bytes/complex/float/int/str OR given a scalar
+    # default (``dt=0.5``).  For such a parameter ``k + 1`` was deferred to a
+    # LATER phase: ``fortran_c_shell._graph_control_expression`` rebuilds an
+    # expression tree from the node's graph parents where a consumer needs it.
+    # Only some consumers call it (branch predicates, scalar field writes).
+    # A returned ``k + 1``, or a scalar feeding a tensor op
+    # (``x * (dt * 0.5)``), reaches no such consumer and had no producer.
+    # That phase re-derives the value per consumer, which its own docstring
+    # warns gives one source value a second physical definition and, for a
+    # loop-carried update, a stale one.  The function then carried an
+    # unnamed, unused formal and the
+    # full-native gate rejected it.  ``def f(k): return k + 1`` compiled and
+    # ``def f(k: int): return k + 1`` did not, though they are one program.
+    # The decision to defer lived only in this classifier's private cache, so
+    # no row on the identity book told the consumer it owed the computation:
+    # a morph with no edge (tools/compiler_probes/
+    # probe_annotated_scalar_parameter.py; docs/
+    # DECISION_scalar_expression_deferral_2026-09-30.md).
+    #
+    # Rule now: a scalar expression is ordinary numerical work.  It resolves
+    # at compile time when its operands are known (constant folding is
+    # another pass) and otherwise is computed ONCE by the region that owns it,
+    # as soon as its operands are available (the planner's dependency
+    # order), and every consumer reads that one published value.  Nothing is
+    # re-derived per consumer and nothing is deferred to the latest use.
+    #
+    # Evidence for removing it (all compile-only, 2026-09-30): with the rule
+    # off, 14 programs compiled and each annotated form matched its plain
+    # twin; with it on, 7 annotated/defaulted forms were rejected.  The
+    # concordance audit tool gave identical rows and findings on all six of
+    # its cases either way.
+    #
+    # If a scalar op turns out to cost a needless shader dispatch on a GPU
+    # backend, fix that in the deployment profile of that backend, with the
+    # producer recorded on the book.  Do not restore a deferral no row
+    # records.
     coordinator_accessor = (
         str(data.get("op") or node_type) in ACCESSOR_OPERATORS
     )
     # ``<<``/``>>`` are ordinary numeric tensor operators (bitfield extraction
     # in a byte decoder, for example), not inherently coordinator-side. A
-    # genuine *scalar* shift -- address/index arithmetic -- is already caught
-    # by ``static_scalar_expression`` below (every operand a scalar), exactly
-    # as a scalar ``&`` is; there is deliberately no ``coordinator_bitand``.
+    # genuine *scalar* shift -- address/index arithmetic -- was once caught by
+    # the scalar-expression deferral (removed 2026-09-30, see above), exactly
+    # as a scalar ``&`` was; there is deliberately no ``coordinator_bitand``.
     # Special-casing every shift as coordinator metadata additionally swallowed
     # tensor-parallel shifts, which then never reached a numeric region.
     coordinator_boolean_not = (
@@ -7291,7 +7291,6 @@ def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
         or python_shape_index
         or compares_none
         or non_numeric_constant_operand
-        or static_scalar_expression
         or coordinator_accessor
         or coordinator_boolean_not
         or chained_comparison
