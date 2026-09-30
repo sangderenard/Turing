@@ -15,10 +15,19 @@ their latest fact and revision history), with nothing recomputed:
   time         every point carries its construction time: the book's write
                clock (``IdentityPage.stamps``) at the row's first cell, and for
                an identity the earliest row naming it.  The background is the
-               kernel-smoothed average of that time over the plan (contours =
-               equal construction time); Space runs an integrator that moves
-               each point down the field's gradient toward where the smoothed
-               time equals its own, with edge springs and density repulsion.
+               kernel-smoothed average of that time over the sphere (contours =
+               equal construction time).
+  physics      one ``ComputationalWorld`` (``src/computational_world``: the
+               dt-managed BoundSpring) holds TWO spring networks and advances
+               both on one admitted dt per frame through ``WorldTickLease``:
+               the SHELL is this graph, its network pinned ON the unit sphere
+               (``surface=True``); the CORE is the compiler's own resolved
+               ``ProcessGraph`` of the same lowering, contained INSIDE a small
+               sphere at the centre, its compile order (asap levels) top to
+               bottom.  Space runs the lease.  The order field is a force layer
+               before the integrator (``spring_external_force``): each shell
+               point is pushed down the gradient of smoothed time minus its
+               own, from the same field the contours are drawn from (O toggles).
   line         row -> every id its key names (bright) or its latest fact
                names (dim), coloured by the row's page
   causal edge  a directed edge the book itself recorded: DERIVED (source
@@ -55,14 +64,15 @@ writes the extracted graph so ``--graph`` reopens it with no compiler import.
 
     left-drag: turn the sphere (release to coast)   right/middle-drag or
     shift+left-drag: pan   wheel: zoom   arrows: pan
+    O: order-field force on/off   K: core (process graph) on/off
     F: reset zoom/pan   T: reset rotation   click: pick a point
     M: mass (toggle; ``--mass``)  a released spin no longer decays to a stop:
         the damping drops out as the speed approaches an inertial floor
         (``MASS_FLOOR`` radians per frame), only the excess over the floor
         decays, and the sphere keeps turning at the floor until dragged again
     1 page  2 scope  3 revisions  4 degree  5 time   (colour mode)
-    Space: run/stop the time integrator   R: reset layout   B: time background
-        ``--drift`` starts with the integrator running (after ``--settle``),
+    Space: run/stop the world   R: reset layout   B: time background
+        ``--drift`` starts with the world running (after ``--settle``),
         so the points drift and the contour background evolves live from the
         first frame; Space still stops and restarts it
     G: animation  off -> build -> flow      , .: slower / faster
@@ -70,8 +80,12 @@ writes the extracted graph so ``--graph`` reopens it with no compiler import.
                with a cyan border when its row is written, an identity gets a
                pink border each time a later row attaches to it, and the very
                front of the compilation is white-hot
-        flow   the finished graph, everything visible, the same borders
-               sweeping over it as repeating waves in construction order
+        flow   the finished graph, everything visible; the world's own
+               activation cycle sweeps FLOW_GROUPS construction-order groups
+               through BOTH networks: the active group's edges contract their
+               rest length (the yank), its nodes glow larger, then relax --
+               read straight off the spring state (glow, rest lengths), so
+               the twitch is the compile order and it perturbs the physics
     C: causal focus on the picked point (again to leave)
     D: colormap diffusion from the picked/focused point (toggle; ``--diffuse``)
         heat spreads from the point over the causal edges, forward along them
@@ -516,6 +530,28 @@ def layout(graph) -> np.ndarray:
     return pos.astype(np.float32)
 
 
+def process_graph_arrays(pg) -> dict:
+    """The compiler's resolved ``ProcessGraph`` as plain arrays for the core:
+    nodes in graph order, its own edges, labels from the semantic ``type``,
+    and compile order as the asap level normalized to 0..1 (the graph's
+    ``levels`` when the lowering computed them, else the scheduler's asap)."""
+    G = pg.G
+    nodes = list(G.nodes)
+    index = {node: i for i, node in enumerate(nodes)}
+    levels = dict(pg.levels) if getattr(pg, "levels", None) else pg.scheduler.compute_asap_levels()
+    level = np.array([float(levels.get(node, 0) or 0) for node in nodes], np.float64)
+    span = (level.max() - level.min()) if len(level) else 0.0
+    core_t = ((level - level.min()) / span if span > 0 else np.zeros_like(level)).astype(np.float32)
+    edges = np.array([(index[a], index[b]) for a, b in G.edges if a in index and b in index], np.int64).reshape(-1, 2)
+    label = [str(G.nodes[node].get("type") or G.nodes[node].get("label") or node)[:48] for node in nodes]
+    return {
+        "core_t": core_t,
+        "core_src": edges[:, 0].copy(),
+        "core_dst": edges[:, 1].copy(),
+        "core_label": np.asarray(label, dtype="U"),
+    }
+
+
 def load_graph(args) -> dict:
     if args.graph:
         with np.load(args.graph, allow_pickle=False) as data:
@@ -527,10 +563,16 @@ def load_graph(args) -> dict:
         import pickle
         obj = pickle.loads(Path(args.book).read_bytes())
         book = obj if isinstance(obj, IdentityBook) else identity_book(obj)
+        graph_core = None
     else:
         import audit_identity_concordance as audit
-        book = identity_book(audit.CASES[args.case]())
-    return extract_graph(book, args.infer_edges)
+        graphs = []
+        book = identity_book(audit.CASES[args.case](process_graph_sink=graphs.append))
+        graph_core = process_graph_arrays(graphs[-1]) if graphs else None
+    graph = extract_graph(book, args.infer_edges)
+    if graph_core is not None:
+        graph.update(graph_core)
+    return graph
 
 
 # -- colour ------------------------------------------------------------------
@@ -660,45 +702,41 @@ class TimeField:
         return grid[..., cell[:, 1], cell[:, 0]]
 
 
-class Integrator:
-    """Semi-implicit Euler on the sphere's (u, v) map: springs keep the graph
-    connected, density gradient spreads it, and the time potential
-    1/2 (T(p) - t_i)^2 slides each point toward the place whose smoothed time
-    is its own.  u wraps; v stops at the poles."""
+class SphereMap:
+    """The plan's (u, v) map of the unit sphere and its geometry helpers.
+    u is longitude (periodic), v is height on the Lambert equal-area mapping
+    (sin latitude = 1 - 2v), so equal map area is equal sphere area."""
 
-    def __init__(self, graph, pos, field):
-        self.graph = graph
-        self.field = field
-        self.t = graph["t"].astype(np.float64)
+    def __init__(self, pos):
         lo, hi = pos[:, [0, 2]].min(axis=0), pos[:, [0, 2]].max(axis=0)
         size = float(max((hi - lo).max(), 1.0) * 1.35)
         origin = (lo + hi) / 2 - size / 2
         self.u0 = ((pos[:, [0, 2]] - origin) / size).astype(np.float64)
-        rev = graph["rev"].astype(np.float64)
-        self.radius = 1.0 + 0.03 * np.log1p(np.maximum(rev - 1.0, 0.0))     # revisions lift a row off the surface
-        self.reset()
-        self.k_spring, self.rest = 0.5, 0.012
-        self.k_time, self.k_repel, self.damping, self.dt = 30.0, 0.15, 0.88, 0.05
+        self.u0[:, 0] %= 1.0
+        self.u0[:, 1] = np.clip(self.u0[:, 1], 0.02, 0.98)
 
-    def reset(self):
-        self.u = self.u0.copy()
-        self.v = np.zeros_like(self.u)
-
-    def sphere(self, u=None):
+    @staticmethod
+    def sphere(u):
         """(u, v) -> unit sphere: longitude 2 pi (u - 1/2), sin(latitude) = 1 - 2v."""
-        u = self.u if u is None else u
         lon = 2 * math.pi * (u[:, 0] - 0.5)
         s = 1.0 - 2.0 * u[:, 1]
         c = np.sqrt(np.maximum(1.0 - s * s, 0.0))
         return np.stack([c * np.sin(lon), s, c * np.cos(lon)], axis=1)
 
-    def write(self, pos):
-        pos[:] = (self.sphere() * self.radius[:, None]).astype(np.float32)
+    @staticmethod
+    def unmap(p):
+        """Points -> (u, v) in [0, 1]^2 by direction (the inverse of ``sphere``)."""
+        r = np.linalg.norm(p, axis=1)
+        q = p / np.maximum(r, 1e-9)[:, None]
+        u = (np.arctan2(q[:, 0], q[:, 2]) / (2 * math.pi) + 0.5) % 1.0
+        v = np.clip((1.0 - q[:, 1]) / 2.0, 0.0, 1.0)
+        return np.stack([u, v], axis=1)
 
-    def segments(self, pos, a, b):
-        """Line vertices (4 per edge): an arc from row node ``a`` to id node
-        ``b`` through a midpoint lifted back onto the sphere, so an edge that
-        crossed the old map seam is drawn whole and stays near the surface."""
+    @staticmethod
+    def segments(pos, a, b):
+        """Line vertices (4 per edge): an arc from node ``a`` to node ``b``
+        through a midpoint lifted back to the endpoints' mean radius, so an
+        edge across the map seam is drawn whole and stays near its surface."""
         pa, pb = pos[a].astype(np.float64), pos[b].astype(np.float64)
         mid = (pa + pb) / 2
         length = np.linalg.norm(mid, axis=1, keepdims=True)
@@ -708,31 +746,219 @@ class Integrator:
         out[:, 0], out[:, 1], out[:, 2], out[:, 3] = pa, mid, mid, pb
         return out
 
-    def step(self):
-        g, f = self.graph, self.field
-        n = len(self.u)
-        f.update(self.u, self.t)
-        er, ei, ew = g["edge_row"], g["edge_id"], g["edge_weight"]
-        d = self.u[ei] - self.u[er]
-        d[:, 0] -= np.round(d[:, 0])                       # nearest longitude image
-        length = np.linalg.norm(d, axis=1) + 1e-9
-        pull = (self.k_spring * ew * (length - self.rest) / length)[:, None] * d
-        force = np.zeros_like(self.u)
-        for axis in (0, 1):
-            force[:, axis] += np.bincount(er, weights=pull[:, axis], minlength=n)
-            force[:, axis] -= np.bincount(ei, weights=pull[:, axis], minlength=n)
-        force -= self.k_repel * f.sample(f.grad_repel, self.u).T
-        known = np.isfinite(self.t)
-        error = np.where(known, f.sample(f.time, self.u) - np.nan_to_num(self.t), 0.0)
-        conf = f.sample(f.confidence, self.u)
-        force -= (self.k_time * error * conf)[:, None] * f.sample(f.grad_time, self.u).T
-        self.v = (self.v + force * self.dt) * self.damping
-        speed = np.linalg.norm(self.v, axis=1, keepdims=True)
-        self.v *= np.minimum(1.0, 0.02 / np.maximum(speed, 1e-12))
-        moved = self.u + self.v * self.dt
-        self.u = np.stack([moved[:, 0] % 1.0, np.clip(moved[:, 1], 0.005, 0.995)], axis=1)
-        self.v[(moved[:, 1] < 0.005) | (moved[:, 1] > 0.995), 1] = 0.0
-        return float(np.abs(error).mean())
+
+def order_force(field, positions, t, gain):
+    """The order field as a force on the shell: splat construction time from
+    where the points ARE, smooth it, and push each point down the gradient of
+    (smoothed time - its own time), in 3-d tangent to the sphere.  Returns the
+    (n, 3) force and the mean |T - t| (the HUD's settle measure)."""
+    u = SphereMap.unmap(positions)
+    field.update(u, t)
+    known = np.isfinite(t)
+    error = np.where(known, field.sample(field.time, u) - np.nan_to_num(t), 0.0)
+    conf = field.sample(field.confidence, u)
+    f_map = -(gain * error * conf)[:, None] * field.sample(field.grad_time, u).T   # per unit u
+    lon = 2 * math.pi * (u[:, 0] - 0.5)
+    s = 1.0 - 2.0 * u[:, 1]
+    c2 = np.maximum(1.0 - s * s, 0.05)
+    c = np.sqrt(c2)
+    d_lon = 2 * math.pi * np.stack([c * np.cos(lon), np.zeros_like(c), -c * np.sin(lon)], axis=1)
+    d_lat = np.stack([2 * s / c * np.sin(lon), -2 * np.ones_like(c), 2 * s / c * np.cos(lon)], axis=1)
+    # a map-space force to 3-d: each basis vector over its own squared length
+    force = (f_map[:, :1] * d_lon / (4 * math.pi ** 2 * c2)[:, None]
+             + f_map[:, 1:] * d_lat * (c2 / 4)[:, None])
+    mean_error = float(np.abs(error[known]).mean()) if known.any() else 0.0
+    return force.astype(np.float32), mean_error
+
+
+def core_layout(core_t, src, dst) -> np.ndarray:
+    """Initial placement of the process graph inside the core sphere: compile
+    order (asap level, ``core_t`` 0..1) runs top to bottom, each level's nodes
+    on a disc, then a few rounds toward neighbours' means."""
+    n = len(core_t)
+    pos = np.zeros((n, 3), np.float64)
+    if n == 0:
+        return pos.astype(np.float32)
+    levels = np.round(core_t * 64).astype(np.int64)
+    pos[:, 1] = (0.5 - core_t) * 1.5 * CORE_RADIUS
+    for level in np.unique(levels):
+        members = np.flatnonzero(levels == level)
+        for i, node in enumerate(members):
+            r = 0.55 * CORE_RADIUS * math.sqrt((i + 0.5) / len(members))
+            theta = i * 2.399963 + level * 0.7
+            pos[node, 0], pos[node, 2] = r * math.cos(theta), r * math.sin(theta)
+    for _ in range(12):
+        acc = np.zeros((n, 3)); cnt = np.zeros(n)
+        np.add.at(acc, src, pos[dst]); np.add.at(cnt, src, 1)
+        np.add.at(acc, dst, pos[src]); np.add.at(cnt, dst, 1)
+        mean = acc / np.maximum(cnt, 1)[:, None]
+        pull = np.where(cnt[:, None] > 0, mean, pos)
+        pos[:, [0, 2]] = 0.6 * pos[:, [0, 2]] + 0.4 * pull[:, [0, 2]]
+    radius = np.linalg.norm(pos, axis=1)
+    pos *= np.minimum(1.0, 0.85 * CORE_RADIUS / np.maximum(radius, 1e-9))[:, None]
+    return pos.astype(np.float32)
+
+
+def group_masks(node_group, edge_group, groups):
+    """(groups, n) and (groups, e) boolean membership from per-item group ids (-1 = none)."""
+    ids = np.arange(groups)[:, None]
+    return (node_group[None, :] == ids), (edge_group[None, :] == ids)
+
+
+class World:
+    """The one physics: ``ComputationalWorld`` with two BoundSpring networks
+    (core = the process graph, contained; shell = the concordance graph, on the
+    surface), advanced through ``WorldTickLease`` on one admitted dt per frame.
+
+    Groups: FLOW_GROUPS construction-order bins.  A shell node's group is its
+    construction time; a line's is its row's, a causal edge's its target's.
+    A core node's group is its asap level scaled to the same bins.  The active
+    group's edges contract (level mask: lines, mild; role mask: the book's
+    causal edges and the core's edges, strong) and its nodes glow.
+    """
+
+    def __init__(self, graph, shell_pos, flow_seconds=16.0):
+        from src.computational_world.spring import BoundSpringParameters
+        self._params_cls = BoundSpringParameters
+        self.graph = graph
+        self.n_shell = len(shell_pos)
+        self.shell_pos0 = shell_pos.astype(np.float32)
+        er, ei = graph["edge_row"], graph["edge_id"]
+        csrc, cdst, ckind = graph["cedge_src"], graph["cedge_dst"], graph["cedge_kind"]
+        real = ckind != EDGE_HEURISTIC                    # heuristic edges coincide with the lines
+        self.shell_edges = np.concatenate([np.stack([er, ei], axis=1),
+                                           np.stack([csrc[real], cdst[real]], axis=1)]).astype(np.int64)
+        t = graph["t"]
+        known = np.isfinite(t)
+        node_group = np.where(known, np.floor(np.clip(np.nan_to_num(t), 0, 1) * (FLOW_GROUPS - 1e-6)).astype(np.int64), -1)
+        line_group = node_group[er]
+        causal_group = node_group[cdst[real]]
+        has_causal = np.zeros(self.n_shell, bool)
+        has_causal[csrc[real]] = True
+        has_causal[cdst[real]] = True
+        none_lines, none_causal = np.full(len(er), -1, np.int64), np.full(int(real.sum()), -1, np.int64)
+        self.shell_masks = {
+            "level": group_masks(node_group, np.concatenate([line_group, none_causal]), FLOW_GROUPS),
+            "role": group_masks(np.where(has_causal, node_group, -1), np.concatenate([none_lines, causal_group]), FLOW_GROUPS),
+        }
+        self.shell_group = node_group
+        self.core_t = np.asarray(graph.get("core_t", np.zeros(0, np.float32)), np.float32)
+        self.core_src = np.asarray(graph.get("core_src", np.zeros(0, np.int64)), np.int64)
+        self.core_dst = np.asarray(graph.get("core_dst", np.zeros(0, np.int64)), np.int64)
+        self.n_core = len(self.core_t)
+        self.core_pos0 = core_layout(self.core_t, self.core_src, self.core_dst)
+        core_group = np.round(np.clip(self.core_t, 0, 1) * (FLOW_GROUPS - 1)).astype(np.int64)
+        self.core_masks = group_masks(core_group, core_group[self.core_dst], FLOW_GROUPS)
+        self.core_group = core_group
+        self.cycle_period = flow_seconds / FLOW_GROUPS
+        shared = dict(k_stretch=SPRING_K, c_repulse=SPRING_REPULSE, damping=SPRING_DAMPING, growth_rate=0.0,
+                      relax_rate=0.12, cycle_period=self.cycle_period, nominal_dt=1.0 / 60.0,
+                      glow_rise=0.5, glow_decay=0.08)
+        # Contraction is legacy per-nominal-step: each step the active group's rest
+        # length loses base * (1 - target) and relaxes back toward base by
+        # relax_rate, so a group active for many frames settles at
+        # rest = base * (1 - (1 - target) / relax_rate).  Targets below give
+        # 0.85 * base for the lines and 0.5 * base for the causal/core edges.
+        self.yank = BoundSpringParameters(level_target=1.0 - 0.15 * 0.12, type_target=1.0, role_target=1.0 - 0.5 * 0.12,
+                                          glow_peak_alpha=1.0, glow_floor_alpha=0.0,
+                                          glow_peak_radius=1.0, glow_floor_radius=0.0, **shared)
+        self.quiet = BoundSpringParameters(level_target=1.0, type_target=1.0, role_target=1.0,
+                                           glow_peak_alpha=0.0, glow_floor_alpha=0.0,
+                                           glow_peak_radius=0.0, glow_floor_radius=0.0, **shared)
+        self.accepted = self.rejected = 0
+        self.ext_mean = 0.0
+        self.reset()
+
+    def _install(self):
+        from src.common.tensors.abstraction import AbstractTensor as AT
+        from src.computational_world.state import ComputationalWorldState
+        from src.computational_world.spring import install_bound_spring, append_bound_spring
+        state = ComputationalWorldState.empty()
+        if self.n_core:
+            nmask, emask = self.core_masks
+            install_bound_spring(
+                state, self.core_pos0.tolist(),
+                [tuple(e) for e in np.stack([self.core_src, self.core_dst], axis=1).tolist()],
+                edge_level_mask=emask.tolist(), node_level_mask=nmask.tolist(),
+                edge_type_mask=(emask & False).tolist(), node_type_mask=(nmask & False).tolist(),
+                edge_role_mask=emask.tolist(), node_role_mask=nmask.tolist(),
+                parameters=self._params_cls(boundary_radius=CORE_RADIUS, cycle_period=self.cycle_period))
+        ln, le = self.shell_masks["level"]
+        rn, re_ = self.shell_masks["role"]
+        append_bound_spring(
+            state, self.shell_pos0.tolist(), [tuple(e) for e in self.shell_edges.tolist()],
+            edge_level_mask=le.tolist(), node_level_mask=ln.tolist(),
+            edge_type_mask=(le & False).tolist(), node_type_mask=(ln & False).tolist(),
+            edge_role_mask=re_.tolist(), node_role_mask=rn.tolist(),
+            parameters=self._params_cls(boundary_radius=SHELL_RADIUS, cycle_period=self.cycle_period),
+            surface=True)
+        # both spheres sit at the origin: the core inside, the shell on the unit sphere
+        networks = int(state.spring_boundary_center.shape[0])
+        state.spring_boundary_center = AT.tensor([[0.0, 0.0, 0.0]] * networks, dtype="float32")
+        state.validate_sparse_shapes()
+        return state
+
+    def reset(self):
+        from src.computational_world.engine import ComputationalWorld, WorldTickLease
+        from src.common.dt_system.state_table import StateTable
+        self.state = self._install()
+        self.world = ComputationalWorld(self.state, spring_parameters=self.quiet)
+        self.lease = WorldTickLease(self.world, self.state, StateTable())
+        self.lease.set_active(True)
+        self.t = 0.0
+        self.request = 0
+
+    def set_flow(self, flow: bool):
+        self.world.spring_parameters = self.yank if flow else self.quiet
+
+    def step(self, dt, external=None):
+        """One frame: the host force layer, then the managed window [t, t + dt]."""
+        from src.common.tensors.abstraction import AbstractTensor as AT
+        from src.computational_world.engine import WorldStatusBatch
+        from src.common.dt_system.time_runtime import TimeWindowRequest
+        if external is not None:
+            self.state.spring_external_force = AT.tensor(external.tolist(), dtype="float32")
+            self.ext_mean = float(np.linalg.norm(external, axis=1).mean())
+        self.request += 1
+        start = float(self.state.managed_time.item())          # the record, not a running sum
+        report = self.lease.advance_from_shell(
+            TimeWindowRequest(self.request, 0, start, start + dt, dt), WorldStatusBatch)
+        self.t = float(self.state.managed_time.item())
+        self.accepted = len(report.result.accepted_dts)
+        self.rejected = int(report.result.rejected_attempts)
+
+    def positions(self):
+        p = np.asarray(self.state.spring_position.data, np.float32)
+        return p[self.n_core:], p[:self.n_core]
+
+    def glow(self):
+        """Per node (core then shell): border strength 0..1 and size boost 0..1 from the spring state."""
+        alpha = np.asarray(self.state.spring_glow_alpha.data, np.float32).reshape(-1)
+        radius = np.asarray(self.state.spring_glow_radius.data, np.float32).reshape(-1)
+        return np.clip(alpha, 0, 1), np.clip(radius, 0, 1)
+
+    def active_group(self):
+        return int(self.state.spring_group_index.item()) % FLOW_GROUPS
+
+
+def spring_effects(world, er, ei):
+    """The flow animation read off the spring state: glow -> border and size,
+    the active group's nodes white-hot, lit lines between glowing nodes."""
+    strength, boost = world.glow()
+    strength, boost = strength[world.n_core:], boost[world.n_core:]
+    n = world.n_shell
+    active = world.shell_group == world.active_group()
+    rgb = np.where(active[:, None], FRONT_RGB, ATTACH_RGB).astype(np.float32)
+    g_edge = np.maximum(strength[er], strength[ei]).astype(np.float32)
+    return {
+        "border": np.concatenate([rgb, strength[:, None]], axis=1).astype(np.float32),
+        "size": (1.0 + 1.6 * boost).astype(np.float32),
+        "node_alpha": np.ones(n, np.float32),
+        "edge_alpha": (1.0 + 2.0 * g_edge).astype(np.float32),
+        "edge_glow": g_edge,
+        "edge_tint": np.broadcast_to(ATTACH_RGB, (len(er), 3)).astype(np.float32),
+        "front": -1,
+    }
 
 
 # -- construction animation -----------------------------------------------------
@@ -740,8 +966,14 @@ class Integrator:
 BIRTH_RGB = np.array([0.55, 0.95, 1.00], np.float32)     # border when a point is instantiated
 ATTACH_RGB = np.array([1.00, 0.45, 0.80], np.float32)    # border when a later row attaches to it
 FRONT_RGB = np.array([1.00, 1.00, 1.00], np.float32)     # the very front
-FLOW_FRONTS = 3                                           # waves in flow mode
+FLOW_FRONTS = 3                                           # waves in the legacy border sweep
+FLOW_GROUPS = 24                                          # construction-order groups the world cycles through
 ANIMATIONS = ("off", "build", "flow")
+CORE_RADIUS = 0.42      # the process graph's boundary sphere, inside the unit shell
+CORE_RING_RGB = np.array([0.95, 0.95, 1.0], np.float32)   # the core's resting ring: pale, always on
+SHELL_RADIUS = 1.0
+SPRING_K, SPRING_REPULSE, SPRING_DAMPING = 8.0, 0.005, 0.9  # BoundSpring parameters shared by both networks
+ORDER_GAIN = 30.0       # the order field's force gain (``--order-gain``); measured: 20-40 settles |T-t| 0.136 -> 0.06 in 150 frames
 
 
 def animation_effects(graph, mode: str, clock: float) -> dict:
@@ -1178,9 +1410,11 @@ def main(argv=None) -> None:
     source.add_argument("--book", help="pickled IdentityBook or SSA module")
     source.add_argument("--graph", help="graph saved by --save-graph")
     ap.add_argument("--save-graph", help="write the extracted graph (.npz) and continue")
-    ap.add_argument("--settle", type=int, default=None, help="integrator steps to run before the first frame")
+    ap.add_argument("--settle", type=int, default=None, help="world frames (1/60 s each) to run before the first frame")
+    ap.add_argument("--order-gain", type=float, default=ORDER_GAIN, help="order-field force gain (0 disables the layer)")
+    ap.add_argument("--flow-seconds", type=float, default=16.0, help="one sweep of the activation cycle through all groups")
     ap.add_argument("--drift", action="store_true",
-                    help="start with the time integrator running (Space toggles it): the points drift and the "
+                    help="start with the world running (Space toggles it): the points drift and the "
                          "contour background is recomputed live every frame")
     ap.add_argument("--mass", action="store_true",
                     help="start with mass on (M toggles it): a released spin keeps an inertial floor instead of stopping")
@@ -1202,6 +1436,7 @@ def main(argv=None) -> None:
     ap.add_argument("--anim", choices=ANIMATIONS, default="off", help="start in this construction animation")
     ap.add_argument("--anim-at", type=float, help="freeze the animation clock at this construction time (0..1)")
     ap.add_argument("--bare", action="store_true", help="start with points and lines hidden (background only)")
+    ap.add_argument("--no-bg", action="store_true", help="start with the time background hidden (B toggles it)")
     ap.add_argument("--size", type=int, nargs=2, default=(1400, 900))
     ap.add_argument("--snapshot", help="write a PNG of the first frame and continue")
     ap.add_argument("--exit-after", type=float, help="quit after this many seconds")
@@ -1230,23 +1465,54 @@ def main(argv=None) -> None:
         focus_jobs.append(found[0])
     if args.settle is None:
         args.settle = 600 if focus_jobs else 0
-    pos = layout(graph)
     if "t" not in graph or not np.isfinite(graph["t"]).any():
         print("no construction stamps in this book (pickled before the clock); time map is empty", flush=True)
         graph["t"] = np.full(n, np.nan, np.float32)
-    field = TimeField()
-    integrator = Integrator(graph, pos, field)
-    for _ in range(args.settle):
-        integrator.step()
-    integrator.write(pos)
-    field.update(integrator.u, integrator.t)
     er, ei, ew = graph["edge_row"], graph["edge_id"], graph["edge_weight"]
     ensure_causal(graph)
     csrc, cdst, ckind = graph["cedge_src"], graph["cedge_dst"], graph["cedge_kind"]
+    field = TimeField()
+    plan = SphereMap(layout(graph))
+    world = World(graph, SphereMap.sphere(plan.u0) * SHELL_RADIUS, flow_seconds=args.flow_seconds)
+    pos, core_pos = world.positions()
+    pos, core_pos = pos.copy(), core_pos.copy()
+    t_shell = graph["t"].astype(np.float64)
+    FRAME_DT = 1.0 / 60.0
+
+    def world_frame(order_on: bool):
+        """One frame of the one physics: the order-field layer (if on), then the lease."""
+        external = None
+        if order_on and args.order_gain > 0:
+            force, err = order_force(field, pos, t_shell, args.order_gain)
+            external = np.zeros((world.n_core + world.n_shell, 3), np.float32)
+            external[world.n_core:] = force
+        else:
+            u = SphereMap.unmap(pos)
+            field.update(u, t_shell)
+            known = np.isfinite(t_shell)
+            err = float(np.abs(field.sample(field.time, u)[known] - t_shell[known]).mean()) if known.any() else 0.0
+            if world.ext_mean:
+                external = np.zeros((world.n_core + world.n_shell, 3), np.float32)
+        world.step(FRAME_DT, external)
+        if external is None or not external.any():
+            world.ext_mean = 0.0
+        shell, core = world.positions()
+        pos[:] = shell
+        core_pos[:] = core
+        return err
+
+    settle_started = time.perf_counter()
+    for _ in range(args.settle):
+        world_frame(True)
+    field.update(SphereMap.unmap(pos), t_shell)
+    if args.settle:
+        print(f"settled {args.settle} world frames in {time.perf_counter() - settle_started:.1f}s "
+              f"(world time {world.t:.2f}s)", flush=True)
     degree = (np.bincount(er, minlength=n) + np.bincount(ei, minlength=n)).astype(np.float32)
     summary = causal_summary(graph)
     print(f"graph: {int((kind == 0).sum())} rows, {int((kind == 1).sum())} ids, "
-          f"{len(er)} lines, {len(csrc)} causal edges, {len(graph['pages'])} pages "
+          f"{len(er)} lines, {len(csrc)} causal edges, {len(graph['pages'])} pages; "
+          f"core: {world.n_core} process-graph nodes, {len(world.core_src)} edges "
           f"({time.perf_counter() - started:.1f}s)", flush=True)
     print(summary, flush=True)
 
@@ -1297,6 +1563,8 @@ def main(argv=None) -> None:
 
     point_vao, point_vbo = make_vao(12)
     line_vao, line_vbo = make_vao(7)
+    core_point_vao, core_point_vbo = make_vao(12)
+    core_line_vao, core_line_vbo = make_vao(7)
     pick_point_vao, pick_point_vbo = make_vao(12)
     pick_line_vao, pick_line_vbo = make_vao(7)
     scale = np.where(kind == 1, ID_SCALE, 1.0).astype(np.float32)
@@ -1346,9 +1614,13 @@ def main(argv=None) -> None:
         camera.rotate(np.array([1.0, 0.0, 0.0]), math.radians(args.tilt))
     state = dict(mode=0, isolate=-1, lines=True, points=True, psize=7.0, lalpha=0.35,
                  hud=True, bg=True, physics=bool(args.drift), error=0.0, pick=-1, dirty=True, hud_dirty=True, drag=None, moved=False, last_motion=0.0,
-                 anim=args.anim, anim_t0=time.time(), speed=1.0, front=-1, focus=None, diffuse=bool(args.diffuse))
+                 anim=args.anim, anim_t0=time.time(), speed=1.0, front=-1, focus=None, diffuse=bool(args.diffuse),
+                 order=True, core=True)
+    world.set_flow(args.anim == "flow")
     if args.bare:
         state["lines"] = state["points"] = False
+    if args.no_bg:
+        state["bg"] = False
 
     def anim_clock():
         if args.anim_at is not None:
@@ -1359,7 +1631,7 @@ def main(argv=None) -> None:
 
     def upload_lines(rgb, alpha, cedge_rgb, cedge_alpha):
         """The line buffer: row->id lines first, then the book's causal edges."""
-        seg = np.concatenate([integrator.segments(pos, er, ei), integrator.segments(pos, csrc, cdst)])
+        seg = np.concatenate([SphereMap.segments(pos, er, ei), SphereMap.segments(pos, csrc, cdst)])
         paint = np.concatenate([np.concatenate([rgb, alpha[:, None]], axis=1),
                                 np.concatenate([cedge_rgb, cedge_alpha[:, None]], axis=1)])
         paint = np.repeat(paint[:, None, :], 4, axis=1)
@@ -1368,7 +1640,13 @@ def main(argv=None) -> None:
     def rebuild():
         colors = node_colors(graph, state["mode"], degree, state["isolate"])
         focus = state["focus"]
-        fx = None if state["anim"] == "off" or focus else animation_effects(graph, state["anim"], anim_clock())
+        if state["anim"] == "off" or focus:
+            fx = None
+        elif state["anim"] == "flow":
+            fx = spring_effects(world, er, ei)
+        else:
+            fx = animation_effects(graph, state["anim"], anim_clock())
+        rebuild_core()
         if focus:
             colors = focus["fx"]["rgba"].copy()
             upload(point_vbo, np.concatenate([pos, colors, (scale * focus["fx"]["size"])[:, None],
@@ -1404,6 +1682,29 @@ def main(argv=None) -> None:
         upload_lines(rgb, alpha, KIND_TINT[ckind], cedge_alpha.astype(np.float32))
         state["dirty"] = False
 
+    core_rgb = _time_ramp(world.core_t) if world.n_core else np.zeros((0, 3), np.float32)
+
+    def rebuild_core():
+        """The process graph inside the sphere: nodes by compile order, edges as chords, glow from the state."""
+        if not world.n_core:
+            return
+        strength, boost = world.glow()
+        strength, boost = strength[:world.n_core], boost[:world.n_core]
+        if state["anim"] != "flow":
+            strength, boost = np.zeros_like(strength), np.zeros_like(boost)
+        active = (world.core_group == world.active_group()) if state["anim"] == "flow" else np.zeros(world.n_core, bool)
+        rgb = np.where(active[:, None], FRONT_RGB, np.where(strength[:, None] > 0.02, BIRTH_RGB, CORE_RING_RGB)).astype(np.float32)
+        colors = np.concatenate([core_rgb, np.full((world.n_core, 1), 0.9, np.float32)], axis=1)
+        border = np.concatenate([rgb, np.maximum(strength, 0.45)[:, None]], axis=1)
+        upload(core_point_vbo, np.concatenate([core_pos, colors, (1.15 * (1.0 + 1.6 * boost))[:, None], border], axis=1))
+        src, dst = world.core_src, world.core_dst
+        seg = SphereMap.segments(core_pos, src, dst)
+        glow = np.maximum(strength[src], strength[dst])
+        paint = np.concatenate([(core_rgb[src] + core_rgb[dst]) / 2 * (1 - glow[:, None]) + ATTACH_RGB * glow[:, None],
+                                (1.6 + 2.0 * glow)[:, None]], axis=1)
+        paint = np.repeat(paint[:, None, :], 4, axis=1)
+        upload(core_line_vbo, np.concatenate([seg, paint], axis=2).reshape((-1, 7)))
+
     def rebuild_pick():
         p = state["pick"]
         if p < 0:
@@ -1411,8 +1712,8 @@ def main(argv=None) -> None:
         upload(pick_point_vbo, np.array([[*pos[p], 1, 1, 1, 1, 2.2, 0, 0, 0, 0]], np.float32))
         mask = (er == p) | (ei == p)
         cmask = ((csrc == p) | (cdst == p)) & (ckind != EDGE_HEURISTIC)
-        seg = np.concatenate([integrator.segments(pos, er[mask], ei[mask]),
-                              integrator.segments(pos, csrc[cmask], cdst[cmask])])
+        seg = np.concatenate([SphereMap.segments(pos, er[mask], ei[mask]),
+                              SphereMap.segments(pos, csrc[cmask], cdst[cmask])])
         paint = np.concatenate([np.ones((int(mask.sum()), 4), np.float32),
                                 np.concatenate([KIND_TINT[ckind[cmask]], np.ones((int(cmask.sum()), 1), np.float32)], axis=1)])
         paint = np.repeat(paint[:, None, :], 4, axis=1)
@@ -1447,6 +1748,11 @@ def main(argv=None) -> None:
                   f"mass {'ON' if camera.mass else 'off'}   "
                   f"diffusion {'ON' if state['diffuse'] else 'off'}",
                   (235, 235, 240)),
+                 (f"world: t {world.t:6.2f}s   last frame {world.accepted} admitted dt, {world.rejected} rejected   "
+                  f"order force {'ON' if state['order'] and args.order_gain > 0 else 'off'} (gain {args.order_gain:g}, mean |F| {world.ext_mean:.3f})   "
+                  f"core {world.n_core} nodes {len(world.core_src)} edges {'shown' if state['core'] else 'hidden'}   "
+                  f"group {world.active_group()}/{FLOW_GROUPS}",
+                  (200, 225, 235)),
                  (summary[:200], (190, 200, 215))]
         if state["anim"] != "off":
             clock = anim_clock()
@@ -1493,7 +1799,7 @@ def main(argv=None) -> None:
         if focus:
             draw_focus_labels(surf, w, h, focus)
         if not focus:
-         surf.blit(font.render("drag turns sphere | rmb pan | wheel zoom | F view | T front | M mass | 1-5 color | SPACE physics | R reset | B bg | G animate | L P lines/points | PgUp/Dn page | C focus | D diffuse | H hud", True, (150, 150, 160)), (8, h - 22))
+         surf.blit(font.render("drag turns sphere | rmb pan | wheel zoom | F view | T front | M mass | O order | K core | 1-5 color | SPACE physics | R reset | B bg | G animate | L P lines/points | PgUp/Dn page | C focus | D diffuse | H hud", True, (150, 150, 160)), (8, h - 22))
         data = pygame.image.tostring(surf, "RGBA", True)
         gl.glBindTexture(gl.GL_TEXTURE_2D, hud_tex)
         gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
@@ -1597,8 +1903,7 @@ def main(argv=None) -> None:
     def update_scene():
         nonlocal pick_edges, frame_count
         if state["physics"]:
-            state["error"] = integrator.step()
-            integrator.write(pos)
+            state["error"] = world_frame(state["order"])
             state["dirty"] = True
             state["hud_dirty"] = True
         if state["dirty"] or state["physics"]:
@@ -1644,6 +1949,15 @@ def main(argv=None) -> None:
             for hemisphere in (0, 1):       # far side first, then the near side over it
                 gl.glUniform1i(gl.glGetUniformLocation(prog_bg, "uPass"), hemisphere)
                 gl.glDrawArrays(gl.GL_TRIANGLES, 0, bg_count)
+        if state["core"] and world.n_core:
+            # the process graph inside: over the translucent near hemisphere, under the shell,
+            # drawn smaller and with its own veil so it reads as inside
+            use(prog_line, lalpha=min(1.0, state["lalpha"] * 1.4))
+            gl.glBindVertexArray(core_line_vao)
+            gl.glDrawArrays(gl.GL_LINES, 0, 4 * len(world.core_src))
+            use(prog_point, psize=state["psize"])
+            gl.glBindVertexArray(core_point_vao)
+            gl.glDrawArrays(gl.GL_POINTS, 0, world.n_core)
         if state["lines"]:
             use(prog_line, lalpha=state["lalpha"])
             gl.glBindVertexArray(line_vao); gl.glBindBuffer(gl.GL_ARRAY_BUFFER, line_vbo)
@@ -1705,11 +2019,18 @@ def main(argv=None) -> None:
                     state["mode"] = k - pygame.K_1; state["dirty"] = state["hud_dirty"] = True
                 elif k == pygame.K_SPACE: state["physics"] = not state["physics"]; state["hud_dirty"] = True
                 elif k == pygame.K_r:
-                    integrator.reset(); integrator.write(pos); state["dirty"] = True
+                    world.reset(); world.set_flow(state["anim"] == "flow")
+                    shell, core = world.positions(); pos[:] = shell; core_pos[:] = core
+                    field.update(SphereMap.unmap(pos), t_shell); state["dirty"] = True
+                elif k == pygame.K_o: state["order"] = not state["order"]; state["hud_dirty"] = True
+                elif k == pygame.K_k: state["core"] = not state["core"]; state["hud_dirty"] = True
                 elif k == pygame.K_b: state["bg"] = not state["bg"]
                 elif k == pygame.K_g:
                     state["anim"] = ANIMATIONS[(ANIMATIONS.index(state["anim"]) + 1) % len(ANIMATIONS)]
                     state["anim_t0"] = time.time(); state["dirty"] = state["hud_dirty"] = True
+                    world.set_flow(state["anim"] == "flow")
+                    if state["anim"] == "flow":
+                        state["physics"] = True                     # the twitch is the world's cycle
                 elif k == pygame.K_COMMA: state["speed"] = max(0.1, state["speed"] / 1.5); state["hud_dirty"] = True
                 elif k == pygame.K_PERIOD: state["speed"] = min(20.0, state["speed"] * 1.5); state["hud_dirty"] = True
                 elif k == pygame.K_l: state["lines"] = not state["lines"]

@@ -425,8 +425,15 @@ def _causal_limit(
     limits.append(float((max_velocity / (acceleration_mag + 1.0e-9)).min().item()))
     limits.append(float((max_displacement / (velocity_mag + 1.0e-9)).min().item()))
     cycle_remaining = cfg.cycle_period - float(state.spring_cycle_time.item())
-    limits.append(max(cycle_remaining, 1.0e-12))
-    return min(limits) if limits else max(cycle_remaining, 1.0e-12)
+    if cycle_remaining <= 1.0e-12:
+        # The boundary is here: a step of any size from this state crosses it
+        # (``advance_bound_spring`` crosses at period - 1e-15), so the ceiling
+        # is the boundary after it.  Measured with a 1/60 s frame dividing the
+        # period exactly: the old floor of 1e-12 forced a 1e-12 s slice, and
+        # the controller then climbed back over 377 slices of 4.4e-5 s.
+        cycle_remaining += cfg.cycle_period
+    limits.append(cycle_remaining)
+    return min(limits)
 
 
 def advance_bound_spring(
