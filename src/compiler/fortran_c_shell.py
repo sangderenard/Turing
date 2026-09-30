@@ -40832,6 +40832,32 @@ def _emit_class_surface_module(
     return emitted, export_symbols
 
 
+def _single_exit_tuple_arity(returns: Iterable[ast.Return]) -> int:
+    """Arity shared by every published return when all are tuple literals.
+
+    Mirrors the tail-recursion exit rewrite: a tuple literal of one common
+    arity at every site is published one private name per lane, so each lane
+    keeps its own SSA producer through the control merge.  Any other shape
+    (mixed arities, a non-tuple return, a starred element) reports 0 and the
+    whole value is published through one name as before.
+    """
+
+    statements = tuple(returns)
+    if not statements:
+        return 0
+    arities = set()
+    for statement in statements:
+        value = statement.value
+        if not isinstance(value, ast.Tuple) or any(
+            isinstance(element, ast.Starred) for element in value.elts
+        ):
+            return 0
+        arities.add(len(value.elts))
+    if len(arities) != 1:
+        return 0
+    return int(next(iter(arities)))
+
+
 def _normalize_top_level_guard_returns(
     tree: ast.Module,
     target_names: Iterable[str],
@@ -40873,22 +40899,14 @@ def _normalize_top_level_guard_returns(
             for candidate in ast.walk(node)
             if isinstance(candidate, ast.Name)
         }
-        result_name = "__turing_single_exit_result"
-        suffix = 0
-        while result_name in occupied:
-            suffix += 1
-            result_name = f"__turing_single_exit_result_{suffix}"
 
         guard_lines: list[int] = []
+        rewritten_returns: list[ast.Return] = []
 
-        def result_assignment(statement: ast.Return) -> ast.Assign:
-            assignment = ast.Assign(
-                targets=[ast.Name(id=result_name, ctx=ast.Store())],
-                value=statement.value,
-            )
-            return ast.copy_location(assignment, statement)
-
-        def nest(statements: list[ast.stmt]) -> list[ast.stmt] | None:
+        def nest(
+            statements: list[ast.stmt],
+            emit: Callable[[ast.Return], list[ast.stmt]],
+        ) -> list[ast.stmt] | None:
             for index, statement in enumerate(statements[:-1]):
                 if not (
                     isinstance(statement, ast.If)
@@ -40898,18 +40916,18 @@ def _normalize_top_level_guard_returns(
                     and statement.body[-1].value is not None
                 ):
                     continue
-                tail = nest(statements[index + 1 :])
+                tail = nest(statements[index + 1 :], emit)
                 if tail is None:
                     tail = [
                         *statements[index + 1 : -1],
-                        result_assignment(statements[-1]),
+                        *emit(statements[-1]),
                     ]
                 guarded_return = statement.body[-1]
                 rewritten = ast.If(
                     test=statement.test,
                     body=[
                         *statement.body[:-1],
-                        result_assignment(guarded_return),
+                        *emit(guarded_return),
                     ],
                     orelse=tail,
                 )
@@ -40918,17 +40936,80 @@ def _normalize_top_level_guard_returns(
                 return [*statements[:index], rewritten]
             return None
 
-        rewritten_body = nest(list(node.body))
-        if rewritten_body is None:
+        def collect(statement: ast.Return) -> list[ast.stmt]:
+            rewritten_returns.append(statement)
+            return []
+
+        # First pass: decide whether the canonical guard form is present and
+        # gather every return the rewrite will publish, so the exit shape is
+        # chosen from all sites at once (as the tail-recursion rewrite does).
+        if nest(list(node.body), collect) is None:
             return
+        guard_lines.clear()
+        tuple_result_arity = _single_exit_tuple_arity(rewritten_returns)
+        if tuple_result_arity:
+            result_names = []
+            for lane in range(tuple_result_arity):
+                result_index = lane
+                while (
+                    f"__turing_single_exit_result_{result_index}" in occupied
+                ):
+                    result_index += tuple_result_arity
+                result_name = f"__turing_single_exit_result_{result_index}"
+                result_names.append(result_name)
+                occupied.add(result_name)
+        else:
+            result_name = "__turing_single_exit_result"
+            suffix = 0
+            while result_name in occupied:
+                suffix += 1
+                result_name = f"__turing_single_exit_result_{suffix}"
+            result_names = [result_name]
+
+        def result_assignment(statement: ast.Return) -> list[ast.stmt]:
+            value = statement.value
+            if tuple_result_arity:
+                assert isinstance(value, ast.Tuple)
+                assignments: list[ast.stmt] = []
+                for name, expression in zip(
+                    result_names, value.elts, strict=True,
+                ):
+                    assignment = ast.Assign(
+                        targets=[ast.Name(id=name, ctx=ast.Store())],
+                        value=expression,
+                    )
+                    assignments.append(ast.copy_location(
+                        assignment, statement,
+                    ))
+                return assignments
+            assignment = ast.Assign(
+                targets=[ast.Name(id=result_names[0], ctx=ast.Store())],
+                value=value,
+            )
+            return [ast.copy_location(assignment, statement)]
+
+        rewritten_body = nest(list(node.body), result_assignment)
+        assert rewritten_body is not None
         final_return = ast.copy_location(
-            ast.Return(value=ast.Name(id=result_name, ctx=ast.Load())),
+            ast.Return(value=(
+                ast.Tuple(
+                    elts=[
+                        ast.Name(id=name, ctx=ast.Load())
+                        for name in result_names
+                    ],
+                    ctx=ast.Load(),
+                )
+                if tuple_result_arity else
+                ast.Name(id=result_names[0], ctx=ast.Load())
+            )),
             terminal,
         )
         node.body = [*rewritten_body, final_return]
         receipts.append({
             "function": qualified_name,
-            "result_name": result_name,
+            "result_name": result_names[0],
+            "result_names": tuple(result_names),
+            "tuple_result_arity": int(tuple_result_arity),
             "guard_count": len(guard_lines),
             "source_lines": tuple(sorted(guard_lines)),
         })
