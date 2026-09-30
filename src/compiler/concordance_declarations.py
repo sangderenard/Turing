@@ -313,6 +313,24 @@ RETURN_VERSION_REASONS: tuple = (
     VERSION_DOES_NOT_DOMINATE_RETURN, RECORD_DESCRIPTORS_DIFFER,
 )
 
+# ============================================================================
+# Step 4: planner structure (plan 80, part A) -- owned by the step-4 lane
+# ============================================================================
+
+# (step-4 declarations go here)
+
+# ============================================================================
+# Step 5: control SSA builder (plan 80, part B) -- owned by the step-5 lane
+# ============================================================================
+
+# (step-5 declarations go here)
+
+# ============================================================================
+# Steps 6-8: records, linker, tables (plan 90) -- owned by those lanes
+# ============================================================================
+
+# (steps 6-8 declarations go here)
+
 __all__ = [name for name in dir() if not name.startswith("_") and name not in {
     "ast", "dataclass", "Enum", "Any", "Ref", "RowField", "K", "Unresolved",
     "declare_page", "declare_reason", "declare_stage", "declare_transform",
