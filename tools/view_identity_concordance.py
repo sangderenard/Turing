@@ -58,6 +58,9 @@ writes the extracted graph so ``--graph`` reopens it with no compiler import.
     F: reset zoom/pan   T: reset rotation   click: pick a point
     1 page  2 scope  3 revisions  4 degree  5 time   (colour mode)
     Space: run/stop the time integrator   R: reset layout   B: time background
+        ``--drift`` starts with the integrator running (after ``--settle``),
+        so the points drift and the contour background evolves live from the
+        first frame; Space still stops and restarts it
     G: animation  off -> build -> flow      , .: slower / faster
         build  the graph is constructed in its recorded order: a point appears
                with a cyan border when its row is written, an identity gets a
@@ -1160,6 +1163,9 @@ def main(argv=None) -> None:
     source.add_argument("--graph", help="graph saved by --save-graph")
     ap.add_argument("--save-graph", help="write the extracted graph (.npz) and continue")
     ap.add_argument("--settle", type=int, default=None, help="integrator steps to run before the first frame")
+    ap.add_argument("--drift", action="store_true",
+                    help="start with the time integrator running (Space toggles it): the points drift and the "
+                         "contour background is recomputed live every frame")
     ap.add_argument("--turn", type=float, default=0.0, help="start with the sphere turned this many degrees about its axis")
     ap.add_argument("--tilt", type=float, default=0.0, help="start with the sphere tipped this many degrees about the horizontal axis")
     ap.add_argument("--list", metavar="TEXT", help="print the nodes whose label contains TEXT, then exit")
@@ -1321,7 +1327,7 @@ def main(argv=None) -> None:
     if args.tilt:
         camera.rotate(np.array([1.0, 0.0, 0.0]), math.radians(args.tilt))
     state = dict(mode=0, isolate=-1, lines=True, points=True, psize=7.0, lalpha=0.35,
-                 hud=True, bg=True, physics=False, error=0.0, pick=-1, dirty=True, hud_dirty=True, drag=None, moved=False, last_motion=0.0,
+                 hud=True, bg=True, physics=bool(args.drift), error=0.0, pick=-1, dirty=True, hud_dirty=True, drag=None, moved=False, last_motion=0.0,
                  anim=args.anim, anim_t0=time.time(), speed=1.0, front=-1, focus=None, diffuse=bool(args.diffuse))
     if args.bare:
         state["lines"] = state["points"] = False
