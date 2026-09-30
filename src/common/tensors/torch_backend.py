@@ -43,6 +43,7 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class PyTorchTensorOperations(AbstractTensor):
+    _compare_broadcasts = True  # ``==``/``<``/... go straight to the array compare
     supports_native_batched_matmul = True
     def argwhere_(self):
         import torch

@@ -55,6 +55,7 @@ def _to_tuple2(x):
     return (x, x) if isinstance(x, (int, np.integer)) else x
 
 class NumPyTensorOperations(AbstractTensor):
+    _compare_broadcasts = True  # ``==``/``<``/... go straight to the array compare
     supports_native_batched_matmul = True
     # Division mode constant: 'normal', 'zero', 'max', 'limit'
     DIVIDE_MODE = 'zero'  # Change as needed or make configurable

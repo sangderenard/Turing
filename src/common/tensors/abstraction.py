@@ -294,6 +294,11 @@ class AbstractTensor:
     _identity_token: int | None = None
     _preferred_backend: str | None = None
     _preferred_device: Any = None
+    # A backend whose ``equal_``/``less_``/... broadcast by NumPy rules sets
+    # this, and ``==``/``<``/... then reach it directly (see
+    # ``abstraction_methods.elementwise._BACKEND_COMPARE``).  The pure and the
+    # source-producing backends leave it off and keep the scalar reference.
+    _compare_broadcasts: bool = False
     inf: float = float('inf')
     ninf: float = float('-inf')
     nan: float = float('nan')
