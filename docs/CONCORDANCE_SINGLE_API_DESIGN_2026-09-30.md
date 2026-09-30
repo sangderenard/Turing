@@ -267,6 +267,10 @@ function with no mint edge). Existing per-page findings stay.
 
 ### 6.4 Steps 1-3, concretely
 
+Declared vocabulary for steps 2-3 lives in `src/compiler/concordance_declarations.py`
+(all pages, stages, transforms, reasons and fact types as objects; plans 60 and 70
+are the specs).
+
 Step 1 (`src/compiler/identity_concordance.py`, `src/compiler/monotonic_ids.py`):
 the types above, the registry, `Concordance.post`, the latch (OPEN),
 auto-tagging of raw `IdentityPage.set/revise/concord/bind_alias/PageMapping`
@@ -275,8 +279,11 @@ re-expressed through `post` (its three pages become the generic edge /
 dependents / state pages), the two audit findings. Zero behaviour change.
 
 Step 2 (ingestion roots, `graph_express2.py`, reducer canonical relabel):
-`ssa_identity_tokens` (ingestion id -> canonical id) posted NOVEL per
-canonical id with the ingestion cell as operand; `identity_table`,
+`ssa_identity_tokens` (ingestion id -> canonical id) posted as DERIVED
+`canonical_value` rows, one per relabelled node, from the `ingestion_value`
+cell (corrected by plan 60: canonical ids are dense enumerate positions
+consumed as dense, so they cannot be MINTED mints; the one NOVEL root per
+source construct is the `source_span` row); `identity_table`,
 `class_definitions`, `function_parameter_annotations`, `value_kind`,
 `map_ir` object rows posted DERIVED from their AST-span rows (the span row
 itself is the one NOVEL root per source construct). These pages are the
