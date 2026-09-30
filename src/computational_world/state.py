@@ -73,6 +73,12 @@ class ComputationalWorldState:
     spring_boundary_radius: AbstractTensor
     spring_node_network: AbstractTensor
     spring_edge_network: AbstractTensor
+    # Per network: True pins the network ON its boundary sphere (two-sided
+    # containment, radial velocity stripped) instead of inside it.
+    spring_network_surface: AbstractTensor
+    # Per node (S, 3): the force layer a host adds before the integrator
+    # (an order field, a pointer, a wind); zero when nothing is added.
+    spring_external_force: AbstractTensor
     artifact_references: tuple[str, ...] = ()
     provenance_records: tuple[Any, ...] = ()
     pending_status: tuple[Any, ...] = ()
@@ -126,6 +132,8 @@ class ComputationalWorldState:
             spring_boundary_radius=_tensor([], dtype="float32"),
             spring_node_network=_tensor([], dtype="int32"),
             spring_edge_network=_tensor([], dtype="int32"),
+            spring_network_surface=_tensor([], dtype="bool"),
+            spring_external_force=_tensor([], dtype="float32").reshape((0, 3)),
         )
 
     @classmethod
@@ -214,10 +222,12 @@ class ComputationalWorldState:
             raise ValueError("spring active node count exceeds resident capacity")
         for name in (
             "spring_velocity", "spring_mass", "spring_glow_alpha",
-            "spring_glow_radius", "spring_node_network",
+            "spring_glow_radius", "spring_node_network", "spring_external_force",
         ):
             if int(getattr(self, name).shape[0]) != spring_nodes:
                 raise ValueError(f"spring node table is misaligned at {name}")
+        if tuple(self.spring_external_force.shape[1:]) != (3,):
+            raise ValueError("spring external force must have shape (S, 3)")
         if tuple(self.spring_position.shape[1:]) != (3,):
             raise ValueError("spring positions must have shape (S, 3)")
         if tuple(self.spring_edge_index.shape[:1]) != (2,):
@@ -260,6 +270,8 @@ class ComputationalWorldState:
         ) + 1
         if tuple(self.spring_boundary_center.shape) != (network_count, 3):
             raise ValueError("spring network boundary centers are misaligned")
+        if tuple(self.spring_network_surface.shape) != (network_count,):
+            raise ValueError("spring network surface flags are misaligned")
         if tuple(self.spring_boundary_radius.shape) != (network_count,):
             raise ValueError("spring network boundary radii are misaligned")
 

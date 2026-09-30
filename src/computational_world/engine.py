@@ -315,6 +315,16 @@ class WorldTickLease:
         report = self.runtime.advance(request, commit_gate=commit_gate)
         if self.state.pending_status:
             raise RuntimeError("accepted world window left shell material pending")
+        # One record for world time.  Inside the window ``advance_world`` sums
+        # ``managed_time += dt`` per accepted slice, which boundary events need;
+        # the runtime lands ``current_time`` on ``request.t_end`` exactly.  A
+        # window the controller crawled through (measured: one rejection, then
+        # 378 slices of 4.4e-5 s) left the sum 103 ulps from the landing, and
+        # the next request, which must start at both, could satisfy neither.
+        # At the window's end the state's time is the landed time.
+        self.state.managed_time = AbstractTensor.tensor(
+            [float(report.t_end)], dtype="float64"
+        )
         self.world.publish_committed(
             self.state,
             self.state_table,
