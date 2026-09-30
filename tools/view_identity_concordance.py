@@ -56,6 +56,13 @@ Sources (one of):
     python tools/view_identity_concordance.py --case mapping
     python tools/view_identity_concordance.py --book module_or_book.pkl
     python tools/view_identity_concordance.py --graph saved.npz
+    python tools/view_identity_concordance.py --case oscillator --backend torch --device cuda --drift --anim flow
+
+``--backend torch --device cuda`` runs the world physics (both spring
+networks) on the torch backend on the GPU; the lowering itself stays as it
+is.  The oscillator case (8881 shell nodes, 19k springs) needs it: the
+sanctioned force assembly is a dense node-by-edge incidence, 60-100 s per
+frame on NumPy, and its matmul on a GPU.
 
 ``--case`` lowers one of ``audit_identity_concordance``'s seconds-long cases;
 ``--book`` reads a pickled ``IdentityBook`` or SSA module (what
@@ -928,14 +935,20 @@ class World:
         self.rejected = int(report.result.rejected_attempts)
 
     def positions(self):
-        p = np.asarray(self.state.spring_position.data, np.float32)
+        # ``tolist`` is the read-back every backend answers, a CUDA tensor included
+        p = np.asarray(self.state.spring_position.tolist(), np.float32).reshape(-1, 3)
         return p[self.n_core:], p[:self.n_core]
 
     def glow(self):
         """Per node (core then shell): border strength 0..1 and size boost 0..1 from the spring state."""
-        alpha = np.asarray(self.state.spring_glow_alpha.data, np.float32).reshape(-1)
-        radius = np.asarray(self.state.spring_glow_radius.data, np.float32).reshape(-1)
+        alpha = np.asarray(self.state.spring_glow_alpha.tolist(), np.float32).reshape(-1)
+        radius = np.asarray(self.state.spring_glow_radius.tolist(), np.float32).reshape(-1)
         return np.clip(alpha, 0, 1), np.clip(radius, 0, 1)
+
+    def backend_name(self):
+        data = self.state.spring_position.data
+        device = getattr(data, "device", None)
+        return type(self.state.spring_position).__name__.replace("TensorOperations", "") + (f":{device}" if device is not None else "")
 
     def active_group(self):
         return int(self.state.spring_group_index.item()) % FLOW_GROUPS
@@ -1412,6 +1425,10 @@ def main(argv=None) -> None:
     ap.add_argument("--save-graph", help="write the extracted graph (.npz) and continue")
     ap.add_argument("--settle", type=int, default=None, help="world frames (1/60 s each) to run before the first frame")
     ap.add_argument("--order-gain", type=float, default=ORDER_GAIN, help="order-field force gain (0 disables the layer)")
+    ap.add_argument("--backend", choices=("numpy", "torch", "jax"), default=None,
+                    help="AbstractTensor backend for the world physics (AbstractTensor.set_default_backend); "
+                         "set after the lowering so the compile itself is unchanged")
+    ap.add_argument("--device", default=None, help="device for --backend, e.g. cuda or cuda:0")
     ap.add_argument("--flow-seconds", type=float, default=16.0, help="one sweep of the activation cycle through all groups")
     ap.add_argument("--drift", action="store_true",
                     help="start with the world running (Space toggles it): the points drift and the "
@@ -1473,7 +1490,11 @@ def main(argv=None) -> None:
     csrc, cdst, ckind = graph["cedge_src"], graph["cedge_dst"], graph["cedge_kind"]
     field = TimeField()
     plan = SphereMap(layout(graph))
+    if args.backend or args.device:
+        from src.common.tensors.abstraction import AbstractTensor
+        AbstractTensor.set_default_backend(args.backend or "numpy", args.device)
     world = World(graph, SphereMap.sphere(plan.u0) * SHELL_RADIUS, flow_seconds=args.flow_seconds)
+    print(f"world physics on {world.backend_name()}", flush=True)
     pos, core_pos = world.positions()
     pos, core_pos = pos.copy(), core_pos.copy()
     t_shell = graph["t"].astype(np.float64)
@@ -1748,7 +1769,7 @@ def main(argv=None) -> None:
                   f"mass {'ON' if camera.mass else 'off'}   "
                   f"diffusion {'ON' if state['diffuse'] else 'off'}",
                   (235, 235, 240)),
-                 (f"world: t {world.t:6.2f}s   last frame {world.accepted} admitted dt, {world.rejected} rejected   "
+                 (f"world [{world.backend_name()}]: t {world.t:6.2f}s   last frame {world.accepted} admitted dt, {world.rejected} rejected   "
                   f"order force {'ON' if state['order'] and args.order_gain > 0 else 'off'} (gain {args.order_gain:g}, mean |F| {world.ext_mean:.3f})   "
                   f"core {world.n_core} nodes {len(world.core_src)} edges {'shown' if state['core'] else 'hidden'}   "
                   f"group {world.active_group()}/{FLOW_GROUPS}",
