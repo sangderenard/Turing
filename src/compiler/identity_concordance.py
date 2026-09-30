@@ -3395,7 +3395,9 @@ class IdentityBook:
         fact is a disagreement (``ValueError``, as ``concord`` raises) and
         the same fact writes no cell but still records its edge.
         ``Mode.REVISE``: a ``Derived`` revision is admitted only if some
-        source cell is stamped newer than the row's previous revision.
+        source cell is stamped newer than the row's previous revision, or
+        the revision derives from a different set of cells than the previous
+        revision did (a different source is a cause).
         Every post ticks the shared clock exactly once.
         """
         registry = self.registry
@@ -3488,11 +3490,26 @@ class IdentityBook:
                 previous = max(
                     target_page.stamps[(row, column)] for column, _ in entries
                 )
-                if not any(stamp > previous for _, stamp in sources):
+                # A revision has a cause when a source cell changed since the
+                # previous revision, OR when it derives from a different set of
+                # cells than the previous revision did: a second field write
+                # derives from a second assignment's cells, which were posted
+                # at ingestion (older than the first revision) yet are a new
+                # source.  Same cells, none changed: no cause, refused.
+                previous_ref = Ref(page, row, entries[-1][0])
+                previous_sources = {
+                    source.key for source, _stage in self.edges_into(previous_ref)
+                }
+                proposed_sources = {ref.key for ref, _stamp in sources}
+                if (
+                    not any(stamp > previous for _, stamp in sources)
+                    and proposed_sources == previous_sources
+                ):
                     raise ConcordanceRefusal(
                         f"post {page.name} {row!r}: REVISE without a changed "
                         f"source; every Derived cell is stamped at or before "
-                        f"the row's previous revision ({previous})"
+                        f"the row's previous revision ({previous}) and the "
+                        f"cell set is the previous revision's"
                     )
             column = entries[-1][0] + 1 if entries else 0
             write_cell = True
