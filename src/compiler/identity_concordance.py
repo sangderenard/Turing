@@ -79,6 +79,19 @@ Findings (each is one concrete disagreement, with the two claims):
 ``layout-derivation-invalidated``
     a row laid out from a since-redeclared row has not itself been
     re-declared (its ``layout_state`` is still ``invalidated``).
+``unsourced-fact``
+    a resolved cell on a registered page with neither an inbound edge on
+    ``concordance_edge`` nor a mint edge on ``concordance_mint``.  While the
+    book's latch is OPEN every write through a raw page primitive is tagged
+    on ``concordance_unsourced`` and listed here by page and stage: that
+    list is the migration worklist for ``IdentityBook.post``.
+``unsourced-identity``
+    a ``MINTED`` value id among a function's values that no mint edge
+    accounts for (it was minted directly, not through a ``Novel`` post).
+
+The two ``unsourced-*`` kinds are reported on their own line of
+``concordance_report`` and are not counted in its first line, which is the
+pass/fail gate of ``tools/audit_identity_concordance.py``.
 """
 
 from __future__ import annotations
@@ -88,9 +101,11 @@ import contextvars
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from collections.abc import MutableMapping
+from enum import Enum
 from typing import Any, Iterable, Mapping
 
-from .id_space import group_by_prefix, label as id_label
+from .id_space import MINTED, group_by_prefix, has_flag, label as id_label
+from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 
 
 def publish_program_abi_graph_identities(
@@ -794,6 +809,9 @@ class Finding:
 
 
 _INOUT_REDEFINED = ("program_abi_mutable", "program_abi_field_written")
+#: Finding kinds ``concordance_report`` counts on their own line rather than
+#: in its gating first line.
+_UNSOURCED_KINDS = frozenset({"unsourced-fact", "unsourced-identity"})
 
 
 class CorrelationTable:
@@ -1025,6 +1043,79 @@ class CorrelationTable:
         found.extend(self._table_member_findings(module))
         found.extend(self._layout_table_findings(module))
         found.extend(self._operand_position_orphan_findings(module))
+        # Last, so callers that show the first few findings still see the
+        # per-page kinds first; ``concordance_report`` counts these two kinds
+        # on their own line.
+        found.extend(self._unsourced_findings(module))
+        return found
+
+    def _unsourced_worklist(
+        self, module: Any,
+    ) -> tuple[dict[tuple[str, str, str], int], list[tuple[str, int]]]:
+        """Cells with no edge, grouped, and minted ids with no mint edge.
+
+        Group key ``(page, stage, unit)``: ``unit`` is ``"cell"`` for a
+        resolved cell on a registered page that no edge or mint row names,
+        ``"raw row"`` for a row on an unregistered page written through a raw
+        primitive (tagged on the unsourced page while the latch is OPEN).
+        """
+        book = identity_book(module)
+        registered = book.registry.pages
+        private = set(book.registry.private_pages) | set(_PRIVATE_PAGE_NAMES)
+        sourced: set[Any] = set()
+        edge_page = book.pages.get(EDGE_PAGE.name)
+        if edge_page is not None:
+            sourced.update(row[0] for row in edge_page.rows())
+        minted_with_edge: set[int] = set()
+        mint_page = book.pages.get(MINT_PAGE.name)
+        if mint_page is not None:
+            for row in mint_page.rows():
+                sourced.add(row[0])
+                if row[1] is not None:
+                    minted_with_edge.add(int(row[1]))
+        tags: dict[tuple[str, Any], str] = {}
+        unsourced_page = book.pages.get(UNSOURCED_PAGE.name)
+        if unsourced_page is not None:
+            for row in unsourced_page.rows():
+                tags[(row[0], row[1])] = row[2]
+        groups: Counter = Counter()
+        for name, page in book.pages.items():
+            if name not in registered or name in private:
+                continue
+            for (row, column), fact in page.cells.items():
+                if fact is None or isinstance(fact, Unresolved):
+                    continue
+                if (name, row, column) in sourced:
+                    continue
+                groups[(name, tags.get((name, row), "unknown"), "cell")] += 1
+        for (page_name, _row), stage_name in tags.items():
+            if page_name in registered:
+                continue
+            groups[(page_name, stage_name, "raw row")] += 1
+        identities = [
+            (function, value_id)
+            for function, value_id in self.rows
+            if has_flag(value_id, MINTED) and value_id not in minted_with_edge
+        ]
+        return dict(groups), identities
+
+    def _unsourced_findings(self, module: Any) -> list[Finding]:
+        groups, identities = self._unsourced_worklist(module)
+        found = [
+            Finding(
+                "unsourced-fact", page_name, None,
+                f"stage {stage_name}: {count} {unit}(s) with neither an "
+                "inbound edge nor a mint edge",
+            )
+            for (page_name, stage_name, unit), count in sorted(groups.items())
+        ]
+        found.extend(
+            Finding(
+                "unsourced-identity", function, value_id,
+                "minted id has no mint edge (minted outside a Novel post)",
+            )
+            for function, value_id in identities
+        )
         return found
 
     def _layout_table_findings(self, module: Any) -> list[Finding]:
@@ -2531,10 +2622,14 @@ def concordance_report(module: Any, *, limit: int = 12) -> str:
     by_kind: dict[str, list[Finding]] = defaultdict(list)
     for finding in findings:
         by_kind[finding.kind].append(finding)
+    # The first line is the gate ``tools/audit_identity_concordance.py``
+    # reads; the two ``unsourced-*`` kinds are the migration worklist and
+    # are counted on their own line below, not here.
+    gated = [f for f in findings if f.kind not in _UNSOURCED_KINDS]
     census = group_by_prefix(value_id for _function, value_id in table.rows)
     lines = [
         f"identity concordance: {len(table.rows)} rows across "
-        f"{len(module.functions)} functions, {len(findings)} finding(s)"
+        f"{len(module.functions)} functions, {len(gated)} finding(s)"
     ]
     # Every row gathered under its own id group, before any finding: a
     # count per prefix says at a glance which spaces this module actually
@@ -2548,6 +2643,12 @@ def concordance_report(module: Any, *, limit: int = 12) -> str:
                 f"{group.label}={len(group.value_ids)}" for group in census
             )
         )
+    groups, identities = table._unsourced_worklist(module)
+    lines.append(
+        f"  unsourced: {sum(groups.values())} fact(s), "
+        f"{len(identities)} identit(ies) -- latch "
+        f"{identity_book(module).latch.name}"
+    )
     for kind in sorted(by_kind):
         entries = by_kind[kind]
         lines.append(f"  [{kind}] x{len(entries)}")
@@ -2636,6 +2737,342 @@ def _carried_phi(function: Any, header: str, carried_id: int) -> Any:
     return None
 
 
+# --------------------------------------------------------------------------
+# The one writing api: ``IdentityBook.post`` (design:
+# docs/CONCORDANCE_SINGLE_API_DESIGN_2026-09-30.md, sections 2 and 6).
+#
+# A post names the page it writes (a registry object, never a free string),
+# the row (validated against the page's declared shape), the fact, the
+# stage making the statement, and its provenance: ``Derived`` from exact
+# source cells, ``Novel`` (the book mints the id and records the transform
+# that produced it), or ``Unsourced`` (admitted only while the book's latch
+# is OPEN, and recorded so the audit lists it).  The edge, reverse-index,
+# mint and unsourced records live on four private pages named below; the
+# read api on the book (``edges_into``, ``edges_out_of``, ``mint_of``,
+# ``unsourced_rows``) is how a viewer reads them without knowing the names.
+#
+# Migration state: every write that still reaches ``IdentityPage.set``
+# without coming through ``post`` is tagged ``Unsourced(RAW_PRIMITIVE)`` on
+# the unsourced page while the latch is OPEN, and refused once it is CLOSED.
+# --------------------------------------------------------------------------
+
+
+class ConcordanceRefusal(ValueError):
+    """A post (or a raw write under a CLOSED latch) the book would not admit.
+
+    Raised at the call; nothing is recorded.
+    """
+
+
+class Mode(Enum):
+    CONCORD = "concord"
+    REVISE = "revise"
+
+
+class Latch(Enum):
+    OPEN = "open"
+    CLOSED = "closed"
+
+
+class RowFieldKind(Enum):
+    SCOPE = "scope"
+    VALUE_ID = "value_id"
+    NAME = "name"
+    INDEX = "index"
+    LABEL = "label"
+    PAGE_REF = "page_ref"
+
+
+class _New:
+    """The sentinel a ``Novel`` post carries where the minted id will go."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "NEW"
+
+    def __reduce__(self):
+        return "NEW"
+
+
+NEW = _New()
+
+
+def _hashable(item: Any) -> bool:
+    try:
+        hash(item)
+    except TypeError:
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class RowField:
+    name: str
+    kind: RowFieldKind
+
+    def admits(self, item: Any) -> bool:
+        kind = self.kind
+        if kind is RowFieldKind.SCOPE:
+            return item is not None and _hashable(item)
+        if kind is RowFieldKind.VALUE_ID:
+            return isinstance(item, int) and not isinstance(item, bool)
+        if kind is RowFieldKind.NAME:
+            return isinstance(item, str)
+        if kind is RowFieldKind.INDEX:
+            return isinstance(item, int) and not isinstance(item, bool)
+        if kind is RowFieldKind.LABEL:
+            return _hashable(item)
+        if kind is RowFieldKind.PAGE_REF:
+            return isinstance(item, Ref)
+        return False
+
+
+@dataclass(frozen=True, repr=False)
+class Page:
+    """A declared page: its name, its row shape and the type of its facts."""
+
+    name: str
+    row_fields: tuple[RowField, ...]
+    fact_type: Any = object
+
+    def __repr__(self) -> str:
+        return f"Page({self.name!r})"
+
+
+@dataclass(frozen=True)
+class Stage:
+    name: str
+
+
+@dataclass(frozen=True)
+class Transform:
+    name: str
+    arity: int
+
+
+@dataclass(frozen=True)
+class Reason:
+    name: str
+
+
+@dataclass(frozen=True, repr=False)
+class Ref:
+    """The full vector of one cell's location: page, row, column."""
+
+    page: Page
+    row: tuple
+    column: int
+
+    @property
+    def key(self) -> tuple[str, tuple, int]:
+        """The cell's location as it is stored inside edge rows."""
+        return (self.page.name, self.row, self.column)
+
+    def __repr__(self) -> str:
+        return f"Ref({self.page.name!r}, {render_row(self.row)}, {self.column})"
+
+
+@dataclass(frozen=True)
+class Derived:
+    cells: tuple[Ref, ...]
+
+
+@dataclass(frozen=True)
+class Novel:
+    transform: Transform
+    operands: tuple[Ref, ...]
+
+
+@dataclass(frozen=True)
+class Unsourced:
+    reason: Reason
+
+
+@dataclass(frozen=True)
+class Unresolved:
+    """The fact a writer posts when it looked and could not decide."""
+
+    reason: Reason
+    read: tuple[Ref, ...] = ()
+
+
+class Registry:
+    """Declared pages, stages, transforms and reasons: the closed vocabulary
+    ``IdentityBook.post`` accepts.  Each name is declared once; declaring it
+    again with the same shape returns the existing object, with a different
+    shape is refused."""
+
+    def __init__(self) -> None:
+        self.pages: dict[str, Page] = {}
+        self.stages: dict[str, Stage] = {}
+        self.transforms: dict[str, Transform] = {}
+        self.reasons: dict[str, Reason] = {}
+        #: Pages the book writes for itself (edges, reverse index, mints,
+        #: unsourced tags).  Their cells are the edges; the ``unsourced-fact``
+        #: finding does not ask them for edges of their own.
+        self.private_pages: set[str] = set()
+
+    def declare_page(
+        self,
+        name: str,
+        row_fields: Iterable[RowField],
+        fact_type: Any = object,
+        *,
+        private: bool = False,
+    ) -> Page:
+        fields = tuple(row_fields)
+        if not isinstance(name, str) or not name:
+            raise ConcordanceRefusal(f"page name must be a non-empty str: {name!r}")
+        if not fields or not all(isinstance(item, RowField) for item in fields):
+            raise ConcordanceRefusal(
+                f"page {name!r}: row_fields must be a non-empty tuple of RowField"
+            )
+        proposed = Page(name, fields, fact_type)
+        existing = self.pages.get(name)
+        if existing is None:
+            self.pages[name] = proposed
+            if private:
+                self.private_pages.add(name)
+            return proposed
+        if existing != proposed:
+            raise ConcordanceRefusal(
+                f"page {name!r} already declared with a different shape: "
+                f"declared={existing.row_fields!r}/{existing.fact_type!r}, "
+                f"proposed={fields!r}/{fact_type!r}"
+            )
+        return existing
+
+    def declare_stage(self, name: str) -> Stage:
+        return self._declare(self.stages, Stage(str(name)), "stage")
+
+    def declare_transform(self, name: str, arity: int) -> Transform:
+        return self._declare(
+            self.transforms, Transform(str(name), int(arity)), "transform",
+        )
+
+    def declare_reason(self, name: str) -> Reason:
+        return self._declare(self.reasons, Reason(str(name)), "reason")
+
+    @staticmethod
+    def _declare(table: dict, proposed: Any, what: str) -> Any:
+        existing = table.get(proposed.name)
+        if existing is None:
+            table[proposed.name] = proposed
+            return proposed
+        if existing != proposed:
+            raise ConcordanceRefusal(
+                f"{what} {proposed.name!r} already declared as {existing!r}, "
+                f"proposed {proposed!r}"
+            )
+        return existing
+
+    def page(self, name: str) -> Page:
+        """The declared page named ``name``; an undeclared name is refused."""
+        page = self.pages.get(name)
+        if page is None:
+            raise ConcordanceRefusal(f"undeclared page {name!r}")
+        return page
+
+
+REGISTRY = Registry()
+declare_page = REGISTRY.declare_page
+declare_stage = REGISTRY.declare_stage
+declare_transform = REGISTRY.declare_transform
+declare_reason = REGISTRY.declare_reason
+
+_SCOPE = RowFieldKind.SCOPE
+_VALUE_ID = RowFieldKind.VALUE_ID
+_NAME = RowFieldKind.NAME
+_INDEX = RowFieldKind.INDEX
+_LABEL = RowFieldKind.LABEL
+
+#: One edge per (target cell, source cell) a ``Derived`` post named.  Row
+#: ``(target_key, source_key, stage_name)``, each key ``(page, row,
+#: column)`` as ``Ref.key`` spells it; scope-first by target so
+#: ``edges_into`` is one ``scope_rows`` read.
+EDGE_PAGE = declare_page(
+    "concordance_edge",
+    (RowField("target", _SCOPE), RowField("source", _LABEL),
+     RowField("stage", _NAME)),
+    bool, private=True,
+)
+#: The same edges read from their source end: row ``(source_key,
+#: edge_row)`` so ``edges_out_of`` is one ``scope_rows`` read.
+DEPENDENTS_PAGE = declare_page(
+    "concordance_dependents",
+    (RowField("source", _SCOPE), RowField("edge_row", _LABEL)),
+    bool, private=True,
+)
+#: One row per ``Novel`` post: ``(target_key, minted_id)`` with fact
+#: ``(transform, operands)``.  ``minted_id`` is None for a root row that
+#: carried no ``NEW`` (an AST source span, say): the post is then an origin
+#: edge only and mints nothing.
+MINT_PAGE = declare_page(
+    "concordance_mint",
+    (RowField("target", _SCOPE), RowField("minted_id", _LABEL)),
+    tuple, private=True,
+)
+#: One row per unsourced statement: ``(page_name, row, stage_name)`` with
+#: the ``Reason`` as fact.  Both ``Unsourced`` posts and raw-primitive
+#: writes land here while the latch is OPEN.
+UNSOURCED_PAGE = declare_page(
+    "concordance_unsourced",
+    (RowField("page", _SCOPE), RowField("row", _LABEL),
+     RowField("stage", _NAME)),
+    Reason, private=True,
+)
+_PRIVATE_PAGE_NAMES = frozenset(
+    page.name for page in (EDGE_PAGE, DEPENDENTS_PAGE, MINT_PAGE, UNSOURCED_PAGE)
+)
+
+#: The stage recorded for a raw write when the book knows no better
+#: (``IdentityBook.active_stage`` unset), and the reason every such write
+#: is tagged with.
+RAW_STAGE = declare_stage("raw_primitive")
+RAW_PRIMITIVE = declare_reason("raw_primitive")
+
+
+def _validate_row(page: Page, row: Any, *, allow_new: bool) -> tuple[int, ...]:
+    """Check ``row`` against ``page.row_fields``; return the NEW positions."""
+
+    if not isinstance(row, tuple):
+        raise ConcordanceRefusal(
+            f"{page.name}: row must be a tuple, got {type(row).__name__}"
+        )
+    if len(row) != len(page.row_fields):
+        raise ConcordanceRefusal(
+            f"{page.name}: row {row!r} has {len(row)} element(s); the page "
+            f"declares {len(page.row_fields)}: "
+            f"{tuple(item.name for item in page.row_fields)!r}"
+        )
+    new_positions: list[int] = []
+    for position, (declared, item) in enumerate(zip(page.row_fields, row)):
+        if item is NEW:
+            if declared.kind is not RowFieldKind.VALUE_ID or not allow_new:
+                raise ConcordanceRefusal(
+                    f"{page.name}: NEW is admissible only in a VALUE_ID field "
+                    f"of a Novel post (field {declared.name!r} at {position})"
+                )
+            new_positions.append(position)
+            continue
+        if not declared.admits(item):
+            raise ConcordanceRefusal(
+                f"{page.name}: row element {position} ({declared.name!r}, "
+                f"{declared.kind.name}) does not admit {item!r}"
+            )
+    return tuple(new_positions)
+
+
+def _validate_fact(page: Page, fact: Any) -> None:
+    if isinstance(fact, Unresolved):
+        return
+    if not isinstance(fact, page.fact_type):
+        raise ConcordanceRefusal(
+            f"{page.name}: fact {fact!r} is not a {page.fact_type!r}"
+        )
+
+
 @dataclass
 class IdentityPage:
     """One pipeline stage's row (identity) x column (round) table of facts."""
@@ -2647,13 +3084,44 @@ class IdentityPage:
     #: rows one scope owns (a function's table, a planning scope) are read
     #: from the page without scanning every cell.  Part of the page itself.
     scopes: dict[Any, dict[Any, None]] = field(default_factory=dict)
+    #: The construction clock: one counter shared by every page of a book
+    #: (``IdentityBook.page`` hands its own), ticked by each write, so the
+    #: order of writes across pages is recorded, not inferred.  A page made
+    #: outside a book keeps a clock of its own.
+    clock: list[int] = field(default_factory=lambda: [0])
+    #: ``(row, column)`` -> the clock reading when that cell was written.
+    stamps: dict[tuple[Any, int], int] = field(default_factory=dict)
+    #: The book this page belongs to (``IdentityBook.page`` sets it); a page
+    #: made outside a book has none, so its writes cannot be tagged or
+    #: latched.
+    book: Any = field(default=None, repr=False, compare=False)
 
-    def set(self, row: Any, column: int, fact: Any) -> None:
+    def _stamp(self, row: Any, column: int, fact: Any) -> None:
+        """Write one cell at the current clock reading without ticking.
+
+        ``IdentityBook.post`` writes a fact and its edges through this so
+        they share one reading; it ticks the clock once afterwards.
+        """
         if column not in self.columns:
             self.columns.append(column)
         self.cells[(row, column)] = fact
+        self.stamps[(row, column)] = self.clock[0]
         if isinstance(row, tuple) and row:
             self.scopes.setdefault(row[0], {}).setdefault(row, None)
+
+    def set(self, row: Any, column: int, fact: Any) -> None:
+        """The raw primitive every pre-api write bottoms out in.
+
+        On a book's page this is a write that names no source: while the
+        book's latch is OPEN it is admitted and tagged
+        ``Unsourced(RAW_PRIMITIVE)`` on the unsourced page in the same clock
+        tick; once the latch is CLOSED it is refused.
+        """
+        book = self.book
+        if book is not None:
+            book._admit_raw_write(self, row)
+        self._stamp(row, column, fact)
+        self.clock[0] += 1
 
     def scope_rows(self, scope: Any) -> tuple[Any, ...]:
         """Every row whose first element is ``scope``, in recorded order."""
@@ -2865,15 +3333,281 @@ class IdentityBook:
     """Every stage's page, so one identity's claim can be read across all
     of them -- the comparison none of them makes on its own."""
 
-    def __init__(self, *, detached: bool = False) -> None:
+    def __init__(
+        self, *, detached: bool = False, registry: Registry | None = None,
+    ) -> None:
         self.pages: dict[str, IdentityPage] = {}
+        #: Shared by every page: the book's construction clock.
+        self.clock: list[int] = [0]
         #: Created by ``current_identity_book`` because nothing had begun a
         #: compile.  A standalone transaction owns its own book instead of
         #: joining one of these, whose facts belong to no single program.
         self.detached = bool(detached)
+        #: The declared vocabulary ``post`` accepts (pages, stages,
+        #: transforms, reasons).  The module registry unless a caller hands
+        #: its own.
+        self.registry: Registry = REGISTRY if registry is None else registry
+        #: OPEN admits ``Unsourced`` posts and raw primitive writes (tagging
+        #: each on the unsourced page); CLOSED refuses both.  Closing it is
+        #: the proof that no writer bypasses ``post``.
+        self.latch: Latch = Latch.OPEN
+        #: When a pass sets this, raw writes made while it is set are tagged
+        #: with that stage instead of ``RAW_STAGE``.
+        self.active_stage: Stage | None = None
 
-    def page(self, name: str) -> IdentityPage:
-        return self.pages.setdefault(name, IdentityPage(name))
+    def page(self, name: Any) -> IdentityPage:
+        """The page named ``name`` (a str or a declared ``Page``), created
+        on first mention with this book's clock."""
+        if isinstance(name, Page):
+            name = name.name
+        page = self.pages.get(name)
+        if page is None:
+            page = self.pages[name] = IdentityPage(
+                name, clock=self.clock, book=self,
+            )
+        elif page.book is None:
+            page.book = self
+        return page
+
+    # ------------------------------------------------------------- the api
+    def post(
+        self,
+        page: Page,
+        row: tuple,
+        fact: Any,
+        *,
+        stage: Stage,
+        provenance: Derived | Novel | Unsourced,
+        mode: Mode,
+    ) -> Ref:
+        """Write one fact with its provenance; the only sanctioned writer.
+
+        ``Derived``: the fact cell plus one edge per source cell on the
+        edge page and its reverse index, all at one clock reading.
+        ``Novel``: the row's ``NEW`` is replaced by an id minted here and
+        the mint edge (transform, operands) is written beside the fact; a
+        row with no ``NEW`` is a root that mints nothing and gets only the
+        origin edge.
+        ``Unsourced``: admitted only while the latch is OPEN, recorded on
+        the unsourced page with its reason and ``stage``.
+
+        ``Mode.CONCORD``: the first statement owns the row; a different
+        fact is a disagreement (``ValueError``, as ``concord`` raises) and
+        the same fact writes no cell but still records its edge.
+        ``Mode.REVISE``: a ``Derived`` revision is admitted only if some
+        source cell is stamped newer than the row's previous revision.
+        Every post ticks the shared clock exactly once.
+        """
+        registry = self.registry
+        if not isinstance(page, Page) or registry.pages.get(page.name) != page:
+            raise ConcordanceRefusal(f"post: undeclared page {page!r}")
+        if not isinstance(stage, Stage) or registry.stages.get(stage.name) != stage:
+            raise ConcordanceRefusal(f"post: undeclared stage {stage!r}")
+        if not isinstance(mode, Mode):
+            raise ConcordanceRefusal(f"post: mode must be a Mode, got {mode!r}")
+        novel = isinstance(provenance, Novel)
+        new_positions = _validate_row(page, row, allow_new=novel)
+        _validate_fact(page, fact)
+
+        sources: tuple[tuple[Ref, int], ...] = ()
+        if isinstance(provenance, Derived):
+            if not provenance.cells:
+                raise ConcordanceRefusal(
+                    f"post {page.name} {row!r}: Derived names no source cell"
+                )
+            sources = tuple(
+                (ref, self._source_stamp(ref)) for ref in provenance.cells
+            )
+        elif novel:
+            transform = provenance.transform
+            if (
+                not isinstance(transform, Transform)
+                or registry.transforms.get(transform.name) != transform
+            ):
+                raise ConcordanceRefusal(
+                    f"post {page.name}: undeclared transform {transform!r}"
+                )
+            if len(provenance.operands) != transform.arity:
+                raise ConcordanceRefusal(
+                    f"post {page.name}: transform {transform.name!r} takes "
+                    f"{transform.arity} operand(s), got {len(provenance.operands)}"
+                )
+            # One NEW: the book mints the id.  No NEW: a root (an AST source
+            # span row, say) that has no minted id; the post writes only its
+            # origin edge and mints nothing.
+            if len(new_positions) > 1:
+                raise ConcordanceRefusal(
+                    f"post {page.name} {row!r}: a Novel row carries at most one "
+                    f"NEW, found {len(new_positions)}"
+                )
+            for operand in provenance.operands:
+                self._source_stamp(operand)
+        elif isinstance(provenance, Unsourced):
+            if self.latch is not Latch.OPEN:
+                raise ConcordanceRefusal(
+                    f"post {page.name} {row!r}: Unsourced({provenance.reason.name})"
+                    " refused; the latch is CLOSED"
+                )
+            reason = provenance.reason
+            if (
+                not isinstance(reason, Reason)
+                or registry.reasons.get(reason.name) != reason
+            ):
+                raise ConcordanceRefusal(
+                    f"post {page.name}: undeclared reason {reason!r}"
+                )
+        else:
+            raise ConcordanceRefusal(
+                f"post {page.name}: provenance must be Derived, Novel or "
+                f"Unsourced, got {provenance!r}"
+            )
+
+        target_page = self.page(page)
+        minted: int | None = None
+        if novel and new_positions:
+            # Direct ``GLOBAL_MONOTONIC_IDS.mint()`` calls still exist
+            # elsewhere; sharing the source keeps this id disjoint from them.
+            minted = GLOBAL_MONOTONIC_IDS.mint()
+            position = new_positions[0]
+            row = row[:position] + (minted,) + row[position + 1:]
+
+        entries = target_page.history(row)
+        if mode is Mode.CONCORD:
+            if entries:
+                column, incumbent = entries[-1]
+                if incumbent != fact:
+                    raise ValueError(
+                        f"{page.name} disagreement for {row!r}: "
+                        f"recorded={incumbent!r}, proposed={fact!r}"
+                    )
+                write_cell = False
+            else:
+                column, write_cell = 0, True
+        else:
+            if entries and sources:
+                previous = max(
+                    target_page.stamps[(row, column)] for column, _ in entries
+                )
+                if not any(stamp > previous for _, stamp in sources):
+                    raise ConcordanceRefusal(
+                        f"post {page.name} {row!r}: REVISE without a changed "
+                        f"source; every Derived cell is stamped at or before "
+                        f"the row's previous revision ({previous})"
+                    )
+            column = entries[-1][0] + 1 if entries else 0
+            write_cell = True
+
+        if write_cell:
+            target_page._stamp(row, column, fact)
+        target = Ref(page, row, column)
+        target_key = target.key
+        if sources:
+            edge_page = self.page(EDGE_PAGE)
+            dependents = self.page(DEPENDENTS_PAGE)
+            for source_ref, _ in sources:
+                edge_row = (target_key, source_ref.key, stage.name)
+                edge_page._stamp(edge_row, 0, True)
+                dependents._stamp((source_ref.key, edge_row), 0, True)
+        elif novel:
+            self.page(MINT_PAGE)._stamp(
+                (target_key, minted), 0,
+                (provenance.transform, tuple(provenance.operands)),
+            )
+        else:
+            self.page(UNSOURCED_PAGE)._stamp(
+                (page.name, row, stage.name), 0, provenance.reason,
+            )
+        self.clock[0] += 1
+        return target
+
+    def _source_stamp(self, ref: Any) -> int:
+        """The clock reading of an existing cell named by ``ref``; a Ref to
+        no cell (or to an undeclared page) is refused."""
+        if not isinstance(ref, Ref):
+            raise ConcordanceRefusal(f"source must be a Ref, got {ref!r}")
+        if self.registry.pages.get(ref.page.name) != ref.page:
+            raise ConcordanceRefusal(f"source names undeclared page {ref.page!r}")
+        page = self.pages.get(ref.page.name)
+        if page is None or (ref.row, ref.column) not in page.cells:
+            raise ConcordanceRefusal(f"source cell does not exist: {ref!r}")
+        return page.stamps[(ref.row, ref.column)]
+
+    def _admit_raw_write(self, page: IdentityPage, row: Any) -> None:
+        """Tag (OPEN) or refuse (CLOSED) a write made through a raw
+        primitive rather than ``post``."""
+        if self.latch is not Latch.OPEN:
+            raise ConcordanceRefusal(
+                f"raw write refused under a CLOSED latch: page {page.name!r} "
+                f"row {row!r}; write it through IdentityBook.post"
+            )
+        stage = self.active_stage if self.active_stage is not None else RAW_STAGE
+        self.page(UNSOURCED_PAGE)._stamp(
+            (page.name, row, stage.name), 0, RAW_PRIMITIVE,
+        )
+
+    # -------------------------------------------------------------- reading
+    def _ref_from_key(self, key: tuple) -> Ref:
+        page_name, row, column = key
+        return Ref(self.registry.page(page_name), row, column)
+
+    def latest_ref(self, page: Page, row: tuple) -> Ref | None:
+        """The Ref of ``row``'s most recent cell on ``page``, or None."""
+        stored = self.pages.get(page.name)
+        if stored is None:
+            return None
+        entries = stored.history(row)
+        if not entries:
+            return None
+        return Ref(page, row, entries[-1][0])
+
+    def stamp_of(self, ref: Ref) -> int:
+        return self._source_stamp(ref)
+
+    def edges_into(self, ref: Ref) -> tuple[tuple[Ref, Stage], ...]:
+        """Every (source cell, stage) ``ref``'s cell was derived from."""
+        edge_page = self.pages.get(EDGE_PAGE.name)
+        if edge_page is None:
+            return ()
+        return tuple(
+            (self._ref_from_key(row[1]), self.registry.stages[row[2]])
+            for row in edge_page.scope_rows(ref.key)
+        )
+
+    def edges_out_of(self, ref: Ref) -> tuple[tuple[Ref, Stage], ...]:
+        """Every (target cell, stage) derived from ``ref``'s cell."""
+        dependents = self.pages.get(DEPENDENTS_PAGE.name)
+        if dependents is None:
+            return ()
+        return tuple(
+            (self._ref_from_key(row[1][0]), self.registry.stages[row[1][2]])
+            for row in dependents.scope_rows(ref.key)
+        )
+
+    def mint_of(self, ref: Ref) -> tuple[Transform, tuple[Ref, ...]] | None:
+        """The (transform, operands) a Novel post minted ``ref``'s row
+        with, or None when the cell was not posted Novel."""
+        mint_page = self.pages.get(MINT_PAGE.name)
+        if mint_page is None:
+            return None
+        for row in mint_page.scope_rows(ref.key):
+            fact = mint_page.latest(row)
+            if fact is not None:
+                return fact
+        return None
+
+    def unsourced_rows(self) -> tuple[tuple[Any, Any, Reason, Stage], ...]:
+        """Every unsourced statement as (page, row, reason, stage); ``page``
+        is the declared Page when the name is registered, else the name."""
+        unsourced = self.pages.get(UNSOURCED_PAGE.name)
+        if unsourced is None:
+            return ()
+        pages = self.registry.pages
+        stages = self.registry.stages
+        return tuple(
+            (pages.get(row[0], row[0]), row[1], unsourced.latest(row),
+             stages.get(row[2], Stage(row[2])))
+            for row in unsourced.rows()
+        )
 
     def mint_scope(self, label: Any) -> tuple[str, int]:
         """A fresh scope, numbered by this book in causal order.
@@ -2977,6 +3711,38 @@ def descriptor_from_shape_transformation_state(
     return descriptor
 
 
+#: The three pages of ``record_shape_transformation``: the edge (row IS the
+#: edge: target, source, stage, operator, role; fact the operator's input
+#: and output states), its reverse index keyed by the source identity, and
+#: the consulted projection whose fact points back at its edge.  Their rows
+#: and facts are exactly what ``withdraw_superseded_shape_derivations`` and
+#: ``concordant_shape_transformation_state`` read.
+SHAPE_EDGE_PAGE = declare_page(
+    "shape_transformation_concordance",
+    (RowField("target_scope", _SCOPE), RowField("target_id", _LABEL),
+     RowField("source_scope", _NAME), RowField("source_id", _LABEL),
+     RowField("stage", _NAME), RowField("operation", _NAME),
+     RowField("role", _NAME)),
+    tuple,
+)
+SHAPE_DEPENDENTS_PAGE = declare_page(
+    "shape_transformation_dependents",
+    (RowField("source", _SCOPE), RowField("edge_row", _LABEL)),
+    bool,
+)
+SHAPE_STATE_PAGE = declare_page(
+    "shape_transformation_state",
+    (RowField("scope", _SCOPE), RowField("value_id", _LABEL)),
+    tuple,
+)
+#: A shape edge whose source identity has no changed state cell on the book
+#: (the source is a graph identity the caller read off the graph).
+SHAPE_SOURCE_NOT_ON_BOOK = declare_reason("shape_source_not_on_book")
+#: A shape state re-resolved over an edge that did not change since the
+#: row's previous revision (the row was withdrawn or re-pointed in between).
+SHAPE_STATE_REDERIVED = declare_reason("shape_state_rederived_over_unchanged_edge")
+
+
 def record_shape_transformation(
     source_scope: Any,
     source_id: Any,
@@ -3001,39 +3767,72 @@ def record_shape_transformation(
     target_scope = authored_function_name(target_scope)
     source = shape_transformation_state(source_state)
     target = shape_transformation_state(target_state)
-    edge_page = current_identity_book().page(
-        "shape_transformation_concordance"
-    )
+    book = current_identity_book()
+    # Callers still pass the stage as a label; the registry mints the Stage
+    # object from it (a name already declared is returned, never redeclared).
+    # The seam closes when the callers pass Stage objects themselves.
+    stage_object = book.registry.declare_stage(str(stage))
     edge_row = (
         target_scope, target_id, source_scope, source_id,
         str(stage), str(operation), str(role),
     )
     edge_fact = (source, target)
-    if edge_page.latest(edge_row) != edge_fact:
-        edge_page.set(
-            edge_row, max(edge_page.columns, default=-1) + 1, edge_fact,
+    edge_ref = book.latest_ref(SHAPE_EDGE_PAGE, edge_row)
+    if edge_ref is None or book.page(SHAPE_EDGE_PAGE).latest(edge_row) != edge_fact:
+        # The source side of a shape edge is a graph identity, not a book
+        # row (census 00, section 2).  When the book already holds a state
+        # cell for that identity and it changed since this edge was last
+        # written, the edge derives from it; otherwise the cause is not on
+        # the book and the edge is posted unsourced, which the audit lists.
+        source_ref = book.latest_ref(SHAPE_STATE_PAGE, (source_scope, source_id))
+        if source_ref is not None and _newer_than_row(book, source_ref, edge_ref):
+            provenance: Derived | Unsourced = Derived((source_ref,))
+        else:
+            provenance = Unsourced(SHAPE_SOURCE_NOT_ON_BOOK)
+        edge_ref = book.post(
+            SHAPE_EDGE_PAGE, edge_row, edge_fact,
+            stage=stage_object, provenance=provenance, mode=Mode.REVISE,
         )
     # The same edge, read from its source end: which targets were derived
     # from this identity.  A row's first element is the source identity, so
     # the page answers it directly (``scope_rows``) without a side index.
-    current_identity_book().page("shape_transformation_dependents").set(
-        ((source_scope, source_id), edge_row), 0, True,
-    )
-    state_page = current_identity_book().page(
-        "shape_transformation_state"
+    book.post(
+        SHAPE_DEPENDENTS_PAGE, ((source_scope, source_id), edge_row), True,
+        stage=stage_object, provenance=Derived((edge_ref,)),
+        mode=Mode.CONCORD,
     )
     state_row = (target_scope, target_id)
     state_fact = ("resolved", target, edge_row)
-    if state_page.latest(state_row) != state_fact:
+    state_ref = book.latest_ref(SHAPE_STATE_PAGE, state_row)
+    if state_ref is None or book.page(SHAPE_STATE_PAGE).latest(state_row) != state_fact:
         previous = concordant_shape_transformation_state(
             target_scope, target_id,
         )
-        state_page.revise(state_row, state_fact)
+        # The projection derives from its edge when the edge changed since
+        # the row's previous revision; a re-resolution over an unchanged
+        # edge (the row was withdrawn or re-pointed in between) has its
+        # cause off the book and is posted unsourced.
+        if _newer_than_row(book, edge_ref, state_ref):
+            provenance = Derived((edge_ref,))
+        else:
+            provenance = Unsourced(SHAPE_STATE_REDERIVED)
+        book.post(
+            SHAPE_STATE_PAGE, state_row, state_fact,
+            stage=stage_object, provenance=provenance, mode=Mode.REVISE,
+        )
         if previous != target:
             withdraw_superseded_shape_derivations(
                 target_scope, target_id, target, reason=stage,
             )
     return target
+
+
+def _newer_than_row(book: IdentityBook, source: Ref, latest: Ref | None) -> bool:
+    """Whether ``source``'s cell is stamped after the row ``latest`` names
+    (a row with no cell yet is older than anything)."""
+    if latest is None:
+        return True
+    return book.stamp_of(source) > book.stamp_of(latest)
 
 
 def withdraw_superseded_shape_derivations(
@@ -4337,9 +5136,13 @@ def render_row(row: Any) -> str:
     if isinstance(row, int):
         return id_label(row)
     if isinstance(row, tuple):
+        # Nested tuples (an edge row holding two cell keys, a dependents
+        # row holding an edge row) are rendered the same way, so the ids
+        # inside them are labelled too.
         return (
             "(" + ", ".join(
                 id_label(item) if isinstance(item, int) and not isinstance(item, bool)
+                else render_row(item) if isinstance(item, tuple)
                 else repr(item)
                 for item in row
             ) + ")"

@@ -1,4 +1,15 @@
-"""Central issuer for compiler-created representational IDs."""
+"""Central issuer for compiler-created representational IDs.
+
+Migration note (2026-09-30, docs/CONCORDANCE_SINGLE_API_DESIGN_2026-09-30.md
+section 6.2): the sanctioned way to mint an id is a ``Novel`` post through
+``IdentityBook.post`` in ``identity_concordance``, which draws the id from
+``GLOBAL_MONOTONIC_IDS`` and writes the mint edge (transform, operands) in
+the same clock tick, so the id is born joined to what it was made from.  A
+direct ``GLOBAL_MONOTONIC_IDS.mint()`` call records nothing; the audit lists
+every such id under ``unsourced-identity``.  Direct minting stays callable
+only while the ~100 existing call sites migrate and is to be closed
+afterwards: ``mint`` becomes unreachable except through the api.
+"""
 
 from __future__ import annotations
 
