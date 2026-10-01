@@ -9831,9 +9831,18 @@ class _ControlSSABuilder:
                 ),
                 "backedge": (latch.name, header.name),
             })
+        # The targets leave scope at the loop's exit, and the exit is caused
+        # by the latch: the induction update ``next_induction`` is what the
+        # header compares to leave.  Its cell is the withdrawal's cause.
+        # Without it the withdrawal cited exactly the cells the LOOP_CONTROL
+        # binding cited (canonical id, induction, loop, iterable), and the
+        # book refused it as a REVISE with no new source: measured on
+        # ``for k in range(6)`` in the oscillator case's ``cos_series``,
+        # graph id 0, ConcordanceRefusal at control_value_binding.
+        exit_cause = self._value_cell(next_induction)
         for target_id, previous in restored_values.items():
             # RESTORED (or withdrawn): the loop targets leave scope.
-            self._withdraw(target_id, previous, loop_cell)
+            self._withdraw(target_id, previous, loop_cell, exit_cause)
         if previous_induction is None:
             self.local_control_values.pop(loop.induction, None)
         else:
