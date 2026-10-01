@@ -2719,9 +2719,14 @@ def _concord_lexical_reads(
     # The read is a fact of the occurrence before it is one of any consumer:
     # a keyword argument's wrapper (and with it the Name node) can be absent
     # from the function subgraph, leaving the read with no consumer edge.
-    # Row ``(scope, "occurrence", id)`` is the source a later operand
-    # position forks from (``_set_operands``).
-    page.concord((scope, "occurrence", int(occurrence_id)), str(binding))
+    # Row ``(scope, "occurrence", id, 0)`` is the source a later operand
+    # position forks from (``_set_operands``).  It is keyed like every row
+    # of the declared page (scope, consumer, role, ordinal): an occurrence is
+    # one read, ordinal 0.  The three-key form left the fork source two
+    # fields long, and the typed ``OperandFork(cause, consumer, role,
+    # ordinal)`` refused it: ``for name, limit in channels.items()`` (the
+    # audit mapping case) raised TypeError missing ``source_ordinal``.
+    page.concord((scope, "occurrence", int(occurrence_id), 0), str(binding))
     if occurrence_id not in graph.G:
         return
     for consumer in tuple(graph.G.successors(occurrence_id)):
@@ -5526,7 +5531,7 @@ def _normalize_lexical_values(
                 # from the wrapper position that consumed it.
                 def read_source(value_expression, wrapper_id):
                     if isinstance(value_expression, ast.Name):
-                        return ("occurrence", id(value_expression))
+                        return ("occurrence", id(value_expression), 0)
                     return (wrapper_id, "value", 0)
 
                 receiver_fork: dict[tuple[str, int], tuple[Any, ...]] = {}
