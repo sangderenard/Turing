@@ -820,6 +820,9 @@ class NumPyTensorOperations(AbstractTensor):
         return np.sqrt(self.data)
 
     def tensor_from_list_(self, data, dtype, device):
+        if isinstance(data, np.ndarray):
+            # An array is copied as an array: no per-element Python list.
+            return np.array(data, dtype=self._torch_dtype_to_numpy(dtype))
         if not isinstance(data, (list, tuple)):
             try:
                 data = data.tolist()

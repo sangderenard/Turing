@@ -1032,7 +1032,7 @@ class World:
         from src.computational_world.engine import WorldStatusBatch
         from src.common.dt_system.time_runtime import TimeWindowRequest
         if external is not None:
-            self.state.spring_external_force = AT.tensor(external.tolist(), dtype="float32")
+            self.state.spring_external_force = AT.tensor(np.ascontiguousarray(external, np.float32), dtype="float32")
             self.ext_mean = float(np.linalg.norm(external, axis=1).mean())
         self.request += 1
         start = float(self.state.managed_time.item())          # the record, not a running sum
@@ -1042,15 +1042,18 @@ class World:
         self.accepted = len(report.result.accepted_dts)
         self.rejected = int(report.result.rejected_attempts)
 
+    def all_positions(self):
+        """Every node's position in world order (core, then shell): one read-back."""
+        return np.asarray(self.state.spring_position.numpy(), np.float32).reshape(-1, 3)
+
     def positions(self):
-        # ``tolist`` is the read-back every backend answers, a CUDA tensor included
-        p = np.asarray(self.state.spring_position.tolist(), np.float32).reshape(-1, 3)
+        p = self.all_positions()
         return p[self.n_core:], p[:self.n_core]
 
     def glow(self):
         """Per node (core then shell): border strength 0..1 and size boost 0..1 from the spring state."""
-        alpha = np.asarray(self.state.spring_glow_alpha.tolist(), np.float32).reshape(-1)
-        radius = np.asarray(self.state.spring_glow_radius.tolist(), np.float32).reshape(-1)
+        alpha = np.asarray(self.state.spring_glow_alpha.numpy(), np.float32).reshape(-1)
+        radius = np.asarray(self.state.spring_glow_radius.numpy(), np.float32).reshape(-1)
         return np.clip(alpha, 0, 1), np.clip(radius, 0, 1)
 
     def backend_name(self):
