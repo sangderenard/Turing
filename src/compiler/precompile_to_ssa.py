@@ -67,6 +67,7 @@ from .concordance_declarations import (
     LOOP_CARRIED_ENTRY,
     LOOP_ENTRY_STATE,
     LOOP_RESULT_PORT_BINDING,
+    LOOP_RESULT_RECONCILIATION,
     LOOP_RESULT_VERSION,
     NAME_ARM_VERSION_MISSING,
     NAME_BINDING,
@@ -85,6 +86,7 @@ from .concordance_declarations import (
     RETURN_SLOT_UNRESOLVED_ON_EDGE,
     ROW_COLUMN_PROJECTION,
     SCALAR_ITEM_MERGE,
+    SCALAR_PARAMETER,
     SEQUENCE_LENGTH_CELL,
     SSA_FIELD_VERSION,
     SSA_VALUE,
@@ -943,6 +945,111 @@ def resolve_sequence_schemas(
     return resolved, tuple(shortfalls)
 
 
+def _post_derived_or_raw(
+    book: Any, page: Any, row: tuple, fact: Any, sources: Any,
+    *, stage: Any, mode: Any,
+) -> Any:
+    """Post ``fact`` DERIVED from ``sources`` when any exist; otherwise write
+    it through the raw primitive, which the book tags ``Unsourced`` itself.
+
+    For module-level writers (the region assembly, the reconciliation pass)
+    that have no function root to fall back on: a write that can name no
+    cell stays visible on the unsourced worklist rather than inventing one.
+    """
+
+    cells = tuple(cell for cell in (sources or ()) if isinstance(cell, Ref))
+    if cells:
+        return book.post(
+            page, row, fact, stage=stage, provenance=Derived(cells), mode=mode,
+        )
+    stored = book.page(page)
+    if mode is Mode.CONCORD:
+        stored.concord(row, fact)
+    else:
+        stored.revise(row, fact)
+    return book.latest_ref(page, row)
+
+
+def _post_region_signature(
+    book: Any, scope: Any, lexical_read_scope: Any, region_index: int,
+    signature: tuple,
+) -> Any:
+    """``region_signature`` row ``(function scope, region)``: CONCORD
+    DERIVED(the ``deployment_region`` cell when the planner posted one, else
+    the canonical cells of the region's feeds and outputs -- plan 80 B7's
+    fallback, re-derived when the planner's cell lands)."""
+
+    feeds, outputs = signature
+    fact = RegionSignature(tuple(map(int, feeds)), tuple(map(int, outputs)))
+    row = (scope, int(region_index))
+    existing = book.latest_ref(REGION_SIGNATURE, row)
+    if existing is not None and (
+        book.pages[REGION_SIGNATURE.name].cells.get((row, existing.column))
+        == fact
+    ):
+        return existing
+    sources: list = []
+    if lexical_read_scope is not None:
+        for value_id in (*feeds, *outputs):
+            cell = book.latest_ref(
+                CANONICAL_VALUE, (tuple(lexical_read_scope), int(value_id)),
+            )
+            if cell is not None and cell not in sources:
+                sources.append(cell)
+    return _post_derived_or_raw(
+        book, REGION_SIGNATURE, row, fact, tuple(sources),
+        stage=CONTROL_SSA_REGION, mode=Mode.CONCORD,
+    )
+
+
+def _function_root_cell(book: Any, scope: Any) -> Ref:
+    """The function-root ``cell_set`` row ``(scope, 0)`` of a lowering, posted
+    NOVEL(CONTROL_FUNCTION_ROOT) on first need (the same row the builder's
+    ``_function_root`` posts, so a module-level minter shares it)."""
+
+    existing = book.latest_ref(CELL_SET, (scope, 0))
+    if existing is not None:
+        return existing
+    return book.post(
+        CELL_SET, (scope, 0), (),
+        stage=CONTROL_SSA_ENTRY,
+        provenance=Novel(CONTROL_FUNCTION_ROOT, ()),
+        mode=Mode.CONCORD,
+    )
+
+
+def _mint_ssa_id(
+    book: Any, scope: Any, transform: Any, operands: Any, *,
+    dtype: Any = None, shape: tuple = (), stage: Any,
+) -> int:
+    """Mint one SSA id through the book from outside a builder: a NOVEL
+    ``ssa_value`` row on ``(scope, NEW)`` whose operand is the one cell in
+    ``operands`` (several become a ``cell_set`` row; none is refused, since
+    a module-level minter has no function root)."""
+
+    cells = tuple(dict.fromkeys(
+        cell for cell in (operands or ()) if isinstance(cell, Ref)
+    ))
+    if len(cells) == 1:
+        operand = cells[0]
+    elif cells:
+        ordinal = book.page(CELL_SET).scope_row_count(scope) + 1
+        operand = book.post(
+            CELL_SET, (scope, ordinal), tuple(cell.key for cell in cells),
+            stage=stage, provenance=Derived(cells), mode=Mode.CONCORD,
+        )
+    else:
+        raise ConcordanceRefusal(
+            f"mint under {scope!r} names no operand cell for {transform.name}"
+        )
+    ref = book.post(
+        SSA_VALUE, (scope, NEW),
+        SSAValueFact(dtype, tuple(shape), SSAValueOrigin.MINTED),
+        stage=stage, provenance=Novel(transform, (operand,)), mode=Mode.REVISE,
+    )
+    return int(ref.row[1])
+
+
 def _control_expression_mapping(
     expression: ControlExpression | None,
 ) -> dict[str, object] | None:
@@ -1027,6 +1134,15 @@ class _ControlSSABuilder:
         )
 
         self.program = program
+        #: ssa id -> the SSAValue object the book's ``ssa_value`` row names
+        #: (plan 80 B2.1): the one private structure the builder keeps,
+        #: because emitted instructions hold the objects and mutate them.
+        self.ssa_value_objects: dict[int, SSAValue] = {}
+        #: The function-root ``cell_set`` cell, posted on first need.
+        self._root_cell: Ref | None = None
+        #: The stage posts are made under until a construct's lowering
+        #: sets its own (conditional, loop, region, finish).
+        self.active_stage: Any = CONTROL_SSA_ENTRY
         self.evolution = active_evolution_metagraph()
         self.control_evolution = record_control_program_evolution(program)
         self.ssa_evolution = (
@@ -1071,6 +1187,17 @@ class _ControlSSABuilder:
         # the resolved planning-concordance snapshot immutable for identity
         # and shape decisions that must survive those lexical rewrites.
         self.concorded_value_aliases = dict(self.value_aliases)
+        # PLANNING aliases: one ``control_value_alias`` row per resolved
+        # planning alias, DERIVED(the ``control_value_concordance`` cell that
+        # resolved it, else the canonical cells of alias and source).
+        for alias, source in self.value_aliases.items():
+            self._post_alias(
+                alias, source, AliasKind.PLANNING,
+                self._book().latest_ref(
+                    CONTROL_VALUE_CONCORDANCE, (str(function_name), int(alias)),
+                ),
+                stage=CONTROL_SSA_ENTRY,
+            )
         self.inout_value_ids = set(map(int, inout_value_ids))
         # Authored literals the control function owns; a use before any
         # region published them is materialized by
@@ -1198,15 +1325,6 @@ class _ControlSSABuilder:
                     super().__setitem__(key, value)
 
             self.external_values = _TracedExternals()
-        #: ssa id -> the SSAValue object the book's ``ssa_value`` row names
-        #: (plan 80 B2.1): the one private structure the builder keeps,
-        #: because emitted instructions hold the objects and mutate them.
-        self.ssa_value_objects: dict[int, SSAValue] = {}
-        #: The function-root ``cell_set`` cell, posted on first need.
-        self._root_cell: Ref | None = None
-        #: The stage posts are made under until a construct's lowering
-        #: sets its own (conditional, loop, region, finish).
-        self.active_stage: Any = CONTROL_SSA_ENTRY
         self.declared_parameter_only_ids: set[int] = set()
         self.validation_contracts: list[dict[str, object]] = []
         self.control_identity_receipts: list[tuple[int, int, str]] = []
@@ -10411,7 +10529,104 @@ class _ControlSSABuilder:
             self.branch(merge)
         self.current = merge
 
+    def _finish_pages(
+        self,
+        named_returns: tuple,
+        parameter_value_names: tuple,
+        returned: tuple,
+    ) -> dict[str, Any]:
+        """Post ``function_parameter`` / ``function_output`` and materialize
+        the metadata tuples from the pages (plan 80 B2.6).
+
+        ``parameter_names`` and ``named_outputs`` are read back from the rows
+        just posted; ``carried_port_values`` and ``value_aliases`` from the
+        ``carried_port_value`` and ``control_value_alias`` pages.  Each is
+        checked against the value the builder computed and the computed
+        value is kept when a page cannot reproduce it (a duplicate returned
+        id, a port whose object the table lost), so the metadata the 18
+        readers consume stays byte-identical to today.
+        """
+
+        book = self._book()
+        scope = self._scope()
+        # -- function_parameter: DERIVED(declared_parameter USED, the
+        #    argument's ssa_value cell, its binding cell).
+        for name, value_id in parameter_value_names:
+            declared = self._declare_parameter(value_id, ParameterDeclaration.USED)
+            argument = self.ssa_value_objects.get(int(value_id))
+            self._post_concord(
+                FUNCTION_PARAMETER, (scope, str(name)), int(value_id),
+                declared, self._binding_cell(value_id), argument,
+                stage=CONTROL_SSA_FINISH,
+            )
+        page = book.pages.get(FUNCTION_PARAMETER.name)
+        parameter_names = tuple(
+            (str(row[1]), int(page.latest(row)))
+            for row in (() if page is None else page.scope_rows(scope))
+            if page.latest(row) is not None
+        )
+        if parameter_names != tuple(parameter_value_names):
+            parameter_names = tuple(parameter_value_names)
+        # -- function_output: slot -> (name or None, ssa id), DERIVED(the
+        #    slot value's cell (the merge Phi or the single edge's value)).
+        pending_names = list(named_returns)
+        for slot, value in enumerate(returned):
+            name = next(
+                (
+                    candidate for candidate, value_id in pending_names
+                    if int(value_id) == int(value.id)
+                ),
+                None,
+            )
+            if name is not None:
+                pending_names.remove((name, next(
+                    value_id for candidate, value_id in pending_names
+                    if candidate == name and int(value_id) == int(value.id)
+                )))
+            self._post_concord(
+                FUNCTION_OUTPUT, (scope, int(slot)), (name, int(value.id)),
+                value, self._binding_cell(value.id), stage=CONTROL_SSA_FINISH,
+            )
+        page = book.pages.get(FUNCTION_OUTPUT.name)
+        named_outputs = tuple(
+            (str(fact[0]), int(fact[1]))
+            for row in (() if page is None else page.scope_rows(scope))
+            for fact in (page.latest(row),)
+            if fact is not None and fact[0] is not None
+        )
+        if named_outputs != tuple(named_returns):
+            named_outputs = tuple(named_returns)
+        # -- carried_port_values: port -> the Phi object the page's cell names.
+        legacy_ports = dict(getattr(self, "_carried_port_values", {}) or {})
+        page = book.pages.get(CARRIED_PORT_VALUE.name)
+        carried_port_values: dict[int, SSAValue] = {}
+        for row in (() if page is None else page.scope_rows(scope)):
+            fact = page.latest(row)
+            if not isinstance(fact, Ref):
+                continue
+            port = self.ssa_value_objects.get(int(fact.row[1]))
+            if port is not None:
+                carried_port_values[int(row[1])] = port
+        if carried_port_values != legacy_ports:
+            carried_port_values = legacy_ports
+        # -- value_aliases: alias -> source, the latest alias rows.
+        page = book.pages.get(CONTROL_VALUE_ALIAS.name)
+        value_aliases: dict[int, int] = {}
+        for row in (() if page is None else page.scope_rows(scope)):
+            fact = page.latest(row)
+            if isinstance(fact, AliasFact) and fact.source_id is not None:
+                value_aliases[int(row[1])] = int(fact.source_id)
+        if value_aliases != dict(self.value_aliases):
+            value_aliases = dict(self.value_aliases)
+        return {
+            "parameter_names": parameter_names,
+            "named_outputs": named_outputs,
+            "carried_port_values": carried_port_values,
+            "value_aliases": value_aliases,
+        }
+
     def finish(self) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
+        self.active_stage = CONTROL_SSA_FINISH
         returned = []
         named_returns = []
         returned_ids = set()
@@ -10688,7 +10903,9 @@ class _ControlSSABuilder:
                         # An unresolved slot on this return: keep the Phi
                         # arity honest with an explicit absence and record
                         # the shortfall rather than silently dropping the edge.
-                        value = self.fresh_value(dtype="none")
+                        value = self.fresh_value(
+                            dtype="none", transform=CONTROL_CONST,
+                        )
                         self.current = block
                         # Insert before the block's terminator.
                         terminator = block.instrs.pop()
@@ -10711,7 +10928,10 @@ class _ControlSSABuilder:
                 if len(edges) == 1:
                     merged = incoming_values[0]
                 else:
-                    merged = self.fresh_value(dtype=dtype)
+                    merged = self.fresh_value(
+                        dtype=dtype, transform=PHI_RETURN_MERGE,
+                        operands=tuple(incoming_values),
+                    )
                     self.emit(
                         Handler.Phi,
                         incoming_values,
@@ -10736,24 +10956,25 @@ class _ControlSSABuilder:
             self.emit(Handler.Ret, returned)
         elif fallthrough_open:
             self.emit(Handler.Ret, returned)
+        page_metadata = self._finish_pages(
+            tuple(named_returns), tuple(parameter_value_names), tuple(returned),
+        )
         function = Function(
                 self.function_name,
                 self.arguments,
                 self.blocks,
                 metadata={
                     "recursion_table": dict(self.ssa_recursion_table),
-                    "named_outputs": tuple(named_returns),
+                    "named_outputs": page_metadata["named_outputs"],
                     # port id -> the carried phi VALUE standing at that
                     # port after the loops.  The record-return expansion
                     # resolves layout components by id, and a component
                     # whose id doubles as a written field slot must resolve
                     # to the phi, not the unwritten slot argument.
-                    "carried_port_values": dict(
-                        getattr(self, "_carried_port_values", {}) or {}
-                    ),
-                    "value_aliases": dict(self.value_aliases),
+                    "carried_port_values": page_metadata["carried_port_values"],
+                    "value_aliases": page_metadata["value_aliases"],
                     "value_names": tuple(value_names),
-                    "parameter_names": parameter_value_names,
+                    "parameter_names": page_metadata["parameter_names"],
                     "validation_contracts": tuple(self.validation_contracts),
                     "control_identity_receipts": tuple(dict.fromkeys(
                         self.control_identity_receipts
@@ -11006,12 +11227,15 @@ def _canonicalize_non_dominating_loop_result_uses(
                             )
                             if cell is not None
                         )
-                        book.post(LOOP_RESULT_RECONCILIATION, row, (
-                            outcome,
-                            f"{block_name}#{instruction_index}",
-                            str(instruction.op),
-                            detail,
-                        ))
+                        _post_derived_or_raw(
+                            book, LOOP_RESULT_RECONCILIATION, row, (
+                                outcome,
+                                f"{block_name}#{instruction_index}",
+                                str(instruction.op),
+                                detail,
+                            ),
+                            sources, stage=CONTROL_SSA_FINISH, mode=Mode.REVISE,
+                        )
                     except Exception:
                         pass
 
@@ -11313,17 +11537,41 @@ def lower_class_navigation_to_ssa(
         "permission_bits": permission_bits,
     }
 
+    from .identity_concordance import current_identity_book as _navigation_book
+
     class Builder:
         def __init__(self, name: str, dtypes: tuple[str, ...]):
             self.name = name
+            # Every value of a navigation function is minted through the
+            # book under the function's own scope: formals from the function
+            # root, results from their operands' cells.
+            self.book = _navigation_book()
+            self.scope = str(name)
+            self.root = _function_root_cell(self.book, self.scope)
             self.args = [
-                SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=dtype)
+                SSAValue(self._mint(CONTROL_EXPRESSION, (), dtype), dtype=dtype)
                 for dtype in dtypes
             ]
             self.instructions: list[Instr] = []
 
+        def _mint(self, transform: Any, args: Any, dtype: str) -> int:
+            operands = tuple(
+                cell for cell in (
+                    self.book.latest_ref(SSA_VALUE, (self.scope, int(value.id)))
+                    for value in args
+                )
+                if cell is not None
+            ) or (self.root,)
+            return _mint_ssa_id(
+                self.book, self.scope, transform, operands,
+                dtype=dtype, stage=CONTROL_SSA_ENTRY,
+            )
+
         def emit(self, operation: Handler, args=(), *, dtype="i32", **attributes):
-            result = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=dtype)
+            result = SSAValue(self._mint(
+                CONTROL_CONST if operation is Handler.Const else CONTROL_EXPRESSION,
+                args, dtype,
+            ), dtype=dtype)
             self.instructions.append(Instr(
                 operation.value, list(args), result, attributes=attributes,
             ))
@@ -11600,8 +11848,29 @@ def _inject_field_slot_access(
     # dodge those too or it collides with a load result.
     existing_ids.update(int(value_id) for _kind, value_id, _slot in field_ops)
     existing_ids.update(int(value_id) for value_id in output_value_ids)
+    # Field-slot cells are FIELD_SLOT_ACCESS mints on the control function's
+    # scope, from the receiver's ``ssa_value`` cell (its parameter seed) or
+    # the function root when the receiver has no row.
+    from .identity_concordance import current_identity_book as _slot_book
+
+    _slot_scope = str(
+        control_function.metadata.get("tensor_shape_concordance_scope")
+        or control_function.name
+    )
+    _receiver_cell = _slot_book().latest_ref(
+        SSA_VALUE, (_slot_scope, int(self_value_id)),
+    )
+
     def fresh() -> int:
-        return GLOBAL_MONOTONIC_IDS.mint()
+        book = _slot_book()
+        operand = (
+            _receiver_cell if _receiver_cell is not None
+            else _function_root_cell(book, _slot_scope)
+        )
+        return _mint_ssa_id(
+            book, _slot_scope, FIELD_SLOT_ACCESS, (operand,),
+            dtype=dtype, stage=CONTROL_SSA_FINISH,
+        )
 
     # A receiver is physically a set of typed columns.  The traditional one
     # arena form is the degenerate (and fastest) one-column case.  Slots keep a
@@ -13148,7 +13417,7 @@ def _concord_region_feed_consumers(
         return
     from .identity_concordance import current_identity_book
 
-    page = current_identity_book().page("region_feed_consumer")
+    book = current_identity_book()
     feed_ids = set(map(int, feeds))
     consumers: dict[int, list[int]] = {}
     for instruction in instructions:
@@ -13159,10 +13428,32 @@ def _concord_region_feed_consumers(
                 consumers.setdefault(int(argument.id), []).append(
                     int(instruction.res.id)
                 )
+    scope = tuple(lexical_read_scope)
     for feed, nodes in consumers.items():
-        page.concord(
+        # DERIVED(the ``consumer_operand`` cells when the planner declared
+        # them, else the consumers' and the feed's canonical cells).
+        sources = []
+        for node in dict.fromkeys(nodes):
+            for cell in (
+                (
+                    book.latest_ref(
+                        book.registry.pages["consumer_operand"],
+                        (scope, int(node), int(feed)),
+                    )
+                    if "consumer_operand" in book.registry.pages else None
+                ),
+                book.latest_ref(CANONICAL_VALUE, (scope, int(node))),
+            ):
+                if cell is not None and cell not in sources:
+                    sources.append(cell)
+        feed_cell = book.latest_ref(CANONICAL_VALUE, (scope, int(feed)))
+        if feed_cell is not None and feed_cell not in sources:
+            sources.append(feed_cell)
+        _post_derived_or_raw(
+            book, REGION_FEED_CONSUMER,
             (str(control_scope), int(region_index), feed),
-            tuple(dict.fromkeys(nodes)),
+            tuple(dict.fromkeys(nodes)), tuple(sources),
+            stage=CONTROL_SSA_REGION, mode=Mode.CONCORD,
         )
 
 
@@ -13226,8 +13517,8 @@ def _split_region_captures_by_binding(
             slots.setdefault(int(argument.id), []).append(
                 (instruction, index, binding)
             )
-    split_page = book.page("region_capture_binding")
     expanded: list[int] = []
+    scope = tuple(lexical_read_scope)
     for value_id in map(int, captures):
         expanded.append(value_id)
         reads = slots.get(value_id)
@@ -13240,12 +13531,52 @@ def _split_region_captures_by_binding(
             or not set(bindings) & carried_initials[value_id]
         ):
             continue
-        split_page.concord(
+        source_cell = book.latest_ref(CANONICAL_VALUE, (scope, value_id))
+
+        def read_cells(binding: Any) -> tuple:
+            """The ``lexical_read_binding`` cells of the slots that read
+            ``binding``."""
+
+            found = []
+            for instruction, index, read in reads:
+                if read != binding:
+                    continue
+                roles = list(getattr(instruction, "arg_roles", ()) or ())
+                positions = list(_operand_positions(
+                    zip(instruction.args, roles)
+                ))
+                role, ordinal, _argument = positions[index]
+                cell = book.latest_ref(
+                    LEXICAL_READ_BINDING,
+                    (scope, int(instruction.res.id), role, ordinal),
+                )
+                if cell is not None and cell not in found:
+                    found.append(cell)
+            return tuple(found)
+
+        # DERIVED(the ``lexical_read_binding`` cells of the first binding's
+        # slots, the source's canonical cell).
+        _post_derived_or_raw(
+            book, REGION_CAPTURE_BINDING,
             (str(control_scope), int(region_index), value_id),
             (value_id, str(bindings[0])),
+            (*read_cells(bindings[0]), source_cell),
+            stage=CONTROL_SSA_REGION, mode=Mode.CONCORD,
         )
         for binding in bindings[1:]:
-            formal_id = int(GLOBAL_MONOTONIC_IDS.mint())
+            binding_cells = read_cells(binding)
+            # The split formal is a NOVEL mint: REGION_FORMAL_SPLIT from the
+            # binding's read cells and the source's canonical cell.
+            source_value = next(
+                instruction.args[index]
+                for instruction, index, read in reads if read == binding
+            )
+            formal_id = _mint_ssa_id(
+                book, str(control_scope), REGION_FORMAL_SPLIT,
+                (*binding_cells, source_cell),
+                dtype=source_value.dtype, shape=tuple(source_value.shape or ()),
+                stage=CONTROL_SSA_REGION,
+            )
             for instruction, index, read in reads:
                 if read != binding:
                     continue
@@ -13256,9 +13587,15 @@ def _split_region_captures_by_binding(
                     shape=source.shape,
                     device=getattr(source, "device", None),
                 )
-            split_page.concord(
+            _post_derived_or_raw(
+                book, REGION_CAPTURE_BINDING,
                 (str(control_scope), int(region_index), formal_id),
                 (value_id, str(binding)),
+                (
+                    *binding_cells, source_cell,
+                    book.latest_ref(SSA_VALUE, (str(control_scope), formal_id)),
+                ),
+                stage=CONTROL_SSA_REGION, mode=Mode.CONCORD,
             )
             expanded.append(formal_id)
     return tuple(expanded)
@@ -13916,8 +14253,14 @@ def lower_control_sections_to_ssa(
     # assembled.  Its authored value ids repeat, while the physical metadata
     # ids minted by each lowering do not.  Scope tensor rows to this exact
     # control instance so one lowering cannot read another's shape address.
+    # The scope is numbered by the book (``scope_registry``), so each
+    # lowering of one method owns distinct rows and the rows carry no
+    # process object id (census 75, section 8).
+    _control_label, _control_serial = current_identity_book().mint_scope(
+        f"control:{control_name}"
+    )
     tensor_shape_concordance_scope = (
-        f"{control_name}@control:{id(control):x}"
+        f"{control_name}@control:{_control_serial}"
     )
     # Row ``(control scope, value id)`` -> the dtype the control program
     # declares for a uniform it reads (loop-bound leaves are ints).  One
@@ -13928,10 +14271,31 @@ def lower_control_sections_to_ssa(
     # Row ``(control scope, value id)`` -> the scalar dtype the producing
     # region computes for that value.
     region_dtype_page = _book().page("region_value_dtype")
+
+    def _graph_cell(value_id: Any) -> Any:
+        """The ``canonical_value`` cell of a graph id in this function."""
+
+        if lexical_read_scope is None or value_id is None:
+            return None
+        return _book().latest_ref(
+            CANONICAL_VALUE, (tuple(lexical_read_scope), int(value_id)),
+        )
+
     for uniform in getattr(control, "uniforms", ()) or ():
-        uniform_dtype_page.concord(
+        # DERIVED(the uniform's declaration cell: its ``scalar_parameter``
+        # row when declared, else its canonical cell).
+        _post_derived_or_raw(
+            _book(), CONTROL_UNIFORM_DTYPE,
             (str(tensor_shape_concordance_scope), int(uniform.value_id)),
             str(uniform.dtype),
+            (
+                _book().latest_ref(
+                    SCALAR_PARAMETER,
+                    (str(control_name), int(uniform.value_id)),
+                ),
+                _graph_cell(uniform.value_id),
+            ),
+            stage=CONTROL_SSA_ENTRY, mode=Mode.CONCORD,
         )
     # ``np.asarray`` reaches the plan as canonical ``tensor``.  When its
     # requested dtype already equals the operand dtype it is a view of the
@@ -14005,8 +14369,13 @@ def lower_control_sections_to_ssa(
                 (control_name, int(alias_id))
             )
             if incumbent is None:
-                control_value_concordance.bind_alias(
-                    control_name, int(alias_id), int(resident_id)
+                # DERIVED(alias node's and resident's canonical cells); the
+                # planning alias row that joined them is the planner's page.
+                _post_derived_or_raw(
+                    _book(), CONTROL_VALUE_CONCORDANCE,
+                    (control_name, int(alias_id)), int(resident_id),
+                    (_graph_cell(alias_id), _graph_cell(resident_id)),
+                    stage=CONTROL_SSA_ENTRY, mode=Mode.REVISE,
                 )
             elif control_value_concordance.resolve_alias(
                 control_name, int(alias_id)
@@ -15258,7 +15627,17 @@ def lower_control_sections_to_ssa(
                     continue
                 row = (str(tensor_shape_concordance_scope), int(result.id))
                 if region_dtype_page.latest(row) != str(result.dtype):
-                    region_dtype_page.revise(row, str(result.dtype))
+                    # REVISE DERIVED(the value's canonical cell, the
+                    # incumbent dtype cell): a later region's different
+                    # dtype is a retype the audit sees.
+                    _post_derived_or_raw(
+                        _book(), REGION_VALUE_DTYPE, row, str(result.dtype),
+                        (
+                            _book().latest_ref(REGION_VALUE_DTYPE, row),
+                            _graph_cell(result.id),
+                        ),
+                        stage=CONTROL_SSA_REGION, mode=Mode.REVISE,
+                    )
             effective_captures = _split_region_captures_by_binding(
                 lexical_read_scope, tensor_shape_concordance_scope,
                 region_index, instructions, effective_captures,
@@ -15318,6 +15697,10 @@ def lower_control_sections_to_ssa(
             region_signatures[region_index] = (
                 tuple(int(vid) for vid in effective_captures),
                 outputs,
+            )
+            _post_region_signature(
+                _book(), str(tensor_shape_concordance_scope), lexical_read_scope,
+                region_index, region_signatures[region_index],
             )
             _concord_region_feed_consumers(
                 lexical_read_scope, tensor_shape_concordance_scope,
@@ -15608,10 +15991,19 @@ def lower_control_sections_to_ssa(
                             ) or 0),
                         ),
                     }
-                tensor_shape_concordance.set(
-                    (tensor_shape_concordance_scope, value_id),
-                    max(tensor_shape_concordance.columns, default=-1) + 1,
-                    committed,
+                # REVISE DERIVED(the incumbent contract cell when merged
+                # over one, the value's canonical cell).
+                _post_derived_or_raw(
+                    _book(), TENSOR_SHAPE_CONCORDANCE,
+                    (tensor_shape_concordance_scope, value_id), committed,
+                    (
+                        _book().latest_ref(
+                            TENSOR_SHAPE_CONCORDANCE,
+                            (tensor_shape_concordance_scope, value_id),
+                        ),
+                        _graph_cell(value_id),
+                    ),
+                    stage=CONTROL_SSA_REGION, mode=Mode.REVISE,
                 )
     control = place_loop_carried_region_producers(
         control,
@@ -15653,9 +16045,9 @@ def lower_control_sections_to_ssa(
                 )
                 if rank <= 0:
                     continue
-                tensor_shape_concordance.set(
+                _post_derived_or_raw(
+                    _book(), TENSOR_SHAPE_CONCORDANCE,
                     (tensor_shape_concordance_scope, value_id),
-                    max(tensor_shape_concordance.columns, default=-1) + 1,
                     {
                         "program_abi_storage": "span",
                         "program_abi_rank": int(rank),
@@ -15665,6 +16057,14 @@ def lower_control_sections_to_ssa(
                         "tensor_element_count_value_id": None,
                         "source": "planned-region-rank",
                     },
+                    (
+                        _book().latest_ref(
+                            TENSOR_SHAPE_CONCORDANCE,
+                            (tensor_shape_concordance_scope, value_id),
+                        ),
+                        _graph_cell(value_id),
+                    ),
+                    stage=CONTROL_SSA_REGION, mode=Mode.REVISE,
                 )
                 region_value_ranks[value_id] = max(
                     int(rank), region_value_ranks.get(value_id, 0)
@@ -16444,6 +16844,14 @@ def lower_precompile_and_control_to_ssa(
     region_feed_meta: dict[int, tuple[Meta, ...]] = {}
     region_value_meta: dict[int, Meta] = {}
     region_shortfalls: list[SSALoweringShortfall] = []
+    # The control scope of this lowering, numbered by the book, so the
+    # region signatures below and the builder's own rows share one scope.
+    from .identity_concordance import current_identity_book as _fused_book
+
+    _fused_label, _fused_serial = _fused_book().mint_scope(
+        f"control:{control_name}"
+    )
+    fused_control_scope = f"{control_name}@control:{_fused_serial}"
     for region_index, region_artifact in sorted(
         (region_programs or {}).items()
     ):
@@ -16465,6 +16873,10 @@ def lower_precompile_and_control_to_ssa(
                 int(value_id)
                 for value_id in region_program.outputs.values()
             ),
+        )
+        _post_region_signature(
+            _fused_book(), fused_control_scope, None,
+            int(region_index), region_signatures[int(region_index)],
         )
         region_feed_meta[int(region_index)] = tuple(
             region_program.meta[int(value_id)]
@@ -16524,6 +16936,10 @@ def lower_precompile_and_control_to_ssa(
             region_signatures[region_index] = (
                 tuple(int(value_id) for value_id in region.captures),
                 outputs,
+            )
+            _post_region_signature(
+                _fused_book(), fused_control_scope, None,
+                int(region_index), region_signatures[region_index],
             )
             shape_by_id = {
                 int(value_id): Meta(tuple(map(int, shape)), str(dtype))

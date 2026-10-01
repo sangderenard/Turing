@@ -2345,20 +2345,64 @@ def _set_operands(
         source == target for source, target in moves.items()
     ):
         return
+    from ...compiler.concordance_declarations import (
+        IDENTITY_TRANSITION, LEXICAL_READ_BINDING, OPERAND_FORK, OPERAND_MOVE,
+        OPERAND_POSITION, OPERAND_RETIRE, OperandFork, OperandMove,
+        OperandRetire,
+    )
+    from ...compiler.identity_concordance import (
+        Derived as _Derived, Mode as _Mode, Novel as _Novel,
+        Unresolved as _Unresolved,
+    )
+
     cause = cause.name if isinstance(cause, _Transform) else str(cause)
     book = current_identity_book()
-    transition_page = book.page("identity_transition")
+    transition_page = book.page(IDENTITY_TRANSITION)
+    read_page = book.page(LEXICAL_READ_BINDING)
+    consumer_cell = node_identity_cell(graph, node_id)
+
+    def position_cell(consumer: Any, role: Any, ordinal: Any) -> Any:
+        """The cell that records an operand position: its latest
+        ``identity_transition`` cell, else its ``lexical_read_binding``
+        cell, else the consumer node's identity cell."""
+
+        for page in (IDENTITY_TRANSITION, LEXICAL_READ_BINDING):
+            cell = book.latest_ref(page, (scope, consumer, role, ordinal))
+            if cell is not None:
+                return cell
+        return consumer_cell
+
+    def post_transition(row: tuple, fact: Any, transform: Any, operand: Any) -> Any:
+        """One operator on ``identity_transition``: NOVEL(transform,
+        (operand cell,)) on a row with no NEW -- the origin edge names what
+        the position was moved, retired or forked from (plan 70, section 3;
+        plan 80 B1.3)."""
+
+        return book.post(
+            IDENTITY_TRANSITION, row, fact,
+            stage=OPERAND_POSITION,
+            provenance=_Novel(transform, (operand,)),
+            mode=_Mode.REVISE,
+        )
+
+    transitions: dict[tuple, Any] = {}
     for (role, ordinal), target in moves.items():
         if target == (role, ordinal):
             continue
-        transition_page.revise(
-            (scope, node_id, role, ordinal),
-            ("retire", None, None, None, cause) if target is None
-            else ("move", node_id, *target, cause),
-        )
+        row = (scope, node_id, role, ordinal)
+        operand = position_cell(node_id, role, ordinal)
+        if target is None:
+            transitions[(role, ordinal)] = post_transition(
+                row, OperandRetire(cause), OPERAND_RETIRE, operand,
+            )
+        else:
+            transitions[(role, ordinal)] = post_transition(
+                row, OperandMove(cause, node_id, *target), OPERAND_MOVE, operand,
+            )
     for (role, ordinal), source in forks.items():
-        transition_page.revise(
-            (scope, node_id, role, ordinal), ("fork", *source, cause),
+        transitions[(role, ordinal)] = post_transition(
+            (scope, node_id, role, ordinal), OperandFork(cause, *source),
+            OPERAND_FORK, position_cell(*source),
         )
     for name in _OPERAND_POSITION_ROW_PAGES:
         page = book.page(name)
@@ -2377,10 +2421,35 @@ def _set_operands(
                 arriving[target] = fact
         for source, fact in facts.items():
             if fact is not None and source not in arriving:
+                # The vacated position: a None revision, as today.  The
+                # declared page holds ``str`` facts, so the withdrawal stays
+                # a raw (tagged) write until readers admit ``Unresolved``.
                 page.revise((scope, node_id, *source), None)
         for target, fact in arriving.items():
             if page.latest((scope, node_id, *target)) != fact:
-                page.revise((scope, node_id, *target), fact)
+                if isinstance(fact, _Unresolved) or not isinstance(fact, str):
+                    page.revise((scope, node_id, *target), fact)
+                    continue
+                # The follow-up names the transition that caused it: the
+                # arriving fact derives from the position's transition cell
+                # (the move's source position, or the fork's target).
+                cause_cell = next(
+                    (
+                        transitions[source]
+                        for source, moved_to in moves.items()
+                        if moved_to == target and source in transitions
+                    ),
+                    transitions.get(target),
+                )
+                if cause_cell is None:
+                    page.revise((scope, node_id, *target), fact)
+                    continue
+                book.post(
+                    LEXICAL_READ_BINDING, (scope, node_id, *target), fact,
+                    stage=OPERAND_POSITION,
+                    provenance=_Derived((cause_cell,)),
+                    mode=_Mode.REVISE,
+                )
     for name in _OPERAND_POSITION_FACT_PAGES:
         page = book.page(name)
         for _role, _ordinal, parent in old:
