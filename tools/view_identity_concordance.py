@@ -749,72 +749,132 @@ def node_colors(graph, mode: int, degree: np.ndarray, isolate: int) -> np.ndarra
 # -- time field and integrator -----------------------------------------------
 
 class TimeField:
-    """The smoothed occurrence-time map over the plan, and its gradient.
+    """The smoothed occurrence-time map over the sphere, and its gradient, as
+    AbstractTensor on the world's device.
 
-    Every point splats its own construction time onto a grid; a Gaussian blur
-    of (time x count) over a blur of count is the time a point *here* would
-    be expected to have.  Coordinates are ``u`` in [0, 1]^2 = (longitude,
-    equal-area height).  Longitude is periodic; the poles are the two ends of
-    the v axis, handled by blurring over the grid mirrored at both ends, so the
-    smoothing, gradients and integrator see a sphere with no seam and no edge.
+    Every node splats its own construction time onto a grid (a summing
+    scatter); a Gaussian blur of (time x count) over a blur of count is the
+    time a node *here* would be expected to have.  Coordinates are ``u`` in
+    [0, 1]^2 = (longitude, equal-area height).  Longitude is periodic; the
+    poles are the two ends of the v axis, handled by blurring over the grid
+    mirrored at both ends, so the smoothing and gradients see a sphere with
+    no seam and no edge.  The kernels, index tensors and node times are made
+    once; a frame is scatter, four FFT blurs, two gradients and gathers.
     """
 
-    def __init__(self, res=192, sigma=0.09, sigma_repel=0.035, sigma_far=0.05):
-        self.res = res
+    def __init__(self, t, res=192, sigma=0.09, sigma_far=0.05):
+        from src.common.tensors.abstraction import AbstractTensor as AT
+        self.AT, self.res = AT, res
         f = np.fft.fftfreq(2 * res)[:, None] ** 2 + np.fft.rfftfreq(res)[None, :] ** 2   # v mirrored: 2*res rows
-        self._blur_time = np.exp(-2 * math.pi ** 2 * (sigma * res) ** 2 * f)
-        self._blur_repel = np.exp(-2 * math.pi ** 2 * (sigma_repel * res) ** 2 * f)
-        self._blur_far = np.exp(-2 * math.pi ** 2 * (sigma_far * res) ** 2 * f)
-        self.time = np.zeros((res, res), np.float32)       # T[z, x]
-        self.density = np.zeros((res, res), np.float32)
-        self.grad_time = np.zeros((2, res, res), np.float32)   # d/du (x, z)
-        self.grad_repel = np.zeros((2, res, res), np.float32)
-        self.confidence = np.zeros((res, res), np.float32)
-        self.time_far = np.zeros((res, res), np.float32)       # the same map, blurred again for the far side
-        self.density_far = np.zeros((res, res), np.float32)
+        self._blur_time = AT.tensor(np.exp(-2 * math.pi ** 2 * (sigma * res) ** 2 * f).astype(np.float32))
+        self._blur_far = AT.tensor(np.exp(-2 * math.pi ** 2 * (sigma_far * res) ** 2 * f).astype(np.float32))
+        self._reverse = AT.tensor(np.arange(res - 1, -1, -1, dtype=np.int64))
+        t = np.asarray(t, np.float64)
+        known = np.isfinite(t)
+        self.has_known = bool(known.any())
+        self._known = AT.tensor(np.flatnonzero(known).astype(np.int64))
+        self._t = AT.tensor(np.nan_to_num(t).astype(np.float32))
+        self._t_known = AT.tensor(t[known].astype(np.float32))
+        self._known_mask = AT.tensor(known.astype(np.float32))
+        self._known_count = max(int(known.sum()), 1)
+        self._zeros = AT.tensor(np.zeros(res * res, np.float32))
+        self._ones = AT.tensor(np.ones(int(known.sum()), np.float32))
+        zero = AT.tensor(np.zeros((res, res), np.float32))
+        self.time = self.density = self.confidence = self.time_far = self.density_far = zero
+        self.grad_x = self.grad_z = zero
 
     def _blur(self, grid, kernel):
-        mirrored = np.concatenate([grid, grid[::-1]], axis=0)
-        blurred = np.fft.irfft2(np.fft.rfft2(mirrored) * kernel, s=mirrored.shape)
-        return blurred[: self.res]
+        mirrored = self.AT.cat([grid, grid.index_select(0, self._reverse)], dim=0)
+        spectrum = mirrored.rfft(axis=1).fft(axis=0) * kernel
+        return spectrum.ifft(axis=0).irfft(n=self.res, axis=1)[: self.res]
 
     def _cells(self, u):
-        x = np.floor(u[:, 0] * self.res).astype(np.int64) % self.res
-        z = np.clip(np.floor(u[:, 1] * self.res).astype(np.int64), 0, self.res - 1)
-        return np.stack([x, z], axis=1)
-
-    def update(self, u, t):
-        known = np.isfinite(t)
-        cell = self._cells(u[known])
-        flat = cell[:, 1] * self.res + cell[:, 0]
-        size = self.res * self.res
-        count = np.bincount(flat, minlength=size).reshape(self.res, self.res).astype(np.float64)
-        weighted = np.bincount(flat, weights=t[known], minlength=size).reshape(self.res, self.res)
-        w, wt = self._blur(count, self._blur_time), self._blur(weighted, self._blur_time)
-        eps = 1e-3 * max(float(w.max()), 1e-9)
-        self.time = (wt / (w + eps)).astype(np.float32)
-        self.confidence = (w / (w + 8 * eps)).astype(np.float32)
-        self.density = (w / max(float(w.max()), 1e-9)).astype(np.float32)
-        # The far side's extra blur is made here, on the same periodic grid, so it wraps
-        # at the longitude seam exactly like the near map (mip levels clamp there).
-        self.time_far = self._blur(self.time, self._blur_far).astype(np.float32)
-        self.density_far = self._blur(self.density, self._blur_far).astype(np.float32)
-        repel = self._blur(count, self._blur_repel)
-        repel /= max(float(repel.max()), 1e-9)
-        self.grad_time = self._gradient(self.time)
-        self.grad_repel = self._gradient(repel)
+        res = self.res
+        x = (u[:, 0] * res).floor().astype("int64") % res
+        z = (u[:, 1] * res).floor().clamp(min=0.0, max=float(res - 1)).astype("int64")
+        return z * res + x
 
     def _gradient(self, grid):
-        """Central difference per unit u, stacked (x, z): periodic in x,
-        mirrored (zero slope) across the poles in z."""
-        gx = (np.roll(grid, -1, axis=1) - np.roll(grid, 1, axis=1)) * (self.res / 2)
-        padded = np.concatenate([grid[:1], grid, grid[-1:]], axis=0)
-        gz = (padded[2:] - padded[:-2]) * (self.res / 2)
-        return np.stack([gx, gz]).astype(np.float32)
+        """Central difference per unit u: periodic in x, mirrored (zero slope) across the poles in z."""
+        AT, half = self.AT, self.res / 2
+        gx = (AT.cat([grid[:, 1:], grid[:, :1]], dim=1) - AT.cat([grid[:, -1:], grid[:, :-1]], dim=1)) * half
+        padded = AT.cat([grid[:1], grid, grid[-1:]], dim=0)
+        return gx, (padded[2:] - padded[:-2]) * half
 
-    def sample(self, grid, u):
-        cell = self._cells(u)
-        return grid[..., cell[:, 1], cell[:, 0]]
+    def sample(self, grid, flat):
+        return grid.reshape((-1,)).index_select(0, flat)
+
+    def update(self, u):
+        """Splat, blur and differentiate from the nodes' map coordinates ``u`` (n, 2)."""
+        AT, res = self.AT, self.res
+        if not self.has_known:
+            return
+        flat = self._cells(u.index_select(0, self._known))
+        count = self._zeros.scatter(flat, self._ones, 0).reshape((res, res))
+        weighted = self._zeros.scatter(flat, self._t_known, 0).reshape((res, res))
+        w, wt = self._blur(count, self._blur_time), self._blur(weighted, self._blur_time)
+        peak = AT.maximum(w.max(), 1e-9)
+        eps = peak * 1e-3
+        self.time = wt / (w + eps)
+        self.confidence = w / (w + eps * 8.0)
+        self.density = w / peak
+        # The far side's extra blur is made on the same periodic grid, so it wraps
+        # at the longitude seam exactly like the near map.
+        self.time_far = self._blur(self.time, self._blur_far)
+        self.density_far = self._blur(self.density, self._blur_far)
+        self.grad_x, self.grad_z = self._gradient(self.time)
+
+    def host_maps(self):
+        """The four background maps (time, density, far time, far density) for the texture: one read-back."""
+        stacked = self.AT.stack([self.time, self.density, self.time_far, self.density_far], dim=-1)
+        return np.ascontiguousarray(stacked.numpy(), np.float32)
+
+    @staticmethod
+    def unmap(p):
+        """Points (n, 3) -> (u, v) map coordinates (n, 2) by direction."""
+        AT = type(p)
+        r = (p * p).sum(dim=1, keepdim=True).sqrt()
+        q = p / AT.maximum(r, 1e-9)
+        u = (AT.atan2(q[:, 0], q[:, 2]) * (1.0 / (2 * math.pi)) + 0.5) % 1.0
+        v = ((1.0 - q[:, 1]) * 0.5).clamp(min=0.0, max=1.0)
+        return AT.stack([u, v], dim=1)
+
+    def order_force(self, positions, gain):
+        """The order field as a force on the shell: splat construction time from
+        where the nodes ARE, smooth it, and push each node down the gradient of
+        (smoothed time - its own time), tangent to the sphere.  Returns the
+        (n, 3) force and the mean |T - t| over stamped nodes (a 0-d tensor)."""
+        AT = self.AT
+        u = self.unmap(positions)
+        self.update(u)
+        flat = self._cells(u)
+        error = (self.sample(self.time, flat) - self._t) * self._known_mask
+        conf = self.sample(self.confidence, flat)
+        push = error * conf * (-float(gain))
+        fx, fz = push * self.sample(self.grad_x, flat), push * self.sample(self.grad_z, flat)
+        lon = (u[:, 0] - 0.5) * (2 * math.pi)
+        s = 1.0 - u[:, 1] * 2.0
+        c2 = AT.maximum(1.0 - s * s, 0.05)
+        c = c2.sqrt()
+        sin_lon, cos_lon = lon.sin(), lon.cos()
+        # a map-space force to 3-d: each basis vector over its own squared length
+        lon_scale = fx * (2 * math.pi) / (c2 * (4 * math.pi ** 2))
+        lat_scale = fz * (c2 / 4.0)
+        force = AT.stack([
+            lon_scale * c * cos_lon + lat_scale * (s * 2.0 / c) * sin_lon,
+            lat_scale * -2.0,
+            lon_scale * (c * -1.0) * sin_lon + lat_scale * (s * 2.0 / c) * cos_lon,
+        ], dim=1)
+        mean_error = error.abs().sum() / float(self._known_count)
+        return force.astype("float32"), mean_error
+
+    def mean_error(self, positions):
+        """Update the field from ``positions`` without a force; the mean |T - t|."""
+        u = self.unmap(positions)
+        self.update(u)
+        flat = self._cells(u)
+        error = (self.sample(self.time, flat) - self._t) * self._known_mask
+        return error.abs().sum() / float(self._known_count)
 
 
 class SphereMap:
@@ -838,52 +898,6 @@ class SphereMap:
         c = np.sqrt(np.maximum(1.0 - s * s, 0.0))
         return np.stack([c * np.sin(lon), s, c * np.cos(lon)], axis=1)
 
-    @staticmethod
-    def unmap(p):
-        """Points -> (u, v) in [0, 1]^2 by direction (the inverse of ``sphere``)."""
-        r = np.linalg.norm(p, axis=1)
-        q = p / np.maximum(r, 1e-9)[:, None]
-        u = (np.arctan2(q[:, 0], q[:, 2]) / (2 * math.pi) + 0.5) % 1.0
-        v = np.clip((1.0 - q[:, 1]) / 2.0, 0.0, 1.0)
-        return np.stack([u, v], axis=1)
-
-    @staticmethod
-    def segments(pos, a, b):
-        """Line vertices (4 per edge): an arc from node ``a`` to node ``b``
-        through a midpoint lifted back to the endpoints' mean radius, so an
-        edge across the map seam is drawn whole and stays near its surface."""
-        pa, pb = pos[a].astype(np.float64), pos[b].astype(np.float64)
-        mid = (pa + pb) / 2
-        length = np.linalg.norm(mid, axis=1, keepdims=True)
-        reach = (np.linalg.norm(pa, axis=1) + np.linalg.norm(pb, axis=1))[:, None] / 2
-        mid = np.where(length > 0.25, mid / np.maximum(length, 1e-9) * reach, mid)
-        out = np.empty((len(a), 4, 3), np.float32)
-        out[:, 0], out[:, 1], out[:, 2], out[:, 3] = pa, mid, mid, pb
-        return out
-
-
-def order_force(field, positions, t, gain):
-    """The order field as a force on the shell: splat construction time from
-    where the points ARE, smooth it, and push each point down the gradient of
-    (smoothed time - its own time), in 3-d tangent to the sphere.  Returns the
-    (n, 3) force and the mean |T - t| (the HUD's settle measure)."""
-    u = SphereMap.unmap(positions)
-    field.update(u, t)
-    known = np.isfinite(t)
-    error = np.where(known, field.sample(field.time, u) - np.nan_to_num(t), 0.0)
-    conf = field.sample(field.confidence, u)
-    f_map = -(gain * error * conf)[:, None] * field.sample(field.grad_time, u).T   # per unit u
-    lon = 2 * math.pi * (u[:, 0] - 0.5)
-    s = 1.0 - 2.0 * u[:, 1]
-    c2 = np.maximum(1.0 - s * s, 0.05)
-    c = np.sqrt(c2)
-    d_lon = 2 * math.pi * np.stack([c * np.cos(lon), np.zeros_like(c), -c * np.sin(lon)], axis=1)
-    d_lat = np.stack([2 * s / c * np.sin(lon), -2 * np.ones_like(c), 2 * s / c * np.cos(lon)], axis=1)
-    # a map-space force to 3-d: each basis vector over its own squared length
-    force = (f_map[:, :1] * d_lon / (4 * math.pi ** 2 * c2)[:, None]
-             + f_map[:, 1:] * d_lat * (c2 / 4)[:, None])
-    mean_error = float(np.abs(error[known]).mean()) if known.any() else 0.0
-    return force.astype(np.float32), mean_error
 
 
 def core_layout(core_t, src, dst) -> np.ndarray:
@@ -1032,8 +1046,10 @@ class World:
         from src.computational_world.engine import WorldStatusBatch
         from src.common.dt_system.time_runtime import TimeWindowRequest
         if external is not None:
-            self.state.spring_external_force = AT.tensor(np.ascontiguousarray(external, np.float32), dtype="float32")
-            self.ext_mean = float(np.linalg.norm(external, axis=1).mean())
+            if not isinstance(external, AT):
+                external = AT.tensor(np.ascontiguousarray(external, np.float32), dtype="float32")
+            self.state.spring_external_force = external
+            self.ext_mean = float(((external * external).sum(dim=1).sqrt()).mean().item())
         self.request += 1
         start = float(self.state.managed_time.item())          # the record, not a running sum
         report = self.lease.advance_from_shell(
@@ -1816,7 +1832,6 @@ def main(argv=None) -> None:
     er, ei, ew = graph["edge_row"], graph["edge_id"], graph["edge_weight"]
     ensure_causal(graph)
     csrc, cdst, ckind = graph["cedge_src"], graph["cedge_dst"], graph["cedge_kind"]
-    field = TimeField()
     plan = SphereMap(layout(graph))
     if args.backend or args.device:
         from src.common.tensors.abstraction import AbstractTensor
@@ -1828,33 +1843,31 @@ def main(argv=None) -> None:
     pos, core_pos = pos.copy(), core_pos.copy()
     t_shell = graph["t"].astype(np.float64)
     FRAME_DT = 1.0 / 60.0
+    field = TimeField(t_shell)                         # on the world's device
+    from src.common.tensors.abstraction import AbstractTensor as _AT
+    zeros_core = _AT.tensor(np.zeros((world.n_core, 3), np.float32))
+    zeros_all = _AT.tensor(np.zeros((world.n_core + world.n_shell, 3), np.float32))
+
+    def shell_positions():
+        return world.state.spring_position[world.n_core:]
 
     def world_frame(order_on: bool):
         """One frame of the one physics: the order-field layer (if on), then the lease."""
-        external = None
         if order_on and args.order_gain > 0:
-            force, err = order_force(field, pos, t_shell, args.order_gain)
-            external = np.zeros((world.n_core + world.n_shell, 3), np.float32)
-            external[world.n_core:] = force
+            force, err = field.order_force(shell_positions(), args.order_gain)
+            world.step(FRAME_DT, _AT.cat([zeros_core, force], dim=0))
         else:
-            u = SphereMap.unmap(pos)
-            field.update(u, t_shell)
-            known = np.isfinite(t_shell)
-            err = float(np.abs(field.sample(field.time, u)[known] - t_shell[known]).mean()) if known.any() else 0.0
-            if world.ext_mean:
-                external = np.zeros((world.n_core + world.n_shell, 3), np.float32)
-        world.step(FRAME_DT, external)
-        if external is None or not external.any():
+            err = field.mean_error(shell_positions())
+            world.step(FRAME_DT, zeros_all if world.ext_mean else None)
             world.ext_mean = 0.0
-        shell, core = world.positions()
-        pos[:] = shell
-        core_pos[:] = core
-        return err
+        everything = world.all_positions()            # the one read-back: drawing and picking
+        pos[:], core_pos[:] = everything[world.n_core:], everything[:world.n_core]
+        return float(err.item()) if hasattr(err, "item") else float(err)
 
     settle_started = time.perf_counter()
     for _ in range(args.settle):
         world_frame(True)
-    field.update(SphereMap.unmap(pos), t_shell)
+    field.mean_error(shell_positions())
     if args.settle:
         print(f"settled {args.settle} world frames in {time.perf_counter() - settle_started:.1f}s "
               f"(world time {world.t:.2f}s)", flush=True)
@@ -2014,8 +2027,7 @@ def main(argv=None) -> None:
     field_allocated = [False]
 
     def upload_field():
-        data = np.ascontiguousarray(
-            np.stack([field.time, field.density, field.time_far, field.density_far], axis=-1), np.float32)
+        data = field.host_maps()
         gl.glActiveTexture(gl.GL_TEXTURE0)
         gl.glBindTexture(gl.GL_TEXTURE_2D, bg_tex)
         if field_allocated[0]:
@@ -2471,7 +2483,7 @@ def main(argv=None) -> None:
                 elif k == pygame.K_r:
                     world.reset(); world.set_flow(state["anim"] == "flow")
                     shell, core = world.positions(); pos[:] = shell; core_pos[:] = core
-                    field.update(SphereMap.unmap(pos), t_shell); state["dirty"] = True
+                    field.mean_error(shell_positions()); state["dirty"] = True
                 elif k == pygame.K_o: state["order"] = not state["order"]; state["hud_dirty"] = True
                 elif k == pygame.K_k: state["core"] = not state["core"]; state["hud_dirty"] = True
                 elif k == pygame.K_b: state["bg"] = not state["bg"]

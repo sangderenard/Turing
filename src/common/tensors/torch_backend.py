@@ -703,6 +703,10 @@ class PyTorchTensorOperations(AbstractTensor):
     def boolean_mask_select_(self, mask):
         return self.data[mask]
 
+    def atan2_(self, other):
+        other = other.data if isinstance(other, AbstractTensor) else other
+        return torch.atan2(self.data, torch.as_tensor(other, device=self.data.device, dtype=self.data.dtype))
+
     # ---------------- FFT family (the NumPy backend's surface, on the device) -----------------
     def fft_(self, n=None, axis=-1, norm=None):
         return torch.fft.fft(self.data, n=n, dim=axis, norm=norm)
