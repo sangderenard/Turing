@@ -44,6 +44,13 @@ class BoundSpringParameters:
     glow_floor_alpha: float = 0.1
     glow_peak_radius: float = 0.2
     glow_floor_radius: float = 0.1
+    #: Bytes one tile of the force assembly may hold.  The incidence matmul
+    #: and the pairwise repulsion are dense (nodes x edges, nodes x nodes x
+    #: 3); measured on a 13,024-node, 46,348-edge world, one untiled call
+    #: peaked at 12.8 GB.  ``_forces`` splits edges and repulsion rows into
+    #: tiles under this budget; a world that fits in one tile runs the
+    #: untiled code unchanged.  Compute layout only, not physics.
+    force_tile_bytes: int = 512 * 2 ** 20
 
     def __post_init__(self) -> None:
         if self.k_stretch < 0.0 or self.c_repulse < 0.0:
@@ -54,6 +61,8 @@ class BoundSpringParameters:
             raise ValueError("spring managed periods must be positive")
         if self.c_frac <= 0.0:
             raise ValueError("spring relativistic fraction must be positive")
+        if int(self.force_tile_bytes) <= 0:
+            raise ValueError("spring force tile budget must be positive")
 
 
 def _tensor(value, dtype: str):
@@ -349,13 +358,16 @@ def _forces(
         # indexed-assignment semantics. It is the same spring force sum as
         # the legacy pair of ``index_add_`` calls.
         node_ids = AT.arange(node_count, dtype="int64").reshape((-1, 1))
-        source_incidence = (node_ids == source.reshape((1, -1))).astype("float32")
-        target_incidence = (node_ids == target.reshape((1, -1))).astype("float32")
         active_rest_length = (
             state.spring_rest_length[:edge_count].clone()
             if rest_length is None else rest_length
         )
+        # Autotile over edges: per edge the two incidence columns cost about
+        # 10 bytes per node (float32 + the bool compare, twice).
+        edge_tile = max(1, int(cfg.force_tile_bytes) // max(10 * node_count, 1))
         if edge_count == 1:
+            source_incidence = (node_ids == source.reshape((1, -1))).astype("float32")
+            target_incidence = (node_ids == target.reshape((1, -1))).astype("float32")
             length = (
                 (displacement * displacement).sum(dim=1, keepdim=True).sqrt()
                 + 1.0e-9
@@ -367,7 +379,9 @@ def _forces(
                 source_incidence[:, :, None] * (-edge_force)[None, :, :]
                 + target_incidence[:, :, None] * edge_force[None, :, :]
             ).sum(dim=1)
-        else:
+        elif edge_tile >= edge_count:
+            source_incidence = (node_ids == source.reshape((1, -1))).astype("float32")
+            target_incidence = (node_ids == target.reshape((1, -1))).astype("float32")
             force = bound_spring_stretch_force(
                 displacement,
                 source_incidence,
@@ -375,7 +389,20 @@ def _forces(
                 active_rest_length,
                 cfg.k_stretch,
             )
-    if cfg.c_repulse and node_count:
+        else:
+            for e0 in range(0, edge_count, edge_tile):
+                e1 = min(edge_count, e0 + edge_tile)
+                force = force + bound_spring_stretch_force(
+                    displacement[e0:e1],
+                    (node_ids == source[e0:e1].reshape((1, -1))).astype("float32"),
+                    (node_ids == target[e0:e1].reshape((1, -1))).astype("float32"),
+                    active_rest_length[e0:e1],
+                    cfg.k_stretch,
+                )
+    # Autotile over repulsion rows: per row about 52 bytes per node live at
+    # once (displacement and its product, x3 float32, plus four row planes).
+    row_tile = max(1, int(cfg.force_tile_bytes) // max(52 * node_count, 1))
+    if cfg.c_repulse and node_count and row_tile >= node_count:
         displacement = position[:, None, :] - position[None, :, :]
         distance2 = (displacement * displacement).sum(dim=2) + cfg.eps_rep
         off_diagonal = 1.0 - AT.eye(node_count, dtype="float32")
@@ -389,6 +416,27 @@ def _forces(
         force = force + (
             cfg.c_repulse * inverse[:, :, None] * displacement
         ).sum(dim=1)
+    elif cfg.c_repulse and node_count:
+        # The same rows of the same pairwise sum, a tile of rows at a time:
+        # the identity and the same-network mask are the full ones' rows.
+        network = state.spring_node_network[:node_count].clone().reshape((-1, 1))
+        column_ids = AT.arange(node_count, dtype="int64").reshape((1, -1))
+        repulsion = []
+        for r0 in range(0, node_count, row_tile):
+            r1 = min(node_count, r0 + row_tile)
+            rows = r1 - r0
+            displacement = position[r0:r1][:, None, :] - position[None, :, :]
+            distance2 = (displacement * displacement).sum(dim=2) + cfg.eps_rep
+            row_ids = AT.arange(r0, r1, dtype="int64").reshape((-1, 1))
+            off_diagonal = 1.0 - (row_ids == column_ids).astype("float32")
+            network_rows = AT.broadcast_to(network[r0:r1], (rows, node_count))
+            network_columns = AT.broadcast_to(network.T(), (rows, node_count))
+            same_network = (network_rows == network_columns).astype("float32")
+            inverse = off_diagonal * same_network / distance2
+            repulsion.append((
+                cfg.c_repulse * inverse[:, :, None] * displacement
+            ).sum(dim=1))
+        force = force + AT.cat(repulsion, dim=0)
     # The host's force layer, added before the integrator and before the
     # causal ceiling, so the dt system admits it like every other force.
     force = force + state.spring_external_force[:node_count]

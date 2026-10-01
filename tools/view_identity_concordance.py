@@ -932,7 +932,7 @@ class World:
     causal edges and the core's edges, strong) and its nodes glow.
     """
 
-    def __init__(self, graph, shell_pos, flow_seconds=16.0):
+    def __init__(self, graph, shell_pos, flow_seconds=16.0, tile_bytes=512 * 2 ** 20):
         from src.computational_world.spring import BoundSpringParameters
         self._params_cls = BoundSpringParameters
         self.graph = graph
@@ -968,7 +968,7 @@ class World:
         self.cycle_period = flow_seconds / FLOW_GROUPS
         shared = dict(k_stretch=SPRING_K, c_repulse=SPRING_REPULSE, damping=SPRING_DAMPING, growth_rate=0.0,
                       relax_rate=0.12, cycle_period=self.cycle_period, nominal_dt=1.0 / 60.0,
-                      glow_rise=0.5, glow_decay=0.08)
+                      glow_rise=0.5, glow_decay=0.08, force_tile_bytes=int(tile_bytes))
         # Contraction is legacy per-nominal-step: each step the active group's rest
         # length loses base * (1 - target) and relaxes back toward base by
         # relax_rate, so a group active for many frames settles at
@@ -1546,6 +1546,9 @@ def main(argv=None) -> None:
                     help="AbstractTensor backend for the world physics (AbstractTensor.set_default_backend); "
                          "set after the lowering so the compile itself is unchanged")
     ap.add_argument("--device", default=None, help="device for --backend, e.g. cuda or cuda:0")
+    ap.add_argument("--tile-mb", type=float, default=512.0,
+                    help="memory one tile of the spring force assembly may hold (BoundSpringParameters."
+                         "force_tile_bytes); larger tiles are faster, smaller ones fit smaller devices")
     ap.add_argument("--flow-seconds", type=float, default=16.0, help="one sweep of the activation cycle through all groups")
     ap.add_argument("--drift", action="store_true",
                     help="start with the world running (Space toggles it): the points drift and the "
@@ -1622,7 +1625,8 @@ def main(argv=None) -> None:
     if args.backend or args.device:
         from src.common.tensors.abstraction import AbstractTensor
         AbstractTensor.set_default_backend(args.backend or "numpy", args.device)
-    world = World(graph, SphereMap.sphere(plan.u0) * SHELL_RADIUS, flow_seconds=args.flow_seconds)
+    world = World(graph, SphereMap.sphere(plan.u0) * SHELL_RADIUS, flow_seconds=args.flow_seconds,
+                  tile_bytes=int(args.tile_mb * 2 ** 20))
     print(f"world physics on {world.backend_name()}", flush=True)
     pos, core_pos = world.positions()
     pos, core_pos = pos.copy(), core_pos.copy()
