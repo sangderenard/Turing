@@ -44,12 +44,11 @@ class BoundSpringParameters:
     glow_floor_alpha: float = 0.1
     glow_peak_radius: float = 0.2
     glow_floor_radius: float = 0.1
-    #: Bytes one tile of the force assembly may hold.  The incidence matmul
-    #: and the pairwise repulsion are dense (nodes x edges, nodes x nodes x
-    #: 3); measured on a 13,024-node, 46,348-edge world, one untiled call
-    #: peaked at 12.8 GB.  ``_forces`` splits edges and repulsion rows into
-    #: tiles under this budget; a world that fits in one tile runs the
-    #: untiled code unchanged.  Compute layout only, not physics.
+    #: Bytes one tile of the force assembly may hold.  The pairwise
+    #: repulsion is dense (nodes x nodes x 3); ``_forces`` splits its rows
+    #: into tiles under this budget, and a world that fits in one tile runs
+    #: the untiled code unchanged.  The edge forces are a scatter, O(edges),
+    #: and need no tiling.  Compute layout only, not physics.
     force_tile_bytes: int = 512 * 2 ** 20
 
     def __post_init__(self) -> None:
@@ -354,51 +353,29 @@ def _forces(
         source = state.spring_edge_index[0, :edge_count].clone()
         target = state.spring_edge_index[1, :edge_count].clone()
         displacement = position.index_select(0, source) - position.index_select(0, target)
-        # Incidence accumulation handles repeated endpoints without backend
-        # indexed-assignment semantics. It is the same spring force sum as
-        # the legacy pair of ``index_add_`` calls.
-        node_ids = AT.arange(node_count, dtype="int64").reshape((-1, 1))
         active_rest_length = (
             state.spring_rest_length[:edge_count].clone()
             if rest_length is None else rest_length
         )
-        # Autotile over edges: per edge the two incidence columns cost about
-        # 10 bytes per node (float32 + the bool compare, twice).
-        edge_tile = max(1, int(cfg.force_tile_bytes) // max(10 * node_count, 1))
-        if edge_count == 1:
-            source_incidence = (node_ids == source.reshape((1, -1))).astype("float32")
-            target_incidence = (node_ids == target.reshape((1, -1))).astype("float32")
-            length = (
-                (displacement * displacement).sum(dim=1, keepdim=True).sqrt()
-                + 1.0e-9
-            )
-            direction = displacement / length
-            delta = length.reshape((-1,)) - active_rest_length
-            edge_force = cfg.k_stretch * delta.reshape((-1, 1)) * direction
-            force = (
-                source_incidence[:, :, None] * (-edge_force)[None, :, :]
-                + target_incidence[:, :, None] * edge_force[None, :, :]
-            ).sum(dim=1)
-        elif edge_tile >= edge_count:
-            source_incidence = (node_ids == source.reshape((1, -1))).astype("float32")
-            target_incidence = (node_ids == target.reshape((1, -1))).astype("float32")
-            force = bound_spring_stretch_force(
-                displacement,
-                source_incidence,
-                target_incidence,
-                active_rest_length,
-                cfg.k_stretch,
-            )
-        else:
-            for e0 in range(0, edge_count, edge_tile):
-                e1 = min(edge_count, e0 + edge_tile)
-                force = force + bound_spring_stretch_force(
-                    displacement[e0:e1],
-                    (node_ids == source[e0:e1].reshape((1, -1))).astype("float32"),
-                    (node_ids == target[e0:e1].reshape((1, -1))).astype("float32"),
-                    active_rest_length[e0:e1],
-                    cfg.k_stretch,
-                )
+        # The eager form of ``bound_spring_stretch_force``: the same Hooke
+        # edge force, accumulated onto the endpoints by AbstractTensor's
+        # summing scatter -- the legacy pair of ``index_add_`` calls, O(E),
+        # on the backend's own accumulation (torch ``index_add_``, NumPy
+        # ``np.add.at``).  ``bound_spring_stretch_force`` keeps the incidence
+        # matmul as the compiler-facing form; run eagerly it builds two dense
+        # nodes x edges incidences and multiplies through them, O(N * E):
+        # 13,024 nodes x 46,348 edges peaked at 12.8 GB.
+        length = (
+            (displacement * displacement).sum(dim=1, keepdim=True).sqrt()
+            + 1.0e-9
+        )
+        direction = displacement / length
+        delta = length.reshape((-1,)) - active_rest_length
+        edge_force = cfg.k_stretch * delta.reshape((-1, 1)) * direction
+        force = (
+            force.scatter(source, -edge_force, 0, reduce="sum")
+            .scatter(target, edge_force, 0, reduce="sum")
+        )
     # Autotile over repulsion rows: per row about 52 bytes per node live at
     # once (displacement and its product, x3 float32, plus four row planes).
     row_tile = max(1, int(cfg.force_tile_bytes) // max(52 * node_count, 1))
