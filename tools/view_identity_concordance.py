@@ -55,6 +55,27 @@ their latest fact and revision history), with nothing recomputed:
                picked node's pin bright; picking a core node selects its row
                (so D diffuses the book from that node's identity cell).
                ``--focus core#N`` does the same in batch.
+  ring         realization: the rows of the step-9 emission pages
+               (``emission_artifact`` / ``emission_function`` /
+               ``emission_unit``) are ARTIFACT nodes (kind 2), drawn in
+               SCREEN space on a ring at the display's boundary -- a
+               Poincare-style limit, the ellipse inscribed in the window.
+               Clockwise from 12 o'clock (a RING_SEAM gap kept clear at
+               the top for the HUD), per backend: artifact parts, then
+               each function row followed by its units by ordinal.  Radius
+               is tanh(d / 2) with the hyperbolic distance d growing with
+               emission order (the book's write clock), so later output is
+               packed toward the limit.  Their causal edges are drawn from
+               the ring to the PROJECTED position of the sphere cell they
+               derive from (updated as the sphere turns); the book's DERIVED
+               edge from a compiler cell into an emission row is its own
+               class ``realize`` (magenta): it marks exactly where compiler
+               provenance ends and artifact identity begins, and it is never
+               merged with the chain inside the artifact.  Ring nodes pick
+               like any node; C / D focus and diffuse from them back through
+               the book.  Rows only exist when the module was EMITTED:
+               ``--probe NAME`` (``probe_emission_chain``'s programs) or
+               ``--case NAME --emit c|llvm|both --emit-root SYMBOL``.
 
 The layout starts as a plan: pages on a ring, each page's rows a disc around
 its slot, identities pulled to the centroid of the rows that name them.  That
@@ -70,6 +91,7 @@ Sources (one of):
     python tools/view_identity_concordance.py --book module_or_book.pkl
     python tools/view_identity_concordance.py --graph saved.npz
     python tools/view_identity_concordance.py --case oscillator --backend torch --device cuda --drift --anim flow
+    python tools/view_identity_concordance.py --probe bump --emit both
 
 ``--backend torch --device cuda`` runs the world physics (both spring
 networks) on the torch backend on the GPU; the lowering itself stays as it
@@ -158,8 +180,17 @@ MAX_ATOMS = 32          # ids taken from one row + fact, so a fat fact cannot fa
 ID_SCALE = 1.9          # identity points draw larger than row points
 
 # causal edge classes (graph["cedge_kind"]) and node provenance (graph["node_prov"])
-EDGE_DERIVED, EDGE_MINT, EDGE_HEURISTIC, EDGE_CELL_REF = 0, 1, 2, 3
-EDGE_KIND_NAMES = ("derived", "mint", "heuristic", "cell_ref")   # cell_ref: a fact holds a Ref to another cell
+EDGE_DERIVED, EDGE_MINT, EDGE_HEURISTIC, EDGE_CELL_REF, EDGE_REALIZE = 0, 1, 2, 3, 4
+# cell_ref: a fact holds a Ref to another cell; realize: the book's DERIVED edge
+# from a compiler cell (sphere) into an emission row (ring) -- kept its own class
+EDGE_KIND_NAMES = ("derived", "mint", "heuristic", "cell_ref", "realize")
+KIND_ROW, KIND_ID, KIND_ARTIFACT = 0, 1, 2     # graph["kind"]
+ART_ARTIFACT, ART_FUNCTION, ART_UNIT = 0, 1, 2  # graph["art_class"]: ring order artifact -> function -> unit
+ART_CLASS_NAMES = ("artifact", "function", "unit")
+RING_D_IN, RING_D_OUT = 2.6, 5.4                # hyperbolic distance of the first / last emitted row
+RING_MARGIN = 14.0                              # px between the ring's limit and the window edge
+RING_SEAM = math.radians(18.0)                  # the ring starts this far clockwise of 12 o'clock and ends as far
+                                                # before it: the top stays clear for the HUD's title lines
 PROV_NONE, PROV_MINT, PROV_UNSOURCED = 0, 1, 2
 EDGE_PATH_API = "book-api"                       # book.registry / edges_into / mint_of / unsourced_rows
 EDGE_PATH_PAGES = "book-pages+write-order"       # exact edge pages the book keeps today + causal_edges
@@ -382,14 +413,20 @@ def extract_graph(book, infer_edges="auto") -> dict:
     row_node: dict[tuple[str, object], int] = {}   # (page name, row) -> row node
     held_refs: list[tuple] = []                    # (holding node, page, row, column, Ref)
 
+    art_class_of_page = _artifact_page_classes()     # emission pages -> ring class
+    art_rows: list[tuple[int, int, object]] = []      # (node, ring class, row)
+
     def scope_index(name):
         return scopes.setdefault(name, len(scopes))
 
     for page_index, page_name in enumerate(pages):
         page = book.pages[page_name]
+        ring_class = art_class_of_page.get(page_name)
         for row in page.rows():
             node = len(kind)
             row_node[(page_name, row)] = node
+            if ring_class is not None:
+                art_rows.append((node, ring_class, row))
             key_atoms, fact_atoms = [], []
             history = page.history(row)
             key_refs = []
@@ -404,13 +441,19 @@ def extract_graph(book, infer_edges="auto") -> dict:
                     held_refs.append((node, page_name, row, column, ref))
             scope = next((a for a in key_atoms if isinstance(a, str)), page_name)
             scope_id = scope_index(scope)
-            kind.append(0); page_of.append(page_index); scope_of.append(scope_id)
+            kind.append(KIND_ROW if ring_class is None else KIND_ARTIFACT)
+            page_of.append(page_index); scope_of.append(scope_id)
             rev.append(len(history))
             stamps = getattr(page, "stamps", {})    # absent on books pickled before the clock
             first = [stamps[(row, c)] for c, _ in history if (row, c) in stamps]
             born.append(float(min(first)) if first else math.nan)
             label.append(f"[{page_name}] {render_row(row)}")
             detail.append(repr(history[-1][1])[:300] if history else "")
+            if ring_class is not None:
+                # an emission row is realization, not identity: its unit
+                # ordinals, byte lengths and counts are not ids, so it names
+                # no identity point (its Refs above are still edges)
+                continue
             for atoms, weight in ((key_atoms, 1.0), (fact_atoms, 0.45)):
                 for atom in atoms:
                     if isinstance(atom, str):
@@ -458,6 +501,12 @@ def extract_graph(book, infer_edges="auto") -> dict:
         seen_refs.add((source, target))
         sink.edge(source, target, EDGE_CELL_REF, page_name, cell_time(page_name, row, column))
     sink.grow(n_rows + len(id_keys))
+    # the book's DERIVED edge from a compiler cell into an emission row: realize
+    is_art = np.zeros(n_rows + len(id_keys), bool)
+    is_art[[node for node, _c, _r in art_rows]] = True
+    for e, (source, target) in enumerate(zip(sink.src, sink.dst)):
+        if sink.kind[e] == EDGE_DERIVED and is_art[target] and not is_art[source]:
+            sink.kind[e] = EDGE_REALIZE
 
     scope_names = [None] * len(scopes)
     for name, index in scopes.items():
@@ -502,6 +551,7 @@ def extract_graph(book, infer_edges="auto") -> dict:
         "latch": np.asarray(sink.latch, dtype="U"),
         "unsourced_listed": np.asarray(sink.unsourced_listed, np.int64),
     }
+    graph.update(ring_placement(len(kind), art_rows, born))
     if infer_edges == "on" or (infer_edges == "auto" and not (edge_path == EDGE_PATH_API and sink.latch == "CLOSED")):
         add_heuristic_edges(graph)
     graph["_row_node"] = row_node                  # private: popped by load_graph (not saved)
@@ -554,6 +604,120 @@ def ensure_core_row(graph) -> None:
         graph["core_row"] = np.full(len(graph.get("core_t", ())), -1, np.int64)
 
 
+def _artifact_page_classes() -> dict:
+    """Page name -> ring class for the step-9 emission pages, read from their
+    declarations (a tree without them has no ring)."""
+    try:
+        from src.compiler.concordance_declarations import (
+            EMISSION_ARTIFACT, EMISSION_FUNCTION, EMISSION_UNIT)
+    except ImportError:
+        return {}
+    return {EMISSION_ARTIFACT.name: ART_ARTIFACT, EMISSION_FUNCTION.name: ART_FUNCTION,
+            EMISSION_UNIT.name: ART_UNIT}
+
+
+def _row_at(row, index):
+    return row[index] if isinstance(row, tuple) and len(row) > index else None
+
+
+def _declared_key(member):
+    """Sort key: an Enum member by its declared position, anything else after, by text."""
+    import enum
+    if isinstance(member, enum.Enum):
+        return (list(type(member)).index(member), member.name)
+    return (1 << 20, str(member))
+
+
+def ring_placement(n, art_rows, born) -> dict:
+    """Screen-ring coordinates of the ARTIFACT nodes (emission rows).
+
+    Angle (clockwise from 12 o'clock): backends in ``Backend``'s declared
+    order, a gap between them; inside one backend the ``emission_artifact``
+    rows (by ``ArtifactPart``'s declared order), then every
+    ``emission_function`` row (by emission time) followed by its
+    ``emission_unit`` rows by unit ordinal.  Radius in the unit disc:
+    tanh(d / 2), d linear in emission order (rank of the write clock) from
+    RING_D_IN to RING_D_OUT, so the latest output packs toward the limit."""
+    art_class = np.full(n, -1, np.int8)
+    art_backend = np.full(n, -1, np.int16)
+    angle = np.full(n, np.nan, np.float32)
+    radius = np.full(n, np.nan, np.float32)
+    backends: list[str] = []
+    if art_rows:
+        def born_of(node):
+            return born[node] if np.isfinite(born[node]) else math.inf
+
+        by_backend: dict = {}
+        for node, cls, row in art_rows:
+            art_class[node] = cls
+            by_backend.setdefault(_row_at(row, 1), []).append((node, cls, row))
+        sequence: list = []                          # node per slot, None = gap
+        gap = max(2, int(round(0.04 * len(art_rows))))
+        for b_index, backend in enumerate(sorted(by_backend, key=_declared_key)):
+            backends.append(_named(backend))
+            members = by_backend[backend]
+            arts = sorted((m for m in members if m[1] == ART_ARTIFACT),
+                          key=lambda m: (_declared_key(_row_at(m[2], 2)[0] if isinstance(_row_at(m[2], 2), tuple)
+                                                       else _row_at(m[2], 2)),
+                                         str(_row_at(m[2], 2)), str(_row_at(m[2], 0))))
+            funcs = sorted((m for m in members if m[1] == ART_FUNCTION),
+                           key=lambda m: (born_of(m[0]), str(_row_at(m[2], 0))))
+            units: dict = {}
+            for m in members:
+                if m[1] == ART_UNIT:
+                    units.setdefault(str(_row_at(m[2], 0)), []).append(m)
+            for listed in units.values():
+                listed.sort(key=lambda m: (_row_at(m[2], 2) if isinstance(_row_at(m[2], 2), int) else 1 << 30,
+                                           born_of(m[0])))
+            seq = [m[0] for m in arts]
+            for f in funcs:
+                seq.append(f[0])
+                seq.extend(m[0] for m in units.pop(str(_row_at(f[2], 0)), ()))
+            for symbol in sorted(units):             # units whose function row is missing
+                seq.extend(m[0] for m in units[symbol])
+            art_backend[seq] = b_index
+            sequence.extend(seq)
+            sequence.extend([None] * gap)
+        total = len(sequence)
+        span = 2 * math.pi - 2 * RING_SEAM
+        for slot, node in enumerate(sequence):
+            if node is not None:
+                angle[node] = RING_SEAM + span * (slot + 0.5) / total
+        nodes = np.asarray([node for node, _c, _r in art_rows], np.int64)
+        clock = np.asarray([born_of(node) for node in nodes], np.float64)
+        rank = np.argsort(np.argsort(clock, kind="stable"), kind="stable")
+        frac = rank / max(len(nodes) - 1, 1)
+        radius[nodes] = np.tanh((RING_D_IN + (RING_D_OUT - RING_D_IN) * frac) / 2.0)
+    return {"art_class": art_class, "art_backend": art_backend, "art_angle": angle,
+            "art_radius": radius, "backends": np.asarray(backends, dtype="U")}
+
+
+def ensure_artifacts(graph) -> None:
+    """A graph saved before the ring (or a book that never emitted) has no
+    ARTIFACT nodes: every node gets class -1."""
+    if "art_class" not in graph:
+        graph.update(ring_placement(len(graph["kind"]), [], []))
+
+
+def artifact_summary(graph) -> str:
+    """The HUD/stdout line for the ring: per backend, units (sourced /
+    unsourced), functions, artifact parts; and the realize edges."""
+    cls, backend = graph["art_class"], graph["art_backend"]
+    if not (cls >= 0).any():
+        return "realization ring: no emission rows (lower and emit: --probe NAME, or --case NAME --emit ...)"
+    unsourced = graph["node_prov"] == PROV_UNSOURCED
+    parts = []
+    for b, name in enumerate(graph["backends"]):
+        mine = backend == b
+        units = mine & (cls == ART_UNIT)
+        parts.append(f"{name}: {int(units.sum())} units ({int((units & ~unsourced).sum())} sourced, "
+                     f"{int((units & unsourced).sum())} unsourced)  "
+                     f"{int((mine & (cls == ART_FUNCTION)).sum())} functions  "
+                     f"{int((mine & (cls == ART_ARTIFACT)).sum())} artifacts")
+    realize = int((graph["cedge_kind"] == EDGE_REALIZE).sum())
+    return "realization ring   " + "   |   ".join(parts) + f"   |   realize edges {realize}"
+
+
 def add_heuristic_edges(graph) -> None:
     """Append ``causal_edges``' write-order inference as HEURISTIC causal
     edges, tagged ``write-order``, so a book without the post api still has
@@ -604,7 +768,7 @@ def causal_summary(graph) -> str:
     return (f"edges: {graph['edge_path']}   latch {graph['latch']}   "
             f"derived {counts['derived']}  mint {counts['mint']} ({int((prov == PROV_MINT).sum())} mint nodes)  "
             f"unsourced {int((prov == PROV_UNSOURCED).sum())} ({listed} listed)  cell_ref {counts['cell_ref']}  "
-            f"heuristic {counts['heuristic']}   "
+            f"realize {counts['realize']}  heuristic {counts['heuristic']}   "
             f"stages: {', '.join(stage_tags) or '-'}   transforms: {', '.join(transform_tags) or '-'}")
 
 
@@ -672,6 +836,7 @@ def load_graph(args) -> dict:
             graph = {key: data[key] for key in data.files}
         ensure_causal(graph)
         ensure_core_row(graph)
+        ensure_artifacts(graph)
         return graph
     from src.compiler.identity_concordance import IdentityBook, identity_book
     graphs = []
@@ -679,16 +844,69 @@ def load_graph(args) -> dict:
         import pickle
         obj = pickle.loads(Path(args.book).read_bytes())
         book = obj if isinstance(obj, IdentityBook) else identity_book(obj)
+    elif args.probe:
+        module, root = lower_probe(args.probe, graphs.append)
+        emit_module(module, root, args.emit or "both")
+        book = identity_book(module)
     else:
         import audit_identity_concordance as audit
-        book = identity_book(audit.CASES[args.case](process_graph_sink=graphs.append))
+        module = audit.CASES[args.case](process_graph_sink=graphs.append)
+        if args.emit:
+            if not args.emit_root:
+                raise SystemExit("--case with --emit needs --emit-root SYMBOL (the root function to emit)")
+            emit_module(module, args.emit_root, args.emit)
+        book = identity_book(module)
     graph = extract_graph(book, args.infer_edges)
     row_node = graph.pop("_row_node")
     if graphs:
         graph.update(process_graph_arrays(graphs[-1]))
         graph["core_row"] = core_identity_rows(graphs[-1], book, row_node)
     ensure_core_row(graph)
+    ensure_artifacts(graph)
     return graph
+
+
+def lower_probe(spec, process_graph_sink):
+    """``--probe NAME[:annotated]``: one program of ``probe_emission_chain``
+    (``probe_scalar_native_correctness.PROGRAMS``), lowered as that probe
+    lowers it (same entry, contract and tensor reference), plus the resolved
+    process-graph sink for the core.  Returns (module, root symbol)."""
+    import warnings
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "compiler_probes"))
+    import probe_emission_chain as chain
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    name, _, flag = spec.partition(":")
+    if name not in chain.native.PROGRAMS:
+        raise SystemExit(f"--probe {name!r}: one of {', '.join(chain.native.PROGRAMS)} (add :annotated)")
+    template, dtype, _scalar, has_tensor = chain.native.PROGRAMS[name]
+    annotation = ((": float" if dtype == "float64" else ": int") if flag == "annotated" else "")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, _exports = lower_ast_source_to_ssa(
+            template.format(a=annotation), "f", name="scalar_native", python_bindings={},
+            extraction_contract=chain.native.contract(dtype, has_tensor),
+            runtime_closure_only=True, resolved_process_graph_sink=process_graph_sink,
+            **({"tensor_ssa_reference": chain.native._tensor_reference()} if has_tensor else {}),
+        )
+    return module, chain.ROOT
+
+
+def emit_module(module, root, which):
+    """Emit ``root`` through the backends' own entries (C module lane, LLVM
+    module lane); each posts its emission rows on the module's attached
+    book.  Nothing is compiled."""
+    if which in ("c", "both"):
+        from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+        artifact = emit_ssa_module_to_c(module, root)
+        print(f"emitted C: {root}  complete={artifact.complete}  "
+              f"{len(artifact.source.splitlines())} lines" +
+              ("" if artifact.complete else f"  shortfalls {artifact.shortfalls[:3]}"), flush=True)
+    if which in ("llvm", "both"):
+        from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
+        artifact = emit_ssa_function_to_llvm(module, root)
+        print(f"emitted LLVM: {root}  complete={artifact.complete}  "
+              f"{len(artifact.llvm_ir.splitlines())} lines" +
+              ("" if artifact.complete else f"  shortfalls {artifact.shortfalls[:3]}"), flush=True)
 
 
 # -- colour ------------------------------------------------------------------
@@ -720,7 +938,7 @@ def node_colors(graph, mode: int, degree: np.ndarray, isolate: int) -> np.ndarra
     kind, page_of, scope_of = graph["kind"], graph["page_of"], graph["scope_of"]
     n = len(kind)
     rgb = np.zeros((n, 3), np.float32)
-    is_row = kind == 0
+    is_row = kind != KIND_ID                    # rows and ring (emission) rows
     if mode == 0:
         table = _hue_table(len(graph["pages"]))
         rgb[is_row] = table[page_of[is_row]]
@@ -1341,8 +1559,12 @@ CONSEQUENCE_RGB = np.array([1.00, 0.58, 0.12], np.float32)   # what it caused
 NEUTRAL_RGB = np.array([0.40, 0.40, 0.46], np.float32)       # no flow reaches it
 UNSOURCED_RGB = np.array([1.00, 0.10, 0.16], np.float32)     # hard: flow dies here
 MINT_RING_RGB = np.array([0.35, 1.00, 0.45], np.float32)     # ring on a minted row / id
-KIND_WEIGHT = np.array([1.0, 1.0, 0.6, 1.0], np.float32)     # derived, mint, heuristic, cell_ref
-KIND_TINT = np.array([(0.85, 0.92, 1.00), (0.35, 1.00, 0.45), (0.5, 0.5, 0.55), (1.00, 0.80, 0.35)], np.float32)
+KIND_WEIGHT = np.array([1.0, 1.0, 0.6, 1.0, 1.0], np.float32)     # derived, mint, heuristic, cell_ref, realize
+REALIZE_RGB = np.array([1.00, 0.30, 0.85], np.float32)      # compiler cell -> emission row: provenance ends here
+RING_CHAIN_RGB = np.array([1.00, 0.88, 0.55], np.float32)   # edges inside the artifact (unit -> function -> file)
+RING_LIMIT_RGB = np.array([0.55, 0.60, 0.75], np.float32)   # the ring's limit ellipse
+KIND_TINT = np.array([(0.85, 0.92, 1.00), (0.35, 1.00, 0.45), (0.5, 0.5, 0.55), (1.00, 0.80, 0.35),
+                      tuple(REALIZE_RGB)], np.float32)
 PIN_RGB = np.array([0.80, 0.55, 1.00], np.float32)          # core node -> its identity row on the shell
 CLOCK_TAU = 0.25          # heat falls by 1/e across a quarter of the compilation clock
 DIFFUSE_STEPS, DIFFUSE_DECAY = 6, 0.7
@@ -1446,7 +1668,7 @@ uniform samplerBuffer uColor;    // rgba per node
 uniform samplerBuffer uBorder;   // rgba per node: the border outside flow
 uniform samplerBuffer uScale;    // r per node
 uniform samplerBuffer uGlow;     // rg per node: spring glow alpha, glow radius
-uniform isamplerBuffer uMeta;    // r: activation group, g: flags (1 core, 2 minted)
+uniform isamplerBuffer uMeta;    // r: activation group, g: flags (1 core, 2 minted, 4 ring: drawn by RING_POINT_VERT)
 uniform int uOffset;             // first node of this draw
 uniform int uFlow;               // 1: border and size from the spring glow
 uniform int uActive;             // the spring's active group
@@ -1473,6 +1695,11 @@ void main() {
   vec4 col = texelFetch(uColor, i);
   vec4 border = texelFetch(uBorder, i);
   float scale = texelFetch(uScale, i).r;
+  if ((texelFetch(uMeta, i).g & 4) != 0) {   // a ring (emission) node: not on the sphere
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    vCol = vec4(0.0); vBorder = vec4(0.0); vBack = 0.0; vZ = 0.0; gl_PointSize = 1.0;
+    return;
+  }
   if (uFlow == 1) {
     vec2 g = clamp(texelFetch(uGlow, i).rg, 0.0, 1.0);
     ivec2 meta = texelFetch(uMeta, i).rg;
@@ -1575,6 +1802,99 @@ void main() {
   fragColor = vec4(vCol.rgb, vCol.a * uLineAlpha);
 }
 """
+# The realization ring is drawn in SCREEN space: a node's (angle, r) maps to
+# the ellipse inscribed in the window (RING_MARGIN px in), clockwise from 12
+# o'clock.  ``uRing`` holds, per node in world order, (angle, r, 1 if ring, 0).
+RING_GLSL = """
+uniform vec2 uScreen;
+vec2 ringNdc(float angle, float r) {
+  vec2 k = vec2(1.0) - 2.0 * vec2(@MARGIN@) / max(uScreen, vec2(1.0));
+  return vec2(k.x * r * sin(angle), k.y * r * cos(angle));
+}
+"""
+RING_POINT_VERT = """#version 330 core
+uniform samplerBuffer uRing;
+uniform isamplerBuffer uIndex;   // ring slot -> node (world order)
+uniform samplerBuffer uColor;
+uniform samplerBuffer uBorder;
+uniform samplerBuffer uScale;
+uniform int uFirst;
+uniform float uPointSize;
+uniform int uOverride;
+uniform vec4 uOverrideColor;
+uniform vec4 uOverrideBorder;
+uniform float uOverrideScale;
+out vec4 vCol;
+out vec4 vBorder;
+out float vBack;
+out float vZ;
+@RING@
+void main() {
+  int i = texelFetch(uIndex, uFirst + gl_VertexID).r;
+  vec4 a = texelFetch(uRing, i);
+  vec4 col = texelFetch(uColor, i);
+  vec4 border = texelFetch(uBorder, i);
+  float scale = texelFetch(uScale, i).r;
+  if (uOverride == 1) { col = uOverrideColor; border = uOverrideBorder; scale = uOverrideScale; }
+  gl_Position = vec4(ringNdc(a.x, a.y), 0.0, 1.0);
+  vCol = col; vBorder = border; vBack = 0.0; vZ = 1.0;
+  gl_PointSize = uPointSize * scale;
+}
+"""
+# A ring edge: each endpoint is either a ring node (screen space) or a sphere
+# node (its projected position this frame, dimmed on the far side).  uLimit
+# draws the limit ellipse itself as a line loop.
+RING_LINE_VERT = """#version 330 core
+uniform samplerBuffer uPos;
+uniform samplerBuffer uRing;
+uniform isamplerBuffer uPairs;
+uniform samplerBuffer uEdgeColor;
+uniform int uLimit;
+uniform int uLimitCount;
+uniform vec4 uLimitColor;
+uniform mat4 uMVP;
+uniform mat3 uRot;
+out vec4 vCol;
+out float vBack;
+out float vZ;
+@RING@
+void main() {
+  vZ = 1.0; vBack = 0.0;
+  if (uLimit == 1) {
+    gl_Position = vec4(ringNdc(6.28318530718 * float(gl_VertexID) / float(uLimitCount), 1.0), 0.0, 1.0);
+    vCol = uLimitColor;
+    return;
+  }
+  int e = gl_VertexID / 2;
+  ivec2 ab = texelFetch(uPairs, e).rg;
+  int i = (gl_VertexID - 2 * e == 0) ? ab.x : ab.y;
+  vec4 a = texelFetch(uRing, i);
+  vec4 c = texelFetch(uEdgeColor, e);
+  if (a.z > 0.5) {
+    gl_Position = vec4(ringNdc(a.x, a.y), 0.0, 1.0);
+  } else {
+    vec3 p = texelFetch(uPos, i).xyz;
+    gl_Position = uMVP * vec4(p, 1.0);
+    float front = smoothstep(-0.25, 0.25, (uRot * p).z / max(length(p), 1e-6));
+    vBack = 1.0 - front;
+    c.a *= mix(0.35, 1.0, front);
+  }
+  vCol = c;
+}
+"""
+RING_GLSL = RING_GLSL.replace("@MARGIN@", f"{RING_MARGIN:.1f}")
+RING_POINT_VERT = RING_POINT_VERT.replace("@RING@", RING_GLSL)
+RING_LINE_VERT = RING_LINE_VERT.replace("@RING@", RING_GLSL)
+
+
+def ring_screen(graph_angle, graph_radius, w, h):
+    """The CPU twin of ``ringNdc``: pixel (x, y) of ring nodes in a w x h window."""
+    kx, ky = 1.0 - 2.0 * RING_MARGIN / max(w, 1), 1.0 - 2.0 * RING_MARGIN / max(h, 1)
+    x = kx * graph_radius * np.sin(graph_angle)
+    y = ky * graph_radius * np.cos(graph_angle)
+    return (x * 0.5 + 0.5) * w, (1.0 - (y * 0.5 + 0.5)) * h
+
+
 BG_VERT = """#version 330 core
 layout(location=0) in vec2 aUv;
 uniform mat4 uMVP;
@@ -1827,6 +2147,12 @@ def main(argv=None) -> None:
     source.add_argument("--case", default="mapping", help="audit_identity_concordance case to lower")
     source.add_argument("--book", help="pickled IdentityBook or SSA module")
     source.add_argument("--graph", help="graph saved by --save-graph")
+    source.add_argument("--probe", metavar="NAME[:annotated]",
+                        help="lower one probe_emission_chain program (bump, chain, twice, cond, loop, scale, "
+                             "shared) and EMIT it, so the book holds the emission rows (the ring)")
+    ap.add_argument("--emit", choices=("c", "llvm", "both"), default=None,
+                    help="emit after lowering (--probe defaults to both; --case needs --emit-root)")
+    ap.add_argument("--emit-root", metavar="SYMBOL", help="root function symbol to emit for --case --emit")
     ap.add_argument("--save-graph", help="write the extracted graph (.npz) and continue")
     ap.add_argument("--settle", type=int, default=None, help="world frames (1/60 s each) to run before the first frame")
     ap.add_argument("--order-gain", type=float, default=ORDER_GAIN, help="order-field force gain (0 disables the layer)")
@@ -1874,8 +2200,16 @@ def main(argv=None) -> None:
     kind, page_of = graph["kind"], graph["page_of"]
     n = len(kind)
     ensure_core_row(graph)
+    ensure_causal(graph)
+    ensure_artifacts(graph)
     core_row = np.asarray(graph["core_row"], np.int64)
     core_label = graph.get("core_label", np.zeros(0, dtype="U"))
+    art_class = np.asarray(graph["art_class"], np.int8)
+    is_art = art_class >= 0
+    art_nodes = np.flatnonzero(is_art)
+    n_art = len(art_nodes)
+    ring_summary = artifact_summary(graph)
+    print(ring_summary, flush=True)
     if args.list is not None:
         found = resolve_focus(graph, args.list)
         for i in found[:200]:
@@ -1918,6 +2252,7 @@ def main(argv=None) -> None:
     pos, core_pos = world.positions()
     pos, core_pos = pos.copy(), core_pos.copy()
     t_shell = graph["t"].astype(np.float64)
+    t_shell[is_art] = np.nan                           # ring nodes are not on the sphere: no field, no force
     FRAME_DT = 1.0 / 60.0
     field = TimeField(t_shell)                         # on the world's device
     physics = PhysicsThread(world, field, args.order_gain, FRAME_DT)
@@ -1936,7 +2271,7 @@ def main(argv=None) -> None:
     pinned = np.flatnonzero((core_row >= 0) & (core_row < n))
     n_pinned = len(pinned)
     summary = causal_summary(graph)
-    print(f"graph: {int((kind == 0).sum())} rows, {int((kind == 1).sum())} ids, "
+    print(f"graph: {int((kind == 0).sum())} rows, {int((kind == 1).sum())} ids, {n_art} ring (emission) rows, "
           f"{len(er)} lines, {len(csrc)} causal edges, {len(graph['pages'])} pages; "
           f"core: {world.n_core} process-graph nodes, {len(world.core_src)} edges, "
           f"pinned {n_pinned}/{world.n_core} "
@@ -1971,6 +2306,7 @@ def main(argv=None) -> None:
 
     prog_point, prog_line, prog_hud = program(NODE_VERT, FRAG_POINT), program(LINE_VERT, FRAG_LINE), program(HUD_VERT, HUD_FRAG)
     prog_bg = program(BG_VERT, BG_FRAG)
+    prog_ring_point, prog_ring_line = program(RING_POINT_VERT, FRAG_POINT), program(RING_LINE_VERT, FRAG_LINE)
     gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
     gl.glEnable(gl.GL_BLEND)
     gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
@@ -2028,8 +2364,24 @@ def main(argv=None) -> None:
     meta = np.zeros((M, 2), np.int32)
     meta[:nc, 0], meta[:nc, 1] = world.core_group, 1
     meta[nc:, 0] = world.shell_group
-    meta[nc:, 1] = np.where(graph["node_prov"] == PROV_MINT, 2, 0)
+    meta[nc:, 1] = np.where(graph["node_prov"] == PROV_MINT, 2, 0) | np.where(is_art, 4, 0)
     meta_tb.set(meta)
+    # the realization ring: per node (angle, r, ring flag), ring slot -> node, and
+    # every causal edge with a ring end (drawn from the ring, not on the sphere)
+    ring_tb, ring_index_tb = TexBuf(gl.GL_RGBA32F, 4, np.float32), TexBuf(gl.GL_R32I, 1, np.int32)
+    ring_pairs_tb, ring_color_tb = TexBuf(gl.GL_RG32I, 2, np.int32), TexBuf(gl.GL_RGBA32F, 4, np.float32)
+    ring_data = np.zeros((M, 4), np.float32)
+    ring_data[nc + art_nodes, 0] = graph["art_angle"][art_nodes]
+    ring_data[nc + art_nodes, 1] = graph["art_radius"][art_nodes]
+    ring_data[nc + art_nodes, 2] = 1.0
+    ring_tb.set(ring_data)
+    ring_index_tb.set((art_nodes + nc).astype(np.int32))
+    ring_slot = np.full(n, -1, np.int64)
+    ring_slot[art_nodes] = np.arange(n_art)
+    ring_edge = np.flatnonzero(is_art[csrc] | is_art[cdst])
+    ring_pairs_tb.set(np.stack([csrc[ring_edge], cdst[ring_edge]], axis=1).astype(np.int32) + nc
+                      if len(ring_edge) else np.zeros((0, 2), np.int32))
+    ring_realize = ckind[ring_edge] == EDGE_REALIZE
     core_rgb = _time_ramp(world.core_t) if nc else np.zeros((0, 3), np.float32)
     node_color[:nc, :3], node_color[:nc, 3] = core_rgb, 0.9
     node_border[:nc, :3], node_border[:nc, 3] = CORE_RING_RGB, 0.45
@@ -2163,8 +2515,38 @@ def main(argv=None) -> None:
         color_tb.set(node_color)
         border_tb.set(node_border)
         scale_tb.set(node_scale)
-        write_shell_edges(edge_rgb, alpha.astype(np.float32), cedge_rgb, np.asarray(cedge_alpha, np.float32))
+        cedge_rgb = np.asarray(cedge_rgb, np.float32)
+        cedge_alpha = np.asarray(cedge_alpha, np.float32).copy()
+        ring_colors[0] = (cedge_rgb[ring_edge].copy(), cedge_alpha[ring_edge].copy(), bool(focus))
+        cedge_alpha[ring_edge] = 0.0                   # drawn from the ring, not on the sphere
+        write_shell_edges(edge_rgb, alpha.astype(np.float32), cedge_rgb, cedge_alpha)
+        rebuild_ring()
         state["dirty"] = False
+
+    ring_colors = [None]
+
+    def rebuild_ring():
+        """Ring edge colours.  Outside a focus: realize edges magenta, the
+        artifact's own chain pale gold, both lit by their ends' visibility.
+        In a focus / diffusion: the focus colours, the realize edges still
+        tinted toward magenta.  The picked node's ring edges are bright."""
+        if not len(ring_edge) or ring_colors[0] is None:
+            return
+        rgb, alpha, focused = ring_colors[0]
+        rgb, alpha = rgb.copy(), alpha.copy()
+        if focused:
+            rgb[ring_realize] = 0.6 * rgb[ring_realize] + 0.4 * REALIZE_RGB
+            alpha = np.maximum(alpha, 0.10)
+        else:
+            vis = node_color[nc + csrc[ring_edge], 3] * node_color[nc + cdst[ring_edge], 3]
+            rgb[:] = np.where(ring_realize[:, None], REALIZE_RGB, RING_CHAIN_RGB)
+            alpha = np.where(ring_realize, 0.60, 0.10) * vis   # the chain fans (function <- every unit): kept dim
+        p = state["pick"]
+        if p >= 0:
+            hit = (csrc[ring_edge] == p) | (cdst[ring_edge] == p)
+            rgb[hit] = np.where(ring_realize[hit, None], np.array([1.0, 0.75, 0.95], np.float32), 1.0)
+            alpha[hit] = 1.0
+        ring_color_tb.set(np.concatenate([rgb, alpha[:, None]], axis=1))
 
     def rebuild_pins():
         """Pin colours: the picked core node's pin (or the pins onto the picked row) bright."""
@@ -2177,11 +2559,12 @@ def main(argv=None) -> None:
     def rebuild_pick():
         """The picked row's lines: their pairs and colours (positions come from the node buffer)."""
         rebuild_pins()
+        rebuild_ring()
         p = state["pick"]
         if p < 0:
             return 0
         mask = (er == p) | (ei == p)
-        cmask = ((csrc == p) | (cdst == p)) & (ckind != EDGE_HEURISTIC)
+        cmask = ((csrc == p) | (cdst == p)) & (ckind != EDGE_HEURISTIC) & ~(is_art[csrc] | is_art[cdst])
         pick_pairs_tb.set(np.concatenate([np.stack([er[mask], ei[mask]], axis=1),
                                           np.stack([csrc[cmask], cdst[cmask]], axis=1)]).astype(np.int32) + nc)
         pick_color_tb.set(np.concatenate([
@@ -2201,8 +2584,14 @@ def main(argv=None) -> None:
             else:
                 fx = focus_effects(graph, hops, args.depth, er, ei)
             state["focus"] = {"node": int(node), "hops": hops, "fx": fx}
-            camera.face(pos[node])
-            camera.dist = 3.0
+            if not is_art[node]:
+                camera.face(pos[node])
+                camera.dist = 3.0
+            else:                                         # a ring node is in view: face the sphere cell it came from
+                score = fx["heat"] if "heat" in fx else np.where(np.isfinite(hops), 1.0 / (1.0 + np.abs(np.nan_to_num(hops))), 0.0)
+                score = np.where(is_art, 0.0, score)
+                if score.max() > 0:
+                    camera.face(pos[int(np.argmax(score))])
         state["dirty"] = state["hud_dirty"] = True
 
     pick_edges = 0
@@ -2225,7 +2614,8 @@ def main(argv=None) -> None:
                   f"core pinned {n_pinned}/{world.n_core}   "
                   f"group {snap['group']}/{FLOW_GROUPS}",
                   (200, 225, 235)),
-                 (summary[:200], (190, 200, 215))]
+                 (summary[:200], (190, 200, 215)),
+                 (ring_summary[:220], tuple(int(255 * v) for v in RING_CHAIN_RGB))]
         if state["anim"] != "off":
             clock = anim_clock()
             front = state["front"]
@@ -2267,7 +2657,15 @@ def main(argv=None) -> None:
             lines = [(f"{mode_name}   {graph['label'][focus['node']][:100]}", (255, 255, 255)),
                      (counts, (200, 205, 215)),
                      (summary[:200], (190, 200, 215)),
+                     (ring_summary[:220], tuple(int(255 * v) for v in RING_CHAIN_RGB)),
                      (f"core pinned {n_pinned}/{world.n_core}", (200, 225, 235))]
+            if is_art[focus["node"]]:
+                node = focus["node"]
+                cls = ART_CLASS_NAMES[int(art_class[node])]
+                backend = str(graph["backends"][int(graph["art_backend"][node])]) if graph["art_backend"][node] >= 0 else "?"
+                lines.append((f"seeded from the realization ring: {backend} {cls}  "
+                              f"(realize edges magenta: where compiler provenance ends)",
+                              tuple(int(255 * v) for v in REALIZE_RGB)))
             c = state["pick_core"]
             if 0 <= c < world.n_core and core_row[c] == focus["node"]:
                 lines.append((f"seeded from core#{c}  {str(core_label[c])[:90]}  (its identity cell)",
@@ -2295,6 +2693,9 @@ def main(argv=None) -> None:
         ok = (clip[:, 3] > 1e-6)
         sx = (clip[:, 0] / np.where(ok, clip[:, 3], 1.0) * 0.5 + 0.5) * w
         sy = (1 - (clip[:, 1] / np.where(ok, clip[:, 3], 1.0) * 0.5 + 0.5)) * h
+        if n_art:                                             # ring nodes sit in screen space
+            sx[art_nodes], sy[art_nodes] = ring_screen(graph["art_angle"][art_nodes], graph["art_radius"][art_nodes], w, h)
+            ok[art_nodes], facing[art_nodes] = True, 1.0
         heat = focus["fx"].get("heat")
         if heat is None:
             order = [i for i in np.argsort(np.abs(np.nan_to_num(hops, nan=1e9)), kind="stable")
@@ -2349,13 +2750,19 @@ def main(argv=None) -> None:
             label(f"+{args.depth}  built on it (future)", bar.right - 150, bar.bottom + 3, (255, 190, 120))
 
     def pick_at(mx, my, mvp, w, h):
+        if n_art:                                             # the ring first: it is in screen space, on top
+            rx, ry = ring_screen(graph["art_angle"][art_nodes], graph["art_radius"][art_nodes], w, h)
+            rd2 = (rx - mx) ** 2 + (ry - my) ** 2
+            hit = int(np.argmin(rd2))
+            if rd2[hit] < 10 ** 2:
+                return int(art_nodes[hit]), -1
         clip = np.concatenate([pos, np.ones((n, 1), np.float32)], axis=1) @ mvp.T.astype(np.float32)
         ok = clip[:, 3] > 1e-6
         ndc = clip[:, :2] / np.where(ok, clip[:, 3], 1.0)[:, None]
         sx, sy = (ndc[:, 0] * 0.5 + 0.5) * w, (1 - (ndc[:, 1] * 0.5 + 0.5)) * h
         dist2 = (sx - mx) ** 2 + (sy - my) ** 2
         colors_alpha = node_colors(graph, 0, degree, state["isolate"])[:, 3]
-        dist2 = np.where(ok & (colors_alpha > 0.02), dist2, np.inf)
+        dist2 = np.where(ok & (colors_alpha > 0.02) & ~is_art, dist2, np.inf)
         near = np.flatnonzero(dist2 < 16 ** 2)
         best, best_w = -1, math.inf
         if len(near):
@@ -2466,6 +2873,49 @@ def main(argv=None) -> None:
             gl.glBindVertexArray(empty_vao)
             gl.glDrawArrays(gl.GL_LINES, 0, 4 * int(count))
 
+        def draw_ring_points(w, h, first, count, override=None):
+            gl.glUseProgram(prog_ring_point)
+            gl.glUniform2f(loc(prog_ring_point, "uScreen"), float(w), float(h))
+            gl.glUniform1f(loc(prog_ring_point, "uPointSize"), state["psize"] * 1.1)
+            gl.glUniform1i(loc(prog_ring_point, "uPass"), -1)
+            for unit, (buf, name) in enumerate(((ring_tb, "uRing"), (ring_index_tb, "uIndex"), (color_tb, "uColor"),
+                                                (border_tb, "uBorder"), (scale_tb, "uScale")), start=1):
+                buf.bind(unit)
+                gl.glUniform1i(loc(prog_ring_point, name), unit)
+            gl.glUniform1i(loc(prog_ring_point, "uFirst"), int(first))
+            gl.glUniform1i(loc(prog_ring_point, "uOverride"), 0 if override is None else 1)
+            if override is not None:
+                gl.glUniform4f(loc(prog_ring_point, "uOverrideColor"), *override[0])
+                gl.glUniform4f(loc(prog_ring_point, "uOverrideBorder"), *override[1])
+                gl.glUniform1f(loc(prog_ring_point, "uOverrideScale"), override[2])
+            gl.glBindVertexArray(empty_vao)
+            gl.glDrawArrays(gl.GL_POINTS, 0, int(count))
+
+        def draw_ring(w, h):
+            """The realization ring, over everything but the HUD: its limit,
+            the edges from the ring back to the sphere cells, the nodes."""
+            gl.glUseProgram(prog_ring_line)
+            gl.glUniformMatrix4fv(loc(prog_ring_line, "uMVP"), 1, gl.GL_FALSE, mvp32)
+            gl.glUniformMatrix3fv(loc(prog_ring_line, "uRot"), 1, gl.GL_TRUE, rot32)
+            gl.glUniform2f(loc(prog_ring_line, "uScreen"), float(w), float(h))
+            gl.glUniform1i(loc(prog_ring_line, "uPass"), -1)
+            for unit, (buf, name) in enumerate(((pos_tb, "uPos"), (ring_tb, "uRing"), (ring_pairs_tb, "uPairs"),
+                                                (ring_color_tb, "uEdgeColor")), start=1):
+                buf.bind(unit)
+                gl.glUniform1i(loc(prog_ring_line, name), unit)
+            gl.glBindVertexArray(empty_vao)
+            gl.glUniform1f(loc(prog_ring_line, "uLineAlpha"), 1.0)
+            gl.glUniform1i(loc(prog_ring_line, "uLimit"), 1)
+            gl.glUniform1i(loc(prog_ring_line, "uLimitCount"), 360)
+            gl.glUniform4f(loc(prog_ring_line, "uLimitColor"), *RING_LIMIT_RGB, 0.45)
+            gl.glDrawArrays(gl.GL_LINE_LOOP, 0, 360)
+            gl.glUniform1i(loc(prog_ring_line, "uLimit"), 0)
+            if state["lines"] and len(ring_edge):
+                gl.glUniform1f(loc(prog_ring_line, "uLineAlpha"), min(1.0, 0.4 + state["lalpha"] * 1.6))
+                gl.glDrawArrays(gl.GL_LINES, 0, 2 * len(ring_edge))
+            if state["points"]:
+                draw_ring_points(w, h, 0, n_art)
+
         if state["bg"]:
             gl.glUseProgram(prog_bg)
             gl.glUniformMatrix4fv(loc(prog_bg, "uMVP"), 1, gl.GL_FALSE, mvp32)
@@ -2496,7 +2946,11 @@ def main(argv=None) -> None:
             if n_pinned:                                # core -> shell identity pins
                 draw_edges(pin_pairs_tb, pin_color_tb, n_pinned, 1.0, arc=0)
         draw_shell(1)                                   # the near side over it
-        if state["pick"] >= 0:
+        if n_art:
+            draw_ring(w, h)
+        if state["pick"] >= 0 and is_art[state["pick"]]:
+            draw_ring_points(w, h, int(ring_slot[state["pick"]]), 1, ((1, 1, 1, 1), (*REALIZE_RGB, 1.0), 2.4))
+        elif state["pick"] >= 0:
             draw_nodes(nc + state["pick"], 1, ((1, 1, 1, 1), (0, 0, 0, 0), 2.2))
         if 0 <= state["pick_core"] < nc and state["core"]:
             draw_nodes(state["pick_core"], 1, ((1, 0.92, 1, 1), (*PIN_RGB, 1.0), 2.2))
