@@ -1461,6 +1461,7 @@ uniform float uRef;
 out vec4 vCol;
 out vec4 vBorder;
 out float vBack;
+out float vZ;                     // view-space z: > 0 the near hemisphere (as BG_VERT)
 const vec3 FRONT = @FRONT@;
 const vec3 ATTACH = @ATTACH@;
 const vec3 BIRTH = @BIRTH@;
@@ -1486,7 +1487,8 @@ void main() {
   }
   if (uOverride == 1) { col = uOverrideColor; border = uOverrideBorder; scale = uOverrideScale; }
   gl_Position = uMVP * vec4(p, 1.0);
-  float facing = (uRot * p).z / max(length(p), 1e-6);
+  vZ = (uRot * p).z;
+  float facing = vZ / max(length(p), 1e-6);
   float front = smoothstep(-0.25, 0.25, facing);
   vBack = 1.0 - front;
   vBorder = vec4(border.rgb, border.a * mix(0.4, 1.0, front));
@@ -1511,6 +1513,7 @@ uniform mat4 uMVP;
 uniform mat3 uRot;
 out vec4 vCol;
 out float vBack;
+out float vZ;                     // view-space z: > 0 the near hemisphere (as BG_VERT)
 const vec3 ATTACH = @ATTACH@;
 void main() {
   int e = gl_VertexID / 4;
@@ -1529,7 +1532,8 @@ void main() {
     c.a = (uGlowMode == 1) ? c.a * (1.0 + 2.0 * g) : c.a + 2.0 * g;
   }
   gl_Position = uMVP * vec4(p, 1.0);
-  float facing = (uRot * p).z / max(length(p), 1e-6);
+  vZ = (uRot * p).z;
+  float facing = vZ / max(length(p), 1e-6);
   float front = smoothstep(-0.25, 0.25, facing);
   vBack = 1.0 - front;
   vCol = vec4(c.rgb * mix(0.55, 1.0, front), c.a * mix(0.32, 1.0, front));
@@ -1544,8 +1548,11 @@ FRAG_POINT = """#version 330 core
 in vec4 vCol;
 in vec4 vBorder;
 in float vBack;
+in float vZ;
+uniform int uPass;                // -1 everything, 0 far hemisphere only, 1 near only
 out vec4 fragColor;
 void main() {
+  if (uPass >= 0 && (uPass == 0) == (vZ > 0.0)) discard;
   float d = length(gl_PointCoord - vec2(0.5));
   if (d > 0.5 || vCol.a < 0.02) discard;
   float inner = mix(mix(0.36, 0.0, vBack), 0.46, vBorder.a);   // far side: soft, blurred; a border keeps the rim crisp
@@ -1558,9 +1565,12 @@ void main() {
 FRAG_LINE = """#version 330 core
 in vec4 vCol;
 in float vBack;
+in float vZ;
 uniform float uLineAlpha;
+uniform int uPass;                // -1 everything, 0 far hemisphere only, 1 near only
 out vec4 fragColor;
 void main() {
+  if (uPass >= 0 && (uPass == 0) == (vZ > 0.0)) discard;   // an edge over the rim is cut at the rim
   if (vCol.a < 0.02) discard;
   fragColor = vec4(vCol.rgb, vCol.a * uLineAlpha);
 }
@@ -2425,8 +2435,9 @@ def main(argv=None) -> None:
             if lalpha is not None:
                 gl.glUniform1f(loc(prog, "uLineAlpha"), lalpha)
 
-        def draw_nodes(offset, count, override=None):
+        def draw_nodes(offset, count, override=None, half=-1):
             use(prog_point, psize=state["psize"])
+            gl.glUniform1i(loc(prog_point, "uPass"), half)
             for unit, (buf, name) in enumerate(((pos_tb, "uPos"), (color_tb, "uColor"), (border_tb, "uBorder"),
                                                 (scale_tb, "uScale"), (glow_tb, "uGlow"), (meta_tb, "uMeta")), start=1):
                 buf.bind(unit)
@@ -2442,8 +2453,9 @@ def main(argv=None) -> None:
             gl.glBindVertexArray(empty_vao)
             gl.glDrawArrays(gl.GL_POINTS, 0, int(count))
 
-        def draw_edges(pairs, colors, count, lalpha, glow_mode=0, glow_edges=0, arc=1):
+        def draw_edges(pairs, colors, count, lalpha, glow_mode=0, glow_edges=0, arc=1, half=-1):
             use(prog_line, lalpha=lalpha)
+            gl.glUniform1i(loc(prog_line, "uPass"), half)
             for unit, (buf, name) in enumerate(((pos_tb, "uPos"), (pairs, "uPairs"), (colors, "uEdgeColor"),
                                                 (glow_tb, "uGlow")), start=1):
                 buf.bind(unit)
@@ -2465,20 +2477,25 @@ def main(argv=None) -> None:
             for hemisphere in (0, 1):       # far side first, then the near side over it
                 gl.glUniform1i(loc(prog_bg, "uPass"), hemisphere)
                 gl.glDrawArrays(gl.GL_TRIANGLES, 0, bg_count)
+        def draw_shell(half):
+            """One hemisphere of the shell: 0 the far side (behind the core), 1 the near side (over it)."""
+            if state["lines"]:
+                draw_edges(shell_pairs_tb, shell_color_tb, len(er) + len(csrc), state["lalpha"],
+                           glow_mode=1, glow_edges=len(er), half=half)
+            if state["pick"] >= 0 and pick_edges:
+                draw_edges(pick_pairs_tb, pick_color_tb, pick_edges, 0.9, half=half)
+            if state["points"]:
+                draw_nodes(nc, n, half=half)
+
+        draw_shell(0)                                   # the far side of the shell, behind the core
         if state["core"] and nc:
-            # the process graph inside: over the translucent near hemisphere, under the shell
+            # the process graph inside: over the far shell, under the near shell
             draw_edges(core_pairs_tb, core_color_tb, len(world.core_src), min(1.0, state["lalpha"] * 1.4),
                        glow_mode=2, glow_edges=len(world.core_src))
             draw_nodes(0, nc)
             if n_pinned:                                # core -> shell identity pins
                 draw_edges(pin_pairs_tb, pin_color_tb, n_pinned, 1.0, arc=0)
-        if state["lines"]:
-            draw_edges(shell_pairs_tb, shell_color_tb, len(er) + len(csrc), state["lalpha"],
-                       glow_mode=1, glow_edges=len(er))
-        if state["pick"] >= 0 and pick_edges:
-            draw_edges(pick_pairs_tb, pick_color_tb, pick_edges, 0.9)
-        if state["points"]:
-            draw_nodes(nc, n)
+        draw_shell(1)                                   # the near side over it
         if state["pick"] >= 0:
             draw_nodes(nc + state["pick"], 1, ((1, 1, 1, 1), (0, 0, 0, 0), 2.2))
         if 0 <= state["pick_core"] < nc and state["core"]:
