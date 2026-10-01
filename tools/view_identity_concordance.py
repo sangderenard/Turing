@@ -1524,18 +1524,129 @@ void main() {
   fragColor = vec4(col, mix(0.70, 0.24, vBack));
 }
 """
+# The HUD is instanced quads, one per glyph or shape, drawn by one shader:
+# a glyph samples the font atlas (rasterized once at startup), a solid quad is
+# filled, a ring is shaped, and the focus legend's gradient is computed per
+# pixel from the same formulas the node colours use.  The CPU lays the text
+# out (which glyph goes where); it paints no pixel.
 HUD_VERT = """#version 330 core
-layout(location=0) in vec2 pos;
-layout(location=1) in vec2 uv;
+uniform samplerBuffer uInst;     // 3 texels per quad: (x, y, w, h) px, (u0, v0, u1, v1) or kind, rgba
+uniform vec2 uScreen;
 out vec2 vUv;
-void main() { gl_Position = vec4(pos, 0.0, 1.0); vUv = uv; }
+out vec2 vLocal;
+out vec4 vCol;
+out vec2 vSize;
+flat out float vKind;
+void main() {
+  int q = gl_VertexID / 6;
+  int k = gl_VertexID - 6 * q;
+  vec2 corner = (k == 0) ? vec2(0, 0) : (k == 1) ? vec2(1, 0) : (k == 2) ? vec2(1, 1)
+              : (k == 3) ? vec2(0, 0) : (k == 4) ? vec2(1, 1) : vec2(0, 1);
+  vec4 rect = texelFetch(uInst, 3 * q);
+  vec4 uv = texelFetch(uInst, 3 * q + 1);
+  vCol = texelFetch(uInst, 3 * q + 2);
+  vec2 px = rect.xy + corner * rect.zw;
+  vLocal = corner;
+  vSize = rect.zw;
+  vKind = uv.x < 0.0 ? uv.x : 0.0;
+  vUv = mix(uv.xy, uv.zw, corner);
+  gl_Position = vec4(px.x / uScreen.x * 2.0 - 1.0, 1.0 - px.y / uScreen.y * 2.0, 0.0, 1.0);
+}
 """
 HUD_FRAG = """#version 330 core
 in vec2 vUv;
-uniform sampler2D uTex;
+in vec2 vLocal;
+in vec4 vCol;
+in vec2 vSize;
+flat in float vKind;
+uniform sampler2D uAtlas;
+uniform int uLegendHeat;         // legend: 1 diffusion (history | consequence), 0 hop gradient
+uniform float uDepth;
 out vec4 fragColor;
-void main() { fragColor = texture(uTex, vUv); }
+const vec3 NEUTRAL = @NEUTRAL@;
+const vec3 HISTORY = @HISTORY@;
+const vec3 CONSEQUENCE = @CONSEQUENCE@;
+const vec3 COOL_N = @COOL_NEAR@;
+const vec3 COOL_F = @COOL_FAR@;
+const vec3 WARM_N = @WARM_NEAR@;
+const vec3 WARM_F = @WARM_FAR@;
+void main() {
+  if (vKind > -0.5) {                              // glyph
+    fragColor = vec4(vCol.rgb, vCol.a * texture(uAtlas, vUv).a);
+  } else if (vKind > -1.5) {                       // solid
+    fragColor = vCol;
+  } else if (vKind > -2.5) {                       // ring, 2 px wide
+    vec2 d = (vLocal - 0.5) * vSize;
+    float r = length(d), outer = 0.5 * min(vSize.x, vSize.y);
+    float a = smoothstep(outer + 0.5, outer - 0.5, r) * smoothstep(outer - 2.5, outer - 1.5, r);
+    fragColor = vec4(vCol.rgb, vCol.a * a);
+  } else {                                         // legend gradient, -1 sources ... +1 builders
+    float v = vLocal.x * 2.0 - 1.0;
+    vec3 col;
+    if (abs(v) < 0.02) {
+      col = vec3(1.0);
+    } else if (uLegendHeat == 1) {
+      float f = pow(min(1.0, abs(v)), 0.6);
+      col = mix(NEUTRAL, v < 0.0 ? HISTORY : CONSEQUENCE, f);
+    } else {
+      float f = clamp(1.0 - (abs(v) * uDepth - 1.0) / max(uDepth, 1.0), 0.0, 1.0);
+      col = v < 0.0 ? mix(COOL_F, COOL_N, f) : mix(WARM_F, WARM_N, f);
+    }
+    fragColor = vec4(col, 1.0);
+  }
+}
 """
+for _name, _value in (("@NEUTRAL@", NEUTRAL_RGB), ("@HISTORY@", HISTORY_RGB), ("@CONSEQUENCE@", CONSEQUENCE_RGB),
+                      ("@COOL_NEAR@", COOL_NEAR), ("@COOL_FAR@", COOL_FAR),
+                      ("@WARM_NEAR@", WARM_NEAR), ("@WARM_FAR@", WARM_FAR)):
+    HUD_FRAG = HUD_FRAG.replace(_name, "vec3(%s)" % ", ".join(f"{float(x):.4f}" for x in _value))
+HUD_SOLID, HUD_RING, HUD_LEGEND = -1.0, -2.0, -3.0
+
+
+class GlyphAtlas:
+    """Printable ASCII of each font size rasterized once into one atlas; text is
+    laid out from its metrics and drawn as glyph quads by the HUD shader."""
+
+    def __init__(self, pygame, sizes):
+        self.height, self.glyph = {}, {}
+        images = []
+        for size in sizes:
+            font = pygame.font.Font(None, size)
+            self.height[size] = font.get_height()
+            for code in range(32, 127):
+                surface = font.render(chr(code), True, (255, 255, 255))
+                images.append((size, chr(code), surface.get_width(), surface.get_height(),
+                               pygame.image.tostring(surface, "RGBA")))
+        width, x, y, row = 1024, 0, 0, 0
+        placed = []
+        for size, ch, w, h, raw in images:
+            if x + w > width:
+                x, y, row = 0, y + row + 1, 0
+            placed.append((size, ch, x, y, w, h, raw))
+            x, row = x + w + 1, max(row, h)
+        height = 1 << max(4, (y + row).bit_length())
+        self.pixels = np.zeros((height, width, 4), np.uint8)
+        for size, ch, gx, gy, w, h, raw in placed:
+            self.pixels[gy:gy + h, gx:gx + w] = np.frombuffer(raw, np.uint8).reshape(h, w, 4)
+            self.glyph[(size, ch)] = (gx / width, gy / height, (gx + w) / width, (gy + h) / height, w, h)
+        self.size = (width, height)
+
+    def width(self, text, size):
+        return sum(self.glyph.get((size, ch), self.glyph[(size, "?")])[4] for ch in text)
+
+    def emit(self, out, text, x, y, size, rgb, alpha=1.0):
+        """Append one quad per glyph of ``text`` at pixel (x, y), top-left."""
+        r, g, b = (float(c) for c in rgb)
+        for ch in text:
+            u0, v0, u1, v1, w, h = self.glyph.get((size, ch), self.glyph[(size, "?")])
+            if ch != " ":
+                out.append((x, y, w, h, u0, v0, u1, v1, r, g, b, alpha))
+            x += w
+        return x
+
+
+def hud_quad(out, x, y, w, h, kind, rgb=(1, 1, 1), alpha=1.0):
+    out.append((x, y, w, h, kind, 0, 0, 0, *(float(c) for c in rgb), alpha))
 
 
 def perspective(fov, aspect, near, far):
@@ -1775,8 +1886,16 @@ def main(argv=None) -> None:
     pygame.display.set_caption("identity concordance")
 
     def program(vs, fs):
-        return compileProgram(compileShader(vs, gl.GL_VERTEX_SHADER),
-                              compileShader(fs, gl.GL_FRAGMENT_SHADER))
+        # Linked without compileProgram's validation: validation runs before
+        # the sampler uniforms are assigned (they all default to unit 0), and
+        # buffer and 2-D samplers on one unit fail it.  Units are set per draw.
+        prog = gl.glCreateProgram()
+        for source, stage in ((vs, gl.GL_VERTEX_SHADER), (fs, gl.GL_FRAGMENT_SHADER)):
+            gl.glAttachShader(prog, compileShader(source, stage))
+        gl.glLinkProgram(prog)
+        if gl.glGetProgramiv(prog, gl.GL_LINK_STATUS) != gl.GL_TRUE:
+            raise RuntimeError(f"shader link failed: {gl.glGetProgramInfoLog(prog)!r}")
+        return prog
 
     prog_point, prog_line, prog_hud = program(NODE_VERT, FRAG_POINT), program(LINE_VERT, FRAG_LINE), program(HUD_VERT, HUD_FRAG)
     prog_bg = program(BG_VERT, BG_FRAG)
@@ -1859,19 +1978,20 @@ def main(argv=None) -> None:
         alpha, radius = world.glow()
         glow_tb.set(np.stack([alpha, radius], axis=1))
 
-    # HUD: a pygame-rendered surface on a screen quad, as SpeciesHud does
-    hud_vao = gl.glGenVertexArrays(1); hud_vbo = gl.glGenBuffers(1)
-    quad = np.array([-1, -1, 0, 0, 1, -1, 1, 0, -1, 1, 0, 1, 1, 1, 1, 1], np.float32)
-    gl.glBindVertexArray(hud_vao); gl.glBindBuffer(gl.GL_ARRAY_BUFFER, hud_vbo)
-    gl.glBufferData(gl.GL_ARRAY_BUFFER, quad.nbytes, quad, gl.GL_STATIC_DRAW)
-    gl.glEnableVertexAttribArray(0); gl.glVertexAttribPointer(0, 2, gl.GL_FLOAT, False, 16, ctypes.c_void_p(0))
-    gl.glEnableVertexAttribArray(1); gl.glVertexAttribPointer(1, 2, gl.GL_FLOAT, False, 16, ctypes.c_void_p(8))
-    gl.glBindVertexArray(0)
-    hud_tex = gl.glGenTextures(1)
-    gl.glBindTexture(gl.GL_TEXTURE_2D, hud_tex)
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
-    font = pygame.font.Font(None, 22)
+    # HUD: glyph and shape quads from one instance buffer, glyphs from the atlas
+    HUD_BIG, HUD_SMALL = 22, 19
+    atlas = GlyphAtlas(pygame, (HUD_BIG, HUD_SMALL))
+    atlas_tex = gl.glGenTextures(1)
+    gl.glActiveTexture(gl.GL_TEXTURE0)
+    gl.glBindTexture(gl.GL_TEXTURE_2D, atlas_tex)
+    gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, atlas.size[0], atlas.size[1], 0,
+                    gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, np.ascontiguousarray(atlas.pixels))
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
+    hud_tb = TexBuf(gl.GL_RGBA32F, 4, np.float32)
+    hud_quads = [0]
+    hud_legend = [0, float(args.depth)]
 
     # background: the time field on a (u, v) sphere mesh, translucent both faces
     nu, nv = 128, 64
@@ -2020,7 +2140,7 @@ def main(argv=None) -> None:
     page_rgb = _hue_table(len(pages))
 
     def draw_hud(w, h):
-        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        quads = []
         lines = [(f"identity concordance   color: {MODES[state['mode']]}   "
                   f"{int((kind == 0).sum())} rows  {int((kind == 1).sum())} ids  {len(er)} lines   "
                   f"physics {'ON' if state['physics'] else 'off'}  |T-t| {state['error']:.3f}   "
@@ -2084,18 +2204,17 @@ def main(argv=None) -> None:
         for text, color in lines:
             if not text:
                 y += 8; continue
-            img = font.render(text, True, color)
-            surf.blit(img, (8, y)); y += img.get_height() + 1
+            atlas.emit(quads, text, 8, y, HUD_BIG, [c / 255.0 for c in color])
+            y += atlas.height[HUD_BIG] + 1
         if focus:
-            draw_focus_labels(surf, w, h, focus)
+            draw_focus_labels(quads, w, h, focus)
         if not focus:
-         surf.blit(font.render("drag turns sphere | rmb pan | wheel zoom | F view | T front | M mass | O order | K core | 1-5 color | SPACE physics | R reset | B bg | G animate | L P lines/points | PgUp/Dn page | C focus | D diffuse | H hud", True, (150, 150, 160)), (8, h - 22))
-        data = pygame.image.tostring(surf, "RGBA", True)
-        gl.glBindTexture(gl.GL_TEXTURE_2D, hud_tex)
-        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
-        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, w, h, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, data)
+            atlas.emit(quads, "drag turns sphere | rmb pan | wheel zoom | F view | T front | M mass | O order | K core | 1-5 color | SPACE physics | R reset | B bg | G animate | L P lines/points | PgUp/Dn page | C focus | D diffuse | H hud",
+                       8, h - 22, HUD_BIG, (150 / 255, 150 / 255, 160 / 255))
+        hud_tb.set(np.asarray(quads, np.float32).reshape(-1, 4) if quads else np.zeros((3, 4), np.float32))
+        hud_quads[0] = len(quads)
 
-    def draw_focus_labels(surf, w, h, focus):
+    def draw_focus_labels(quads, w, h, focus):
         hops = focus["hops"]
         rgba = focus["fx"]["rgba"]
         mvp = state["mvp"]
@@ -2112,8 +2231,7 @@ def main(argv=None) -> None:
             score = heat + np.where(focus["fx"]["reached_unsourced"], 0.5, 0.0)
             order = [i for i in np.argsort(-score, kind="stable")
                      if score[i] > 0.02 and ok[i] and facing[i] > -0.1][: args.max_labels]
-        small = pygame.font.Font(None, 19)
-        taken = [pygame.Rect(0, 0, 330, 60)]                  # the title block
+        taken = [pygame.Rect(0, 0, 330, 60)]                  # the title block (layout only)
         for i in order:
             if np.isfinite(hops[i]):
                 hop = int(hops[i])
@@ -2125,8 +2243,8 @@ def main(argv=None) -> None:
             elif heat is not None and graph["node_prov"][i] == PROV_MINT:
                 tag += " MINT"
             text = f"{tag} {str(graph['label'][i])[:56]}"
-            color = tuple(int(255 * c) for c in rgba[i, :3])
-            width, height = small.size(text)
+            color = rgba[i, :3]
+            width, height = atlas.width(text, HUD_SMALL), atlas.height[HUD_SMALL]
             for dx, dy in ((9, -height - 3), (9, 3), (-width - 9, -height - 3), (-width - 9, 3),
                            (9, -height // 2), (-width - 9, -height // 2), (-width // 2, -height - 12),
                            (-width // 2, 10)):
@@ -2134,43 +2252,29 @@ def main(argv=None) -> None:
                 if rect.left >= 0 and rect.right <= w and rect.top >= 0 and rect.bottom <= h - 60 \
                         and rect.collidelist(taken) < 0:
                     taken.append(rect.inflate(4, 2))
-                    surf.blit(small.render(text, True, (8, 10, 14)), (rect.x + 1, rect.y + 1))
-                    surf.blit(small.render(text, True, color), rect.topleft)
+                    atlas.emit(quads, text, rect.x + 1, rect.y + 1, HUD_SMALL, (8 / 255, 10 / 255, 14 / 255))
+                    atlas.emit(quads, text, rect.x, rect.y, HUD_SMALL, color)
                     break
-        # legend: the gradient the colours are read against
+        # legend: the gradient the colours are read against (computed in the HUD shader)
         bar = pygame.Rect(w // 2 - 260, h - 46, 520, 12)
-        for k in range(bar.width):
-            v = (k / (bar.width - 1)) * 2 - 1                # -1 sources ... +1 builders
-            if heat is not None:                             # divergent: history | neutral | consequence
-                f = min(1.0, abs(v)) ** 0.6
-                col = NEUTRAL_RGB * (1.0 - f) + (HISTORY_RGB if v < 0 else CONSEQUENCE_RGB) * f
-                if abs(v) < 0.02:
-                    col = (1.0, 1.0, 1.0)
-            else:
-                f = 1.0 - (abs(v) * args.depth - 1.0) / max(args.depth, 1) if abs(v) > 0 else 1.0
-                f = max(0.0, min(1.0, f))
-                if abs(v) < 0.02:
-                    col = (1.0, 1.0, 1.0)
-                elif v < 0:
-                    col = COOL_FAR + (COOL_NEAR - COOL_FAR) * f
-                else:
-                    col = WARM_FAR + (WARM_NEAR - WARM_FAR) * f
-            pygame.draw.line(surf, tuple(int(255 * c) for c in col), (bar.x + k, bar.y), (bar.x + k, bar.bottom))
+        hud_quad(quads, bar.x, bar.y, bar.width, bar.height, HUD_LEGEND)
+        hud_legend[0], hud_legend[1] = (1 if heat is not None else 0), float(args.depth)
+
+        def label(text, x, y, rgb):
+            atlas.emit(quads, text, x, y, HUD_SMALL, [c / 255.0 for c in rgb])
+
         if heat is not None:
-            surf.blit(small.render("history (hot = near)", True, (150, 200, 235)), (bar.x, bar.bottom + 3))
-            surf.blit(small.render("this node", True, (255, 255, 255)), (bar.centerx - 26, bar.bottom + 3))
-            surf.blit(small.render("consequence (hot = near)", True, (255, 190, 120)), (bar.right - 160, bar.bottom + 3))
-            swatch = pygame.Rect(bar.right + 24, bar.y, 12, 12)
-            pygame.draw.rect(surf, tuple(int(255 * c) for c in UNSOURCED_RGB), swatch)
-            surf.blit(small.render("unsourced (flow dies)", True, (235, 150, 150)), (swatch.right + 4, swatch.y - 2))
-            ring = pygame.Rect(bar.right + 24, bar.y + 16, 12, 12)
-            pygame.draw.ellipse(surf, tuple(int(255 * c) for c in MINT_RING_RGB), ring, 2)
-            surf.blit(small.render("mint (ring)", True, (170, 235, 180)), (ring.right + 4, ring.y - 2))
+            label("history (hot = near)", bar.x, bar.bottom + 3, (150, 200, 235))
+            label("this node", bar.centerx - 26, bar.bottom + 3, (255, 255, 255))
+            label("consequence (hot = near)", bar.right - 160, bar.bottom + 3, (255, 190, 120))
+            hud_quad(quads, bar.right + 24, bar.y, 12, 12, HUD_SOLID, UNSOURCED_RGB)
+            label("unsourced (flow dies)", bar.right + 40, bar.y - 2, (235, 150, 150))
+            hud_quad(quads, bar.right + 24, bar.y + 16, 12, 12, HUD_RING, MINT_RING_RGB)
+            label("mint (ring)", bar.right + 40, bar.y + 14, (170, 235, 180))
         else:
-            surf.blit(small.render(f"sources (past)  -{args.depth}", True, (150, 200, 235)), (bar.x, bar.bottom + 3))
-            surf.blit(small.render("this node", True, (255, 255, 255)), (bar.centerx - 26, bar.bottom + 3))
-            surf.blit(small.render(f"+{args.depth}  built on it (future)", True, (255, 190, 120)),
-                      (bar.right - 150, bar.bottom + 3))
+            label(f"sources (past)  -{args.depth}", bar.x, bar.bottom + 3, (150, 200, 235))
+            label("this node", bar.centerx - 26, bar.bottom + 3, (255, 255, 255))
+            label(f"+{args.depth}  built on it (future)", bar.right - 150, bar.bottom + 3, (255, 190, 120))
 
     def pick_at(mx, my, mvp, w, h):
         clip = np.concatenate([pos, np.ones((n, 1), np.float32)], axis=1) @ mvp.T.astype(np.float32)
@@ -2316,11 +2420,16 @@ def main(argv=None) -> None:
             if state["hud_dirty"]:
                 draw_hud(w, h); state["hud_dirty"] = False
             gl.glUseProgram(prog_hud)
-            gl.glUniform1i(loc(prog_hud, "uTex"), 0)
             gl.glActiveTexture(gl.GL_TEXTURE0)
-            gl.glBindTexture(gl.GL_TEXTURE_2D, hud_tex)
-            gl.glBindVertexArray(hud_vao)
-            gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, atlas_tex)
+            gl.glUniform1i(loc(prog_hud, "uAtlas"), 0)
+            hud_tb.bind(1)
+            gl.glUniform1i(loc(prog_hud, "uInst"), 1)
+            gl.glUniform2f(loc(prog_hud, "uScreen"), float(w), float(h))
+            gl.glUniform1i(loc(prog_hud, "uLegendHeat"), int(hud_legend[0]))
+            gl.glUniform1f(loc(prog_hud, "uDepth"), float(hud_legend[1]))
+            gl.glBindVertexArray(empty_vao)
+            gl.glDrawArrays(gl.GL_TRIANGLES, 0, 6 * hud_quads[0])
         gl.glBindVertexArray(0)
     if focus_jobs:                                  # batch: one image per node, then done
         out_dir = Path(args.out)
