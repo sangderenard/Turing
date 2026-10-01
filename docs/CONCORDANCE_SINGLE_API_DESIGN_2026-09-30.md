@@ -322,3 +322,29 @@ rooted DERIVED chain from its AST span to its return-site state rows.
    write in that arm (the arm cell is the entered cell); refuse with
    `Unresolved(ARM_VERSION_MISSING)` only when the book records a version for
    the arm and the builder cannot find it. Never refuse the scope ladder.
+
+## 8. Visualizer intent (user, 2026-10-01)
+
+When provenance is smooth and complete from process graph to artifact, the
+concordance represents the actual transformation all the way to artifact
+output, and the globe viewer (`tools/view_identity_concordance.py`) shows it
+radially:
+
+- **center: meaning** -- the process graph (the core inside the sphere). The
+  control graph is interdependent with it and will be folded in much later;
+  for now the process graph alone is right.
+- **shell: transformation** -- the concordance on the sphere surface.
+- **hyperbolic boundary: realization** -- the artifact endpoints (emission
+  units, functions, artifacts from step 9 Part B: EMISSION_UNIT /
+  EMISSION_FUNCTION / EMISSION_ARTIFACT) placed on a ring representing the
+  display's hyperbolic boundary, an infinity around the edge of the screen,
+  organized clockwise, each holding edges back to the sphere-surface cells
+  they came from. Hyperbolic area grows toward the ring, so a large emitted
+  product fits where lowering expands a compact program.
+
+Keep an explicit edge from the last compiler state to the emitted unit (the
+emission row's DERIVED edge), never merge the two: it marks exactly where
+compiler provenance ends and artifact identity begins. Optional later: a
+second, native position per emitted unit (the product's own dependency
+graph, relaxed outside), joined to its ring position, to show compiler
+history against product structure.
