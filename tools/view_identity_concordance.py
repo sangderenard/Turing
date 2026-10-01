@@ -106,10 +106,6 @@ writes the extracted graph so ``--graph`` reopens it with no compiler import.
                rest length (the yank), its nodes glow larger, then relax --
                read straight off the spring state (glow, rest lengths), so
                the twitch is the compile order and it perturbs the physics
-    N: node forces  none -> full -> top-k   (``--repulsion``, ``--repulse-k``)
-        the repulsion, the one force not carried by an edge: off, every
-        same-network pair (the N x N sum), or each node's k nearest
-        same-network nodes, re-chosen from the positions every evaluation
     C: causal focus on the picked point (again to leave)
     D: colormap diffusion from the picked/focused point (toggle; ``--diffuse``)
         heat spreads from the point over the causal edges, forward along them
@@ -952,8 +948,7 @@ class World:
     causal edges and the core's edges, strong) and its nodes glow.
     """
 
-    def __init__(self, graph, shell_pos, flow_seconds=16.0, tile_bytes=512 * 2 ** 20,
-                 repulsion="full", repulse_k=16):
+    def __init__(self, graph, shell_pos, flow_seconds=16.0, tile_bytes=512 * 2 ** 20):
         from src.computational_world.spring import BoundSpringParameters
         self._params_cls = BoundSpringParameters
         self.graph = graph
@@ -989,8 +984,7 @@ class World:
         self.cycle_period = flow_seconds / FLOW_GROUPS
         shared = dict(k_stretch=SPRING_K, c_repulse=SPRING_REPULSE, damping=SPRING_DAMPING, growth_rate=0.0,
                       relax_rate=0.12, cycle_period=self.cycle_period, nominal_dt=1.0 / 60.0,
-                      glow_rise=0.5, glow_decay=0.08, force_tile_bytes=int(tile_bytes),
-                      repulsion=repulsion, repulse_k=int(repulse_k))
+                      glow_rise=0.5, glow_decay=0.08, force_tile_bytes=int(tile_bytes))
         # Contraction is legacy per-nominal-step: each step the active group's rest
         # length loses base * (1 - target) and relaxes back toward base by
         # relax_rate, so a group active for many frames settles at
@@ -1047,22 +1041,6 @@ class World:
 
     def set_flow(self, flow: bool):
         self.world.spring_parameters = self.yank if flow else self.quiet
-
-    def set_repulsion(self, mode: str):
-        """Node forces (BoundSpringParameters.repulsion): none, full N x N, or top-k nearest."""
-        import dataclasses
-        flow = self.world.spring_parameters is self.yank
-        self.yank = dataclasses.replace(self.yank, repulsion=mode)
-        self.quiet = dataclasses.replace(self.quiet, repulsion=mode)
-        self.set_flow(flow)
-
-    @property
-    def repulsion(self):
-        return self.quiet.repulsion
-
-    def repulsion_name(self):
-        cfg = self.quiet
-        return f"top-{cfg.repulse_k}" if cfg.repulsion == "topk" else cfg.repulsion
 
     def step(self, dt, external=None):
         """One frame: the host force layer, then the managed window [t, t + dt]."""
@@ -1184,8 +1162,6 @@ class PhysicsThread(threading.Thread):
                     self.order_on = bool(value)
                 elif name == "flow":
                     self.world.set_flow(bool(value))
-                elif name == "repulsion":
-                    self.world.set_repulsion(value)
                 elif name == "reset":
                     self.world.reset()
                     self.world.set_flow(bool(value))
@@ -1860,10 +1836,6 @@ def main(argv=None) -> None:
     ap.add_argument("--tile-mb", type=float, default=512.0,
                     help="memory one tile of the spring force assembly may hold (BoundSpringParameters."
                          "force_tile_bytes); larger tiles are faster, smaller ones fit smaller devices")
-    ap.add_argument("--repulsion", choices=("none", "full", "topk"), default="full",
-                    help="node forces, the repulsion not carried by an edge (BoundSpringParameters.repulsion): "
-                         "none, every same-network pair (N x N), or each node's --repulse-k nearest; key N cycles")
-    ap.add_argument("--repulse-k", type=int, default=16, help="neighbours per node for --repulsion topk")
     ap.add_argument("--flow-seconds", type=float, default=16.0, help="one sweep of the activation cycle through all groups")
     ap.add_argument("--drift", action="store_true",
                     help="start with the world running (Space toggles it): the points drift and the "
@@ -1940,8 +1912,8 @@ def main(argv=None) -> None:
         from src.common.tensors.abstraction import AbstractTensor
         AbstractTensor.set_default_backend(args.backend or "numpy", args.device)
     world = World(graph, SphereMap.sphere(plan.u0) * SHELL_RADIUS, flow_seconds=args.flow_seconds,
-                  tile_bytes=int(args.tile_mb * 2 ** 20), repulsion=args.repulsion, repulse_k=args.repulse_k)
-    print(f"world physics on {world.backend_name()}, node forces {world.repulsion_name()}", flush=True)
+                  tile_bytes=int(args.tile_mb * 2 ** 20))
+    print(f"world physics on {world.backend_name()}", flush=True)
     pos, core_pos = world.positions()
     pos, core_pos = pos.copy(), core_pos.copy()
     t_shell = graph["t"].astype(np.float64)
@@ -2129,7 +2101,7 @@ def main(argv=None) -> None:
     state = dict(mode=0, isolate=-1, lines=True, points=True, psize=7.0, lalpha=0.35,
                  hud=True, bg=True, physics=bool(args.drift), error=0.0, pick=-1, dirty=True, hud_dirty=True, drag=None, moved=False, last_motion=0.0,
                  anim=args.anim, anim_t0=time.time(), speed=1.0, front=-1, focus=None, diffuse=bool(args.diffuse),
-                 order=True, core=True, pick_core=-1, repulsion=args.repulsion)
+                 order=True, core=True, pick_core=-1)
     world.set_flow(args.anim == "flow")
     if args.bare:
         state["lines"] = state["points"] = False
@@ -2248,7 +2220,6 @@ def main(argv=None) -> None:
                  (f"world [{world.backend_name()}] on its own thread: t {snap['t']:6.2f}s   last frame {snap['accepted']} admitted dt, {snap['rejected']} rejected   "
                   f"physics {physics.frames} frames ({physics.frames / max(physics.busy, 1e-9):.1f}/s busy)   "
                   f"order force {'ON' if state['order'] and args.order_gain > 0 else 'off'} (gain {args.order_gain:g}, mean |F| {snap['ext_mean']:.3f})   "
-                  f"node forces {world.repulsion_name()}   "
                   f"core {world.n_core} nodes {len(world.core_src)} edges {'shown' if state['core'] else 'hidden'}, "
                   f"core pinned {n_pinned}/{world.n_core}   "
                   f"group {snap['group']}/{FLOW_GROUPS}",
@@ -2309,7 +2280,7 @@ def main(argv=None) -> None:
         if focus:
             draw_focus_labels(quads, w, h, focus)
         if not focus:
-            atlas.emit(quads, "drag turns sphere | rmb pan | wheel zoom | F view | T front | M mass | O order | N node forces | K core | 1-5 color | SPACE physics | R reset | B bg | G animate | L P lines/points | PgUp/Dn page | C focus | D diffuse | H hud",
+            atlas.emit(quads, "drag turns sphere | rmb pan | wheel zoom | F view | T front | M mass | O order | K core | 1-5 color | SPACE physics | R reset | B bg | G animate | L P lines/points | PgUp/Dn page | C focus | D diffuse | H hud",
                        8, h - 22, HUD_BIG, (150 / 255, 150 / 255, 160 / 255))
         hud_tb.set(np.asarray(quads, np.float32).reshape(-1, 4) if quads else np.zeros((3, 4), np.float32))
         hud_quads[0] = len(quads)
@@ -2613,11 +2584,6 @@ def main(argv=None) -> None:
                 elif k == pygame.K_t: camera.front()
                 elif k == pygame.K_m: camera.mass = not camera.mass; state["hud_dirty"] = True
                 elif k == pygame.K_h: state["hud"] = not state["hud"]
-                elif k == pygame.K_n:
-                    modes = ("none", "full", "topk")
-                    state["repulsion"] = modes[(modes.index(state["repulsion"]) + 1) % len(modes)]
-                    physics.command("repulsion", state["repulsion"])
-                    state["hud_dirty"] = True
                 elif k == pygame.K_c:
                     set_focus(None if state["focus"] else (state["pick"] if state["pick"] >= 0 else None))
                 elif k == pygame.K_d:
