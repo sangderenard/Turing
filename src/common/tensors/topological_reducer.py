@@ -2693,6 +2693,77 @@ def fork_read_scope(graph: Any, cause: str) -> None:
         graph_data["operand_position_scope"] = forked
 
 
+def fork_operand_position_scope(graph: Any, members: Any, cause: str) -> None:
+    """Give an extracted subgraph its own operand-position scope.
+
+    A subgraph copied out of a source graph (``copy.copy`` + ``subgraph``)
+    inherits the source's metadata, so its operand rewrites would post into
+    the SOURCE graph's operand-position scope: the function-subgraph filter
+    retired the source's rows for positions the source still has.  One
+    operand table written by two graphs is one identity with two writers.
+
+    As ``fork_read_scope`` forks a read scope: a scope is minted by the
+    book, every operand-position row (``identity_transition`` and the
+    position-keyed pages) whose consumer is one of ``members`` is copied
+    under it DERIVED from the cell it copies (stage FUNCTION_SUBGRAPH), and
+    the fork's origin is posted on ``scope_origin`` DERIVED from the source
+    scope's registry cell.  The subgraph then names the fork; the source's
+    rows are never written by the subgraph again.
+    """
+
+    graph_data = graph.G.graph
+    source = _operand_position_scope(graph)
+    if source is None:
+        return
+    from ...compiler.concordance_declarations import (
+        IDENTITY_TRANSITION, SCOPE_ORIGIN, SCOPE_REGISTRY, ScopeFork,
+    )
+
+    members = set(members)
+    book = current_identity_book()
+    forked = book.mint_scope(f"{source[0]}|operands", _FUNCTION_SUBGRAPH)
+    registered = book.registry.pages
+    for name in (
+        IDENTITY_TRANSITION.name,
+        *_OPERAND_POSITION_ROW_PAGES,
+        *_OPERAND_POSITION_FACT_PAGES,
+    ):
+        page = book.pages.get(name)
+        if page is None:
+            continue
+        declared = registered.get(name)
+        for row in tuple(page.scope_rows(source)):
+            if len(row) < 2 or row[1] not in members:
+                continue
+            fact = page.latest(row)
+            if fact is None:
+                continue
+            if declared is None or not (
+                isinstance(fact, _Unresolved)
+                or isinstance(fact, declared.fact_type)
+            ):
+                # A page whose writer still writes raw facts is copied
+                # through the raw primitive, as ``fork_read_scope`` does.
+                page.set((forked, *row[1:]), 0, fact)
+                continue
+            book.post(
+                declared, (forked, *row[1:]), fact, stage=_FUNCTION_SUBGRAPH,
+                provenance=_Derived((book.latest_ref(declared, row),)),
+                mode=_Mode.CONCORD,
+            )
+    source_cell = book.latest_ref(SCOPE_REGISTRY, source)
+    book.post(
+        SCOPE_ORIGIN, (forked,), ScopeFork(source, str(cause)),
+        stage=_FUNCTION_SUBGRAPH,
+        provenance=(
+            _Derived((source_cell,)) if source_cell is not None
+            else _Unsourced(_SYNTHESIZED_NO_SOURCE)
+        ),
+        mode=_Mode.CONCORD,
+    )
+    graph_data["operand_position_scope"] = forked
+
+
 def _append_operand(graph: Any, node_id: Any, parent: Any, role: str) -> None:
     """Append one operand through ``_set_operands`` unless already present.
 
@@ -3313,6 +3384,10 @@ def _normalize_lexical_values(
         f"lexical_reads:{value_class_scope}"
     )
     ingestion_read_scope = (read_scope, "ingestion")
+    # The operand-position scope the graph arrived with: an extracted
+    # subgraph's own fork (``fork_operand_position_scope``), else the build
+    # scope.  The canonical relabel continues ITS rows, not the source's.
+    entry_operand_scope = graph.G.graph.get("operand_position_scope")
     # Operand-position facts are keyed in the ingestion scope until canonical
     # renumbering; ``_set_operands`` moves them with every operand rewrite.
     graph.G.graph["operand_position_scope"] = ingestion_read_scope
@@ -8406,8 +8481,9 @@ def _normalize_lexical_values(
             )
     # Step 9 (plan 100, 1.1): the operand-position rows follow their
     # consumers into canonical ids, so the canonical graph's edges are the
-    # latest ``identity_transition`` facts under its own scope.  The build
-    # scope's rows (``ProcessGraph.connect``'s Appends) first, then this
+    # latest ``identity_transition`` facts under its own scope.  The scope
+    # the graph arrived with first (an extracted subgraph's own fork of the
+    # build scope's ``ProcessGraph.connect`` Appends), then this
     # reduction's rewrites, which supersede them; each canonical row is
     # DERIVED from the row it continues.  A fact naming an id that left the
     # graph has no canonical spelling and stays where it is.
@@ -8420,7 +8496,10 @@ def _normalize_lexical_values(
     )
     transition_page = book.page(_IDENTITY_TRANSITION_PAGE)
     for transition_scope in dict.fromkeys(
-        tuple(scope) for scope in (build_scope, ingestion_read_scope)
+        tuple(scope)
+        for scope in (
+            entry_operand_scope or build_scope, ingestion_read_scope,
+        )
         if scope is not None
     ):
         for row in tuple(transition_page.scope_rows(transition_scope)):
@@ -12055,6 +12134,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         }
         function_graph = copy.copy(graph)
         function_graph.G = graph.G.subgraph(included).copy()
+        # The subgraph's operand rewrites (parameter Inputs, the filter
+        # below) post into its own scope, forked from the source's rows.
+        fork_operand_position_scope(
+            function_graph, included, "function_subgraph",
+        )
         # Extraction decisions are occurrence contracts, not merely a root-
         # graph audit log.  Several reducer rewrites rebuild a Call node's
         # attributes while preserving its source AST identity; the global
