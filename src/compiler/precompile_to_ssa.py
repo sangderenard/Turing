@@ -4196,6 +4196,31 @@ class _ControlSSABuilder:
             )
         return cells
 
+    def _recorded_name_write(self, value_id: int) -> bool:
+        """Whether the book records an authored write producing ``value_id``:
+        a ``name_binding`` row under the read scope whose fact names it.
+
+        This is the record decision 7.2 asks for: an arm id with no such
+        row is not a write the arm made (a merge node, a planner alias), so
+        the arm takes the entered version; an arm id with one and no
+        binding in this lowering is a version the builder cannot find.
+        """
+
+        if self.lexical_read_scope is None:
+            return False
+        recorded = getattr(self, "_authored_write_ids", None)
+        if recorded is None:
+            recorded = set()
+            page = self._book().pages.get(NAME_BINDING.name)
+            if page is not None:
+                for row in page.scope_rows(self.lexical_read_scope):
+                    fact = page.latest(row)
+                    value = getattr(fact, "value_id", None)
+                    if value is not None and getattr(fact, "authored", True):
+                        recorded.add(int(value))
+            self._authored_write_ids = recorded
+        return int(value_id) in recorded
+
     def _carried_name_arm(
         self,
         arm_id: Any,
@@ -4225,6 +4250,12 @@ class _ControlSSABuilder:
         if value is not None:
             source = self._binding_cell(arm_id)
             return value, source if source is not None else self._value_cell(value)
+        if not self._recorded_name_write(arm_id):
+            # The book records no authored write of this value in the arm
+            # (no ``name_binding`` row names it): the arm did not assign, the
+            # value falls up the scope ladder to the entered version.  Never
+            # refused (design decision 7.2).
+            return snapshot, snapshot_cell
         missing = self._bind_unresolved(
             arm_id, NAME_ARM_VERSION_MISSING, snapshot_cell,
         )
