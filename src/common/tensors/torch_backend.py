@@ -703,6 +703,33 @@ class PyTorchTensorOperations(AbstractTensor):
     def boolean_mask_select_(self, mask):
         return self.data[mask]
 
+    # ---------------- FFT family (the NumPy backend's surface, on the device) -----------------
+    def fft_(self, n=None, axis=-1, norm=None):
+        return torch.fft.fft(self.data, n=n, dim=axis, norm=norm)
+
+    def ifft_(self, n=None, axis=-1, norm=None):
+        return torch.fft.ifft(self.data, n=n, dim=axis, norm=norm)
+
+    def rfft_(self, n=None, axis=-1, norm=None):
+        return torch.fft.rfft(self.data, n=n, dim=axis, norm=norm)
+
+    def irfft_(self, n=None, axis=-1, norm=None):
+        return torch.fft.irfft(self.data, n=n, dim=axis, norm=norm)
+
+    def rfftfreq_(self, n, d=1.0):
+        return torch.fft.rfftfreq(n, d=d, device=self.default_device, dtype=torch.float64)
+
+    def fftfreq_(self, n, d=1.0):
+        return torch.fft.fftfreq(n, d=d, device=self.default_device, dtype=torch.float64)
+
+    def scatter_sum_(self, dim, index, src):
+        """``self`` plus ``src`` accumulated at ``index`` along ``dim``, repeated
+        destinations summed (torch ``index_add_``), on the tensor's device."""
+        idx = torch.as_tensor(self._AbstractTensor__unwrap(index), device=self.data.device).long().reshape(-1)
+        values = self._AbstractTensor__unwrap(src)
+        values = torch.as_tensor(values, device=self.data.device, dtype=self.data.dtype)
+        return self.data.clone().index_add_(dim, idx, values)
+
     def numpy(self):
         """The tensor as a NumPy array: one device-to-host copy (a CUDA tensor
         refuses ``np.array(tensor)``, which is what ``AbstractTensor.numpy``

@@ -288,6 +288,20 @@ def scatter(x: Any, index: Any, src: Any, dim: int = 0, *, reduce: str = "sum"):
     axis = dim if dim >= 0 else nd + dim
     from ..abstraction import AbstractTensor
     finalize = AbstractTensor._pre_autograd('scatter', [x, index, src], params={'dim': dim})
+    # A summing scatter over an integer index tensor goes to the backend's own
+    # accumulation when it has one (torch ``index_add_``, NumPy ``np.add.at``):
+    # one device pass, no host round trip.  The rounds below read the index
+    # back as a Python list and loop once per repeat, which a grid splat --
+    # thousands of nodes landing in shared cells -- cannot afford on a GPU.
+    backend_sum = getattr(type(x), "scatter_sum_", None)
+    if reduce == "sum" and backend_sum is not None and isinstance(index, AbstractTensor) \
+            and "int" in str(getattr(index, "dtype", "")):
+        src_t = src if isinstance(src, AbstractTensor) else x.ensure_tensor(src)
+        src_shape = tuple(src_t.get_shape())
+        if len(src_shape) == nd and src_shape[axis] == int(index.numel()):
+            result = type(x)(track_time=x.track_time, tape=getattr(x, "_tape", None))
+            result.data = backend_sum(x, axis, index, src_t)
+            return finalize(result)
     result = x.clone()
 
     positions = _integer_positions(index)

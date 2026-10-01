@@ -1010,6 +1010,17 @@ class NumPyTensorOperations(AbstractTensor):
         import numpy as np
         return np.fft.fftfreq(n, d=d)
 
+    def scatter_sum_(self, dim, index, src):
+        """``self`` plus ``src`` accumulated at ``index`` along ``dim``, repeated
+        destinations summed (``np.add.at``)."""
+        import numpy as np
+        out = np.array(self.data, copy=True)
+        idx = np.asarray(self._AbstractTensor__unwrap(index)).astype(np.int64).reshape(-1)
+        values = np.asarray(self._AbstractTensor__unwrap(src), dtype=out.dtype)
+        indexer = (slice(None),) * (dim % out.ndim) + (idx,)
+        np.add.at(out, indexer, values)
+        return out
+
     # _tensor_from_list is provided centrally by AbstractTensor; do not duplicate here.
 
 register_backend("numpy", NumPyTensorOperations)
