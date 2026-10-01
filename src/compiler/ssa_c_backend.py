@@ -95,6 +95,10 @@ class CFunctionArtifact:
     precision_sections: bool = False
     library_path: Path | None = None
     _entry: Any = field(default=None, repr=False)
+    #: ``emission_concordance.ArtifactEmission``: the book and the
+    #: MODULE_TEXT cell ``compile`` derives its file, command and library
+    #: rows from (plan 100, 4.2).  None when the module had no book.
+    emission: Any = field(default=None, repr=False, compare=False)
 
     @property
     def complete(self) -> bool:
@@ -126,13 +130,14 @@ class CFunctionArtifact:
         source_path = destination / f"{self.name}.c"
         library_path = destination / f"{self.name}.dll"
         source_path.write_text(self.source, encoding="utf-8")
+        command = [
+            sys.executable, "-m", "ziglang", "cc", "-shared",
+            f"-{optimization}",
+            *flags,
+            "-o", str(library_path), str(source_path),
+        ]
         completed = subprocess.run(
-            [
-                sys.executable, "-m", "ziglang", "cc", "-shared",
-                f"-{optimization}",
-                *flags,
-                "-o", str(library_path), str(source_path),
-            ],
+            command,
             capture_output=True,
             text=True,
             check=False,
@@ -143,6 +148,11 @@ class CFunctionArtifact:
                 + completed.stderr[-2000:]
             )
         self.library_path = library_path
+        if self.emission is not None:
+            self.emission.build(
+                self.name, source_text=self.source, source_path=source_path,
+                command=command, library_path=library_path,
+            )
         return self
 
     def entry(self):
@@ -375,6 +385,21 @@ def emit_ssa_function_to_c(
         for block in function.blocks.values()
         for instruction in block.instrs
     )
+    # Plan 100, 4.3: every unit of text below is posted beside the line
+    # that holds it, on the module's attached book (never the ambient one).
+    from .concordance_declarations import (
+        EMISSION_C, ArtifactPart, Backend, FUNCTION_TEXT_PENDING, UnitKind,
+    )
+    from .emission_concordance import (
+        ArtifactEmission, emission_book, emission_recorder, post_artifact_part,
+    )
+
+    book = emission_book(module, "emit_ssa_function_to_c")
+    header = f"TURING_EXPORT void {name}(const double *in, double *out) {{"
+    recorder = emission_recorder(
+        book, function, Backend.C_SCALAR, stage=EMISSION_C, symbol=name,
+    )
+    recorder.header(header, args=function.args, spelling=name)
 
     def expression(value_id: int) -> str | None:
         value = expressions.get(int(value_id))
@@ -388,6 +413,11 @@ def emit_ssa_function_to_c(
             value = float(instruction.attributes.get("constant", instruction.attributes.get("value")))
             constants[int(instruction.res.id)] = value
             expressions[int(instruction.res.id)] = value.hex()
+            recorder.unit(
+                UnitKind.LITERAL, expressions[int(instruction.res.id)],
+                result=instruction.res, args=instruction.args,
+                instruction=instruction,
+            )
             continue
         if op == "Ret":
             outputs = tuple(int(value.id) for value in instruction.args)
@@ -412,6 +442,11 @@ def emit_ssa_function_to_c(
             expressions[int(instruction.res.id)] = float(
                 materialization.value
             ).hex()
+            recorder.unit(
+                UnitKind.LITERAL, expressions[int(instruction.res.id)],
+                result=instruction.res, args=instruction.args,
+                instruction=instruction,
+            )
             continue
         if instruction.res is None:
             shortfalls.append(CEmissionShortfall(op, "instruction has no result"))
@@ -487,6 +522,10 @@ def emit_ssa_function_to_c(
                         + ", ".join(value.hex() for value in values)
                         + "};"
                     )
+                    recorder.unit(
+                        UnitKind.TABLE, emitted_tables[table_name],
+                        spelling=table_name,
+                    )
                 rendered = _table_sin_c(
                     args[0], shift, table_name, len(values) - 1,
                     lower, upper, periodic,
@@ -515,6 +554,11 @@ def emit_ssa_function_to_c(
             continue
         expressions[result_id] = f"t{result_id}"
         lines.append(f"    const double t{result_id} = {rendered};")
+        recorder.unit(
+            UnitKind.STATEMENT, lines[-1], result=instruction.res,
+            args=instruction.args, spelling=f"t{result_id}",
+            instruction=instruction,
+        )
 
     if not output_names:
         output_names = tuple(f"output{index}" for index in range(len(outputs)))
@@ -525,6 +569,14 @@ def emit_ssa_function_to_c(
         value = expression(value_id)
         if value is not None:
             stores.append(f"    out[{index}] = {value};")
+            recorder.unit(
+                UnitKind.OUTPUT_STORE, stores[-1], args=(value_id,),
+                spelling=f"out[{index}]",
+            )
+    recorder.unit(UnitKind.RETURN, "}")
+    recorder.finish("\n".join((
+        header, *emitted_tables.values(), *lines, *stores, "}",
+    )))
     source = "\n".join((
         "#include <math.h>",
         "#include <limits.h>",
@@ -547,7 +599,7 @@ def emit_ssa_function_to_c(
         "#define TURING_EXPORT __attribute__((visibility(\"default\")))",
         "#endif",
         *_FLOORED_HELPERS,
-        f"TURING_EXPORT void {name}(const double *in, double *out) {{",
+        header,
         *emitted_tables.values(),
         *lines,
         *stores,
@@ -555,6 +607,11 @@ def emit_ssa_function_to_c(
         "",
     ))
     publications = function_output_publications(function)
+    module_text = post_artifact_part(
+        book, name, Backend.C_SCALAR, ArtifactPart.MODULE_TEXT, data=source,
+        sources=(recorder.finished,), reason=FUNCTION_TEXT_PENDING,
+        stage=EMISSION_C,
+    )
     return CFunctionArtifact(
         name,
         source,
@@ -564,6 +621,10 @@ def emit_ssa_function_to_c(
         publications,
         publication_surface_plan(publications, target="c"),
         precision_sections=precision_present,
+        emission=(
+            None if book is None
+            else ArtifactEmission(book, Backend.C_SCALAR, module_text)
+        ),
     )
 
 
@@ -872,6 +933,10 @@ class CModuleArtifact:
     #: registered by ``entry()`` via ``os.add_dll_directory``.
     _dll_directories: tuple[str, ...] = field(default=(), repr=False)
     _dll_handles: Any = field(default=None, repr=False)
+    #: ``emission_concordance.ArtifactEmission``: the book and the
+    #: MODULE_TEXT / BUFFER_ORDER cells ``compile`` and ``compile_standalone``
+    #: derive their file, command and library rows from (plan 100, 4.2).
+    emission: Any = field(default=None, repr=False, compare=False)
 
     @property
     def complete(self) -> bool:
@@ -946,16 +1011,22 @@ class CModuleArtifact:
                     encoding="utf-8",
                 )
             pool_sources.append(str(destination / "turing_pool.c"))
+        pieces: list[tuple[str, str, Any]] = []
         if link == "dynamic":
             # link against the pieces' own DLLs; their IR is not recompiled
             link_inputs, piece_dlls = self._dynamic_link_inputs()
             pool_sources.extend(link_inputs)
             self._dll_directories = tuple(sorted({str(dll.parent.resolve()) for dll in piece_dlls}))
+            pieces.extend(
+                (symbol, library, library or None)
+                for symbol, library in self.linked_libraries
+            )
         else:
             for symbol, llvm_ir in self.linked_llvm:
                 piece_path = destination / f"{symbol}.ll"
                 piece_path.write_text(llvm_ir, encoding="utf-8")
                 pool_sources.append(str(piece_path))
+                pieces.append((symbol, llvm_ir, piece_path))
         command = [
             sys.executable, "-m", "ziglang", "cc", "-shared",
             f"-{optimization}",
@@ -973,6 +1044,12 @@ class CModuleArtifact:
             )
             if completed.returncode == 0 and library_path.is_file():
                 self.library_path = library_path
+                if self.emission is not None:
+                    self.emission.build(
+                        self.name, source_text=self.source,
+                        source_path=source_path, command=command,
+                        library_path=library_path, pieces=pieces,
+                    )
                 return self
             if "sub-compilation" not in (completed.stderr or ""):
                 break
@@ -1291,6 +1368,7 @@ class CModuleArtifact:
                 f"unsupported C optimization level {optimization!r}"
             )
         linked_sources: list[str] = []
+        pieces: list[tuple[str, str, Any]] = []
         if link == "dynamic":
             # link against the pieces' DLLs and put a copy of each beside the
             # executable, which is where a standalone program's loader looks
@@ -1300,11 +1378,16 @@ class CModuleArtifact:
             linked_sources.extend(link_inputs)
             for dll in piece_dlls:
                 shutil.copy2(dll, destination / dll.name)
+            pieces.extend(
+                (symbol, library, library or None)
+                for symbol, library in self.linked_libraries
+            )
         else:
             for symbol, llvm_ir in self.linked_llvm:
                 piece_path = destination / f"{symbol}.ll"
                 piece_path.write_text(llvm_ir, encoding="utf-8")
                 linked_sources.append(str(piece_path))
+                pieces.append((symbol, llvm_ir, piece_path))
         command = [
             sys.executable, "-m", "ziglang", "cc", f"-{optimization}",
             "-std=c11",
@@ -1319,6 +1402,19 @@ class CModuleArtifact:
             raise RuntimeError(
                 f"standalone C compile failed ({completed.returncode}):\n"
                 + (completed.stderr or completed.stdout)[-4000:]
+            )
+        if self.emission is not None:
+            # The host is made from the buffer order and the feeds; the
+            # feeds are payload, not cells (plan 100, 4.2).
+            self.emission.build(
+                self.name, source_text=self.source,
+                source_path=module_source_path, command=command,
+                library_path=executable_path, pieces=pieces,
+                variant="standalone",
+                extra_sources=((
+                    "host", host_source, host_source_path,
+                    (self.emission.buffer_order,),
+                ),),
             )
         return CStandaloneExecutable(
             directory=destination,
@@ -1421,6 +1517,20 @@ def emit_ssa_module_to_c(
 
     from .ir_identities import precision_backend_shortfalls
     from .ssa_storage_requirements import module_storage_requirements
+    # Plan 100, 4.3: each unit of text is posted beside the append that
+    # holds it, on the module's attached book (never the ambient one); the
+    # text itself is untouched.
+    from .concordance_declarations import (
+        EMISSION_C, ArtifactPart, Backend, FUNCTION_TEXT_PENDING,
+        VALUE_WITHOUT_IDENTITY_CELL, UnitKind,
+    )
+    from .emission_concordance import (
+        ArtifactEmission, emission_book, emission_recorder,
+        post_artifact_part, value_cell,
+    )
+
+    emission = emission_book(module, "emit_ssa_module_to_c")
+    recorders: dict[str, Any] = {}
 
     name = str(entry_name or function_name)
     reachable = _module_call_closure(module, function_name)
@@ -2077,6 +2187,15 @@ def emit_ssa_module_to_c(
             parameters.append(f"void *{destination}")
         if fn in extent_users:
             parameters.append("long long *extents")
+        header = (
+            f"static {function_return_type} {_c_symbol(fn)}("
+            + ", ".join(parameters) + ") {"
+        )
+        recorder = recorders[fn] = emission_recorder(
+            emission, function, Backend.C_MODULE, stage=EMISSION_C,
+            symbol=_c_symbol(fn),
+        )
+        recorder.header(header, args=function.args)
         piece = function.metadata.get("llvm_piece")
         if piece:
             symbol = str(piece["symbol"])
@@ -2116,6 +2235,7 @@ def emit_ssa_module_to_c(
             extern_line = f"extern void {symbol}(void **buffers, int32_t *extents);"
             if extern_line not in prototypes:
                 prototypes.append(extern_line)
+                recorder.unit(UnitKind.PROTOTYPE, extern_line, spelling=symbol)
             linked_llvm.append((symbol, str(piece["llvm_ir"])))
             linked_libraries.append((symbol, str(piece.get("library_path") or "")))
             shim = [
@@ -2129,14 +2249,26 @@ def emit_ssa_module_to_c(
                 f"static {function_return_type} {_c_symbol(fn)}("
                 + ", ".join(parameters) + ");"
             )
+            recorder.unit(
+                UnitKind.PROTOTYPE, prototypes[-1], spelling=_c_symbol(fn),
+            )
+            recorder.unit(
+                UnitKind.CALL, "\n".join(shim),
+                args=(*function.args, *native_outputs[fn]), spelling=symbol,
+            )
+            recorder.unit(UnitKind.RETURN, "}")
             definitions.append("\n".join((
-                f"static {function_return_type} {_c_symbol(fn)}("
-                + ", ".join(parameters) + ") {",
+                header,
                 *shim,
                 "}",
             )))
+            if fn != function_name:
+                recorder.finish(definitions[-1])
+            else:
+                root_definition = definitions[-1]
             continue
         body: list[str] = []
+        span = recorder.span(body)
         expressions: dict[int, str] = {
             int(formal.id): storage_expression(formal, f"v{formal.id}")
             for formal in function.args
@@ -2766,6 +2898,30 @@ def emit_ssa_module_to_c(
                             )
             return assignments
 
+        def phi_edge_values(source_block: str, target_block: str) -> tuple:
+            """The (Phi result, incoming value) pairs one CFG edge copies,
+            read from the same ``incoming_blocks`` attribute
+            ``phi_edge_assignments`` reads: the values its unit spells."""
+
+            values: list = []
+            target = function.blocks.get(target_block)
+            if target is None:
+                return ()
+            for instruction in target.instrs:
+                if str(instruction.op) != "Phi" or instruction.res is None:
+                    continue
+                incoming = tuple(
+                    instruction.attributes.get("incoming_blocks") or ()
+                )
+                for position, origin in enumerate(incoming):
+                    if str(origin) == source_block and position < len(
+                        instruction.args
+                    ):
+                        values.extend((
+                            instruction.res, instruction.args[position],
+                        ))
+            return tuple(values)
+
         def output_publications(returned_values: Sequence = ()) -> list[str]:
             """Publish results by the same authority as the LLVM lane.
 
@@ -2850,6 +3006,15 @@ def emit_ssa_module_to_c(
 
         aggregate_projection_instruction_ids = {
             id(instruction)
+            for record in aggregate_abi.calls
+            if record.caller == fn
+            for projection in record.projections
+            for instruction in (projection.address, projection.load)
+        }
+        # The call that binds each skipped projection: its elided unit row
+        # reads the call's unit (plan 100, 4.4).
+        aggregate_projection_calls = {
+            id(instruction): record.call
             for record in aggregate_abi.calls
             if record.caller == fn
             for projection in record.projections
@@ -3019,6 +3184,7 @@ def emit_ssa_module_to_c(
         for block_name in block_names:
             block = function.blocks[block_name]
             flush_trace()
+            span.close()
             body.append(f"    {_c_label(block_name)}: (void)0;")
             block_is_guarded = block_name in effect_guarded_blocks
             if block_is_guarded:
@@ -3027,8 +3193,12 @@ def emit_ssa_module_to_c(
                 # concurrent lanes serialize the append without an order.
                 effect_guard_used[0] = True
                 body.append("        turing_pool_effect_lock();")
+            span.take(UnitKind.BLOCK_LABEL, spelling=_c_label(block_name))
             for position, instruction in enumerate(block.instrs):
                 flush_trace()
+                # Every path below ends in ``continue``; the lines this
+                # instruction appends are posted when the next one opens.
+                span.open(instruction)
                 emission_context["block"] = block_name
                 emission_context["instruction"] = instruction
                 if trace_this_function:
@@ -3048,6 +3218,11 @@ def emit_ssa_module_to_c(
                 if id(instruction) in aggregate_projection_instruction_ids:
                     # The native call binds these abstract tuple projections
                     # directly to caller-owned output storage.
+                    span.pending = None
+                    recorder.elided(
+                        instruction,
+                        binding=aggregate_projection_calls.get(id(instruction)),
+                    )
                     continue
                 if instruction.attributes.get("precision_section"):
                     precision_present = True
@@ -3210,7 +3385,12 @@ def emit_ssa_module_to_c(
                             f"        turing_trace_event({_trace_text(fn)}, "
                             f"{_trace_text(block_name)}, {_trace_text('Br -> ' + target)});"
                         )
+                    span.take_pending()
                     body.extend(phi_edge_assignments(block_name, target))
+                    span.take(
+                        UnitKind.PHI_EDGE_ASSIGNMENT,
+                        args=phi_edge_values(block_name, target),
+                    )
                     body.append(f"        goto {_c_label(target)};")
                     continue
                 if op in {"CondBr", "condbr"}:
@@ -3228,15 +3408,25 @@ def emit_ssa_module_to_c(
                             f"(long long)({condition}));"
                         )
                     body.append(f"        if ({condition}) {{")
+                    span.take_pending()
                     body.extend(
                         "    " + line
                         for line in phi_edge_assignments(block_name, on_true)
                     )
+                    span.take(
+                        UnitKind.PHI_EDGE_ASSIGNMENT,
+                        args=phi_edge_values(block_name, on_true),
+                    )
                     body.append(f"            goto {_c_label(on_true)};")
                     body.append("        } else {")
+                    span.take_pending()
                     body.extend(
                         "    " + line
                         for line in phi_edge_assignments(block_name, on_false)
+                    )
+                    span.take(
+                        UnitKind.PHI_EDGE_ASSIGNMENT,
+                        args=phi_edge_values(block_name, on_false),
                     )
                     body.append(f"            goto {_c_label(on_false)};")
                     body.append("        }")
@@ -3261,7 +3451,12 @@ def emit_ssa_module_to_c(
                                 _trace_text(fn), _trace_text(block_name), label,
                                 returned, held, returned_type,
                             ))
+                    span.take_pending()
                     body.extend(output_publications(tuple(instruction.args)))
+                    span.take(
+                        UnitKind.OUTPUT_STORE,
+                        args=(*instruction.args, *native_outputs[fn]),
+                    )
                     # Outputs live in caller-visible buffers already. Route
                     # every exit through the activation-storage cleanup.
                     body.append(f"        goto cleanup_{_c_symbol(fn)};")
@@ -5005,6 +5200,7 @@ def emit_ssa_module_to_c(
                 body.append("        " + declared)
 
         flush_trace()
+        span.close()
         # Planner regions commonly have no Ret instruction: their declared
         # output record is the terminator contract.  Publish scalar results
         # at the lexical end as well; shaped results were written directly
@@ -5015,16 +5211,29 @@ def emit_ssa_module_to_c(
             for instruction in block.instrs
         ):
             body.extend(output_publications())
+            span.take(UnitKind.OUTPUT_STORE, args=native_outputs[fn])
 
         declarations = [
             f"    {kind} t{phi_id};"
             for phi_id, kind in sorted(phi_declarations.items())
         ]
+        # A Phi is spelled by its hoisted declaration (plan 100, 4.4).
+        for (phi_id, _kind), line in zip(
+            sorted(phi_declarations.items()), declarations,
+        ):
+            recorder.unit(
+                UnitKind.DECLARATION, line, result=phi_id,
+                spelling=f"t{phi_id}",
+            )
         declarations.extend(local_tensor_declarations)
         declarations.extend(
             f"    {element_type} *{storage_name} = NULL;"
             for element_type, storage_name, _count in frame_allocations
         )
+        # Tensor temporaries and frame storage: declared storage, no value
+        # of their own in the line (derived from the function cell only).
+        for line in declarations[len(phi_declarations):]:
+            recorder.unit(UnitKind.DECLARATION, line)
         allocation_setup = [
             line
             for element_type, storage_name, count in frame_allocations
@@ -5044,19 +5253,30 @@ def emit_ssa_module_to_c(
             ),
             "    return;",
         ]
+        for line in allocation_setup:
+            recorder.unit(UnitKind.STATEMENT, line)
+        recorder.unit(UnitKind.RETURN, "\n".join((*cleanup, "}")))
         prototypes.append(
             f"static {function_return_type} {_c_symbol(fn)}("
             + ", ".join(parameters) + ");"
         )
+        recorder.unit(
+            UnitKind.PROTOTYPE, prototypes[-1], spelling=_c_symbol(fn),
+        )
         definitions.append("\n".join((
-            f"static {function_return_type} {_c_symbol(fn)}("
-            + ", ".join(parameters) + ") {",
+            header,
             *declarations,
             *allocation_setup,
             *body,
             *cleanup,
             "}",
         )))
+        if fn != function_name:
+            recorder.finish(definitions[-1])
+        else:
+            # The root's row also holds the public wrapper's units
+            # (plan 100, 4.3); it is finished after the wrapper.
+            root_definition = definitions[-1]
 
     # -- the public wrapper: same buffer ABI as the LLVM lane ---------------
     root = module.functions[function_name]
@@ -5071,6 +5291,12 @@ def emit_ssa_module_to_c(
     buffer_dtypes: list[str] = []
     entry_lines: list[str] = []
     root_allocations: list[tuple[str, str, int]] = []
+    # The wrapper's units are posted under the root function's row.
+    wrapper = recorders.get(function_name) or emission_recorder(
+        emission, root, Backend.C_MODULE, stage=EMISSION_C,
+        symbol=_c_symbol(function_name),
+    )
+    entry_span = wrapper.span(entry_lines)
 
     def activation_array(element_type: str, count: int) -> str:
         """Allocate wrapper-owned storage with LLVM alloca lifetime."""
@@ -5168,6 +5394,9 @@ def emit_ssa_module_to_c(
                         f"    memset({owned}, 0, sizeof(*{owned}) "
                         f"* {allocation_count});"
                     )
+                    entry_span.take(
+                        UnitKind.STATEMENT, args=(value_id,), spelling=owned,
+                    )
                 else:
                     allocation_count = next(
                         count for _kind, name, count in root_allocations
@@ -5176,6 +5405,10 @@ def emit_ssa_module_to_c(
                     entry_lines.append(
                         f"    memcpy({owned}, {copied_from}, "
                         f"sizeof(*{owned}) * {allocation_count});"
+                    )
+                    entry_span.take(
+                        UnitKind.STATEMENT,
+                        args=(value_id, int(split_source)), spelling=owned,
                     )
             rendered_actuals.append(owned_storage_names[value_id])
             continue
@@ -5193,6 +5426,9 @@ def emit_ssa_module_to_c(
             f"    {held} *b{index} = "
             f"({held} *)buffers[{index}];"
         )
+        entry_span.take(
+            UnitKind.FORMAL, args=(value_id,), spelling=f"b{index}",
+        )
         rendered_actuals.append(f"b{index}")
     root_formal_ids = {int(formal.id) for formal in root.args}
     watched_private_copies = []
@@ -5207,6 +5443,9 @@ def emit_ssa_module_to_c(
                 rendered_actuals.append(owned)
             else:
                 entry_lines.append(f"    {element_type} {owned} = 0;")
+                entry_span.take(
+                    UnitKind.DECLARATION, args=(output_id,), spelling=owned,
+                )
                 rendered_actuals.append(f"&{owned}")
             continue
         if output_id in root_formal_ids and output_id not in owned_storage_names:
@@ -5227,6 +5466,9 @@ def emit_ssa_module_to_c(
         entry_lines.append(
             f"    {element_type} *b{index} = "
             f"({element_type} *)buffers[{index}];"
+        )
+        entry_span.take(
+            UnitKind.FORMAL, args=(output_id,), spelling=f"b{index}",
         )
         if output_id in root_formal_ids:
             # A private frame formal is already passed to the function. Watch
@@ -5263,6 +5505,10 @@ def emit_ssa_module_to_c(
                     )
                 )
                 entry_lines.append(f"    ((int64_t *){capacity})[0] = {count};")
+                entry_span.take(
+                    UnitKind.STATEMENT,
+                    args=(int(sequence.capacity_value_id),), spelling=capacity,
+                )
     # -- record-parameter relocation prologue -------------------------------
     # Record parameters are runtime cell arenas (the program mutates scalar
     # cells in place), but their private storage starts calloc-zeroed, so
@@ -5303,6 +5549,10 @@ def emit_ssa_module_to_c(
                         f"(void *)({bound});"
                         f"  /* {field.name} */"
                     )
+                entry_span.take(
+                    UnitKind.STATEMENT,
+                    args=(record_id, int(value_ids[0])), spelling=arena,
+                )
     entry_lines.append(
         f"    {_c_symbol(function_name)}("
         + ", ".join((
@@ -5310,7 +5560,15 @@ def emit_ssa_module_to_c(
             *(("extents",) if function_name in extent_users else ()),
         )) + ");"
     )
+    entry_span.take(
+        UnitKind.CALL, args=(*root.args, *native_outputs[function_name]),
+        spelling=_c_symbol(function_name),
+    )
     entry_lines.extend(watched_private_copies)
+    entry_span.take(
+        UnitKind.OUTPUT_STORE, args=tuple(int(item) for item in watch),
+    )
+    wrapper_body_count = len(entry_lines)
     entry_lines = [
         *(
             f"    {element_type} *{storage_name} = NULL;"
@@ -5334,6 +5592,21 @@ def emit_ssa_module_to_c(
             in reversed(root_allocations)
         ),
     ]
+    # The reassembled wrapper: its allocation prologue and cleanup lines
+    # surround the lines already posted above.
+    wrapper_header = f"TURING_EXPORT void {name}(void **buffers, long long *extents) {{"
+    wrapper_tail = 1 + len(root_allocations)
+    wrapper_prefix = len(entry_lines) - wrapper_body_count - wrapper_tail
+    wrapper.unit(UnitKind.FUNCTION_HEADER, wrapper_header, spelling=name)
+    for line in entry_lines[:wrapper_prefix]:
+        wrapper.unit(UnitKind.DECLARATION, line)
+    wrapper.unit(
+        UnitKind.RETURN, "\n".join((*entry_lines[len(entry_lines) - wrapper_tail:], "}")),
+    )
+    wrapper_finished = wrapper.finish("\n".join((
+        *((root_definition,) if function_name in recorders else ()),
+        wrapper_header, *entry_lines, "}",
+    )))
 
     source = "\n".join((
         "#include <math.h>",
@@ -5368,11 +5641,34 @@ def emit_ssa_module_to_c(
         "",
         *deployment_trampolines,
         "",
-        f"TURING_EXPORT void {name}(void **buffers, long long *extents) {{",
+        wrapper_header,
         *entry_lines,
         "}",
         "",
     ))
+    # MODULE_TEXT derives from every reachable function's finished row (the
+    # root's holds the wrapper); BUFFER_ORDER from each slot value's cell.
+    module_text = post_artifact_part(
+        emission, name, Backend.C_MODULE, ArtifactPart.MODULE_TEXT,
+        data=source,
+        sources=tuple(
+            wrapper_finished if fn == function_name else recorders[fn].finished
+            for fn in reachable if fn in recorders
+        ),
+        reason=FUNCTION_TEXT_PENDING, stage=EMISSION_C,
+    )
+    buffer_order_cell = None if emission is None else post_artifact_part(
+        emission, name, Backend.C_MODULE, ArtifactPart.BUFFER_ORDER,
+        data=repr((
+            tuple(buffer_order), tuple(buffer_dtypes), tuple(buffer_shapes),
+            tuple(extent_order),
+        )),
+        location=tuple(buffer_order),
+        sources=tuple(
+            value_cell(emission, root, value_id) for value_id in buffer_order
+        ),
+        reason=VALUE_WITHOUT_IDENTITY_CELL, stage=EMISSION_C,
+    )
     return CModuleArtifact(
         linked_llvm=tuple(linked_llvm),
         linked_libraries=tuple(linked_libraries),
@@ -5386,6 +5682,12 @@ def emit_ssa_module_to_c(
         precision_sections=precision_present,
         pool_required=bool(pooled_regions) or effect_guard_used[0],
         pooled_regions=tuple(pooled_regions),
+        emission=(
+            None if emission is None
+            else ArtifactEmission(
+                emission, Backend.C_MODULE, module_text, buffer_order_cell,
+            )
+        ),
     )
 
 

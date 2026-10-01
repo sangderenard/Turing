@@ -8719,10 +8719,10 @@ def _ordinary_conditional_control_programs(
             ))
             if slots is None:
                 return None
-            # LoopDescriptor.return_controls anchors a return at its value,
-            # not an ast.Return statement node. Tuple containers can be
-            # reduced away, in which case its last surviving exact slot is
-            # the anchor, as in LoopComposer.describe.
+            # ``site_node_id`` is a position hint (the returned expression's
+            # node, as LoopComposer.describe's hint); the SITE is
+            # ``return_site_cell`` below. Tuple containers can be reduced
+            # away, in which case the last surviving exact slot is the hint.
             signature = lambda expr: (
                 *(getattr(expr, key, None) for key in (
                     "lineno", "col_offset", "end_lineno", "end_col_offset")),
@@ -8737,11 +8737,16 @@ def _ordinary_conditional_control_programs(
             ), None)
             if inside_loop and site_id is None:
                 return None
+            # The site's identity is the return construct's cell, the same
+            # cell ``LoopComposer.describe`` keys the loop's copy by: the
+            # overlay matches the two by site, never by the value returned.
+            from .ssa_record_return_state import return_site_cell_for
             return LoopControlBlock(
                 "return", None, True, None,
                 source_action="return",
                 site_node_id=site_id,
                 return_value_ids=tuple(slots),
+                return_site_cell=return_site_cell_for(graph, returned),
             )
 
         body_return_control = (
@@ -9492,12 +9497,22 @@ def _overlay_control_or_require_subdivision(
             return (block.callee,)
         return ()
 
+    # A return is matched by its SITE: the return construct's cell when the
+    # block carries one (several sites may return one value), else the
+    # legacy position hint.
+    def return_site_key(block):
+        if block.return_site_cell is not None:
+            return ("site", block.return_site_cell)
+        if block.site_node_id is not None:
+            return ("node", int(block.site_node_id))
+        return None
+
     owned_returns = {}
     def collect(block):
         if (isinstance(block, LoopControlBlock) and block.action == "return"
-                and block.site_node_id is not None and block.predicate_value_id is None
+                and return_site_key(block) is not None and block.predicate_value_id is None
                 and block.predicate_expression is None):
-            owned_returns.setdefault(int(block.site_node_id), set()).add(tuple(block.return_value_ids))
+            owned_returns.setdefault(return_site_key(block), set()).add(tuple(block.return_value_ids))
         for child in children(block):
             collect(child)
 
@@ -9506,8 +9521,8 @@ def _overlay_control_or_require_subdivision(
 
     def remove_duplicate_return(block):
         if (isinstance(block, LoopControlBlock) and block.action == "return"
-                and block.site_node_id is not None
-                and owned_returns.get(int(block.site_node_id)) == {tuple(block.return_value_ids)}):
+                and return_site_key(block) is not None
+                and owned_returns.get(return_site_key(block)) == {tuple(block.return_value_ids)}):
             return SequenceBlock(())
         if isinstance(block, SequenceBlock):
             return replace(block, blocks=tuple(remove_duplicate_return(child) for child in block.blocks))

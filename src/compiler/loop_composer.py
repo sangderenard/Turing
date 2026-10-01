@@ -52,6 +52,7 @@ from .loop_ir import (
 )
 from .hierarchical_plan import PlanClosure, PlanLine
 from .process_graph_value_ids import next_process_value_id
+from .ssa_record_return_state import return_site_cell_for, return_site_span
 # Step 9 (plan 100, 1.2): the causes this module's operand rewrites record
 # on ``identity_transition`` through ``_set_operands`` (imported where used:
 # ``topological_reducer`` is imported lazily in this module).
@@ -184,13 +185,21 @@ class LoopDescriptor:
     iteration_outputs: tuple[LoopIterationOutput, ...] = ()
     backpressured_output: bool = False
     # Every source ``return`` with a value inside this loop's body:
-    # (return-value node id, guard chain ((predicate id, expect_true), ...
-    # outermost first), per-slot value ids in function-output order).
-    # Unlike ``return_nodes`` (the sole-root "terminal loop exit" special
-    # case), these carry the return's OWN values so the function exit can
-    # merge them per slot (control-aware result merging).
+    # (position hint, guard chain ((predicate id, expect_true), ...
+    # outermost first), per-slot value ids in function-output order,
+    # (return-site cell, returned-expression span)).  The SITE -- the
+    # return construct, keyed on the book by its cell -- is the identity;
+    # the hint (the returned expression's node, or a surviving slot
+    # element, None when neither exists) only orders the edge after that
+    # node when it is a body node.  Unlike ``return_nodes`` (the sole-root
+    # "terminal loop exit" special case), these carry the return's OWN
+    # values so the function exit can merge them per slot (control-aware
+    # result merging).
     return_controls: tuple[
-        tuple[int, tuple[tuple[int, bool], ...], tuple[int | None, ...]], ...
+        tuple[
+            int | None, tuple[tuple[int, bool], ...], tuple[int | None, ...],
+            tuple[Any, tuple[int, int, int, int] | None],
+        ], ...
     ] = ()
     # Every source break/continue in this loop's body:
     # (statement node id, action, guard chain outermost-first,
@@ -757,11 +766,12 @@ def _retarget_plan_value_ids(
     )
     return_controls = tuple(
         (
-            rename(node_id),
+            None if node_id is None else rename(node_id),
             tuple((rename(predicate_id), expect_true) for predicate_id, expect_true in chain),
             tuple(None if slot is None else rename(slot) for slot in slots),
+            site,
         )
-        for node_id, chain, slots in loop.return_controls
+        for node_id, chain, slots, site in loop.return_controls
     )
     control_sites = tuple(
         (
@@ -2705,11 +2715,13 @@ class LoopComposer:
             return int(value) in graph.G and (
                 int(initial) in graph.G or int(initial) in declared_identity_ids
             )
-        # (return-value node id, guard chain, per-slot value ids): every
-        # ``return <value>`` in this loop's body, whatever its nesting.
-        return_controls: list[
-            tuple[int, tuple[tuple[int, bool], ...], tuple[int | None, ...]]
-        ] = []
+        # (position hint, guard chain, per-slot value ids, (site cell, span)):
+        # every ``return <value>`` in this loop's body, whatever its nesting,
+        # one entry per authored return site.
+        return_controls: list[tuple[
+            int | None, tuple[tuple[int, bool], ...], tuple[int | None, ...],
+            tuple[Any, tuple[int, int, int, int] | None],
+        ]] = []
         return_slot_values = dict(
             graph.G.graph.get("return_slot_values") or {}
         )
@@ -2830,11 +2842,21 @@ class LoopComposer:
                             int(value_id) for value_id in reversed(slot_values)
                             if value_id is not None and int(value_id) in graph.G
                         ), None)
-                    if return_value_id is not None and slot_values is not None:
+                    if slot_values is not None:
+                        # The site is the return CONSTRUCT: its cell on the
+                        # book (the ``return_site_*`` rows' key) and its
+                        # span.  Every authored return is its own site even
+                        # when several return one value (``return m`` three
+                        # times); the value node is only a position hint.
                         return_controls.append((
-                            int(return_value_id),
+                            None if return_value_id is None
+                            else int(return_value_id),
                             tuple(chain),
                             tuple(slot_values),
+                            (
+                                return_site_cell_for(graph, returned),
+                                return_site_span(returned),
+                            ),
                         ))
                     condition_id = (
                         graph_node_for_ast(expression.test)
@@ -4580,6 +4602,13 @@ def analyze_shader_loop_reductions(
             if return_value:
                 yield node
 
+        # A return construct has no graph node of its own (its returned
+        # ``Name`` occurrence is resolved away), so its lexical position is
+        # recorded where the walk meets it: after every node of its
+        # expression and before the next statement's first node.  Keyed by
+        # the returned expression's span, the key ``return_controls`` sites
+        # carry.
+        return_construct_position: dict[tuple[int, int, int, int], float] = {}
         if isinstance(loop_expression, (ast.For, ast.AsyncFor, ast.While)):
             for statement in loop_expression.body:
                 for expression in source_order_walk(statement):
@@ -4590,6 +4619,12 @@ def analyze_shader_loop_reductions(
                         and int(node_id) not in lexical_nodes
                     ):
                         lexical_nodes.append(int(node_id))
+                    if isinstance(expression, ast.Return):
+                        span = return_site_span(expression.value)
+                        if span is not None:
+                            return_construct_position.setdefault(
+                                span, len(lexical_nodes) - 0.5,
+                            )
         lexical_nodes.extend(
             int(node_id)
             for node_id in nested_body_nodes
@@ -5421,26 +5456,44 @@ def analyze_shader_loop_reductions(
         # position (like break/continue) so the non-returning path's later
         # work never runs on the returning path, and guarded by every
         # enclosing predicate rather than the innermost only.
-        body_items.extend(
-            (
-                max((lexical_position[node_id], *(
-                    lexical_position[int(value_id)]
-                    for value_id in slot_values
-                    if value_id is not None and int(value_id) in lexical_position
-                ))),
+        #
+        # Each authored return is its own site: positioned by its CONSTRUCT
+        # (``return_construct_position``), never dropped because the value
+        # it returns is not a body node (``return m`` of a parameter).  The
+        # position hint orders it after that node only when it is a body
+        # node, and only then names it as the edge's ``site_node_id``.
+        def return_position(node_id, slot_values, span):
+            positions = [
+                lexical_position[int(value_id)]
+                for value_id in (node_id, *slot_values)
+                if value_id is not None and int(value_id) in lexical_position
+            ]
+            if span in return_construct_position:
+                positions.append(return_construct_position[span])
+            elif node_id is None or node_id not in lexical_position:
+                return None
+            return max(positions) if positions else None
+
+        for node_id, chain, slot_values, (site_cell, span) in loop.return_controls:
+            position = return_position(node_id, slot_values, span)
+            if position is None:
+                continue
+            body_items.append((
+                position,
                 LoopControlBlock(
                     "return",
                     chain[-1][0] if chain else None,
                     True,
                     guarded_expression(chain),
                     source_action="return",
-                    site_node_id=int(node_id),
+                    site_node_id=(
+                        int(node_id) if node_id is not None
+                        and node_id in lexical_position else None
+                    ),
                     return_value_ids=tuple(slot_values),
+                    return_site_cell=site_cell,
                 ),
-            )
-            for node_id, chain, slot_values in loop.return_controls
-            if node_id in lexical_position
-        )
+            ))
         body_items.extend(
             (
                 lexical_position[node_id],

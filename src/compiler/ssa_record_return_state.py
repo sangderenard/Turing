@@ -27,15 +27,19 @@ def function_scope_of(function):
     return str(metadata.get("tensor_shape_concordance_scope") or function.name)
 
 
-def ssa_value_identity_cell(function, value_id):
+def ssa_value_identity_cell(function, value_id, *, book=None):
     """The latest ``ssa_value`` cell of ``value_id`` in ``function``, or
-    None when no pass has posted the value's identity."""
+    None when no pass has posted the value's identity.  ``book``: the book
+    to read (a backend, after the compile closed, passes the module's
+    attached book); default the active compile's."""
     from .concordance_declarations import SSA_VALUE
     from .identity_concordance import current_identity_book
 
     if value_id is None:
         return None
-    return current_identity_book().latest_ref(
+    if book is None:
+        book = current_identity_book()
+    return book.latest_ref(
         SSA_VALUE, (function_scope_of(function), int(value_id)),
     )
 
@@ -60,6 +64,74 @@ def identity_cells(function, *items):
         if cell is not None and cell not in found:
             found.append(cell)
     return tuple(found)
+
+
+# ---------------------------------------------------------------------------
+# The identity of a return SITE (plan 70, section 2).
+#
+# The reducer posts ``return_site_slot`` / ``return_site_field_state`` /
+# ``return_site_container`` rows keyed by the return construct's cell and
+# presents them, keyed by the returned expression's source span, through
+# read views (``return_slot_values`` and its siblings); the view's span join
+# (cell -> span) is the only place the two keys meet once the construct's
+# own nodes have left the graph.  A site is that cell -- never the value it
+# returns: three ``return m`` sites return one value and are three sites.
+# ---------------------------------------------------------------------------
+
+
+def return_site_span(expression):
+    """The span key of the return whose returned expression is
+    ``expression`` (``(lineno, col, end_lineno, end_col)``), or None."""
+    if expression is None or getattr(expression, "lineno", None) is None:
+        return None
+    return (
+        int(expression.lineno), int(getattr(expression, "col_offset", -1)),
+        int(getattr(expression, "end_lineno", -1)),
+        int(getattr(expression, "end_col_offset", -1)),
+    )
+
+
+def return_site_cells(metadata):
+    """``span -> return-site cell`` for one graph's metadata mapping.
+
+    Read from the reducer's return-site views (their cell -> span join);
+    a site whose construct node still carries ``return_site_cell`` is
+    found on the node too.  Empty when neither survives (the receipts were
+    copied into plain dicts), in which case no site identity is claimed.
+    """
+    from .identity_concordance import Ref
+
+    found = {}
+    for key in ("return_slot_values", "return_record_field_states"):
+        view = (metadata or {}).get(key)
+        spans = getattr(view, "_spans", None)
+        if not isinstance(spans, dict):
+            continue
+        for cell, span in spans.items():
+            if isinstance(cell, Ref) and span is not None:
+                found.setdefault(tuple(span), cell)
+    return found
+
+
+def return_site_cell_for(graph, expression):
+    """The return-site cell of the return whose returned expression is
+    ``expression`` in ``graph`` (a ProcessGraph or its networkx graph)."""
+    span = return_site_span(expression)
+    if span is None:
+        return None
+    nx_graph = getattr(graph, "G", graph)
+    cell = return_site_cells(getattr(nx_graph, "graph", None)).get(span)
+    if cell is not None:
+        return cell
+    for _node_id, data in nx_graph.nodes(data=True):
+        cell = (data.get("attributes") or {}).get("return_site_cell")
+        if cell is None:
+            continue
+        candidate = data.get("expr_obj")
+        for item in (candidate, getattr(candidate, "value", None)):
+            if return_site_span(item) == span:
+                return cell
+    return None
 
 
 def mint_ssa_value(function, transform, operands, *, dtype=None, shape=(), stage):
@@ -1567,6 +1639,7 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         RECORD_RETURN_FIELD_SELECTION,
         RECORD_RETURN_VERSION,
         RETURN_SITE_FIELD_STATE,
+        RETURN_SITE_SLOT,
         SITES_DISAGREE_ON_VERSION,
         SITE_WITHOUT_FIELD_STATE,
         SSA_FIELD_VERSION,
@@ -1574,9 +1647,10 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         VERSION_IS_FORMAL_SHAPED_OR_MISTYPED,
         VERSION_NOT_CONST_OR_CARRIED_PHI,
         VERSION_NOT_UNIQUELY_DEFINED,
+        FieldState,
     )
     from .identity_concordance import (
-        Derived, Mode, Ref, Unresolved, current_identity_book,
+        Derived, Mode, Ref, RowFieldKind, Unresolved, current_identity_book,
     )
 
     # Every exit of the lookup is a statement on ``record_return_field_selection``
@@ -1591,7 +1665,12 @@ def scalar_return_field_versions(function, source_graph, functions=None):
 
     def return_site_cell(span):
         """The return construct's site cell for the receipt keyed by ``span``."""
-        if span is None or not hasattr(source_graph, 'nodes'):
+        if span is None:
+            return None
+        joined = return_site_cells(source_graph.graph).get(tuple(span))
+        if joined is not None:
+            return joined
+        if not hasattr(source_graph, 'nodes'):
             return None
         for _node_id, data in source_graph.nodes(data=True):
             cell = (data.get('attributes') or {}).get('return_site_cell')
@@ -1644,26 +1723,31 @@ def scalar_return_field_versions(function, source_graph, functions=None):
                 cells.append(ref)
         return tuple(cells)
 
-    def decide(reason, value, read, *, field, predecessor, phi_cell, position):
+    def decide(reason, value, read, *, field, predecessor, phi_cell, position,
+               fact=None):
         """Return ``value`` after posting the decision that produced it.
 
         ``reason`` None is success: ``read`` is (site state cell, version
-        cell) and the fact is that version cell.  Otherwise the fact is
-        ``Unresolved(reason, read)`` derived from what was read, or
-        ``Unsourced(reason)`` when nothing on the book was read.
+        cell) and the fact is that version cell -- or, for a site that
+        records no write of the field, ``fact`` is the entered version's
+        cell and ``read`` is (the site's slot cell, that cell).  Otherwise
+        the fact is ``Unresolved(reason, read)`` derived from what was
+        read, or ``Unsourced(reason)`` when nothing on the book was read.
         """
         if scope is None or not isinstance(phi_cell, Ref) or position is None:
             return value
         row = (scope, phi_cell, str(field), int(position), str(predecessor))
         read = tuple(cell for cell in read if isinstance(cell, Ref))
         if reason is None:
-            versions = [cell for cell in read if cell.page == SSA_FIELD_VERSION]
-            if len(read) < 2 or not versions:
-                # The lookup found a version through the graph's receipt view
-                # but the book holds no site row or version cell to derive
-                # it from; nothing can be posted as a sourced selection.
-                return value
-            fact = versions[-1]
+            if fact is None:
+                versions = [cell for cell in read if cell.page == SSA_FIELD_VERSION]
+                if len(read) < 2 or not versions:
+                    # The lookup found a version through the graph's receipt
+                    # view but the book holds no site row or version cell to
+                    # derive it from; nothing can be posted as a sourced
+                    # selection.
+                    return value
+                fact = versions[-1]
         else:
             if not read:
                 # An exit that read no site or version row (no receipts, an
@@ -1781,36 +1865,108 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         return all(boolean_phi_tree(argument, visiting | {value_id})
                    for argument in instruction.args)
 
+    def cell_fact(cell):
+        """The fact stored at ``cell`` (its own column, not the row's latest)."""
+        stored = current_identity_book().pages.get(cell.page.name)
+        if stored is None:
+            return None
+        return dict(stored.history(cell.row)).get(cell.column)
+
+    def cell_value_id(cell):
+        """The VALUE_ID element of a node identity cell's row."""
+        if not isinstance(cell, Ref):
+            return None
+        for declared, item in zip(cell.page.row_fields, cell.row):
+            if declared.kind is RowFieldKind.VALUE_ID and isinstance(item, int):
+                return int(item)
+        return None
+
+    def site_state_value_id(state_cell):
+        """The value id a ``return_site_field_state`` cell names: its field
+        state's value cell, read from the book; None when the site's state
+        is Unresolved."""
+        field_state_cell = cell_fact(state_cell)
+        if not isinstance(field_state_cell, Ref):
+            return None
+        field_state = cell_fact(field_state_cell)
+        if not isinstance(field_state, FieldState):
+            return None
+        return cell_value_id(field_state.value)
+
+    def entered_version(site, receiver, slots, fallback, exit_with):
+        """The version current at a site that records no write of the
+        field: the receiver's entered field value -- its ProgramABI formal,
+        which is the parameter's descriptor value (``fallback``) only when
+        that value is a formal.  The selection derives from the site's slot
+        cell carrying the receiver and the formal's identity cell.  A
+        descriptor value that is not a formal is another site's write
+        folded into the descriptor; nothing is selected from it."""
+        book = current_identity_book()
+        slot_cell = next((
+            book.latest_ref(RETURN_SITE_SLOT, (scope, site, index))
+            for index, value in enumerate(slots)
+            if value is not None and int(value) == int(receiver)
+        ), None)
+        read = tuple(cell for cell in (slot_cell,) if cell is not None)
+        if int(fallback.id) not in formal_ids:
+            return exit_with(SITE_WITHOUT_FIELD_STATE, read)
+        formal_cell = ssa_value_identity_cell(function, int(fallback.id))
+        if slot_cell is None or formal_cell is None:
+            return exit_with(SITE_WITHOUT_FIELD_STATE, read)
+        return exit_with(None, (slot_cell, formal_cell), fact=formal_cell)
+
     def lookup(receiver, field, predecessor, fallback, *, alias_receivers=(),
                phi_cell=None, position=None):
-        def exit_with(reason, read=()):
+        def exit_with(reason, read=(), *, fact=None):
             return decide(
                 reason, fallback, read, field=field, predecessor=predecessor,
-                phi_cell=phi_cell, position=position,
+                phi_cell=phi_cell, position=position, fact=fact,
             )
 
         block = function.blocks.get(predecessor)
         if block is None or not block.instrs:
             return exit_with(PREDECESSOR_BLOCK_EMPTY)
-        slots = (block.instrs[-1].attributes or {}).get('return_source_value_ids')
+        terminal_attributes = block.instrs[-1].attributes or {}
+        slots = terminal_attributes.get('return_source_value_ids')
         if slots is None:
             return exit_with(PREDECESSOR_NOT_A_RETURN_EDGE)
-        sites = [span for span, values in
-                 (source_graph.graph.get('return_slot_values') or {}).items()
-                 if tuple(values) == tuple(slots)]
-        # Equal return slot identities can occur at different authored sites.
-        # Missing field state at even one such site is not a proof.
-        states = [dict(((int(r), str(f)), int(v)) for r, f, v in receipts.get(span, ()))
-                  for span in sites]
-        key = (int(receiver), str(field))
-        state_cells = site_state_cells(sites, receiver, field)
-        if not states or any(key not in state for state in states):
-            return exit_with(SITE_WITHOUT_FIELD_STATE, state_cells)
-        candidates = {state[key] for state in states}
-        if len(candidates) != 1:
-            return exit_with(SITES_DISAGREE_ON_VERSION, state_cells)
-        read = (*state_cells, *version_cells(state_cells))
-        candidates = definitions.get(next(iter(candidates)), ())
+        site = terminal_attributes.get('return_site_cell')
+        if isinstance(site, Ref) and scope is not None:
+            # The edge names its own return SITE (the construct's cell the
+            # control builder stamped beside ``return_source_value_ids``):
+            # the field state is that site's ``return_site_field_state``
+            # row, never another site's that happens to return the same
+            # value.
+            state_cell = current_identity_book().latest_ref(
+                RETURN_SITE_FIELD_STATE, (scope, site, int(receiver), str(field)),
+            )
+            if state_cell is None:
+                # The site records no write of this field: the version
+                # current there is the entered one (the scope ladder).
+                return entered_version(site, receiver, slots, fallback, exit_with)
+            version_id = site_state_value_id(state_cell)
+            if version_id is None:
+                return exit_with(SITE_WITHOUT_FIELD_STATE, (state_cell,))
+            read = (state_cell, *version_cells((state_cell,)))
+            candidates = definitions.get(int(version_id), ())
+        else:
+            sites = [span for span, values in
+                     (source_graph.graph.get('return_slot_values') or {}).items()
+                     if tuple(values) == tuple(slots)]
+            # An edge that names no site: equal return slot identities can
+            # occur at different authored sites, and missing field state
+            # at even one such site is not a proof.
+            states = [dict(((int(r), str(f)), int(v)) for r, f, v in receipts.get(span, ()))
+                      for span in sites]
+            key = (int(receiver), str(field))
+            state_cells = site_state_cells(sites, receiver, field)
+            if not states or any(key not in state for state in states):
+                return exit_with(SITE_WITHOUT_FIELD_STATE, state_cells)
+            candidates = {state[key] for state in states}
+            if len(candidates) != 1:
+                return exit_with(SITES_DISAGREE_ON_VERSION, state_cells)
+            read = (*state_cells, *version_cells(state_cells))
+            candidates = definitions.get(next(iter(candidates)), ())
         if len(candidates) != 1:
             return exit_with(VERSION_NOT_UNIQUELY_DEFINED, read)
         owner, value = candidates[0]

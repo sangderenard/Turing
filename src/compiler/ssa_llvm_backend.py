@@ -1202,6 +1202,21 @@ def _emit_repository_call_module(
         extract_llvm_function,
     )
 
+    # Plan 100, 4.3: each unit of text is posted beside the append that
+    # holds it, on the module's attached book (never the ambient one); the
+    # text itself is untouched.
+    from .concordance_declarations import (
+        EMISSION_LLVM, ArtifactPart, Backend, FUNCTION_TEXT_PENDING,
+        VALUE_WITHOUT_IDENTITY_CELL, UnitKind,
+    )
+    from .emission_concordance import (
+        ArtifactEmission, emission_book, emission_recorder,
+        post_artifact_part, value_cell,
+    )
+
+    emission = emission_book(module, "_emit_repository_call_module")
+    recorders: dict[str, _Any] = {}
+
     reachable, kernels_used = _internal_call_closure(module, function_name)
     piece_records = _piece_symbols(module)
     linked_pieces: dict[str, str] = {}
@@ -1817,7 +1832,18 @@ def _emit_repository_call_module(
             *(f"ptr %out.{index}" for index in range(len(outputs))),
             *(("ptr %extents",) if name in extent_users else ()),
         ]
+        header = (
+            f"define internal void @{internal_symbols[name]}"
+            f"({', '.join(parameters)}) {{"
+        )
+        recorder = recorders[name] = emission_recorder(
+            emission, function, Backend.LLVM_MODULE, stage=EMISSION_LLVM,
+            symbol=internal_symbols[name],
+        )
+        recorder.header(header, args=(*function.args, *outputs))
         body: list[str] = []
+        span = recorder.span(body)
+        fused_heads: dict[int, _Any] = {}
         entry_allocas: list[str] = []
         entry_frees: list[str] = []
         pointers: dict[int, str] = {
@@ -2235,6 +2261,9 @@ def _emit_repository_call_module(
         for instruction_index, (block_name, instruction) in enumerate(
             scheduled_instructions
         ):
+            # Every path below ends in ``continue``; the lines an instruction
+            # appends are posted when the next one opens.
+            span.close()
             if block_name != active_block:
                 if pending_shadow:
                     body.extend(pending_shadow)
@@ -2243,6 +2272,8 @@ def _emit_repository_call_module(
                 active_block = block_name
                 block_exit_label[block_name] = block_name
                 register_cache.clear()
+                span.take(UnitKind.BLOCK_LABEL, spelling=block_name)
+            span.open(instruction)
             operation = str(instruction.op)
             if pending_shadow and operation not in {"Phi", "phi"}:
                 body.extend(pending_shadow)
@@ -2252,6 +2283,11 @@ def _emit_repository_call_module(
             tag = f"{instruction_index}.{result_id if result_id is not None else 'v'}"
 
             if instruction_index in fused_handled:
+                # Spelled inside the fused run its head emitted.
+                span.pending = None
+                recorder.elided(
+                    instruction, binding=fused_heads.get(instruction_index),
+                )
                 continue
             fused_step = _fusable_elementwise(instruction, fused_constants)
             if fused_step is not None:
@@ -2358,11 +2394,21 @@ def _emit_repository_call_module(
                         )
                         body.append(f"  store double {out}, ptr {address}, align 8")
                     fused_handled.add(step_index)
+                    fused_heads[step_index] = instruction
                 body.append(f"  %{lane}.next = add i64 %{lane}.i, 1")
                 body.append(f"  br label %{lane}.header")
                 body.append(f"{lane}.exit:")
                 block_exit_label[active_block] = f"{lane}.exit"
                 register_cache.clear()
+                # The run's text spells every step's result and operands.
+                span.take_pending(args=tuple(
+                    value
+                    for _index, step_instruction, _step in run
+                    for value in (*step_instruction.args,)
+                ) + tuple(
+                    step_instruction.res
+                    for _index, step_instruction, _step in run[1:]
+                ))
                 continue
 
             if operation in {"Const", "StaticRef"} and result is not None:
@@ -2708,7 +2754,12 @@ def _emit_repository_call_module(
                 continue
 
             if operation in {"Ret", "ret", "Return", "return"}:
+                span.take_pending()
                 emit_return_values(tuple(instruction.args))
+                span.take(
+                    UnitKind.OUTPUT_STORE,
+                    args=(*instruction.args, *outputs),
+                )
                 body.append("  ret void")
                 emitted_return = True
                 continue
@@ -4055,17 +4106,28 @@ def _emit_repository_call_module(
                 name, operation, "operation has no repository LLVM emission",
             ))
 
+        span.close()
         if not emitted_return:
             emit_return_values()
+            span.take(UnitKind.OUTPUT_STORE, args=outputs)
             body.append("  ret void")
+            span.take(UnitKind.RETURN)
         if not any(line.endswith(":") for line in body):
             body.insert(0, "entry:")
+            recorder.unit(UnitKind.BLOCK_LABEL, body[0], spelling="entry")
         entry_label_index = next(
             (index for index, line in enumerate(body) if line.endswith(":")),
             0,
         )
         body[entry_label_index + 1:entry_label_index + 1] = entry_allocas
+        # Frame storage spliced after the entry label, and its releases
+        # spliced before every return: declared storage, no value of its own.
+        for line in entry_allocas:
+            recorder.unit(UnitKind.DECLARATION, line)
+        if entry_frees:
+            recorder.unit(UnitKind.STATEMENT, "\n".join(entry_frees))
         _release_frame_before_returns(body, entry_frees)
+        recorder.unit(UnitKind.RETURN, "}")
         emitted_functions.append("\n".join((
             # ``internal``: these helpers exist only for the exported entry
             # wrapper below, and saying so is what LETS the optimizer inline
@@ -4073,11 +4135,15 @@ def _emit_repository_call_module(
             # invoked once per element pays a full ABI call each time --
             # seventeen stack-argument stores per element on Win64 -- which
             # measured 3.6x the whole kernel's arithmetic at two limbs.
-            f"define internal void @{internal_symbols[name]}"
-            f"({', '.join(parameters)}) {{",
+            header,
             *body,
             "}",
         )))
+        if name != function_name:
+            # Hashed before ``_annotate_noalias`` rewrites the define line.
+            recorder.finish(emitted_functions[-1])
+        else:
+            root_definition = emitted_functions[-1]
 
     root = module.functions[function_name]
     root_outputs = function_outputs[function_name]
@@ -4120,6 +4186,15 @@ def _emit_repository_call_module(
     buffer_dtypes: list[str] = []
     public_pointer: dict[int, str] = {}
     wrapper: list[str] = ["entry:"]
+    # The wrapper's units are posted under the root function's row.
+    wrapper_header = f"define void @{entry_name}(ptr %buffers, ptr %extents) {{"
+    entry_recorder = recorders.get(function_name) or emission_recorder(
+        emission, root, Backend.LLVM_MODULE, stage=EMISSION_LLVM,
+        symbol=internal_symbols[function_name],
+    )
+    entry_recorder.unit(UnitKind.FUNCTION_HEADER, wrapper_header, spelling=entry_name)
+    entry_recorder.unit(UnitKind.BLOCK_LABEL, wrapper[0], spelling="entry")
+    entry_span = entry_recorder.span(wrapper)
     for value in public_values:
         value_id = int(value.id)
         if value_id in public_pointer:
@@ -4149,6 +4224,7 @@ def _emit_repository_call_module(
         loaded = f"%public.{slot}"
         wrapper.append(f"  {address} = getelementptr ptr, ptr %buffers, i64 {slot}")
         wrapper.append(f"  {loaded} = load ptr, ptr {address}, align 8")
+        entry_span.take(UnitKind.FORMAL, args=(value,), spelling=loaded)
         public_pointer[value_id] = loaded
     wrapper_frees: list[str] = []
     for storage_index, value in enumerate(root_internal_storage):
@@ -4161,6 +4237,7 @@ def _emit_repository_call_module(
         )
         local = f"%root.frame.{storage_index}"
         _frame_slot(local, llvm_type, count, wrapper, wrapper_frees)
+        entry_span.take(UnitKind.DECLARATION, args=(value,), spelling=local)
         public_pointer[int(value.id)] = local
     internal_call_records.append((
         None,
@@ -4181,8 +4258,18 @@ def _emit_repository_call_module(
         ))
         + ")"
     )
+    entry_span.take(
+        UnitKind.CALL, args=(*root.args, *root_outputs),
+        spelling=internal_symbols[function_name],
+    )
     wrapper.extend(wrapper_frees)
     wrapper.append("  ret void")
+    entry_span.take(UnitKind.RETURN)
+    entry_recorder.unit(UnitKind.RETURN, "}")
+    wrapper_finished = entry_recorder.finish("\n".join((
+        *((root_definition,) if function_name in recorders else ()),
+        wrapper_header, *wrapper, "}",
+    )))
 
     definitions: dict[str, str] = {}
     declarations: dict[str, str] = {}
@@ -4236,12 +4323,37 @@ def _emit_repository_call_module(
             emitted_functions, internal_call_records,
         )),
         "\n".join((
-            f"define void @{entry_name}(ptr %buffers, ptr %extents) {{",
+            wrapper_header,
             *wrapper,
             "}",
         )),
     ) if part)
     publications = function_output_publications(module.functions[function_name])
+    # MODULE_TEXT derives from every reachable function's finished row (the
+    # root's holds the wrapper); kernel definitions and declarations pulled
+    # in by symbol are module text with no unit of their own (listed in the
+    # step-9 continuation).  BUFFER_ORDER from each slot value's cell.
+    module_text = post_artifact_part(
+        emission, entry_name, Backend.LLVM_MODULE, ArtifactPart.MODULE_TEXT,
+        data=llvm_ir + "\n",
+        sources=tuple(
+            wrapper_finished if fn == function_name else recorders[fn].finished
+            for fn in reachable if fn in recorders
+        ),
+        reason=FUNCTION_TEXT_PENDING, stage=EMISSION_LLVM,
+    )
+    buffer_order_cell = None if emission is None else post_artifact_part(
+        emission, entry_name, Backend.LLVM_MODULE, ArtifactPart.BUFFER_ORDER,
+        data=repr((
+            tuple(buffer_order), tuple(buffer_dtypes), tuple(buffer_shapes),
+            tuple(module_extent_order),
+        )),
+        location=tuple(buffer_order),
+        sources=tuple(
+            value_cell(emission, root, value_id) for value_id in buffer_order
+        ),
+        reason=VALUE_WITHOUT_IDENTITY_CELL, stage=EMISSION_LLVM,
+    )
     return LLVMFunctionArtifact(
         name=entry_name,
         llvm_ir=llvm_ir + "\n",
@@ -4255,6 +4367,12 @@ def _emit_repository_call_module(
         output_surfaces=publication_surface_plan(publications, target="llvm"),
         watched=tuple(watched_ids),
         watch_shortfalls=tuple(watch_shortfalls),
+        emission=(
+            None if emission is None
+            else ArtifactEmission(
+                emission, Backend.LLVM_MODULE, module_text, buffer_order_cell,
+            )
+        ),
     )
 
 
@@ -4292,6 +4410,13 @@ class LLVMFunctionArtifact:
     _library: _Any = _field(default=None, repr=False)
     _validation_error_reset: _Any = _field(default=None, repr=False)
     _validation_error_take: _Any = _field(default=None, repr=False)
+    #: ``emission_concordance.ArtifactEmission``: the book and the
+    #: MODULE_TEXT / BUFFER_ORDER cells ``compile_artifact`` derives its
+    #: file, command and library rows from (plan 100, 4.2).  None when the
+    #: module had no book.  ``dataclasses.replace`` copies it: a replaced
+    #: ``llvm_ir`` then shows as a SOURCE_FILE hash that differs from its
+    #: MODULE_TEXT row.
+    emission: _Any = _field(default=None, repr=False, compare=False)
 
     @property
     def complete(self) -> bool:
@@ -6169,6 +6294,12 @@ def compile_artifact(
         )
         if completed.returncode == 0 and library.is_file():
             artifact.library_path = library
+            if artifact.emission is not None:
+                artifact.emission.build(
+                    artifact.name, source_text=artifact.llvm_ir,
+                    source_path=source, command=command,
+                    library_path=library,
+                )
             return artifact
         if "sub-compilation" not in (completed.stderr or ""):
             break

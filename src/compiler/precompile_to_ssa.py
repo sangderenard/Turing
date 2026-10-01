@@ -6035,6 +6035,10 @@ class _ControlSSABuilder:
                 self.branch(exit_block)
                 self.current.instrs[-1].attributes["source_control"] = "return"
                 self.current.instrs[-1].attributes["return_source_value_ids"] = tuple(block.return_value_ids)
+                if block.return_site_cell is not None:
+                    # The edge names its own return SITE (the construct's
+                    # cell), not only the values it carries.
+                    self.current.instrs[-1].attributes["return_site_cell"] = block.return_site_cell
                 self.current = self.new_block("unreachable_return_control")
             else:
                 fallthrough = self.new_block("return_control_next")
@@ -6059,6 +6063,8 @@ class _ControlSSABuilder:
                 self.function_return_edges.append((self.current, edge_values))
                 self.branch(exit_block)
                 self.current.instrs[-1].attributes["return_source_value_ids"] = tuple(block.return_value_ids)
+                if block.return_site_cell is not None:
+                    self.current.instrs[-1].attributes["return_site_cell"] = block.return_site_cell
                 self.current = fallthrough
             return
         if isinstance(block, LoopControlBlock):

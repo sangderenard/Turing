@@ -271,6 +271,12 @@ class LoopControlBlock:
     # site did not rebind that name.
     site_node_id: int | None = None
     site_values: tuple[tuple[int, int], ...] = ()
+    # ``return``: the return SITE's identity cell -- the cell the reducer
+    # keys the ``return_site_slot`` / ``return_site_field_state`` rows by
+    # (the return construct, never the value it returns).  Lowering stamps
+    # it on the return edge beside ``return_source_value_ids`` so a merge
+    # predecessor names its own site.  None when no site row exists.
+    return_site_cell: Any = None
 
     def __post_init__(self) -> None:
         if self.action not in {"break", "continue", "return"}:
@@ -1056,7 +1062,12 @@ def post_control_program(
             carried = cells(updated for updated, _initial in block.carried_aliases)
             sites = cells(block.control_site_ids)
         elif isinstance(block, LoopControlBlock):
-            owner = cell(block.site_node_id)
+            # A return edge is owned by its return site's cell.
+            owner = (
+                block.return_site_cell
+                if isinstance(block.return_site_cell, Ref)
+                else cell(block.site_node_id)
+            )
             predicate = cell(block.predicate_value_id)
             extra = (str(block.action), block.source_action)
         elif isinstance(block, (CallBlock, DispatchBlock, ExternalReferenceCallBlock)):

@@ -1595,7 +1595,136 @@ CONTROL_PROGRAM = declare_page("control_program", (
     RowField("function_scope", K.SCOPE), RowField("program", K.LABEL),
 ), ControlProgramFact)                 # REVISE
 
-__all__ = [name for name in dir() if not name.startswith("_") and name not in {
+# ----------------------------------------------------------------------------
+# Step 9 Part B: emission as the last layer (plan 100, section 4).  Writers:
+# ``emission_concordance.py`` (the recorder and the artifact helpers), called
+# beside every append of ``ssa_c_backend`` (and the other backends as they
+# are routed).  The function element of a unit / function row is the
+# function's SYMBOL: a planned region carries its root's control scope, so
+# the value scope cannot key one function's rows (see the module docstring
+# of ``emission_concordance``).
+# ----------------------------------------------------------------------------
+
+# -- stages ------------------------------------------------------------------
+EMISSION_C = declare_stage("emission_c")
+EMISSION_LLVM = declare_stage("emission_llvm")
+EMISSION_FORTRAN = declare_stage("emission_fortran")
+EMISSION_WASM = declare_stage("emission_wasm")
+EMISSION_JAVASCRIPT = declare_stage("emission_javascript")
+#: ``compile`` / ``compile_standalone`` / ``write``: the files and the
+#: command made from the module text.
+ARTIFACT_BUILD = declare_stage("artifact_build")
+
+# -- reasons -----------------------------------------------------------------
+#: A unit spells an SSA value whose identity cell no pass posted (the
+#: worklist of plan 100, 4.1 item 2).
+VALUE_WITHOUT_IDENTITY_CELL = declare_reason("value_without_identity_cell")
+#: The module reached a backend with no attached book (plan 100, R9.2).
+NO_BOOK_AT_EMISSION = declare_reason("no_book_at_emission")
+#: A BLOCK_LABEL unit while ``ssa_block`` (plan 100, 2.6) is not posted.
+BLOCK_ORIGIN_UNROUTED = declare_reason("block_origin_unrouted")
+#: ``emission_function`` posted before its units (revised by ``finish``).
+FUNCTION_TEXT_PENDING = declare_reason("function_text_pending")
+#: A linked LLVM piece whose own MODULE_TEXT is not on this book.
+PIECE_ARTIFACT_UNROUTED = declare_reason("piece_artifact_unrouted")
+WASM_REGION_UNROUTED = declare_reason("wasm_region_unrouted")
+#: An instruction another unit spells (an aggregate projection bound by
+#: its call): its own row reads the binding unit.
+UNIT_ELIDED = declare_reason("unit_elided")
+# ``NO_FUNCTION_SCOPE`` is declared in the step-8 block above.
+
+# -- transforms --------------------------------------------------------------
+#: A value ``with_native_sgd_loop`` / ``with_native_adam_loop`` mints for
+#: its wrapper (operand: the wrapped root's function cell).
+NATIVE_LOOP_WRAPPER_VALUE = declare_transform("native_loop_wrapper_value", 1)
+
+
+# -- facts -------------------------------------------------------------------
+class Backend(Enum):
+    C_SCALAR = "c_scalar"
+    C_MODULE = "c_module"
+    LLVM_SCALAR = "llvm_scalar"
+    LLVM_MODULE = "llvm_module"
+    FORTRAN = "fortran"
+    WASM_WAT = "wasm_wat"
+    WASM_BINARY = "wasm_binary"
+    JAVASCRIPT = "javascript"
+
+
+class UnitKind(Enum):
+    FUNCTION_HEADER = "function_header"
+    FORMAL = "formal"
+    BLOCK_LABEL = "block_label"
+    STATEMENT = "statement"
+    INLINED_EXPRESSION = "inlined_expression"
+    LITERAL = "literal"
+    PHI_EDGE_ASSIGNMENT = "phi_edge_assignment"
+    BRANCH = "branch"
+    RETURN = "return"
+    CALL = "call"
+    DECLARATION = "declaration"
+    OUTPUT_STORE = "output_store"
+    TABLE = "table"
+    PROTOTYPE = "prototype"
+
+
+class ArtifactPart(Enum):
+    """``emission_artifact.part``: a member, or ``(member, detail...)`` --
+    ``(PIECE_FILE, symbol)``, ``(SOURCE_FILE, "host")``, and any part of a
+    standalone build suffixed ``"standalone"``."""
+
+    MODULE_TEXT = "module_text"
+    SOURCE_FILE = "source_file"
+    PIECE_FILE = "piece_file"
+    COMPILE_COMMAND = "compile_command"
+    LIBRARY = "library"
+    BINARY = "binary"
+    API_CONTRACT = "api_contract"
+    BUFFER_ORDER = "buffer_order"
+
+
+@dataclass(frozen=True)
+class EmittedUnit:
+    """``text``: the exact line(s) appended (for LITERAL / INLINED_EXPRESSION
+    the expression inlined, which has no line of its own); ``spelling``: the
+    token the unit binds its result to (``t{id}``), "" when none."""
+
+    kind: UnitKind
+    text: str
+    spelling: str
+
+
+@dataclass(frozen=True)
+class FunctionEmission:
+    symbol: str
+    unit_count: int
+    text_sha256: str
+
+
+@dataclass(frozen=True)
+class ArtifactFact:
+    """Never the text: its hash and length, and where it went (path parts,
+    or the command tuple)."""
+
+    sha256: str
+    byte_length: int
+    location: tuple
+
+
+# -- pages -------------------------------------------------------------------
+EMISSION_UNIT = declare_page("emission_unit", (
+    RowField("function", K.SCOPE), RowField("backend", K.LABEL),
+    RowField("unit", K.INDEX),
+), EmittedUnit)                        # EmittedUnit | Unresolved(UNIT_ELIDED); CONCORD (REVISE on re-emission)
+EMISSION_FUNCTION = declare_page("emission_function", (
+    RowField("function", K.SCOPE), RowField("backend", K.LABEL),
+), FunctionEmission)                   # Unresolved(FUNCTION_TEXT_PENDING) then FunctionEmission; REVISE
+EMISSION_ARTIFACT = declare_page("emission_artifact", (
+    RowField("artifact", K.NAME), RowField("backend", K.LABEL),
+    RowField("part", K.LABEL),
+), ArtifactFact)                       # REVISE
+
+__all__ =[name for name in dir() if not name.startswith("_") and name not in {
     "ast", "dataclass", "Enum", "Any", "Ref", "RowField", "K", "Unresolved",
     "declare_page", "declare_reason", "declare_stage", "declare_transform",
 }]
