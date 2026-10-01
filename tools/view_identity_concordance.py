@@ -143,7 +143,9 @@ import argparse
 import colorsys
 import ctypes
 import math
+import queue
 import re
+import threading
 import sys
 import time
 from pathlib import Path
@@ -1081,24 +1083,97 @@ class World:
         return int(self.state.spring_group_index.item()) % FLOW_GROUPS
 
 
-def spring_effects(world, er, ei):
-    """The flow animation read off the spring state: glow -> border and size,
-    the active group's nodes white-hot, lit lines between glowing nodes."""
-    strength, boost = world.glow()
-    strength, boost = strength[world.n_core:], boost[world.n_core:]
-    n = world.n_shell
-    active = world.shell_group == world.active_group()
-    rgb = np.where(active[:, None], FRONT_RGB, ATTACH_RGB).astype(np.float32)
-    g_edge = np.maximum(strength[er], strength[ei]).astype(np.float32)
-    return {
-        "border": np.concatenate([rgb, strength[:, None]], axis=1).astype(np.float32),
-        "size": (1.0 + 1.6 * boost).astype(np.float32),
-        "node_alpha": np.ones(n, np.float32),
-        "edge_alpha": (1.0 + 2.0 * g_edge).astype(np.float32),
-        "edge_glow": g_edge,
-        "edge_tint": np.broadcast_to(ATTACH_RGB, (len(er), 3)).astype(np.float32),
-        "front": -1,
-    }
+class PhysicsThread(threading.Thread):
+    """The world steps on its own thread; the viewer draws on the main thread.
+
+    Each physics frame runs the order layer (on the world's device) and one
+    managed window, then publishes a snapshot -- every position, the glow,
+    the four background maps and the HUD numbers -- under a lock.  The viewer
+    draws at its own rate from the newest snapshot and never touches the
+    world: keys that change the physics (run, order, flow, reset) are queued
+    as commands and applied here between frames.
+    """
+
+    def __init__(self, world, field, gain, frame_dt):
+        super().__init__(daemon=True, name="world-physics")
+        from src.common.tensors.abstraction import AbstractTensor as AT
+        self.AT, self.world, self.field, self.gain, self.frame_dt = AT, world, field, float(gain), frame_dt
+        self.zeros_core = AT.tensor(np.zeros((world.n_core, 3), np.float32))
+        self.zeros_all = AT.tensor(np.zeros((world.n_core + world.n_shell, 3), np.float32))
+        self._lock, self._wake, self._halt = threading.Lock(), threading.Event(), threading.Event()
+        self._commands = queue.SimpleQueue()
+        self.running, self.order_on = False, True
+        self.frames, self.busy = 0, 0.0
+        self._seq = 0
+        self.snapshot = None
+
+    def shell_positions(self):
+        return self.world.state.spring_position[self.world.n_core:]
+
+    def frame(self):
+        """One physics frame: the order-field layer (if on), then the lease.  The mean |T - t|."""
+        world = self.world
+        if self.order_on and self.gain > 0:
+            force, err = self.field.order_force(self.shell_positions(), self.gain)
+            world.step(self.frame_dt, self.AT.cat([self.zeros_core, force], dim=0))
+        else:
+            err = self.field.mean_error(self.shell_positions())
+            world.step(self.frame_dt, self.zeros_all if world.ext_mean else None)
+            world.ext_mean = 0.0
+        return float(err.item()) if hasattr(err, "item") else float(err)
+
+    def publish(self, error):
+        world = self.world
+        alpha, radius = world.glow()
+        snap = {
+            "positions": world.all_positions(), "glow": np.stack([alpha, radius], axis=1),
+            "maps": self.field.host_maps(), "error": float(error), "t": world.t,
+            "accepted": world.accepted, "rejected": world.rejected, "ext_mean": world.ext_mean,
+            "group": world.active_group(),
+        }
+        with self._lock:
+            self._seq += 1
+            snap["seq"] = self._seq
+            self.snapshot = snap
+
+    def latest(self):
+        with self._lock:
+            return self.snapshot
+
+    def command(self, name, value=None):
+        self._commands.put((name, value))
+        self._wake.set()
+
+    def stop(self):
+        self._halt.set()
+        self._wake.set()
+
+    def run(self):
+        while not self._halt.is_set():
+            self._wake.clear()                       # before the drain: a later command re-sets it
+            while True:
+                try:
+                    name, value = self._commands.get_nowait()
+                except queue.Empty:
+                    break
+                if name == "run":
+                    self.running = bool(value)
+                elif name == "order":
+                    self.order_on = bool(value)
+                elif name == "flow":
+                    self.world.set_flow(bool(value))
+                elif name == "reset":
+                    self.world.reset()
+                    self.world.set_flow(bool(value))
+                    self.publish(self.field.mean_error(self.shell_positions()).item())
+            if self.running:
+                started = time.perf_counter()
+                error = self.frame()
+                self.publish(error)
+                self.busy += time.perf_counter() - started
+                self.frames += 1
+            else:
+                self._wake.wait(0.05)
 
 
 # -- construction animation -----------------------------------------------------
@@ -1844,30 +1919,13 @@ def main(argv=None) -> None:
     t_shell = graph["t"].astype(np.float64)
     FRAME_DT = 1.0 / 60.0
     field = TimeField(t_shell)                         # on the world's device
-    from src.common.tensors.abstraction import AbstractTensor as _AT
-    zeros_core = _AT.tensor(np.zeros((world.n_core, 3), np.float32))
-    zeros_all = _AT.tensor(np.zeros((world.n_core + world.n_shell, 3), np.float32))
-
-    def shell_positions():
-        return world.state.spring_position[world.n_core:]
-
-    def world_frame(order_on: bool):
-        """One frame of the one physics: the order-field layer (if on), then the lease."""
-        if order_on and args.order_gain > 0:
-            force, err = field.order_force(shell_positions(), args.order_gain)
-            world.step(FRAME_DT, _AT.cat([zeros_core, force], dim=0))
-        else:
-            err = field.mean_error(shell_positions())
-            world.step(FRAME_DT, zeros_all if world.ext_mean else None)
-            world.ext_mean = 0.0
-        everything = world.all_positions()            # the one read-back: drawing and picking
-        pos[:], core_pos[:] = everything[world.n_core:], everything[:world.n_core]
-        return float(err.item()) if hasattr(err, "item") else float(err)
+    physics = PhysicsThread(world, field, args.order_gain, FRAME_DT)
 
     settle_started = time.perf_counter()
     for _ in range(args.settle):
-        world_frame(True)
-    field.mean_error(shell_positions())
+        physics.frame()
+    physics.publish(field.mean_error(physics.shell_positions()).item())
+    pos[:], core_pos[:] = physics.latest()["positions"][world.n_core:], physics.latest()["positions"][:world.n_core]
     if args.settle:
         print(f"settled {args.settle} world frames in {time.perf_counter() - settle_started:.1f}s "
               f"(world time {world.t:.2f}s)", flush=True)
@@ -1988,8 +2046,7 @@ def main(argv=None) -> None:
         pos_tb.set(vec4s(np.concatenate([core_pos, pos])))
 
     def upload_glow():
-        alpha, radius = world.glow()
-        glow_tb.set(np.stack([alpha, radius], axis=1))
+        glow_tb.set(physics.latest()["glow"])
 
     # HUD: glyph and shape quads from one instance buffer, glyphs from the atlas
     HUD_BIG, HUD_SMALL = 22, 19
@@ -2027,7 +2084,7 @@ def main(argv=None) -> None:
     field_allocated = [False]
 
     def upload_field():
-        data = field.host_maps()
+        data = physics.latest()["maps"]
         gl.glActiveTexture(gl.GL_TEXTURE0)
         gl.glBindTexture(gl.GL_TEXTURE_2D, bg_tex)
         if field_allocated[0]:
@@ -2152,6 +2209,7 @@ def main(argv=None) -> None:
     page_rgb = _hue_table(len(pages))
 
     def draw_hud(w, h):
+        snap = physics.latest()
         quads = []
         lines = [(f"identity concordance   color: {MODES[state['mode']]}   "
                   f"{int((kind == 0).sum())} rows  {int((kind == 1).sum())} ids  {len(er)} lines   "
@@ -2159,11 +2217,12 @@ def main(argv=None) -> None:
                   f"mass {'ON' if camera.mass else 'off'}   "
                   f"diffusion {'ON' if state['diffuse'] else 'off'}",
                   (235, 235, 240)),
-                 (f"world [{world.backend_name()}]: t {world.t:6.2f}s   last frame {world.accepted} admitted dt, {world.rejected} rejected   "
-                  f"order force {'ON' if state['order'] and args.order_gain > 0 else 'off'} (gain {args.order_gain:g}, mean |F| {world.ext_mean:.3f})   "
+                 (f"world [{world.backend_name()}] on its own thread: t {snap['t']:6.2f}s   last frame {snap['accepted']} admitted dt, {snap['rejected']} rejected   "
+                  f"physics {physics.frames} frames ({physics.frames / max(physics.busy, 1e-9):.1f}/s busy)   "
+                  f"order force {'ON' if state['order'] and args.order_gain > 0 else 'off'} (gain {args.order_gain:g}, mean |F| {snap['ext_mean']:.3f})   "
                   f"core {world.n_core} nodes {len(world.core_src)} edges {'shown' if state['core'] else 'hidden'}, "
                   f"core pinned {n_pinned}/{world.n_core}   "
-                  f"group {world.active_group()}/{FLOW_GROUPS}",
+                  f"group {snap['group']}/{FLOW_GROUPS}",
                   (200, 225, 235)),
                  (summary[:200], (190, 200, 215))]
         if state["anim"] != "off":
@@ -2318,14 +2377,19 @@ def main(argv=None) -> None:
     frame_count = 0
     t0 = time.time()
     snapshot_pending = args.snapshot
+    shown_seq = [0]
+    rendered = [0]
 
     def update_scene():
         nonlocal pick_edges, frame_count
-        stepped = bool(state["physics"])
-        if stepped:
-            state["error"] = world_frame(state["order"])
+        snap = physics.latest()
+        fresh = snap["seq"] != shown_seq[0]
+        if fresh:                                   # a new physics frame: its positions, glow and maps
+            shown_seq[0] = snap["seq"]
+            pos[:], core_pos[:] = snap["positions"][nc:], snap["positions"][:nc]
+            state["error"] = snap["error"]
             state["hud_dirty"] = True
-        if stepped or state["dirty"]:
+        if fresh or state["dirty"]:
             upload_positions()
             upload_glow()
             upload_field()
@@ -2358,7 +2422,7 @@ def main(argv=None) -> None:
             return locations[key]
 
         flow = 1 if (state["anim"] == "flow" and not state["focus"]) else 0
-        active = world.active_group()
+        active = physics.latest()["group"]
 
         def use(prog, psize=None, lalpha=None):
             gl.glUseProgram(prog)
@@ -2465,34 +2529,49 @@ def main(argv=None) -> None:
         pygame.quit()
         return
 
+    def finish():
+        physics.stop()
+        elapsed = max(time.time() - t0, 1e-9)
+        print(f"render: {rendered[0]} frames in {elapsed:.1f}s ({rendered[0] / elapsed:.1f} fps); "
+              f"physics thread: {physics.frames} frames ({physics.frames / elapsed:.2f}/s wall, "
+              f"{physics.frames / max(physics.busy, 1e-9):.2f}/s busy) on {world.backend_name()}", flush=True)
+        pygame.quit()
+
+    physics.command("run", state["physics"])
+    physics.command("order", state["order"])
+    physics.start()
+    t0 = time.time()
     while True:
         w, h = pygame.display.get_window_size()
         mvp = camera.mvp(w / max(h, 1))                       # the matrix events pick against
         for ev in pygame.event.get():
             if ev.type == QUIT:
-                pygame.quit(); return
+                finish(); return
             if ev.type == VIDEORESIZE:
                 state["hud_dirty"] = True
             if ev.type == KEYDOWN:
                 k = ev.key
                 if k == pygame.K_ESCAPE:
-                    pygame.quit(); return
+                    finish(); return
                 elif k in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5):
                     state["mode"] = k - pygame.K_1; state["dirty"] = state["hud_dirty"] = True
-                elif k == pygame.K_SPACE: state["physics"] = not state["physics"]; state["hud_dirty"] = True
+                elif k == pygame.K_SPACE:
+                    state["physics"] = not state["physics"]; state["hud_dirty"] = True
+                    physics.command("run", state["physics"])
                 elif k == pygame.K_r:
-                    world.reset(); world.set_flow(state["anim"] == "flow")
-                    shell, core = world.positions(); pos[:] = shell; core_pos[:] = core
-                    field.mean_error(shell_positions()); state["dirty"] = True
-                elif k == pygame.K_o: state["order"] = not state["order"]; state["hud_dirty"] = True
+                    physics.command("reset", state["anim"] == "flow"); state["dirty"] = True
+                elif k == pygame.K_o:
+                    state["order"] = not state["order"]; state["hud_dirty"] = True
+                    physics.command("order", state["order"])
                 elif k == pygame.K_k: state["core"] = not state["core"]; state["hud_dirty"] = True
                 elif k == pygame.K_b: state["bg"] = not state["bg"]
                 elif k == pygame.K_g:
                     state["anim"] = ANIMATIONS[(ANIMATIONS.index(state["anim"]) + 1) % len(ANIMATIONS)]
                     state["anim_t0"] = time.time(); state["dirty"] = state["hud_dirty"] = True
-                    world.set_flow(state["anim"] == "flow")
+                    physics.command("flow", state["anim"] == "flow")
                     if state["anim"] == "flow":
                         state["physics"] = True                     # the twitch is the world's cycle
+                        physics.command("run", True)
                 elif k == pygame.K_COMMA: state["speed"] = max(0.1, state["speed"] / 1.5); state["hud_dirty"] = True
                 elif k == pygame.K_PERIOD: state["speed"] = min(20.0, state["speed"] * 1.5); state["hud_dirty"] = True
                 elif k == pygame.K_l: state["lines"] = not state["lines"]
@@ -2556,9 +2635,10 @@ def main(argv=None) -> None:
             print(f"snapshot -> {snapshot_pending}", flush=True)
             snapshot_pending = None
         pygame.display.flip()
+        rendered[0] += 1
         clock.tick(60)
         if args.exit_after is not None and time.time() - t0 > args.exit_after:
-            pygame.quit(); return
+            finish(); return
 
 
 if __name__ == "__main__":
