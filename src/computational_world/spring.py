@@ -17,6 +17,9 @@ from ..common.tensors.abstraction import AbstractTensor as AT
 from .state import ComputationalWorldState
 
 
+REPULSION_MODES = ("none", "full", "topk")
+
+
 @dataclass(frozen=True, slots=True)
 class BoundSpringParameters:
     k_stretch: float = 8.0
@@ -51,6 +54,13 @@ class BoundSpringParameters:
     #: tiles under this budget; a world that fits in one tile runs the
     #: untiled code unchanged.  Compute layout only, not physics.
     force_tile_bytes: int = 512 * 2 ** 20
+    #: Which node pairs the repulsion -- the one force that is not carried by
+    #: an edge -- sums over.  ``"full"``: every same-network pair (the legacy
+    #: N x N sum).  ``"topk"``: each node's ``repulse_k`` nearest same-network
+    #: nodes, chosen afresh from the positions at every force evaluation.
+    #: ``"none"``: no repulsion, whatever ``c_repulse`` says.
+    repulsion: str = "full"
+    repulse_k: int = 8
 
     def __post_init__(self) -> None:
         if self.k_stretch < 0.0 or self.c_repulse < 0.0:
@@ -63,6 +73,10 @@ class BoundSpringParameters:
             raise ValueError("spring relativistic fraction must be positive")
         if int(self.force_tile_bytes) <= 0:
             raise ValueError("spring force tile budget must be positive")
+        if self.repulsion not in REPULSION_MODES:
+            raise ValueError(f"spring repulsion must be one of {REPULSION_MODES}")
+        if int(self.repulse_k) <= 0:
+            raise ValueError("spring top-k repulsion needs k >= 1")
 
 
 def _tensor(value, dtype: str):
@@ -402,7 +416,11 @@ def _forces(
     # Autotile over repulsion rows: per row about 52 bytes per node live at
     # once (displacement and its product, x3 float32, plus four row planes).
     row_tile = max(1, int(cfg.force_tile_bytes) // max(52 * node_count, 1))
-    if cfg.c_repulse and node_count and row_tile >= node_count:
+    repulse = cfg.c_repulse and node_count and cfg.repulsion != "none"
+    if repulse and cfg.repulsion == "topk":
+        if node_count > 1:
+            force = force + _topk_repulsion(state, cfg, position, node_count)
+    elif repulse and row_tile >= node_count:
         displacement = position[:, None, :] - position[None, :, :]
         distance2 = (displacement * displacement).sum(dim=2) + cfg.eps_rep
         off_diagonal = 1.0 - AT.eye(node_count, dtype="float32")
@@ -416,7 +434,7 @@ def _forces(
         force = force + (
             cfg.c_repulse * inverse[:, :, None] * displacement
         ).sum(dim=1)
-    elif cfg.c_repulse and node_count:
+    elif repulse:
         # The same rows of the same pairwise sum, a tile of rows at a time:
         # the identity and the same-network mask are the full ones' rows.
         network = state.spring_node_network[:node_count].clone().reshape((-1, 1))
@@ -451,6 +469,59 @@ def _forces(
     ).clamp(min=1.0e-9).sqrt()
     acceleration = proposed_acceleration / (gamma ** 3)
     return force, acceleration
+
+
+def _topk_repulsion(state, cfg: BoundSpringParameters, position, node_count: int):
+    """Repulsion from each node's ``repulse_k`` nearest same-network nodes.
+
+    The full sum's term, ``c_repulse * d / (|d|^2 + eps)``, over a chosen
+    neighbour set instead of every pair.  Selection ranks one N x N plane per
+    row tile: within a row ``|p - q|^2 = |p|^2 - 2 (p.q - |q|^2 / 2)`` and
+    ``|p|^2`` is the row's constant, so the nearest q are the largest
+    ``p.q - |q|^2 / 2`` -- one matmul and one broadcast subtract, no N x N x 3
+    displacement.  Self and other-network columns are set to -1e30 by two
+    ``where``.  The force is computed from the exact gathered displacements,
+    and a pick that is self or another network (a network smaller than
+    k + 1) carries zero weight.  Rows are tiled under ``force_tile_bytes`` at
+    about 16 bytes per node per row (score, two masked scores, two bool planes).
+    """
+    k = min(int(cfg.repulse_k), node_count - 1)
+    network = state.spring_node_network[:node_count].clone().reshape((-1, 1))
+    network_flat = network.reshape((-1,))
+    network_columns = network.T()
+    column_ids = AT.arange(node_count, dtype="int64").reshape((1, -1))
+    half_norm2 = (0.5 * (position * position).sum(dim=1)).reshape((1, -1))
+    position_t = position.T()
+    row_tile = max(1, int(cfg.force_tile_bytes) // max(16 * node_count, 1))
+    repulsion = []
+    for r0 in range(0, node_count, row_tile):
+        r1 = min(node_count, r0 + row_tile)
+        rows = r1 - r0
+        row_position = position[r0:r1]
+        row_ids = AT.arange(r0, r1, dtype="int64").reshape((-1, 1))
+        row_network = network[r0:r1]
+        closeness = row_position @ position_t - half_norm2
+        # Nested ``where`` rather than ``&``: AbstractTensor's ``__and__``
+        # runs value by value in Python (1.2M calls for one 484-node tile).
+        candidate = AT.where(
+            row_network == network_columns,
+            AT.where(row_ids != column_ids, closeness, -1.0e30),
+            -1.0e30,
+        )
+        nearest = AT.get_tensor(AT.topk(candidate, k, dim=1).indices)
+        neighbour = nearest.reshape((-1,))
+        displacement = (
+            row_position[:, None, :]
+            - position.index_select(0, neighbour).reshape((rows, k, 3))
+        )
+        neighbour_network = network_flat.index_select(0, neighbour).reshape((rows, k))
+        valid = (
+            (neighbour_network == row_network).astype("float32")
+            * (nearest != row_ids).astype("float32")
+        )
+        inverse = valid / ((displacement * displacement).sum(dim=2) + cfg.eps_rep)
+        repulsion.append((cfg.c_repulse * inverse[:, :, None] * displacement).sum(dim=1))
+    return AT.cat(repulsion, dim=0) if len(repulsion) > 1 else repulsion[0]
 
 
 def _causal_limit(
