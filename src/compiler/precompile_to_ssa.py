@@ -10697,7 +10697,11 @@ class _ControlSSABuilder:
                         # An unresolved slot on this return: keep the Phi
                         # arity honest with an explicit absence and record
                         # the shortfall rather than silently dropping the edge.
-                        value = self.fresh_value(dtype="none")
+                        # No cell names the missing value: CONTROL_CONST with no
+                        # operand, so the mint names the function root (plan 80 B2.6
+                        # keeps the shortfall; the slot's function_output row is
+                        # where RETURN_SLOT_UNRESOLVED_ON_EDGE belongs).
+                        value = self.fresh_value(dtype="none", transform=CONTROL_CONST)
                         self.current = block
                         # Insert before the block's terminator.
                         terminator = block.instrs.pop()
@@ -10720,7 +10724,11 @@ class _ControlSSABuilder:
                 if len(edges) == 1:
                     merged = incoming_values[0]
                 else:
-                    merged = self.fresh_value(dtype=dtype)
+                    # One operand per return edge (plan 80 N4: a return merge is variadic).
+                    merged = self.fresh_value(
+                        dtype=dtype, transform=PHI_RETURN_MERGE,
+                        operands=tuple(incoming_values),
+                    )
                     self.emit(
                         Handler.Phi,
                         incoming_values,
