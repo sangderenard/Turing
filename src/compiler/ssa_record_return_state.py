@@ -44,6 +44,26 @@ def ssa_value_identity_cell(function, value_id, *, book=None):
     )
 
 
+def ssa_block_identity_cell(function, label, *, book=None):
+    """The latest ``ssa_block`` cell of block ``label`` of ``function``
+    (row ``(function_scope_of(function), function.name, label)``), or None
+    when no pass posted the block.  The fact is an ``SSABlockKind`` or
+    ``Unresolved(SSA_BLOCK_OWNER_UNROUTED)``; either way the cell carries
+    its edge back to the control cell that owns the block.  ``book`` as in
+    ``ssa_value_identity_cell``."""
+    from .concordance_declarations import SSA_BLOCK
+    from .identity_concordance import current_identity_book
+
+    if label is None:
+        return None
+    if book is None:
+        book = current_identity_book()
+    return book.latest_ref(
+        SSA_BLOCK,
+        (function_scope_of(function), str(function.name), str(label)),
+    )
+
+
 def identity_cells(function, *items):
     """The distinct cells named by ``items``: a Ref as itself, an int (or an
     object with ``.id``) as its ``ssa_value`` cell; None and values without
@@ -1631,6 +1651,7 @@ def scalar_return_field_versions(function, source_graph, functions=None):
     dictionary handles, infer call aliases, or synthesize loop-header state.
     """
     from .concordance_declarations import (
+        CANONICAL_RELABEL,
         INTERVENING_CALL_NOT_READONLY,
         INTERVENING_STORE,
         NO_RETURN_FIELD_RECEIPTS,
@@ -1638,6 +1659,7 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         PREDECESSOR_NOT_A_RETURN_EDGE,
         RECORD_RETURN_FIELD_SELECTION,
         RECORD_RETURN_VERSION,
+        REDUCER_FIELD_STATE,
         RETURN_SITE_FIELD_STATE,
         RETURN_SITE_SLOT,
         SITES_DISAGREE_ON_VERSION,
@@ -1719,6 +1741,21 @@ def scalar_return_field_versions(function, source_graph, functions=None):
             if not isinstance(field_state, Ref):
                 continue
             ref = book.latest_ref(SSA_FIELD_VERSION, (scope, field_state))
+            if ref is None:
+                # Control SSA publishes a write's version at the field-state
+                # cell stamped on the SetAttr (the reduction's ingestion
+                # row); the return site names the canonical re-post of that
+                # same state.  The book joins them: the canonical cell is
+                # DERIVED from the ingestion cell at the canonical-relabel
+                # stage.  Follow that edge, never an id match.
+                ref = next((
+                    found for source, stage in book.edges_into(field_state)
+                    if stage == CANONICAL_RELABEL
+                    and isinstance(source, Ref)
+                    and source.page == REDUCER_FIELD_STATE
+                    for found in (book.latest_ref(SSA_FIELD_VERSION, (scope, source)),)
+                    if found is not None
+                ), None)
             if ref is not None:
                 cells.append(ref)
         return tuple(cells)
@@ -1947,7 +1984,16 @@ def scalar_return_field_versions(function, source_graph, functions=None):
             version_id = site_state_value_id(state_cell)
             if version_id is None:
                 return exit_with(SITE_WITHOUT_FIELD_STATE, (state_cell,))
-            read = (state_cell, *version_cells((state_cell,)))
+            versions = version_cells((state_cell,))
+            read = (state_cell, *versions)
+            if versions:
+                # The site's version IS the SSA value posted on that
+                # state's ``ssa_field_version`` row; the field state's own
+                # value cell names the source graph's value, which is not
+                # an SSA identity.
+                posted = cell_fact(versions[-1])
+                if isinstance(posted, int):
+                    version_id = int(posted)
             candidates = definitions.get(int(version_id), ())
         else:
             sites = [span for span, values in

@@ -1050,6 +1050,72 @@ def _mint_ssa_id(
     return int(ref.row[1])
 
 
+def _post_planned_region_identities(
+    book: Any, scope: str, function: Function, signature_cell: Any,
+    graph_cell: Any,
+) -> None:
+    """The identity cells of one planned region function (plan 100, 4.1
+    item 2 and 2.6), posted where ``lower_control_sections_to_ssa``
+    assembles it.
+
+    ``ssa_value``: every value the region body PRODUCES with no row yet --
+    a literal's ``Const`` and every intermediate, whose ids are the graph
+    ids they lower -- is adopted as the control builder's ``_value_cell``
+    adopts a graph id: ADOPTED_GRAPH_ID DERIVED from the id's
+    ``canonical_value`` cell (``graph_cell``, the read-only post-relabel arm
+    of ``node_identity_cell``), else
+    ``Unsourced(GRAPH_ID_WITHOUT_CANONICAL_CELL)``.  A value that already
+    has a row keeps it.  The formals are not posted here: a formal's id is
+    the feed id it binds in the caller, under the same control scope, so
+    its row IS the feed's (posted by the builder at the call, or the
+    feed's ``control_value_binding``) -- one identity, one key.
+
+    ``ssa_block``: the region's one block, DERIVED from the region's
+    ``region_signature`` cell."""
+
+    from .concordance_declarations import (
+        REGION_VALUE_MINT_UNRECORDED, SSA_BLOCK, SSABlockKind,
+    )
+    from .id_space import MINTED, has_flag
+
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            value = instruction.res
+            if value is None or getattr(value, "id", None) is None:
+                continue
+            row = (scope, int(value.id))
+            if book.latest_ref(SSA_VALUE, row) is not None:
+                continue
+            source = graph_cell(int(value.id))
+            # An id with the MINTED flag is no graph id: its minter (the
+            # plan's min/max fold) posted no record, and the row says so
+            # rather than calling it adopted.
+            minted = has_flag(int(value.id), MINTED)
+            book.post(
+                SSA_VALUE, row,
+                SSAValueFact(
+                    value.dtype, tuple(value.shape or ()),
+                    SSAValueOrigin.MINTED if minted
+                    else SSAValueOrigin.ADOPTED_GRAPH_ID,
+                ),
+                stage=CONTROL_SSA_REGION,
+                provenance=(
+                    Derived((source,)) if source is not None
+                    else Unsourced(REGION_VALUE_MINT_UNRECORDED) if minted
+                    else Unsourced(GRAPH_ID_WITHOUT_CANONICAL_CELL)
+                ),
+                mode=Mode.REVISE,
+            )
+    if not isinstance(signature_cell, Ref):
+        return
+    for label in function.blocks:
+        book.post(
+            SSA_BLOCK, (scope, str(function.name), str(label)),
+            SSABlockKind(str(label)), stage=CONTROL_SSA_REGION,
+            provenance=Derived((signature_cell,)), mode=Mode.CONCORD,
+        )
+
+
 def _control_expression_mapping(
     expression: ControlExpression | None,
 ) -> dict[str, object] | None:
@@ -1224,6 +1290,10 @@ class _ControlSSABuilder:
         self.function_name = function_name
         self.blocks: dict[str, BasicBlock] = {}
         self.block_counts: dict[str, int] = {}
+        #: The ``control_block`` cell (None: the block has no row of its
+        #: own) of each control block being lowered, innermost last: the
+        #: owner every ``ssa_block`` row ``new_block`` posts derives from.
+        self._control_cells: list[Ref | None] = []
         self.shortfalls: list[SSALoweringShortfall] = []
         self.region_callees = dict(region_callees or {})
         # A region with a recorded signature is schedulable by definition; its
@@ -4929,7 +4999,52 @@ class _ControlSSABuilder:
         name = stem if count == 0 else f"{stem}.{count}"
         block = BasicBlock(name)
         self.blocks[name] = block
+        self._post_ssa_block(name, stem)
         return block
+
+    def _post_ssa_block(self, label: str, stem: str) -> Ref:
+        """``ssa_block`` row ``(scope, function, label)`` (plan 100, 2.6),
+        CONCORD.  ENTRY / FUNCTION_EXIT belong to the function: DERIVED
+        from the shell ``control_program`` cell (when posted) and the
+        function root.  Any other block is DERIVED from the ``control_block``
+        cell of the control block being lowered; when that block has no row
+        of its own the fact is ``Unresolved(SSA_BLOCK_OWNER_UNROUTED)``
+        reading the nearest enclosing control cell (else the function's)."""
+
+        from .concordance_declarations import (
+            CONTROL_PROGRAM, SHELL, SSA_BLOCK, SSA_BLOCK_OWNER_UNROUTED,
+            SSABlockKind as _Kind,
+        )
+
+        # The stem is the declared kind's value: an undeclared stem raises.
+        kind = _Kind(stem)
+        book = self._book()
+        program = (
+            None if self.lexical_read_scope is None
+            else book.latest_ref(
+                CONTROL_PROGRAM, (tuple(self.lexical_read_scope), SHELL),
+            )
+        )
+        function_cells = tuple(
+            cell for cell in (program, self._function_root()) if cell is not None
+        )
+        fact: Any = kind
+        if kind in {_Kind.ENTRY, _Kind.FUNCTION_EXIT}:
+            sources = function_cells
+        elif self._control_cells and self._control_cells[-1] is not None:
+            sources = (self._control_cells[-1],)
+        else:
+            enclosing = next(
+                (cell for cell in reversed(self._control_cells) if cell is not None),
+                None,
+            )
+            sources = (enclosing,) if enclosing is not None else function_cells
+            fact = Unresolved(SSA_BLOCK_OWNER_UNROUTED, sources)
+        return book.post(
+            SSA_BLOCK, (self._scope(), str(self.function_name), str(label)),
+            fact, stage=self._stage(), provenance=Derived(sources),
+            mode=Mode.CONCORD,
+        )
 
     def function_exit_block(self) -> BasicBlock:
         """The one block every source ``return`` branches to (created lazily).
@@ -5816,10 +5931,21 @@ class _ControlSSABuilder:
         previous = self._evolution_source
         if self.evolution is not None:
             self._evolution_source = self.evolution.component_for_artifact(block)
+        # A SequenceBlock is a container with no row (flattened for
+        # placement); its children are owned by their own rows.
+        owned = not isinstance(block, SequenceBlock)
+        if owned:
+            from .control_source import control_block_cell
+
+            self._control_cells.append(control_block_cell(
+                self._book(), self.lexical_read_scope, block,
+            ))
         try:
             self._lower(block, path=path)
         finally:
             self._evolution_source = previous
+            if owned:
+                self._control_cells.pop()
 
     def _emit_resource_cleanup(self, action: str, path: str) -> None:
         for scope, loop_depth in reversed(self.resource_scopes):
@@ -15744,9 +15870,13 @@ def lower_control_sections_to_ssa(
                 tuple(int(vid) for vid in effective_captures),
                 outputs,
             )
-            _post_region_signature(
+            signature_cell = _post_region_signature(
                 _book(), str(tensor_shape_concordance_scope), lexical_read_scope,
                 region_index, region_signatures[region_index],
+            )
+            _post_planned_region_identities(
+                _book(), str(tensor_shape_concordance_scope), region_function,
+                signature_cell, _graph_cell,
             )
             _concord_region_feed_consumers(
                 lexical_read_scope, tensor_shape_concordance_scope,

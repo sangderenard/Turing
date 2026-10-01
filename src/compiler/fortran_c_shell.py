@@ -1049,6 +1049,24 @@ def _recover_late_source_literals(
         for node_id, data in graph_obj.nodes(data=True):
             value_id = int(data.get("value_id", node_id))
             source_candidates.setdefault(value_id, []).append((int(node_id), data))
+    # A formal claimed on the book as a member of one of this function's
+    # declared records (the ``record_member`` page under a table owned by
+    # this function) is a caller input.  Its id equal to a graph Constant's
+    # value id is not provenance: the record member row is.
+    declared_members: set[int] = set()
+    from .identity_concordance import current_identity_book
+
+    member_page = current_identity_book().pages.get("record_member")
+    if member_page is not None:
+        for row in member_page.rows():
+            owner = row[0] if isinstance(row, tuple) and len(row) == 2 else None
+            if (
+                isinstance(owner, tuple) and owner
+                and owner[0] == function.name
+                and isinstance(row[1], int)
+                and member_page.latest(row)
+            ):
+                declared_members.add(int(row[1]))
     recovered = []
     instructions = []
     retained_args = []
@@ -1057,6 +1075,9 @@ def _recover_late_source_literals(
 
     for formal in function.args:
         value_id = int(formal.id)
+        if value_id in declared_members:
+            retained_args.append(formal)
+            continue
         candidates = source_candidates.get(value_id, ())
         exact = tuple(data for node_id, data in candidates if node_id == value_id)
         # Structural folding may leave aliases that share a value_id.  The
@@ -24709,18 +24730,29 @@ def _class_surface_ssa_program(
                 access_receipts = field_access_receipts(
                     parameter_key, str(field_name), storage_identity,
                 )
+                field_read_ids = tuple(
+                    field_read[0]
+                    for node_id, data in graph.nodes(data=True)
+                    for field_read in (
+                        _record_field_read(graph, node_id, data),
+                    )
+                    if field_read is not None
+                    and field_read[1] in parameter_ids
+                    and field_read[2] == str(field_name)
+                )
+                # A scalar field's formal is its INCOMING value.  An authored
+                # read names it, and values written beside a read stay
+                # aliases of that one storage.  With no read, a value
+                # written to the field is a later version of it (its write
+                # publishes that version at the write's field-state cell),
+                # never its formal: taking the write value as the formal
+                # made a written literal the caller input, which the late
+                # literal recovery then folded into a constant on every
+                # path, and the incoming value reached no return site.
+                scalar_writes_as_storage = bool(field_read_ids)
                 candidate_ids = tuple(dict.fromkeys(
                     resolve_record_storage(value_id) for value_id in (
-                    *(
-                        field_read[0]
-                        for node_id, data in graph.nodes(data=True)
-                        for field_read in (
-                            _record_field_read(graph, node_id, data),
-                        )
-                        if field_read is not None
-                        and field_read[1] in parameter_ids
-                        and field_read[2] == str(field_name)
-                    ),
+                    *field_read_ids,
                     *(
                         write_source_ids_by_field.get(str(field_name), ())
                         if storage != "scalar"
@@ -24731,11 +24763,16 @@ def _class_surface_ssa_program(
                             )
                             if int(value_id) not in scalar_write_sources
                         )
+                        if scalar_writes_as_storage
+                        else ()
                     ),
                 )))
                 if not candidate_ids:
                     if not access_receipts:
                         continue
+                    # No authored read names the incoming value: mint its
+                    # formal NOVEL through the record-abi minter, the
+                    # declared parameter record's cell as operand.
                     candidate_ids = (GLOBAL_MONOTONIC_IDS.mint(),)
                 if (
                     "sequence" in access_receipts

@@ -1614,6 +1614,9 @@ EMISSION_JAVASCRIPT = declare_stage("emission_javascript")
 #: ``compile`` / ``compile_standalone`` / ``write``: the files and the
 #: command made from the module text.
 ARTIFACT_BUILD = declare_stage("artifact_build")
+#: ``ssa_llvm_backend._annotate_noalias``: rewrites a define line after its
+#: FUNCTION_HEADER unit was posted (the unit is revised under this stage).
+LLVM_NOALIAS_ANNOTATION = declare_stage("llvm_noalias_annotation")
 
 # -- reasons -----------------------------------------------------------------
 #: A unit spells an SSA value whose identity cell no pass posted (the
@@ -1637,6 +1640,10 @@ UNIT_ELIDED = declare_reason("unit_elided")
 #: A value ``with_native_sgd_loop`` / ``with_native_adam_loop`` mints for
 #: its wrapper (operand: the wrapped root's function cell).
 NATIVE_LOOP_WRAPPER_VALUE = declare_transform("native_loop_wrapper_value", 1)
+#: The root of kernel / library text a backend pulls in by symbol
+#: (``extract_llvm_function``, the intrinsic table, a bounded constant's
+#: helper): authored input, as a source span is; no operands.
+AUTHORED_KERNEL_TEXT = declare_transform("authored_kernel_text", 0)
 
 
 # -- facts -------------------------------------------------------------------
@@ -1666,6 +1673,8 @@ class UnitKind(Enum):
     OUTPUT_STORE = "output_store"
     TABLE = "table"
     PROTOTYPE = "prototype"
+    #: A kernel / library definition or declaration pulled in by symbol.
+    KERNEL_TEXT = "kernel_text"
 
 
 class ArtifactPart(Enum):
@@ -1681,6 +1690,25 @@ class ArtifactPart(Enum):
     BINARY = "binary"
     API_CONTRACT = "api_contract"
     BUFFER_ORDER = "buffer_order"
+    #: ``(symbol, LLVM_MODULE, KERNEL_SOURCE)``: the authored text of a
+    #: kernel pulled in by symbol, NOVEL(AUTHORED_KERNEL_TEXT).
+    KERNEL_SOURCE = "kernel_source"
+
+
+class NativeLoop(Enum):
+    """Which native loop wrapper keys a wrapper's rows ``(symbol, loop)``."""
+
+    SGD = "sgd"
+    ADAM = "adam"
+
+
+@dataclass(frozen=True)
+class NativeLoopValue:
+    """One id a native loop wrapper minted for its own buffer: its role
+    (``steps``, ``first_moment``, ...) and the parameter it serves."""
+
+    role: str
+    parameter: int | None
 
 
 @dataclass(frozen=True)
@@ -1723,6 +1751,109 @@ EMISSION_ARTIFACT = declare_page("emission_artifact", (
     RowField("artifact", K.NAME), RowField("backend", K.LABEL),
     RowField("part", K.LABEL),
 ), ArtifactFact)                       # REVISE
+NATIVE_LOOP_VALUE = declare_page("native_loop_value", (
+    RowField("wrapper", K.SCOPE), RowField("value", K.VALUE_ID),
+), NativeLoopValue)                    # NOVEL(NATIVE_LOOP_WRAPPER_VALUE); CONCORD
+
+# ----------------------------------------------------------------------------
+# Step 9 identities: the cells upstream of emission (plan 100, 2.6 and 4.1
+# item 2).  Writers: ``precompile_to_ssa`` -- ``_ControlSSABuilder.new_block``
+# (every SSA block the control builder makes) and the planned-region assembly
+# of ``lower_control_sections_to_ssa`` (the region's one block and the
+# ``ssa_value`` row of every value the region body produces).  Reader:
+# ``ssa_record_return_state.ssa_block_identity_cell``.
+#
+# ``ssa_block`` is keyed (function scope, function symbol, label): a planned
+# region carries its root's control scope (step 6), so the scope alone would
+# put the root's ``entry`` and the region's ``entry`` on one row -- the same
+# reason step 9 Part B keys emission rows by the symbol.
+# ----------------------------------------------------------------------------
+
+#: The SSA block's role in the construct that made it: one member per block
+#: stem ``_ControlSSABuilder.new_block`` is called with (the label is the stem,
+#: suffixed ``.N`` for the N-th repeat).
+class SSABlockKind(Enum):
+    ENTRY = "entry"
+    FUNCTION_EXIT = "function_exit"
+    IF_TRUE = "if_true"
+    IF_FALSE = "if_false"
+    IF_MERGE = "if_merge"
+    LOOP_HEADER = "loop_header"
+    LOOP_BODY = "loop_body"
+    LOOP_LATCH = "loop_latch"
+    LOOP_EXIT = "loop_exit"
+    WHILE_HEADER = "while_header"
+    WHILE_BODY = "while_body"
+    WHILE_LATCH = "while_latch"
+    WHILE_EXIT = "while_exit"
+    LOOP_CONTROL_NEXT = "loop_control_next"
+    UNREACHABLE_LOOP_CONTROL = "unreachable_loop_control"
+    RETURN_CONTROL_NEXT = "return_control_next"
+    RETURN_EDGE = "return_edge"
+    UNREACHABLE_RETURN_CONTROL = "unreachable_return_control"
+    RESOURCE_EXIT = "resource_exit"
+    RESOURCE_EXIT_NEXT = "resource_exit_next"
+    VALIDATION_PASS = "validation_pass"
+    VALIDATION_FAIL = "validation_fail"
+    STATE_CASE = "state_case"
+    STATE_NEXT = "state_next"
+    STATE_MERGE = "state_merge"
+    CHILD_TABLE_LIVE = "child_table_live"
+    MAPPING_SETDEFAULT_FOUND = "mapping_setdefault_found"
+    MAPPING_SETDEFAULT_MISSING = "mapping_setdefault_missing"
+    MAPPING_SETDEFAULT_MERGE = "mapping_setdefault_merge"
+    SEQUENCE_MUTATION_SELECTED = "sequence_mutation_selected"
+    SEQUENCE_MUTATION_SKIPPED = "sequence_mutation_skipped"
+    SEQUENCE_MUTATION_MERGE = "sequence_mutation_merge"
+    SEQUENCE_MAXIMUM_SELECTED = "sequence_maximum_selected"
+    SEQUENCE_MAXIMUM_RETAINED = "sequence_maximum_retained"
+    SEQUENCE_MAXIMUM_MERGE = "sequence_maximum_merge"
+    SEQUENCE_MAXIMUM_HEADER = "sequence_maximum_header"
+    SEQUENCE_MAXIMUM_BODY = "sequence_maximum_body"
+    SEQUENCE_MAXIMUM_LOOP_SELECTED = "sequence_maximum_loop_selected"
+    SEQUENCE_MAXIMUM_LOOP_RETAINED = "sequence_maximum_loop_retained"
+    SEQUENCE_MAXIMUM_LATCH = "sequence_maximum_latch"
+    SEQUENCE_MAXIMUM_EXIT = "sequence_maximum_exit"
+    SEQUENCE_QUERY_SELECTED = "sequence_query_selected"
+    SEQUENCE_QUERY_DEFAULTED = "sequence_query_defaulted"
+    SEQUENCE_QUERY_MERGE = "sequence_query_merge"
+    SEQUENCE_POP_SELECTED = "sequence_pop_selected"
+    SEQUENCE_POP_EMPTY = "sequence_pop_empty"
+    SEQUENCE_REMOVE_SCAN = "sequence_remove_scan"
+    SEQUENCE_REMOVE_COMPARE = "sequence_remove_compare"
+    SEQUENCE_REMOVE_NEXT = "sequence_remove_next"
+    SEQUENCE_REMOVE_SHIFT = "sequence_remove_shift"
+    SEQUENCE_REMOVE_SHIFT_ROW = "sequence_remove_shift_row"
+    SEQUENCE_REMOVE_SHIFT_NEXT = "sequence_remove_shift_next"
+    SEQUENCE_REMOVE_STORE_LENGTH = "sequence_remove_store_length"
+    SEQUENCE_REMOVE_ABSENT = "sequence_remove_absent"
+    SEQUENCE_REMOVE_COMPLETE = "sequence_remove_complete"
+
+
+#: A block made while lowering a control block that has no ``control_block``
+#: row (a container's child the program poster could not own, a
+#: ``StateMachineTick``): the fact is ``Unresolved`` and reads the nearest
+#: enclosing control cell (else the program / function root cell).
+SSA_BLOCK_OWNER_UNROUTED = declare_reason("ssa_block_owner_unrouted")
+#: A planned-region value whose id carries the MINTED flag but whose minter
+#: posted no mint record (``hierarchical_plan``'s variadic min/max fold,
+#: ``fresh_like``): its ``ssa_value`` row is posted origin MINTED and
+#: Unsourced with this reason, so the worklist names the minter's gap.
+REGION_VALUE_MINT_UNRECORDED = declare_reason("region_value_mint_unrecorded")
+
+#: ``tensor_ssa_lowering.lower_tensor_calls_to_repository_ssa``: replaces
+#: tensor operations with explicit kernel calls.
+TENSOR_SSA_LOWERING = declare_stage("tensor_ssa_lowering")
+#: A value that lowering mints (a kernel's static shape / opcode / stride
+#: constant, an ``extent``, a call result buffer): NOVEL on ``ssa_value``
+#: from the cell of the tensor operation being lowered (its result's
+#: ``ssa_value`` cell, else its first argument's), else the function root.
+TENSOR_LOWERING_VALUE = declare_transform("tensor_lowering_value", 1)
+
+SSA_BLOCK = declare_page("ssa_block", (
+    RowField("function_scope", K.SCOPE), RowField("function", K.NAME),
+    RowField("label", K.LABEL),
+), SSABlockKind)                       # SSABlockKind | Unresolved(SSA_BLOCK_OWNER_UNROUTED); CONCORD
 
 __all__ =[name for name in dir() if not name.startswith("_") and name not in {
     "ast", "dataclass", "Enum", "Any", "Ref", "RowField", "K", "Unresolved",

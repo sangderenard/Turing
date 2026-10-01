@@ -610,7 +610,7 @@ def emit_ssa_function_to_c(
     module_text = post_artifact_part(
         book, name, Backend.C_SCALAR, ArtifactPart.MODULE_TEXT, data=source,
         sources=(recorder.finished,), reason=FUNCTION_TEXT_PENDING,
-        stage=EMISSION_C,
+        stage=EMISSION_C, module=module, what="emit_ssa_function_to_c",
     )
     return CFunctionArtifact(
         name,
@@ -1526,7 +1526,7 @@ def emit_ssa_module_to_c(
     )
     from .emission_concordance import (
         ArtifactEmission, emission_book, emission_recorder,
-        post_artifact_part, value_cell,
+        imported_kernel_scope, kernel_callers, post_artifact_part, value_cell,
     )
 
     emission = emission_book(module, "emit_ssa_module_to_c")
@@ -1534,6 +1534,38 @@ def emit_ssa_module_to_c(
 
     name = str(entry_name or function_name)
     reachable = _module_call_closure(module, function_name)
+
+    # A tensor reference kernel the module imported from authored LLVM text
+    # (``binary_value``, ``binary_scalar_double``) is no lowering: its row's
+    # scope derives from its callers' rows, its call sites' operand cells and
+    # the kernel text's own KERNEL_SOURCE root, and its body's values are its
+    # own (``emission_concordance``, "Scopes that are not lowerings").
+    imported_kernels = kernel_callers(module, reachable)
+    kernel_scopes: dict[str, tuple] = {}
+
+    def recorder_for(fn: str) -> Any:
+        """The recorder of ``fn``: the one already emitting it, else a new
+        one (a caller's cell opened ahead of its header reuses the pending
+        row when its header comes)."""
+
+        if fn in recorders:
+            return recorders[fn]
+        if fn in imported_kernels:
+            if fn not in kernel_scopes:
+                kernel_scopes[fn] = ()      # a recursive kernel's own call
+                kernel_scopes[fn] = imported_kernel_scope(
+                    emission, module, fn, imported_kernels[fn], recorder_for,
+                    stage=EMISSION_C,
+                )
+            return emission_recorder(
+                emission, module.functions[fn], Backend.C_MODULE,
+                stage=EMISSION_C, symbol=_c_symbol(fn),
+                scope_cells=kernel_scopes[fn], local_values=True,
+            )
+        return emission_recorder(
+            emission, module.functions[fn], Backend.C_MODULE,
+            stage=EMISSION_C, symbol=_c_symbol(fn),
+        )
     storage_requirements_by_function = module_storage_requirements(module)
     aggregate_abi = analyze_aggregate_abi(module, reachable)
     aggregate_calls = {
@@ -2191,10 +2223,7 @@ def emit_ssa_module_to_c(
             f"static {function_return_type} {_c_symbol(fn)}("
             + ", ".join(parameters) + ") {"
         )
-        recorder = recorders[fn] = emission_recorder(
-            emission, function, Backend.C_MODULE, stage=EMISSION_C,
-            symbol=_c_symbol(fn),
-        )
+        recorder = recorders[fn] = recorder_for(fn)
         recorder.header(header, args=function.args)
         piece = function.metadata.get("llvm_piece")
         if piece:
@@ -3193,7 +3222,10 @@ def emit_ssa_module_to_c(
                 # concurrent lanes serialize the append without an order.
                 effect_guard_used[0] = True
                 body.append("        turing_pool_effect_lock();")
-            span.take(UnitKind.BLOCK_LABEL, spelling=_c_label(block_name))
+            span.take(
+                UnitKind.BLOCK_LABEL, spelling=_c_label(block_name),
+                block=block_name,
+            )
             for position, instruction in enumerate(block.instrs):
                 flush_trace()
                 # Every path below ends in ``continue``; the lines this
@@ -5656,6 +5688,7 @@ def emit_ssa_module_to_c(
             for fn in reachable if fn in recorders
         ),
         reason=FUNCTION_TEXT_PENDING, stage=EMISSION_C,
+        module=module, what="emit_ssa_module_to_c",
     )
     buffer_order_cell = None if emission is None else post_artifact_part(
         emission, name, Backend.C_MODULE, ArtifactPart.BUFFER_ORDER,

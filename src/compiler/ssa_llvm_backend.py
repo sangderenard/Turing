@@ -1206,11 +1206,12 @@ def _emit_repository_call_module(
     # holds it, on the module's attached book (never the ambient one); the
     # text itself is untouched.
     from .concordance_declarations import (
-        EMISSION_LLVM, ArtifactPart, Backend, FUNCTION_TEXT_PENDING,
-        VALUE_WITHOUT_IDENTITY_CELL, UnitKind,
+        EMISSION_LLVM, LLVM_NOALIAS_ANNOTATION, ArtifactPart, Backend,
+        FUNCTION_TEXT_PENDING, VALUE_WITHOUT_IDENTITY_CELL, UnitKind,
     )
     from .emission_concordance import (
-        ArtifactEmission, emission_book, emission_recorder,
+        ArtifactEmission, call_demands, calling_units, emission_book,
+        emission_recorder, kernel_source_cell, piece_source_cell,
         post_artifact_part, value_cell,
     )
 
@@ -1824,6 +1825,7 @@ def _emit_repository_call_module(
     # five-element accumulation to its last element).
     internal_call_records: list[tuple[str | None, str, tuple[str, ...]]] = []
     emitted_functions: list[str] = []
+    emitted_names: list[str] = []
     for name in reachable:
         function = module.functions[name]
         outputs = function_outputs[name]
@@ -2272,7 +2274,7 @@ def _emit_repository_call_module(
                 active_block = block_name
                 block_exit_label[block_name] = block_name
                 register_cache.clear()
-                span.take(UnitKind.BLOCK_LABEL, spelling=block_name)
+                span.take(UnitKind.BLOCK_LABEL, spelling=block_name, block=block_name)
             span.open(instruction)
             operation = str(instruction.op)
             if pending_shadow and operation not in {"Phi", "phi"}:
@@ -4114,7 +4116,10 @@ def _emit_repository_call_module(
             span.take(UnitKind.RETURN)
         if not any(line.endswith(":") for line in body):
             body.insert(0, "entry:")
-            recorder.unit(UnitKind.BLOCK_LABEL, body[0], spelling="entry")
+            recorder.unit(
+                UnitKind.BLOCK_LABEL, body[0], spelling="entry",
+                block=next(iter(function.blocks), None),
+            )
         entry_label_index = next(
             (index for index, line in enumerate(body) if line.endswith(":")),
             0,
@@ -4139,11 +4144,9 @@ def _emit_repository_call_module(
             *body,
             "}",
         )))
-        if name != function_name:
-            # Hashed before ``_annotate_noalias`` rewrites the define line.
-            recorder.finish(emitted_functions[-1])
-        else:
-            root_definition = emitted_functions[-1]
+        # Finished (hashed) after ``_annotate_noalias`` rewrites the define
+        # line, below: the function row hashes the text that ships.
+        emitted_names.append(name)
 
     root = module.functions[function_name]
     root_outputs = function_outputs[function_name]
@@ -4193,7 +4196,12 @@ def _emit_repository_call_module(
         symbol=internal_symbols[function_name],
     )
     entry_recorder.unit(UnitKind.FUNCTION_HEADER, wrapper_header, spelling=entry_name)
-    entry_recorder.unit(UnitKind.BLOCK_LABEL, wrapper[0], spelling="entry")
+    # The public wrapper's one block is authored here, not by the control
+    # builder: its label derives from the root's function cell.
+    entry_recorder.unit(
+        UnitKind.BLOCK_LABEL, wrapper[0], spelling="entry",
+        block_cell=entry_recorder.open_function(),
+    )
     entry_span = entry_recorder.span(wrapper)
     for value in public_values:
         value_id = int(value.id)
@@ -4266,18 +4274,20 @@ def _emit_repository_call_module(
     wrapper.append("  ret void")
     entry_span.take(UnitKind.RETURN)
     entry_recorder.unit(UnitKind.RETURN, "}")
-    wrapper_finished = entry_recorder.finish("\n".join((
-        *((root_definition,) if function_name in recorders else ()),
-        wrapper_header, *wrapper, "}",
-    )))
 
     definitions: dict[str, str] = {}
     declarations: dict[str, str] = {}
     unresolved: set[str] = set()
+    # Where each symbol's text came from, for its KERNEL_TEXT unit: the
+    # linked piece that carried it, the intrinsic table, or the authored
+    # kernel library (``extract_llvm_function`` / ``_declaration``).
+    symbol_origins: dict[str, tuple] = {}
     for piece_symbol, piece_ir in linked_pieces.items():
         piece_declarations, piece_definitions = _piece_module_parts(piece_ir)
         declarations.update(piece_declarations)
         definitions.update(piece_definitions)
+        for symbol in (*piece_declarations, *piece_definitions):
+            symbol_origins[symbol] = ("piece", piece_symbol)
     # The scalar tables reach target intrinsics from the emitted bodies and the
     # wrapper, not only from authored kernels, so the closure starts at every
     # symbol this module actually references.
@@ -4296,12 +4306,14 @@ def _emit_repository_call_module(
             continue
         if symbol in _LLVM_INTRINSIC_DECLARATIONS:
             declarations[symbol] = _LLVM_INTRINSIC_DECLARATIONS[symbol]
+            symbol_origins[symbol] = ("intrinsic",)
             continue
         try:
             definition = extract_llvm_function(symbol)
         except KeyError:
             try:
                 declarations[symbol] = extract_llvm_declaration(symbol)
+                symbol_origins[symbol] = ("library",)
             except KeyError:
                 unresolved.add(symbol)
                 shortfalls.append(LLVMEmissionShortfall(
@@ -4310,29 +4322,92 @@ def _emit_repository_call_module(
                 ))
             continue
         definitions[symbol] = definition
+        symbol_origins[symbol] = ("library",)
         for dependency in _re.findall(r"@([A-Za-z_$.-][\w$.-]*)\s*\(", definition):
             if dependency != symbol:
                 pending_kernels.add(dependency)
 
+    annotated_functions = _annotate_noalias(
+        emitted_functions, internal_call_records,
+    )
     llvm_ir = "\n\n".join(part for part in (
         f'source_filename = "turing.ssa-llvm.{entry_name}"',
         "\n".join(_host_target_lines()),
         "\n".join(declarations[symbol] for symbol in sorted(declarations)),
         "\n\n".join(definitions[symbol] for symbol in sorted(definitions)),
-        "\n\n".join(_annotate_noalias(
-            emitted_functions, internal_call_records,
-        )),
+        "\n\n".join(annotated_functions),
         "\n".join((
             wrapper_header,
             *wrapper,
             "}",
         )),
     ) if part)
+
+    # Kernel / library text pulled in by symbol: one KERNEL_TEXT unit per
+    # symbol under the root's row, from its origin row, the call
+    # instructions that name it and every unit whose text calls it.
+    kernel_texts = {**declarations, **definitions}
+    piece_cells = {
+        piece_symbol: piece_source_cell(
+            emission, entry_name, piece_symbol, piece_ir, stage=EMISSION_LLVM,
+        )
+        for piece_symbol, piece_ir in linked_pieces.items()
+    } if emission is not None else {}
+    kernel_origins: dict[str, _Any] = {}
+    if emission is not None:
+        for symbol, text in kernel_texts.items():
+            origin = symbol_origins.get(symbol, ("library",))
+            kernel_origins[symbol] = (
+                piece_cells.get(origin[1]) if origin[0] == "piece"
+                else kernel_source_cell(
+                    emission, symbol, text, stage=EMISSION_LLVM,
+                    origin=(
+                        (__name__, "_LLVM_INTRINSIC_DECLARATIONS")
+                        if origin[0] == "intrinsic"
+                        else (extract_llvm_function.__module__, "LLVM_SSA_MODULE")
+                    ),
+                )
+            )
+    entry_recorder.kernel_texts(
+        kernel_texts, origins=kernel_origins,
+        demands=call_demands(
+            emission, (module.functions[fn] for fn in reachable), kernel_texts,
+        ),
+        scan=tuple(
+            recorders[fn] for fn in reachable
+            if fn in recorders and recorders[fn] is not entry_recorder
+        ),
+    )
+    # ``_annotate_noalias`` rewrote define lines after their FUNCTION_HEADER
+    # units were posted: each rewritten header unit is revised to the line
+    # that ships, under the annotation's stage, from its previous cell and
+    # every unit that calls the function (the verdict reads every call
+    # site).  Then each function row is finished on the shipped text.
+    all_recorders = tuple(dict.fromkeys((*recorders.values(), entry_recorder)))
+    for fn, original, annotated in zip(
+        emitted_names, emitted_functions, annotated_functions,
+    ):
+        if annotated != original:
+            recorders[fn].revise_unit(
+                0, annotated.split("\n", 1)[0],
+                sources=calling_units(all_recorders, internal_symbols[fn]),
+                stage=LLVM_NOALIAS_ANNOTATION,
+            )
+        if fn != function_name:
+            recorders[fn].finish(annotated)
+    root_definitions = tuple(
+        annotated for fn, annotated in zip(emitted_names, annotated_functions)
+        if fn == function_name
+    )
+    wrapper_finished = entry_recorder.finish("\n".join((
+        *root_definitions,
+        wrapper_header, *wrapper, "}",
+        *(kernel_texts[symbol] for symbol in sorted(kernel_texts)),
+    )))
     publications = function_output_publications(module.functions[function_name])
     # MODULE_TEXT derives from every reachable function's finished row (the
-    # root's holds the wrapper); kernel definitions and declarations pulled
-    # in by symbol are module text with no unit of their own (listed in the
-    # step-9 continuation).  BUFFER_ORDER from each slot value's cell.
+    # root's holds the wrapper and the kernel text).  BUFFER_ORDER from each
+    # slot value's cell.
     module_text = post_artifact_part(
         emission, entry_name, Backend.LLVM_MODULE, ArtifactPart.MODULE_TEXT,
         data=llvm_ir + "\n",
@@ -4341,6 +4416,7 @@ def _emit_repository_call_module(
             for fn in reachable if fn in recorders
         ),
         reason=FUNCTION_TEXT_PENDING, stage=EMISSION_LLVM,
+        module=module, what="_emit_repository_call_module",
     )
     buffer_order_cell = None if emission is None else post_artifact_part(
         emission, entry_name, Backend.LLVM_MODULE, ArtifactPart.BUFFER_ORDER,
@@ -4371,6 +4447,7 @@ def _emit_repository_call_module(
             None if emission is None
             else ArtifactEmission(
                 emission, Backend.LLVM_MODULE, module_text, buffer_order_cell,
+                root=root, function_cell=wrapper_finished,
             )
         ),
     )
@@ -4673,6 +4750,17 @@ def with_native_sgd_loop(
             f"LLVM artifact has no unique public entry @{original_name}"
         )
 
+    # Plan 100, 4.1 item 2: the wrapper's own ids are NOVEL rows
+    # (NATIVE_LOOP_WRAPPER_VALUE) and its text units derive from the wrapped
+    # root's row, on the wrapped artifact's book; the text is untouched.
+    from .concordance_declarations import NativeLoop
+    from .emission_concordance import NativeLoopEmission
+
+    loop_emission = NativeLoopEmission(
+        getattr(artifact, "emission", None), NativeLoop.SGD, selected_name,
+    )
+    loop_emission.value(steps_id, "steps")
+    loop_emission.value(learning_rate_id, "learning_rate")
     lines = [
         f"define void @{selected_name}(ptr %buffers, ptr %extents) {{",
         "entry:",
@@ -4683,6 +4771,14 @@ def with_native_sgd_loop(
         "  %lr.ptr = load ptr, ptr %lr.addr, align 8",
         "  %lr = load double, ptr %lr.ptr, align 8",
     ]
+    loop_emission.header(lines[0])
+    loop_emission.renamed(
+        f"define internal void @{once_name}(ptr %buffers, ptr %extents) {{",
+        once_name,
+    )
+    loop_emission.lines(lines, 1, 2)
+    loop_emission.formal(lines[2:5], minted=(steps_id,), spelling="%steps")
+    loop_emission.formal(lines[5:8], minted=(learning_rate_id,), spelling="%lr")
     for pair_index, (parameter, gradient) in enumerate(pairs):
         lines.extend((
             f"  %parameter.addr.{pair_index} = getelementptr ptr, ptr %buffers, i64 {positions[parameter]}",
@@ -4690,6 +4786,11 @@ def with_native_sgd_loop(
             f"  %gradient.addr.{pair_index} = getelementptr ptr, ptr %buffers, i64 {positions[gradient]}",
             f"  %gradient.ptr.{pair_index} = load ptr, ptr %gradient.addr.{pair_index}, align 8",
         ))
+        loop_emission.formal(
+            lines[-4:], values=(parameter, gradient),
+            spelling=f"%parameter.ptr.{pair_index}",
+        )
+    body_start = len(lines)
     lines.extend((
         "  br label %training.header",
         "training.header:",
@@ -4736,9 +4837,15 @@ def with_native_sgd_loop(
         "  ret void",
         "}",
     ))
+    loop_emission.lines(lines, body_start)
+    llvm_ir = renamed.rstrip() + "\n\n" + "\n".join(lines) + "\n"
     return LLVMFunctionArtifact(
         name=selected_name,
-        llvm_ir=renamed.rstrip() + "\n\n" + "\n".join(lines) + "\n",
+        llvm_ir=llvm_ir,
+        emission=loop_emission.artifact(
+            selected_name, llvm_ir,
+            (*artifact.buffer_order, steps_id, learning_rate_id),
+        ),
         buffer_order=(*artifact.buffer_order, steps_id, learning_rate_id),
         buffer_shapes=(*artifact.buffer_shapes, (), ()),
         extent_order=artifact.extent_order,
@@ -4912,6 +5019,30 @@ def with_native_adam_loop(
     if count != 1:
         raise ValueError(f"LLVM artifact has no unique public entry @{original_name}")
 
+    # Plan 100, 4.1 item 2: every ``fresh_id()`` is a NOVEL row
+    # (NATIVE_LOOP_WRAPPER_VALUE) and the wrapper's text units derive from
+    # the wrapped root's row, on the wrapped artifact's book; the text is
+    # untouched.
+    from .concordance_declarations import NativeLoop
+    from .emission_concordance import NativeLoopEmission
+
+    loop_emission = NativeLoopEmission(
+        getattr(artifact, "emission", None), NativeLoop.ADAM, selected_name,
+    )
+    for parameter, _gradient in pairs:
+        loop_emission.value(first_moment_ids[parameter], "first_moment", parameter)
+        loop_emission.value(second_moment_ids[parameter], "second_moment", parameter)
+        loop_emission.value(
+            gradient_accumulator_ids[parameter], "gradient_accumulator", parameter,
+        )
+    for value_id, role in (
+        (steps_id, "steps"), (learning_rate_id, "learning_rate"),
+        (beta1_id, "beta1"), (beta2_id, "beta2"), (epsilon_id, "epsilon"),
+        (beta1_power_id, "beta1_power"), (beta2_power_id, "beta2_power"),
+        (iteration_id, "iteration"),
+    ):
+        loop_emission.value(value_id, role)
+
     def load_scalar(lines, value_id: int, llvm_type: str, label: str) -> None:
         slot = wrapped_positions[value_id]
         lines.extend((
@@ -4920,9 +5051,12 @@ def with_native_adam_loop(
             f"  %{label} = load {llvm_type}, ptr %{label}.ptr, align "
             f"{4 if llvm_type == 'i32' else 8}",
         ))
+        loop_emission.formal(lines[-3:], minted=(value_id,), spelling=f"%{label}")
 
     gradient_norm_id = fresh_id()
     clipped_gradient_norm_id = fresh_id()
+    loop_emission.value(gradient_norm_id, "gradient_norm")
+    loop_emission.value(clipped_gradient_norm_id, "clipped_gradient_norm")
     for value_id in (gradient_norm_id, clipped_gradient_norm_id):
         buffer_order.append(value_id)
         buffer_shapes.append(())
@@ -4937,6 +5071,12 @@ def with_native_adam_loop(
         "  %gradient.norm.square.ptr = alloca double, align 8",
         "  store double 0.0, ptr %gradient.norm.square.ptr, align 8",
     ]
+    loop_emission.header(lines[0])
+    loop_emission.renamed(
+        f"define internal void @{once_name}(ptr %buffers, ptr %extents) {{",
+        once_name,
+    )
+    loop_emission.lines(lines, 1, 4)
     load_scalar(lines, steps_id, "i32", "steps")
     load_scalar(lines, learning_rate_id, "double", "lr")
     load_scalar(lines, beta1_id, "double", "beta1")
@@ -4957,6 +5097,17 @@ def with_native_adam_loop(
         f"  %clipped.gradient.norm.addr = getelementptr ptr, ptr %buffers, i64 {wrapped_positions[clipped_gradient_norm_id]}",
         "  %clipped.gradient.norm.ptr = load ptr, ptr %clipped.gradient.norm.addr, align 8",
     ))
+    for offset, value_id, spelling in (
+        (10, beta1_power_id, "%beta1.power.ptr"),
+        (8, beta2_power_id, "%beta2.power.ptr"),
+        (6, iteration_id, "%iteration.ptr"),
+        (4, gradient_norm_id, "%gradient.norm.ptr"),
+        (2, clipped_gradient_norm_id, "%clipped.gradient.norm.ptr"),
+    ):
+        loop_emission.formal(
+            lines[len(lines) - offset:len(lines) - offset + 2],
+            minted=(value_id,), spelling=spelling,
+        )
     for pair_index, (parameter, gradient) in enumerate(pairs):
         lines.extend((
             f"  %parameter.addr.{pair_index} = getelementptr ptr, ptr %buffers, i64 {positions[parameter]}",
@@ -4970,11 +5121,26 @@ def with_native_adam_loop(
             f"  %gradient.accumulator.addr.{pair_index} = getelementptr ptr, ptr %buffers, i64 {wrapped_positions[gradient_accumulator_ids[parameter]]}",
             f"  %gradient.accumulator.{pair_index} = load ptr, ptr %gradient.accumulator.addr.{pair_index}, align 8",
         ))
+        loop_emission.formal(
+            lines[-10:-6], values=(parameter, gradient),
+            spelling=f"%parameter.ptr.{pair_index}",
+        )
+        loop_emission.formal(
+            lines[-6:], minted=(
+                first_moment_ids[parameter], second_moment_ids[parameter],
+                gradient_accumulator_ids[parameter],
+            ),
+            spelling=f"%moment1.ptr.{pair_index}",
+        )
     for cycle_index, value_id in enumerate(cycled):
         lines.extend((
             f"  %cycle.addr.{cycle_index} = getelementptr ptr, ptr %buffers, i64 {positions[value_id]}",
             f"  %cycle.bank.{cycle_index} = load ptr, ptr %cycle.addr.{cycle_index}, align 8",
         ))
+        loop_emission.formal(
+            lines[-2:], values=(value_id,), spelling=f"%cycle.bank.{cycle_index}",
+        )
+    body_start = len(lines)
     lines.extend((
         "  br label %training.header",
         "training.header:",
@@ -5143,10 +5309,16 @@ def with_native_adam_loop(
             f"  store ptr %cycle.bank.{cycle_index}, ptr %cycle.addr.{cycle_index}, align 8"
         )
     lines.extend(("  ret void", "}"))
+    loop_emission.lines(lines, body_start)
     sqrt_declaration = (
         "" if "@llvm.sqrt.f64" in renamed
         else "\ndeclare double @llvm.sqrt.f64(double)\n"
     )
+    if sqrt_declaration:
+        loop_emission.kernel_declaration(
+            "llvm.sqrt.f64", sqrt_declaration.strip("\n"),
+            origin=(__name__, "with_native_adam_loop"),
+        )
     state = {
         "kind": "adam",
         "first_moment": first_moment_ids,
@@ -5167,9 +5339,11 @@ def with_native_adam_loop(
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "max_global_gradient_norm": max_global_gradient_norm,
     }
+    llvm_ir = renamed.rstrip() + sqrt_declaration + "\n" + "\n".join(lines) + "\n"
     return LLVMFunctionArtifact(
         name=selected_name,
-        llvm_ir=renamed.rstrip() + sqrt_declaration + "\n" + "\n".join(lines) + "\n",
+        llvm_ir=llvm_ir,
+        emission=loop_emission.artifact(selected_name, llvm_ir, buffer_order),
         buffer_order=tuple(buffer_order),
         buffer_shapes=tuple(buffer_shapes),
         extent_order=artifact.extent_order,
@@ -5292,6 +5466,30 @@ def emit_ssa_function_to_llvm(
         for argument in instruction.args
     }
     buffer_aliases: dict[int, int] = {}
+
+    # Plan 100, 4.3: the single-block lane posts each unit beside the lines
+    # that hold it, on the module's attached book; the text is untouched.
+    from .concordance_declarations import (
+        EMISSION_LLVM, ArtifactPart, Backend, FUNCTION_TEXT_PENDING,
+        VALUE_WITHOUT_IDENTITY_CELL, UnitKind,
+    )
+    from .emission_concordance import (
+        ArtifactEmission, call_demands, emission_book, emission_recorder,
+        kernel_source_cell, post_artifact_part, value_cell,
+    )
+
+    emission = emission_book(module, "emit_ssa_function_to_llvm")
+    header = f"define void @{name}(ptr %buffers, ptr %extents) {{"
+    recorder = emission_recorder(
+        emission, function, Backend.LLVM_SCALAR, stage=EMISSION_LLVM,
+        symbol=name,
+    )
+    recorder.header(header, args=function.args, spelling=name)
+    recorder.unit(
+        UnitKind.BLOCK_LABEL, "entry:", spelling="entry",
+        block=next(iter(function.blocks), None),
+    )
+    span = recorder.span(lines)
 
     def buffer(value_id: int) -> str:
         # The instruction stream is already scheduled by the compiler; a
@@ -5477,6 +5675,7 @@ def emit_ssa_function_to_llvm(
                 and accounting.get("compiler_frame_member") is not None
             ):
                 scalars[int(argument.id)] = (argument_pointer, "ptr")
+            span.take(UnitKind.FORMAL, args=(argument,), spelling=argument_pointer)
             continue
         llvm_type = _value_llvm_type(argument)
         register = f"%argument.{int(argument.id)}"
@@ -5485,9 +5684,13 @@ def emit_ssa_function_to_llvm(
             f"align {_align(llvm_type)}"
         )
         scalars[int(argument.id)] = (register, llvm_type)
+        span.take(UnitKind.FORMAL, args=(argument,), spelling=register)
 
     for block in function.blocks.values():
         for instruction in block.instrs:
+            # Every path below ends in ``continue``; the lines an
+            # instruction appends are posted when the next one opens.
+            span.open(instruction)
             operation = instruction.op
             result_id = int(instruction.res.id) if instruction.res is not None else None
 
@@ -5569,6 +5772,11 @@ def emit_ssa_function_to_llvm(
                     elements = ", ".join(f"i32 {int(item)}" for item in payload)
                     globals_out.append(
                         f"{symbol} = private constant [{len(payload)} x i32] [{elements}]"
+                    )
+                    recorder.unit(
+                        UnitKind.DECLARATION, globals_out[-1],
+                        result=instruction.res, spelling=symbol,
+                        instruction=instruction,
                     )
                     scalars[result_id] = (symbol, "ptr")
                 elif isinstance(payload, float) and not payload.is_integer():
@@ -6114,6 +6322,7 @@ def emit_ssa_function_to_llvm(
                 function_name, str(operation),
                 "operation has no likeness-table entry",
             ))
+    span.close()
 
     # Authored kernels can call other authored helpers as well as external
     # math/intrinsic symbols.  Carry their definition closure and exact
@@ -6180,6 +6389,58 @@ def emit_ssa_function_to_llvm(
         "}",
         "",
     ))
+    recorder.unit(UnitKind.RETURN, "  ret void")
+    recorder.unit(UnitKind.RETURN, "}")
+    # Kernel / library text pulled in by symbol: one KERNEL_TEXT unit each,
+    # from its origin row (the authored library, the intrinsic table, the
+    # bounded constant's helper, the stream sink's declaration), the call
+    # instructions that name it and every unit whose text calls it.
+    pulled_texts = {
+        **external_declarations, **definitions,
+        **(
+            {"turing_stream_publish_double": declarations[-1]}
+            if publishes_text else {}
+        ),
+    }
+    pulled_origins: dict[str, _Any] = {}
+    if emission is not None:
+        for symbol, text in pulled_texts.items():
+            origin = (
+                (__name__, "_LLVM_INTRINSIC_DECLARATIONS")
+                if symbol in external_declarations
+                and symbol in _LLVM_INTRINSIC_DECLARATIONS
+                else (f"{__package__}.bounded_constants", "materialize_pi")
+                if symbol in bounded_definitions
+                else (__name__, "turing_stream_publish_double")
+                if symbol == "turing_stream_publish_double"
+                else (extract_llvm_function.__module__, "LLVM_SSA_MODULE")
+            )
+            pulled_origins[symbol] = kernel_source_cell(
+                emission, symbol, text, origin=origin, stage=EMISSION_LLVM,
+            )
+    recorder.kernel_texts(
+        pulled_texts, origins=pulled_origins,
+        demands=call_demands(emission, (function,), pulled_texts),
+    )
+    finished = recorder.finish("\n".join((
+        header, "entry:", *lines, "  ret void", "}",
+        *globals_out,
+        *(pulled_texts[symbol] for symbol in sorted(pulled_texts)),
+    )))
+    module_text = post_artifact_part(
+        emission, name, Backend.LLVM_SCALAR, ArtifactPart.MODULE_TEXT,
+        data=llvm_ir, sources=(finished,), reason=FUNCTION_TEXT_PENDING,
+        stage=EMISSION_LLVM, module=module, what="emit_ssa_function_to_llvm",
+    )
+    buffer_order_cell = None if emission is None else post_artifact_part(
+        emission, name, Backend.LLVM_SCALAR, ArtifactPart.BUFFER_ORDER,
+        data=repr((tuple(buffer_ids), tuple(extent_order))),
+        location=tuple(buffer_ids),
+        sources=tuple(
+            value_cell(emission, function, value_id) for value_id in buffer_ids
+        ),
+        reason=VALUE_WITHOUT_IDENTITY_CELL, stage=EMISSION_LLVM,
+    )
     publications = function_output_publications(function)
     return LLVMFunctionArtifact(
         name=name,
@@ -6209,6 +6470,13 @@ def emit_ssa_function_to_llvm(
                 "is not among them",
             )
             for item in watch if int(item) not in set(buffer_ids)
+        ),
+        emission=(
+            None if emission is None
+            else ArtifactEmission(
+                emission, Backend.LLVM_SCALAR, module_text, buffer_order_cell,
+                root=function, function_cell=finished,
+            )
         ),
     )
 

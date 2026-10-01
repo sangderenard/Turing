@@ -2188,9 +2188,44 @@ def lower_tensor_calls_to_repository_ssa(
     linked_roots: set[str] = set()
     shortfalls: list[TensorSSALoweringShortfall] = []
 
+    #: ``(function, instruction)`` being lowered: every ``fresh`` value is
+    #: made for that tensor operation, inside that function.
+    lowering_at: list[Any] = [None, None]
+
     def fresh(*, shape=(), dtype: str | None = "float64") -> SSAValue:
+        # Minted through the book (plan 100, 4.1 item 2): a NOVEL
+        # ``ssa_value`` row under the function's scope, from the cell of the
+        # tensor operation being lowered (its result's, else its first
+        # argument's that has one), else the function root.  The id comes
+        # from the same monotonic source the bare mint used, so the emitted
+        # text is unchanged; what changes is that a kernel's opcode / shape
+        # constant in a planned region now has an identity cell.
+        from .concordance_declarations import (
+            TENSOR_LOWERING_VALUE, TENSOR_SSA_LOWERING,
+        )
+        from .precompile_to_ssa import _function_root_cell, _mint_ssa_id
+        from .ssa_record_return_state import (
+            function_scope_of, ssa_value_identity_cell,
+        )
+
+        owner, source = lowering_at
+        scope = function_scope_of(owner)
+        cell = None
+        if source is not None:
+            for value in (
+                *((source.res,) if source.res is not None else ()),
+                *source.args,
+            ):
+                cell = ssa_value_identity_cell(owner, value.id, book=book)
+                if cell is not None:
+                    break
+        if cell is None:
+            cell = _function_root_cell(book, scope)
         return SSAValue(
-            GLOBAL_MONOTONIC_IDS.mint(),
+            _mint_ssa_id(
+                book, scope, TENSOR_LOWERING_VALUE, (cell,),
+                dtype=dtype, shape=tuple(shape), stage=TENSOR_SSA_LOWERING,
+            ),
             dtype=dtype,
             shape=tuple(shape),
         )
@@ -2651,6 +2686,7 @@ def lower_tensor_calls_to_repository_ssa(
         for block_name, block in function.blocks.items():
             rewritten: list[Instr] = []
             for original in block.instrs:
+                lowering_at[:] = [function, original]
                 instruction = dataclasses.replace(
                     original, args=[resolve(argument) for argument in original.args]
                 )

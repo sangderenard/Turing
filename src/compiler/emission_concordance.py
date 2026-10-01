@@ -17,7 +17,30 @@ to ``current_identity_book()`` when nothing is attached, which after the
 compile closed mints a detached book and loses every post silently; this
 module therefore reads the attached book directly and never calls either.  A
 module with no attached book (or a detached one) posts nothing; the first such
-emission in the process says so once on stderr (``no_book_at_emission``).
+emission in the process says so once on stderr (``no_book_at_emission``), and
+every MODULE_TEXT it would have posted is kept on ``module.metadata
+["emission_gaps"]`` (artifact, backend, text hash, length, emitter) so that
+``replay_emission_gaps`` can post each one as ``Unsourced(NO_BOOK_AT_EMISSION)``
+once a book is attached.  The gap is not posted on a detached ambient book:
+reaching one needs ``current_identity_book()``, which emission never calls.
+
+Scopes that are not lowerings.  ``EmissionRecorder(scope_cells=...)`` derives
+the ``emission_function`` row from the given cells instead of the lowering's
+``cell_set`` root: a tensor reference kernel imported from authored LLVM text
+(its callers' ``emission_function`` rows, its call instructions' operand
+cells, and the kernel text's own ``emission_artifact`` KERNEL_SOURCE root) and
+a native loop wrapper (the wrapped root's ``emission_function`` row).  With
+``local_values=True`` (the imported kernels) a value with no identity cell is
+the kernel body's own: the unit derives from the kernel's scope cell, and the
+recorder counts it in ``local_values``.
+
+Kernel and library text pulled into an LLVM module by symbol is one
+``KERNEL_TEXT`` unit per symbol (``EmissionRecorder.kernel_texts``), DERIVED
+from the symbol's origin row (``kernel_source_cell``: NOVEL
+``AUTHORED_KERNEL_TEXT`` root for authored text, the piece's
+``Unsourced(PIECE_ARTIFACT_UNROUTED)`` row for a linked piece), every unit
+whose text calls the symbol, and the cells of the call instructions that name
+it.
 
 Row keys.  ``emission_unit`` and ``emission_function`` are keyed by the
 function's SYMBOL, not by ``function_scope_of(function)``: a planned region
@@ -36,19 +59,25 @@ This module must not import the reducer (backends import it).
 from __future__ import annotations
 
 import hashlib
+import re
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .concordance_declarations import (
     ARTIFACT_BUILD,
+    AUTHORED_KERNEL_TEXT,
     BLOCK_ORIGIN_UNROUTED,
     CONTROL_VALUE_BINDING,
     EMISSION_ARTIFACT,
     EMISSION_FUNCTION,
     EMISSION_UNIT,
     FUNCTION_TEXT_PENDING,
+    NATIVE_LOOP_VALUE,
+    NATIVE_LOOP_WRAPPER_VALUE,
+    NO_BOOK_AT_EMISSION,
     NO_FUNCTION_SCOPE,
+    PIECE_ARTIFACT_UNROUTED,
     UNIT_ELIDED,
     VALUE_WITHOUT_IDENTITY_CELL,
     ArtifactFact,
@@ -56,12 +85,14 @@ from .concordance_declarations import (
     Backend,
     EmittedUnit,
     FunctionEmission,
+    NativeLoopValue,
     UnitKind,
 )
 from .identity_concordance import (
     ConcordanceRefusal,
     Derived,
     Mode,
+    Novel,
     Ref,
     Unresolved,
     Unsourced,
@@ -69,13 +100,22 @@ from .identity_concordance import (
 
 _NO_BOOK_REPORTED = [False]
 
+#: ``module.metadata`` key of the MODULE_TEXT posts an unbooked emission
+#: could not make (see ``replay_emission_gaps``).
+EMISSION_GAPS = "emission_gaps"
+
+#: An LLVM call site's callee symbol, as the backends' own closure scans
+#: spell it (``_emit_repository_call_module`` / the single-block lane).
+_SYMBOL_REFERENCE = re.compile(r"@([A-Za-z_$.-][\w$.-]*)\s*\(")
+
 
 def emission_book(module: Any, what: str = "emission") -> Any:
     """The book the compile attached to ``module``, or None.
 
-    Never ``identity_book(module)`` / ``current_identity_book()``: after the
-    compile closed either would hand back a fresh detached book.  A detached
-    book attached by hand (a probe's no-book run) counts as no book."""
+    Never ``identity_book(module)`` / ``current_identity_book()``: with no
+    book attached the first falls through to the second, which after the
+    compile closed hands back a fresh detached book.  A detached book attached
+    by hand (a probe's no-book run) counts as no book."""
 
     metadata = getattr(module, "metadata", None)
     book = None if metadata is None else metadata.get("identity_book")
@@ -89,6 +129,33 @@ def emission_book(module: Any, what: str = "emission") -> Any:
             )
         return None
     return book
+
+
+def replay_emission_gaps(module: Any) -> tuple[Ref, ...]:
+    """Post every MODULE_TEXT an unbooked emission of ``module`` kept on its
+    metadata, now that a book is attached: one ``emission_artifact`` row
+    ``(artifact, backend, (MODULE_TEXT, NO_BOOK_AT_EMISSION.name))`` per gap,
+    ``Unsourced(NO_BOOK_AT_EMISSION)``, the fact the text's hash and length.
+    The replayed gaps leave the metadata; with no book attached nothing is
+    posted and the gaps stay."""
+
+    metadata = getattr(module, "metadata", None)
+    if metadata is None or not metadata.get(EMISSION_GAPS):
+        return ()
+    book = emission_book(module, "replay_emission_gaps")
+    if book is None:
+        return ()
+    posted: list[Ref] = []
+    for artifact, backend, digest, length, what in tuple(metadata[EMISSION_GAPS]):
+        posted.append(book.post(
+            EMISSION_ARTIFACT,
+            (str(artifact), backend, (ArtifactPart.MODULE_TEXT, NO_BOOK_AT_EMISSION.name)),
+            ArtifactFact(digest, length, (str(what),)),
+            stage=ARTIFACT_BUILD, provenance=Unsourced(NO_BOOK_AT_EMISSION),
+            mode=Mode.REVISE,
+        ))
+    metadata[EMISSION_GAPS] = []
+    return tuple(posted)
 
 
 def value_cell(book: Any, function: Any, value: Any) -> Ref | None:
@@ -108,6 +175,106 @@ def value_cell(book: Any, function: Any, value: Any) -> Ref | None:
         return cell
     return book.latest_ref(
         CONTROL_VALUE_BINDING, (function_scope_of(function), int(value_id)),
+    )
+
+
+def ssa_block_cell(book: Any, function: Any, label: Any) -> Ref | None:
+    """The ``ssa_block`` cell of ``function``'s block ``label`` (plan 100,
+    2.6), or None.  Always with the attached ``book``: without it the
+    reader would fall back to the ambient one, which emission never reads."""
+
+    from .ssa_record_return_state import ssa_block_identity_cell
+
+    if book is None or label is None or function is None:
+        return None
+    return ssa_block_identity_cell(function, str(label), book=book)
+
+
+def kernel_source_cell(
+    book: Any, symbol: str, text: str, *, origin: Iterable = (),
+    stage: Any = None,
+) -> Ref | None:
+    """The origin row of authored kernel / library text pulled in by symbol:
+    ``emission_artifact (symbol, LLVM_MODULE, KERNEL_SOURCE)``, a NOVEL
+    ``AUTHORED_KERNEL_TEXT`` root (the text is authored input, as a source
+    span is), ``location`` = ``origin`` (the table it was read from).  Every
+    backend that spells the kernel derives from this one row: the LLVM text
+    pulled in by symbol, and the C function imported from the same text."""
+
+    if book is None:
+        return None
+    from .concordance_declarations import EMISSION_LLVM
+
+    digest, length = _sha256(text)
+    fact = ArtifactFact(digest, length, tuple(map(str, origin)))
+    row = (str(symbol), Backend.LLVM_MODULE, ArtifactPart.KERNEL_SOURCE)
+    latest = book.latest_ref(EMISSION_ARTIFACT, row)
+    if latest is not None and book.pages[EMISSION_ARTIFACT.name].latest(row) == fact:
+        return latest
+    return book.post(
+        EMISSION_ARTIFACT, row, fact, stage=stage or EMISSION_LLVM,
+        provenance=Novel(AUTHORED_KERNEL_TEXT, ()),
+        mode=Mode.REVISE if latest is not None else Mode.CONCORD,
+    )
+
+
+def piece_source_cell(
+    book: Any, artifact: str, piece: str, text: str, *, stage: Any = None,
+) -> Ref | None:
+    """A linked LLVM piece's text inside ``artifact``: the piece was emitted
+    (if at all) on the book of the compile that built it, so its row here is
+    ``Unsourced(PIECE_ARTIFACT_UNROUTED)``, as ``ArtifactEmission.build``
+    posts it for C."""
+
+    from .concordance_declarations import EMISSION_LLVM
+
+    return post_artifact_part(
+        book, artifact, Backend.LLVM_MODULE, (ArtifactPart.PIECE_FILE, str(piece)),
+        data=text, sources=(None,), reason=PIECE_ARTIFACT_UNROUTED,
+        stage=stage or EMISSION_LLVM,
+    )
+
+
+def call_demands(
+    book: Any, functions: Iterable, symbols: Iterable[str],
+) -> dict[str, tuple[Ref, ...]]:
+    """symbol -> the cells of the call instructions (in ``functions``) whose
+    declared ``callee`` is that symbol: the result's cell, else the
+    operands' cells."""
+
+    wanted = {str(symbol) for symbol in symbols}
+    found: dict[str, list[Ref]] = {}
+    if book is None:
+        return {}
+    for function in functions:
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                callee = (getattr(instruction, "attributes", None) or {}).get("callee")
+                if callee is None or str(callee) not in wanted:
+                    continue
+                cells = []
+                result = getattr(instruction, "res", None)
+                cell = None if result is None else value_cell(book, function, result)
+                if cell is not None:
+                    cells.append(cell)
+                else:
+                    cells.extend(
+                        value_cell(book, function, argument)
+                        for argument in instruction.args
+                    )
+                found.setdefault(str(callee), []).extend(cells)
+    return {symbol: _distinct(cells) for symbol, cells in found.items()}
+
+
+def calling_units(recorders: Iterable, symbol: str) -> tuple[Ref, ...]:
+    """Every unit (of ``recorders``) whose text calls ``@symbol(``."""
+
+    symbol = str(symbol)
+    return _distinct(
+        ref
+        for recorder in recorders
+        for ref, text in recorder.texts
+        if symbol in _SYMBOL_REFERENCE.findall(text)
     )
 
 
@@ -149,7 +316,8 @@ class _Span:
 
     def take(
         self, kind: UnitKind, *, result: Any = None, args: Iterable = (),
-        spelling: str = "", instruction: Any = None,
+        spelling: str = "", instruction: Any = None, block: Any = None,
+        block_cell: Ref | None = None, extra_cells: Iterable = (),
     ) -> Ref | None:
         if len(self.lines) <= self.at:
             return None
@@ -157,7 +325,8 @@ class _Span:
         self.at = len(self.lines)
         return self.recorder.unit(
             kind, text, result=result, args=args, spelling=spelling,
-            instruction=instruction,
+            instruction=instruction, block=block, block_cell=block_cell,
+            extra_cells=extra_cells,
         )
 
     def open(self, instruction: Any) -> None:
@@ -199,16 +368,22 @@ class EmissionRecorder:
 
     def __init__(
         self, book: Any, function: Any, backend: Backend, *, stage: Any,
-        symbol: str | None = None,
+        symbol: str | None = None, key: Any = None,
+        scope_cells: Iterable | None = None, local_values: bool = False,
     ) -> None:
         self.book = book
         self.function = function
         self.backend = backend
         self.stage = stage
-        self.key = str(function.name)
+        self.key = str(function.name) if key is None else key
         self.symbol = str(symbol if symbol is not None else function.name)
+        # Not a lowering: the function row derives from these cells (see the
+        # module docstring, "Scopes that are not lowerings").
+        self.scope_cells = None if scope_cells is None else _distinct(scope_cells)
+        self.local_values = 0 if local_values else None
         self.function_cell: Ref | None = None
         self.units: list[Ref] = []
+        self.texts: list[tuple[Ref, str]] = []
         self.count = 0
         self.unsourced = 0
         self.unsourced_values: list[int] = []
@@ -231,59 +406,78 @@ class EmissionRecorder:
             page, row, fact, stage=self.stage, provenance=provenance, mode=mode,
         )
 
+    def open_function(self) -> Ref | None:
+        """Post ``emission_function`` pending (once per emission) and return
+        its cell.  ``header`` calls it; an emitter calls it early for a
+        function whose cell another function's scope derives from before
+        that function's own header is reached (a kernel's later caller)."""
+
+        if self.book is None:
+            return None
+        if self.function_cell is not None:
+            return self.function_cell
+        book = self.book
+        row = (self.key, self.backend)
+        pending = Unresolved(FUNCTION_TEXT_PENDING)
+        latest = book.latest_ref(EMISSION_FUNCTION, row)
+        incumbent = (
+            None if latest is None
+            else book.pages[EMISSION_FUNCTION.name].cells.get((row, latest.column))
+        )
+        if incumbent == pending:
+            # Posted pending already with no finish in between (an emission
+            # that stopped early, or ``open_function`` called ahead of the
+            # header): the pending cell stands.
+            self.function_cell = latest
+            return latest
+        if self.scope_cells is not None:
+            sources = self.scope_cells
+        else:
+            # The lowering's root row, posted on first need by the same
+            # helper module-level minters share (a straight-line lowering
+            # that never named it has none yet).
+            from .precompile_to_ssa import _function_root_cell
+            from .ssa_record_return_state import function_scope_of
+
+            sources = _distinct((
+                _function_root_cell(book, function_scope_of(self.function)),
+            ))
+        self.function_cell = book.post(
+            EMISSION_FUNCTION, row, pending, stage=self.stage,
+            provenance=(
+                Derived(sources) if sources else Unsourced(NO_FUNCTION_SCOPE)
+            ),
+            mode=Mode.REVISE,
+        )
+        return self.function_cell
+
     def header(
         self, text: str, *, args: Iterable = (), spelling: str = "",
+        extra_cells: Iterable = (),
     ) -> Ref | None:
         """Post ``emission_function`` pending, then the FUNCTION_HEADER unit
         DERIVED from it and the formals' cells."""
 
-        if self.book is not None:
-            from .ssa_record_return_state import function_scope_of
-
-            book = self.book
-            row = (self.key, self.backend)
-            pending = Unresolved(FUNCTION_TEXT_PENDING)
-            latest = book.latest_ref(EMISSION_FUNCTION, row)
-            incumbent = (
-                None if latest is None
-                else book.pages[EMISSION_FUNCTION.name].cells.get(
-                    (row, latest.column)
-                )
-            )
-            if incumbent == pending:
-                # A header posted again with no finish in between (an
-                # emission that stopped early): the pending cell stands.
-                self.function_cell = latest
-            else:
-                # The lowering's root row, posted on first need by the same
-                # helper module-level minters share (a straight-line lowering
-                # that never named it has none yet).
-                from .precompile_to_ssa import _function_root_cell
-
-                root = _function_root_cell(book, function_scope_of(self.function))
-                self.function_cell = book.post(
-                    EMISSION_FUNCTION, row, pending, stage=self.stage,
-                    provenance=(
-                        Derived((root,)) if root is not None
-                        else Unsourced(NO_FUNCTION_SCOPE)
-                    ),
-                    mode=Mode.REVISE,
-                )
+        self.open_function()
         return self.unit(
             UnitKind.FUNCTION_HEADER, text, args=args,
-            spelling=spelling or self.symbol,
+            spelling=spelling or self.symbol, extra_cells=extra_cells,
         )
 
     def unit(
         self, kind: UnitKind, text: str, *, result: Any = None,
         args: Iterable = (), spelling: str = "", extra_cells: Iterable = (),
-        instruction: Any = None,
+        instruction: Any = None, block: Any = None,
+        block_cell: Ref | None = None,
     ) -> Ref | None:
         """One unit of emitted text.  DERIVED from the function cell, the
         result's and every argument's identity cell, and ``extra_cells``;
         ``Unsourced(value_without_identity_cell)`` when some value has no
-        cell; a BLOCK_LABEL is ``Unsourced(block_origin_unrouted)`` until
-        ``ssa_block`` (plan 100, 2.6) is on the tree."""
+        cell (in a ``local_values`` scope such a value is the scope's own and
+        is counted, not unsourced).  A BLOCK_LABEL derives from
+        ``block_cell`` (a block the emitter itself authors: the wrapper's
+        entry) or from the ``ssa_block`` cell of ``block``;
+        ``Unsourced(block_origin_unrouted)`` while neither exists."""
 
         ordinal = self.count
         self.count += 1
@@ -298,11 +492,26 @@ class EmissionRecorder:
                 missing.append(int(getattr(value, "id", value)))
             else:
                 cells.append(cell)
+        label_cell = None
+        if kind is UnitKind.BLOCK_LABEL:
+            label_cell = block_cell or ssa_block_cell(
+                self.book, self.function, block,
+            )
+            if label_cell is None and self.local_values is not None:
+                # A block of the imported kernel text: no control lowering
+                # made it, the kernel scope did.
+                label_cell = self.function_cell
+            cells.append(label_cell)
+        if missing and self.local_values is not None:
+            # The imported kernel body's own values: no pass lowers them,
+            # their identity is the kernel scope the function cell carries.
+            self.local_values += len(missing)
+            missing = []
         if missing:
             provenance: Any = Unsourced(VALUE_WITHOUT_IDENTITY_CELL)
             self.unsourced += 1
             self.unsourced_values.extend(missing)
-        elif kind is UnitKind.BLOCK_LABEL:
+        elif kind is UnitKind.BLOCK_LABEL and label_cell is None:
             provenance = Unsourced(BLOCK_ORIGIN_UNROUTED)
             self.unsourced += 1
         elif not _distinct(cells):
@@ -317,9 +526,84 @@ class EmissionRecorder:
             EmittedUnit(kind, str(text), str(spelling)), provenance,
         )
         self.units.append(ref)
+        self.texts.append((ref, str(text)))
         if instruction is not None:
             self.instruction_units.setdefault(id(instruction), ref)
         return ref
+
+    def revise_unit(
+        self, ordinal: int, text: str, *, sources: Iterable, stage: Any,
+    ) -> Ref | None:
+        """A later pass rewrote the text of unit ``ordinal`` (``_annotate_
+        noalias`` adds ``noalias`` to a define line): REVISE the same row with
+        the text that ships, DERIVED from the unit's previous cell and
+        ``sources`` (what justified the rewrite), under the rewriting pass's
+        ``stage`` -- the rewrite is its own edge, the count is unchanged."""
+
+        if self.book is None:
+            return None
+        row = (self.key, self.backend, int(ordinal))
+        previous = self.book.latest_ref(EMISSION_UNIT, row)
+        if previous is None:
+            return None
+        fact = self.book.pages[EMISSION_UNIT.name].latest(row)
+        if not isinstance(fact, EmittedUnit) or fact.text == text:
+            return previous
+        ref = self.book.post(
+            EMISSION_UNIT, row, EmittedUnit(fact.kind, str(text), fact.spelling),
+            stage=stage, provenance=Derived(_distinct((previous, *sources))),
+            mode=Mode.REVISE,
+        )
+        self.units = [ref if unit == previous else unit for unit in self.units]
+        self.texts = [
+            (ref, str(text)) if unit == previous else (unit, old)
+            for unit, old in self.texts
+        ]
+        return ref
+
+    def kernel_texts(
+        self, texts: Mapping[str, str], *, origins: Mapping[str, Ref | None],
+        demands: Mapping[str, Iterable[Ref]] = {}, scan: Iterable = (),
+    ) -> dict[str, Ref | None]:
+        """One KERNEL_TEXT unit per symbol of kernel / library text pulled
+        into this module by symbol (plan 100, 4.3), posted under this
+        recorder's row (the root's), in an order where every kernel that
+        calls another is posted first (ties by symbol).  Each derives from
+        its origin row (``origins``), the cells of the call instructions that
+        name it (``demands``), and every unit -- of ``scan``'s recorders,
+        this one, and the kernels already posted -- whose text calls it."""
+
+        symbols = sorted(texts)
+        callers: dict[str, set[str]] = {symbol: set() for symbol in symbols}
+        for symbol in symbols:
+            for called in _SYMBOL_REFERENCE.findall(texts[symbol]):
+                if called in callers and called != symbol:
+                    callers[called].add(symbol)
+        order: list[str] = []
+        remaining = list(symbols)
+        while remaining:
+            ready = [s for s in remaining if callers[s] <= set(order)]
+            chosen = ready[0] if ready else remaining[0]
+            order.append(chosen)
+            remaining.remove(chosen)
+        references: dict[str, list[Ref]] = {}
+        if self.book is not None:
+            for recorder in (*scan, self):
+                for ref, text in recorder.texts:
+                    for called in _SYMBOL_REFERENCE.findall(text):
+                        references.setdefault(called, []).append(ref)
+        posted: dict[str, Ref | None] = {}
+        for symbol in order:
+            ref = self.unit(
+                UnitKind.KERNEL_TEXT, texts[symbol], spelling=symbol,
+                extra_cells=(
+                    origins.get(symbol), *demands.get(symbol, ()),
+                    *references.get(symbol, ()),
+                    *(posted.get(caller) for caller in sorted(callers[symbol])),
+                ),
+            )
+            posted[symbol] = ref
+        return posted
 
     def elided(self, instruction: Any, *, binding: Any = None) -> Ref | None:
         """An instruction the emitter skips because another unit spells it
@@ -367,15 +651,83 @@ class EmissionRecorder:
 
 def emission_recorder(
     book: Any, function: Any, backend: Backend, *, stage: Any,
-    symbol: str | None = None,
+    symbol: str | None = None, key: Any = None,
+    scope_cells: Iterable | None = None, local_values: bool = False,
 ) -> EmissionRecorder:
-    return EmissionRecorder(book, function, backend, stage=stage, symbol=symbol)
+    return EmissionRecorder(
+        book, function, backend, stage=stage, symbol=symbol, key=key,
+        scope_cells=scope_cells, local_values=local_values,
+    )
+
+
+def imported_kernel_scope(
+    book: Any, module: Any, kernel: str, callers: Iterable,
+    recorder_for: Any, *, stage: Any,
+) -> tuple[Ref, ...]:
+    """The scope cells of a tensor reference kernel the module imported from
+    authored LLVM text (its function declares ``llvm_argument_names``, which
+    only ``import_llvm_to_repository_ssa`` writes): every calling function's
+    ``emission_function`` cell (``recorder_for(caller).open_function()``,
+    opened ahead of its header when the caller is emitted later), the cells
+    of each call instruction's operands, and the kernel text's own
+    KERNEL_SOURCE root."""
+
+    if book is None:
+        return ()
+    cells: list[Any] = []
+    for caller, instruction in callers:
+        cells.append(recorder_for(caller).open_function())
+        cells.extend(
+            value_cell(book, module.functions[caller], argument)
+            for argument in instruction.args
+        )
+    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        extract_llvm_function,
+    )
+
+    try:
+        text = extract_llvm_function(str(kernel))
+    except KeyError:
+        text = None
+    if text is not None:
+        cells.append(kernel_source_cell(
+            book, str(kernel), text,
+            origin=(extract_llvm_function.__module__, "LLVM_SSA_MODULE"),
+            stage=stage,
+        ))
+    return _distinct(cells)
+
+
+def is_imported_kernel(function: Any) -> bool:
+    """A function ``import_llvm_to_repository_ssa`` made from authored LLVM
+    text (it alone declares ``llvm_argument_names``)."""
+
+    return (getattr(function, "metadata", None) or {}).get(
+        "llvm_argument_names"
+    ) is not None
+
+
+def kernel_callers(module: Any, names: Iterable[str]) -> dict[str, list]:
+    """kernel name -> [(calling function, call instruction)], over ``names``
+    in order, for every call whose declared ``callee`` is an imported
+    kernel among ``names``."""
+
+    names = tuple(names)
+    kernels = {name for name in names if is_imported_kernel(module.functions[name])}
+    found: dict[str, list] = {name: [] for name in kernels}
+    for name in names:
+        for block in module.functions[name].blocks.values():
+            for instruction in block.instrs:
+                callee = (getattr(instruction, "attributes", None) or {}).get("callee")
+                if callee is not None and str(callee) in kernels:
+                    found[str(callee)].append((name, instruction))
+    return found
 
 
 def post_artifact_part(
     book: Any, artifact: str, backend: Backend, part: Any, *, data: Any,
     location: Iterable = (), sources: Iterable = (), reason: Any = None,
-    stage: Any = ARTIFACT_BUILD,
+    stage: Any = ARTIFACT_BUILD, module: Any = None, what: str = "",
 ) -> Ref | None:
     """One ``emission_artifact`` row: ``(artifact, backend, part)`` ->
     ``ArtifactFact(sha256 of data, byte length, location)``, REVISE.
@@ -383,9 +735,19 @@ def post_artifact_part(
     DERIVED from ``sources`` when every one is a cell; ``Unsourced(reason)``
     when some source is None (``reason`` names the missing hop).  A rebuild
     that names the same source cells and no newer one is not a new fact the
-    api admits: the previous row stands and is returned."""
+    api admits: the previous row stands and is returned.
+
+    No book: nothing is posted; a MODULE_TEXT of ``module`` is kept on its
+    metadata for ``replay_emission_gaps``."""
 
     if book is None:
+        metadata = getattr(module, "metadata", None)
+        if metadata is not None and part is ArtifactPart.MODULE_TEXT:
+            digest, length = _sha256(data)
+            gaps = metadata.get(EMISSION_GAPS)
+            if not isinstance(gaps, list):
+                gaps = metadata[EMISSION_GAPS] = []
+            gaps.append((str(artifact), backend, digest, length, str(what)))
         return None
     sources = tuple(sources)
     digest, length = _sha256(data)
@@ -418,16 +780,25 @@ class ArtifactEmission:
     from (plan 100, 4.2: SOURCE_FILE <- MODULE_TEXT, COMPILE_COMMAND <-
     SOURCE_FILE + PIECE_FILE, LIBRARY <- COMPILE_COMMAND)."""
 
-    __slots__ = ("book", "backend", "module_text", "buffer_order")
+    __slots__ = (
+        "book", "backend", "module_text", "buffer_order", "root",
+        "function_cell",
+    )
 
     def __init__(
         self, book: Any, backend: Backend, module_text: Ref | None,
-        buffer_order: Ref | None = None,
+        buffer_order: Ref | None = None, *, root: Any = None,
+        function_cell: Ref | None = None,
     ) -> None:
         self.book = book
         self.backend = backend
         self.module_text = module_text
         self.buffer_order = buffer_order
+        # The root ``Function`` whose values the public slots are, and its
+        # finished ``emission_function`` cell (the entry): what a native
+        # loop wrapper of this artifact derives from.
+        self.root = root
+        self.function_cell = function_cell
 
     def build(
         self, artifact: str, *, source_text: str, source_path: Any,
@@ -490,13 +861,210 @@ class ArtifactEmission:
         )
 
 
+_DEFINED_REGISTER = re.compile(r"^\s*(%[\w.$-]+)\s*=", re.MULTILINE)
+_USED_REGISTER = re.compile(r"%[\w.$-]+")
+
+
+class NativeLoopEmission:
+    """Posts the text ``with_native_sgd_loop`` / ``with_native_adam_loop``
+    add around an emitted LLVM artifact (plan 100, 4.1 item 2 / 4.3).
+
+    The book is the wrapped artifact's (``artifact.emission.book``); without
+    one every method is a no-op that still counts.  Rows: the wrapper's
+    ``emission_function`` / ``emission_unit`` are keyed ``(symbol, loop)``
+    (the wrapper may reuse the wrapped entry's symbol) and derive from the
+    wrapped root's ``emission_function`` cell and the wrapped MODULE_TEXT;
+    each id the wrapper mints for its own buffers is a NOVEL
+    ``native_loop_value`` row, transform ``NATIVE_LOOP_WRAPPER_VALUE``,
+    operand the wrapped root's ``emission_function`` cell.  The wrapper's
+    blocks are authored here: their labels derive from the wrapper's function
+    cell.  A body unit derives from the units that define the registers it
+    reads (the wrapper's own def-use, in the text it wrote)."""
+
+    def __init__(self, wrapped: Any, loop: Any, symbol: str) -> None:
+        from .concordance_declarations import EMISSION_LLVM
+
+        self.wrapped = wrapped
+        book = None if wrapped is None else wrapped.book
+        if book is not None and wrapped.function_cell is None:
+            book = None
+        self.book = book
+        self.backend = Backend.LLVM_MODULE if wrapped is None else wrapped.backend
+        self.loop = loop
+        self.symbol = str(symbol)
+        self.key = (self.symbol, loop)
+        self.values: dict[int, Ref | None] = {}
+        self.defined: dict[str, Ref] = {}
+        self.recorder = EmissionRecorder(
+            book, None if wrapped is None else wrapped.root,
+            self.backend, stage=EMISSION_LLVM, symbol=self.symbol,
+            key=self.key,
+            scope_cells=(
+                None if book is None
+                else (wrapped.function_cell, wrapped.module_text)
+            ),
+        )
+
+    def value(self, value_id: int, role: str, parameter: int | None = None) -> Ref | None:
+        """The NOVEL row of one id the wrapper minted for its own buffer."""
+
+        if self.book is None:
+            self.values[int(value_id)] = None
+            return None
+        from .concordance_declarations import EMISSION_LLVM
+
+        row = (self.key, int(value_id))
+        fact = NativeLoopValue(str(role), None if parameter is None else int(parameter))
+        latest = self.book.latest_ref(NATIVE_LOOP_VALUE, row)
+        ref = self.book.post(
+            NATIVE_LOOP_VALUE, row, fact, stage=EMISSION_LLVM,
+            provenance=Novel(NATIVE_LOOP_WRAPPER_VALUE, (self.wrapped.function_cell,)),
+            mode=Mode.REVISE if latest is not None else Mode.CONCORD,
+        )
+        self.values[int(value_id)] = ref
+        return ref
+
+    def _note(self, ref: Ref | None, text: str) -> Ref | None:
+        if ref is not None:
+            for register in _DEFINED_REGISTER.findall(text):
+                self.defined[register] = ref
+        return ref
+
+    def _readers(self, text: str) -> tuple:
+        defined = set(_DEFINED_REGISTER.findall(text))
+        return tuple(
+            self.defined[register]
+            for register in dict.fromkeys(_USED_REGISTER.findall(text))
+            if register in self.defined and register not in defined
+        )
+
+    def header(self, text: str) -> Ref | None:
+        return self.recorder.header(text, spelling=self.symbol)
+
+    def renamed(self, text: str, once_name: str) -> Ref | None:
+        """The wrapped entry's define line, renamed internal: a rewrite of
+        the wrapped module text, posted as a unit of the wrapper."""
+
+        return self.recorder.unit(
+            UnitKind.FUNCTION_HEADER, text, spelling=str(once_name),
+            extra_cells=(None if self.wrapped is None else self.wrapped.module_text,),
+        )
+
+    def formal(
+        self, lines: Iterable[str], *, values: Iterable = (),
+        minted: Iterable[int] = (), spelling: str = "",
+    ) -> Ref | None:
+        """One public slot (or slot group) the wrapper loads: ``values`` are
+        the wrapped root's public value ids, ``minted`` the wrapper's own."""
+
+        text = "\n".join(lines)
+        return self._note(self.recorder.unit(
+            UnitKind.FORMAL, text, args=tuple(int(v) for v in values),
+            spelling=spelling,
+            extra_cells=tuple(self.values.get(int(v)) for v in minted),
+        ), text)
+
+    def lines(self, lines: list, start: int = 0, stop: int | None = None) -> None:
+        """Post ``lines[start:stop]`` block by block: a label line is a
+        BLOCK_LABEL of a block this wrapper authored; each block's body is a
+        STATEMENT and its terminator a BRANCH / RETURN; the closing brace a
+        RETURN."""
+
+        recorder = self.recorder
+        group: list[str] = []
+
+        def flush() -> None:
+            if not group:
+                return
+            terminator = None
+            if group[-1].lstrip().startswith(("br ", "ret ")) or group[-1].strip() == "ret void":
+                terminator = group.pop()
+            if group:
+                text = "\n".join(group)
+                self._note(recorder.unit(
+                    UnitKind.STATEMENT, text, extra_cells=self._readers(text),
+                ), text)
+            if terminator is not None:
+                kind = UnitKind.RETURN if terminator.lstrip().startswith("ret") else UnitKind.BRANCH
+                recorder.unit(kind, terminator, extra_cells=self._readers(terminator))
+            group.clear()
+
+        for line in lines[start:stop]:
+            if line == "}":
+                flush()
+                recorder.unit(UnitKind.RETURN, line)
+            elif line.endswith(":") and not line.startswith(" "):
+                flush()
+                recorder.unit(
+                    UnitKind.BLOCK_LABEL, line, spelling=line[:-1],
+                    block_cell=recorder.function_cell,
+                )
+            else:
+                group.append(line)
+        flush()
+
+    def kernel_declaration(self, symbol: str, text: str, origin: Iterable) -> None:
+        """A library declaration the wrapper adds by symbol (``llvm.sqrt``)."""
+
+        self.recorder.kernel_texts(
+            {str(symbol): text},
+            origins={str(symbol): kernel_source_cell(
+                self.book, str(symbol), text, origin=origin,
+            )},
+        )
+
+    def artifact(
+        self, name: str, llvm_ir: str, buffer_order: Iterable[int],
+    ) -> "ArtifactEmission | None":
+        """Finish the wrapper's function row and post the wrapped artifact's
+        MODULE_TEXT (from the wrapped one's and the wrapper's function row)
+        and BUFFER_ORDER (from the wrapped one's and every minted value)."""
+
+        from .concordance_declarations import EMISSION_LLVM
+
+        recorder = self.recorder
+        text = "\n".join(text for _ref, text in recorder.texts)
+        finished = recorder.finish(text)
+        if self.book is None:
+            return None
+        module_text = post_artifact_part(
+            self.book, name, self.backend, ArtifactPart.MODULE_TEXT,
+            data=llvm_ir, sources=(self.wrapped.module_text, finished),
+            reason=FUNCTION_TEXT_PENDING, stage=EMISSION_LLVM,
+        )
+        order = tuple(int(value) for value in buffer_order)
+        buffer_cell = post_artifact_part(
+            self.book, name, self.backend, ArtifactPart.BUFFER_ORDER,
+            data=repr(order), location=order,
+            sources=(
+                self.wrapped.buffer_order,
+                *(self.values[value] for value in order if value in self.values),
+            ),
+            reason=VALUE_WITHOUT_IDENTITY_CELL, stage=EMISSION_LLVM,
+        )
+        return ArtifactEmission(
+            self.book, self.backend, module_text, buffer_cell,
+            root=self.wrapped.root, function_cell=finished,
+        )
+
+
 __all__ = [
     "ArtifactEmission",
+    "EMISSION_GAPS",
     "EmissionRecorder",
+    "NativeLoopEmission",
+    "call_demands",
     "emission_book",
     "emission_recorder",
+    "imported_kernel_scope",
+    "is_imported_kernel",
+    "kernel_callers",
+    "kernel_source_cell",
     "path_location",
+    "piece_source_cell",
     "post_artifact_part",
+    "replay_emission_gaps",
+    "ssa_block_cell",
     "unit_kind_of",
     "value_cell",
 ]

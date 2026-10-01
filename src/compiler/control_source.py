@@ -889,6 +889,169 @@ def _callsite_marker(block: Any) -> int | None:
         return None
 
 
+def _describe_control_block(
+    block: Any, *, cell: Any, region_cell: Any, callsite_cell: Any,
+) -> Any:
+    """``(kind, owner cell or None, reason, fact fields)`` of one block
+    (plan 100, 2.2); ``owner`` None means the program cell stands in.
+
+    ``cell(value id)``, ``region_cell(ordinal)`` and ``callsite_cell(id)``
+    resolve ids to cells: ``post_control_program`` passes its graph-backed
+    resolvers, ``control_block_cell`` read-only ones, so the one rule that
+    names a block's owner keys both the writer's rows and the reader's
+    lookups."""
+
+    from .concordance_declarations import CONTROL_OWNER_UNKNOWN, REGION_CELL_UNROUTED
+    from .identity_concordance import Ref
+
+    def cells(value_ids: Any) -> tuple:
+        return tuple(
+            item for item in (cell(value_id) for value_id in value_ids)
+            if item is not None
+        )
+
+    kind = _control_block_kind(block)
+    if kind is None:
+        return None
+    owner = reason = predicate = callsite = None
+    carried: tuple = ()
+    sites: tuple = ()
+    regions: tuple = ()
+    extra: tuple = ()
+    if isinstance(block, StatementBlock):
+        region = _region_marker(block)
+        callsite_ordinal = _callsite_marker(block)
+        if region is not None:
+            owner = region_cell(region)
+            regions = (owner,) if owner is not None else ()
+            extra = ("region", int(region))
+            if owner is None:
+                reason = REGION_CELL_UNROUTED
+        elif callsite_ordinal is not None:
+            owner = callsite = callsite_cell(callsite_ordinal)
+            extra = ("callsite", int(callsite_ordinal))
+            if owner is None:
+                reason = REGION_CELL_UNROUTED
+        else:
+            extra = ("lines", tuple(block.lines))
+    elif isinstance(block, ConditionalBlock):
+        owner = cell(block.source_node_id)
+        predicate = cell(block.predicate_value_id)
+        field_cells = tuple(block.carried_field_cells)
+        carried = tuple(
+            item for item in (
+                field_cells[index][2]
+                if index < len(field_cells)
+                and isinstance(field_cells[index], tuple)
+                and len(field_cells[index]) == 3
+                and isinstance(field_cells[index][2], Ref)
+                else cell(alias[3])
+                for index, alias in enumerate(block.carried_aliases)
+            )
+            if item is not None
+        )
+        extra = (bool(block.expect_true),)
+    elif isinstance(block, LoopBlock):
+        owner = cell(block.source_loop_node_id)
+        carried = cells(updated for updated, _initial in block.carried_aliases)
+        sites = cells(block.control_site_ids)
+        extra = (
+            str(block.induction), str(block.start), str(block.stop),
+            str(block.step), str(block.comparison),
+            str(block.schedule_preference),
+        )
+    elif isinstance(block, WhileBlock):
+        owner = cell(block.source_loop_node_id)
+        predicate = cell(block.predicate_value_id)
+        carried = cells(updated for updated, _initial in block.carried_aliases)
+        sites = cells(block.control_site_ids)
+    elif isinstance(block, LoopControlBlock):
+        # A return edge is owned by its return site's cell.
+        owner = (
+            block.return_site_cell
+            if isinstance(block.return_site_cell, Ref)
+            else cell(block.site_node_id)
+        )
+        predicate = cell(block.predicate_value_id)
+        extra = (str(block.action), block.source_action)
+    elif isinstance(block, (CallBlock, DispatchBlock, ExternalReferenceCallBlock)):
+        owner = callsite = callsite_cell(block.callsite_id)
+        extra = (
+            getattr(block, "operation", None),
+            getattr(block, "identity", None),
+        )
+    elif isinstance(block, ResourceScopeBlock):
+        owner = cell(block.source_scope_id)
+    elif isinstance(block, ValidationBlock):
+        owner = predicate = cell(block.predicate_value_id)
+        extra = (
+            int(block.error_code), bool(block.expect_true),
+            block.extraction_identity,
+        )
+    elif isinstance(block, SequenceMutationBlock):
+        owner = cell(block.mutation.effect_node_id)
+        extra = (str(block.mutation.operator),)
+    elif isinstance(block, ScalarFieldWriteBlock):
+        owner = (
+            block.field_state_cell
+            if isinstance(block.field_state_cell, Ref)
+            else cell(block.effect_node_id)
+        )
+        extra = (str(block.dtype),)
+    elif isinstance(block, SequenceQueryBlock):
+        owner = cell(block.result_value_id)
+        if owner is None:
+            owner = cell(block.source_call_node_id)
+        extra = (str(block.operation),)
+    elif isinstance(block, StreamPublishBlock):
+        owner = cell(block.value_id)
+        extra = (bool(block.final),)
+    elif isinstance(block, StateMachineTick):
+        extra = (str(block.state),)
+    elif isinstance(block, ParallelDeployment):
+        extra = (str(block.schedule_preference),)
+    if owner is None and reason is None and not isinstance(
+        block, (StateMachineTick, ParallelDeployment),
+    ):
+        reason = CONTROL_OWNER_UNKNOWN
+    return kind, owner, reason, (predicate, carried, sites, regions, callsite, extra)
+
+
+def control_block_cell(book: Any, scope: Any, block: Any) -> Any:
+    """The ``control_block`` cell ``post_control_program`` posted for
+    ``block`` under read scope ``scope``, or None.  Read-only: ids resolve
+    through ``canonical_value`` rows (the post-relabel arm of
+    ``node_identity_cell``) and ``call_binding`` rows, and nothing is
+    posted.  A block whose owner is the program-cell stand-in has no cell
+    of its own here (None): several ownerless blocks share that row."""
+
+    from .concordance_declarations import CALL_BINDING, CANONICAL_VALUE, CONTROL_BLOCK
+
+    if book is None or scope is None or block is None:
+        return None
+    scope = tuple(scope)
+
+    def cell(value_id: Any) -> Any:
+        if value_id is None or isinstance(value_id, bool) or not isinstance(value_id, int):
+            return None
+        return book.latest_ref(CANONICAL_VALUE, (scope, int(value_id)))
+
+    def callsite_cell(callsite_id: Any) -> Any:
+        if callsite_id is None:
+            return None
+        bound = book.latest_ref(CALL_BINDING, (scope, int(callsite_id)))
+        return bound if bound is not None else cell(callsite_id)
+
+    described = _describe_control_block(
+        block, cell=cell, region_cell=lambda _ordinal: None,
+        callsite_cell=callsite_cell,
+    )
+    if described is None or described[1] is None:
+        return None
+    kind, owner, _reason, _fields = described
+    return book.latest_ref(CONTROL_BLOCK, (scope, kind, owner))
+
+
 def post_control_program(
     graph: Any,
     program: "ControlProgram | None",
@@ -1003,114 +1166,10 @@ def post_control_program(
         return bound if bound is not None else cell(callsite_id)
 
     def describe(block: Any) -> Any:
-        """``(kind, owner cell or None, reason, fact fields)`` of one block
-        (plan 100, 2.2); ``owner`` None means the program cell stands in."""
-
-        kind = _control_block_kind(block)
-        if kind is None:
-            return None
-        owner = reason = predicate = callsite = None
-        carried: tuple = ()
-        sites: tuple = ()
-        regions: tuple = ()
-        extra: tuple = ()
-        if isinstance(block, StatementBlock):
-            region = _region_marker(block)
-            callsite_ordinal = _callsite_marker(block)
-            if region is not None:
-                owner = region_cell(region)
-                regions = (owner,) if owner is not None else ()
-                extra = ("region", int(region))
-                if owner is None:
-                    reason = REGION_CELL_UNROUTED
-            elif callsite_ordinal is not None:
-                owner = callsite = callsite_cell(callsite_ordinal)
-                extra = ("callsite", int(callsite_ordinal))
-                if owner is None:
-                    reason = REGION_CELL_UNROUTED
-            else:
-                extra = ("lines", tuple(block.lines))
-        elif isinstance(block, ConditionalBlock):
-            owner = cell(block.source_node_id)
-            predicate = cell(block.predicate_value_id)
-            field_cells = tuple(block.carried_field_cells)
-            carried = tuple(
-                item for item in (
-                    field_cells[index][2]
-                    if index < len(field_cells)
-                    and isinstance(field_cells[index], tuple)
-                    and len(field_cells[index]) == 3
-                    and isinstance(field_cells[index][2], Ref)
-                    else cell(alias[3])
-                    for index, alias in enumerate(block.carried_aliases)
-                )
-                if item is not None
-            )
-            extra = (bool(block.expect_true),)
-        elif isinstance(block, LoopBlock):
-            owner = cell(block.source_loop_node_id)
-            carried = cells(updated for updated, _initial in block.carried_aliases)
-            sites = cells(block.control_site_ids)
-            extra = (
-                str(block.induction), str(block.start), str(block.stop),
-                str(block.step), str(block.comparison),
-                str(block.schedule_preference),
-            )
-        elif isinstance(block, WhileBlock):
-            owner = cell(block.source_loop_node_id)
-            predicate = cell(block.predicate_value_id)
-            carried = cells(updated for updated, _initial in block.carried_aliases)
-            sites = cells(block.control_site_ids)
-        elif isinstance(block, LoopControlBlock):
-            # A return edge is owned by its return site's cell.
-            owner = (
-                block.return_site_cell
-                if isinstance(block.return_site_cell, Ref)
-                else cell(block.site_node_id)
-            )
-            predicate = cell(block.predicate_value_id)
-            extra = (str(block.action), block.source_action)
-        elif isinstance(block, (CallBlock, DispatchBlock, ExternalReferenceCallBlock)):
-            owner = callsite = callsite_cell(block.callsite_id)
-            extra = (
-                getattr(block, "operation", None),
-                getattr(block, "identity", None),
-            )
-        elif isinstance(block, ResourceScopeBlock):
-            owner = cell(block.source_scope_id)
-        elif isinstance(block, ValidationBlock):
-            owner = predicate = cell(block.predicate_value_id)
-            extra = (
-                int(block.error_code), bool(block.expect_true),
-                block.extraction_identity,
-            )
-        elif isinstance(block, SequenceMutationBlock):
-            owner = cell(block.mutation.effect_node_id)
-            extra = (str(block.mutation.operator),)
-        elif isinstance(block, ScalarFieldWriteBlock):
-            owner = (
-                block.field_state_cell
-                if isinstance(block.field_state_cell, Ref)
-                else cell(block.effect_node_id)
-            )
-            extra = (str(block.dtype),)
-        elif isinstance(block, SequenceQueryBlock):
-            owner = cell(block.result_value_id)
-            if owner is None:
-                owner = cell(block.source_call_node_id)
-            extra = (str(block.operation),)
-        elif isinstance(block, StreamPublishBlock):
-            owner = cell(block.value_id)
-            extra = (bool(block.final),)
-        elif isinstance(block, StateMachineTick):
-            extra = (str(block.state),)
-        elif isinstance(block, ParallelDeployment):
-            extra = (str(block.schedule_preference),)
-        if owner is None and reason is None and not isinstance(
-            block, (StateMachineTick, ParallelDeployment),
-        ):
-            reason = CONTROL_OWNER_UNKNOWN
-        return kind, owner, reason, (predicate, carried, sites, regions, callsite, extra)
+        return _describe_control_block(
+            block, cell=cell, region_cell=region_cell,
+            callsite_cell=callsite_cell,
+        )
 
     def fact_cells(fields: tuple) -> tuple:
         predicate, carried, sites, regions, callsite, _extra = fields
