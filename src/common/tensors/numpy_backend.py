@@ -452,26 +452,6 @@ class NumPyTensorOperations(AbstractTensor):
         except (TypeError, ValueError):
             return None
 
-    def _numpy_dtype_to_torch(self, dtype):
-        if torch is None:
-            return dtype
-        if dtype == np.float32:
-            return torch.float32
-        if dtype == np.float64:
-            return torch.float64
-        if dtype == np.int64:
-            return torch.int64
-        if dtype == np.int32:
-            return torch.int32
-        if dtype == np.bool_:
-            return torch.bool
-        # No torch equivalent (complex64/128, float16, uint*, ...): report the
-        # numpy dtype itself instead of None. ``.dtype`` must always be able
-        # to name what the tensor holds -- returning None here silently made
-        # a complex tensor (e.g. the output of ``fft()``) unable to report
-        # its own dtype at all.
-        return np.dtype(dtype)
-
     def full_(self, size, fill_value, dtype, device):
         return np.full(size, fill_value, dtype=self._torch_dtype_to_numpy(dtype))
 
@@ -489,10 +469,15 @@ class NumPyTensorOperations(AbstractTensor):
         return "cpu"
 
     def get_dtype_(self):
-        tensor = self.data
-        if isinstance(tensor, np.ndarray):
-            return self._numpy_dtype_to_torch(tensor.dtype)
-        return tensor.dtype
+        # The array's own numpy dtype -- the same vocabulary as this
+        # backend's ``float_dtype_``/``long_dtype_``/``bool_dtype_``.  It used
+        # to be translated to a torch dtype whenever torch was importable, so
+        # a NumPy tensor named its dtype differently per machine: ``t.dtype ==
+        # t.long_dtype_`` was False for an int64 tensor, and the compiler
+        # recorded ``"torch.float32"`` for a NumPy feed and then raised in
+        # ``np.dtype("torch.float32")`` (glsl_deployment_strategy, the
+        # broadcast descriptor rule) on any machine with torch installed.
+        return self.data.dtype
 
     def item_(self):
         return self.data.item()
