@@ -102,10 +102,9 @@ writes the extracted graph so ``--graph`` reopens it with no compiler import.
                front of the compilation is white-hot
         flow   the finished graph, everything visible; the world's own
                activation cycle sweeps FLOW_GROUPS construction-order groups
-               through BOTH networks: the active group's edges contract their
-               rest length (the yank), its nodes glow larger, then relax --
-               read straight off the spring state (glow, rest lengths), so
-               the twitch is the compile order and it perturbs the physics
+               through BOTH networks: the active group's nodes glow larger,
+               then fade -- read straight off the spring state's glow, so the
+               sweep is the compile order (it no longer contracts any spring)
     C: causal focus on the picked point (again to leave)
     D: colormap diffusion from the picked/focused point (toggle; ``--diffuse``)
         heat spreads from the point over the causal edges, forward along them
@@ -941,11 +940,15 @@ class World:
     (core = the process graph, contained; shell = the concordance graph, on the
     surface), advanced through ``WorldTickLease`` on one admitted dt per frame.
 
+    Cheap by construction: the shell carries no springs -- its nodes drift,
+    damped, under the host's order-field force (the background texture's
+    gradient) and stay on the sphere; the core keeps its process-graph springs
+    as the settling (a scatter over its few hundred edges).  No repulsion
+    (``c_repulse=0``), and no contraction: the activation cycle only glows.
+
     Groups: FLOW_GROUPS construction-order bins.  A shell node's group is its
-    construction time; a line's is its row's, a causal edge's its target's.
-    A core node's group is its asap level scaled to the same bins.  The active
-    group's edges contract (level mask: lines, mild; role mask: the book's
-    causal edges and the core's edges, strong) and its nodes glow.
+    construction time; a core node's is its asap level scaled to the same bins.
+    The active group's nodes glow.
     """
 
     def __init__(self, graph, shell_pos, flow_seconds=16.0, tile_bytes=512 * 2 ** 20):
@@ -954,24 +957,10 @@ class World:
         self.graph = graph
         self.n_shell = len(shell_pos)
         self.shell_pos0 = shell_pos.astype(np.float32)
-        er, ei = graph["edge_row"], graph["edge_id"]
-        csrc, cdst, ckind = graph["cedge_src"], graph["cedge_dst"], graph["cedge_kind"]
-        real = ckind != EDGE_HEURISTIC                    # heuristic edges coincide with the lines
-        self.shell_edges = np.concatenate([np.stack([er, ei], axis=1),
-                                           np.stack([csrc[real], cdst[real]], axis=1)]).astype(np.int64)
         t = graph["t"]
         known = np.isfinite(t)
         node_group = np.where(known, np.floor(np.clip(np.nan_to_num(t), 0, 1) * (FLOW_GROUPS - 1e-6)).astype(np.int64), -1)
-        line_group = node_group[er]
-        causal_group = node_group[cdst[real]]
-        has_causal = np.zeros(self.n_shell, bool)
-        has_causal[csrc[real]] = True
-        has_causal[cdst[real]] = True
-        none_lines, none_causal = np.full(len(er), -1, np.int64), np.full(int(real.sum()), -1, np.int64)
-        self.shell_masks = {
-            "level": group_masks(node_group, np.concatenate([line_group, none_causal]), FLOW_GROUPS),
-            "role": group_masks(np.where(has_causal, node_group, -1), np.concatenate([none_lines, causal_group]), FLOW_GROUPS),
-        }
+        self.shell_masks = group_masks(node_group, np.zeros(0, np.int64), FLOW_GROUPS)   # nodes only: no shell springs
         self.shell_group = node_group
         self.core_t = np.asarray(graph.get("core_t", np.zeros(0, np.float32)), np.float32)
         self.core_src = np.asarray(graph.get("core_src", np.zeros(0, np.int64)), np.int64)
@@ -982,15 +971,17 @@ class World:
         self.core_masks = group_masks(core_group, core_group[self.core_dst], FLOW_GROUPS)
         self.core_group = core_group
         self.cycle_period = flow_seconds / FLOW_GROUPS
-        shared = dict(k_stretch=SPRING_K, c_repulse=SPRING_REPULSE, damping=SPRING_DAMPING, growth_rate=0.0,
+        # max_displacement is pinned: the default derives it from the mean spring
+        # length, and with the shell's springs gone that would be the core's short
+        # edges (0.13-0.19), throttling the shell's drift 2-3x.  0.2 is what the
+        # full spring set gave (0.5 * 0.43 on mapping, 0.5 * 0.39 on oscillator).
+        shared = dict(k_stretch=SPRING_K, c_repulse=0.0, damping=SPRING_DAMPING, growth_rate=0.0,
                       relax_rate=0.12, cycle_period=self.cycle_period, nominal_dt=1.0 / 60.0,
-                      glow_rise=0.5, glow_decay=0.08, force_tile_bytes=int(tile_bytes))
-        # Contraction is legacy per-nominal-step: each step the active group's rest
-        # length loses base * (1 - target) and relaxes back toward base by
-        # relax_rate, so a group active for many frames settles at
-        # rest = base * (1 - (1 - target) / relax_rate).  Targets below give
-        # 0.85 * base for the lines and 0.5 * base for the causal/core edges.
-        self.yank = BoundSpringParameters(level_target=1.0 - 0.15 * 0.12, type_target=1.0, role_target=1.0 - 0.5 * 0.12,
+                      glow_rise=0.5, glow_decay=0.08, force_tile_bytes=int(tile_bytes),
+                      max_displacement=DRIFT_MAX_STEP)
+        # Targets 1.0: the activation cycle never contracts a rest length; the
+        # active group only glows.
+        self.yank = BoundSpringParameters(level_target=1.0, type_target=1.0, role_target=1.0,
                                           glow_peak_alpha=1.0, glow_floor_alpha=0.0,
                                           glow_peak_radius=1.0, glow_floor_radius=0.0, **shared)
         self.quiet = BoundSpringParameters(level_target=1.0, type_target=1.0, role_target=1.0,
@@ -1014,13 +1005,12 @@ class World:
                 edge_type_mask=(emask & False).tolist(), node_type_mask=(nmask & False).tolist(),
                 edge_role_mask=emask.tolist(), node_role_mask=nmask.tolist(),
                 parameters=self._params_cls(boundary_radius=CORE_RADIUS, cycle_period=self.cycle_period))
-        ln, le = self.shell_masks["level"]
-        rn, re_ = self.shell_masks["role"]
+        nmask, emask = self.shell_masks
         append_bound_spring(
-            state, self.shell_pos0.tolist(), [tuple(e) for e in self.shell_edges.tolist()],
-            edge_level_mask=le.tolist(), node_level_mask=ln.tolist(),
-            edge_type_mask=(le & False).tolist(), node_type_mask=(ln & False).tolist(),
-            edge_role_mask=re_.tolist(), node_role_mask=rn.tolist(),
+            state, self.shell_pos0.tolist(), [],
+            edge_level_mask=emask.tolist(), node_level_mask=nmask.tolist(),
+            edge_type_mask=emask.tolist(), node_type_mask=(nmask & False).tolist(),
+            edge_role_mask=emask.tolist(), node_role_mask=(nmask & False).tolist(),
             parameters=self._params_cls(boundary_radius=SHELL_RADIUS, cycle_period=self.cycle_period),
             surface=True)
         # both spheres sit at the origin: the core inside, the shell on the unit sphere
@@ -1187,7 +1177,8 @@ ANIMATIONS = ("off", "build", "flow")
 CORE_RADIUS = 0.42      # the process graph's boundary sphere, inside the unit shell
 CORE_RING_RGB = np.array([0.95, 0.95, 1.0], np.float32)   # the core's resting ring: pale, always on
 SHELL_RADIUS = 1.0
-SPRING_K, SPRING_REPULSE, SPRING_DAMPING = 8.0, 0.005, 0.9  # BoundSpring parameters shared by both networks
+SPRING_K, SPRING_DAMPING = 8.0, 0.9   # the core's springs; damping for both networks
+DRIFT_MAX_STEP = 0.2                     # BoundSpringParameters.max_displacement (see World)
 ORDER_GAIN = 30.0       # the order field's force gain (``--order-gain``); measured: 20-40 settles |T-t| 0.136 -> 0.06 in 150 frames
 
 
@@ -2570,7 +2561,7 @@ def main(argv=None) -> None:
                     state["anim_t0"] = time.time(); state["dirty"] = state["hud_dirty"] = True
                     physics.command("flow", state["anim"] == "flow")
                     if state["anim"] == "flow":
-                        state["physics"] = True                     # the twitch is the world's cycle
+                        state["physics"] = True                     # the glow sweep is the world's cycle
                         physics.command("run", True)
                 elif k == pygame.K_COMMA: state["speed"] = max(0.1, state["speed"] / 1.5); state["hud_dirty"] = True
                 elif k == pygame.K_PERIOD: state["speed"] = min(20.0, state["speed"] * 1.5); state["hud_dirty"] = True
