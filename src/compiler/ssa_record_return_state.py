@@ -5,6 +5,152 @@ import networkx as nx
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 
 
+# ---------------------------------------------------------------------------
+# The identity cell of a compiler-minted SSA value (plan 90, section 1).
+#
+# Every SSA value a record pass mints after reduction is a row on step 5's
+# ``ssa_value`` page under the function's control scope -- the scope the
+# control builder minted for the lowering and left in
+# ``metadata["tensor_shape_concordance_scope"]`` -- posted NOVEL with the
+# transform that made it and the cells it was made from.  Readers resolve a
+# value's cell through ``ssa_value_identity_cell``; nothing is keyed by an
+# instruction attribute (later frame rounds rebuild instructions and drop
+# attributes; the row survives).
+# ---------------------------------------------------------------------------
+
+
+def function_scope_of(function):
+    """The scope ``function``'s ``ssa_value`` rows are keyed by: the control
+    scope its lowering minted, spelled as ``precompile_to_ssa`` spells it,
+    else the function's name (a function no control lowering built)."""
+    metadata = getattr(function, "metadata", None) or {}
+    return str(metadata.get("tensor_shape_concordance_scope") or function.name)
+
+
+def ssa_value_identity_cell(function, value_id):
+    """The latest ``ssa_value`` cell of ``value_id`` in ``function``, or
+    None when no pass has posted the value's identity."""
+    from .concordance_declarations import SSA_VALUE
+    from .identity_concordance import current_identity_book
+
+    if value_id is None:
+        return None
+    return current_identity_book().latest_ref(
+        SSA_VALUE, (function_scope_of(function), int(value_id)),
+    )
+
+
+def identity_cells(function, *items):
+    """The distinct cells named by ``items``: a Ref as itself, an int (or an
+    object with ``.id``) as its ``ssa_value`` cell; None and values without
+    a row are skipped."""
+    from .identity_concordance import Ref
+
+    found = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, Ref):
+            cell = item
+        else:
+            value_id = getattr(item, "id", item)
+            if isinstance(value_id, bool) or not isinstance(value_id, int):
+                continue
+            cell = ssa_value_identity_cell(function, value_id)
+        if cell is not None and cell not in found:
+            found.append(cell)
+    return tuple(found)
+
+
+def mint_ssa_value(function, transform, operands, *, dtype=None, shape=(), stage):
+    """Mint one SSA id for ``function`` through the book: a NOVEL
+    ``ssa_value`` row on ``(function scope, NEW)`` with ``transform`` and the
+    cells in ``operands`` (several become one ``cell_set`` row; none becomes
+    the function root, as the control builder's ``fresh_value`` does)."""
+    from .identity_concordance import current_identity_book
+    from .precompile_to_ssa import _function_root_cell, _mint_ssa_id
+
+    book = current_identity_book()
+    scope = function_scope_of(function)
+    cells = identity_cells(function, *operands)
+    if not cells:
+        cells = (_function_root_cell(book, scope),)
+    return _mint_ssa_id(
+        book, scope, transform, cells, dtype=dtype, shape=tuple(shape or ()),
+        stage=stage,
+    )
+
+
+def record_descriptor_cell(table, record_id):
+    """The latest ``record_descriptor`` cell of ``record_id`` in ``table``."""
+    from .concordance_declarations import RECORD_DESCRIPTOR
+    from .identity_concordance import current_identity_book
+
+    if table is None or record_id is None:
+        return None
+    return current_identity_book().latest_ref(
+        RECORD_DESCRIPTOR, (table.owner, int(record_id)),
+    )
+
+
+def record_member_cell(table, value_id):
+    """The latest ``record_member`` cell of ``value_id`` in ``table``."""
+    from .concordance_declarations import RECORD_MEMBER
+    from .identity_concordance import current_identity_book
+
+    if table is None or value_id is None:
+        return None
+    return current_identity_book().latest_ref(
+        RECORD_MEMBER, (table.owner, int(value_id)),
+    )
+
+
+def post_record_return_layout(function, table, record_id, layout, *, stage):
+    """Post ``record_return_layout`` row ``(function scope, record)`` =
+    the layout tuple, REVISE, DERIVED(the record's descriptor cell, each
+    layout id's identity cell).  A changed layout none of whose members has
+    a cell yet cannot name its cause and is recorded
+    ``Unsourced(LAYOUT_MEMBER_NOT_YET_DEFINED)``; an unchanged layout posts
+    nothing.  ``metadata["record_return_layouts"]`` stays the readers'
+    view and is written by the caller as before."""
+    from .concordance_declarations import (
+        LAYOUT_MEMBER_NOT_YET_DEFINED, RECORD_RETURN_LAYOUT,
+    )
+    from .identity_concordance import _post_or_unsourced, current_identity_book
+
+    book = current_identity_book()
+    row = (function_scope_of(function), int(record_id))
+    fact = tuple(map(int, layout))
+    stored = book.pages.get(RECORD_RETURN_LAYOUT.name)
+    if stored is not None and stored.latest(row) == fact:
+        return book.latest_ref(RECORD_RETURN_LAYOUT, row)
+    cells = identity_cells(
+        function, record_descriptor_cell(table, record_id), *fact,
+    )
+    return _post_or_unsourced(
+        book, RECORD_RETURN_LAYOUT, row, fact, stage, cells,
+        LAYOUT_MEMBER_NOT_YET_DEFINED,
+    )
+
+
+def assign_record_descriptor(table, record_id, descriptor, sources, *, stage):
+    """``table.records[record_id] = descriptor`` with its cause: the revision
+    is posted DERIVED from ``sources`` when the api admits it (a changed or
+    different source), else written raw as before (tagged by the latch)."""
+    from .identity_concordance import ConcordanceRefusal
+
+    cells = tuple(cell for cell in sources if cell is not None)
+    if cells:
+        try:
+            table.records.assign(
+                int(record_id), descriptor, sources=cells, stage=stage,
+            )
+            return
+        except ConcordanceRefusal:
+            pass
+    table.records[int(record_id)] = descriptor
+
+
 def normalize_declared_scalar_record_shapes(module):
     """Enforce the physical shape promised by scalar record descriptors.
 
@@ -76,6 +222,7 @@ def publish_inout_scalar_return_snapshots(module):
     latest dominating write version.  Ambiguous maxima retain the incumbent.
     """
     from dataclasses import replace
+    from .concordance_declarations import RECORD_RETURN_LAYOUT_STAGE
 
     receipts = []
     returned_layout_updates = {}
@@ -218,8 +365,19 @@ def publish_inout_scalar_return_snapshots(module):
                 field_ids = updated[cursor:cursor + width]
                 cursor += width
                 fields.append(replace(field, value_ids=tuple(field_ids)))
-            table.records[int(record_id)] = replace(
-                record, fields=tuple(fields)
+            # The re-sliced descriptor derives from the incumbent descriptor
+            # and the snapshot versions that replaced the formals; the
+            # returned layout row follows from the new descriptor cell.
+            assign_record_descriptor(
+                table, int(record_id), replace(record, fields=tuple(fields)),
+                identity_cells(
+                    function, record_descriptor_cell(table, record_id), *updated,
+                ),
+                stage=RECORD_RETURN_LAYOUT_STAGE,
+            )
+            post_record_return_layout(
+                function, table, int(record_id), updated,
+                stage=RECORD_RETURN_LAYOUT_STAGE,
             )
         if layouts:
             function.metadata["record_return_layouts"] = tuple(layouts)
@@ -614,6 +772,7 @@ def freshen_redefined_ssa_objects(module):
     uses dominated by that later definition (including individual Phi edges).
     """
     from dataclasses import replace
+    from .concordance_declarations import FRESHEN, RECORD_RETURN_REPAIR
 
     receipts = []
     for symbol, function in module.functions.items():
@@ -666,9 +825,15 @@ def freshen_redefined_ssa_objects(module):
                 "ssa_redefinition_freshened": True,
                 "source_value_id": int(original.id),
             })
+            # The clone is NOVEL(freshen) from the redefined value's own
+            # identity cell (the function root when it has none).
             fresh = replace(
                 original,
-                id=GLOBAL_MONOTONIC_IDS.mint(),
+                id=mint_ssa_value(
+                    function, FRESHEN, (original,),
+                    dtype=original.dtype, shape=original.shape or (),
+                    stage=RECORD_RETURN_REPAIR,
+                ),
                 accounting=accounting,
             )
             definition.res = fresh
@@ -1267,6 +1432,11 @@ def publish_scalar_record_return_fields(module):
     record table, so repeated publication is idempotent.
     """
     from ..transmogrifier.ssa import Instr, SSAValue
+    from .concordance_declarations import (
+        RECORD_RETURN_FIELD_CONVERSION, RECORD_RETURN_FIELD_SELECTION,
+        RECORD_RETURN_VERSION,
+    )
+    from .identity_concordance import current_identity_book
 
     changes = 0
     for symbol, function in module.functions.items():
@@ -1279,7 +1449,20 @@ def publish_scalar_record_return_fields(module):
             return_slot_values={span: slots for span, slots, states in receipts},
             return_record_field_states={span: states for span, slots, states in receipts},
         )
+        selection_scope = function.metadata.get('record_return_state_scope')
+        if selection_scope is not None:
+            graph.graph['lexical_read_scope'] = tuple(selection_scope)
         lookup = scalar_return_field_versions(function, graph, module.functions)
+
+        def selection_cell(phi_cell, field_name, position, predecessor):
+            if selection_scope is None or phi_cell is None:
+                return None
+            return current_identity_book().latest_ref(
+                RECORD_RETURN_FIELD_SELECTION, (
+                    tuple(selection_scope), phi_cell, str(field_name),
+                    int(position), str(predecessor),
+                ),
+            )
         values = {int(value.id): value for value in function.args}
         for block in function.blocks.values():
             for operation in block.instrs:
@@ -1303,6 +1486,15 @@ def publish_scalar_record_return_fields(module):
                 if not (len(receivers) == len(predecessors) == len(operation.args)):
                     continue
                 arguments = list(operation.args)
+                # The selection rows are keyed by the record return-merge
+                # Phi this field Phi expands (its ``record_phi``), read
+                # from the book, never from an attribute.
+                phi_cell = ssa_value_identity_cell(
+                    function,
+                    attrs.get('record_phi')
+                    if attrs.get('record_phi') is not None
+                    else (operation.res.accounting or {}).get('record_phi'),
+                )
                 for index, (receiver, predecessor) in enumerate(zip(receivers, predecessors)):
                     edge = function.blocks.get(predecessor)
                     if edge is None or not edge.instrs:
@@ -1323,13 +1515,25 @@ def publish_scalar_record_return_fields(module):
                     if fallback is None:
                         continue
                     selected = lookup(slots[slot], field.name, predecessor, fallback,
-                                      alias_receivers=(receiver,))
+                                      alias_receivers=(receiver,),
+                                      phi_cell=phi_cell, position=index)
                     if selected.dtype != fallback.dtype:
                         key = (predecessor, int(selected.id), fallback.dtype)
                         converted = conversions.get(key)
                         if converted is None:
+                            # The Cast is NOVEL(record_return_field_conversion)
+                            # from the selection cell that chose its operand
+                            # (else the operand's own cell).
+                            chosen_by = selection_cell(
+                                phi_cell, field.name, index, predecessor,
+                            )
                             converted = SSAValue(
-                                GLOBAL_MONOTONIC_IDS.mint(),
+                                mint_ssa_value(
+                                    function, RECORD_RETURN_FIELD_CONVERSION,
+                                    (selected,) if chosen_by is None else (chosen_by,),
+                                    dtype=fallback.dtype,
+                                    stage=RECORD_RETURN_VERSION,
+                                ),
                                 dtype=fallback.dtype,
                             )
                             edge.instrs.insert(-1, Instr('Cast', [selected], converted, attributes={
@@ -1372,7 +1576,7 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         VERSION_NOT_UNIQUELY_DEFINED,
     )
     from .identity_concordance import (
-        Derived, Mode, Ref, Unresolved, Unsourced, current_identity_book,
+        Derived, Mode, Ref, Unresolved, current_identity_book,
     )
 
     # Every exit of the lookup is a statement on ``record_return_field_selection``
@@ -1461,6 +1665,12 @@ def scalar_return_field_versions(function, source_graph, functions=None):
                 return value
             fact = versions[-1]
         else:
+            if not read:
+                # An exit that read no site or version row (no receipts, an
+                # empty predecessor, a predecessor that is not a return
+                # edge) still read the Phi whose row it keys: the Phi's
+                # identity cell is what was looked at.
+                read = (phi_cell,)
             fact = Unresolved(reason, read=read)
         book = current_identity_book()
         stored = book.pages.get(RECORD_RETURN_FIELD_SELECTION.name)
@@ -1469,7 +1679,7 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         book.post(
             RECORD_RETURN_FIELD_SELECTION, row, fact,
             stage=RECORD_RETURN_VERSION,
-            provenance=Derived(read) if read else Unsourced(reason),
+            provenance=Derived(read),
             mode=Mode.REVISE,
         )
         return value
@@ -1488,6 +1698,10 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         (span, tuple((source_graph.graph.get('return_slot_values') or {}).get(span, ())), tuple(states))
         for span, states in receipts.items()
     )
+    if scope is not None:
+        # The reduction scope the receipts' rows are keyed by, so the later
+        # publication over the receipt view keys the same selection rows.
+        function.metadata['record_return_state_scope'] = scope
     formal_ids = {int(value.id) for value in function.args}
     definitions = {}
     instructions = {}

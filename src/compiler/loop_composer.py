@@ -52,6 +52,16 @@ from .loop_ir import (
 )
 from .hierarchical_plan import PlanClosure, PlanLine
 from .process_graph_value_ids import next_process_value_id
+# Step 9 (plan 100, 1.2): the causes this module's operand rewrites record
+# on ``identity_transition`` through ``_set_operands`` (imported where used:
+# ``topological_reducer`` is imported lazily in this module).
+from .concordance_declarations import (
+    LOOP_BODY_CLONE as _LOOP_BODY_CLONE,
+    LOOP_CONTINUATION_REWIRE_OPERANDS as _LOOP_CONTINUATION_REWIRE_OPERANDS,
+    LOOP_EDGE_REBUILD as _LOOP_EDGE_REBUILD,
+    LOOP_MATERIALIZER as _LOOP_MATERIALIZER,
+    LOOP_PARENT_REPLACEMENT as _LOOP_PARENT_REPLACEMENT,
+)
 
 
 class LoopStrategy(str, Enum):
@@ -448,21 +458,22 @@ def _post_loop_region_membership(
 def _rebuild_graph_edges(graph: Any) -> None:
     """Make NetworkX edges and cached parent/child tables agree."""
 
+    from ..common.tensors.topological_reducer import _set_operands
+
     graph.G.remove_edges_from(tuple(graph.G.edges))
     for node_id in graph.G:
         graph.G.nodes[node_id]["children"] = []
     for node_id, data in graph.G.nodes(data=True):
         (data.get("attributes") or {}).pop("recursion_region_id", None)
         (data.get("attributes") or {}).pop("control_ir_owned", None)
-        normalized = []
-        for parent, role in data.get("parents") or ():
-            parent = int(parent)
-            if parent not in graph.G:
-                continue
-            normalized.append((parent, role))
-            graph.G.add_edge(parent, node_id, role=role)
-            graph.G.nodes[parent]["children"].append((node_id, role))
-        data["parents"] = normalized
+        normalized = [
+            (int(parent), role)
+            for parent, role in data.get("parents") or ()
+            if int(parent) in graph.G
+        ]
+        # The one writer materializes the edge and ``children`` for every
+        # operand position; a parent that left the graph retires.
+        _set_operands(graph, node_id, normalized, cause=_LOOP_EDGE_REBUILD)
     try:
         generations = tuple(nx.topological_generations(graph.G))
     except nx.NetworkXUnfeasible:
@@ -836,6 +847,8 @@ def _replace_parent_value(
 ) -> None:
     """Replace one value use without identifying its distinct consumers."""
 
+    from ..common.tensors.topological_reducer import _set_operands
+
     old_value_id = int(old_value_id)
     for _node_id, data in graph.G.nodes(data=True):
         _retarget_cached_value_ids(data, old_value_id, replacements)
@@ -865,7 +878,13 @@ def _replace_parent_value(
                 )
                 for index, replacement in enumerate(replacements)
             )
-        data["parents"] = rewritten
+        _set_operands(
+            graph, _node_id, rewritten, cause=_LOOP_PARENT_REPLACEMENT,
+            same=(
+                {old_value_id: int(replacements[0])}
+                if len(replacements) == 1 else None
+            ),
+        )
     graph.roots = [
         (
             int(replacements[-1])
@@ -929,13 +948,16 @@ def evaporate_unrolled_loops(
     def add_clone(source_id: int, parents: tuple[tuple[int, str], ...]) -> int:
         clone_id = next_process_value_id(graph)
         cloned = copy.deepcopy(dict(graph.G.nodes[int(source_id)]))
-        cloned["parents"] = list(parents)
+        cloned["parents"] = []
         cloned["children"] = []
         cloned["value_id"] = clone_id
         attributes = dict(cloned.get("attributes") or {})
         attributes["unrolled_from"] = int(source_id)
         cloned["attributes"] = attributes
         graph.G.add_node(clone_id, **cloned)
+        from ..common.tensors.topological_reducer import _set_operands
+
+        _set_operands(graph, clone_id, list(parents), cause=_LOOP_BODY_CLONE)
         return clone_id
 
     def add_constant(value: object, loop_id: int) -> int:
@@ -1367,17 +1389,21 @@ def evaporate_unrolled_loops(
                     (ast.GeneratorExp, ast.comprehension),
                 )
             }
-            materializer["parents"] = [
-                (int(parent), role)
-                for parent, role in parents
-                if int(parent) not in structural
-                and int(parent) != int(loop.node_id)
-                and str(role) not in {"elt", "generators"}
-            ]
-            materializer["parents"].extend(
-                (int(value_id), f"arg{index}")
-                for index, value_id in enumerate(values)
-            )
+            from ..common.tensors.topological_reducer import _set_operands
+
+            _set_operands(graph, materializer_id, [
+                *(
+                    (int(parent), role)
+                    for parent, role in parents
+                    if int(parent) not in structural
+                    and int(parent) != int(loop.node_id)
+                    and str(role) not in {"elt", "generators"}
+                ),
+                *(
+                    (int(value_id), f"arg{index}")
+                    for index, value_id in enumerate(values)
+                ),
+            ], cause=_LOOP_MATERIALIZER)
             attributes = dict(materializer.get("attributes") or {})
             attributes["materialization_kind"] = "unrolled_loop"
             attributes["materialized_value_ids"] = tuple(values)
@@ -1866,20 +1892,21 @@ def materialize_retained_loop_ports(
                 )
                 for role, ordinal, parent in positions
             ]
-            if reads_old:
-                # The operand rewrite goes through the one writer of a
-                # node's operand list so ``identity_transition`` records the
-                # move (plan 80, A2.6); ``same`` pairs the old parent with
-                # the port at the same position.
-                from ..common.tensors.topological_reducer import _set_operands
+            # The operand rewrite goes through the one writer of a node's
+            # operand list so ``identity_transition`` records the move (plan
+            # 80, A2.6); ``same`` pairs the old parent with the port at the
+            # same position.  A node that reads nothing of the old value
+            # passes its list unchanged (no row moves).
+            from ..common.tensors.topological_reducer import _set_operands
 
-                _set_operands(
-                    graph, int(node_id), rewired_parents,
-                    cause="loop_continuation_rewire",
-                    same={int(old_value_id): int(new_value_id)},
-                )
-            else:
-                data["parents"] = rewired_parents
+            _set_operands(
+                graph, int(node_id), rewired_parents,
+                cause=_LOOP_CONTINUATION_REWIRE_OPERANDS,
+                same=(
+                    {int(old_value_id): int(new_value_id)} if reads_old
+                    else None
+                ),
+            )
             # Every cached copy of an id this edge rewrite touches -- a
             # port's `value_source_id`, the leaf ledgers, and a not-yet
             # materialized loop node's own carried/initial/state-effect
@@ -2220,17 +2247,23 @@ def materialize_retained_loop_ports(
                     })
                 for consumer_id in aggregate_consumers:
                     consumer = graph.G.nodes[consumer_id]
-                    consumer["parents"] = [
-                        (int(parent), role)
-                        for parent, role in (
-                            consumer.get("parents") or ()
-                        )
-                        if int(parent) != int(effect.state_input_id)
-                    ]
-                    consumer["parents"].extend(
-                        (int(result_id), f"arg{index}")
-                        for index, result_id in enumerate(result_ids)
+                    from ..common.tensors.topological_reducer import (
+                        _set_operands,
                     )
+
+                    _set_operands(graph, consumer_id, [
+                        *(
+                            (int(parent), role)
+                            for parent, role in (
+                                consumer.get("parents") or ()
+                            )
+                            if int(parent) != int(effect.state_input_id)
+                        ),
+                        *(
+                            (int(result_id), f"arg{index}")
+                            for index, result_id in enumerate(result_ids)
+                        ),
+                    ], cause=_LOOP_MATERIALIZER)
                     consumer_attributes = dict(
                         consumer.get("attributes") or {}
                     )

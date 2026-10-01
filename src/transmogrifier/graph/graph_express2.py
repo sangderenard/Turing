@@ -4433,20 +4433,28 @@ class ProcessGraph:
                 target=tgt_id,
                 store_id=store_id
             )
-            if not self.G.has_edge(src_id, tgt_id):
+            # Step 9 (plan 100, 1.2): an authored operand edge is a row
+            # first.  ``_set_operands`` is the one writer of ``parents``,
+            # ``children`` and the networkx edge; it posts the Append on
+            # ``identity_transition`` under this build's
+            # ``ingestion_value_scope`` DERIVED(operand cell, consumer
+            # cell).  The ``Edge`` record stays an edge attribute.
+            from ...common.tensors.topological_reducer import _set_operands
+            from ...compiler.concordance_declarations import INGEST_EDGE
+
+            if 'children' not in self.G.nodes[src_id]:
+                self.G.nodes[src_id]['children'] = []
+            parents = list(self.G.nodes[tgt_id].get('parents') or ())
+            if src_id not in [p for p, _ in parents]:
+                _set_operands(
+                    self, tgt_id, [*parents, (src_id, consumer_role)],
+                    cause=INGEST_EDGE, edge_payload={'extra': set()},
+                )
+            elif not self.G.has_edge(src_id, tgt_id):
                 self.G.add_edge(src_id, tgt_id, extra=set())
             if 'extra' not in self.G[src_id][tgt_id]:
                 self.G[src_id][tgt_id]['extra'] = set()
             self.G[src_id][tgt_id]['extra'].add(edge)
-
-            if 'children' not in self.G.nodes[src_id]:
-                self.G.nodes[src_id]['children'] = []
-            if 'parents' not in self.G.nodes[tgt_id]:
-                self.G.nodes[tgt_id]['parents'] = []
-            if tgt_id not in [p for p, _ in self.G.nodes[src_id]['children']]:
-                self.G.nodes[src_id]['children'].append((tgt_id, producer_role))
-            if src_id not in [p for p, _ in self.G.nodes[tgt_id]['parents']]:
-                self.G.nodes[tgt_id]['parents'].append((src_id, consumer_role))
             self.observe_evolution_edge(src_id, tgt_id, consumer_role)
 
     def _spec_build_tasks(
@@ -5499,11 +5507,9 @@ class ProcessGraph:
                         domain_node=domain_node,
                         store_id=store_id,
                         expr_obj=store_label,
-                        parents=[(nid, 'result')],
+                        parents=[],
                         children=[]
                     )
-
-                    node_data['children'].append((store_node_id, 'result'))
 
                     edge = Edge(
                         id = (nid, store_node_id, 'output', 'result'),
@@ -5512,7 +5518,16 @@ class ProcessGraph:
                         store_id = store_id,
                         target = store_node_id,
                     )
-                    self.G.add_edge(nid, store_node_id, extra=[edge])
+                    # Step 9 (plan 100, 1.2): the store's one operand edge
+                    # is a row; the one writer materializes ``parents``,
+                    # ``children`` and the networkx edge.
+                    from ...common.tensors.topological_reducer import _set_operands
+                    from ...compiler.concordance_declarations import INGEST_EDGE
+
+                    _set_operands(
+                        self, store_node_id, [(nid, 'result')],
+                        cause=INGEST_EDGE, edge_payload={'extra': [edge]},
+                    )
 
                 current_outputs += 1
 

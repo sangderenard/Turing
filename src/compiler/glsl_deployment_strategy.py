@@ -88,6 +88,20 @@ from ..common.tensors.topological_reducer import (
     _append_operand,
     _set_operands,
 )
+# Step 9 (plan 100, 1.2): the causes this module's operand rewrites record.
+from .concordance_declarations import (
+    AGGREGATE_FORMAL_MEMBERS as _AGGREGATE_FORMAL_MEMBERS,
+    AGGREGATE_MEMBER as _AGGREGATE_MEMBER,
+    BOUND_RECEIVER as _BOUND_RECEIVER,
+    CALLSITE_FOLD_LITERAL as _CALLSITE_FOLD_LITERAL,
+    CALLSITE_FOLD_REMOVE_NODE as _CALLSITE_FOLD_REMOVE_NODE,
+    CALLSITE_FOLD_REPLACE_ALIAS as _CALLSITE_FOLD_REPLACE_ALIAS,
+    DISPATCH_STORE as _DISPATCH_STORE_TRANSFORM,
+    PROJECTION_TO_LEAF as _PROJECTION_TO_LEAF,
+    REGION_BOUNDARY_INPUT as _REGION_BOUNDARY_INPUT,
+    SCALAR_INTRINSIC_RECEIVER as _SCALAR_INTRINSIC_RECEIVER,
+    UNBROADCAST_CHAIN as _UNBROADCAST_CHAIN,
+)
 from .loop_composer import (
     LoopBackendCapabilities,
     LoopComposer,
@@ -272,17 +286,12 @@ def _lower_python_scalar_intrinsics(graph: Any) -> None:
         # takes that read as its ``operand`` (a fork of the read position).
         _set_operands(
             SimpleNamespace(G=G), int(node_id), [(int(receiver_id), "operand")],
-            cause="scalar_intrinsic_receiver",
+            cause=_SCALAR_INTRINSIC_RECEIVER,
             fork_from=(
                 {("operand", 0): (int(attribute_id), "value", 0)}
                 if attribute_id is not None else None
             ),
         )
-        G.add_edge(int(receiver_id), int(node_id), role="operand")
-        receiver_children = list(G.nodes[int(receiver_id)].get("children", ()))
-        if not any(int(child) == int(node_id) for child, _ in receiver_children):
-            receiver_children.append((int(node_id), "operand"))
-        G.nodes[int(receiver_id)]["children"] = receiver_children
         attributes = dict(data.get("attributes") or {})
         attributes.update({
             "source_operator": "builtins.int.bit_length",
@@ -7748,7 +7757,9 @@ def _dispatch_subgraph(
             data["attributes"].pop("value", None)
         data["op"] = "input"
         data["label"] = f"value_{node_id}"
-        _set_operands(subgraph, node_id, [], cause="region_boundary_input")
+        _set_operands(subgraph, node_id, [], cause=_REGION_BOUNDARY_INPUT)
+        # Semantic ``dependency`` edges written above are not operand
+        # positions; they go with the boundary too.
         for parent in tuple(subgraph.G.predecessors(node_id)):
             subgraph.G.remove_edge(parent, node_id)
 
@@ -7784,12 +7795,12 @@ def _dispatch_subgraph(
             type="Store",
             op="store",
             label=f"value_{output_id}",
-            parents=[(output_id, "value")],
+            parents=[],
             children=[],
         )
-        subgraph.G.add_edge(output_id, store_id)
-        subgraph.G.nodes[output_id].setdefault("children", []).append(
-            (store_id, "value")
+        _set_operands(
+            subgraph, store_id, [(output_id, "value")],
+            cause=_DISPATCH_STORE_TRANSFORM,
         )
         store_nodes.append(store_id)
     subgraph.roots = store_nodes
@@ -9026,9 +9037,18 @@ def _ordinary_conditional_control_programs(
             anchor_region=anchor_region,
         ))
         program_expressions.append((int(control_id), expression))
-    return _nest_region_less_conditionals(
+    nested = _nest_region_less_conditionals(
         graph, tuple(programs), tuple(program_expressions), subgraphs,
     )
+    # Step 9 (plan 100, 2.3): one ``control_program`` row per authored
+    # conditional, its blocks on ``control_block`` with their placements;
+    # the label is the conditional's own node cell (derived by the helper).
+    from .concordance_declarations import CONTROL_PROGRAM_BUILD
+    from .control_source import post_control_program
+
+    for program in nested:
+        post_control_program(graph, program, stage=CONTROL_PROGRAM_BUILD)
+    return nested
 
 
 def _nest_region_less_conditionals(
@@ -17319,13 +17339,9 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
             member = next_process_value_id(graph)
             edges = [(left, "body"), (right, "orelse"), (parents["test"], "test")]
             graph.G.add_node(member, type="Phi", op="Phi", value_id=member,
-                             parents=edges, children=[], tensor=copy.deepcopy(descriptor),
+                             parents=[], children=[], tensor=copy.deepcopy(descriptor),
                              attributes={"conditional_result_of": int(node_id)})
-            for parent, role in edges:
-                graph.G.add_edge(parent, member, role=role)
-                graph.G.nodes[parent].setdefault("children", []).append((member, role))
-            graph.G.add_edge(member, int(node_id), role="elts")
-            graph.G.nodes[member]["children"].append((int(node_id), "elts"))
+            _set_operands(graph, member, edges, cause=_AGGREGATE_MEMBER)
             _append_operand(graph, int(node_id), member, "elts")
             bindings.append((int(left), int(right), member))
         attributes.update({
@@ -17522,7 +17538,7 @@ def _publish_callsite_return_members(
         member_id = next_process_value_id(caller)
         caller.G.add_node(
             member_id, type="Indexed", op="Indexed", value_id=member_id,
-            parents=[(node_id, "base"), (index_id, "index")], children=[],
+            parents=[], children=[],
             attributes={"authored_call_result_projection": True},
             # A member that is itself an aggregate has no tensor fact of its
             # own; its structure stays in the ordered output descriptors,
@@ -17532,10 +17548,10 @@ def _publish_callsite_return_members(
                 else copy.deepcopy(dict(descriptor))
             ),
         )
-        caller.G.add_edge(node_id, member_id, role="base")
-        caller.G.add_edge(index_id, member_id, role="index")
-        data.setdefault("children", []).append((member_id, "base"))
-        caller.G.nodes[index_id]["children"].append((member_id, "index"))
+        _set_operands(
+            caller, member_id, [(node_id, "base"), (index_id, "index")],
+            cause=_AGGREGATE_MEMBER,
+        )
         leaves.append(member_id)
         record(index, member_id, "materialized", descriptor)
     attributes.update({
@@ -18438,7 +18454,7 @@ def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
             graph.G.add_node(
                 member_id,
                 type="Indexed", op="Indexed", value_id=member_id,
-                parents=[(int(node_id), "base"), (index_id, "index")],
+                parents=[],
                 children=[],
                 attributes={
                     "authored_call_result_projection": True,
@@ -18449,10 +18465,10 @@ def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
                     else copy.deepcopy(dict(descriptor))
                 ),
             )
-            graph.G.add_edge(int(node_id), member_id, role="base")
-            graph.G.add_edge(index_id, member_id, role="index")
-            data.setdefault("children", []).append((member_id, "base"))
-            graph.G.nodes[index_id]["children"].append((member_id, "index"))
+            _set_operands(
+                graph, member_id, [(int(node_id), "base"), (index_id, "index")],
+                cause=_AGGREGATE_MEMBER,
+            )
             replacements.append(member_id)
             replaced.append((int(leaf_id), int(member_id)))
             repaired += 1
@@ -21621,17 +21637,9 @@ def _fold_callsite_structural_values(
         # edges are cut, so the ``proven_literal`` row below can derive from
         # them (plan 80, A1.2).
         literal_sources = _fold_literal_source_cells(graph, int(node_id))
-        for parent, _role in tuple(data.get("parents") or ()):
-            if graph.G.has_edge(int(parent), int(node_id)):
-                graph.G.remove_edge(int(parent), int(node_id))
-            if int(parent) in graph.G:
-                graph.G.nodes[int(parent)]["children"] = [
-                    (child, role)
-                    for child, role in graph.G.nodes[int(parent)].get(
-                        "children", ()
-                    )
-                    if int(child) != int(node_id)
-                ]
+        # The folded node reads nothing any more: its positions retire
+        # through the one writer (edges and ``children`` with them).
+        _set_operands(graph, int(node_id), [], cause=_CALLSITE_FOLD_LITERAL)
         # A constant fold changes the value-producing operation, not the
         # structural identity of an authored aggregate.  Retain the compact
         # aggregate ledger so later sequence lowering can still distinguish
@@ -21677,7 +21685,7 @@ def _fold_callsite_structural_values(
         })
         data.update({
             "type": "Constant", "op": "const", "label": repr(value),
-            "parents": [], "attributes": attributes,
+            "attributes": attributes,
             "constant": copy.deepcopy(value), "expr_obj": None,
         })
         # A proven literal belongs to the VALUE, not to the graph instance
@@ -21727,15 +21735,8 @@ def _fold_callsite_structural_values(
                 (int(parent), str(role))
                 for parent, role in successor_data.get("parents") or ()
                 if int(parent) != node_id
-            ], cause="callsite_fold_remove_node")
-        for predecessor in tuple(graph.G.predecessors(node_id)):
-            graph.G.nodes[int(predecessor)]["children"] = [
-                (child, role)
-                for child, role in graph.G.nodes[int(predecessor)].get(
-                    "children", ()
-                )
-                if int(child) != node_id
-            ]
+            ], cause=_CALLSITE_FOLD_REMOVE_NODE)
+        _set_operands(graph, node_id, [], cause=_CALLSITE_FOLD_REMOVE_NODE)
         graph.G.remove_node(node_id)
         # The identity table must name only values that exist.  A removed
         # aggregate formal left in a name's history is later seeded as an
@@ -21773,19 +21774,11 @@ def _fold_callsite_structural_values(
                 )
                 for parent, role in successor_data.get("parents") or ()
             )
-            if graph.G.has_edge(node_id, int(successor)):
-                graph.G.remove_edge(node_id, int(successor))
             _set_operands(
                 graph, int(successor), list(replacement),
-                cause="callsite_fold_replace_alias", same={node_id: source_id},
+                cause=_CALLSITE_FOLD_REPLACE_ALIAS, same={node_id: source_id},
             )
             _follow_declared_value_source(successor_data, node_id, source_id)
-            for parent, role in replacement:
-                if not graph.G.has_edge(int(parent), int(successor)):
-                    graph.G.add_edge(int(parent), int(successor), role=str(role))
-                children = graph.G.nodes[int(parent)].setdefault("children", [])
-                if (int(successor), str(role)) not in children:
-                    children.append((int(successor), str(role)))
         identities = graph.G.graph.get("identity_table") or {}
         # Each ``name_binding`` version naming the alias revises to the
         # source's identity (plan 80, A2.7); return slots naming it follow.
@@ -23463,26 +23456,16 @@ def _alias_projection_to_member(
                 str(role),
             )
             for parent, role in successor_data.get("parents") or ()
-        ], cause="projection_to_leaf", same={projection: leaf_id})
+        ], cause=_PROJECTION_TO_LEAF, same={projection: leaf_id})
         _follow_declared_value_source(successor_data, projection, leaf_id)
-        for parent, role in successor_data["parents"]:
-            if int(parent) == leaf_id:
-                graph.G.nodes[leaf_id].setdefault("children", []).append(
-                    (int(successor), str(role))
-                )
-        graph.G.remove_edge(projection, int(successor))
-        graph.G.add_edge(leaf_id, int(successor))
     index_ids = tuple(
         int(parent)
         for parent, role in projection_data.get("parents") or ()
         if str(role) in {"index", "slice", "subscript"}
     )
-    for parent in tuple(graph.G.predecessors(projection)):
-        graph.G.nodes[int(parent)]["children"] = [
-            (child, role)
-            for child, role in graph.G.nodes[int(parent)].get("children", ())
-            if int(child) != projection
-        ]
+    # The projection's own positions retire (its parents' ``children``
+    # entries and edges with them) before the node is removed below.
+    _set_operands(graph, projection, [], cause=_PROJECTION_TO_LEAF)
     # A loop that carries this projection (``a, b = history`` bound as its
     # initial) caches the projection id without being its successor; move
     # every cached copy before the node is gone.
@@ -23645,12 +23628,7 @@ def _apply_callsite_aggregate_descriptors(
             formal["tensor"] = {}
             _set_operands(graph, int(input_id), [
                 (int(leaf), "elts") for leaf in leaves
-            ], cause="aggregate_formal_members")
-            for leaf in leaves:
-                graph.G.add_edge(int(leaf), int(input_id), role="elts")
-                graph.G.nodes[int(leaf)].setdefault("children", []).append(
-                    (int(input_id), "elts")
-                )
+            ], cause=_AGGREGATE_FORMAL_MEMBERS)
             for leaf_id, member_path, nested_members, nested_path in nested:
                 materialize(
                     leaf_id,
@@ -23714,7 +23692,7 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
         role = "operand"
         graph.G.add_node(
             node_id, op=op, type=op, label=op,
-            parents=[(current, role)], children=[],
+            parents=[], children=[],
             attributes={
                 **dict(attributes),
                 "tensor_candidate": op,
@@ -23727,8 +23705,7 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
             },
             control={}, constant=None, expr_obj=None, store_id=None,
         )
-        graph.G.add_edge(current, node_id, role=role)
-        graph.G.nodes[current]["children"].append((node_id, role))
+        _set_operands(graph, node_id, [(current, role)], cause=_UNBROADCAST_CHAIN)
         current = node_id
 
     while len(current_shape) > len(target_shape):
@@ -24366,13 +24343,7 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         parents = [(int(parent), str(role)) for parent, role in data.get("parents") or ()
                    if str(role) not in {"callee", "func", "function", "operand", "receiver"}]
         parents.append((receiver_id, "operand"))
-        _set_operands(graph, int(node_id), parents, cause="bound_receiver")
-        if graph.G.has_edge(selector, node_id):
-            graph.G.remove_edge(selector, node_id)
-        graph.G.add_edge(receiver_id, node_id)
-        graph.G.nodes[selector]["children"] = [(child, role) for child, role in graph.G.nodes[selector].get("children") or ()
-                                                 if int(child) != int(node_id)]
-        graph.G.nodes[receiver_id].setdefault("children", []).append((int(node_id), "operand"))
+        _set_operands(graph, int(node_id), parents, cause=_BOUND_RECEIVER)
 
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}

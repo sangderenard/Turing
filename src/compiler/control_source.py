@@ -773,6 +773,561 @@ class RegionCode:
     launch_body: StatementBlock | None = None
 
 
+# ---------------------------------------------------------------------------
+# Step 9, part A (2) (plan 100, section 2): every control block is a row on
+# ``control_block``, its position a ``control_block_placement`` revision, the
+# program a ``control_program`` row.  The tree every builder and rewriter
+# returns is the materialized view; ``post_control_program`` is the one
+# writer, called once at each return.
+# ---------------------------------------------------------------------------
+
+#: The scope a program is tagged under when its graph has no read scope.
+_UNSCOPED_CONTROL = ("unscoped_control", 0)
+_CALLSITE_MARKER_PREFIX = "__plan_callsite_"
+
+
+def _control_block_kind(block: Any) -> Any:
+    """The ``ControlBlockKind`` of one block; None for a ``SequenceBlock``
+    (a container, flattened for placement) or an unknown object."""
+
+    from .concordance_declarations import ControlBlockKind as Kind
+
+    return {
+        StatementBlock: Kind.STATEMENT,
+        ConditionalBlock: Kind.CONDITIONAL,
+        LoopBlock: Kind.LOOP,
+        WhileBlock: Kind.WHILE,
+        LoopControlBlock: Kind.LOOP_CONTROL,
+        StateMachineTick: Kind.STATE_MACHINE_TICK,
+        ParallelDeployment: Kind.PARALLEL_DEPLOYMENT,
+        CallBlock: Kind.CALL,
+        DispatchBlock: Kind.DISPATCH,
+        ResourceScopeBlock: Kind.RESOURCE_SCOPE,
+        ExternalReferenceCallBlock: Kind.EXTERNAL_REFERENCE_CALL,
+        ValidationBlock: Kind.VALIDATION,
+        SequenceMutationBlock: Kind.SEQUENCE_MUTATION,
+        SequenceQueryBlock: Kind.SEQUENCE_QUERY,
+        ScalarFieldWriteBlock: Kind.SCALAR_FIELD_WRITE,
+        StreamPublishBlock: Kind.STREAM_PUBLISH,
+    }.get(type(block))
+
+
+def _flatten_control_sequence(block: Any) -> tuple:
+    """The blocks of one arm with every nested ``SequenceBlock`` flattened:
+    the ordinal a placement records (plan 100, 2.1)."""
+
+    if block is None:
+        return ()
+    if isinstance(block, SequenceBlock):
+        return tuple(
+            item
+            for child in block.blocks
+            for item in _flatten_control_sequence(child)
+        )
+    return (block,)
+
+
+def _control_block_arms(block: Any) -> tuple:
+    """``(arm, index, flattened children)`` per arm of ``block``."""
+
+    from .concordance_declarations import Arm
+
+    if isinstance(block, ConditionalBlock):
+        arms = [(Arm.BODY, 0, block.body)]
+        if block.orelse is not None:
+            arms.append((Arm.ORELSE, 0, block.orelse))
+    elif isinstance(block, LoopBlock):
+        arms = [
+            (Arm.BODY, 0, block.body),
+            (Arm.TERMINAL, 0, SequenceBlock(tuple(block.terminal_controls))),
+        ]
+    elif isinstance(block, WhileBlock):
+        arms = [
+            (Arm.CONDITION, 0, block.condition),
+            (Arm.BODY, 0, block.body),
+            (Arm.TERMINAL, 0, SequenceBlock(tuple(block.terminal_controls))),
+        ]
+    elif isinstance(block, StateMachineTick):
+        arms = [
+            (Arm.CASE, index, body)
+            for index, (_state, body) in enumerate(block.cases)
+        ]
+        if block.default is not None:
+            arms.append((Arm.DEFAULT, 0, block.default))
+    elif isinstance(block, ParallelDeployment):
+        arms = [(Arm.LANE, index, lane) for index, lane in enumerate(block.lanes)]
+    elif isinstance(block, CallBlock):
+        arms = [(Arm.CALLEE, 0, block.callee)]
+    elif isinstance(block, ResourceScopeBlock):
+        arms = [
+            (Arm.BODY, 0, block.body),
+            (Arm.CLEANUP, 0, SequenceBlock(tuple(block.cleanup))),
+        ]
+    else:
+        return ()
+    return tuple(
+        (arm, index, _flatten_control_sequence(body))
+        for arm, index, body in arms
+    )
+
+
+def _callsite_marker(block: Any) -> int | None:
+    if not isinstance(block, StatementBlock) or len(block.lines) != 1:
+        return None
+    line = block.lines[0]
+    if not line.startswith(_CALLSITE_MARKER_PREFIX) or not line.endswith("__"):
+        return None
+    try:
+        return int(line[len(_CALLSITE_MARKER_PREFIX):-2])
+    except ValueError:
+        return None
+
+
+def post_control_program(
+    graph: Any,
+    program: "ControlProgram | None",
+    *,
+    stage: Any,
+    cause: tuple = (),
+    label: Any = None,
+    previous: "ControlProgram | None" = None,
+) -> Any:
+    """Post one ControlProgram tree on the book; return its program cell.
+
+    ``graph`` is the ProcessGraph (or its networkx graph) the program was
+    built for: its ``lexical_read_scope`` keys every row, its nodes resolve
+    the blocks' ids to cells (``node_identity_cell``), its
+    ``planning_scope`` resolves region markers to ``deployment_region``
+    cells and ``call_binding`` resolves callsites.  ``cause`` names the
+    cells whose change made the rewriter return a new tree.  ``label`` is
+    the ``control_program`` row's label: ``SHELL`` for the function's one
+    program, else the owning construct's cell (derived from the first
+    conditional or loop of the root when None).  ``previous`` is the tree
+    this one replaces; a block of it that is gone has its placement
+    withdrawn by ``Unresolved(COLLAPSED_EMPTY_CONSTRUCT)`` -- an edge, never
+    an erasure.
+
+    Rows, per plan 100 section 2.3: each block posts ``control_block``
+    CONCORD DERIVED(owner cell, the cells its fact names, ``cause``) -- a
+    block whose identity fields changed (a conditional whose carries were
+    enriched) posts a REVISE with those cells as its cause, or
+    ``Unsourced(CONTROL_BLOCK_REVISION_UNCAUSED)`` when the api would admit
+    no cause; a block whose owner cannot be named is keyed on the program
+    cell and ``Unsourced(CONTROL_OWNER_UNKNOWN)`` (a region marker with no
+    ``deployment_region`` row: ``REGION_CELL_UNROUTED``); two such blocks
+    with different facts cannot share the fallback row, so the second is
+    not posted and is counted in ``metadata["control_program_unrouted"]``.
+    Then ``control_block_placement`` REVISE DERIVED(block cell, parent cell
+    or program cell, ``cause``) only when the placement changed, then
+    ``control_program`` REVISE when its fact changed.  A rewriter that
+    changes nothing posts nothing new.  A graph with no read scope posts one
+    ``Unsourced(CONTROL_FUNCTION_SCOPE_UNKNOWN)`` program row under
+    ``_UNSCOPED_CONTROL`` so the audit lists the caller.
+    """
+
+    if graph is None or program is None:
+        return None
+    from .concordance_declarations import (
+        Arm, CALL_BINDING, COLLAPSED_EMPTY_CONSTRUCT, CONTROL_BLOCK,
+        CONTROL_BLOCK_PLACEMENT, CONTROL_BLOCK_REVISION_UNCAUSED,
+        CONTROL_FUNCTION_SCOPE_UNKNOWN, CONTROL_OWNER_UNKNOWN,
+        CONTROL_PROGRAM, ControlBlockFact, ControlProgramFact,
+        DEPLOYMENT_REGION, Placement, REGION_CELL_UNROUTED, ROOT, SHELL,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Ref, Unresolved, Unsourced, current_identity_book,
+    )
+    from ..common.tensors.topological_reducer import node_identity_cell
+
+    G = getattr(graph, "G", graph)
+    metadata = getattr(G, "graph", None) or {}
+    book = current_identity_book()
+    scope = metadata.get("lexical_read_scope")
+    if scope is None:
+        book.post(
+            CONTROL_PROGRAM,
+            (_UNSCOPED_CONTROL, (
+                str(metadata.get("function_name")),
+                SHELL if label is None else label,
+            )),
+            ControlProgramFact((), (), (), None, (), ()),
+            stage=stage, provenance=Unsourced(CONTROL_FUNCTION_SCOPE_UNKNOWN),
+            mode=Mode.REVISE,
+        )
+        return None
+    scope = tuple(scope)
+    resolvable = bool(
+        metadata.get("canonical_value_ids")
+        or metadata.get("operand_position_scope")
+        or metadata.get("ingestion_value_scope")
+    )
+    value_to_node: dict[int, Any] = {}
+    for node_id, data in G.nodes(data=True):
+        value_id = data.get("value_id", node_id)
+        if isinstance(value_id, int) and not isinstance(value_id, bool):
+            value_to_node.setdefault(int(value_id), node_id)
+    planning_scope = metadata.get("planning_scope")
+    cause = tuple(dict.fromkeys(item for item in cause if isinstance(item, Ref)))
+
+    def cell(value_id: Any) -> Any:
+        if value_id is None or not resolvable or isinstance(value_id, bool):
+            return None
+        if not isinstance(value_id, int):
+            return None
+        node_id = value_to_node.get(int(value_id), int(value_id))
+        if node_id not in G:
+            return None
+        return node_identity_cell(graph, node_id)
+
+    def cells(value_ids: Any) -> tuple:
+        return tuple(
+            item for item in (cell(value_id) for value_id in value_ids)
+            if item is not None
+        )
+
+    def region_cell(ordinal: Any) -> Any:
+        if planning_scope is None or ordinal is None:
+            return None
+        return book.latest_ref(DEPLOYMENT_REGION, (planning_scope, int(ordinal)))
+
+    def callsite_cell(callsite_id: Any) -> Any:
+        if callsite_id is None:
+            return None
+        bound = book.latest_ref(CALL_BINDING, (scope, int(callsite_id)))
+        return bound if bound is not None else cell(callsite_id)
+
+    def describe(block: Any) -> Any:
+        """``(kind, owner cell or None, reason, fact fields)`` of one block
+        (plan 100, 2.2); ``owner`` None means the program cell stands in."""
+
+        kind = _control_block_kind(block)
+        if kind is None:
+            return None
+        owner = reason = predicate = callsite = None
+        carried: tuple = ()
+        sites: tuple = ()
+        regions: tuple = ()
+        extra: tuple = ()
+        if isinstance(block, StatementBlock):
+            region = _region_marker(block)
+            callsite_ordinal = _callsite_marker(block)
+            if region is not None:
+                owner = region_cell(region)
+                regions = (owner,) if owner is not None else ()
+                extra = ("region", int(region))
+                if owner is None:
+                    reason = REGION_CELL_UNROUTED
+            elif callsite_ordinal is not None:
+                owner = callsite = callsite_cell(callsite_ordinal)
+                extra = ("callsite", int(callsite_ordinal))
+                if owner is None:
+                    reason = REGION_CELL_UNROUTED
+            else:
+                extra = ("lines", tuple(block.lines))
+        elif isinstance(block, ConditionalBlock):
+            owner = cell(block.source_node_id)
+            predicate = cell(block.predicate_value_id)
+            field_cells = tuple(block.carried_field_cells)
+            carried = tuple(
+                item for item in (
+                    field_cells[index][2]
+                    if index < len(field_cells)
+                    and isinstance(field_cells[index], tuple)
+                    and len(field_cells[index]) == 3
+                    and isinstance(field_cells[index][2], Ref)
+                    else cell(alias[3])
+                    for index, alias in enumerate(block.carried_aliases)
+                )
+                if item is not None
+            )
+            extra = (bool(block.expect_true),)
+        elif isinstance(block, LoopBlock):
+            owner = cell(block.source_loop_node_id)
+            carried = cells(updated for updated, _initial in block.carried_aliases)
+            sites = cells(block.control_site_ids)
+            extra = (
+                str(block.induction), str(block.start), str(block.stop),
+                str(block.step), str(block.comparison),
+                str(block.schedule_preference),
+            )
+        elif isinstance(block, WhileBlock):
+            owner = cell(block.source_loop_node_id)
+            predicate = cell(block.predicate_value_id)
+            carried = cells(updated for updated, _initial in block.carried_aliases)
+            sites = cells(block.control_site_ids)
+        elif isinstance(block, LoopControlBlock):
+            owner = cell(block.site_node_id)
+            predicate = cell(block.predicate_value_id)
+            extra = (str(block.action), block.source_action)
+        elif isinstance(block, (CallBlock, DispatchBlock, ExternalReferenceCallBlock)):
+            owner = callsite = callsite_cell(block.callsite_id)
+            extra = (
+                getattr(block, "operation", None),
+                getattr(block, "identity", None),
+            )
+        elif isinstance(block, ResourceScopeBlock):
+            owner = cell(block.source_scope_id)
+        elif isinstance(block, ValidationBlock):
+            owner = predicate = cell(block.predicate_value_id)
+            extra = (
+                int(block.error_code), bool(block.expect_true),
+                block.extraction_identity,
+            )
+        elif isinstance(block, SequenceMutationBlock):
+            owner = cell(block.mutation.effect_node_id)
+            extra = (str(block.mutation.operator),)
+        elif isinstance(block, ScalarFieldWriteBlock):
+            owner = (
+                block.field_state_cell
+                if isinstance(block.field_state_cell, Ref)
+                else cell(block.effect_node_id)
+            )
+            extra = (str(block.dtype),)
+        elif isinstance(block, SequenceQueryBlock):
+            owner = cell(block.result_value_id)
+            if owner is None:
+                owner = cell(block.source_call_node_id)
+            extra = (str(block.operation),)
+        elif isinstance(block, StreamPublishBlock):
+            owner = cell(block.value_id)
+            extra = (bool(block.final),)
+        elif isinstance(block, StateMachineTick):
+            extra = (str(block.state),)
+        elif isinstance(block, ParallelDeployment):
+            extra = (str(block.schedule_preference),)
+        if owner is None and reason is None and not isinstance(
+            block, (StateMachineTick, ParallelDeployment),
+        ):
+            reason = CONTROL_OWNER_UNKNOWN
+        return kind, owner, reason, (predicate, carried, sites, regions, callsite, extra)
+
+    def fact_cells(fields: tuple) -> tuple:
+        predicate, carried, sites, regions, callsite, _extra = fields
+        return tuple(
+            item for item in (predicate, *carried, *sites, *regions, callsite)
+            if isinstance(item, Ref)
+        )
+
+    def admissible_revision(page: Any, row: tuple, sources: tuple) -> bool:
+        """The api's REVISE rule, checked at the writer (plan 80 R5)."""
+
+        latest = book.latest_ref(page, row)
+        if latest is None:
+            return True
+        stored = book.pages[page.name]
+        newest = max(
+            stored.stamps[(row, column)] for column, _fact in stored.history(row)
+        )
+        previous_sources = {
+            source.key for source, _stage in book.edges_into(latest)
+        }
+        return (
+            any(book.stamp_of(source) > newest for source in sources)
+            or {source.key for source in sources} != previous_sources
+        )
+
+    def revise(page: Any, row: tuple, fact: Any, sources: tuple) -> Any:
+        sources = tuple(dict.fromkeys(item for item in sources if isinstance(item, Ref)))
+        if sources and admissible_revision(page, row, sources):
+            return book.post(
+                page, row, fact, stage=stage, provenance=Derived(sources),
+                mode=Mode.REVISE,
+            )
+        return book.post(
+            page, row, fact, stage=stage,
+            provenance=Unsourced(CONTROL_BLOCK_REVISION_UNCAUSED),
+            mode=Mode.REVISE,
+        )
+
+    def latest_fact(page: Any, row: tuple) -> Any:
+        stored = book.pages.get(page.name)
+        return None if stored is None else stored.latest(row)
+
+    root_blocks = _flatten_control_sequence(program.root)
+    descriptions = {id(block): describe(block) for block in root_blocks}
+    if label is None:
+        label = SHELL
+        for block in root_blocks:
+            described = descriptions[id(block)]
+            if (
+                isinstance(block, (ConditionalBlock, LoopBlock, WhileBlock))
+                and described is not None and described[1] is not None
+            ):
+                label = described[1]
+                break
+    program_row = (scope, label)
+    program_cell = book.latest_ref(CONTROL_PROGRAM, program_row)
+    if program_cell is None:
+        seeds = tuple(dict.fromkeys((
+            *cause,
+            *(
+                described[1] for described in descriptions.values()
+                if described is not None and described[1] is not None
+            ),
+        )))
+        program_cell = book.post(
+            CONTROL_PROGRAM, program_row,
+            ControlProgramFact((), (), (), None, (), ()),
+            stage=stage,
+            provenance=(
+                Derived(seeds) if seeds else Unsourced(CONTROL_OWNER_UNKNOWN)
+            ),
+            mode=Mode.REVISE,
+        )
+    unrouted = 0
+    posted_block_cells: set = set()
+
+    def post_block(block: Any) -> Any:
+        nonlocal unrouted
+        described = descriptions.get(id(block))
+        if described is None:
+            described = describe(block)
+        if described is None:
+            return None
+        kind, owner, reason, fields = described
+        fallback = owner is None
+        owner = program_cell if fallback else owner
+        fact = ControlBlockFact(kind, *fields)
+        row = (scope, kind, owner)
+        sources = tuple(dict.fromkeys((owner, *fact_cells(fields), *cause)))
+        latest = book.latest_ref(CONTROL_BLOCK, row)
+        if latest is None:
+            return book.post(
+                CONTROL_BLOCK, row, fact, stage=stage,
+                provenance=(
+                    Unsourced(reason) if reason is not None else Derived(sources)
+                ),
+                mode=Mode.CONCORD,
+            )
+        if latest_fact(CONTROL_BLOCK, row) == fact:
+            if reason is None:
+                # Same fact: the design's no-op that still records its edge.
+                return book.post(
+                    CONTROL_BLOCK, row, fact, stage=stage,
+                    provenance=Derived(sources), mode=Mode.CONCORD,
+                )
+            return latest
+        if fallback:
+            # Two ownerless blocks with different facts cannot share the
+            # program cell's row; the second is the worklist's.
+            unrouted += 1
+            return None
+        return revise(CONTROL_BLOCK, row, fact, sources)
+
+    def place(block_cell: Any, parent: Any, arm: Any, index: int, ordinal: int) -> None:
+        row = (scope, block_cell)
+        fact = Placement(parent, arm, int(ordinal), int(index))
+        if latest_fact(CONTROL_BLOCK_PLACEMENT, row) == fact:
+            return
+        revise(
+            CONTROL_BLOCK_PLACEMENT, row, fact,
+            (block_cell, parent if isinstance(parent, Ref) else program_cell, *cause),
+        )
+
+    def visit(blocks: tuple, parent: Any, arm: Any, index: int) -> tuple:
+        placed = []
+        for ordinal, block in enumerate(blocks):
+            block_cell = post_block(block)
+            if block_cell is None:
+                continue
+            posted_block_cells.add(block_cell.key)
+            placed.append(block_cell)
+            place(block_cell, parent, arm, index, ordinal)
+            for child_arm, child_index, children in _control_block_arms(block):
+                visit(children, block_cell, child_arm, child_index)
+        return tuple(placed)
+
+    root_cells = visit(root_blocks, ROOT, Arm.ROOT_SEQUENCE, 0)
+
+    if previous is not None:
+        def previous_cells(blocks: tuple) -> None:
+            for block in blocks:
+                described = describe(block)
+                if described is None:
+                    continue
+                kind, owner, _reason, fields = described
+                row = (scope, kind, program_cell if owner is None else owner)
+                block_cell = book.latest_ref(CONTROL_BLOCK, row)
+                if (
+                    block_cell is not None
+                    and block_cell.key not in posted_block_cells
+                    and latest_fact(CONTROL_BLOCK, row) == ControlBlockFact(kind, *fields)
+                ):
+                    placement_row = (scope, block_cell)
+                    placement = book.latest_ref(CONTROL_BLOCK_PLACEMENT, placement_row)
+                    if placement is not None and not isinstance(
+                        latest_fact(CONTROL_BLOCK_PLACEMENT, placement_row),
+                        Unresolved,
+                    ):
+                        revise(
+                            CONTROL_BLOCK_PLACEMENT, placement_row,
+                            Unresolved(COLLAPSED_EMPTY_CONSTRUCT, (placement,)),
+                            (placement, *cause),
+                        )
+                for _arm, _index, children in _control_block_arms(block):
+                    previous_cells(children)
+        previous_cells(_flatten_control_sequence(previous.root))
+
+    def region_or_ordinal(ordinal: Any) -> Any:
+        found = region_cell(ordinal)
+        return found if found is not None else int(ordinal)
+
+    def cell_or_id(value_id: Any) -> Any:
+        found = cell(value_id)
+        return found if found is not None else value_id
+
+    program_fact = ControlProgramFact(
+        regions=tuple(region_or_ordinal(index) for index in program.region_indices),
+        uniforms=tuple(program.uniforms),
+        value_aliases=tuple(
+            (cell_or_id(updated), cell_or_id(initial))
+            for updated, initial in program.value_aliases
+        ),
+        anchor_region=(
+            None if program.anchor_region is None
+            else region_or_ordinal(program.anchor_region)
+        ),
+        specialized_conditionals=tuple(
+            cell_or_id(node_id)
+            for node_id in program.specialized_conditional_node_ids
+        ),
+        root_blocks=root_cells,
+    )
+    if latest_fact(CONTROL_PROGRAM, program_row) != program_fact:
+        program_cell = revise(
+            CONTROL_PROGRAM, program_row, program_fact,
+            (
+                *root_cells, *cause,
+                *(item for item in program_fact.regions if isinstance(item, Ref)),
+            ),
+        )
+    if unrouted:
+        metadata["control_program_unrouted"] = (
+            int(metadata.get("control_program_unrouted") or 0) + unrouted
+        )
+    return program_cell
+
+
+def post_control_rewrite(
+    graph: Any,
+    program: "ControlProgram | None",
+    *,
+    cause: tuple = (),
+    label: Any = None,
+    previous: "ControlProgram | None" = None,
+) -> Any:
+    """``post_control_program`` at stage ``CONTROL_PROGRAM_REWRITE`` with the
+    shell label: the one call each rewriter of ``_class_surface_ssa_program``
+    makes where it replaces the ControlProgram."""
+
+    from .concordance_declarations import CONTROL_PROGRAM_REWRITE, SHELL
+
+    return post_control_program(
+        graph, program, stage=CONTROL_PROGRAM_REWRITE, cause=cause,
+        label=SHELL if label is None else label, previous=previous,
+    )
+
+
 def _indent(lines: Iterable[str], spaces: int = 4) -> tuple[str, ...]:
     prefix = " " * spaces
     return tuple(prefix + line if line else line for line in lines)
@@ -2047,6 +2602,8 @@ def compose_region_code(
     program: ControlProgram,
     target: ControlTarget,
     regions: Iterable[RegionCode],
+    *,
+    graph: Any = None,
 ) -> ControlProgram:
     """Substitute late-selected interiors into one shell control program.
 
@@ -2192,7 +2749,7 @@ def compose_region_code(
             "logical shell must consume each region exactly once: "
             f"expected={expected!r}, consumed={tuple(consumed)!r}"
         )
-    return ControlProgram(
+    composed = ControlProgram(
         root=root,
         region_indices=expected,
         uniforms=program.uniforms,
@@ -2208,6 +2765,10 @@ def compose_region_code(
             program.specialized_conditional_node_ids
         ),
     )
+    # Step 9 (plan 100, 2.3): the composed tree is a revision of the planned
+    # one; a caller that hands the graph gets the rows posted here.
+    post_control_rewrite(graph, composed, previous=program)
+    return composed
 
 
 def project_control_regions(
@@ -2216,6 +2777,7 @@ def project_control_regions(
     *,
     retained_value_ids: Iterable[int] | None = None,
     preserve_source_loop_carries: bool = False,
+    graph: Any = None,
 ) -> ControlProgram:
     """Project compiled control onto regions that still require runtime work.
 
@@ -2581,7 +3143,7 @@ def project_control_regions(
         )
         if lanes:
             projected_deployments.append(replace(deployment, lanes=lanes))
-    return ControlProgram(
+    projected = ControlProgram(
         root,
         tuple(
             region_index
@@ -2631,6 +3193,10 @@ def project_control_regions(
         ),
         program.specialized_conditional_node_ids,
     )
+    # Step 9 (plan 100, 2.3): a collapsed construct's placement is withdrawn
+    # by ``Unresolved(COLLAPSED_EMPTY_CONSTRUCT)`` from ``previous``.
+    post_control_rewrite(graph, projected, previous=program)
+    return projected
 
 
 def _order_conditional_state_dependencies(block: ControlBlock) -> ControlBlock:

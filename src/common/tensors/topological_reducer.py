@@ -53,6 +53,22 @@ from ...compiler.identity_concordance import (
     Unresolved as _Unresolved,
 )
 from ...compiler.concordance_declarations import (
+    # Step 9 (plan 100, 1.2): the causes this module's operand rewrites
+    # record on ``identity_transition``.
+    APPEND_OPERAND as _APPEND_OPERAND,
+    CANONICAL_RELABEL_OPERANDS as _CANONICAL_RELABEL_OPERANDS,
+    CLASS_TABLE_MEMBER as _CLASS_TABLE_MEMBER,
+    DISSOLVE_EXPR as _DISSOLVE_EXPR,
+    DISSOLVE_RETURN as _DISSOLVE_RETURN,
+    DISSOLVE_WRAPPER as _DISSOLVE_WRAPPER,
+    FUNCTION_SUBGRAPH_FILTER as _FUNCTION_SUBGRAPH_FILTER,
+    PARAMETER_INPUT as _PARAMETER_INPUT,
+    REDIRECT_VALUE as _REDIRECT_VALUE,
+    REDUCER_SYNTHESIS as _REDUCER_SYNTHESIS,
+    REMOVE_NODE as _REMOVE_NODE,
+    REPLACE_INPUTS as _REPLACE_INPUTS,
+)
+from ...compiler.concordance_declarations import (
     CANONICAL_RELABEL as _CANONICAL_RELABEL_STAGE,
     CANONICAL_VALUE as _CANONICAL_VALUE,
     CLASS_FIELD_DECLARATION as _CLASS_FIELD_DECLARATION,
@@ -2253,7 +2269,90 @@ def _operand_position_scope(graph: Any) -> Any:
     scope = graph_data.get("operand_position_scope")
     if scope is None:
         scope = graph_data.get("lexical_read_scope")
+    if scope is None:
+        # Step 9 (plan 100, 1.1): an edge ``build_from_ast`` writes before
+        # any reduction is keyed in the build's ingestion scope -- the
+        # scope ``ensure_node`` posted the nodes under.  The canonical
+        # relabel moves these rows to the read scope with every other
+        # operand-position row.
+        scope = graph_data.get("ingestion_value_scope")
     return None if scope is None else tuple(scope)
+
+
+#: The scope an operand rewrite is tagged under when its graph has none
+#: (neither built by ``build_from_ast`` nor entered normalization): the
+#: ``Unsourced(NO_OPERAND_POSITION_SCOPE)`` row of plan 70 section 3.
+_UNSCOPED_OPERANDS = ("unscoped_operands", 0)
+
+
+def _materialize_operands(
+    graph: Any,
+    node_id: Any,
+    old_parents: Any,
+    parents: Any,
+    edge_payload: Mapping[str, Any] | None,
+) -> None:
+    """Make ``children`` and the networkx edges agree with ``parents``.
+
+    The operand list is the fact (``identity_transition``); ``parents``,
+    ``children`` and ``graph.G.edges`` are its three materializations and
+    ``_set_operands`` writes all three (plan 100, 1.1).  For every parent
+    that left the list its ``children`` entries naming this consumer and
+    the edge go; for every parent in the list the edge exists (its ``role``
+    is the parent's first role here) and ``children`` holds exactly one
+    ``(consumer, role)`` per role, stale role spellings replaced in place
+    so sibling order is kept.  A parent that is not a node is skipped:
+    networkx would create it (see ``_replace_inputs``).
+    """
+
+    G = graph.G
+    by_parent: dict[Any, list[Any]] = {}
+    for parent, role in parents:
+        roles = by_parent.setdefault(parent, [])
+        if role not in roles:
+            roles.append(role)
+    for parent in dict.fromkeys(parent for parent, _role in old_parents):
+        if parent in by_parent or parent not in G:
+            continue
+        parent_data = G.nodes[parent]
+        if parent_data.get("children"):
+            parent_data["children"] = [
+                child for child in parent_data["children"]
+                if child[0] != node_id
+            ]
+        if G.has_edge(parent, node_id):
+            G.remove_edge(parent, node_id)
+    payload = {
+        key: (set(value) if isinstance(value, set) else value)
+        for key, value in dict(edge_payload or {}).items()
+    }
+    for parent, roles in by_parent.items():
+        if parent not in G:
+            continue
+        if G.has_edge(parent, node_id):
+            G.edges[parent, node_id]["role"] = roles[0]
+        else:
+            G.add_edge(parent, node_id, role=roles[0], **payload)
+        parent_data = G.nodes[parent]
+        children = list(parent_data.get("children") or ())
+        present = [tuple(child) for child in children if child[0] == node_id]
+        if (
+            len(present) == len(roles)
+            and {child[1] for child in present} == set(roles)
+        ):
+            continue
+        pending = list(roles)
+        rebuilt: list = []
+        for child in children:
+            if child[0] != node_id:
+                rebuilt.append(child)
+            elif child[1] in pending:
+                pending.remove(child[1])
+                rebuilt.append(child)
+            elif pending:
+                rebuilt.append((node_id, pending.pop(0)))
+        rebuilt.extend((node_id, role) for role in pending)
+        parent_data["children"] = rebuilt
 
 
 def _set_operands(
@@ -2264,16 +2363,28 @@ def _set_operands(
     cause: str | _Transform,
     same: Mapping[Any, Any] | None = None,
     fork_from: Mapping[tuple[Any, int], tuple[Any, ...]] | None = None,
+    edge_payload: Mapping[str, Any] | None = None,
+    materialize: bool = True,
 ) -> None:
     """The one writer of a node's operand list, recorded on the book.
 
     ``cause`` names the rewrite that changed the list: a registered
     ``Transform`` (its name is recorded) or, for callers not yet migrated,
     the legacy string.  Plan 70 section 3 has every append/move/retire/fork
-    posted through ``IdentityBook.post`` on page ``identity_transition``;
-    that page is not declared in ``concordance_declarations`` (only the
-    ``OPERAND_*`` transforms and the ``operand_position`` stage are), so the
-    revise writes below stay raw until it is -- see the step-3 report.
+    posted through ``IdentityBook.post`` on page ``identity_transition``
+    (declared by step 5; the Append post landed with step 9, plan 100 1.2):
+    a new position with no move source and no fork is
+    ``OperandAppend(cause, operand)`` DERIVED(operand node cell, consumer
+    node cell); a graph with no operand-position scope posts one
+    ``Unsourced(NO_OPERAND_POSITION_SCOPE)`` row per rewrite under
+    ``_UNSCOPED_OPERANDS``, which the audit lists.
+
+    Step 9 also makes this the writer of the other two copies of every
+    operand edge: ``children`` on the parents and the networkx edge
+    (``_materialize_operands``).  ``edge_payload`` is extra edge data for
+    a new edge (``build_from_ast``'s ``extra`` set); ``materialize=False``
+    is for the canonical relabel only, whose edges are already relabeled
+    by ``add_edges_from`` while this call moves the rows.
 
     Facts keyed by an operand position (the binding one operand read, see
     ``_OPERAND_POSITION_ROW_PAGES``) must name the same operand after any
@@ -2304,13 +2415,31 @@ def _set_operands(
     if node_id not in graph.G:
         return
     data = graph.G.nodes[node_id]
-    old = list(_operand_positions(data.get("parents") or ()))
+    old_parents = list(data.get("parents") or ())
+    old = list(_operand_positions(old_parents))
     parents = list(parents)
     data["parents"] = parents
+    if materialize:
+        _materialize_operands(graph, node_id, old_parents, parents, edge_payload)
     scope = _operand_position_scope(graph)
-    if scope is None:
-        return
     new = list(_operand_positions(parents))
+    cause_name = cause.name if isinstance(cause, _Transform) else str(cause)
+    if scope is None:
+        if new == old:
+            return
+        from ...compiler.concordance_declarations import (
+            IDENTITY_TRANSITION, NO_OPERAND_POSITION_SCOPE, OPERAND_POSITION,
+            OperandAppend,
+        )
+        current_identity_book().post(
+            IDENTITY_TRANSITION,
+            (_UNSCOPED_OPERANDS, node_id, "rewrite", 0),
+            OperandAppend(cause_name, tuple(parents)),
+            stage=OPERAND_POSITION,
+            provenance=_Unsourced(NO_OPERAND_POSITION_SCOPE),
+            mode=_Mode.REVISE,
+        )
+        return
     renamed = dict(same or {})
     taken: set[int] = set()
     moves: dict[tuple[Any, int], tuple[Any, int] | None] = {}
@@ -2341,21 +2470,26 @@ def _set_operands(
             for new_role, new_ordinal, _parent in new
         )
     }
-    if not forks and all(
+    # An Append: a new position no old position moved into and no fork
+    # feeds (plan 70 section 3; plan 100 1.2).
+    occupied = {target for target in moves.values() if target is not None}
+    appends = [
+        (role, ordinal, parent)
+        for role, ordinal, parent in new
+        if (role, ordinal) not in occupied and (role, ordinal) not in forks
+    ]
+    if not forks and not appends and all(
         source == target for source, target in moves.items()
     ):
         return
     from ...compiler.concordance_declarations import (
         IDENTITY_TRANSITION, LEXICAL_READ_BINDING, OPERAND_FORK, OPERAND_MOVE,
-        OPERAND_POSITION, OPERAND_RETIRE, OperandFork, OperandMove,
-        OperandRetire,
+        OPERAND_POSITION, OPERAND_RETIRE, OperandAppend, OperandFork,
+        OperandMove, OperandRetire,
     )
-    from ...compiler.identity_concordance import (
-        Derived as _Derived, Mode as _Mode, Novel as _Novel,
-        Unresolved as _Unresolved,
-    )
+    from ...compiler.identity_concordance import Novel as _Novel
 
-    cause = cause.name if isinstance(cause, _Transform) else str(cause)
+    cause = cause_name
     book = current_identity_book()
     transition_page = book.page(IDENTITY_TRANSITION)
     read_page = book.page(LEXICAL_READ_BINDING)
@@ -2403,6 +2537,27 @@ def _set_operands(
         transitions[(role, ordinal)] = post_transition(
             (scope, node_id, role, ordinal), OperandFork(cause, *source),
             OPERAND_FORK, position_cell(*source),
+        )
+    for role, ordinal, parent in appends:
+        if parent not in graph.G:
+            # An operand that is not a node has no cell (``_replace_inputs``
+            # stands an UNTRANSLATED node in for it before calling here).
+            continue
+        row = (scope, node_id, role, ordinal)
+        # A position that existed before (retired, then fed again) derives
+        # from its previous cell too: the history is one row, and the new
+        # source set is what admits the revision.
+        previous = book.latest_ref(IDENTITY_TRANSITION, row)
+        transitions[(role, ordinal)] = book.post(
+            IDENTITY_TRANSITION, row, OperandAppend(cause, parent),
+            stage=OPERAND_POSITION,
+            provenance=_Derived(tuple(
+                cell for cell in (
+                    node_identity_cell(graph, parent), consumer_cell, previous,
+                )
+                if cell is not None
+            )),
+            mode=_Mode.REVISE,
         )
     for name in _OPERAND_POSITION_ROW_PAGES:
         page = book.page(name)
@@ -2547,7 +2702,7 @@ def _append_operand(graph: Any, node_id: Any, parent: Any, role: str) -> None:
     parents = list(graph.G.nodes[node_id].get("parents") or ())
     if (parent, role) not in parents:
         _set_operands(
-            graph, node_id, [*parents, (parent, role)], cause="append_operand",
+            graph, node_id, [*parents, (parent, role)], cause=_APPEND_OPERAND,
         )
 
 
@@ -2571,7 +2726,17 @@ def _replace_inputs(
     honestly inexecutable.
     """
 
+    # Edges that are not operand positions (a static reference's ``callee``
+    # edge written beside the list) go with the old topology; the operand
+    # edges themselves are rewritten by ``_set_operands`` below.
+    operand_parents = {
+        parent for parent, _role in (
+            graph.G.nodes[node_id].get("parents") or ()
+        )
+    } if node_id in graph.G else set()
     for predecessor in tuple(graph.G.predecessors(node_id)):
+        if predecessor in operand_parents:
+            continue
         graph.G.remove_edge(predecessor, node_id)
         graph.G.nodes[predecessor]["children"] = [
             (child_id, role)
@@ -2602,13 +2767,8 @@ def _replace_inputs(
             )
         resolved.append((predecessor, role))
     _set_operands(
-        graph, node_id, resolved, cause="replace_inputs", fork_from=fork_from,
+        graph, node_id, resolved, cause=_REPLACE_INPUTS, fork_from=fork_from,
     )
-    for predecessor, role in resolved:
-        graph.G.add_edge(predecessor, node_id, role=role)
-        children = graph.G.nodes[predecessor].setdefault("children", [])
-        if node_id not in {child_id for child_id, _role in children}:
-            children.append((node_id, role))
 
 
 def _untranslated_operand(
@@ -2682,14 +2842,9 @@ def _remove_node(graph: Any, node_id: int) -> None:
 
     if node_id not in graph.G:
         return
-    for predecessor in tuple(graph.G.predecessors(node_id)):
-        graph.G.nodes[predecessor]["children"] = [
-            (child_id, role)
-            for child_id, role in graph.G.nodes[predecessor].get(
-                "children", ()
-            )
-            if child_id != node_id
-        ]
+    # The removed node's own positions retire through the one writer, which
+    # also clears its parents' ``children`` entries and edges.
+    _set_operands(graph, node_id, [], cause=_REMOVE_NODE)
     for successor in tuple(graph.G.successors(node_id)):
         _set_operands(graph, successor, [
             (parent_id, role)
@@ -2697,7 +2852,7 @@ def _remove_node(graph: Any, node_id: int) -> None:
                 "parents", ()
             )
             if parent_id != node_id
-        ], cause="remove_node")
+        ], cause=_REMOVE_NODE)
     graph.roots = [root for root in graph.roots if root != node_id]
     graph.G.remove_node(node_id)
 
@@ -2778,23 +2933,9 @@ def _redirect_value(
                 (producer_id if parent_id == old_id else parent_id, role)
             )
         _set_operands(
-            graph, successor, replacement, cause="redirect_value",
+            graph, successor, replacement, cause=_REDIRECT_VALUE,
             same={old_id: producer_id},
         )
-        graph.G.add_edge(producer_id, successor, role=graph.G.edges[
-            old_id,
-            successor,
-        ].get("role"))
-        children = graph.G.nodes[producer_id].setdefault("children", [])
-        for _parent_id, role in replacement:
-            if _parent_id == producer_id and (
-                successor,
-                role,
-            ) not in {
-                (child_id, child_role)
-                for child_id, child_role in children
-            }:
-                children.append((successor, role))
     graph.roots = [
         producer_id if root == old_id else root for root in graph.roots
     ]
@@ -3526,7 +3667,11 @@ def _normalize_lexical_values(
         parents: tuple[tuple[int, str], ...] = (),
         source: Any = None,
         source_cell: Any = None,
+        cause: Any = _REDUCER_SYNTHESIS,
     ) -> int:
+        # ``cause``: the Transform the caller names for this node's operand
+        # edges (plan 100, 1.2); ``REDUCER_SYNTHESIS`` for a caller that
+        # names none.
         # ``source_cell``: the cell of the authored construct this node
         # stands for when that construct must not become the node's
         # lexical ``source_span`` (an Input for an ``ast.arg``); it names
@@ -3566,7 +3711,7 @@ def _normalize_lexical_values(
             extra_args={},
             domain_node=None,
             store_id=None,
-            parents=list(parents),
+            parents=[],
             children=[],
             attributes=dict(attributes or {}),
             **({"source_span": node_source_span} if node_source_span else {}),
@@ -3575,13 +3720,6 @@ def _normalize_lexical_values(
             graph.G.nodes[node_id]["constant"] = (
                 attributes or {}
             ).get("value")
-        for parent_id, role in parents:
-            if parent_id not in graph.G:
-                continue
-            graph.G.add_edge(parent_id, node_id, role=role)
-            graph.G.nodes[parent_id].setdefault("children", []).append(
-                (node_id, role)
-            )
         # Every reducer-synthesized node is an ``ingestion_value`` row in
         # this reduction's ingestion scope (plan 60, section 3.1 (c)):
         # DERIVED from the span of the authored ``source`` it stands for,
@@ -3602,6 +3740,10 @@ def _normalize_lexical_values(
             ),
             mode=_Mode.CONCORD,
         )
+        # The operand edges after the node's row exists: each Append
+        # derives from the operand cell and this consumer cell (plan 100,
+        # 1.2); the one writer materializes ``children`` and the edges.
+        _set_operands(graph, node_id, list(parents), cause=cause)
         return node_id
 
     def parameter_argument(name: str) -> ast.arg | None:
@@ -5292,16 +5434,6 @@ def _normalize_lexical_values(
                         "class_ref"
                     ]
                 if str(graph.G.nodes[node_id].get("type")) == "Call":
-                    if not graph.G.has_edge(reference_node_id, node_id):
-                        graph.G.add_edge(
-                            reference_node_id,
-                            node_id,
-                            role="callee",
-                        )
-                        graph.G.nodes[reference_node_id].setdefault(
-                            "children",
-                            [],
-                        ).append((node_id, "callee"))
                     _append_operand(
                         graph, node_id, reference_node_id, "callee",
                     )
@@ -5346,13 +5478,6 @@ def _normalize_lexical_values(
                         ) is not None
                     ):
                         role = f"arg:{index}"
-                        if not graph.G.has_edge(resolved, node_id):
-                            graph.G.add_edge(resolved, node_id, role=role)
-                        children = graph.G.nodes[resolved].setdefault(
-                            "children", []
-                        )
-                        if (node_id, role) not in children:
-                            children.append((node_id, role))
                         _append_operand(graph, node_id, resolved, role)
                 for keyword in expression.keywords:
                     if keyword.arg is None:
@@ -5374,13 +5499,6 @@ def _normalize_lexical_values(
                         ) is not None
                     ):
                         role = f"kw:{keyword.arg}"
-                        if not graph.G.has_edge(resolved, node_id):
-                            graph.G.add_edge(resolved, node_id, role=role)
-                        children = graph.G.nodes[resolved].setdefault(
-                            "children", []
-                        )
-                        if (node_id, role) not in children:
-                            children.append((node_id, role))
                         _append_operand(graph, node_id, resolved, role)
                 if static_arguments:
                     attributes["static_call_arguments"] = static_arguments
@@ -5442,13 +5560,6 @@ def _normalize_lexical_values(
                         ) is not None
                     ):
                         continue
-                    if not graph.G.has_edge(resolved, node_id):
-                        graph.G.add_edge(resolved, node_id, role=role)
-                    children = graph.G.nodes[resolved].setdefault(
-                        "children", []
-                    )
-                    if (node_id, role) not in children:
-                        children.append((node_id, role))
                     _append_operand(graph, node_id, resolved, role)
 
             # Rebuild every call from the values resolved at this lexical
@@ -8293,6 +8404,59 @@ def _normalize_lexical_values(
                 (read_scope, mapping[row[1]], row[2], row[3]),
                 read_page.latest(row),
             )
+    # Step 9 (plan 100, 1.1): the operand-position rows follow their
+    # consumers into canonical ids, so the canonical graph's edges are the
+    # latest ``identity_transition`` facts under its own scope.  The build
+    # scope's rows (``ProcessGraph.connect``'s Appends) first, then this
+    # reduction's rewrites, which supersede them; each canonical row is
+    # DERIVED from the row it continues.  A fact naming an id that left the
+    # graph has no canonical spelling and stays where it is.
+    from ...compiler.concordance_declarations import (
+        IDENTITY_TRANSITION as _IDENTITY_TRANSITION_PAGE,
+        OperandAppend as _OperandAppend,
+        OperandFork as _OperandFork,
+        OperandMove as _OperandMove,
+        OperandTransition as _OperandTransition,
+    )
+    transition_page = book.page(_IDENTITY_TRANSITION_PAGE)
+    for transition_scope in dict.fromkeys(
+        tuple(scope) for scope in (build_scope, ingestion_read_scope)
+        if scope is not None
+    ):
+        for row in tuple(transition_page.scope_rows(transition_scope)):
+            if len(row) != 4 or row[1] not in mapping:
+                continue
+            fact = transition_page.latest(row)
+            if isinstance(fact, _OperandAppend):
+                if fact.operand not in mapping:
+                    continue
+                fact = _OperandAppend(fact.cause, mapping[fact.operand])
+            elif isinstance(fact, _OperandMove):
+                if fact.consumer not in mapping:
+                    continue
+                fact = _OperandMove(
+                    fact.cause, mapping[fact.consumer], fact.role, fact.ordinal,
+                )
+            elif isinstance(fact, _OperandFork):
+                if fact.source_consumer not in mapping:
+                    continue
+                fact = _OperandFork(
+                    fact.cause, mapping[fact.source_consumer],
+                    fact.source_role, fact.source_ordinal,
+                )
+            elif not isinstance(fact, _OperandTransition):
+                continue
+            canonical_row = (read_scope, mapping[row[1]], row[2], row[3])
+            if transition_page.latest(canonical_row) == fact:
+                continue
+            book.post(
+                _IDENTITY_TRANSITION_PAGE, canonical_row, fact,
+                stage=_CANONICAL_RELABEL_STAGE,
+                provenance=_Derived(
+                    (book.latest_ref(_IDENTITY_TRANSITION_PAGE, row),)
+                ),
+                mode=_Mode.REVISE,
+            )
     graph.G.graph["lexical_read_scope"] = read_scope
     graph.G.graph["operand_position_scope"] = read_scope
     # The return-site receipts (``return_slot_values``,
@@ -8468,7 +8632,11 @@ def _normalize_lexical_values(
             (mapping[parent_id], role)
             for parent_id, role in data.get("parents", ())
             if parent_id in mapping
-        ], cause="canonical_relabel", same=mapping)
+        ], cause=_CANONICAL_RELABEL_OPERANDS, same=mapping, materialize=False)
+        # The relabel renames the view: ``add_edges_from`` above already
+        # carried the edges into the canonical ids, and the ``children``
+        # list follows the same mapping here; ``_set_operands`` moves the
+        # rows only (``materialize=False``).
         data["children"] = [
             (mapping[child_id], role)
             for child_id, role in data.get("children", ())
@@ -11405,14 +11573,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 and slice_id in graph.G
                 and graph.G.out_degree(slice_id) == 0
             ):
-                for predecessor in tuple(graph.G.predecessors(slice_id)):
-                    graph.G.nodes[predecessor]["children"] = [
-                        (child_id, role)
-                        for child_id, role in graph.G.nodes[
-                            predecessor
-                        ].get("children", ())
-                        if child_id != slice_id
-                    ]
+                _set_operands(graph, slice_id, [], cause=_DISSOLVE_WRAPPER)
                 graph.G.remove_node(slice_id)
         elif (
             isinstance(expression, ast.Call)
@@ -11598,14 +11759,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     or graph.G.out_degree(keyword_id) != 0
                 ):
                     continue
-                for predecessor in tuple(graph.G.predecessors(keyword_id)):
-                    graph.G.nodes[predecessor]["children"] = [
-                        (child_id, role)
-                        for child_id, role in graph.G.nodes[
-                            predecessor
-                        ].get("children", ())
-                        if child_id != keyword_id
-                    ]
+                _set_operands(graph, keyword_id, [], cause=_DISSOLVE_WRAPPER)
                 graph.G.remove_node(keyword_id)
 
     for node_id, data in list(graph.G.nodes(data=True)):
@@ -11662,14 +11816,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         if isinstance(iterator, ast.Call) and id(iterator) in graph.G:
             iterator_id = id(iterator)
             if graph.G.out_degree(iterator_id) == 0:
-                for predecessor in tuple(graph.G.predecessors(iterator_id)):
-                    graph.G.nodes[predecessor]["children"] = [
-                        (child_id, role)
-                        for child_id, role in graph.G.nodes[
-                            predecessor
-                        ].get("children", ())
-                        if child_id != iterator_id
-                    ]
+                _set_operands(graph, iterator_id, [], cause=_DISSOLVE_WRAPPER)
                 graph.G.remove_node(iterator_id)
 
     for node_id, data in list(graph.G.nodes(data=True)):
@@ -11692,29 +11839,15 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     for predecessor in predecessors:
                         replacement_parents.append((predecessor, role))
             _set_operands(
-                graph, successor, replacement_parents, cause="dissolve_expr",
+                graph, successor, replacement_parents, cause=_DISSOLVE_EXPR,
                 same=(
                     {node_id: predecessors[0]} if len(predecessors) == 1
                     else None
                 ),
             )
-            for predecessor in predecessors:
-                graph.G.add_edge(predecessor, successor)
-                predecessor_children = graph.G.nodes[predecessor].setdefault(
-                    "children", []
-                )
-                if successor not in {
-                    child_id for child_id, _role in predecessor_children
-                }:
-                    predecessor_children.append((successor, "output"))
-        for predecessor in predecessors:
-            graph.G.nodes[predecessor]["children"] = [
-                (child_id, role)
-                for child_id, role in graph.G.nodes[predecessor].get(
-                    "children", ()
-                )
-                if child_id != node_id
-            ]
+        # The wrapper's own positions retire; its parents' ``children``
+        # entries and edges go with them.
+        _set_operands(graph, node_id, [], cause=_DISSOLVE_EXPR)
         # Roots holding the wrapper are replaced by every value it wrapped
         # (deduplicated, order preserved); a wrapper with no value is dropped.
         new_roots: list = []
@@ -11744,15 +11877,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     "parents", ()
                 )
                 if parent_id != node_id
-            ], cause="dissolve_return")
+            ], cause=_DISSOLVE_RETURN)
+        _set_operands(graph, node_id, [], cause=_DISSOLVE_RETURN)
         for returned in predecessors:
-            graph.G.nodes[returned]["children"] = [
-                (child_id, role)
-                for child_id, role in graph.G.nodes[returned].get(
-                    "children", ()
-                )
-                if child_id != node_id
-            ]
             if returned not in graph.roots:
                 graph.roots.append(returned)
         graph.roots = [root for root in graph.roots if root != node_id]
@@ -12184,7 +12311,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 member_data["op"] = "input"
                 member_data["label"] = expression.id
                 _set_operands(
-                    function_graph, member, [], cause="parameter_input",
+                    function_graph, member, [], cause=_PARAMETER_INPUT,
                 )
             if (
                 member_data.get("type") == "Input"
@@ -12212,7 +12339,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 (parent, role)
                 for parent, role in member_data.get("parents", ())
                 if parent in included
-            ], cause="function_subgraph")
+            ], cause=_FUNCTION_SUBGRAPH_FILTER)
+            # Entries naming nodes outside the subgraph: those consumers
+            # are not in ``function_graph``, so no ``_set_operands`` call
+            # of theirs can clear them.
             member_data["children"] = [
                 (child, role)
                 for child, role in member_data.get("children", ())

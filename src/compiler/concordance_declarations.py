@@ -1031,6 +1031,570 @@ SEQUENCE_ROW_DTYPE = declare_page("sequence_row_dtype_concordance", (
     RowField("scope", K.SCOPE), RowField("sequence", K.VALUE_ID),
 ), tuple)                              # (dtypes, source) at the next column
 
+# ----------------------------------------------------------------------------
+# Step 6: record materialization and return versions (plan 90, sections 1-2;
+# census 75, section 3 and the step-6 DRAFT of section 10).
+#
+# The identity of every SSA value the record passes mint (a per-field Phi, a
+# record-return Cast, a program-abi default, an optional presence or inactive
+# payload, a loop record header or projection) is a NOVEL row on step 5's
+# ``ssa_value`` page under the function's control scope
+# (``metadata["tensor_shape_concordance_scope"]``), with the transform below
+# and the cells it was made from as operands; plan 90's SSA_VALUE_IDENTITY is
+# that page, not a second one.  A mint made from several cells names one
+# ``cell_set`` row (step 5's page).  The pages below are the record passes'
+# own statements, re-declared with the row shapes their writers produce.
+# ----------------------------------------------------------------------------
+
+# -- stages ------------------------------------------------------------------
+#: ``materialize_program_abi_record_literals``.
+RECORD_LITERAL_MATERIALIZATION = declare_stage("record_literal_materialization")
+#: ``materialize_record_phis`` and ``materialize_loop_record_phis``.
+RECORD_PHI_EXPANSION_STAGE = declare_stage("record_phi_expansion")
+#: Every ``record_return_layouts`` writer.
+RECORD_RETURN_LAYOUT_STAGE = declare_stage("record_return_layout")
+#: ``_publish_concorded_output_identities``.
+OUTPUT_IDENTITY_STAGE = declare_stage("output_identity")
+#: ``materialize_parameter_record_abi`` (step 7 routes it).
+RECORD_ABI_MATERIALIZATION = declare_stage("record_abi_materialization")
+#: ``recover_structural_source_outputs``.
+STRUCTURAL_RECOVERY = declare_stage("structural_recovery")
+#: ``freshen_redefined_ssa_objects`` and the other
+#: ``ssa_record_return_state`` repairs.
+RECORD_RETURN_REPAIR = declare_stage("record_return_repair")
+
+# -- transforms (arity 1: several sources become one ``cell_set`` row) -------
+#: A per-field Phi of a record merge: operand = the ``cell_set`` of the record
+#: Phi's identity cell and each incoming record's ``record_member`` cell.
+RECORD_FIELD_PHI = declare_transform("record_field_phi", 1)
+#: A constructor field's default Const: operand = the field's
+#: ``class_field_declaration`` cell (else the function root).
+PROGRAM_ABI_DEFAULT = declare_transform("program_abi_default", 1)
+OPTIONAL_PRESENCE = declare_transform("optional_presence", 1)
+OPTIONAL_INACTIVE_PAYLOAD = declare_transform("optional_inactive_payload", 1)
+#: The conceptual record header Phi a loop acquires: operand = the
+#: ``cell_set`` of the initial and updated descriptors' cells.
+LOOP_RECORD_HEADER = declare_transform("loop_record_header", 1)
+#: The projection of a richer callee record onto the loop's schema: operand
+#: = the ``loop_record_schema_concordance`` cell that recorded the projection.
+LOOP_RECORD_PROJECTION = declare_transform("loop_record_projection", 1)
+#: ``freshen_redefined_ssa_objects``: operand = the redefined value's cell.
+FRESHEN = declare_transform("freshen", 1)
+
+# -- reasons -----------------------------------------------------------------
+PLANNER_OUTPUT_UNROUTED = declare_reason("planner_output_unrouted")
+#: A layout revision whose member ids have no identity cell yet, so the
+#: changed layout cannot name a changed source.
+LAYOUT_MEMBER_NOT_YET_DEFINED = declare_reason("layout_member_not_yet_defined")
+#: A numeral literal whose coefficient record arrives only when the
+#: function's calls are linked (the ``"deferred"`` row).
+LITERAL_FIELD_DEFERRED = declare_reason("literal_field_deferred")
+#: ``coalesce_record_field_storage`` took the first read as the resident.
+RESIDENT_CHOSEN_BY_ORDER = declare_reason("resident_chosen_by_order")
+
+# -- pages: new --------------------------------------------------------------
+#: The physical layout returned for a record, one row per (function scope,
+#: record id); REVISE, DERIVED(the record's ``record_descriptor`` cell, each
+#: layout id's ``ssa_value`` cell).  ``metadata["record_return_layouts"]``
+#: is written beside it until its readers move to this page.
+RECORD_RETURN_LAYOUT = declare_page("record_return_layout", (
+    RowField("function_scope", K.SCOPE), RowField("record", K.VALUE_ID),
+), tuple)
+#: One row per field Phi a record Phi expands into; the fact is the field
+#: Phi's ``ssa_value`` cell.  CONCORD, DERIVED(the same cells the mint named).
+RECORD_PHI_EXPANSION = declare_page("record_phi_expansion", (
+    RowField("function_scope", K.SCOPE), RowField("record_phi", K.VALUE_ID),
+    RowField("field", K.NAME), RowField("slot", K.INDEX),
+), Ref)
+
+# -- pages: re-declared with the shapes written today -------------------------
+#: (value ids, sequence id, record id, offset, storage kind); CONCORD.
+RECORD_FIELD_LAYOUT = declare_page("record_field_layout_concordance", (
+    RowField("symbol", K.SCOPE), RowField("result", K.VALUE_ID),
+    RowField("storage_identity", K.NAME),
+), tuple)
+#: (old physical layout, new layout, "record_loop_phi"); CONCORD.
+LOOP_RECORD_LAYOUT = declare_page("loop_record_layout_concordance", (
+    RowField("symbol", K.SCOPE), RowField("loop_node", K.VALUE_ID),
+    RowField("result", K.VALUE_ID),
+), tuple)
+#: (initial signature, updated signature, projected, discarded,
+#: "project_updated_to_initial"); CONCORD.
+LOOP_RECORD_SCHEMA = declare_page("loop_record_schema_concordance", (
+    RowField("symbol", K.SCOPE), RowField("loop_node", K.VALUE_ID),
+    RowField("result", K.VALUE_ID),
+), tuple)
+#: Three statements on one page: (symbol, record, field) -> field value id;
+#: (symbol, node, "deferred") -> True or Unresolved(LITERAL_FIELD_DEFERRED);
+#: (symbol, node, "completed") -> the field tuple.  The third element is a
+#: LABEL because it is a field name or a status; CONCORD.
+NUMERAL_RECORD_LITERAL = declare_page("numeral_record_literal_concordance", (
+    RowField("symbol", K.SCOPE), RowField("node_or_record", K.VALUE_ID),
+    RowField("field_or_status", K.LABEL),
+), object)
+RECORD_FIELD_DECOMPOSITION = declare_page("record_field_decomposition", (
+    RowField("owner", K.SCOPE), RowField("record", K.VALUE_ID),
+    RowField("storage_identity", K.NAME),
+), tuple)                              # CONCORD
+PROGRAM_ABI_KEYED_ROW_RECORD = declare_page("program_abi_keyed_row_record", (
+    RowField("owner", K.SCOPE), RowField("record", K.VALUE_ID),
+    RowField("storage_identity", K.NAME),
+), int)                                # CONCORD
+#: The resident among a field's reads: its id, or
+#: Unresolved(RESIDENT_CHOSEN_BY_ORDER) when the first read was taken.
+RECORD_FIELD_RESIDENT = declare_page("record_field_resident_concordance", (
+    RowField("symbol", K.SCOPE), RowField("parameter_root", K.VALUE_ID),
+    RowField("field", K.NAME),
+), object)                             # CONCORD
+RECORD_FIELD_STORAGE = declare_page("record_field_storage_concordance", (
+    RowField("caller", K.SCOPE), RowField("record", K.VALUE_ID),
+    RowField("storage_identity", K.NAME),
+), dict)                               # REVISE
+NUMERAL_LEAF_MATERIALIZATION = declare_page("numeral_leaf_materialization_concordance", (
+    RowField("symbol", K.SCOPE), RowField("parameter", K.NAME),
+    RowField("path", K.LABEL),
+), str)                                # CONCORD
+NUMERAL_RETURN_LEAVES = declare_page("numeral_return_leaves_concordance", (
+    RowField("symbol", K.SCOPE), RowField("argument", K.VALUE_ID),
+), tuple)                              # CONCORD
+#: ``_publish_concorded_output_identities``: alias value -> result value;
+#: REVISE, DERIVED(the alias's and the result's ``ssa_value`` cells).
+OUTPUT_IDENTITY = declare_page("output_identity_concordance", (
+    RowField("function", K.NAME), RowField("alias", K.VALUE_ID),
+), int)
+#: ``_concord_record_return_phi_inputs``: (candidate, chosen, reason);
+#: REVISE, DERIVED(the ``record_return_field_selection`` cell the choice
+#: was made by, the chosen value's ``ssa_value`` cell).
+RECORD_RETURN_PHI_INPUT = declare_page("record_return_phi_input_concordance", (
+    RowField("function", K.SCOPE), RowField("phi", K.VALUE_ID),
+    RowField("field", K.NAME), RowField("position", K.INDEX),
+    RowField("predecessor", K.NAME),
+), tuple)
+RECORD_PHI_TEMPORAL_FALLBACK = declare_page("record_phi_temporal_fallback_concordance", (
+    RowField("function", K.SCOPE), RowField("result", K.VALUE_ID),
+    RowField("block", K.NAME), RowField("use_index", K.INDEX),
+    RowField("position", K.INDEX),
+), tuple)                              # CONCORD
+
+# ----------------------------------------------------------------------------
+# Step 7: the frame linker (plan 90, section 3; census 10, sections 1.1-1.6
+# and 2; census 75, section 4 and the step-7 DRAFT of section 10).
+#
+# Every SSA value the linker mints (a leased result slot, a frame-tail slot,
+# a replacement slot, a cloned frame value, a constructor remap, a scaffold
+# constant, a structural fold intermediate, a declared row column, a nested
+# record part) is a NOVEL row on step 5's ``ssa_value`` page under the
+# function's control scope, with one of the transforms below and the cell it
+# was made from as operand (several cells become one ``cell_set`` row; none
+# names the function root, as step 5's ``fresh_value`` does).  The pages
+# below are the linker's own statements.  The argument storage the binding
+# walk mints from absence is RECORDED, never raised: the storage row is
+# NOVEL and the binding row is ``Unresolved(STORAGE_MINTED_FROM_ABSENCE)``.
+# ----------------------------------------------------------------------------
+
+# -- stages ------------------------------------------------------------------
+#: The binding walk of ``_class_surface_ssa_program`` (one linked call).
+FRAME_BINDING = declare_stage("frame_binding")
+#: The frame fixed point: leases, ledger proposals, replacement slots.
+FRAME_LINK = declare_stage("frame_link")
+#: ``_complete_propagated_frame_tails``.
+FRAME_TAIL_STAGE = declare_stage("frame_tail")
+#: The record-forwarding roots (``record_parameter_value`` / row handles).
+RECORD_FORWARDING = declare_stage("record_forwarding")
+#: Sequence residency decided while lowering sequence operations.
+PLANNING_RESIDENCY = declare_stage("planning_residency")
+#: The shell control handoff's planning aliases.
+SHELL_HANDOFF = declare_stage("shell_handoff")
+
+# -- transforms (arity 1) ----------------------------------------------------
+#: Caller storage leased for a callee value: operand = the callee value's
+#: ``ssa_value`` cell (its ``record_member`` cell joins through the binding).
+RESULT_STORAGE_LEASE = declare_transform("result_storage_lease", 1)
+#: A caller slot appended for a callee formal the call was short by.
+FRAME_TAIL_SLOT = declare_transform("frame_tail_slot", 1)
+#: A caller clone of linked frame storage (``clone_value`` on a lease).
+FRAME_STORAGE_CLONE = declare_transform("frame_storage_clone", 1)
+#: The slot an accepted ledger proposal replaces a shared slot with.
+REPLACEMENT_SLOT = declare_transform("replacement_slot", 1)
+#: ``remap[old_id]`` inside a constructor frame; pool ids and strides.
+CONSTRUCTOR_REMAP = declare_transform("constructor_remap", 1)
+#: Output index / address constants, derived lengths, literal values,
+#: projected element addresses, child pool columns.
+FRAME_SCAFFOLD = declare_transform("frame_scaffold", 1)
+#: A structural Boolean / membership / load intermediate.
+STRUCTURAL_FOLD = declare_transform("structural_fold", 1)
+#: One physical leaf of a nested program-abi record (operand = the declared
+#: field cell or the owning record's cell).
+NESTED_RECORD_PART = declare_transform("nested_record_part", 1)
+#: A pooled column of a declared keyed field's rows, and its row record.
+DECLARED_ROW_COLUMN = declare_transform("declared_row_column", 1)
+
+# -- reasons -----------------------------------------------------------------
+#: The binding walk's final ``else``: the callee formal matched no caller
+#: value, literal, default or linked member; storage was leased for it.
+STORAGE_MINTED_FROM_ABSENCE = declare_reason("storage_minted_from_absence")
+#: ``record_parameter_row_handle``: the abi record declares no ``identity``,
+#: so the schema NAME stands in for the row identity.
+ROW_IDENTITY_FROM_SCHEMA_NAME = declare_reason("row_identity_from_schema_name")
+#: A frame tail completed for a formal no ``argument_binding`` row binds.
+FORMAL_UNBOUND_AT_TAIL = declare_reason("formal_unbound_at_tail")
+#: ``_linked_caller_member`` found the callee formal a member of no record
+#: bound at this call.
+MEMBER_NOT_BOUND_AT_CALL = declare_reason("member_not_bound_at_call")
+#: An aggregate output whose position the projection table lacks.
+AGGREGATE_POSITION_MISSING = declare_reason("aggregate_position_missing")
+#: A planning alias built by matching an authored name (``singleton_name_aliases``).
+RESIDENCY_FROM_NAME_MATCH = declare_reason("residency_from_name_match")
+#: A linker statement whose source value has no ``ssa_value`` / ``canonical_value``
+#: cell on the book (a function another lowering built).
+FRAME_SOURCE_CELL_ABSENT = declare_reason("frame_source_cell_absent")
+
+# -- facts -------------------------------------------------------------------
+class ArgumentBindingFact(tuple):
+    """``(kind, source)`` of one callee formal at one callsite: ``kind`` is
+    the binding kind string the call record carries (``caller_value``,
+    ``caller_literal``, ``caller_storage``, ``default_literal``), ``source``
+    the caller value id or the literal.  A tuple, so every reader that reads
+    ``(kind, source)`` pairs off the page keeps reading."""
+
+    __slots__ = ()
+
+    def __new__(cls, kind: Any, source: Any) -> "ArgumentBindingFact":
+        return tuple.__new__(cls, (str(kind), source))
+
+    @property
+    def kind(self) -> str:
+        return self[0]
+
+    @property
+    def source(self) -> Any:
+        return self[1]
+
+
+@dataclass(frozen=True)
+class ResidencyFact:
+    """One sequence value's resident and kind, and the helper that decided."""
+
+    resident: int
+    kind: str
+    helper: str
+
+
+class CallBindingSource(Enum):
+    """How the binding walk learned a callee formal's caller value."""
+
+    IDENTITY_ALIAS = "identity_alias"
+    DEFAULT_LITERAL = "default_literal"
+    DISCOVERY = "discovery"
+
+
+# -- pages: new --------------------------------------------------------------
+#: Caller storage leased for one callee value at one call; the fact is the
+#: storage's ``ssa_value`` cell.  CONCORD, DERIVED(the callee value's cell).
+#: A ``distinct_slot`` lease is its own row, keyed by its serial.
+RESULT_STORAGE_BINDING = declare_page("result_storage_binding", (
+    RowField("caller", K.SCOPE), RowField("callsite", K.LABEL),
+    RowField("callee_value", K.VALUE_ID), RowField("serial", K.INDEX),
+), Ref)
+#: An input of the binding walk: the caller formal an identity alias names,
+#: a Python default, or a discovered linked member.  CONCORD, DERIVED.
+CALL_BINDING_INPUT = declare_page("call_binding_input", (
+    RowField("caller", K.SCOPE), RowField("callsite", K.LABEL),
+    RowField("callee_value", K.VALUE_ID), RowField("source", K.LABEL),
+), object)
+#: ``_linked_caller_member``'s decision: the caller value a callee formal is
+#: at one call, or ``Unresolved(MEMBER_NOT_BOUND_AT_CALL)``.  CONCORD.
+LINKED_CALLER_MEMBER = declare_page("linked_caller_member", (
+    RowField("caller", K.NAME), RowField("callsite", K.LABEL),
+    RowField("callee", K.NAME), RowField("formal", K.VALUE_ID),
+), int)
+#: Sequence residency per value: REVISE, DERIVED(the value's cell, the
+#: operation's cell).  Declared here; the 104 dict writes route to it as
+#: each helper is migrated.
+SEQUENCE_RESIDENCY = declare_page("sequence_residency", (
+    RowField("function", K.NAME), RowField("value", K.VALUE_ID),
+), ResidencyFact)
+
+# -- pages: re-declared (census 75, step 7) ----------------------------------
+#: The callsite moves from the column into the row: one row per binding.
+#: Fact ``ArgumentBindingFact`` or ``Unresolved(STORAGE_MINTED_FROM_ABSENCE)``.
+#: CONCORD; rows written raw before this step keep ``"binding"`` as their
+#: third element with the callsite as the column.
+ARGUMENT_BINDING = declare_page("argument_binding", (
+    RowField("callee", K.NAME), RowField("formal", K.VALUE_ID),
+    RowField("callsite", K.LABEL),
+), ArgumentBindingFact)
+ARGUMENT_BINDING_RESOLUTION = declare_page("argument_binding_resolution", (
+    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
+    RowField("source", K.VALUE_ID),
+), tuple)                              # REVISE (next column)
+#: (callsite, callee, formal); CONCORD, DERIVED(the slot's cell, the formal's cell).
+FRAME_LEASE = declare_page("frame_lease_link", (
+    RowField("caller", K.NAME), RowField("slot", K.VALUE_ID),
+), tuple)
+#: (slot, kind) or Unresolved(FORMAL_UNBOUND_AT_TAIL); CONCORD.
+FRAME_TAIL = declare_page("propagated_frame_tail_concordance", (
+    RowField("owner", K.NAME), RowField("callsite", K.LABEL),
+    RowField("callee", K.NAME), RowField("formal", K.VALUE_ID),
+), tuple)
+#: value -> resident under ``mint_scope(("record_storage_alias", symbol))``;
+#: REVISE, DERIVED(the ``record_field_resident_concordance`` cell).
+RECORD_STORAGE_ALIAS = declare_page("record_storage_alias", (
+    RowField("alias_scope", K.SCOPE), RowField("alias", K.VALUE_ID),
+), int)
+#: (symbol, parameter) for one (symbol, value id); CONCORD, DERIVED(the
+#: parameter's ``name_binding`` cells, the record's declaration cell).
+RECORD_PARAMETER_VALUE = declare_page("record_parameter_value", (
+    RowField("access_scope", K.SCOPE), RowField("symbol_value", K.LABEL),
+), tuple)
+#: ((symbol, parameter), path prefix, row identity) or
+#: Unresolved(ROW_IDENTITY_FROM_SCHEMA_NAME); CONCORD.
+RECORD_PARAMETER_ROW_HANDLE = declare_page("record_parameter_row_handle", (
+    RowField("access_scope", K.SCOPE), RowField("symbol_value", K.LABEL),
+), tuple)
+RECORD_FORWARDING_EDGE = declare_page("record_forwarding_edge", (
+    RowField("access_scope", K.SCOPE), RowField("edge_key", K.LABEL),
+), tuple)                              # REVISE
+RECORD_FORWARDING_UNRESOLVED_ACTUAL = declare_page("record_forwarding_unresolved_actual", (
+    RowField("access_scope", K.SCOPE), RowField("binding", K.LABEL),
+), tuple)                              # CONCORD
+#: caller child record for (caller, callsite, callee child record); CONCORD,
+#: DERIVED(the bound pair's binding cell, both fields' ``record_member`` cells).
+CALL_RECORD_PAIR = declare_page("call_record_pair_concordance", (
+    RowField("caller", K.NAME), RowField("callsite", K.LABEL),
+    RowField("callee_record", K.VALUE_ID),
+), int)
+PLANNING_VALUE = declare_page("planning_value_concordance", (
+    RowField("function", K.SCOPE), RowField("alias", K.VALUE_ID),
+), object)                             # int, None on retirement; REVISE
+PLANNING_ALIAS_TRANSITION = declare_page("planning_alias_transition_concordance", (
+    RowField("function", K.SCOPE), RowField("alias", K.VALUE_ID),
+), tuple)                              # REVISE
+ALIAS_APPLICATION = declare_page("alias_application_concordance", (
+    RowField("function", K.SCOPE), RowField("block", K.NAME),
+    RowField("instruction", K.INDEX), RowField("position", K.INDEX),
+), tuple)                              # CONCORD
+SCHEDULED_CALL_ARGUMENT = declare_page("scheduled_call_argument", (
+    RowField("scope", K.SCOPE), RowField("call_formal", K.LABEL),
+), object)                             # the resident SSAValue; REVISE
+CALL_LINK_ORDER = declare_page("call_link_order_concordance", (
+    RowField("artifact", K.SCOPE), RowField("symbol", K.NAME),
+), int)                                # CONCORD
+KERNEL_BY_VALUE_FORMAL = declare_page("kernel_by_value_formal_concordance", (
+    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
+), str)                                # CONCORD
+PHI_EDGE_PROJECTION_PLACEMENT = declare_page("phi_edge_projection_placement_concordance", (
+    RowField("function", K.SCOPE), RowField("phi", K.VALUE_ID),
+    RowField("position", K.INDEX), RowField("predecessor", K.NAME),
+    RowField("value_id", K.VALUE_ID),
+), tuple)                              # CONCORD
+PRUNED_CALLEE_FORMAL = declare_page("pruned_callee_formal_concordance", (
+    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
+), str)                                # CONCORD
+ENTRY_RECORD_HANDLE = declare_page("entry_record_handle_concordance", (
+    RowField("function", K.SCOPE), RowField("parameter", K.NAME),
+), str)                                # CONCORD
+MEMBER_FORMALS = declare_page("member_formals", (
+    RowField("function", K.SCOPE), RowField("value_id", K.VALUE_ID),
+    RowField("role", K.LABEL),
+), tuple)                              # column = aggregate index
+FORMAL_ACTUAL = declare_page("formal_actual_concordance", (
+    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
+    RowField("caller", K.NAME), RowField("block", K.NAME),
+    RowField("instruction", K.INDEX), RowField("position", K.INDEX),
+), int)                                # CONCORD
+#: ``TransformationLedger`` (routed by ``propose(..., sources=)``): the
+#: retained (rule, proof, target) per identity, REVISE; every proposal as an
+#: event dict, CONCORD; each rejection once, by its full key, CONCORD.
+TRANSFORMATION_DECISION = declare_page("transformation_decision", (
+    RowField("scope", K.SCOPE), RowField("identity", K.LABEL),
+), tuple)
+TRANSFORMATION_EVENT = declare_page("transformation_event", (
+    RowField("scope", K.SCOPE), RowField("serial", K.INDEX),
+), dict)
+TRANSFORMATION_REJECTION = declare_page("transformation_rejection", (
+    RowField("scope", K.SCOPE), RowField("identity", K.LABEL),
+    RowField("rule", K.NAME), RowField("proof", K.LABEL),
+    RowField("retained_rule", K.NAME), RowField("retained_proof", K.LABEL),
+), int)
+
+# ============================================================================
+# Step 9, part A: the graphs as views of the book (plan 100, sections 1-2)
+# -- owned by the step-9 lane
+# ============================================================================
+
+# -- stages ------------------------------------------------------------------
+#: A builder that makes a ControlProgram from the graph
+#: (``_ordinary_conditional_control_programs``, the loop composer's
+#: loop-block construction, ``precompile_to_ssa``'s control-function assembly).
+CONTROL_PROGRAM_BUILD = declare_stage("control_program_build")
+#: Every rewriter that returns a new ControlProgram tree for an old one
+#: (``control_source`` passes, ``_class_surface_ssa_program`` rewriters).
+CONTROL_PROGRAM_REWRITE = declare_stage("control_program_rewrite")
+
+# -- transforms: the causes ``_set_operands`` records (plan 70 section 3,
+# plan 100 section 1.2).  ``cause`` is recorded by name on the
+# ``OperandTransition`` fact; the Append post itself is DERIVED, so arity
+# here is documentary (one consumer per edge).
+INGEST_EDGE = declare_transform("ingest_edge", 1)
+REDUCER_SYNTHESIS = declare_transform("reducer_synthesis", 1)
+APPEND_OPERAND = declare_transform("append_operand", 1)
+REPLACE_INPUTS = declare_transform("replace_inputs", 1)
+REMOVE_NODE = declare_transform("remove_node", 1)
+REDIRECT_VALUE = declare_transform("redirect_value", 1)
+DISSOLVE_EXPR = declare_transform("dissolve_expr", 1)
+DISSOLVE_RETURN = declare_transform("dissolve_return", 1)
+DISSOLVE_WRAPPER = declare_transform("dissolve_wrapper", 1)
+PARAMETER_INPUT = declare_transform("parameter_input", 1)
+FUNCTION_SUBGRAPH_FILTER = declare_transform("function_subgraph_filter", 1)
+CANONICAL_RELABEL_OPERANDS = declare_transform("canonical_relabel_operands", 1)
+CLASS_TABLE_MEMBER = declare_transform("class_table_member", 1)
+PROJECTION_TO_LEAF = declare_transform("projection_to_leaf", 1)
+AGGREGATE_MEMBER = declare_transform("aggregate_member", 1)
+AGGREGATE_FORMAL_MEMBERS = declare_transform("aggregate_formal_members", 1)
+BOUND_RECEIVER = declare_transform("bound_receiver", 1)
+SCALAR_INTRINSIC_RECEIVER = declare_transform("scalar_intrinsic_receiver", 1)
+CALLSITE_FOLD_REMOVE_NODE = declare_transform("callsite_fold_remove_node", 1)
+CALLSITE_FOLD_REPLACE_ALIAS = declare_transform("callsite_fold_replace_alias", 1)
+CALLSITE_FOLD_LITERAL = declare_transform("callsite_fold_literal", 1)
+REGION_BOUNDARY_INPUT = declare_transform("region_boundary_input", 1)
+UNBROADCAST_CHAIN = declare_transform("unbroadcast_chain", 1)
+LOOP_BODY_CLONE = declare_transform("loop_body_clone", 1)
+LOOP_MATERIALIZER = declare_transform("loop_materializer", 1)
+LOOP_EDGE_REBUILD = declare_transform("loop_edge_rebuild", 1)
+LOOP_PARENT_REPLACEMENT = declare_transform("loop_parent_replacement", 1)
+LOOP_CONTINUATION_REWIRE_OPERANDS = declare_transform(
+    "loop_continuation_rewire_operands", 1,
+)
+#: A control block with no authored construct (the synthesized conditional
+#: of ``_class_surface_ssa_program``, a planner-made loop): plan 100, 2.2.
+SYNTHESIZED_CONTROL = declare_transform("synthesized_control", 1)
+
+# -- reasons -----------------------------------------------------------------
+#: A control block whose owner cell cannot be named (plan 100, 2.2).
+CONTROL_OWNER_UNKNOWN = declare_reason("control_owner_unknown")
+#: A region marker whose ``deployment_region`` cell is not on the book.
+REGION_CELL_UNROUTED = declare_reason("region_cell_unrouted")
+#: ``project_control_regions`` collapsed an empty construct: its placement
+#: is withdrawn by an edge, never erased.
+COLLAPSED_EMPTY_CONSTRUCT = declare_reason("collapsed_empty_construct")
+#: A block row whose fact changed between two rewriters with no source cell
+#: the api admits as the cause (same cells, none newer): recorded under the
+#: latch so the audit lists the rewriter.
+CONTROL_BLOCK_REVISION_UNCAUSED = declare_reason("control_block_revision_uncaused")
+#: ``post_control_program`` called for a graph with no ``lexical_read_scope``
+#: (step 6's FUNCTION_SCOPE row is not on the tree yet).
+CONTROL_FUNCTION_SCOPE_UNKNOWN = declare_reason("control_function_scope_unknown")
+
+
+# -- facts -------------------------------------------------------------------
+class ControlBlockKind(Enum):
+    """One member per control block class except ``SequenceBlock`` (a
+    container, flattened for placement ordinals)."""
+
+    STATEMENT = "statement"
+    CONDITIONAL = "conditional"
+    LOOP = "loop"
+    WHILE = "while"
+    LOOP_CONTROL = "loop_control"
+    STATE_MACHINE_TICK = "state_machine_tick"
+    PARALLEL_DEPLOYMENT = "parallel_deployment"
+    CALL = "call"
+    DISPATCH = "dispatch"
+    RESOURCE_SCOPE = "resource_scope"
+    EXTERNAL_REFERENCE_CALL = "external_reference_call"
+    VALIDATION = "validation"
+    SEQUENCE_MUTATION = "sequence_mutation"
+    SEQUENCE_QUERY = "sequence_query"
+    SCALAR_FIELD_WRITE = "scalar_field_write"
+    STREAM_PUBLISH = "stream_publish"
+
+
+class Arm(Enum):
+    """Which arm of its parent a placed block sits in (plan 100, 2.1)."""
+
+    ROOT_SEQUENCE = "root_sequence"
+    BODY = "body"
+    ORELSE = "orelse"
+    CONDITION = "condition"
+    CALLEE = "callee"
+    CLEANUP = "cleanup"
+    CASE = "case"
+    DEFAULT = "default"
+    LANE = "lane"
+    TERMINAL = "terminal"
+
+
+#: ``Placement.parent`` for a block placed directly under the program root.
+ROOT = "root"
+
+
+@dataclass(frozen=True)
+class ControlBlockFact:
+    """A control block's identity-bearing fields as CELLS, never the tree.
+
+    ``predicate``: the predicate value's node cell; ``carried``: the
+    carried-alias cells (``control_carried_field`` cells when the block
+    carries them, else the carried values' node cells); ``sites``: the
+    break / continue / return site cells; ``regions``: the
+    ``deployment_region`` cells a marker names (empty for a block whose
+    region membership is placement, not identity); ``callsite``: the call's
+    ``call_binding`` cell; ``extra``: the non-identity payload (``expect_true``,
+    ``comparison``, ``schedule_preference``, ``dtype``, ``induction``, ...).
+    """
+
+    kind: ControlBlockKind
+    predicate: Any
+    carried: tuple
+    sites: tuple
+    regions: tuple
+    callsite: Any
+    extra: tuple
+
+
+@dataclass(frozen=True)
+class Placement:
+    """Where a block sits: its parent block's cell (or ``ROOT``), the arm
+    of that parent, and its ordinal among the arm's siblings after
+    ``SequenceBlock`` flattening.  ``case`` / ``lane`` index the arm when
+    the parent has several of that kind."""
+
+    parent: Any
+    arm: Arm
+    ordinal: int
+    index: int = 0
+
+
+@dataclass(frozen=True)
+class ControlProgramFact:
+    """The program-level structure: region cells (or ordinals when no
+    ``deployment_region`` row exists), uniform ids, value aliases, the
+    anchor region and the specialized conditionals, as cells where the
+    book has them."""
+
+    regions: tuple
+    uniforms: tuple
+    value_aliases: tuple
+    anchor_region: Any
+    specialized_conditionals: tuple
+    root_blocks: tuple
+
+
+#: ``CONTROL_PROGRAM.program`` for the shell's one program.
+SHELL = "shell"
+
+# -- pages -------------------------------------------------------------------
+CONTROL_BLOCK = declare_page("control_block", (
+    RowField("function_scope", K.SCOPE), RowField("kind", K.LABEL),
+    RowField("owner", K.PAGE_REF),
+), ControlBlockFact)                   # CONCORD; a changed fact is a REVISE with its cause
+CONTROL_BLOCK_PLACEMENT = declare_page("control_block_placement", (
+    RowField("function_scope", K.SCOPE), RowField("block", K.PAGE_REF),
+), Placement)                          # Placement | Unresolved; REVISE
+CONTROL_PROGRAM = declare_page("control_program", (
+    RowField("function_scope", K.SCOPE), RowField("program", K.LABEL),
+), ControlProgramFact)                 # REVISE
+
 __all__ = [name for name in dir() if not name.startswith("_") and name not in {
     "ast", "dataclass", "Enum", "Any", "Ref", "RowField", "K", "Unresolved",
     "declare_page", "declare_reason", "declare_stage", "declare_transform",

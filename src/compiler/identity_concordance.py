@@ -2188,9 +2188,15 @@ class CorrelationTable:
         if page is None:
             return []
         found: list[Finding] = []
+        # Step 7 keys one row per (callee, formal, callsite); rows written
+        # before it key (callee, formal, "binding") with the callsite as the
+        # column.  Both are read per (callee, formal).
+        formals: dict[tuple, dict[Any, dict[str, list]]] = {}
         for row in page.rows():
-            kinds_by_source: dict[Any, dict[str, list[int]]] = {}
-            for column, fact in page.history(row):
+            if not (isinstance(row, tuple) and len(row) >= 2):
+                continue
+            kinds_by_source = formals.setdefault((row[0], row[1]), {})
+            for callsite, fact in argument_binding_history(page, row[0], row[1], rows=(row,)):
                 if not (isinstance(fact, tuple) and len(fact) == 2):
                     continue
                 kind, source = fact
@@ -2198,14 +2204,11 @@ class CorrelationTable:
                     continue
                 kinds_by_source.setdefault(int(source), {}).setdefault(
                     str(kind), []
-                ).append(int(column))
+                ).append(callsite)
+        for (function_name, value_id), kinds_by_source in formals.items():
             for source, by_kind in sorted(kinds_by_source.items()):
                 if len(by_kind) < 2:
                     continue
-                function_name, value_id = (
-                    (row[0], row[1]) if isinstance(row, tuple) and len(row) >= 2
-                    else (str(row), -1)
-                )
                 resolution = book.page(
                     "argument_binding_resolution"
                 ).latest((str(function_name), int(value_id), int(source)))
@@ -2224,7 +2227,7 @@ class CorrelationTable:
                     int(value_id),
                     f"caller id {id_label(int(source))} is bound as "
                     + "; ".join(
-                        f"{kind!r} at callsite(s) {sorted(columns)}"
+                        f"{kind!r} at callsite(s) {sorted(columns, key=repr)}"
                         for kind, columns in sorted(by_kind.items())
                     )
                     + " -- one slot, and only some of those kinds can "
@@ -4924,6 +4927,37 @@ def concord_program_abi_frame_transitions(module: Any) -> tuple[dict, ...]:
     return tuple(receipts)
 
 
+def argument_binding_history(
+    page: Any, callee_symbol: Any, formal_id: int, *, rows: Any = None,
+) -> tuple[tuple[Any, Any], ...]:
+    """Every ``(callsite, fact)`` recorded for one callee formal on the
+    ``argument_binding`` page, in page order.
+
+    Step 7 keys one row per ``(callee, formal, callsite)``; rows written
+    before it key ``(callee, formal, "binding")`` with the callsite as the
+    column.  ``rows`` restricts the read to those rows (a caller iterating
+    the page); by default the formal's rows are read from the page's scope
+    index.  An ``Unresolved`` fact is returned as such.
+    """
+
+    callee_symbol = str(callee_symbol)
+    formal_id = int(formal_id)
+    if rows is None:
+        rows = tuple(
+            row for row in page.scope_rows(callee_symbol)
+            if len(row) == 3 and row[1] == formal_id
+        )
+    history: list[tuple[Any, Any]] = []
+    for row in rows:
+        if not (isinstance(row, tuple) and len(row) == 3):
+            continue
+        if str(row[0]) != callee_symbol or int(row[1]) != formal_id:
+            continue
+        for column, fact in page.history(row):
+            history.append((column if row[2] == "binding" else row[2], fact))
+    return tuple(history)
+
+
 def materializing_binding_kind(
     book: Any, callee_symbol: Any, formal_id: int, source_id: int, kind: Any,
 ) -> str:
@@ -4944,8 +4978,9 @@ def materializing_binding_kind(
     """
 
     page = book.page("argument_binding")
-    row = (str(callee_symbol), int(formal_id), "binding")
-    for _column, fact in page.history(row):
+    for _callsite, fact in argument_binding_history(
+        page, str(callee_symbol), int(formal_id),
+    ):
         if not (isinstance(fact, tuple) and len(fact) == 2):
             continue
         recorded_kind, recorded_source = fact

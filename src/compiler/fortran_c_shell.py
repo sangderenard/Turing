@@ -164,9 +164,13 @@ def _publish_concorded_output_identities(
     output-identity authority.
     """
 
-    from .identity_concordance import current_identity_book
+    from .concordance_declarations import OUTPUT_IDENTITY, OUTPUT_IDENTITY_STAGE
+    from .identity_concordance import Mode, current_identity_book
+    from .precompile_to_ssa import _post_derived_or_raw
+    from .ssa_record_return_state import identity_cells
 
-    page = current_identity_book().page("output_identity_concordance")
+    book = current_identity_book()
+    page = book.page(OUTPUT_IDENTITY)
     committed = dict(function.metadata.get("output_identity_aliases", ()) or ())
     for alias_id, result_id in bindings.items():
         alias_id, result_id = int(alias_id), int(result_id)
@@ -185,7 +189,14 @@ def _publish_concorded_output_identities(
                 f"{durable}, new result says {result_id}"
             )
         if incumbent is None:
-            page.bind_alias(str(function.name), alias_id, result_id)
+            # The output history row derives from the two values it relates:
+            # the alias's and the result's identity cells (raw, as before,
+            # when neither value has a row).
+            _post_derived_or_raw(
+                book, OUTPUT_IDENTITY, (str(function.name), alias_id), result_id,
+                identity_cells(function, alias_id, result_id),
+                stage=OUTPUT_IDENTITY_STAGE, mode=Mode.REVISE,
+            )
         committed[alias_id] = result_id
     function.metadata["output_identity_aliases"] = tuple(sorted(
         committed.items()
@@ -195,7 +206,7 @@ def _publish_concorded_output_identities(
 
 def _concord_record_return_phi_inputs(
     function_name: str, instruction: Any, candidates: Sequence[Any],
-    *, selection_cells: Sequence[Any] = (),
+    *, selection_cells: Sequence[Any] = (), function: Any = None,
 ) -> list[Any]:
     """Keep a return-field Phi's predecessor identities distinct from itself.
 
@@ -211,9 +222,19 @@ def _concord_record_return_phi_inputs(
     changed choice whose selection cell is stamped after the row's prior
     entry is a revision with a cause and is recorded with that cell as its
     source; a change with no changed source is still a disagreement.
+
+    ``function`` (the SSA function the Phi belongs to) lets each row post
+    DERIVED(the selection cell, the chosen value's ``ssa_value`` cell); a
+    call without it, or a row with neither cell, writes raw as before.
     """
 
-    from .identity_concordance import Ref, current_identity_book
+    from .concordance_declarations import (
+        RECORD_RETURN_PHI_INPUT, RECORD_RETURN_VERSION,
+    )
+    from .identity_concordance import (
+        ConcordanceRefusal, Derived, Mode, Ref, current_identity_book,
+    )
+    from .ssa_record_return_state import identity_cells
 
     result = instruction.res
     if result is None:
@@ -222,7 +243,7 @@ def _concord_record_return_phi_inputs(
     if len(incumbents) != len(candidates):
         return list(candidates)
     book = current_identity_book()
-    page = book.page("record_return_phi_input_concordance")
+    page = book.page(RECORD_RETURN_PHI_INPUT)
     selection_cells = tuple(selection_cells) + (None,) * (
         len(candidates) - len(tuple(selection_cells))
     )
@@ -271,9 +292,31 @@ def _concord_record_return_phi_inputs(
                     "record return Phi input concordance disagreement: "
                     f"row={row!r}, prior={prior!r}, new={fact!r}"
                 )
-        page.set(
-            row, max(page.columns, default=-1) + 1, fact,
+        if prior == fact:
+            # The same decision again: nothing to revise.
+            selected.append(chosen)
+            continue
+        cells = () if function is None else identity_cells(
+            function, selection, chosen,
         )
+        posted = False
+        if cells:
+            try:
+                book.post(
+                    RECORD_RETURN_PHI_INPUT, row, fact,
+                    stage=RECORD_RETURN_VERSION, provenance=Derived(cells),
+                    mode=Mode.REVISE,
+                )
+                posted = True
+            except ConcordanceRefusal:
+                # The candidate or reason changed with no changed source
+                # (the choice itself did not, or the check above raised):
+                # recorded raw, so the audit lists it.
+                posted = False
+        if not posted:
+            page.set(
+                row, max(page.columns, default=-1) + 1, fact,
+            )
         selected.append(chosen)
     return selected
 
@@ -412,12 +455,15 @@ def _apply_concorded_function_aliases(
 
 def _publish_concordant_function_aliases(
     function: Any, bindings: Mapping[int, int], *, provenance: str,
+    sources: Mapping[int, tuple] | None = None,
 ) -> dict[int, int]:
     """Advance the live page and durable alias snapshot together.
 
     ``bindings`` are later, explicitly sourced evidence. When such evidence
     refines an existing provisional resident, record the transition before
     advancing it; callers may not silently overwrite a planning row.
+    ``sources`` names, per alias id, the book cells the binding derives
+    from (step 7); ``provenance`` stays the role string of the shape half.
     """
 
     from .identity_concordance import (
@@ -429,11 +475,28 @@ def _publish_concordant_function_aliases(
         resolved_concordant_alias_bindings,
     )
 
+    from .concordance_declarations import (
+        PLANNING_ALIAS_TRANSITION, PLANNING_RESIDENCY, PLANNING_VALUE,
+    )
+    from .identity_concordance import Mode
+
     aliases = _concordant_function_aliases(function)
     page = current_identity_book().page("planning_value_concordance")
     transition_page = current_identity_book().page(
         "planning_alias_transition_concordance"
     )
+    # Step 7: ``sources`` maps an alias id to the cells its binding derives
+    # from; an alias with none is posted Unsourced (the caller named no
+    # cell), never dropped and never a bare write.
+    sources = {} if sources is None else dict(sources)
+
+    def alias_cells(alias_id: int, resident_id: int) -> tuple:
+        return _frame_cells(
+            *sources.get(int(alias_id), ()),
+            _frame_value_cell(function, alias_id),
+            _frame_value_cell(function, resident_id),
+        )
+
     advanced = dict(aliases)
     for alias_id, resident_id in bindings.items():
         alias_id, resident_id = int(alias_id), int(resident_id)
@@ -451,10 +514,10 @@ def _publish_concordant_function_aliases(
                         f"{function.name!r} value {alias_id}: prior={prior!r}, "
                         f"new={fact!r}"
                     )
-            transition_page.set(
-                row,
-                max(transition_page.columns, default=-1) + 1,
-                fact,
+            _frame_post(
+                PLANNING_ALIAS_TRANSITION, row, fact,
+                stage=PLANNING_RESIDENCY, mode=Mode.REVISE,
+                cells=alias_cells(alias_id, resident_id),
             )
         advanced[alias_id] = resident_id
 
@@ -469,7 +532,11 @@ def _publish_concordant_function_aliases(
         alias_id = int(alias_id)
         resident_id = int(resident_id)
         if page.latest((str(function.name), alias_id)) != resident_id:
-            page.bind_alias(str(function.name), alias_id, resident_id)
+            _frame_post(
+                PLANNING_VALUE, (str(function.name), alias_id), resident_id,
+                stage=PLANNING_RESIDENCY, mode=Mode.REVISE,
+                cells=alias_cells(alias_id, resident_id),
+            )
         authored_scope = authored_function_name(function.name)
         source_state = concordant_shape_transformation_state(
             authored_scope, alias_id,
@@ -2531,6 +2598,257 @@ def _sequence_member_by_role(descriptor: Any, role: tuple) -> int | None:
     return None if member is None else int(member)
 
 
+# --------------------------------------------------------------------------
+# The frame linker's book access (concordance step 7, plan 90 section 3).
+#
+# One identity per value, one key to it: an SSA value's identity row is step
+# 5's ``ssa_value`` page under the function's control scope.  Every value the
+# linker mints is a NOVEL row there, with the transform that made it and the
+# cell it was made from; every statement the linker writes derives from the
+# cells it read, or says why it could not.
+# --------------------------------------------------------------------------
+
+
+def _frame_book_scope(function: Any) -> str:
+    """The ``ssa_value`` row scope of ``function``: its control scope, else
+    its name (the same key step 5's builder and region lowering use)."""
+
+    metadata = getattr(function, "metadata", None) or {}
+    return str(
+        metadata.get("tensor_shape_concordance_scope")
+        or getattr(function, "name", function)
+    )
+
+
+def _frame_cells(*items: Any) -> tuple[Any, ...]:
+    """The distinct Refs among ``items`` (None and non-Refs dropped)."""
+
+    from .identity_concordance import Ref
+
+    found: list = []
+    for item in items:
+        if isinstance(item, Ref) and item not in found:
+            found.append(item)
+    return tuple(found)
+
+
+def _frame_value_cell(function: Any, value_id: Any) -> Any:
+    """The ``ssa_value`` cell of ``value_id`` in ``function``, or None."""
+
+    from .concordance_declarations import SSA_VALUE
+    from .identity_concordance import current_identity_book
+
+    if function is None or value_id is None:
+        return None
+    return current_identity_book().latest_ref(
+        SSA_VALUE, (_frame_book_scope(function), int(value_id)),
+    )
+
+
+def _frame_graph_cell(graph: Any, value_id: Any) -> Any:
+    """The ``canonical_value`` cell of graph id ``value_id`` in the source
+    graph ``graph`` (its ``lexical_read_scope``), or None."""
+
+    from .concordance_declarations import CANONICAL_VALUE
+    from .identity_concordance import current_identity_book
+
+    if graph is None or value_id is None:
+        return None
+    read_scope = (getattr(graph, "graph", None) or {}).get("lexical_read_scope")
+    if read_scope is None:
+        return None
+    return current_identity_book().latest_ref(
+        CANONICAL_VALUE, (tuple(read_scope), int(value_id)),
+    )
+
+
+def _frame_table_cell(table: Any, value_id: Any, page: Any) -> Any:
+    """The ``record_member`` / ``sequence_member`` / descriptor cell of
+    ``value_id`` on a book-backed SSA table, or None."""
+
+    from .identity_concordance import current_identity_book
+
+    owner = getattr(table, "owner", None)
+    if table is None or owner is None or value_id is None:
+        return None
+    return current_identity_book().latest_ref(page, (owner, int(value_id)))
+
+
+def _frame_post(
+    page: Any, row: tuple, fact: Any, *, stage: Any, cells: Any = (),
+    mode: Any = None, reason: Any = None,
+) -> Any:
+    """Post ``fact`` DERIVED from ``cells``; ``Unsourced(reason)`` when no
+    cell could be named (default reason ``FRAME_SOURCE_CELL_ABSENT``).
+
+    CONCORD (the default) keeps ``concord``'s rule: a different fact for a
+    recorded row raises.  REVISE with an unchanged fact posts nothing (the
+    previous cell is returned); a revision the api refuses for want of a
+    changed source is recorded ``Unsourced`` rather than dropped.
+    """
+
+    from .concordance_declarations import FRAME_SOURCE_CELL_ABSENT
+    from .identity_concordance import (
+        ConcordanceRefusal, Derived, Mode, Unsourced, current_identity_book,
+    )
+
+    book = current_identity_book()
+    mode = Mode.CONCORD if mode is None else mode
+    reason = FRAME_SOURCE_CELL_ABSENT if reason is None else reason
+    cells = _frame_cells(*cells)
+    if mode is Mode.REVISE:
+        previous = book.latest_ref(page, row)
+        if previous is not None:
+            recorded = book.pages[page.name].latest(row)
+            try:
+                unchanged = bool(recorded == fact)
+            except Exception:  # an array-valued literal compares elementwise
+                unchanged = recorded is fact
+            if unchanged:
+                return previous
+    if cells:
+        try:
+            return book.post(
+                page, row, fact, stage=stage, provenance=Derived(cells),
+                mode=mode,
+            )
+        except ConcordanceRefusal:
+            if mode is not Mode.REVISE:
+                raise
+    return book.post(
+        page, row, fact, stage=stage, provenance=Unsourced(reason), mode=mode,
+    )
+
+
+def _frame_mint(
+    function: Any, transform: Any, operands: Any = (), *,
+    dtype: Any = None, shape: Any = (), stage: Any,
+) -> int:
+    """Mint one SSA id for ``function`` through the book: a NOVEL
+    ``ssa_value`` row under its scope with ``transform`` and the one cell in
+    ``operands`` (several become a ``cell_set`` row; none names the
+    function root, exactly as ``_ControlSSABuilder.fresh_value`` does)."""
+
+    from .identity_concordance import current_identity_book
+    from .precompile_to_ssa import _function_root_cell, _mint_ssa_id
+
+    book = current_identity_book()
+    scope = _frame_book_scope(function)
+    cells = _frame_cells(*operands) or (_function_root_cell(book, scope),)
+    return _mint_ssa_id(
+        book, scope, transform, cells,
+        dtype=dtype, shape=tuple(shape or ()), stage=stage,
+    )
+
+
+class _RecordAbiMinter:
+    """The id source of one record-abi materialization, routed through
+    the book.
+
+    ``materialize_parameter_record_abi`` mints the physical parts of a
+    declared record (columns, lengths, capacities, strides, pointers,
+    status and presence cells, pooled scalars, token constants) at some
+    thirty-five sites, every one of them ``GLOBAL_MONOTONIC_IDS.mint()``.
+    Bound to that name inside the function, this object makes each of them
+    a NOVEL ``ssa_value`` row under the function's scope with the
+    transform NESTED_RECORD_PART and, as operand, the declaration cell the
+    materialization is currently expanding (``declare``), else the function
+    root -- the same rule ``_ControlSSABuilder.fresh_value`` applies to a
+    mint with no more specific cell.  Nothing else in the file sees it.
+    """
+
+    def __init__(self, function: Any, transform: Any, stage: Any) -> None:
+        self.function = function
+        self.transform = transform
+        self.stage = stage
+        self.declaration: Any = None
+
+    def declare(self, cell: Any) -> None:
+        """Name the declaration cell the next mints are parts of."""
+
+        self.declaration = cell
+
+    def mint(self, *operands: Any, dtype: Any = None, shape: Any = ()) -> int:
+        return _frame_mint(
+            self.function, self.transform,
+            (*operands, self.declaration),
+            dtype=dtype, shape=shape, stage=self.stage,
+        )
+
+
+def _result_storage_lease_cell(
+    caller_symbol: Any, callsite_id: Any, callee_value_id: Any,
+) -> Any:
+    """The latest ``result_storage_binding`` cell for one callee value at
+    one call, or None.  Its fact is the leased storage's ``ssa_value``
+    cell; the storage id is that cell's ``row[1]``."""
+
+    from .concordance_declarations import RESULT_STORAGE_BINDING
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    page = book.pages.get(RESULT_STORAGE_BINDING.name)
+    if page is None:
+        return None
+    found = None
+    for row in page.scope_rows(str(caller_symbol)):
+        if (
+            len(row) == 4
+            and row[1] == callsite_id
+            and int(row[2]) == int(callee_value_id)
+        ):
+            found = row
+    return None if found is None else book.latest_ref(RESULT_STORAGE_BINDING, found)
+
+
+def _post_result_storage_lease(
+    caller_function: Any, caller_symbol: Any, callsite_id: Any,
+    callee_value_id: int, storage_id: int, cells: Any, *, stage: Any,
+) -> Any:
+    """Record one leased result slot: row ``(caller, callsite, callee value,
+    serial)`` whose fact is the storage's ``ssa_value`` cell, DERIVED from
+    the callee value's cells.  A ``distinct_slot`` lease for the same callee
+    value is the next serial, never a disagreement (plan 90 R7.3)."""
+
+    from .concordance_declarations import RESULT_STORAGE_BINDING
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    page = book.page(RESULT_STORAGE_BINDING)
+    serial = sum(
+        1 for row in page.scope_rows(str(caller_symbol))
+        if len(row) == 4
+        and row[1] == callsite_id
+        and int(row[2]) == int(callee_value_id)
+    )
+    storage_cell = _frame_value_cell(caller_function, storage_id)
+    return _frame_post(
+        RESULT_STORAGE_BINDING,
+        (str(caller_symbol), callsite_id, int(callee_value_id), int(serial)),
+        storage_cell, stage=stage, cells=cells,
+    )
+
+
+def _argument_binding_fact(book: Any, callee_symbol: Any, formal_id: Any, callsite_id: Any) -> Any:
+    """The ``argument_binding`` fact for one callee formal at one callsite:
+    the step-7 row ``(callee, formal, callsite)`` first, else the pre-step-7
+    row ``(callee, formal, "binding")`` at column ``callsite``.  None when
+    neither exists; an ``Unresolved`` is returned as such."""
+
+    from .concordance_declarations import ARGUMENT_BINDING
+
+    page = book.pages.get(ARGUMENT_BINDING.name)
+    if page is None or callsite_id is None:
+        return None
+    row = (str(callee_symbol), int(formal_id), callsite_id)
+    fact = page.latest(row)
+    if fact is not None:
+        return fact
+    return page.cells.get(
+        ((str(callee_symbol), int(formal_id), "binding"), int(callsite_id)),
+    )
+
+
 def _linked_caller_member(
     caller_symbol: str,
     record: Any,
@@ -2558,7 +2876,12 @@ def _linked_caller_member(
     field, raise: the links disagree and nothing may choose between them.
     """
 
-    from .identity_concordance import current_identity_book
+    from .concordance_declarations import (
+        CALL_RECORD_PAIR, FRAME_LINK, LINKED_CALLER_MEMBER,
+        MEMBER_NOT_BOUND_AT_CALL, RECORD_DESCRIPTOR, RECORD_FIELD_DECOMPOSITION,
+        RECORD_MEMBER, SEQUENCE_MEMBER,
+    )
+    from .identity_concordance import Mode, Unresolved, current_identity_book
     from ..transmogrifier.ssa import SSARecordFieldStorage
 
     callee_id = int(callee_id)
@@ -2567,9 +2890,43 @@ def _linked_caller_member(
         int(callee_value): int(caller_value)
         for caller_value, callee_value in record.argument_bindings
     }
-    pair_page = current_identity_book().page("call_record_pair_concordance")
+    book = current_identity_book()
+    pair_page = book.page("call_record_pair_concordance")
     resolved: set[int] = set()
     sequence_members: set[int] = set()
+    # The cells this decision reads, so the ``linked_caller_member`` row
+    # derives from them: the callee formal's membership cells first.
+    source_cells: list = list(_frame_cells(
+        _frame_table_cell(callee_records, callee_id, RECORD_MEMBER),
+        _frame_table_cell(callee_sequences, callee_id, SEQUENCE_MEMBER),
+    ))
+
+    def record_decision(member: int | None) -> int | None:
+        """Write the decision as the book's row for (caller, callsite,
+        callee, formal): the caller value, or Unresolved(MEMBER_NOT_BOUND_AT_CALL)
+        when the formal is a member of no record bound at this call.  REVISE:
+        a later round may bind a record this round could not."""
+
+        if member is not None:
+            source_cells.extend(_frame_cells(
+                _frame_table_cell(caller_records, member, RECORD_MEMBER),
+                _frame_table_cell(caller_sequences, member, SEQUENCE_MEMBER),
+            ))
+        cells = _frame_cells(*source_cells)
+        _frame_post(
+            LINKED_CALLER_MEMBER,
+            (
+                str(caller_symbol), record.callsite_id,
+                str(record.callee_symbol), callee_id,
+            ),
+            (
+                int(member) if member is not None
+                else Unresolved(MEMBER_NOT_BOUND_AT_CALL, read=cells)
+            ),
+            stage=FRAME_LINK, cells=cells, mode=Mode.REVISE,
+            reason=MEMBER_NOT_BOUND_AT_CALL,
+        )
+        return member
     # The callee formal's memberships, read from the book: ``record_member``
     # names the record fields whose values it is, ``sequence_member`` the
     # sequence descriptors it belongs to, whose handles ``record_member``
@@ -2625,9 +2982,14 @@ def _linked_caller_member(
             )
         caller_record_id = bound.get(record_id)
         if caller_record_id is None:
-            caller_record_id = pair_page.latest((
+            pair_row = (
                 str(caller_symbol), int(record.callsite_id), record_id,
-            ))
+            )
+            caller_record_id = pair_page.latest(pair_row)
+            if caller_record_id is not None:
+                source_cells.extend(_frame_cells(
+                    book.latest_ref(CALL_RECORD_PAIR, pair_row),
+                ))
         if caller_record_id is None:
             continue
         caller_descriptor = getattr(caller_records, "records", {}).get(
@@ -2635,6 +2997,12 @@ def _linked_caller_member(
         )
         if caller_descriptor is None:
             continue
+        source_cells.extend(_frame_cells(
+            _frame_table_cell(callee_records, record_id, RECORD_DESCRIPTOR),
+            _frame_table_cell(
+                caller_records, caller_record_id, RECORD_DESCRIPTOR,
+            ),
+        ))
         caller_field = next((
             candidate for candidate in caller_descriptor.fields
             if candidate.storage_identity == field.storage_identity
@@ -2648,14 +3016,18 @@ def _linked_caller_member(
             # to the caller's resident parts without matching names, positions,
             # dtypes, or SSA accounting.  A role absent from an existing
             # receipt is callee-private operational storage (normally status).
-            decomposition = current_identity_book().page(
-                "record_field_decomposition"
-            ).latest((
+            decomposition_row = (
                 caller_records.owner,
                 int(caller_record_id),
                 str(field.storage_identity),
-            ))
+            )
+            decomposition = book.page(
+                "record_field_decomposition"
+            ).latest(decomposition_row)
             if decomposition is not None:
+                source_cells.extend(_frame_cells(book.latest_ref(
+                    RECORD_FIELD_DECOMPOSITION, decomposition_row,
+                )))
                 caller_member = dict(decomposition).get(tuple(member[1]))
                 if caller_member is not None:
                     resolved.add(int(caller_member))
@@ -2738,7 +3110,22 @@ def _linked_caller_member(
         )
     if resolved and linked_sequence_members is not None:
         linked_sequence_members.update(resolved & sequence_members)
-    return next(iter(resolved), None)
+    return record_decision(next(iter(resolved), None))
+
+
+def _linked_caller_member_cell(
+    caller_symbol: Any, callsite_id: Any, callee_symbol: Any, formal_id: Any,
+) -> Any:
+    """The ``linked_caller_member`` cell ``_linked_caller_member`` wrote for
+    one callee formal at one call, or None."""
+
+    from .concordance_declarations import LINKED_CALLER_MEMBER
+    from .identity_concordance import current_identity_book
+
+    return current_identity_book().latest_ref(
+        LINKED_CALLER_MEMBER,
+        (str(caller_symbol), callsite_id, str(callee_symbol), int(formal_id)),
+    )
 
 
 def _restore_linked_sequence_member(
@@ -2791,15 +3178,30 @@ def _lease_source(formal: Any) -> Any:
 
 def _link_frame_lease(
     caller_symbol: str, slot_id: int, callsite_id: Any,
-    callee_symbol: str, callee_id: int,
-) -> None:
-    """Write the one identity of a leased caller slot; it never changes."""
+    callee_symbol: str, callee_id: int, *,
+    caller_function: Any = None, callee_function: Any = None,
+    sources: Any = (),
+) -> Any:
+    """Write the one identity of a leased caller slot; it never changes.
 
-    from .identity_concordance import current_identity_book
+    ``frame_lease_link`` row ``(caller, slot)`` -> ``(callsite, callee,
+    formal)``, CONCORD, DERIVED(the slot's ``ssa_value`` cell, the callee
+    formal's cell, and ``sources``: the ledger decision cell when the caller
+    is a ``propose`` site).
+    """
 
-    current_identity_book().page("frame_lease_link").concord(
+    from .concordance_declarations import FRAME_LEASE, FRAME_LINK
+
+    return _frame_post(
+        FRAME_LEASE,
         (str(caller_symbol), int(slot_id)),
         (callsite_id, str(callee_symbol), int(callee_id)),
+        stage=FRAME_LINK,
+        cells=(
+            _frame_value_cell(caller_function, slot_id),
+            _frame_value_cell(callee_function, callee_id),
+            *tuple(sources or ()),
+        ),
     )
 
 
@@ -3088,7 +3490,11 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
     """
 
     from ..transmogrifier.ssa import SSAValue
-    from .identity_concordance import current_identity_book
+    from .concordance_declarations import (
+        ARGUMENT_BINDING, FORMAL_UNBOUND_AT_TAIL, FRAME_TAIL, FRAME_TAIL_SLOT,
+        FRAME_TAIL_STAGE,
+    )
+    from .identity_concordance import Ref, Unresolved, current_identity_book
 
     def calls_into(callee_name: str) -> list[tuple[Any, Any]]:
         return [
@@ -3127,16 +3533,39 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                 if len(call.args) >= len(callee.args):
                     continue
                 book = current_identity_book()
-                binding_page = book.page("argument_binding")
                 callsite_id = call.attributes.get("plan_callsite_id")
-                exact_bindings = {
-                    int(formal.id): binding_page.cells.get((
-                        (str(callee_name), int(formal.id), "binding"),
-                        int(callsite_id),
-                    ))
-                    for formal in tail
-                    if callsite_id is not None
-                }
+                # The binding each tail formal has at this callsite, read
+                # through the book's latest cell (never ``cells.get``).  A
+                # binding the walk recorded as Unresolved(STORAGE_MINTED_FROM_ABSENCE)
+                # still leased storage: that storage is read from
+                # ``result_storage_binding`` and restored as caller storage.
+                exact_bindings: dict[int, Any] = {}
+                binding_cells: dict[int, tuple] = {}
+                for formal in tail:
+                    if callsite_id is None:
+                        continue
+                    fact = _argument_binding_fact(
+                        book, callee_name, formal.id, int(callsite_id),
+                    )
+                    binding_cells[int(formal.id)] = _frame_cells(
+                        book.latest_ref(ARGUMENT_BINDING, (
+                            str(callee_name), int(formal.id), int(callsite_id),
+                        )),
+                    )
+                    if isinstance(fact, Unresolved):
+                        lease = _result_storage_lease_cell(
+                            owner.name, int(callsite_id), int(formal.id),
+                        )
+                        storage_cell = (
+                            None if lease is None
+                            else book.pages[lease.page.name].latest(lease.row)
+                        )
+                        if isinstance(storage_cell, Ref):
+                            fact = ("caller_storage", int(storage_cell.row[1]))
+                            binding_cells[int(formal.id)] += (lease,)
+                        else:
+                            fact = None
+                    exact_bindings[int(formal.id)] = fact
                 if not all(
                     (formal.accounting or {}).get("linked_call_frame_storage")
                     or (formal.accounting or {}).get("compiler_frame_storage")
@@ -3203,8 +3632,16 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                             storage_kind = "argument_binding:caller_storage"
                     else:
                         bound_from_concordance = False
+                        # The slot is NOVEL(FRAME_TAIL_SLOT, callee formal
+                        # cell) on the owner's ``ssa_value`` page.
                         slot = SSAValue(
-                            GLOBAL_MONOTONIC_IDS.mint(),
+                            _frame_mint(
+                                owner, FRAME_TAIL_SLOT,
+                                (_frame_value_cell(callee, formal.id),),
+                                dtype=formal.dtype,
+                                shape=tuple(formal.shape or ()),
+                                stage=FRAME_TAIL_STAGE,
+                            ),
                             dtype=formal.dtype,
                             shape=tuple(formal.shape or ()),
                             device=formal.device,
@@ -3228,6 +3665,11 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                     # commit the transition before mutating either signature.
                     # This is the same transaction as ordinary linked frame
                     # storage, not a positional repair.
+                    #
+                    # The row derives from the ``argument_binding`` cell it
+                    # read and the slot's ``ssa_value`` cell; a tail completed
+                    # for a formal no binding row binds is recorded with the
+                    # reason FORMAL_UNBOUND_AT_TAIL instead of as a bare fact.
                     page = book.page(
                         "propagated_frame_tail_concordance"
                     )
@@ -3239,7 +3681,15 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                     claim = (int(slot.id), storage_kind)
                     incumbent = page.latest(row)
                     if incumbent is None:
-                        page.set(row, 0, claim)
+                        _frame_post(
+                            FRAME_TAIL, row, claim, stage=FRAME_TAIL_STAGE,
+                            cells=(
+                                *binding_cells.get(int(formal.id), ()),
+                                _frame_value_cell(owner, slot.id),
+                                _frame_value_cell(callee, formal.id),
+                            ) if bound_from_concordance else (),
+                            reason=FORMAL_UNBOUND_AT_TAIL,
+                        )
                     elif incumbent != claim:
                         raise ValueError(
                             "propagated frame-tail concordance disagreement: "
@@ -4389,11 +4839,10 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
                 (new_id if parent == old_id else parent, held_role)
                 for parent, held_role in child_data.get("parents") or ()
             ], cause="optional_presence_replace", same={old_id: new_id})
-            graph.add_edge(new_id, child, **edge)
-            children = graph.nodes[new_id].setdefault("children", [])
-            if (child, role) not in children:
-                children.append((child, role))
-            graph.remove_edge(old_id, child)
+            # _set_operands is the one writer of parents, children and the
+            # networkx edge (concordance step 9); the hand-written half that
+            # followed here re-added the edge and then removed one that
+            # _set_operands had already removed, which raised.
         graph.nodes[old_id]["children"] = []
 
     from .process_graph_value_ids import next_process_value_id
@@ -16049,7 +16498,23 @@ def _class_surface_ssa_program(
         lower_control_sections_to_ssa,
         resolve_sequence_schemas,
     )
-    from .identity_concordance import current_identity_book
+    from .identity_concordance import (
+        Mode, Unresolved, Unsourced, current_identity_book,
+    )
+    from .concordance_declarations import (
+        AGGREGATE_POSITION_MISSING, ARGUMENT_BINDING, ArgumentBindingFact,
+        CALL_BINDING_INPUT, CALL_RECORD_PAIR, CONSTRUCTOR_REMAP,
+        CallBindingSource, DECLARED_ROW_COLUMN, FRAME_BINDING, FRAME_LINK,
+        FRAME_SCAFFOLD, FRAME_STORAGE_CLONE, GRAPH_ID_WITHOUT_CANONICAL_CELL,
+        NESTED_RECORD_PART, PLANNER_OUTPUT_UNROUTED, PLANNING_VALUE,
+        RECORD_ABI_MATERIALIZATION, RECORD_DESCRIPTOR, RECORD_FIELD_RESIDENT,
+        RECORD_FORWARDING, RECORD_MEMBER, RECORD_PARAMETER_ROW_HANDLE,
+        RECORD_PARAMETER_VALUE, RECORD_STORAGE_ALIAS, REPLACEMENT_SLOT,
+        RESIDENCY_FROM_NAME_MATCH, RESIDENT_CHOSEN_BY_ORDER,
+        RESULT_STORAGE_LEASE, ROW_IDENTITY_FROM_SCHEMA_NAME, SHELL_HANDOFF,
+        STORAGE_MINTED_FROM_ABSENCE, STRUCTURAL_FOLD, NAME_BINDING,
+        CONTRACT_DEMAND_PAGE, DemandKind,
+    )
     from .string_table import StringTable
 
     program_started = time.monotonic()
@@ -17043,6 +17508,7 @@ def _class_surface_ssa_program(
         control = _apply_phi_initial_identity_repairs_to_control(
             control, phi_initial_identity_receipts,
         )
+        from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         import os as _os, sys as _sys
         if _os.environ.get("TURING_DEBUG_REGION_ORDER"):
             def _walk_markers(block, acc):
@@ -17113,6 +17579,7 @@ def _class_surface_ssa_program(
                     for region_index in control.region_indices
                     if int(region_index) in planned_region_indices
                 ),
+                graph=graph,
             )
         external_call_node_ids = {
             int(node_id)
@@ -17159,6 +17626,7 @@ def _class_surface_ssa_program(
                     for region_index in control.region_indices
                     if int(region_index) not in external_only_region_indices
                 ),
+                graph=graph,
             )
         control, predicate_region_ownership_receipts = (
             _rehome_structured_while_predicate_regions(
@@ -17481,6 +17949,7 @@ def _class_surface_ssa_program(
                     for parent, children in direct_children.items()
                 },
             )
+            from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
             def marker_counts(block, counts):
                 from .control_source import (
                     CallBlock, ConditionalBlock, LoopBlock,
@@ -17533,6 +18002,7 @@ def _class_surface_ssa_program(
         control = _nest_lexical_conditionals_in_loops(
             control, graph, getattr(shell, "dispatch_subgraphs", ()),
         )
+        from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         # Loop recurrence selection needs the complete conditional topology.
         # Some conditionals already live in the source loop and are enriched
         # above, while others are ordinary controls inserted by the overlay.
@@ -17558,6 +18028,7 @@ def _class_surface_ssa_program(
             control, graph, getattr(shell, "hierarchy_plan", None),
             getattr(shell, "dispatch_subgraphs", ()),
         )
+        from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         control, lexical_sequence_shortfalls = _install_lexical_sequence_mutations(
             control,
             graph,
@@ -17586,10 +18057,13 @@ def _class_surface_ssa_program(
         control = _attach_graph_control_expressions(
             control, graph_obj, resident=resident_value_ids,
         )
+        from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         control = _consume_resident_control_values(control, resident_value_ids)
+        from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         control = _stamp_conditional_callsite_ownership(
             control, graph, getattr(shell, "hierarchy_plan", None),
         )
+        from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         # Query placement initially sees only predicate result ids.  Once the
         # structured expression is attached, reschedule so a conditional such
         # as ``optional_row is None`` exposes its dependency on the row handle
@@ -17598,6 +18072,7 @@ def _class_surface_ssa_program(
             control,
             root=_schedule_sequence_query_dependencies(control.root),
         )
+        from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         (
             control,
             record_sequence_bindings,
@@ -17611,6 +18086,7 @@ def _class_surface_ssa_program(
                     *record_sequence_bindings,
                 ))),
             )
+            from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         if os.environ.get("TURING_DEBUG_CALL_PLACEMENT"):
             from .control_source import (
                 CallBlock as _DebugCallBlock,
@@ -18791,6 +19267,7 @@ def _class_surface_ssa_program(
                     return replace(block, body=order_field_effects(block.body))
                 return block
             control = replace(control, root=order_field_effects(control.root))
+            from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         # Direct keyed return operands have no numerical region to schedule
         # their reads. Retain their authored positions in the same control
         # tree as construction and mutation, rather than treating them as
@@ -18819,6 +19296,7 @@ def _class_surface_ssa_program(
                 query, int(result_id),
             )
             control = replace(control, root=query_root)
+            from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         # All structural/materialization passes have now had their say about
         # lexical placement.  Reassert query-producer dominance at this final
         # control boundary so a source-position insertion cannot separate a
@@ -18827,6 +19305,7 @@ def _class_surface_ssa_program(
             control,
             root=_schedule_sequence_query_dependencies(control.root),
         )
+        from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         # A loop-bound key is not a function formal.  Preserve the exact
         # ProcessGraph correlation from target value -> comprehension node so
         # keyed reads can be placed under the retained LoopBlock carrying that
@@ -18875,37 +19354,61 @@ def _class_surface_ssa_program(
                     f"span={_probe_data.get('source_span')}",
                     file=sys.stderr, flush=True,
                 )
-        planning_value_aliases = {
-            **_loop_carried_storage_aliases(graph_obj),
-            **_identity_return_aliases(
+        # Step 7: each alias family is posted with its own provenance.  The
+        # graph-owned families (loop-carried storage, identity returns)
+        # derive from the alias's and resident's ``canonical_value`` cells;
+        # the shell's capture-time adapters and the sequence lowering's
+        # residency are planner outputs no page carries yet
+        # (Unsourced(PLANNER_OUTPUT_UNROUTED)); ``singleton_name_aliases`` is
+        # an AST-name match, recorded with the reason RESIDENCY_FROM_NAME_MATCH
+        # and never as a proven residency.
+        alias_families = (
+            (_loop_carried_storage_aliases(graph_obj), None),
+            (_identity_return_aliases(
                 graph_obj, getattr(graph, "function_table", None),
-            ),
+            ), None),
             # Capture-time tensor adapters are exact object-identity facts.
             # The deployment planner already uses them to assign primitive
             # ownership, but previously their only durable copy was mixed
             # into ``ControlProgram.value_aliases`` with control-local carried
             # substitutions. Publish the exact source separately; the latter
             # category is deliberately not a planning-storage concordance.
-            **{
+            ({
                 int(alias_id): int(resident_id)
                 for alias_id, resident_id in dict(
                     getattr(shell, "compiled_process_graph_aliases", {}) or {}
                 ).items()
-            },
-            **{
+            }, PLANNER_OUTPUT_UNROUTED),
+            ({
                 int(value_id): int(resident_id)
                 for value_id, (resident_id, _kind)
                 in conditional_sequence_aliases.items()
-            },
-            **dict(sequence_concat_aliases),
-            **singleton_name_aliases,
-        }
+            }, PLANNER_OUTPUT_UNROUTED),
+            (dict(sequence_concat_aliases), PLANNER_OUTPUT_UNROUTED),
+            (singleton_name_aliases, RESIDENCY_FROM_NAME_MATCH),
+        )
+        planning_value_aliases: dict[int, int] = {}
+        planning_alias_reasons: dict[int, Any] = {}
+        for family, family_reason in alias_families:
+            for alias_id, resident_id in family.items():
+                planning_value_aliases[int(alias_id)] = int(resident_id)
+                planning_alias_reasons[int(alias_id)] = family_reason
         planning_concordance = current_identity_book().page(
             "planning_value_concordance"
         )
         for alias_id, resident_id in planning_value_aliases.items():
-            planning_concordance.bind_alias(
-                str(symbol), int(alias_id), int(resident_id),
+            alias_reason = planning_alias_reasons[int(alias_id)]
+            _frame_post(
+                PLANNING_VALUE, (str(symbol), int(alias_id)), int(resident_id),
+                stage=SHELL_HANDOFF, mode=Mode.REVISE,
+                cells=() if alias_reason is not None else (
+                    _frame_graph_cell(graph_obj, alias_id),
+                    _frame_graph_cell(graph_obj, resident_id),
+                ),
+                reason=(
+                    GRAPH_ID_WITHOUT_CANONICAL_CELL if alias_reason is None
+                    else alias_reason
+                ),
             )
         concorded_sequence_declarations = []
         for sequence_id, policy, column_count, writable in sequence_declarations:
@@ -22185,12 +22688,34 @@ def _class_surface_ssa_program(
         )
         for parameter_name, record in declared.items():
             key = (str(source_symbol), str(parameter_name))
-            parameter_ids = set(map(
+            parameter_versions = tuple(map(
                 int, identities.get(str(parameter_name), ())
             ))
-            for value_id in parameter_ids:
-                access_book.page("record_parameter_value").concord(
+            parameter_ids = set(parameter_versions)
+            # The root of the forwarding graph: each value id of the
+            # declared parameter is DERIVED from its ``name_binding`` cell
+            # (``(read scope, name, version)``) and the record's
+            # ``contract_demand`` PARAMETER_RECORD cell.
+            parameter_read_scope = source_graph.graph.get("lexical_read_scope")
+            record_declaration_cell = access_book.latest_ref(
+                CONTRACT_DEMAND_PAGE,
+                (DemandKind.PARAMETER_RECORD, str(record.get("identity") or "")),
+            )
+            for version, value_id in enumerate(parameter_versions):
+                _frame_post(
+                    RECORD_PARAMETER_VALUE,
                     (access_scope, (str(source_symbol), int(value_id))), key,
+                    stage=RECORD_FORWARDING,
+                    cells=(
+                        None if parameter_read_scope is None
+                        else access_book.latest_ref(NAME_BINDING, (
+                            tuple(parameter_read_scope), str(parameter_name),
+                            int(version),
+                        )),
+                        _frame_graph_cell(source_graph, value_id),
+                        record_declaration_cell,
+                    ),
+                    reason=GRAPH_ID_WITHOUT_CANONICAL_CELL,
                 )
             declared_fields = set(map(
                 str, dict(record.get("fields") or {})
@@ -22336,11 +22861,38 @@ def _class_surface_ssa_program(
                 value_record = field.get("value_record")
                 if value_record is None:
                     continue
-                row_identity = str(
-                    dict(abi_records.get(str(value_record)) or {})
-                    .get("identity") or value_record
+                declared_row_identity = dict(
+                    abi_records.get(str(value_record)) or {}
+                ).get("identity")
+                row_identity = str(declared_row_identity or value_record)
+                # DERIVED(the Indexed node's cell, its base GetAttr's cell,
+                # the owning record's and the value record's declaration
+                # cells).  When the value record declares no ``identity``
+                # the schema NAME stands in: the row is recorded with the
+                # reason ROW_IDENTITY_FROM_SCHEMA_NAME, never as a proven fact.
+                handle_cells = (
+                    _frame_graph_cell(
+                        source_graph, data.get("value_id", node_id),
+                    ),
+                    *(
+                        _frame_graph_cell(
+                            source_graph,
+                            source_graph.nodes[parent].get("value_id", parent),
+                        )
+                        for parent, role in (data.get("parents") or ())
+                        if parent in source_graph
+                        and str(role) in {"value", "base", "operand", "object"}
+                    ),
+                    access_book.latest_ref(CONTRACT_DEMAND_PAGE, (
+                        DemandKind.PARAMETER_RECORD,
+                        str(record.get("identity") or ""),
+                    )),
+                    access_book.latest_ref(CONTRACT_DEMAND_PAGE, (
+                        DemandKind.PARAMETER_RECORD, row_identity,
+                    )),
                 )
-                access_book.page("record_parameter_row_handle").concord(
+                _frame_post(
+                    RECORD_PARAMETER_ROW_HANDLE,
                     (
                         access_scope,
                         (
@@ -22349,6 +22901,16 @@ def _class_surface_ssa_program(
                         ),
                     ),
                     (key, f"{field_name}[]", row_identity),
+                    stage=RECORD_FORWARDING,
+                    cells=(
+                        handle_cells if declared_row_identity is not None
+                        else ()
+                    ),
+                    reason=(
+                        ROW_IDENTITY_FROM_SCHEMA_NAME
+                        if declared_row_identity is None
+                        else GRAPH_ID_WITHOUT_CANONICAL_CELL
+                    ),
                 )
 
     def declared_record_parameter(key: tuple[str, str]) -> Mapping[str, Any]:
@@ -22653,6 +23215,12 @@ def _class_surface_ssa_program(
         declared_records = dict(graph.graph.get("parameter_record_abi") or {})
         if not declared_records:
             return
+        # Step 7: every ``GLOBAL_MONOTONIC_IDS.mint()`` below (and in the
+        # nested materializers that close over this name) is a NOVEL
+        # ``ssa_value`` row of ``function`` -- see ``_RecordAbiMinter``.
+        GLOBAL_MONOTONIC_IDS = _RecordAbiMinter(
+            function, NESTED_RECORD_PART, RECORD_ABI_MATERIALIZATION,
+        )
         identities = graph.graph.get("identity_table") or {}
         values = function_values(function)
         optional_materializations: list[dict[str, Any]] = []
@@ -22663,9 +23231,38 @@ def _class_surface_ssa_program(
         # Coalescing that proven field identity prevents a native aggregate
         # result from being written into a private projection while later
         # reads continue to observe the untouched input field.
+        record_storage_alias_scope = mint_scope(
+            ("record_storage_alias", str(symbol)),
+        )
+        # A read view: every write goes through ``post_storage_alias``.
         record_storage_aliases = current_identity_book().page(
             "record_storage_alias"
-        ).mapping(mint_scope(("record_storage_alias", str(symbol))))
+        ).mapping(record_storage_alias_scope)
+        alias_source_cells: dict[int, tuple] = {}
+
+        def post_storage_alias(
+            value_id: int, resident_id: int, cells: Any = (), *,
+            reason: Any = None,
+        ) -> None:
+            """``record_storage_alias`` row ``(scope, value)`` -> resident,
+            REVISE, DERIVED(the aliased value's graph cell, ``cells``);
+            ``reason`` names why the resident is not a proven choice."""
+
+            value_id, resident_id = int(value_id), int(resident_id)
+            cells = _frame_cells(_frame_graph_cell(graph, value_id), *cells)
+            alias_source_cells[value_id] = cells
+            if record_storage_aliases.get(value_id) == resident_id:
+                return
+            _frame_post(
+                RECORD_STORAGE_ALIAS,
+                (record_storage_alias_scope, value_id), resident_id,
+                stage=RECORD_ABI_MATERIALIZATION, mode=Mode.REVISE,
+                cells=() if reason is not None else cells,
+                reason=(
+                    GRAPH_ID_WITHOUT_CANONICAL_CELL if reason is None
+                    else reason
+                ),
+            )
         indexed_storage_aliases = _loop_carried_storage_aliases(graph)
 
         def resolve_indexed_storage(value_id: int) -> int:
@@ -22742,22 +23339,55 @@ def _class_surface_ssa_program(
                 ))
                 if len(read_ids) < 2:
                     return
-                resident_id = next((
+                argument_resident = next((
                     value_id for value_id in read_ids
                     if any(
                         int(argument.id) == value_id
                         for argument in function.args
                     )
-                ), read_ids[0])
-                resident_id = int(current_identity_book().page(
+                ), None)
+                resident_id = (
+                    read_ids[0] if argument_resident is None
+                    else argument_resident
+                )
+                # The resident row derives from the parameter root's cell and
+                # every read's cell.  A resident that is a formal is a fact;
+                # ``read_ids[0]`` taken from absence of a formal is recorded
+                # as Unresolved(RESIDENT_CHOSEN_BY_ORDER) and the rewrite
+                # still uses the working resident.
+                resident_row = (
+                    str(symbol), min(parameter_ids), str(field_name),
+                )
+                resident_cells = _frame_cells(
+                    _frame_graph_cell(graph, min(parameter_ids)),
+                    *(_frame_graph_cell(graph, value_id) for value_id in read_ids),
+                )
+                resident_page = current_identity_book().page(
                     "record_field_resident_concordance"
-                ).concord(
-                    (str(symbol), min(parameter_ids), str(field_name)),
-                    int(resident_id),
-                ))
+                )
+                incumbent = resident_page.latest(resident_row)
+                if isinstance(incumbent, int):
+                    resident_id = int(incumbent)
+                else:
+                    _frame_post(
+                        RECORD_FIELD_RESIDENT, resident_row,
+                        (
+                            int(resident_id) if argument_resident is not None
+                            else Unresolved(
+                                RESIDENT_CHOSEN_BY_ORDER, read=resident_cells,
+                            )
+                        ),
+                        stage=RECORD_ABI_MATERIALIZATION, cells=resident_cells,
+                        reason=GRAPH_ID_WITHOUT_CANONICAL_CELL,
+                    )
+                resident_cell = current_identity_book().latest_ref(
+                    RECORD_FIELD_RESIDENT, resident_row,
+                )
                 for value_id in read_ids:
                     if value_id != resident_id:
-                        record_storage_aliases[value_id] = resident_id
+                        post_storage_alias(
+                            value_id, resident_id, (resident_cell,),
+                        )
                 return
             prewrite_getters = [
                 value_id for value_id, after_write in getters if not after_write
@@ -22781,12 +23411,29 @@ def _class_surface_ssa_program(
                     for argument in function.args
                 )
             ), int(candidates[0]))
+            # DERIVED(the resident's graph cell, each aliased value's cell);
+            # ``candidates[0]`` is first-in-list from absence of a formal and
+            # is recorded with the reason RESIDENT_CHOSEN_BY_ORDER.
+            alias_reason = (
+                None if any(
+                    int(argument.id) == resident_id
+                    for argument in function.args
+                ) else RESIDENT_CHOSEN_BY_ORDER
+            )
             for value_id, _after_write in getters:
                 if int(value_id) != resident_id:
-                    record_storage_aliases[int(value_id)] = resident_id
+                    post_storage_alias(
+                        int(value_id), resident_id,
+                        (_frame_graph_cell(graph, resident_id),),
+                        reason=alias_reason,
+                    )
             for value_id in write_sources:
                 if storage != "scalar" and int(value_id) != resident_id:
-                    record_storage_aliases[int(value_id)] = resident_id
+                    post_storage_alias(
+                        int(value_id), resident_id,
+                        (_frame_graph_cell(graph, resident_id),),
+                        reason=alias_reason,
+                    )
 
         for parameter_name, record in declared_records.items():
             parameter_ids = set(map(
@@ -22805,7 +23452,23 @@ def _class_surface_ssa_program(
 
         if record_storage_aliases:
             for alias_id in tuple(record_storage_aliases):
-                record_storage_aliases[alias_id] = resolve_record_storage(alias_id)
+                # The resolve pass: each terminal DERIVED from the chain's
+                # alias cells.
+                chain_cells: list = []
+                current = int(alias_id)
+                seen: set[int] = set()
+                while current in record_storage_aliases and current not in seen:
+                    seen.add(current)
+                    chain_cells.extend(_frame_cells(
+                        current_identity_book().latest_ref(
+                            RECORD_STORAGE_ALIAS,
+                            (record_storage_alias_scope, current),
+                        ),
+                    ))
+                    current = int(record_storage_aliases[current])
+                post_storage_alias(
+                    alias_id, resolve_record_storage(alias_id), chain_cells,
+                )
             resident_by_id = function_values(function)
             for block in function.blocks.values():
                 for instruction in block.instrs:
@@ -22838,6 +23501,16 @@ def _class_surface_ssa_program(
             _publish_concordant_function_aliases(
                 function, record_storage_aliases,
                 provenance="parameter_record_storage",
+                sources={
+                    int(alias_id): _frame_cells(
+                        current_identity_book().latest_ref(
+                            RECORD_STORAGE_ALIAS,
+                            (record_storage_alias_scope, int(alias_id)),
+                        ),
+                        *alias_source_cells.get(int(alias_id), ()),
+                    )
+                    for alias_id in record_storage_aliases
+                },
             )
             values = function_values(function)
         table = all_record_tables.setdefault(symbol, SSARecordTable(owner=symbol))
@@ -22990,7 +23663,16 @@ def _class_surface_ssa_program(
                         (str(symbol), str(parameter_name), nested_path),
                         "required_unread_leaf",
                     )
-                    candidates = (GLOBAL_MONOTONIC_IDS.mint(),)
+                    # A leaf no read names but the layout requires:
+                    # NOVEL(NESTED_RECORD_PART, the schema's declaration cell).
+                    candidates = (_frame_mint(
+                        function, NESTED_RECORD_PART,
+                        (current_identity_book().latest_ref(
+                            CONTRACT_DEMAND_PAGE,
+                            (DemandKind.PARAMETER_RECORD, schema_identity),
+                        ),),
+                        stage=RECORD_ABI_MATERIALIZATION,
+                    ),)
                 nested_storage = str(nested_field.get("storage") or "")
                 if nested_storage == "record":
                     child_schema = str(nested_field.get("record") or "")
@@ -23884,13 +24566,24 @@ def _class_surface_ssa_program(
                     continue
                 leaf_dtype = str(leaf_field.get("dtype") or "float64")
                 leaf_mutable = bool(leaf_field.get("mutable", False))
+                column_shape = (
+                    () if row_count is None
+                    else (int(row_count), *leaf_shape)
+                )
+                # NOVEL(DECLARED_ROW_COLUMN, the value record's declaration
+                # cell) on this function's ``ssa_value`` page.
                 column = SSAValue(
-                    GLOBAL_MONOTONIC_IDS.mint(),
-                    dtype=leaf_dtype,
-                    shape=(
-                        () if row_count is None
-                        else (int(row_count), *leaf_shape)
+                    _frame_mint(
+                        function, DECLARED_ROW_COLUMN,
+                        (current_identity_book().latest_ref(
+                            CONTRACT_DEMAND_PAGE,
+                            (DemandKind.PARAMETER_RECORD, schema_identity),
+                        ),),
+                        dtype=leaf_dtype, shape=column_shape,
+                        stage=RECORD_ABI_MATERIALIZATION,
                     ),
+                    dtype=leaf_dtype,
+                    shape=column_shape,
                     accounting={
                         "program_abi_record": schema_identity,
                         "program_abi_parameter": str(parameter_name),
@@ -23936,7 +24629,17 @@ def _class_surface_ssa_program(
                 )
             if not row_fields:
                 return None
-            row_record_id = GLOBAL_MONOTONIC_IDS.mint()
+            # The row record: NOVEL(DECLARED_ROW_COLUMN, cell_set of its
+            # columns' cells).
+            row_record_id = _frame_mint(
+                function, DECLARED_ROW_COLUMN,
+                tuple(
+                    _frame_value_cell(function, value_id)
+                    for row_field in row_fields
+                    for value_id in row_field.value_ids
+                ),
+                stage=RECORD_ABI_MATERIALIZATION,
+            )
             table.register(SSARecordDescriptor(
                 int(row_record_id), schema_identity, tuple(row_fields),
             ))
@@ -23949,6 +24652,13 @@ def _class_surface_ssa_program(
             ))
             if not parameter_ids:
                 continue
+            # Every part minted while this record is expanded (nested
+            # records included) is a part of this declared parameter
+            # record: name its declaration cell as the mints' operand.
+            GLOBAL_MONOTONIC_IDS.declare(current_identity_book().latest_ref(
+                CONTRACT_DEMAND_PAGE,
+                (DemandKind.PARAMETER_RECORD, str(record.get("identity") or "")),
+            ))
             record_id = next((
                 int(value.id) for value in function.args
                 if int(value.id) in parameter_ids
@@ -25064,6 +25774,44 @@ def _class_surface_ssa_program(
             data = graph.nodes.get(int(node_id), {})
             return int(data.get("value_id", node_id))
 
+        # Every value minted here (a default, a presence, an inactive
+        # payload) is a NOVEL ``ssa_value`` row from the abi field's
+        # declaration cell or the payload it stands beside; the literal rows
+        # and the registered descriptor derive from the field values' cells.
+        from .concordance_declarations import (
+            CLASS_FIELD_DECLARATION, CONTRACT_DEMAND_PAGE, DemandKind,
+            LITERAL_FIELD_DEFERRED, NUMERAL_RECORD_LITERAL,
+            OPTIONAL_INACTIVE_PAYLOAD, OPTIONAL_PRESENCE, PROGRAM_ABI_DEFAULT,
+            RECORD_LITERAL_MATERIALIZATION, RECORD_RETURN_LAYOUT_STAGE,
+        )
+        from .identity_concordance import (
+            Derived, Mode, Unresolved, Unsourced, current_identity_book,
+        )
+        from .precompile_to_ssa import _post_derived_or_raw
+        from .ssa_record_return_state import (
+            identity_cells, mint_ssa_value, post_record_return_layout,
+            record_descriptor_cell,
+        )
+        book = current_identity_book()
+
+        def field_declaration_cell(record: Mapping[str, Any], field_name: str):
+            """The abi field's ``class_field_declaration`` cell (the class
+            identity being the record identity) when ingestion posted the
+            class, else the record's ``contract_demand`` row, else None."""
+            identity = str(record["identity"])
+            page = book.pages.get(CLASS_FIELD_DECLARATION.name)
+            if page is not None:
+                for row in page.rows():
+                    if (
+                        len(row) == 3 and str(row[1]) == identity
+                        and row[2] == str(field_name)
+                        and page.latest(row) is not None
+                    ):
+                        return book.latest_ref(CLASS_FIELD_DECLARATION, row)
+            return book.latest_ref(
+                CONTRACT_DEMAND_PAGE, (DemandKind.PARAMETER_RECORD, identity),
+            )
+
         for node_id, data in graph.nodes(data=True):
             matched = abi_record_for_call(data)
             if matched is None:
@@ -25106,7 +25854,21 @@ def _class_surface_ssa_program(
                     value_id = positional_values[index]
                 if value_id is None and "default" in field:
                     default = field.get("default")
-                    value_id = GLOBAL_MONOTONIC_IDS.mint()
+                    default_dtype = "none" if default is None else field.get("dtype")
+                    default_shape = (
+                        tuple(map(int, field["shape"]))
+                        if (
+                            str(field.get("storage")) == "span"
+                            and field.get("shape") is not None
+                        )
+                        else ()
+                    )
+                    value_id = mint_ssa_value(
+                        function, PROGRAM_ABI_DEFAULT,
+                        (field_declaration_cell(record, field_name),),
+                        dtype=default_dtype, shape=default_shape,
+                        stage=RECORD_LITERAL_MATERIALIZATION,
+                    )
                     # A ``None`` default keeps its semantic dtype (``is None``
                     # folds on it) but occupies the field's declared storage:
                     # the emitter consults ``physical_dtype`` first, and
@@ -25115,15 +25877,8 @@ def _class_surface_ssa_program(
                     # stored a double into it.
                     value = SSAValue(
                         value_id,
-                        dtype=("none" if default is None else field.get("dtype")),
-                        shape=(
-                            tuple(map(int, field["shape"]))
-                            if (
-                                str(field.get("storage")) == "span"
-                                and field.get("shape") is not None
-                            )
-                            else ()
-                        ),
+                        dtype=default_dtype,
+                        shape=default_shape,
                         accounting={
                             "program_abi_default": str(field_name),
                             "program_abi_record": str(record["identity"]),
@@ -25444,11 +26199,20 @@ def _class_surface_ssa_program(
                         numeral_literal
                         and child is not None
                         and str(child.identity) == child_identity
-                        and numeral_literal_page.concord(
+                    ):
+                        # The coefficient field IS the child record: DERIVED
+                        # from the child's descriptor cell (CONCORD raises on
+                        # a differing incumbent, as ``concord`` did).
+                        _post_derived_or_raw(
+                            book, NUMERAL_RECORD_LITERAL,
                             (str(symbol), int(record_id), str(field_name)),
                             int(value_id),
-                        ) == int(value_id)
-                    ):
+                            identity_cells(
+                                function, record_descriptor_cell(table, value_id),
+                            ),
+                            stage=RECORD_LITERAL_MATERIALIZATION,
+                            mode=Mode.CONCORD,
+                        )
                         fields.append(SSARecordFieldDescriptor(
                             str(field_name), storage,
                             storage_identity=(
@@ -25471,12 +26235,26 @@ def _class_surface_ssa_program(
                     presence_id = (payload.accounting or {}).get("ssa_optional_presence_id")
                     presence = values.get(int(presence_id)) if presence_id is not None else None
                     if presence is None:
-                        presence = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype="bool")
+                        # NOVEL(optional_presence) from the payload's cell.
+                        presence = SSAValue(
+                            mint_ssa_value(
+                                function, OPTIONAL_PRESENCE, (payload,),
+                                dtype="bool", stage=RECORD_LITERAL_MATERIALIZATION,
+                            ),
+                            dtype="bool",
+                        )
                         constants.append(Instr("Const", [], presence, attributes={"value": not absent}))
                         values[int(presence.id)] = presence
                     if absent:
+                        # NOVEL(optional_inactive_payload) from the absent
+                        # payload's cell it stands in for.
                         payload = SSAValue(
-                            GLOBAL_MONOTONIC_IDS.mint(), dtype=str(dtype),
+                            mint_ssa_value(
+                                function, OPTIONAL_INACTIVE_PAYLOAD, (payload,),
+                                dtype=str(dtype),
+                                stage=RECORD_LITERAL_MATERIALIZATION,
+                            ),
+                            dtype=str(dtype),
                             accounting={"optional_inactive_payload": True},
                         )
                         constants.append(Instr("Const", [], payload, attributes={"value": 0}))
@@ -25510,21 +26288,54 @@ def _class_surface_ssa_program(
             if numeral_literal and len(fields) != len(field_contracts):
                 # A coefficient produced by a call gets its record only when
                 # this function's calls are linked; the literal completes
-                # then (see the linking loop).  ``__init__`` never runs.
-                numeral_literal_page.concord(
-                    (str(symbol), int(node_id), "deferred"), True,
-                )
+                # then (see the linking loop).  ``__init__`` never runs.  The
+                # deferral is an Unresolved reading the declarations of the
+                # fields still missing, never a fact.
+                present = {str(field.name).split(".", 1)[0] for field in fields}
+                missing = identity_cells(function, *(
+                    field_declaration_cell(record, name)
+                    for name, _field in field_contracts
+                    if str(name) not in present
+                ))
+                deferred_row = (str(symbol), int(node_id), "deferred")
+                deferred_fact = Unresolved(LITERAL_FIELD_DEFERRED, read=missing)
+                if numeral_literal_page.latest(deferred_row) != deferred_fact:
+                    book.post(
+                        NUMERAL_RECORD_LITERAL, deferred_row, deferred_fact,
+                        stage=RECORD_LITERAL_MATERIALIZATION,
+                        provenance=(
+                            Derived(missing) if missing
+                            else Unsourced(LITERAL_FIELD_DEFERRED)
+                        ),
+                        mode=Mode.CONCORD,
+                    )
                 constructor_anchors[(str(symbol), int(node_id))] = None
                 continue
             if fields:
-                table.register(SSARecordDescriptor(
-                    record_id, str(record["identity"]), tuple(fields),
-                ))
+                field_cells = identity_cells(
+                    function,
+                    *(value_id for field in fields for value_id in field.value_ids),
+                    *(
+                        record_descriptor_cell(table, field.record_id)
+                        for field in fields if field.record_id is not None
+                    ),
+                )
+                table.register(
+                    SSARecordDescriptor(
+                        record_id, str(record["identity"]), tuple(fields),
+                    ),
+                    sources=field_cells, stage=RECORD_LITERAL_MATERIALIZATION,
+                )
                 layouts.append((record_id, tuple(physical_layout)))
+                post_record_return_layout(
+                    function, table, record_id, physical_layout,
+                    stage=RECORD_RETURN_LAYOUT_STAGE,
+                )
                 if numeral_literal:
                     # The record-ABI literal is the authoritative
                     # construction; ``__init__`` is not a second execution.
-                    numeral_literal_page.concord(
+                    _post_derived_or_raw(
+                        book, NUMERAL_RECORD_LITERAL,
                         (str(symbol), int(node_id), "completed"),
                         tuple(
                             (
@@ -25535,6 +26346,11 @@ def _class_surface_ssa_program(
                             )
                             for field in fields
                         ),
+                        identity_cells(
+                            function, record_descriptor_cell(table, record_id),
+                            *field_cells,
+                        ),
+                        stage=RECORD_LITERAL_MATERIALIZATION, mode=Mode.CONCORD,
                     )
                     constructor_anchors[(str(symbol), int(node_id))] = None
         if constants:
@@ -25586,13 +26402,25 @@ def _class_surface_ssa_program(
         # The record-return selection page is keyed by the return-merge
         # Phi's identity cell; the reduction scope of the source graph is the
         # function scope every field-state and version row is keyed by.
+        # Every value minted here (a field Phi, a conversion Cast) is a NOVEL
+        # ``ssa_value`` row under the function's control scope; the layout
+        # pages derive from those cells and the records' descriptor cells.
         from .concordance_declarations import (
-            RECORD_DESCRIPTORS_DIFFER, RECORD_RETURN_FIELD_SELECTION,
-            RECORD_RETURN_VERSION,
+            LOOP_RECORD_LAYOUT, RECORD_DESCRIPTORS_DIFFER, RECORD_FIELD_LAYOUT,
+            RECORD_FIELD_PHI, RECORD_PHI_EXPANSION, RECORD_PHI_EXPANSION_STAGE,
+            RECORD_RETURN_FIELD_CONVERSION, RECORD_RETURN_FIELD_SELECTION,
+            RECORD_RETURN_LAYOUT_STAGE, RECORD_RETURN_VERSION,
         )
         from .identity_concordance import (
-            Mode, Ref, Unresolved, Unsourced, current_identity_book,
+            Derived, Mode, Ref, Unresolved, Unsourced, current_identity_book,
         )
+        from .precompile_to_ssa import _function_root_cell, _post_derived_or_raw
+        from .ssa_record_return_state import (
+            assign_record_descriptor, function_scope_of, identity_cells,
+            mint_ssa_value, post_record_return_layout, record_descriptor_cell,
+            record_member_cell, ssa_value_identity_cell,
+        )
+        function_scope = function_scope_of(function)
         selection_scope = (
             None if source_graph is None
             else source_graph.graph.get("lexical_read_scope")
@@ -25643,13 +26471,22 @@ def _class_surface_ssa_program(
                         row = selection_row(phi_cell, field_name, position, predecessor)
                         if row is not None:
                             book = current_identity_book()
-                            fact = Unresolved(RECORD_DESCRIPTORS_DIFFER, read=())
+                            # What was read: the two descriptors that differ.
+                            read = identity_cells(
+                                function,
+                                record_descriptor_cell(table, source_receiver),
+                                record_descriptor_cell(table, receiver),
+                            )
+                            fact = Unresolved(RECORD_DESCRIPTORS_DIFFER, read=read)
                             stored = book.pages.get(RECORD_RETURN_FIELD_SELECTION.name)
                             if stored is None or stored.latest(row) != fact:
                                 book.post(
                                     RECORD_RETURN_FIELD_SELECTION, row, fact,
                                     stage=RECORD_RETURN_VERSION,
-                                    provenance=Unsourced(RECORD_DESCRIPTORS_DIFFER),
+                                    provenance=(
+                                        Derived(read) if read
+                                        else Unsourced(RECORD_DESCRIPTORS_DIFFER)
+                                    ),
                                     mode=Mode.REVISE,
                                 )
                         selected_arguments.append(argument)
@@ -25665,14 +26502,21 @@ def _class_surface_ssa_program(
                     key = (predecessor, int(selected.id), argument.dtype)
                     converted = conversions.get(key)
                     if converted is None:
-                        # The Cast's identity should be NOVEL
-                        # (record_return_field_conversion, (selection cell,))
-                        # through the book; no declared page carries a
-                        # VALUE_ID for an SSA Cast, so the id is still minted
-                        # here and only the selection row (above) records
-                        # what the Cast converts.
+                        # The Cast's identity is NOVEL(record_return_field_conversion)
+                        # on ``ssa_value`` from the selection cell that chose
+                        # its operand (the operand's own cell when no
+                        # selection row could be keyed).
+                        chosen_by = selection_cell(
+                            phi_cell, field_name, position, predecessor,
+                        )
                         converted = SSAValue(
-                            GLOBAL_MONOTONIC_IDS.mint(),
+                            mint_ssa_value(
+                                function, RECORD_RETURN_FIELD_CONVERSION,
+                                (selected,) if chosen_by is None else (chosen_by,),
+                                dtype=argument.dtype,
+                                shape=selected.shape or (),
+                                stage=RECORD_RETURN_VERSION,
+                            ),
                             dtype=argument.dtype,
                         )
                         function.blocks[predecessor].instrs.insert(-1, Instr(
@@ -25715,10 +26559,17 @@ def _class_surface_ssa_program(
                         if len(original_arguments) != len(receivers):
                             rebuilt.append(instruction)
                             continue
-                        # The Phi's identity cell on the book, when the pass
-                        # that mints it has posted one (plan 70, S18); the
-                        # selection rows are keyed by it.
-                        phi_cell = attributes.get("identity_cell")
+                        # The selection rows are keyed by the identity cell
+                        # of the record return-merge Phi this field Phi
+                        # expands (``record_phi``), read from the book: the
+                        # control builder posted its ``ssa_value`` row, and
+                        # the row outlives the instruction attributes.
+                        record_phi_id = attributes.get("record_phi")
+                        if record_phi_id is None:
+                            record_phi_id = (
+                                instruction.res.accounting or {}
+                            ).get("record_phi")
+                        phi_cell = ssa_value_identity_cell(function, record_phi_id)
                         predecessors = tuple(attributes.get("incoming_blocks", ()))
                         selected_arguments = select_return_arguments(
                             receivers,
@@ -25737,6 +26588,7 @@ def _class_surface_ssa_program(
                                 )
                                 for position, predecessor in enumerate(predecessors)
                             ),
+                            function=function,
                         )
                         rebuilt.append(instruction)
                         continue
@@ -25869,9 +26721,30 @@ def _class_surface_ssa_program(
                                     tuple(record.record_id for record in incoming),
                                     source_field.name, predecessors, arguments,
                                     (instruction.attributes or {}).get("return_slot_index"),
+                                    phi_cell=ssa_value_identity_cell(function, result_id),
                                 )
+                            # The field Phi is NOVEL(record_field_phi) from
+                            # the record Phi's identity cell and each
+                            # incoming record's member cell for this slot
+                            # (posted after the members-pending check above,
+                            # so every member cell exists).
+                            expansion_cells = identity_cells(
+                                function,
+                                ssa_value_identity_cell(function, result_id),
+                                *(
+                                    record_member_cell(
+                                        table, int(candidate.value_ids[slot_index]),
+                                    )
+                                    for candidate in candidates
+                                ),
+                            )
                             result = SSAValue(
-                                GLOBAL_MONOTONIC_IDS.mint(),
+                                mint_ssa_value(
+                                    function, RECORD_FIELD_PHI, expansion_cells,
+                                    dtype=source_field.dtype or arguments[0].dtype,
+                                    shape=arguments[0].shape or (),
+                                    stage=RECORD_PHI_EXPANSION_STAGE,
+                                ),
                                 dtype=source_field.dtype or arguments[0].dtype,
                                 shape=arguments[0].shape,
                                 accounting={
@@ -25879,6 +26752,19 @@ def _class_surface_ssa_program(
                                     "record_field": source_field.name,
                                     "record_field_slot": slot_index,
                                 },
+                            )
+                            _post_derived_or_raw(
+                                current_identity_book(), RECORD_PHI_EXPANSION,
+                                (
+                                    function_scope, int(result_id),
+                                    str(source_field.name), int(slot_index),
+                                ),
+                                ssa_value_identity_cell(function, int(result.id)),
+                                expansion_cells or (_function_root_cell(
+                                    current_identity_book(), function_scope,
+                                ),),
+                                stage=RECORD_PHI_EXPANSION_STAGE,
+                                mode=Mode.CONCORD,
                             )
                             attributes = dict(instruction.attributes or {})
                             attributes.update({
@@ -25915,10 +26801,11 @@ def _class_surface_ssa_program(
                     # otherwise the loop result exists only in the private
                     # record table and downstream row lowering cannot audit
                     # how its field identities were chosen.
-                    field_page = current_identity_book().page(
-                        "record_field_layout_concordance"
-                    )
-                    for field in merged_descriptor.fields:
+                    book = current_identity_book()
+                    field_page = book.page(RECORD_FIELD_LAYOUT)
+                    for field, candidates in zip(
+                        merged_descriptor.fields, common_fields,
+                    ):
                         row = (
                             str(symbol), int(result_id),
                             str(field.storage_identity),
@@ -25931,9 +26818,7 @@ def _class_surface_ssa_program(
                             field.storage.value,
                         )
                         incumbent_layout = field_page.latest(row)
-                        if incumbent_layout is None:
-                            field_page.set(row, 0, layout)
-                        elif incumbent_layout != layout:
+                        if incumbent_layout is not None and incumbent_layout != layout:
                             raise ValueError(
                                 "record field concordance disagrees with "
                                 "record Phi layout: "
@@ -25941,6 +26826,21 @@ def _class_surface_ssa_program(
                                 f"concordance_layout={incumbent_layout!r}, "
                                 f"phi_layout={layout!r}"
                             )
+                        # DERIVED(each field Phi's identity cell, the
+                        # incoming fields' member cells); the same layout
+                        # again records only its edge.
+                        _post_derived_or_raw(
+                            book, RECORD_FIELD_LAYOUT, row, layout,
+                            identity_cells(
+                                function, *field.value_ids,
+                                *(
+                                    record_member_cell(table, int(value_id))
+                                    for candidate in candidates
+                                    for value_id in candidate.value_ids
+                                ),
+                            ),
+                            stage=RECORD_PHI_EXPANSION_STAGE, mode=Mode.CONCORD,
+                        )
                     if (
                         attributes.get("record_loop_phi") is not None
                         and result_id in table.records
@@ -25970,9 +26870,7 @@ def _class_surface_ssa_program(
                             for field in incumbent.fields
                             for value_id in field.value_ids
                         )
-                        transition_page = current_identity_book().page(
-                            "loop_record_layout_concordance"
-                        )
+                        transition_page = book.page(LOOP_RECORD_LAYOUT)
                         transition_row = (
                             str(symbol),
                             int(attributes["source_loop_node_id"]),
@@ -25987,8 +26885,18 @@ def _class_surface_ssa_program(
                             transition_row
                         )
                         if incumbent_claim is None:
-                            transition_page.set(
-                                transition_row, 0, transition_claim
+                            # DERIVED(the incumbent descriptor cell, the
+                            # merged ids' identity cells).
+                            _post_derived_or_raw(
+                                book, LOOP_RECORD_LAYOUT, transition_row,
+                                transition_claim,
+                                identity_cells(
+                                    function,
+                                    record_descriptor_cell(table, result_id),
+                                    *merged_layout,
+                                ),
+                                stage=RECORD_PHI_EXPANSION_STAGE,
+                                mode=Mode.CONCORD,
                             )
                             function.metadata.setdefault(
                                 "loop_record_layout_transitions", []
@@ -26004,11 +26912,29 @@ def _class_surface_ssa_program(
                         # members advance through the loop-exit Phi.  Direct
                         # assignment is the table's sanctioned revision path:
                         # _BookRows appends record_descriptor history and
-                        # revises every record_member claim in lockstep.
-                        table.records[result_id] = merged_descriptor
+                        # revises every record_member claim in lockstep; the
+                        # revision derives from the incumbent descriptor and
+                        # the field Phis.
+                        assign_record_descriptor(
+                            table, result_id, merged_descriptor,
+                            identity_cells(
+                                function,
+                                record_descriptor_cell(table, result_id),
+                                *merged_layout,
+                            ),
+                            stage=RECORD_PHI_EXPANSION_STAGE,
+                        )
                     else:
-                        table.register(merged_descriptor)
+                        table.register(
+                            merged_descriptor,
+                            sources=identity_cells(function, *merged_layout),
+                            stage=RECORD_PHI_EXPANSION_STAGE,
+                        )
                     layouts[result_id] = tuple(merged_layout)
+                    post_record_return_layout(
+                        function, table, result_id, merged_layout,
+                        stage=RECORD_RETURN_LAYOUT_STAGE,
+                    )
                     changed = True
                 block.instrs = rebuilt
         if layouts:
@@ -26066,6 +26992,18 @@ def _class_surface_ssa_program(
         table = all_record_tables.get(symbol)
         if function is None or table is None:
             return
+        # The header Phi and the schema projection are NOVEL ``ssa_value``
+        # rows from the descriptors they join; the schema row derives from
+        # the two descriptors it compares.
+        from .concordance_declarations import (
+            LOOP_RECORD_HEADER, LOOP_RECORD_PROJECTION, LOOP_RECORD_SCHEMA,
+            RECORD_PHI_EXPANSION_STAGE,
+        )
+        from .identity_concordance import Mode
+        from .precompile_to_ssa import _post_derived_or_raw
+        from .ssa_record_return_state import (
+            identity_cells, mint_ssa_value, record_descriptor_cell,
+        )
         completed = {
             (int(row[0]), int(row[1]), int(row[2]))
             for row in function.metadata.get(
@@ -26207,9 +27145,8 @@ def _class_surface_ssa_program(
                         for field in updated.fields
                         if field not in projected_fields
                     )
-                    schema_page = current_identity_book().page(
-                        "loop_record_schema_concordance"
-                    )
+                    book = current_identity_book()
+                    schema_page = book.page(LOOP_RECORD_SCHEMA)
                     schema_row = (str(symbol), loop_id, result_id)
                     schema_claim = (
                         signatures(initial), signatures(updated),
@@ -26218,21 +27155,39 @@ def _class_surface_ssa_program(
                         "project_updated_to_initial",
                     )
                     incumbent_claim = schema_page.latest(schema_row)
-                    if incumbent_claim is None:
-                        schema_page.set(schema_row, 0, schema_claim)
-                    elif incumbent_claim != schema_claim:
+                    if incumbent_claim is not None and incumbent_claim != schema_claim:
                         raise ValueError(
                             "loop record schema concordance disagreement: "
                             f"row={schema_row!r}, "
                             f"concordance={incumbent_claim!r}, "
                             f"candidate={schema_claim!r}"
                         )
-                    projected_updated_id = GLOBAL_MONOTONIC_IDS.mint()
-                    table.register(SSARecordDescriptor(
-                        projected_updated_id,
-                        str(initial.identity),
-                        tuple(projected_fields),
-                    ))
+                    # DERIVED(the initial and updated descriptors' cells).
+                    schema_cell = _post_derived_or_raw(
+                        book, LOOP_RECORD_SCHEMA, schema_row, schema_claim,
+                        identity_cells(
+                            function,
+                            record_descriptor_cell(table, initial_id),
+                            record_descriptor_cell(table, updated_id),
+                        ),
+                        stage=RECORD_PHI_EXPANSION_STAGE, mode=Mode.CONCORD,
+                    )
+                    projected_updated_id = mint_ssa_value(
+                        function, LOOP_RECORD_PROJECTION, (schema_cell,),
+                        stage=RECORD_PHI_EXPANSION_STAGE,
+                    )
+                    table.register(
+                        SSARecordDescriptor(
+                            projected_updated_id,
+                            str(initial.identity),
+                            tuple(projected_fields),
+                        ),
+                        sources=identity_cells(
+                            function, schema_cell,
+                            record_descriptor_cell(table, updated_id),
+                        ),
+                        stage=RECORD_PHI_EXPANSION_STAGE,
+                    )
                     function.metadata.setdefault(
                         "loop_record_schema_projections", []
                     ).append((
@@ -26302,7 +27257,16 @@ def _class_surface_ssa_program(
                     for field in (() if incumbent is None else incumbent.fields)
                     for value_id in field.value_ids
                 )
-                header_record_id = GLOBAL_MONOTONIC_IDS.mint()
+                # The conceptual header Phi joins the initial record and the
+                # (projected) updated record: NOVEL from both descriptors.
+                header_record_id = mint_ssa_value(
+                    function, LOOP_RECORD_HEADER,
+                    (
+                        record_descriptor_cell(table, initial_id),
+                        record_descriptor_cell(table, projected_updated_id),
+                    ),
+                    stage=RECORD_PHI_EXPANSION_STAGE,
+                )
                 header_value = SSAValue(
                     header_record_id,
                     accounting={
@@ -28230,6 +29194,27 @@ def _class_surface_ssa_program(
         # becomes ``a = f(a_after)``). Never infer frame aliases by spelling.
         identity_aliases: dict[int, int] = {}
         default_literals: dict[int, Any] = {}
+        # Step 7: the cells each frame binding derives from (``call_binding_input``
+        # rows, ``result_storage_binding`` cells), and the formals whose
+        # storage the final ``else`` leased from absence.
+        binding_cells: dict[int, tuple] = {}
+        absent_bindings: set[int] = set()
+
+        def post_binding_input(
+            value_id: int, source: Any, fact: Any, cells: Any,
+        ) -> None:
+            """One input of the walk as a ``call_binding_input`` row,
+            DERIVED(cells) or Unsourced(GRAPH_ID_WITHOUT_CANONICAL_CELL)."""
+
+            binding_cells[int(value_id)] = _frame_cells(_frame_post(
+                CALL_BINDING_INPUT,
+                (
+                    str(caller_symbol), int(planned_call.callsite_id),
+                    int(value_id), source,
+                ),
+                fact, stage=FRAME_BINDING, mode=Mode.REVISE, cells=cells,
+                reason=GRAPH_ID_WITHOUT_CANONICAL_CELL,
+            ))
         if child_graph is not None and callee_function is not None:
             for value in callee_function.args:
                 value_id = int(value.id)
@@ -28302,6 +29287,16 @@ def _class_surface_ssa_program(
                             ):
                                 continue
                             default_literals[int(value_id)] = parameter.default
+        for literal_value_id, literal in default_literals.items():
+            # DERIVED(the child graph's Constant / Input node cell, the
+            # callee formal's cell); the literal itself is the fact.
+            post_binding_input(
+                literal_value_id, CallBindingSource.DEFAULT_LITERAL, literal,
+                (
+                    _frame_graph_cell(child_graph, literal_value_id),
+                    _frame_value_cell(callee_function, literal_value_id),
+                ),
+            )
         frame_bindings = []
         unresolved_frame = []
         receiver_record = None
@@ -28342,9 +29337,30 @@ def _class_surface_ssa_program(
                 old_id = int(old_id)
                 if not distinct_slot and old_id in result_storage_bindings:
                     return result_storage_bindings[old_id]
-                new_id = GLOBAL_MONOTONIC_IDS.mint()
                 source = function_values(callee_function).get(
                     old_id, SSAValue(old_id)
+                )
+                # The storage is NOVEL(RESULT_STORAGE_LEASE, callee value
+                # cell) on the caller's ``ssa_value`` page; the lease row
+                # ``result_storage_binding`` derives from the callee value's
+                # cell and its ``record_member`` cell when ``field`` names one.
+                lease_cells = _frame_cells(
+                    _frame_value_cell(callee_function, old_id),
+                    _frame_table_cell(
+                        all_record_tables.get(callee_symbol), old_id,
+                        RECORD_MEMBER,
+                    ) if field is not None else None,
+                )
+                new_id = _frame_mint(
+                    all_functions[caller_symbol], RESULT_STORAGE_LEASE,
+                    lease_cells,
+                    dtype=(
+                        str(field.dtype)
+                        if field is not None and field.dtype is not None
+                        else source.dtype
+                    ),
+                    shape=tuple(source.shape or ()),
+                    stage=FRAME_BINDING,
                 )
                 value = clone_value(_lease_source(source), new_id, accounting={
                     "returned_record_storage": str(callee_symbol),
@@ -28355,6 +29371,11 @@ def _class_surface_ssa_program(
                         ),
                     } if field is not None else {}),
                 })
+                _post_result_storage_lease(
+                    all_functions[caller_symbol], caller_symbol,
+                    int(planned_call.callsite_id), old_id, new_id,
+                    lease_cells, stage=FRAME_BINDING,
+                )
                 if field is not None and field.dtype is not None:
                     value.dtype = str(field.dtype)
                 if field is not None:
@@ -28722,8 +29743,16 @@ def _class_surface_ssa_program(
                 for record in record_order:
                     if int(record.record_id) == int(root.record_id):
                         continue
-                    result_record_bindings[int(record.record_id)] = (
-                        GLOBAL_MONOTONIC_IDS.mint()
+                    # A caller record id for a nested returned record:
+                    # NOVEL(FRAME_STORAGE_CLONE, the callee record's
+                    # descriptor cell).
+                    result_record_bindings[int(record.record_id)] = _frame_mint(
+                        all_functions[caller_symbol], FRAME_STORAGE_CLONE,
+                        (_frame_table_cell(
+                            callee_result_records, record.record_id,
+                            RECORD_DESCRIPTOR,
+                        ),),
+                        stage=FRAME_BINDING,
                     )
                 for record in reversed(record_order):
                     mapped_fields = []
@@ -28906,16 +29935,41 @@ def _class_surface_ssa_program(
                         )
                         if field.record_id is None or caller_child_id is None:
                             continue
-                        caller_child_id = current_identity_book().page(
-                            "call_record_pair_concordance"
-                        ).concord(
-                            (
-                                str(caller_symbol),
-                                int(planned_call.callsite_id),
-                                int(field.record_id),
-                            ),
-                            int(caller_child_id),
+                        # The pair joins through the declared field both
+                        # records derive from: DERIVED(the bound pair's two
+                        # descriptor cells, both child records' descriptor
+                        # cells).  CONCORD: a different caller child for the
+                        # same callee child is a disagreement.
+                        pair_row = (
+                            str(caller_symbol),
+                            int(planned_call.callsite_id),
+                            int(field.record_id),
                         )
+                        _frame_post(
+                            CALL_RECORD_PAIR, pair_row, int(caller_child_id),
+                            stage=FRAME_BINDING,
+                            cells=(
+                                _frame_table_cell(
+                                    caller_records, bound_record.record_id,
+                                    RECORD_DESCRIPTOR,
+                                ),
+                                _frame_table_cell(
+                                    callee_records, candidate.record_id,
+                                    RECORD_DESCRIPTOR,
+                                ),
+                                _frame_table_cell(
+                                    caller_records, caller_child_id,
+                                    RECORD_DESCRIPTOR,
+                                ),
+                                _frame_table_cell(
+                                    callee_records, field.record_id,
+                                    RECORD_DESCRIPTOR,
+                                ),
+                            ),
+                        )
+                        caller_child_id = int(current_identity_book().page(
+                            "call_record_pair_concordance"
+                        ).latest(pair_row))
                         caller_child = caller_records.records.get(
                             int(caller_child_id)
                         )
@@ -29191,6 +30245,19 @@ def _class_surface_ssa_program(
                     caller_function, present, int(member), callee_formal,
                     str(callee_symbol), int(planned_call.callsite_id),
                 )
+            # The walk's input: DERIVED(the ``linked_caller_member`` cell).
+            binding_cells[int(callee_formal.id)] = _frame_cells(_frame_post(
+                CALL_BINDING_INPUT,
+                (
+                    str(caller_symbol), int(planned_call.callsite_id),
+                    int(callee_formal.id), CallBindingSource.DISCOVERY,
+                ),
+                int(member), stage=FRAME_BINDING, mode=Mode.REVISE,
+                cells=(_linked_caller_member_cell(
+                    caller_symbol, int(planned_call.callsite_id),
+                    callee_symbol, callee_formal.id,
+                ),),
+            ))
             return int(member)
 
         for value in (
@@ -29298,6 +30365,17 @@ def _class_surface_ssa_program(
                 # ``('caller_storage', X)`` and callsite 460 binding
                 # ``('caller_alias', X)`` for one identical X, and only 460
                 # reported ``missing_caller_alias``.
+                post_binding_input(
+                    value_id, CallBindingSource.IDENTITY_ALIAS,
+                    int(identity_aliases[value_id]),
+                    (
+                        _frame_value_cell(callee_function, value_id),
+                        _frame_value_cell(
+                            all_functions[caller_symbol],
+                            identity_aliases[value_id],
+                        ),
+                    ),
+                )
                 frame_bindings.append((
                     value_id, "caller_storage", identity_aliases[value_id]
                 ))
@@ -29329,24 +30407,66 @@ def _class_surface_ssa_program(
                 # descriptors, loop scratch, hook tables, and tape mechanics
                 # look like opaque Python dependencies even though their full
                 # contents were already present in the callee signature.
+                #
+                # Step 7: the storage exists and is NOVEL from the formal,
+                # but the BINDING is not a proven fact -- it is recorded as
+                # Unresolved(STORAGE_MINTED_FROM_ABSENCE) below, beside the
+                # ``result_storage_binding`` row the lease wrote.
+                absent_bindings.add(value_id)
                 frame_bindings.append((
                     value_id,
                     "caller_storage",
                     allocate_result_storage(value_id),
                 ))
-        # Record this call's binding decisions onto the shared book, keyed
-        # the same way tensor_ssa_lowering.py keys its own rows -- (owning
-        # function, value id, kind-of-fact) -- so a value threaded through as
-        # frame storage (the exact "restore" shape: one numbered slot shared
-        # by shape across several call frames) can be read on this page
-        # (who decided its caller binding, and from which callsite) against
-        # the shape-enrichment page (what shape each occurrence of it later
-        # settled to), instead of each staying invisible to the other.
+        # Record this call's binding decisions onto the shared book: row
+        # ``(callee, formal, callsite)`` on ``argument_binding`` (the callsite
+        # is in the row; one row per binding, history per revisit), fact
+        # ``ArgumentBindingFact(kind, source)`` DERIVED from the callee
+        # formal's cell, the caller value's cell and the ``call_binding_input``
+        # / ``result_storage_binding`` cell the walk read -- so a value
+        # threaded through as frame storage can be read on this page against
+        # the shape-enrichment page.  The final ``else`` posts
+        # ``Unresolved(STORAGE_MINTED_FROM_ABSENCE)``; readers treat it as
+        # absence and read the storage through ``result_storage_binding``.
         for recorded_value_id, recorded_kind, recorded_source in frame_bindings:
-            argument_binding_page.set(
-                (str(callee_symbol), int(recorded_value_id), "binding"),
-                int(planned_call.callsite_id),
-                (recorded_kind, recorded_source),
+            recorded_value_id = int(recorded_value_id)
+            formal_cell = _frame_value_cell(callee_function, recorded_value_id)
+            source_cell = (
+                _frame_value_cell(
+                    all_functions[caller_symbol], recorded_source,
+                )
+                if isinstance(recorded_source, int)
+                and not isinstance(recorded_source, bool)
+                else None
+            )
+            lease_cell = (
+                _result_storage_lease_cell(
+                    caller_symbol, int(planned_call.callsite_id),
+                    recorded_value_id,
+                )
+                if recorded_kind == "caller_storage" else None
+            )
+            cells = _frame_cells(
+                formal_cell, source_cell, lease_cell,
+                *binding_cells.get(recorded_value_id, ()),
+            )
+            _frame_post(
+                ARGUMENT_BINDING,
+                (
+                    str(callee_symbol), recorded_value_id,
+                    int(planned_call.callsite_id),
+                ),
+                (
+                    Unresolved(STORAGE_MINTED_FROM_ABSENCE, read=cells)
+                    if recorded_value_id in absent_bindings
+                    else ArgumentBindingFact(recorded_kind, recorded_source)
+                ),
+                stage=FRAME_BINDING, mode=Mode.REVISE, cells=cells,
+                reason=(
+                    STORAGE_MINTED_FROM_ABSENCE
+                    if recorded_value_id in absent_bindings
+                    else GRAPH_ID_WITHOUT_CANONICAL_CELL
+                ),
             )
         decompositions = tuple(
             instruction
@@ -29891,8 +31011,22 @@ def _class_surface_ssa_program(
         "scheduled_call_argument"
     ).mapping(mint_scope("scheduled_call_argument"))
 
-    def mint_compiler_value_id() -> int:
-        return GLOBAL_MONOTONIC_IDS.mint()
+    def mint_compiler_value_id(
+        function: Any = None, transform: Any = None, operands: Any = (), *,
+        dtype: Any = None, shape: Any = (),
+    ) -> int:
+        """Mint one compiler value id.  With ``function`` the id is a NOVEL
+        ``ssa_value`` row under that function's scope (``transform``,
+        default FRAME_SCAFFOLD, from ``operands``); a caller that names no
+        function still draws a bare id, which the audit lists under
+        ``unsourced-identity`` until that site is routed."""
+
+        if function is None:
+            return GLOBAL_MONOTONIC_IDS.mint()
+        return _frame_mint(
+            function, FRAME_SCAFFOLD if transform is None else transform,
+            operands, dtype=dtype, shape=shape, stage=FRAME_LINK,
+        )
 
     def frame_fixed_point_digest() -> str:
         """Fingerprint every mutable ledger governed by the frame pass."""
@@ -31309,6 +32443,10 @@ def _class_surface_ssa_program(
                             if frame_ledger.propose(
                                 identity, "linked_record_member", int(linked_member),
                                 before=int(source), after=int(linked_member),
+                                sources=_frame_cells(_linked_caller_member_cell(
+                                    caller_symbol, int(record.callsite_id),
+                                    record.callee_symbol, callee_id,
+                                )),
                             ):
                                 source = int(linked_member)
                             else:
@@ -31387,9 +32525,18 @@ def _class_surface_ssa_program(
                                         "caller neither receives nor defines"
                                     )
                             else:
+                                # NOVEL(FRAME_STORAGE_CLONE, callee formal
+                                # cell); the lease derives from the
+                                # ``linked_caller_member`` row that found no
+                                # member.
                                 caller_storage = clone_value(
                                     _lease_source(argument),
-                                    mint_compiler_value_id(),
+                                    mint_compiler_value_id(
+                                        caller, FRAME_STORAGE_CLONE,
+                                        (_frame_value_cell(callee, argument_id),),
+                                        dtype=argument.dtype,
+                                        shape=tuple(argument.shape or ()),
+                                    ),
                                     accounting={
                                         "linked_call_frame_storage": str(
                                             record.callee_symbol
@@ -31402,6 +32549,12 @@ def _class_surface_ssa_program(
                                     str(caller_symbol), int(caller_storage.id),
                                     int(record.callsite_id),
                                     str(record.callee_symbol), argument_id,
+                                    caller_function=caller,
+                                    callee_function=callee,
+                                    sources=_frame_cells(_linked_caller_member_cell(
+                                        caller_symbol, int(record.callsite_id),
+                                        record.callee_symbol, argument_id,
+                                    )),
                                 )
                                 caller.args.append(caller_storage)
                                 values[int(caller_storage.id)] = caller_storage
@@ -31644,8 +32797,17 @@ def _class_surface_ssa_program(
                             source_record_id = int(source_record.record_id)
                             if source_record_id in record_id_map:
                                 continue
+                            # A caller record id for a nested returned
+                            # record: NOVEL(FRAME_STORAGE_CLONE, the callee
+                            # record's descriptor cell).
                             record_id_map[source_record_id] = (
-                                mint_compiler_value_id()
+                                mint_compiler_value_id(
+                                    caller, FRAME_STORAGE_CLONE,
+                                    (_frame_table_cell(
+                                        callee_record_table, source_record_id,
+                                        RECORD_DESCRIPTOR,
+                                    ),),
+                                )
                             )
 
                         def allocate_late_result_storage(
@@ -31660,7 +32822,6 @@ def _class_surface_ssa_program(
                                 and source_id in result_storage_bindings
                             ):
                                 return int(result_storage_bindings[source_id])
-                            caller_value_id = mint_compiler_value_id()
                             source = callee_values.get(
                                 source_id,
                                 SSAValue(
@@ -31669,6 +32830,31 @@ def _class_surface_ssa_program(
                                         None if field is None else field.dtype
                                     ),
                                 ),
+                            )
+                            # NOVEL(RESULT_STORAGE_LEASE, callee value cell)
+                            # plus the ``result_storage_binding`` row, as the
+                            # binding walk's ``allocate_result_storage``.
+                            lease_cells = _frame_cells(
+                                _frame_value_cell(callee, source_id),
+                                _frame_table_cell(
+                                    callee_record_table, source_id,
+                                    RECORD_MEMBER,
+                                ) if field is not None else None,
+                            )
+                            caller_value_id = mint_compiler_value_id(
+                                caller, RESULT_STORAGE_LEASE, lease_cells,
+                                dtype=(
+                                    str(field.dtype)
+                                    if field is not None
+                                    and field.dtype is not None
+                                    else source.dtype
+                                ),
+                                shape=tuple(source.shape or ()),
+                            )
+                            _post_result_storage_lease(
+                                caller, record.caller, int(record.callsite_id),
+                                source_id, caller_value_id, lease_cells,
+                                stage=FRAME_LINK,
                             )
                             value = clone_value(
                                 source,
@@ -32035,11 +33221,24 @@ def _class_surface_ssa_program(
                             and live_record_result_map.get(int(callee_id))
                             != source_id
                         ):
-                            replacement_id = mint_compiler_value_id()
+                            # The proof is the result lease the slot came
+                            # from; the replacement slot is NOVEL(REPLACEMENT_SLOT)
+                            # from that same cell.
+                            proposal_cells = _frame_cells(
+                                _result_storage_lease_cell(
+                                    caller_symbol, int(record.callsite_id),
+                                    int(callee_id),
+                                ),
+                                _frame_value_cell(callee, callee_id),
+                            )
+                            replacement_id = mint_compiler_value_id(
+                                caller, REPLACEMENT_SLOT, proposal_cells,
+                            )
                             if not frame_ledger.propose(
                                 (str(caller_symbol), int(record.callsite_id), str(record.callee_symbol), int(callee_id)),
                                 "distinct_result", (str(record.callee_symbol), int(callee_id)),
                                 before=source_id, after=replacement_id,
+                                sources=proposal_cells,
                             ):
                                 incumbent = frame_ledger.incumbent_target(
                                     (str(caller_symbol), int(record.callsite_id), str(record.callee_symbol), int(callee_id))
@@ -32065,6 +33264,10 @@ def _class_surface_ssa_program(
                                 str(caller_symbol), int(replacement.id),
                                 int(record.callsite_id), str(record.callee_symbol),
                                 int(callee_id),
+                                caller_function=caller, callee_function=callee,
+                                sources=_frame_cells(frame_ledger.decision_cell(
+                                    (str(caller_symbol), int(record.callsite_id), str(record.callee_symbol), int(callee_id)),
+                                )),
                             )
                             values[int(replacement.id)] = replacement
                             refreshed_bindings.append((
@@ -32112,6 +33315,16 @@ def _class_surface_ssa_program(
                                 (int(exact_caller_id), int(callee_id)),
                                 before=source_id,
                                 after=source_id,
+                                sources=_frame_cells(
+                                    current_identity_book().latest_ref(
+                                        ARGUMENT_BINDING, (
+                                            str(record.callee_symbol),
+                                            int(callee_id),
+                                            int(record.callsite_id),
+                                        ),
+                                    ),
+                                    _frame_value_cell(caller, exact_caller_id),
+                                ),
                             )
                             if not retained:
                                 source_id = int(
@@ -32150,8 +33363,23 @@ def _class_surface_ssa_program(
                             distinct_bindings.append((callee_id, kind, source))
                             continue
                         replacement_id = slot_by_owner.get((source_id, owner))
+                        # The proof is the owner: the linked member's
+                        # ``record_member`` cell (or the ``linked_caller_member``
+                        # row that found none) and the slot's cell.
+                        owner_cells = _frame_cells(
+                            _frame_table_cell(
+                                caller_record_table, linked_owner, RECORD_MEMBER,
+                            ),
+                            _linked_caller_member_cell(
+                                caller_symbol, int(record.callsite_id),
+                                record.callee_symbol, callee_id,
+                            ),
+                            _frame_value_cell(caller, source_id),
+                        )
                         proposed_replacement_id = (
-                            mint_compiler_value_id()
+                            mint_compiler_value_id(
+                                caller, REPLACEMENT_SLOT, owner_cells,
+                            )
                             if replacement_id is None else replacement_id
                         )
                         if not frame_ledger.propose(
@@ -32159,6 +33387,7 @@ def _class_surface_ssa_program(
                             "distinct_owner", owner,
                             before=source_id,
                             after=proposed_replacement_id,
+                            sources=owner_cells,
                         ):
                             # A losing challenger retains the incumbent's
                             # physical slot, not the conflicting proposal.
@@ -32187,6 +33416,10 @@ def _class_surface_ssa_program(
                                 str(caller_symbol), int(replacement.id),
                                 int(record.callsite_id), str(record.callee_symbol),
                                 int(callee_id),
+                                caller_function=caller, callee_function=callee,
+                                sources=_frame_cells(frame_ledger.decision_cell(
+                                    (str(caller_symbol), int(record.callsite_id), str(record.callee_symbol), int(callee_id)),
+                                )),
                             )
                             values[int(replacement.id)] = replacement
                             replacement_id = int(replacement.id)

@@ -1898,12 +1898,16 @@ def propagate_repository_ssa_call_metadata(
             # pass ever touched their shape.  Pull it onto the same row key
             # (function, value id) so the report shows not just THAT a value
             # round-tripped but WHOSE two binding decisions disagreed about it.
+            from .identity_concordance import argument_binding_history
+
             binding_page = identity_book(module).pages.get("argument_binding")
             binding_report = "; ".join(
                 f"{target[:2]}: " + " -> ".join(
-                    f"callsite{column} {fact[0]}={fact[1]}"
-                    for column, fact in binding_page.history(
-                        (target[0], target[1], "binding")
+                    f"callsite{callsite} {fact[0]}={fact[1]}"
+                    if isinstance(fact, tuple) and len(fact) == 2
+                    else f"callsite{callsite} {fact!r}"
+                    for callsite, fact in argument_binding_history(
+                        binding_page, target[0], target[1],
                     )
                 )
                 for target in list(repeated_writes)[:5]

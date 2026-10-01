@@ -46,6 +46,9 @@ from src.compiler.identity_concordance import (  # noqa: E402
     Unresolved,
     identity_book,
 )
+from src.compiler.ssa_record_return_state import (  # noqa: E402
+    ssa_value_identity_cell,
+)
 
 CONTRACTS = REPO / "extraction_contracts"
 NAME = "branch_written_field"
@@ -306,15 +309,37 @@ def main() -> int:
               not versions)
 
     # ---- link 6: the return-merge selection ------------------------------
+    # A selection row is keyed by a record return-merge Phi's ``ssa_value``
+    # cell (the control builder posts it; record materialization reads it
+    # through ``ssa_value_identity_cell``).  This program's two ``return m``
+    # statements fold into one exit, so the finished ``step`` holds no
+    # return-merge Phi and no row can exist; the probe says which case it is.
+    return_merges = [] if step is None else [
+        instruction
+        for block in step.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Phi"
+        and (instruction.attributes or {}).get("binding") == "return_merge"
+    ]
+    print(f"return-merge Phis in step: {len(return_merges)}")
     selections = cells(book, RECORD_RETURN_FIELD_SELECTION)
     print(f"record_return_field_selection cells: {len(selections)}")
     for ref, fact in selections:
         print(f"    {ref!r} = {fact!r}")
         show_edges(book, ref)
-    if not selections:
+    if return_merges and seam_present:
+        check("every return-merge Phi has an ssa_value identity cell", all(
+            ssa_value_identity_cell(step, int(phi.res.id)) is not None
+            for phi in return_merges
+        ))
+        check("a record return-merge selection row is posted", bool(selections))
+        check("every selection row has an inbound edge", all(
+            bool(book.edges_into(ref)) for ref, _fact in selections
+        ))
+    elif not selections:
         print(
-            "    (none: the return-merge Phi carries no identity cell on the "
-            "book yet, so no selection row can be keyed)"
+            "    (none: the function has no return-merge Phi, so no "
+            "selection row can be keyed)"
         )
 
     # ---- what stays true today --------------------------------------------

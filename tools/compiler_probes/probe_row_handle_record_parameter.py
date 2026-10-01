@@ -97,6 +97,116 @@ def contract_path() -> pathlib.Path:
     return path
 
 
+def book_assertions(module) -> list[str]:
+    """Concordance step 7 (plan 90, section 3.7), read from the book only.
+
+    * one ``record_parameter_row_handle`` row for the Indexed value in
+      ``sync``, with inbound edges;
+    * for every formal of ``center``, one ``argument_binding`` row whose
+      fact is not ``Unresolved`` -- or whose reason is printed;
+    * one ``linked_caller_member`` row per ``Item`` leaf ``center`` reads
+      (``orientation``, ``mass``), with an inbound edge;
+    * zero ``result_storage_binding`` rows for ``center``'s record formals;
+    * no MINTED id defined in the two functions lacks a mint record.
+    """
+
+    from src.compiler.concordance_declarations import (
+        ARGUMENT_BINDING, LINKED_CALLER_MEMBER, RECORD_PARAMETER_ROW_HANDLE,
+        RESULT_STORAGE_BINDING,
+    )
+    from src.compiler.identity_concordance import (
+        MINT_PAGE, Unresolved, identity_book,
+    )
+    from src.compiler.id_space import MINTED, has_flag
+
+    book = identity_book(module)
+    failures: list[str] = []
+    functions = {
+        name.rsplit("__", 1)[-1]: function
+        for name, function in module.functions.items()
+        if name.endswith("__sync") or name.endswith("__center")
+    }
+    sync, center = functions["sync"], functions["center"]
+
+    handles = book.pages.get(RECORD_PARAMETER_ROW_HANDLE.name)
+    handle_rows = [] if handles is None else [
+        row for row in handles.rows()
+        if isinstance(row[1], tuple) and row[1][0] == str(sync.name)
+        and not isinstance(handles.latest(row), Unresolved)
+    ]
+    if len(handle_rows) != 1:
+        failures.append(f"row handles in sync: {handle_rows!r} (want one)")
+    for row in handle_rows:
+        edges = book.edges_into(book.latest_ref(RECORD_PARAMETER_ROW_HANDLE, row))
+        print("row handle", row[1], "->", handles.latest(row), "edges:", len(edges))
+        if not edges:
+            failures.append(f"row handle {row!r} has no inbound edge")
+
+    bindings = book.pages.get(ARGUMENT_BINDING.name)
+    for formal in center.args:
+        rows = [] if bindings is None else [
+            row for row in bindings.scope_rows(str(center.name))
+            if int(row[1]) == int(formal.id)
+        ]
+        facts = [bindings.latest(row) for row in rows]
+        for row, fact in zip(rows, facts):
+            if isinstance(fact, Unresolved):
+                print(f"center formal {int(formal.id)}: Unresolved({fact.reason.name}) at {row[2]!r}")
+            else:
+                print(f"center formal {int(formal.id)}: {fact!r} at {row[2]!r}")
+        if not rows:
+            failures.append(f"center formal {int(formal.id)} has no argument_binding row")
+
+    linked = book.pages.get(LINKED_CALLER_MEMBER.name)
+    linked_rows = [] if linked is None else [
+        row for row in linked.scope_rows(str(sync.name))
+        if row[2] == str(center.name) and isinstance(linked.latest(row), int)
+    ]
+    for row in linked_rows:
+        edges = book.edges_into(book.latest_ref(LINKED_CALLER_MEMBER, row))
+        print("linked member", row[3], "->", linked.latest(row), "edges:", len(edges))
+        if not edges:
+            failures.append(f"linked member {row!r} has no inbound edge")
+    leaf_formals = [
+        formal for formal in center.args
+        if (formal.accounting or {}).get("program_abi_field")
+    ]
+    if len(linked_rows) < len(leaf_formals):
+        failures.append(
+            f"linked members {len(linked_rows)} < record formals {len(leaf_formals)}"
+        )
+
+    leases = book.pages.get(RESULT_STORAGE_BINDING.name)
+    leased = [] if leases is None else [
+        row for row in leases.scope_rows(str(sync.name))
+        if int(row[2]) in {int(formal.id) for formal in leaf_formals}
+    ]
+    if leased:
+        failures.append(f"record formals of center were leased: {leased!r}")
+
+    minted_with_record = {
+        row[1] for row in (
+            () if book.pages.get(MINT_PAGE.name) is None
+            else book.pages[MINT_PAGE.name].rows()
+        )
+    }
+    for function in (sync, center):
+        defined = {int(value.id) for value in function.args} | {
+            int(instruction.res.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
+        orphans = sorted(
+            value_id for value_id in defined
+            if has_flag(value_id, MINTED) and value_id not in minted_with_record
+        )
+        print(f"{function.name}: minted ids without a mint record: {len(orphans)}")
+        if orphans:
+            failures.append(f"{function.name}: unsourced identities {orphans!r}")
+    return failures
+
+
 def main() -> int:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -110,7 +220,9 @@ def main() -> int:
             (int(value.id), (value.accounting or {}).get("program_abi_field"))
             for value in function.args
         ])
-    return 0
+    failures = book_assertions(module)
+    print("failures:", failures)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
