@@ -680,6 +680,17 @@ class PyTorchTensorOperations(AbstractTensor):
             auto_converted = False
         if auto_converted:
             print("[TensorBackend:torch] Auto-converted input to list for tensor_from_list_()")
+        if dtype is None:
+            # NumPy is AbstractTensor's canonical semantics: with no dtype a
+            # Python float is float64, not torch's default float32.  Measured:
+            # AbstractTensor.tensor(1/60) was float32 0.01666666753590107, so
+            # the dt controller's window total could never land on the
+            # float64 request ("managed-time advance did not land exactly").
+            try:
+                import numpy as np
+                dtype = np.asarray(data).dtype
+            except Exception:
+                dtype = None
         return torch.tensor(data, dtype=_torch_dtype(dtype), device=device or self.default_device)
 
     def boolean_mask_select_(self, mask):
