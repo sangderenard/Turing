@@ -1353,29 +1353,111 @@ def diffuse_effects(graph, seeds, steps, decay, er, ei):
 
 # -- GL ----------------------------------------------------------------------
 
-VERT = """#version 330 core
-layout(location=0) in vec3 aPos;
-layout(location=1) in vec4 aCol;
-layout(location=2) in float aScale;
-layout(location=3) in vec4 aBorder;   // rgb + strength: construction-event border
+# Every node lives in one GPU buffer in world order (core nodes, then shell
+# nodes): positions are written once per physics frame, colours only when the
+# mode / focus / pick changes, the spring glow once per physics frame.  The
+# shaders fetch by index (``texelFetch`` on texture buffers); nothing is
+# assembled per vertex on the CPU.
+NODE_VERT = """#version 330 core
+uniform samplerBuffer uPos;      // xyz per node
+uniform samplerBuffer uColor;    // rgba per node
+uniform samplerBuffer uBorder;   // rgba per node: the border outside flow
+uniform samplerBuffer uScale;    // r per node
+uniform samplerBuffer uGlow;     // rg per node: spring glow alpha, glow radius
+uniform isamplerBuffer uMeta;    // r: activation group, g: flags (1 core, 2 minted)
+uniform int uOffset;             // first node of this draw
+uniform int uFlow;               // 1: border and size from the spring glow
+uniform int uActive;             // the spring's active group
+uniform int uOverride;           // 1: a pick mark, drawn with the colours below
+uniform vec4 uOverrideColor;
+uniform vec4 uOverrideBorder;
+uniform float uOverrideScale;
 uniform mat4 uMVP;
-uniform mat3 uRot;              // model rotation: which side of the sphere faces the camera
+uniform mat3 uRot;
 uniform float uPointSize;
 uniform float uRef;
 out vec4 vCol;
 out vec4 vBorder;
 out float vBack;
+const vec3 FRONT = @FRONT@;
+const vec3 ATTACH = @ATTACH@;
+const vec3 BIRTH = @BIRTH@;
+const vec3 RING = @RING@;
+const vec3 MINT = @MINT@;
 void main() {
-  gl_Position = uMVP * vec4(aPos, 1.0);
-  float facing = (uRot * aPos).z / max(length(aPos), 1e-6);
+  int i = uOffset + gl_VertexID;
+  vec3 p = texelFetch(uPos, i).xyz;
+  vec4 col = texelFetch(uColor, i);
+  vec4 border = texelFetch(uBorder, i);
+  float scale = texelFetch(uScale, i).r;
+  if (uFlow == 1) {
+    vec2 g = clamp(texelFetch(uGlow, i).rg, 0.0, 1.0);
+    ivec2 meta = texelFetch(uMeta, i).rg;
+    bool isActive = meta.r == uActive;
+    if ((meta.g & 1) != 0) {
+      border = vec4(isActive ? FRONT : (g.r > 0.02 ? BIRTH : RING), max(g.r, 0.45));
+    } else {
+      border = vec4(isActive ? FRONT : ATTACH, g.r);
+      if ((meta.g & 2) != 0 && border.a < 0.05) border = vec4(MINT, 0.6);
+    }
+    scale *= 1.0 + 1.6 * g.g;
+  }
+  if (uOverride == 1) { col = uOverrideColor; border = uOverrideBorder; scale = uOverrideScale; }
+  gl_Position = uMVP * vec4(p, 1.0);
+  float facing = (uRot * p).z / max(length(p), 1e-6);
   float front = smoothstep(-0.25, 0.25, facing);
   vBack = 1.0 - front;
-  vBorder = vec4(aBorder.rgb, aBorder.a * mix(0.4, 1.0, front));
-  vCol = vec4(aCol.rgb * mix(0.55, 1.0, front), aCol.a * mix(0.32, 1.0, front));
-  gl_PointSize = uPointSize * aScale * mix(1.7, 1.0, front)
+  vBorder = vec4(border.rgb, border.a * mix(0.4, 1.0, front));
+  vCol = vec4(col.rgb * mix(0.55, 1.0, front), col.a * mix(0.32, 1.0, front));
+  gl_PointSize = uPointSize * scale * mix(1.7, 1.0, front)
                * clamp(uRef / max(gl_Position.w, 1e-3), 0.5, 5.0);
 }
 """
+# An edge is four vertices (two segments: a -> mid -> b); the shader takes the
+# edge from ``gl_VertexID / 4``, its endpoints from the static pair buffer and
+# their positions from the node buffer, and lifts the midpoint back to the
+# endpoints' mean radius (an arc on the sphere) unless uArc is 0.
+LINE_VERT = """#version 330 core
+uniform samplerBuffer uPos;
+uniform isamplerBuffer uPairs;    // rg: the edge's two node indices
+uniform samplerBuffer uEdgeColor; // rgba per edge
+uniform samplerBuffer uGlow;
+uniform int uGlowMode;            // 0 none, 1 alpha * (1 + 2g), 2 alpha + 2g
+uniform int uGlowEdges;           // only the first uGlowEdges edges glow
+uniform int uArc;
+uniform mat4 uMVP;
+uniform mat3 uRot;
+out vec4 vCol;
+out float vBack;
+const vec3 ATTACH = @ATTACH@;
+void main() {
+  int e = gl_VertexID / 4;
+  int k = gl_VertexID - 4 * e;
+  ivec2 ab = texelFetch(uPairs, e).rg;
+  vec3 pa = texelFetch(uPos, ab.x).xyz;
+  vec3 pb = texelFetch(uPos, ab.y).xyz;
+  vec3 mid = 0.5 * (pa + pb);
+  float len = length(mid);
+  if (uArc == 1 && len > 0.25) mid *= 0.5 * (length(pa) + length(pb)) / len;
+  vec3 p = (k == 0) ? pa : ((k == 3) ? pb : mid);
+  vec4 c = texelFetch(uEdgeColor, e);
+  if (uGlowMode != 0 && e < uGlowEdges) {
+    float g = max(clamp(texelFetch(uGlow, ab.x).r, 0.0, 1.0), clamp(texelFetch(uGlow, ab.y).r, 0.0, 1.0));
+    c.rgb = mix(c.rgb, ATTACH, g);
+    c.a = (uGlowMode == 1) ? c.a * (1.0 + 2.0 * g) : c.a + 2.0 * g;
+  }
+  gl_Position = uMVP * vec4(p, 1.0);
+  float facing = (uRot * p).z / max(length(p), 1e-6);
+  float front = smoothstep(-0.25, 0.25, facing);
+  vBack = 1.0 - front;
+  vCol = vec4(c.rgb * mix(0.55, 1.0, front), c.a * mix(0.32, 1.0, front));
+}
+"""
+for _name, _value in (("@FRONT@", FRONT_RGB), ("@ATTACH@", ATTACH_RGB), ("@BIRTH@", BIRTH_RGB),
+                      ("@RING@", CORE_RING_RGB), ("@MINT@", MINT_RING_RGB)):
+    _glsl = "vec3(%s)" % ", ".join(f"{float(x):.4f}" for x in _value)
+    NODE_VERT = NODE_VERT.replace(_name, _glsl)
+    LINE_VERT = LINE_VERT.replace(_name, _glsl)
 FRAG_POINT = """#version 330 core
 in vec4 vCol;
 in vec4 vBorder;
@@ -1696,41 +1778,86 @@ def main(argv=None) -> None:
         return compileProgram(compileShader(vs, gl.GL_VERTEX_SHADER),
                               compileShader(fs, gl.GL_FRAGMENT_SHADER))
 
-    prog_point, prog_line, prog_hud = program(VERT, FRAG_POINT), program(VERT, FRAG_LINE), program(HUD_VERT, HUD_FRAG)
+    prog_point, prog_line, prog_hud = program(NODE_VERT, FRAG_POINT), program(LINE_VERT, FRAG_LINE), program(HUD_VERT, HUD_FRAG)
     prog_bg = program(BG_VERT, BG_FRAG)
     gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
     gl.glEnable(gl.GL_BLEND)
     gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
 
-    def make_vao(stride_floats):
-        vao = gl.glGenVertexArrays(1); vbo = gl.glGenBuffers(1)
-        gl.glBindVertexArray(vao); gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
-        stride = stride_floats * 4
-        gl.glEnableVertexAttribArray(0); gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, False, stride, ctypes.c_void_p(0))
-        gl.glEnableVertexAttribArray(1); gl.glVertexAttribPointer(1, 4, gl.GL_FLOAT, False, stride, ctypes.c_void_p(12))
-        if stride_floats > 7:
-            gl.glEnableVertexAttribArray(2)
-            gl.glVertexAttribPointer(2, 1, gl.GL_FLOAT, False, stride, ctypes.c_void_p(28))
-            gl.glEnableVertexAttribArray(3)
-            gl.glVertexAttribPointer(3, 4, gl.GL_FLOAT, False, stride, ctypes.c_void_p(32))
-        else:
-            gl.glVertexAttrib1f(2, 1.0)
-        gl.glBindVertexArray(0)
-        return vao, vbo
+    class TexBuf:
+        """A GPU buffer read by the shaders as a texture buffer.  ``set`` writes
+        in place (``glBufferSubData``) while the size is unchanged."""
 
-    def upload(vbo, data):
-        data = np.ascontiguousarray(data, np.float32)
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
-        gl.glBufferData(gl.GL_ARRAY_BUFFER, data.nbytes, data, gl.GL_DYNAMIC_DRAW)
+        def __init__(self, internal, comps, dtype):
+            self.buf, self.tex = gl.glGenBuffers(1), gl.glGenTextures(1)
+            self.internal, self.comps, self.dtype, self.nbytes = internal, comps, dtype, -1
+            self.set(np.zeros((1, comps), dtype))
 
-    point_vao, point_vbo = make_vao(12)
-    line_vao, line_vbo = make_vao(7)
-    core_point_vao, core_point_vbo = make_vao(12)
-    core_line_vao, core_line_vbo = make_vao(7)
-    pick_point_vao, pick_point_vbo = make_vao(12)
-    pick_line_vao, pick_line_vbo = make_vao(7)
-    pin_line_vao, pin_line_vbo = make_vao(7)
+        def set(self, data):
+            data = np.ascontiguousarray(data, self.dtype).reshape(-1, self.comps)
+            if not len(data):
+                data = np.zeros((1, self.comps), self.dtype)
+            gl.glBindBuffer(gl.GL_TEXTURE_BUFFER, self.buf)
+            if data.nbytes != self.nbytes:
+                gl.glBufferData(gl.GL_TEXTURE_BUFFER, data.nbytes, data, gl.GL_DYNAMIC_DRAW)
+                self.nbytes = data.nbytes
+                gl.glBindTexture(gl.GL_TEXTURE_BUFFER, self.tex)
+                gl.glTexBuffer(gl.GL_TEXTURE_BUFFER, self.internal, self.buf)
+            else:
+                gl.glBufferSubData(gl.GL_TEXTURE_BUFFER, 0, data.nbytes, data)
+
+        def bind(self, unit):
+            gl.glActiveTexture(gl.GL_TEXTURE0 + unit)
+            gl.glBindTexture(gl.GL_TEXTURE_BUFFER, self.tex)
+
+    def vec4s(data):
+        data = np.asarray(data, np.float32).reshape(-1, data.shape[-1] if np.ndim(data) > 1 else 1)
+        out = np.zeros((len(data), 4), np.float32)
+        out[:, : data.shape[1]] = data
+        return out
+
+    empty_vao = gl.glGenVertexArrays(1)                  # attributeless draws read only buffers
+    nc, M = world.n_core, world.n_core + n               # node index: core j -> j, shell i -> nc + i
+    pos_tb = TexBuf(gl.GL_RGBA32F, 4, np.float32)
+    glow_tb = TexBuf(gl.GL_RG32F, 2, np.float32)
+    color_tb = TexBuf(gl.GL_RGBA32F, 4, np.float32)
+    border_tb = TexBuf(gl.GL_RGBA32F, 4, np.float32)
+    scale_tb = TexBuf(gl.GL_R32F, 1, np.float32)
+    meta_tb = TexBuf(gl.GL_RG32I, 2, np.int32)
+    shell_pairs_tb, shell_color_tb = TexBuf(gl.GL_RG32I, 2, np.int32), TexBuf(gl.GL_RGBA32F, 4, np.float32)
+    core_pairs_tb, core_color_tb = TexBuf(gl.GL_RG32I, 2, np.int32), TexBuf(gl.GL_RGBA32F, 4, np.float32)
+    pin_pairs_tb, pin_color_tb = TexBuf(gl.GL_RG32I, 2, np.int32), TexBuf(gl.GL_RGBA32F, 4, np.float32)
+    pick_pairs_tb, pick_color_tb = TexBuf(gl.GL_RG32I, 2, np.int32), TexBuf(gl.GL_RGBA32F, 4, np.float32)
     scale = np.where(kind == 1, ID_SCALE, 1.0).astype(np.float32)
+
+    # static: topology and identity of every node and edge, uploaded once
+    node_color = np.zeros((M, 4), np.float32)
+    node_border = np.zeros((M, 4), np.float32)
+    node_scale = np.zeros((M, 1), np.float32)
+    meta = np.zeros((M, 2), np.int32)
+    meta[:nc, 0], meta[:nc, 1] = world.core_group, 1
+    meta[nc:, 0] = world.shell_group
+    meta[nc:, 1] = np.where(graph["node_prov"] == PROV_MINT, 2, 0)
+    meta_tb.set(meta)
+    core_rgb = _time_ramp(world.core_t) if nc else np.zeros((0, 3), np.float32)
+    node_color[:nc, :3], node_color[:nc, 3] = core_rgb, 0.9
+    node_border[:nc, :3], node_border[:nc, 3] = CORE_RING_RGB, 0.45
+    node_scale[:nc, 0] = 1.15
+    shell_pairs = np.concatenate([np.stack([er, ei], axis=1), np.stack([csrc, cdst], axis=1)]).astype(np.int32) + nc
+    shell_pairs_tb.set(shell_pairs)
+    core_pairs_tb.set(np.stack([world.core_src, world.core_dst], axis=1).astype(np.int32))
+    core_color_tb.set(vec4s(np.concatenate([
+        (core_rgb[world.core_src] + core_rgb[world.core_dst]) / 2 if nc else np.zeros((0, 3), np.float32),
+        np.full((len(world.core_src), 1), 1.6, np.float32)], axis=1)))
+    pin_pairs_tb.set(np.stack([pinned, core_row[pinned] + nc], axis=1).astype(np.int32) if n_pinned else np.zeros((0, 2), np.int32))
+
+    def upload_positions():
+        """The one per-frame geometry write: every node's position, in place."""
+        pos_tb.set(vec4s(np.concatenate([core_pos, pos])))
+
+    def upload_glow():
+        alpha, radius = world.glow()
+        glow_tb.set(np.stack([alpha, radius], axis=1))
 
     # HUD: a pygame-rendered surface on a screen quad, as SpeciesHud does
     hud_vao = gl.glGenVertexArrays(1); hud_vbo = gl.glGenBuffers(1)
@@ -1764,11 +1891,18 @@ def main(argv=None) -> None:
                         (gl.GL_TEXTURE_WRAP_S, gl.GL_REPEAT), (gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)):
         gl.glTexParameteri(gl.GL_TEXTURE_2D, name, value)
 
+    field_allocated = [False]
+
     def upload_field():
         data = np.ascontiguousarray(
             np.stack([field.time, field.density, field.time_far, field.density_far], axis=-1), np.float32)
+        gl.glActiveTexture(gl.GL_TEXTURE0)
         gl.glBindTexture(gl.GL_TEXTURE_2D, bg_tex)
-        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32F, field.res, field.res, 0, gl.GL_RGBA, gl.GL_FLOAT, data)
+        if field_allocated[0]:
+            gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, field.res, field.res, gl.GL_RGBA, gl.GL_FLOAT, data)
+        else:
+            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32F, field.res, field.res, 0, gl.GL_RGBA, gl.GL_FLOAT, data)
+            field_allocated[0] = True
 
     camera = Camera(mass=args.mass)
     if args.turn:
@@ -1792,28 +1926,22 @@ def main(argv=None) -> None:
         hold = 0.15                                        # build: linger after the last write, then repeat
         return ((time.time() - state["anim_t0"]) / cycle) % (1.0 + hold)
 
-    def upload_lines(rgb, alpha, cedge_rgb, cedge_alpha):
-        """The line buffer: row->id lines first, then the book's causal edges."""
-        seg = np.concatenate([SphereMap.segments(pos, er, ei), SphereMap.segments(pos, csrc, cdst)])
-        paint = np.concatenate([np.concatenate([rgb, alpha[:, None]], axis=1),
-                                np.concatenate([cedge_rgb, cedge_alpha[:, None]], axis=1)])
-        paint = np.repeat(paint[:, None, :], 4, axis=1)
-        upload(line_vbo, np.concatenate([seg, paint], axis=2).reshape((-1, 7)))
+    def write_shell_edges(rgb, alpha, cedge_rgb, cedge_alpha):
+        """Edge colours: row->id lines first, then the book's causal edges."""
+        shell_color_tb.set(np.concatenate([
+            np.concatenate([rgb, alpha[:, None]], axis=1),
+            np.concatenate([cedge_rgb, cedge_alpha[:, None]], axis=1)]))
 
     def rebuild():
+        """Colours only (positions and glow are their own buffers).  Runs when
+        the mode, isolation, focus or pick changes, and per frame only for the
+        ``build`` animation, whose colours follow the construction clock."""
         colors = node_colors(graph, state["mode"], degree, state["isolate"])
         focus = state["focus"]
-        if state["anim"] == "off" or focus:
-            fx = None
-        elif state["anim"] == "flow":
-            fx = spring_effects(world, er, ei)
-        else:
-            fx = animation_effects(graph, state["anim"], anim_clock())
-        rebuild_core()
+        fx = animation_effects(graph, "build", anim_clock()) if state["anim"] == "build" and not focus else None
         if focus:
             colors = focus["fx"]["rgba"].copy()
-            upload(point_vbo, np.concatenate([pos, colors, (scale * focus["fx"]["size"])[:, None],
-                                              focus["fx"]["border"]], axis=1))
+            border, size = focus["fx"]["border"], scale * focus["fx"]["size"]
             alpha = focus["fx"]["edge_alpha"] * ew
             if "cedge_alpha" in focus["fx"]:
                 cedge_rgb, cedge_alpha = focus["fx"]["cedge_rgb"], focus["fx"]["cedge_alpha"]
@@ -1821,91 +1949,54 @@ def main(argv=None) -> None:
                 both = np.isfinite(focus["hops"][csrc]) & np.isfinite(focus["hops"][cdst])
                 cedge_rgb = (colors[csrc, :3] + colors[cdst, :3]) / 2
                 cedge_alpha = np.where(both, 2.6, 0.08) * np.where(ckind == EDGE_HEURISTIC, 0.35, 1.0)
-            upload_lines(focus["fx"]["edge_rgb"], alpha, cedge_rgb, cedge_alpha.astype(np.float32))
-            state["dirty"] = False
-            return
-        if fx is None:
-            border, size, state["front"] = np.zeros((n, 4), np.float32), scale, -1
+            edge_rgb = focus["fx"]["edge_rgb"]
+            state["front"] = -1
         else:
-            colors[:, 3] *= fx["node_alpha"]
-            border, size, state["front"] = fx["border"], scale * fx["size"], fx["front"]
-        prov = graph["node_prov"]
-        border = border.copy()
-        ring = (prov == PROV_MINT) & (border[:, 3] < 0.05)             # minted rows / ids keep their ring
-        border[ring, :3], border[ring, 3] = MINT_RING_RGB, 0.6
-        upload(point_vbo, np.concatenate([pos, colors, size[:, None], border], axis=1))
-        row_color = colors[er]
-        alpha = row_color[:, 3] * colors[ei][:, 3] * ew
-        rgb = row_color[:, :3]
-        if fx is not None:
-            alpha = alpha * fx["edge_alpha"]
-            rgb = rgb * (1.0 - fx["edge_glow"][:, None]) + fx["edge_tint"] * fx["edge_glow"][:, None]
-        # the book's own edges: class tint, heuristic ones hidden (they coincide with the lines above)
-        cedge_alpha = colors[csrc, 3] * colors[cdst, 3] * np.where(ckind == EDGE_HEURISTIC, 0.0, 0.7)
-        upload_lines(rgb, alpha, KIND_TINT[ckind], cedge_alpha.astype(np.float32))
+            if fx is None:
+                border, size, state["front"] = np.zeros((n, 4), np.float32), scale, -1
+            else:
+                colors[:, 3] *= fx["node_alpha"]
+                border, size, state["front"] = fx["border"], scale * fx["size"], fx["front"]
+            border = border.copy()
+            ring = (graph["node_prov"] == PROV_MINT) & (border[:, 3] < 0.05)   # minted rows / ids keep their ring
+            border[ring, :3], border[ring, 3] = MINT_RING_RGB, 0.6
+            row_color = colors[er]
+            alpha = row_color[:, 3] * colors[ei][:, 3] * ew
+            edge_rgb = row_color[:, :3]
+            if fx is not None:
+                alpha = alpha * fx["edge_alpha"]
+                edge_rgb = edge_rgb * (1.0 - fx["edge_glow"][:, None]) + fx["edge_tint"] * fx["edge_glow"][:, None]
+            # the book's own edges: class tint, heuristic ones hidden (they coincide with the lines above)
+            cedge_rgb = KIND_TINT[ckind]
+            cedge_alpha = colors[csrc, 3] * colors[cdst, 3] * np.where(ckind == EDGE_HEURISTIC, 0.0, 0.7)
+        node_color[nc:], node_border[nc:], node_scale[nc:, 0] = colors, border, size
+        color_tb.set(node_color)
+        border_tb.set(node_border)
+        scale_tb.set(node_scale)
+        write_shell_edges(edge_rgb, alpha.astype(np.float32), cedge_rgb, np.asarray(cedge_alpha, np.float32))
         state["dirty"] = False
 
-    core_rgb = _time_ramp(world.core_t) if world.n_core else np.zeros((0, 3), np.float32)
-
-    def rebuild_core():
-        """The process graph inside the sphere: nodes by compile order, edges as chords, glow from the state."""
-        if not world.n_core:
-            return
-        strength, boost = world.glow()
-        strength, boost = strength[:world.n_core], boost[:world.n_core]
-        if state["anim"] != "flow":
-            strength, boost = np.zeros_like(strength), np.zeros_like(boost)
-        active = (world.core_group == world.active_group()) if state["anim"] == "flow" else np.zeros(world.n_core, bool)
-        rgb = np.where(active[:, None], FRONT_RGB, np.where(strength[:, None] > 0.02, BIRTH_RGB, CORE_RING_RGB)).astype(np.float32)
-        colors = np.concatenate([core_rgb, np.full((world.n_core, 1), 0.9, np.float32)], axis=1)
-        border = np.concatenate([rgb, np.maximum(strength, 0.45)[:, None]], axis=1)
-        upload(core_point_vbo, np.concatenate([core_pos, colors, (1.15 * (1.0 + 1.6 * boost))[:, None], border], axis=1))
-        src, dst = world.core_src, world.core_dst
-        seg = SphereMap.segments(core_pos, src, dst)
-        glow = np.maximum(strength[src], strength[dst])
-        paint = np.concatenate([(core_rgb[src] + core_rgb[dst]) / 2 * (1 - glow[:, None]) + ATTACH_RGB * glow[:, None],
-                                (1.6 + 2.0 * glow)[:, None]], axis=1)
-        paint = np.repeat(paint[:, None, :], 4, axis=1)
-        upload(core_line_vbo, np.concatenate([seg, paint], axis=2).reshape((-1, 7)))
-        rebuild_pins()
-
     def rebuild_pins():
-        """Core node -> its identity row on the shell: straight chords, dim; the
-        picked core node's pin (or the pins onto the picked row) bright."""
+        """Pin colours: the picked core node's pin (or the pins onto the picked row) bright."""
         if not n_pinned:
             return
-        pa = core_pos[pinned].astype(np.float32)
-        pb = pos[core_row[pinned]].astype(np.float32)
-        mid = (pa + pb) / 2
-        seg = np.stack([pa, mid, mid, pb], axis=1)
         bright = (pinned == state["pick_core"]) | ((state["pick"] >= 0) & (core_row[pinned] == state["pick"]))
         rgb = np.where(bright[:, None], np.array([1.0, 0.92, 1.0], np.float32), PIN_RGB)
-        alpha = np.where(bright, 3.0, 0.22).astype(np.float32)
-        paint = np.repeat(np.concatenate([rgb, alpha[:, None]], axis=1)[:, None, :], 4, axis=1)
-        upload(pin_line_vbo, np.concatenate([seg, paint], axis=2).reshape((-1, 7)))
+        pin_color_tb.set(np.concatenate([rgb, np.where(bright, 3.0, 0.22).astype(np.float32)[:, None]], axis=1))
 
     def rebuild_pick():
-        nonlocal pick_points
-        p, c = state["pick"], state["pick_core"]
-        marks = []
-        if p >= 0:
-            marks.append([*pos[p], 1, 1, 1, 1, 2.2, 0, 0, 0, 0])
-        if 0 <= c < world.n_core and state["core"]:
-            marks.append([*core_pos[c], 1, 0.92, 1, 1, 2.2, *PIN_RGB, 1.0])
-        pick_points = len(marks)
-        if marks:
-            upload(pick_point_vbo, np.array(marks, np.float32))
+        """The picked row's lines: their pairs and colours (positions come from the node buffer)."""
         rebuild_pins()
+        p = state["pick"]
         if p < 0:
             return 0
         mask = (er == p) | (ei == p)
         cmask = ((csrc == p) | (cdst == p)) & (ckind != EDGE_HEURISTIC)
-        seg = np.concatenate([SphereMap.segments(pos, er[mask], ei[mask]),
-                              SphereMap.segments(pos, csrc[cmask], cdst[cmask])])
-        paint = np.concatenate([np.ones((int(mask.sum()), 4), np.float32),
-                                np.concatenate([KIND_TINT[ckind[cmask]], np.ones((int(cmask.sum()), 1), np.float32)], axis=1)])
-        paint = np.repeat(paint[:, None, :], 4, axis=1)
-        upload(pick_line_vbo, np.concatenate([seg, paint], axis=2).reshape((-1, 7)))
+        pick_pairs_tb.set(np.concatenate([np.stack([er[mask], ei[mask]], axis=1),
+                                          np.stack([csrc[cmask], cdst[cmask]], axis=1)]).astype(np.int32) + nc)
+        pick_color_tb.set(np.concatenate([
+            np.ones((int(mask.sum()), 4), np.float32),
+            np.concatenate([KIND_TINT[ckind[cmask]], np.ones((int(cmask.sum()), 1), np.float32)], axis=1)]))
         return int(mask.sum() + cmask.sum())
 
     causal_src, causal_dst = csrc, cdst                 # the book's edges (plus write-order when no api)
@@ -1925,7 +2016,6 @@ def main(argv=None) -> None:
         state["dirty"] = state["hud_dirty"] = True
 
     pick_edges = 0
-    pick_points = 0
     pages = list(graph["pages"])
     page_rgb = _hue_table(len(pages))
 
@@ -2115,18 +2205,20 @@ def main(argv=None) -> None:
 
     def update_scene():
         nonlocal pick_edges, frame_count
-        if state["physics"]:
+        stepped = bool(state["physics"])
+        if stepped:
             state["error"] = world_frame(state["order"])
-            state["dirty"] = True
             state["hud_dirty"] = True
-        if state["dirty"] or state["physics"]:
+        if stepped or state["dirty"]:
+            upload_positions()
+            upload_glow()
             upload_field()
         if state["anim"] != "off":
             frame_count += 1
             if frame_count % 6 == 0:
                 state["hud_dirty"] = True
         was_dirty = state["dirty"]
-        if was_dirty or (state["anim"] != "off" and not state["focus"]):
+        if was_dirty or (state["anim"] == "build" and not state["focus"]):
             rebuild()
         if was_dirty:
             pick_edges = rebuild_pick()
@@ -2141,61 +2233,91 @@ def main(argv=None) -> None:
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
         ref = float(camera.dist)
 
+        locations = {}
+
+        def loc(prog, name):
+            key = (int(prog), name)
+            if key not in locations:
+                locations[key] = gl.glGetUniformLocation(prog, name)
+            return locations[key]
+
+        flow = 1 if (state["anim"] == "flow" and not state["focus"]) else 0
+        active = world.active_group()
+
         def use(prog, psize=None, lalpha=None):
             gl.glUseProgram(prog)
-            gl.glUniformMatrix4fv(gl.glGetUniformLocation(prog, "uMVP"), 1, gl.GL_FALSE, mvp32)
-            gl.glUniformMatrix3fv(gl.glGetUniformLocation(prog, "uRot"), 1, gl.GL_TRUE, rot32)
+            gl.glUniformMatrix4fv(loc(prog, "uMVP"), 1, gl.GL_FALSE, mvp32)
+            gl.glUniformMatrix3fv(loc(prog, "uRot"), 1, gl.GL_TRUE, rot32)
             if psize is not None:
-                gl.glUniform1f(gl.glGetUniformLocation(prog, "uPointSize"), psize)
-                gl.glUniform1f(gl.glGetUniformLocation(prog, "uRef"), ref)
+                gl.glUniform1f(loc(prog, "uPointSize"), psize)
+                gl.glUniform1f(loc(prog, "uRef"), ref)
             if lalpha is not None:
-                gl.glUniform1f(gl.glGetUniformLocation(prog, "uLineAlpha"), lalpha)
+                gl.glUniform1f(loc(prog, "uLineAlpha"), lalpha)
+
+        def draw_nodes(offset, count, override=None):
+            use(prog_point, psize=state["psize"])
+            for unit, (buf, name) in enumerate(((pos_tb, "uPos"), (color_tb, "uColor"), (border_tb, "uBorder"),
+                                                (scale_tb, "uScale"), (glow_tb, "uGlow"), (meta_tb, "uMeta")), start=1):
+                buf.bind(unit)
+                gl.glUniform1i(loc(prog_point, name), unit)
+            gl.glUniform1i(loc(prog_point, "uOffset"), int(offset))
+            gl.glUniform1i(loc(prog_point, "uFlow"), flow)
+            gl.glUniform1i(loc(prog_point, "uActive"), active)
+            gl.glUniform1i(loc(prog_point, "uOverride"), 0 if override is None else 1)
+            if override is not None:
+                gl.glUniform4f(loc(prog_point, "uOverrideColor"), *override[0])
+                gl.glUniform4f(loc(prog_point, "uOverrideBorder"), *override[1])
+                gl.glUniform1f(loc(prog_point, "uOverrideScale"), override[2])
+            gl.glBindVertexArray(empty_vao)
+            gl.glDrawArrays(gl.GL_POINTS, 0, int(count))
+
+        def draw_edges(pairs, colors, count, lalpha, glow_mode=0, glow_edges=0, arc=1):
+            use(prog_line, lalpha=lalpha)
+            for unit, (buf, name) in enumerate(((pos_tb, "uPos"), (pairs, "uPairs"), (colors, "uEdgeColor"),
+                                                (glow_tb, "uGlow")), start=1):
+                buf.bind(unit)
+                gl.glUniform1i(loc(prog_line, name), unit)
+            gl.glUniform1i(loc(prog_line, "uGlowMode"), glow_mode if flow else 0)
+            gl.glUniform1i(loc(prog_line, "uGlowEdges"), int(glow_edges))
+            gl.glUniform1i(loc(prog_line, "uArc"), int(arc))
+            gl.glBindVertexArray(empty_vao)
+            gl.glDrawArrays(gl.GL_LINES, 0, 4 * int(count))
 
         if state["bg"]:
             gl.glUseProgram(prog_bg)
-            gl.glUniformMatrix4fv(gl.glGetUniformLocation(prog_bg, "uMVP"), 1, gl.GL_FALSE, mvp32)
-            gl.glUniformMatrix3fv(gl.glGetUniformLocation(prog_bg, "uRot"), 1, gl.GL_TRUE, rot32)
-            gl.glUniform1f(gl.glGetUniformLocation(prog_bg, "uContours"), 12.0)
-            gl.glUniform1i(gl.glGetUniformLocation(prog_bg, "uField"), 0)
+            gl.glUniformMatrix4fv(loc(prog_bg, "uMVP"), 1, gl.GL_FALSE, mvp32)
+            gl.glUniformMatrix3fv(loc(prog_bg, "uRot"), 1, gl.GL_TRUE, rot32)
+            gl.glUniform1f(loc(prog_bg, "uContours"), 12.0)
+            gl.glUniform1i(loc(prog_bg, "uField"), 0)
             gl.glActiveTexture(gl.GL_TEXTURE0); gl.glBindTexture(gl.GL_TEXTURE_2D, bg_tex)
             gl.glBindVertexArray(bg_vao)
             for hemisphere in (0, 1):       # far side first, then the near side over it
-                gl.glUniform1i(gl.glGetUniformLocation(prog_bg, "uPass"), hemisphere)
+                gl.glUniform1i(loc(prog_bg, "uPass"), hemisphere)
                 gl.glDrawArrays(gl.GL_TRIANGLES, 0, bg_count)
-        if state["core"] and world.n_core:
-            # the process graph inside: over the translucent near hemisphere, under the shell,
-            # drawn smaller and with its own veil so it reads as inside
-            use(prog_line, lalpha=min(1.0, state["lalpha"] * 1.4))
-            gl.glBindVertexArray(core_line_vao)
-            gl.glDrawArrays(gl.GL_LINES, 0, 4 * len(world.core_src))
-            use(prog_point, psize=state["psize"])
-            gl.glBindVertexArray(core_point_vao)
-            gl.glDrawArrays(gl.GL_POINTS, 0, world.n_core)
+        if state["core"] and nc:
+            # the process graph inside: over the translucent near hemisphere, under the shell
+            draw_edges(core_pairs_tb, core_color_tb, len(world.core_src), min(1.0, state["lalpha"] * 1.4),
+                       glow_mode=2, glow_edges=len(world.core_src))
+            draw_nodes(0, nc)
             if n_pinned:                                # core -> shell identity pins
-                use(prog_line, lalpha=1.0)
-                gl.glBindVertexArray(pin_line_vao)
-                gl.glDrawArrays(gl.GL_LINES, 0, 4 * n_pinned)
+                draw_edges(pin_pairs_tb, pin_color_tb, n_pinned, 1.0, arc=0)
         if state["lines"]:
-            use(prog_line, lalpha=state["lalpha"])
-            gl.glBindVertexArray(line_vao); gl.glBindBuffer(gl.GL_ARRAY_BUFFER, line_vbo)
-            gl.glDrawArrays(gl.GL_LINES, 0, 4 * (len(er) + len(csrc)))
+            draw_edges(shell_pairs_tb, shell_color_tb, len(er) + len(csrc), state["lalpha"],
+                       glow_mode=1, glow_edges=len(er))
         if state["pick"] >= 0 and pick_edges:
-            use(prog_line, lalpha=0.9)
-            gl.glBindVertexArray(pick_line_vao)
-            gl.glDrawArrays(gl.GL_LINES, 0, 4 * pick_edges)
+            draw_edges(pick_pairs_tb, pick_color_tb, pick_edges, 0.9)
         if state["points"]:
-            use(prog_point, psize=state["psize"])
-            gl.glBindVertexArray(point_vao)
-            gl.glDrawArrays(gl.GL_POINTS, 0, n)
-        if state["pick"] >= 0 or state["pick_core"] >= 0:
-            use(prog_point, psize=state["psize"])
-            gl.glBindVertexArray(pick_point_vao)
-            gl.glDrawArrays(gl.GL_POINTS, 0, pick_points)
+            draw_nodes(nc, n)
+        if state["pick"] >= 0:
+            draw_nodes(nc + state["pick"], 1, ((1, 1, 1, 1), (0, 0, 0, 0), 2.2))
+        if 0 <= state["pick_core"] < nc and state["core"]:
+            draw_nodes(state["pick_core"], 1, ((1, 0.92, 1, 1), (*PIN_RGB, 1.0), 2.2))
         if state["hud"]:
             if state["hud_dirty"]:
                 draw_hud(w, h); state["hud_dirty"] = False
             gl.glUseProgram(prog_hud)
-            gl.glUniform1i(gl.glGetUniformLocation(prog_hud, "uTex"), 0)
+            gl.glUniform1i(loc(prog_hud, "uTex"), 0)
+            gl.glActiveTexture(gl.GL_TEXTURE0)
             gl.glBindTexture(gl.GL_TEXTURE_2D, hud_tex)
             gl.glBindVertexArray(hud_vao)
             gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4)
