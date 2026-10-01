@@ -42,6 +42,42 @@ except Exception:
 
 from .abstraction import AbstractTensor
 
+# The backend's one dtype spelling table (it was ``to_dtype_``'s private
+# chain).  AbstractTensor passes dtypes as NumPy-style strings, which NumPy
+# takes natively and torch refuses, so every constructor resolves through
+# this; measured: ``AbstractTensor.arange(..., dtype="int64")`` on this
+# backend raised TypeError inside torch.arange.
+_TORCH_DTYPE_SPELLINGS = (
+    (("float", "float32", "f32"), "float32"),
+    (("float64", "double", "f64"), "float64"),
+    (("float16", "half", "f16"), "float16"),
+    (("int", "int32", "i32"), "int32"),
+    (("int64", "long", "i64"), "int64"),
+    (("int16", "i16"), "int16"),
+    (("int8", "i8"), "int8"),
+    (("uint8", "byte"), "uint8"),
+    (("bool",), "bool"),
+    (("complex64", "c64"), "complex64"),
+    (("complex128", "c128", "cdouble"), "complex128"),
+)
+
+
+def _torch_dtype(dtype):
+    """``None`` / a torch dtype / a NumPy dtype / a spelling -> torch dtype or None."""
+    if dtype is None:
+        return None
+    import torch
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    name = getattr(dtype, "name", None) or getattr(dtype, "__name__", None) or str(dtype)
+    if name == "bool_":
+        name = "bool"
+    for spellings, torch_name in _TORCH_DTYPE_SPELLINGS:
+        if name in spellings:
+            return getattr(torch, torch_name)
+    raise ValueError(f"PyTorchTensorOperations: unrecognised dtype {dtype!r}")
+
+
 class PyTorchTensorOperations(AbstractTensor):
     _compare_broadcasts = True  # ``==``/``<``/... go straight to the array compare
     supports_native_batched_matmul = True
@@ -52,7 +88,7 @@ class PyTorchTensorOperations(AbstractTensor):
         return self.data.swapaxes(axis1, axis2)
     def empty_(self, size, dtype=None, device=None):
         import torch
-        return torch.empty(size, dtype=dtype, device=device or self.default_device)
+        return torch.empty(size, dtype=_torch_dtype(dtype), device=device or self.default_device)
     def diag_(self, offset: int = 0):
         import torch
         return torch.diag(self.data, diagonal=offset)
@@ -97,7 +133,13 @@ class PyTorchTensorOperations(AbstractTensor):
         import torch
         x = x.data if isinstance(x, AbstractTensor) else x
         y = y.data if isinstance(y, AbstractTensor) else y
-        return torch.where(self.data, x, y)
+        # The selection rule is ``a if bool(c) else b`` (the scalar kernel,
+        # NumPy's where): a non-bool condition selects by truthiness.  torch
+        # refuses a non-bool condition; measured: the dt controller's
+        # ``_propose_dt_pen`` passes a float presence mask
+        # (error_present * error_limits_present) and raised here.
+        condition = self.data if self.data.dtype == torch.bool else self.data != 0
+        return torch.where(condition, x, y)
 
     def maximum_(self, other):
         import torch
@@ -363,10 +405,10 @@ class PyTorchTensorOperations(AbstractTensor):
         raise NotImplementedError(f"Operator {op} not implemented for PyTorch backend.")
 
     def full_(self, size, fill_value, dtype, device):
-        return torch.full(size, fill_value, dtype=dtype, device=device or self.default_device)
+        return torch.full(size, fill_value, dtype=_torch_dtype(dtype), device=device or self.default_device)
 
     def zeros_(self, size, dtype, device):
-        return torch.zeros(size, dtype=dtype, device=device or self.default_device)
+        return torch.zeros(size, dtype=_torch_dtype(dtype), device=device or self.default_device)
 
     def clone_(self):
         return self.data.clone()
@@ -467,7 +509,7 @@ class PyTorchTensorOperations(AbstractTensor):
         return self.data != value
 
     def arange_(self, start, end, step=1, *, dtype=None, device=None):
-        return torch.arange(start, end, step, device=device or self.default_device, dtype=dtype)
+        return torch.arange(start, end, step, device=device or self.default_device, dtype=_torch_dtype(dtype))
 
     def select_by_indices_(self, indices_dim0, indices_dim1):
         return self.data[indices_dim0, indices_dim1]
@@ -638,7 +680,7 @@ class PyTorchTensorOperations(AbstractTensor):
             auto_converted = False
         if auto_converted:
             print("[TensorBackend:torch] Auto-converted input to list for tensor_from_list_()")
-        return torch.tensor(data, dtype=dtype, device=device or self.default_device)
+        return torch.tensor(data, dtype=_torch_dtype(dtype), device=device or self.default_device)
 
     def boolean_mask_select_(self, mask):
         return self.data[mask]
@@ -651,7 +693,12 @@ class PyTorchTensorOperations(AbstractTensor):
         return self.data < value
 
     def index_select_(self, dim, indices):
-        return torch.index_select(self.data, dim, indices)
+        # Unwrap like the NumPy backend: ``AbstractTensor.index_select`` hands
+        # the indices over as a wrapper, and torch takes only its own long
+        # tensor on the source's device.
+        idx = self._AbstractTensor__unwrap(indices)
+        idx = torch.as_tensor(idx, dtype=torch.long, device=self.data.device)
+        return torch.index_select(self.data, dim, idx)
 
     def argmin_(self, dim=None, keepdim=False):
         x = self.data
@@ -704,7 +751,7 @@ class PyTorchTensorOperations(AbstractTensor):
     def load_(self, filepath: str, dtype, device):
         t = torch.load(filepath, map_location=device or self.default_device)
         if dtype is not None:
-            t = t.to(dtype)
+            t = t.to(_torch_dtype(dtype))
         return t
 
     @property
@@ -761,27 +808,7 @@ class PyTorchTensorOperations(AbstractTensor):
         return result
 
     def to_dtype_(self, dtype: str = "float"):
-        if isinstance(dtype, torch.dtype):
-            return self.data.to(dtype)
-        if dtype in ("float", "float32", "f32"):
-            return self.data.float()
-        elif dtype in ("float64", "double", "f64"):
-            return self.data.double()
-        elif dtype in ("int", "int32", "i32"):
-            return self.data.int()
-        elif dtype in ("int64", "long", "i64"):
-            return self.data.long()
-        elif dtype in ("uint8", "byte"):
-            return self.data.byte()
-        elif dtype in ("bool",):
-            return self.data.bool()
-        elif dtype in ("complex64", "c64"):
-            return self.data.to(torch.complex64)
-        elif dtype in ("complex128", "c128", "cdouble"):
-            return self.data.to(torch.complex128)
-        raise ValueError(
-            f"PyTorchTensorOperations.to_dtype_: unrecognised dtype {dtype!r}"
-        )
+        return self.data.to(_torch_dtype(dtype))
 
     def repeat_(self, repeats: Any = None, dim: int = 0):
         """Repeat tensor data along ``dim`` ``repeats`` times.
