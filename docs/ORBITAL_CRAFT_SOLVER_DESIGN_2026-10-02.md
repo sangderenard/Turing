@@ -32,5 +32,27 @@ manifestation in the dt system and compiler.
    development provenance; build what is new in the dt-system and compiler
    region.
 
-Open: duration (fixed vs free), cost form (per-axis fuel vs |F|), mass
-(constant first vs rocket equation), first-build order.
+## Further decisions (user, same day)
+
+6. **A live game.** There is a fixed flight plan, but the intention is a live
+   game: clicking on a mass transfers the craft to it, with the thruster
+   activations animated.
+7. **Cost.** An alpha/beta mix of total average fuel-consumption rate and
+   time to arrive, plus a steep ("big, scary") run-out-of-fuel penalty that
+   rises sharply as remaining fuel approaches zero.
+8. **The seam is r() and F().** Whatever the craft becomes, it interfaces
+   with the trajectory r() and the force F(). Everything up to that seam can
+   be developed now, before any further craft question is answered; the
+   early jumper sits behind it.
+9. **End goal for the craft.** Mass falls as fuel burns, at a rate set by the
+   thruster type (specific impulse per thruster kind); the craft has its own
+   machine-sim-style but simplified moment and inertia (attitude dynamics),
+   so thrust direction comes from orientation and actuators, not from
+   ideal axis forces.
+
+Build order: (1) jumper behind the r()/F() seam as lockstep dt-system
+pieces; (2) actuation matrix from control signals to F; (3) live tracking of
+a fixed plan; (4) collocation planner with the cost of decision 7;
+(5) off-plan switching with hysteresis and warm-started full-trip re-plans;
+(6) the game: click a mass, transfer, animated thrusters; (7) fuel-burn mass
+loss and attitude dynamics.
