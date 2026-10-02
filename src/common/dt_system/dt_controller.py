@@ -711,6 +711,10 @@ def run_superstep(state,
         dt_try_value = float(dt_try.item())
         if dt_try_value <= 0.0:
             break
+        # A substep clipped to land on the window (or on an event boundary)
+        # is not the controller's step: its length is the remainder, not a
+        # proposal.  See ``last_dt_next`` below.
+        clipped = dt_try_value < float(dt_cap.item())
         metrics, dt_next, dt_used = step_with_dt_control_used(
             state,
             dt_try,
@@ -757,7 +761,19 @@ def run_superstep(state,
                 lattice_value = lattice_count * lattice_quantum
                 if lattice_value.item() > 0.0:
                     dt_cap = lattice_value
-        last_dt_next = dt_next
+        # The continuation into the next round is the controller's proposal
+        # for an unclipped step, never one derived from the clipped landing
+        # remainder.  Program: orbital jumper, window 291.4 s, CFL dt 3.31 s,
+        # ``energy_exchange_fraction=0.2``, pieces publish no energy channel
+        # (every participant HOLD).  HOLD caps the proposal at the step just
+        # taken (``exchange_time_bound(dt_current=...)``), so the clipped
+        # final substep (3.275 s) became ``dt_next``, the next round's first
+        # attempt, and dt ratcheted 3.31 -> 3.28 -> 3.18 -> 1.61 -> 0.45 ->
+        # 0.024 s until a round could not land.  Rule: a clipped substep
+        # leaves ``last_dt_next`` as the last unclipped substep's proposal
+        # (or the round's opening dt_cap when every substep was clipped).
+        if not clipped:
+            last_dt_next = dt_next
 
     if unresolved:
         first = unresolved[0]

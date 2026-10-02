@@ -1039,14 +1039,18 @@ def advance_round(state, window=None, *, subcycles=()):
 
     ``window`` is the world time the containing system asks this round to
     land (default: the graph's ``round_max``).  The first attempt is the
-    continuation the controller left after the previous round, clipped to
-    the window; the round's result becomes the next continuation.  Returns
+    continuation the controller left after the previous round, handed over
+    unclipped: ``run_superstep`` clips the attempt to the window and does not
+    let a clipped substep author the continuation.  Pre-clipping it here made
+    a short window's length the controller's own step, so under a HOLD it
+    became the continuation and later, longer windows never recovered.  The
+    round's result becomes the next continuation.  Returns
     ``(advanced, dt_next, telemetry)`` as ``dt_system`` reports one round.
     """
 
     window = state.round_window if window is None else float(window)
     carried = state.dt_init if state.dt_next is None else float(state.dt_next)
-    initial = min(window, carried)
+    initial = carried
     names, schedule = state.bound_pieces
     _state, _controller, results = dt_system(
         state.pieces, {name: getattr(state, name) for name in names},
