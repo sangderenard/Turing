@@ -14,6 +14,20 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
 import sympy
+from sympy.matrices.expressions.matexpr import MatrixElement
+
+
+def matrix_component_name(base: str, index: Sequence[int]) -> str:
+    """The declared scalar name of component ``index`` of matrix ``base``.
+
+    One spelling for both directions: an element of a MatrixSymbol read on a
+    right-hand side becomes the input column of this name, and a component
+    of a matrix-valued equation becomes the output of this name.  The
+    compiler refuses a set in which this name collides with another input or
+    output, so the spelling never decides identity by itself.
+    """
+
+    return "_".join((str(base), *(str(int(position)) for position in index)))
 
 
 @dataclass(frozen=True)
@@ -40,6 +54,9 @@ SYMPY_PROCESS_GRAPH_TRANSLATIONS: Mapping[object, SympyProcessGraphRule] = (
         sympy.IndexedBase: SympyProcessGraphRule(
             "input", node_type="Input"
         ),
+        # An element of a MatrixSymbol is one declared input column; the
+        # node carries the matrix, its shape and the element index.
+        MatrixElement: SympyProcessGraphRule("input", node_type="Input"),
         sympy.Integer: SympyProcessGraphRule("const", node_type="Constant"),
         sympy.Float: SympyProcessGraphRule("const", node_type="Constant"),
         sympy.Rational: SympyProcessGraphRule("const", node_type="Constant"),
@@ -816,6 +833,40 @@ def ingest_sympy_expression(
                 {
                     "binding_name": str(value),
                     "binding_kind": "symbol",
+                },
+            )
+            memo[value] = node_id
+            return node_id
+
+        if isinstance(value, MatrixElement):
+            # ``M[i, j]`` of a MatrixSymbol ``M`` of declared shape: an input
+            # column, declared like a Symbol input, carrying where it sits in
+            # the matrix.  Any other matrix parent, a symbolic index or a
+            # symbolic shape has no column and is refused here.
+            parent, *positions = value.args
+            if not isinstance(parent, sympy.MatrixSymbol):
+                raise TypeError(
+                    "MatrixElement of a non-MatrixSymbol has no declared "
+                    f"input column: {value!r}")
+            if not all(getattr(item, "is_Integer", False)
+                       for item in (*positions, *parent.shape)):
+                raise TypeError(
+                    "MatrixElement needs integer indices into a MatrixSymbol "
+                    f"of integer shape: {value!r}")
+            index = tuple(int(position) for position in positions)
+            shape = tuple(int(extent) for extent in parent.shape)
+            rule = SYMPY_PROCESS_GRAPH_TRANSLATIONS[MatrixElement]
+            node_id = make_node(
+                value,
+                rule,
+                (),
+                (),
+                {
+                    "binding_name": matrix_component_name(parent.name, index),
+                    "binding_kind": "symbol",
+                    "matrix_symbol": str(parent.name),
+                    "matrix_shape": shape,
+                    "matrix_index": index,
                 },
             )
             memo[value] = node_id
@@ -1944,6 +1995,7 @@ __all__ = [
     "SymbolicProcessModel",
     "ingest_sympy_expression",
     "ingest_sympy_expressions",
+    "matrix_component_name",
     "process_graph_to_sympy_expressions",
     "process_graph_to_sympy_relations",
     "ingest_sympy_process_model",

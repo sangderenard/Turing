@@ -22,52 +22,30 @@ refusal is recorded too.
 Route per law: ``compile_sympy_equations`` -> ``piece_from_law``
 (``symbolic_abstract_tensor_source`` -> ``lower_ast_source_to_ssa`` ->
 LLVM emission + compile) -> C emission (``emit_ssa_module_to_c``) + compile
--> native run against a sympy reference.  The reference is the same set with
-concrete functions chosen for ``r(s)``, ``F(s)`` and numbers for the centers
-(reference side only), ``doit()`` and ``lambdify``.  A law that reaches the
+-> native run against a sympy reference.  The reference evaluates the very
+outputs the compiler declared (``declared_symbolic_outputs``) with concrete
+functions chosen for ``r(s)`` and ``F(s)`` (reference side only), each
+declared MatrixSymbol element input read from its own column
+(``matrix_element_inputs``), ``doit()`` and ``lambdify``.  A law that reaches the
 book prints the process-graph / book / emission-unit counts and one unit's
 chain back to its ``source_span`` through ``book.edges_into``.
 
 The probe exits nonzero while any law fails to lower.  Each failure prints
 the construct, the stage, the raising frame and the message verbatim.
 
-Ranked work list (measured 2026-10-02: 0/8 laws reach the book, 9 failures;
-smallest fix first; verbatim messages in
-``docs/concordance_census/CONTINUATION_orbital_probe.md``):
-
-1. Matrix-valued Equality as an output (the raw set): ``equation output
-   must be a Symbol`` at ``symbolic_equation_compiler.py:91``
-   (``_compile_sympy_equations_uncached``).  Fix there: an Equality whose
-   lhs is a Matrix names one output per element.
-2. ``MatrixElement`` (``c_1[0, 0]``, ``r_start[0, 0]``, ``r_end[0, 0]``):
-   ``no SymPy to ProcessGraph translation rule for MatrixElement`` at
-   ``symbolic_process_graph.py:1064`` (``add_node``, strict ingest).  Fix in
-   ``SYMPY_PROCESS_GRAPH_TRANSLATIONS`` / ``ingest_sympy_expression``: a
-   MatrixSymbol is a parameter of declared shape, a MatrixElement an index
-   into it.  Laws: equation_of_motion_rhs, initial/terminal_condition_rhs.
-3. Undefined applied Functions as values (``r1(0)``, ``r1(L)``, ``F1(s)``
-   at the quadrature nodes): ingest emits ``Call callee='r1'`` with no body
-   and nothing binds it; ``lower_ast_source_to_ssa`` then raises
-   ``FortranEmissionError: full-native execution contract rejected ...``
-   at ``fortran_c_shell.py:45626`` (``_lower_ast_source_to_ssa_impl``):
-   ``undefined_operands=3`` for the cost Integral (the F1/F2/F3 results
-   feeding planned region 5), ``structural_outputs ... call-result-
-   unavailable`` for the boundary-condition lhs.  The Integral itself lowers
-   (5-point Gauss-Legendre in ``lower_integral_declaration``).  Fix: a
-   declared binding for an AppliedUndef (column / sampled Table / bound
-   callee -- the binding ``bitops.declare`` already asks for) accepted by
-   ``compile_sympy_equations`` and carried into the materialized source.
-4. ``Derivative`` of an applied undefined Function (``d2 r1(s)/ds2`` in the
-   EOM lhs, ``d r1(s)/ds`` in the energy): ``ProcessGraph has no
-   graph-native adjoint rule for <n>:call`` at
-   ``process_graph_autograd.py:2072`` (``differentiate_process_graph``,
-   reached from ``symbolic_process_graph.add_node``'s Derivative branch).
-   Needs 3 first (a bound callee or Table has a derivative; an unbound call
-   has none), then an adjoint rule for ``call`` in ``process_graph_autograd``.
-5. Non-ASCII symbol names (``mu_1`` spelled with GREEK SMALL LETTER MU):
-   UNKNOWN -- every law that carries them fails earlier (items 2 and 4).
-   That name's ``isidentifier()`` is True, so the materialized Python is
-   legal; not observed either way.
+Work list: ``WORK_ITEMS`` below (the user's order, 2026-10-02), and
+``LAW_BLOCKERS`` -- the work items each law needs before it can pass.
+``tests/test_orbital_transfer_compile.py`` marks exactly those laws
+``xfail(strict=True)`` with reasons built from ``WORK_ITEMS``, and asserts
+that the union of the blockers IS the work list, so a fix that lands flips
+its laws to XPASS and forces both tables to be edited.  Item 1 (matrices
+and complicated lhs) is resolved: a matrix-valued Equality declares one
+output per component and a non-name lhs its residual
+(``symbolic_equation_compiler.declared_symbolic_outputs``); a MatrixElement
+of a MatrixSymbol is an input column (``symbolic_process_graph``).
+History and verbatim messages:
+``docs/concordance_census/CONTINUATION_orbital_probe.md`` and
+``CONTINUATION_orbital_step1_matrices.md``.
 
     python -u tools/compiler_probes/probe_orbital_transfer.py
 """
@@ -89,6 +67,36 @@ sys.path.insert(0, str(REPO / "tools" / "compiler_probes"))
 BUILD = REPO / "build" / "orbital_transfer"
 BATCH = 4
 TOLERANCE = 1e-12
+
+# The user's work items for this set (2026-10-02), the ones still open.
+# Item 1 (matrices and complicated lhs) is resolved and is not listed.
+WORK_ITEMS: dict[int, str] = {
+    2: "Greek-name sanitation (mu_1/mu_2 spelled with GREEK SMALL LETTER MU)",
+    3: "external functions compiled as runtime-provided symbols "
+       "(r1(s), F1(s) are applied undefined Functions; ingest emits an "
+       "unbound Call)",
+    4: "live differentiation/integration (Derivative of an applied undefined "
+       "Function: no graph-native adjoint rule for call)",
+}
+
+# law -> the open work items it needs before it can pass, by the constructs
+# it carries.  A law not listed must pass.  Item 2 is assigned by construct
+# presence only: every Greek-carrying law also needs item 3, so its own
+# failure (if any) is not observed yet.
+LAW_BLOCKERS: dict[str, tuple[int, ...]] = {
+    "orbital_transfer_raw": (2, 3, 4),
+    "equation_of_motion_lhs": (3, 4),
+    "equation_of_motion_rhs": (2, 3),
+    "total_energy_expression": (2, 3, 4),
+    "force_cost_integral": (3,),
+    "initial_condition_lhs": (3,),
+    "terminal_condition_lhs": (3,),
+}
+
+
+def blocker_reason(items) -> str:
+    """The xfail reason for a law blocked by ``items``, from ``WORK_ITEMS``."""
+    return " | ".join(f"work item {item}: {WORK_ITEMS[item]}" for item in items)
 
 
 # -- the program -----------------------------------------------------------
@@ -125,6 +133,13 @@ def named_laws(program: dict) -> dict[str, tuple[sp.Equality, ...]]:
         else:
             laws[key] = (sp.Eq(sp.Symbol(key), value, evaluate=False),)
     return laws
+
+
+def benchmark_laws(program: dict) -> dict[str, tuple[sp.Equality, ...]]:
+    """The raw Equalities of the set, unnamed as the physics module returns
+    them (``orbital_transfer_raw``), then one law per entry and side."""
+    raw = tuple(value for value in program.values() if isinstance(value, sp.Equality))
+    return {"orbital_transfer_raw": raw, **named_laws(program)}
 
 
 # -- failure capture -------------------------------------------------------
@@ -181,9 +196,9 @@ def _record(failures, law, stage, equations, error):
 # -- reference -------------------------------------------------------------
 
 def reference_bindings(program: dict):
-    """Concrete functions and numbers for the reference evaluation only."""
+    """Concrete functions for the reference evaluation only."""
     s = sp.Symbol("s", real=True)
-    concrete = {
+    return {
         sp.Function("r1"): sp.Lambda(s, 3 + sp.cos(s / 5)),
         sp.Function("r2"): sp.Lambda(s, 2 * sp.sin(s / 7)),
         sp.Function("r3"): sp.Lambda(s, s / 11),
@@ -191,13 +206,6 @@ def reference_bindings(program: dict):
         sp.Function("F2"): sp.Lambda(s, sp.Rational(-1, 20)),
         sp.Function("F3"): sp.Lambda(s, s**2 / 1000),
     }
-    matrices = {
-        sp.MatrixSymbol("c_1", 3, 1): sp.ImmutableMatrix([0, 0, 0]),
-        sp.MatrixSymbol("c_2", 3, 1): sp.ImmutableMatrix([10, -1, 2]),
-        sp.MatrixSymbol("r_start", 3, 1): sp.ImmutableMatrix([1, 2, 3]),
-        sp.MatrixSymbol("r_end", 3, 1): sp.ImmutableMatrix([4, 5, 6]),
-    }
-    return concrete, matrices
 
 
 def reference_columns(names, batch=BATCH) -> dict[str, np.ndarray]:
@@ -205,20 +213,32 @@ def reference_columns(names, batch=BATCH) -> dict[str, np.ndarray]:
     return {name: rng.uniform(0.5, 2.0, batch) for name in names}
 
 
-def reference_values(equations, columns, concrete, matrices) -> dict[str, np.ndarray]:
+def reference_values(compilation, law, columns, concrete) -> dict[str, np.ndarray]:
+    """Each output the compiler declared, evaluated by sympy.
+
+    The outputs are read from the compiler's own declaration
+    (``declared_symbolic_outputs``: assignment rhs, or residual lhs - rhs),
+    and each MatrixSymbol element it declared as an input column is read
+    from that column (``matrix_element_inputs``)."""
+    from src.compiler.symbolic_equation_compiler import declared_symbolic_outputs
+
+    elements = {
+        sp.MatrixSymbol(matrix, *shape)[tuple(index)]: sp.Symbol(column)
+        for column, matrix, shape, index
+        in compilation.function.metadata["matrix_element_inputs"]}
     out = {}
-    for equation in equations:
-        expr = equation.rhs.xreplace(matrices)
+    for row in declared_symbolic_outputs(compilation.equations, law):
+        expr = row.expression.xreplace(elements)
         for function, body in concrete.items():
             expr = expr.replace(function, body)
         expr = expr.doit()
         symbols = sorted(expr.free_symbols, key=lambda symbol: symbol.name)
         missing = [str(symbol) for symbol in symbols if str(symbol) not in columns]
         if missing:
-            raise KeyError(f"reference for {equation.lhs}: no column for {missing}")
+            raise KeyError(f"reference for {row.name}: no column for {missing}")
         function = sp.lambdify(symbols, expr, modules="numpy")
         value = function(*(columns[str(symbol)] for symbol in symbols))
-        out[str(equation.lhs)] = np.broadcast_to(np.asarray(value, np.float64), (BATCH,)).copy()
+        out[row.name] = np.broadcast_to(np.asarray(value, np.float64), (BATCH,)).copy()
     return out
 
 
@@ -261,7 +281,7 @@ def book_report(module, entry, graphs) -> int:
 
 # -- one law ---------------------------------------------------------------
 
-def run_law(law, equations, failures, concrete, matrices, sink=None):
+def run_law(law, equations, failures, concrete, sink=None):
     """Returns the piece (lowered and emitted) or None."""
     from src.compiler.native_package import piece_from_law
     from src.compiler.symbolic_equation_compiler import compile_sympy_equations
@@ -297,7 +317,7 @@ def run_law(law, equations, failures, concrete, matrices, sink=None):
         return piece
     columns = reference_columns(arguments)
     try:
-        expected = reference_values(equations, columns, concrete, matrices)
+        expected = reference_values(compilation, law, columns, concrete)
         llvm = dict(zip(piece.output_names, piece(*(columns[name] for name in arguments))))
         execution = c_artifact.prepare_execution(
             {value_id: columns[name] for name, value_id in zip(arguments, piece.argument_ids)})
@@ -323,10 +343,10 @@ def lower_for_viewer(process_graph_sink):
     that reaches the book, lowered exactly as this probe lowers it.  Returns
     (module, root symbol); refuses with the recorded failures when none does."""
     program = build_program()
-    concrete, matrices = reference_bindings(program)
+    concrete = reference_bindings(program)
     failures: list = []
-    for law, equations in named_laws(program).items():
-        piece = run_law(law, equations, failures, concrete, matrices,
+    for law, equations in benchmark_laws(program).items():
+        piece = run_law(law, equations, failures, concrete,
                         sink=process_graph_sink)
         if piece is not None:
             return piece.module, piece.entry
@@ -335,39 +355,55 @@ def lower_for_viewer(process_graph_sink):
 
 
 def main() -> int:
+    # The set's symbol names are not all cp1252 (GREEK SMALL LETTER MU).
+    sys.stdout.reconfigure(errors="backslashreplace")
     program = build_program()
-    concrete, matrices = reference_bindings(program)
-    laws = named_laws(program)
+    concrete = reference_bindings(program)
+    laws = benchmark_laws(program)
     failures: list = []
     print("program entries:", ", ".join(program))
     print("laws:", {law: [str(eq.lhs) for eq in eqs] for law, eqs in laws.items()})
 
-    # The raw Equalities of the set, unnamed, as the physics module returns them.
-    from src.compiler.symbolic_equation_compiler import compile_sympy_equations
-
-    raw = [value for value in program.values() if isinstance(value, sp.Equality)]
-    try:
-        compile_sympy_equations(raw, name="orbital_transfer_raw")
-        print("ok   raw Equalities accepted")
-    except Exception as error:  # noqa: BLE001
-        _record(failures, "orbital_transfer_raw", "compile_sympy_equations", raw, error)
-
     reached = 0
+    failed_laws: set[str] = set()
     for law, equations in laws.items():
         graphs: list = []
-        piece = run_law(law, equations, failures, concrete, matrices, sink=graphs.append)
+        before = len(failures)
+        piece = run_law(law, equations, failures, concrete, sink=graphs.append)
         if piece is not None:
             reached += 1
             if book_report(piece.module, piece.entry, graphs):
                 print(f"FAIL {law:24} chain did not reach a source_span row")
                 failures.append(Failure(law, "chain", "", "no source_span", ""))
+        if len(failures) > before:
+            failed_laws.add(law)
 
     print()
     print(f"laws reaching the book: {reached}/{len(laws)}; failures: {len(failures)}")
     by_stage = collections.Counter((f.stage, f.frame.split(' ')[-1]) for f in failures)
     for (stage, where), count in sorted(by_stage.items()):
         print(f"  {count} x {stage} raised in {where}")
-    return 1 if failures else 0
+    print()
+    print("work list (open items; item 1, matrices and complicated lhs, resolved):")
+    for item, text in WORK_ITEMS.items():
+        blocked = [law for law, items in LAW_BLOCKERS.items() if item in items]
+        print(f"  {item}. {text}")
+        print(f"     laws: {', '.join(blocked)}")
+    drift = 0
+    for law in laws:
+        expected_fail = law in LAW_BLOCKERS
+        failed = law in failed_laws
+        verdict = "pass"
+        if failed and expected_fail:
+            verdict = "fail, expected: work items " + ", ".join(
+                str(item) for item in LAW_BLOCKERS[law])
+        if failed != expected_fail:
+            drift += 1
+            verdict = ("UNEXPECTED FAIL" if failed
+                       else "XPASS -- remove its LAW_BLOCKERS entry")
+        print(f"  {law:24} {verdict}")
+    print(f"work-list drift: {drift}")
+    return 1 if failures or drift else 0
 
 
 if __name__ == "__main__":

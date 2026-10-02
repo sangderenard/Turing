@@ -1855,6 +1855,48 @@ SSA_BLOCK = declare_page("ssa_block", (
     RowField("label", K.LABEL),
 ), SSABlockKind)                       # SSABlockKind | Unresolved(SSA_BLOCK_OWNER_UNROUTED); CONCORD
 
+# ----------------------------------------------------------------------------
+# Symbolic equation outputs (orbital benchmark, work item 1: matrices and
+# complicated left-hand sides).  Writer: ``symbolic_equation_compiler.
+# compile_sympy_equations``.  Each authored Equality is a NOVEL root on
+# ``symbolic_equation`` keyed by (program, equation index); every declared
+# output the equation produces -- one per component of a matrix lhs, one for
+# a scalar lhs -- is DERIVED from that equation's cell, its fact naming the
+# equation index, the component index and the form (assignment to a declared
+# name, or the residual ``lhs - rhs`` of a non-name lhs).  ``program`` is
+# (law name, digest of the authored set), so two different sets compiled
+# under one name never share a row.
+# ----------------------------------------------------------------------------
+
+class SymbolicOutputForm(Enum):
+    #: lhs is a declared name (a Symbol, or an element of a MatrixSymbol):
+    #: the output is the rhs.
+    ASSIGNMENT = "assignment"
+    #: lhs is any other expression: the output is the residual lhs - rhs,
+    #: zero where the equation holds.
+    RESIDUAL = "residual"
+
+
+@dataclass(frozen=True)
+class SymbolicEquationFact:
+    srepr_sha256: str
+    lhs_shape: tuple
+
+
+@dataclass(frozen=True)
+class SymbolicOutputFact:
+    equation_index: int
+    component: tuple
+    form: SymbolicOutputForm
+
+
+SYMBOLIC_EQUATION = declare_page("symbolic_equation", (
+    RowField("program", K.SCOPE), RowField("equation", K.INDEX),
+), SymbolicEquationFact)               # NOVEL(INGEST_SOURCE) root; CONCORD
+SYMBOLIC_EQUATION_OUTPUT = declare_page("symbolic_equation_output", (
+    RowField("program", K.SCOPE), RowField("output", K.NAME),
+), SymbolicOutputFact)                 # DERIVED(symbolic_equation cell); CONCORD
+
 __all__ =[name for name in dir() if not name.startswith("_") and name not in {
     "ast", "dataclass", "Enum", "Any", "Ref", "RowField", "K", "Unresolved",
     "declare_page", "declare_reason", "declare_stage", "declare_transform",

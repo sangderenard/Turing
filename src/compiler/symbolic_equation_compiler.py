@@ -22,6 +22,7 @@ from .ssa_builder import process_graph_to_ssa_instrs
 from .symbolic_process_graph import (
     ingest_sympy_expression,
     ingest_sympy_expressions,
+    matrix_component_name,
 )
 from .sympy_dual_ir_cache import SympyDualIRCache
 from ..common.tensors.accelerator_backends.aot_checkpoint import callable_digest
@@ -64,6 +65,100 @@ def _numeric_constant(value: Any) -> Any:
     return value
 
 
+@dataclass(frozen=True, slots=True)
+class SymbolicOutputDeclaration:
+    """One declared output of an authored equation set.
+
+    ``component`` is the element index of a matrix-valued equation (``()``
+    for a scalar one).  ``form`` is ``"assignment"`` when the lhs is a
+    declared name (a Symbol, or an element of a MatrixSymbol) and the output
+    is the rhs, or ``"residual"`` when the lhs is any other expression and
+    the output is ``lhs - rhs`` (the lane's linear-system convention; zero
+    where the equation holds).
+    """
+
+    name: str
+    equation_index: int
+    component: tuple[int, ...]
+    form: str
+    expression: sympy.Basic
+
+
+def _is_matrix(value: Any) -> bool:
+    return isinstance(value, (sympy.MatrixBase, sympy.MatrixExpr))
+
+
+def _scalar_output(
+    lhs: sympy.Basic, rhs: sympy.Basic, unnamed: str,
+    equation_index: int, component: tuple[int, ...],
+) -> SymbolicOutputDeclaration:
+    from sympy.matrices.expressions.matexpr import MatrixElement
+
+
+    if isinstance(lhs, sympy.Symbol):
+        return SymbolicOutputDeclaration(
+            str(lhs), equation_index, component, "assignment", rhs)
+    if (
+        isinstance(lhs, MatrixElement)
+        and isinstance(lhs.args[0], sympy.MatrixSymbol)
+        and all(getattr(item, "is_Integer", False) for item in lhs.args[1:])
+    ):
+        return SymbolicOutputDeclaration(
+            matrix_component_name(
+                lhs.args[0].name, tuple(int(item) for item in lhs.args[1:])),
+            equation_index, component, "assignment", rhs)
+    # As written: the residual is the two authored sides, unevaluated.
+    residual = sympy.Add(
+        lhs, sympy.Mul(sympy.Integer(-1), rhs, evaluate=False), evaluate=False)
+    return SymbolicOutputDeclaration(
+        unnamed, equation_index, component, "residual", residual)
+
+
+def declared_symbolic_outputs(
+    equations: Sequence[sympy.Equality], name: str,
+) -> tuple[SymbolicOutputDeclaration, ...]:
+    """The outputs an authored equation set declares, in authored order.
+
+    A scalar equation declares one output; a matrix-valued equation (lhs a
+    Matrix, MatrixSymbol or matrix expression, rhs of the same shape)
+    declares one output per component, row-major.  An output whose lhs is
+    not a declared name is named from the equation: a MatrixSymbol lhs names
+    its components ``matrix_component_name(M, (i, j))``; any other equation
+    is named ``<name>_<equation index>`` and its components
+    ``<name>_<equation index>_<i>_<j>``.
+    """
+
+
+    declarations: list[SymbolicOutputDeclaration] = []
+    for index, equation in enumerate(equations):
+        if not isinstance(equation, sympy.Equality):
+            raise TypeError(f"expected a SymPy Equality, got {equation!r}")
+        lhs, rhs = equation.lhs, equation.rhs
+        unnamed = f"{name}_{index}"
+        if _is_matrix(lhs) or _is_matrix(rhs):
+            if not (_is_matrix(lhs) and _is_matrix(rhs)):
+                raise TypeError(
+                    "a matrix-valued equation needs a matrix on both sides: "
+                    f"{equation!r}")
+            if tuple(lhs.shape) != tuple(rhs.shape):
+                raise TypeError(
+                    f"equation sides differ in shape {tuple(lhs.shape)} vs "
+                    f"{tuple(rhs.shape)}: {equation!r}")
+            rows, columns = (int(extent) for extent in lhs.shape)
+            base = lhs.name if isinstance(lhs, sympy.MatrixSymbol) else unnamed
+            for row in range(rows):
+                for column in range(columns):
+                    component = (row, column)
+                    declarations.append(_scalar_output(
+                        lhs[row, column], rhs[row, column],
+                        matrix_component_name(base, component),
+                        index, component,
+                    ))
+            continue
+        declarations.append(_scalar_output(lhs, rhs, unnamed, index, ()))
+    return tuple(declarations)
+
+
 def _compile_sympy_equations_uncached(
     equations: Sequence[sympy.Equality],
     *,
@@ -74,29 +169,31 @@ def _compile_sympy_equations_uncached(
 ) -> SymbolicEquationCompilation:
     """Lower simultaneous named SymPy equations into repository SSA.
 
-    Each left-hand side names one result and each right-hand side is compiled
-    verbatim through the canonical SymPy ProcessGraph importer.  Output names
-    are not permitted as right-hand-side inputs: one invocation is a
-    simultaneous state transition, and recurrence belongs to the caller that
-    feeds the returned state into the next invocation.
+    Each equation declares its outputs (``declared_symbolic_outputs``): a
+    Symbol lhs names one result, a matrix-valued equation one result per
+    component, and an lhs that is not a declared name contributes its
+    residual.  Every output expression is compiled verbatim through the
+    canonical SymPy ProcessGraph importer.  Output names are not permitted
+    as right-hand-side inputs: one invocation is a simultaneous state
+    transition, and recurrence belongs to the caller that feeds the returned
+    state into the next invocation.
     """
 
     authored = tuple(equations)
     if not authored:
         raise ValueError("symbolic equation program requires equations")
-    for equation in authored:
-        if not isinstance(equation, sympy.Equality):
-            raise TypeError(f"expected a SymPy Equality, got {equation!r}")
-        if not isinstance(equation.lhs, sympy.Symbol):
-            raise TypeError(f"equation output must be a Symbol: {equation!r}")
-    output_names = tuple(str(equation.lhs) for equation in authored)
+    declarations = declared_symbolic_outputs(authored, name)
+    output_names = tuple(row.name for row in declarations)
     if len(output_names) != len(set(output_names)):
         raise ValueError("symbolic equation output names must be unique")
-    output_symbols = frozenset(equation.lhs for equation in authored)
+    output_symbols = frozenset(
+        equation.lhs for equation in authored
+        if isinstance(equation.lhs, sympy.Symbol)
+    )
     recursive = {
         str(symbol)
-        for equation in authored
-        for symbol in equation.rhs.free_symbols & output_symbols
+        for row in declarations if row.form == "assignment"
+        for symbol in row.expression.free_symbols & output_symbols
     }
     if recursive:
         raise ValueError(
@@ -119,10 +216,43 @@ def _compile_sympy_equations_uncached(
     graph = ProcessGraph(materialize_memory=False, source_language="sympy")
     roots = ingest_sympy_expressions(
         graph,
-        tuple(equation.rhs for equation in authored),
+        tuple(row.expression for row in declarations),
         output_names=output_names,
         strict=True,
     )
+    # Input columns are declared by the importer (a Symbol by its name, an
+    # element of a MatrixSymbol by ``matrix_component_name``).  Two inputs
+    # spelled alike, or an input spelled like an output, would be one column
+    # standing for two values: refuse rather than let the spelling decide.
+    input_columns: dict[str, sympy.Basic] = {}
+    for _node_id, data in graph.G.nodes(data=True):
+        if data.get("op") not in {"input", "Input", "Symbol"}:
+            continue
+        column = str((data.get("attributes") or {}).get("binding_name"))
+        value = data.get("expr_obj")
+        incumbent = input_columns.setdefault(column, value)
+        if incumbent != value:
+            raise ValueError(
+                f"symbolic input column {column!r} is declared by both "
+                f"{incumbent!r} and {value!r}")
+    recursive_columns = set(input_columns) & set(output_names)
+    if recursive_columns:
+        raise ValueError(
+            "simultaneous next-state outputs cannot be RHS inputs: "
+            + ", ".join(sorted(recursive_columns))
+        )
+    matrix_element_inputs = tuple(sorted(
+        (
+            str(attributes["binding_name"]),
+            str(attributes["matrix_symbol"]),
+            tuple(attributes["matrix_shape"]),
+            tuple(attributes["matrix_index"]),
+        )
+        for _node_id, data in graph.G.nodes(data=True)
+        if data.get("op") in {"input", "Input", "Symbol"}
+        for attributes in ((data.get("attributes") or {}),)
+        if "matrix_symbol" in attributes
+    ))
     # These equations are a floating physical model.  SymPy retains exact
     # integer/rational literals in the authored form, while the compiled ABI
     # consistently carries scalar f64 values across all native targets.
@@ -268,6 +398,15 @@ def _compile_sympy_equations_uncached(
                 for output_name, root in zip(output_names, roots)
             ),
             "symbolic_equations": tuple(sympy.srepr(eq) for eq in authored),
+            # (output, equation index, component index, form) per output,
+            # in output order; posted on the book by compile_sympy_equations.
+            "symbolic_outputs": tuple(
+                (row.name, row.equation_index, row.component, row.form)
+                for row in declarations
+            ),
+            # (column, MatrixSymbol, shape, element index) per input column
+            # that is an element of a MatrixSymbol.
+            "matrix_element_inputs": matrix_element_inputs,
             "symbolic_source": "sympy",
             "symbolic_dtype": dtype,
             "publications": tuple(
@@ -366,12 +505,82 @@ def compile_sympy_equations(
             publications=publication_rows,
             dtype=dtype,
         )
-        return replace(value, cache_identity=cached.identity, cache_hit=False)
-    return replace(
-        cached.value,
-        cache_identity=cached.identity,
-        cache_hit=cached.hit,
+        value = replace(value, cache_identity=cached.identity, cache_hit=False)
+    else:
+        value = replace(
+            cached.value,
+            cache_identity=cached.identity,
+            cache_hit=cached.hit,
+        )
+    _post_symbolic_outputs(value, name)
+    return value
+
+
+def symbolic_program_scope(
+    compilation: SymbolicEquationCompilation, name: str,
+) -> tuple[str, str]:
+    """The book scope of one compiled set: (law name, digest of its
+    authored equations), the ``program`` field of ``symbolic_equation`` and
+    ``symbolic_equation_output`` rows."""
+
+    import hashlib
+
+    reprs = tuple(compilation.function.metadata.get("symbolic_equations") or ())
+    return (
+        str(name),
+        hashlib.sha256("\n".join(reprs).encode("utf-8")).hexdigest(),
     )
+
+
+def _post_symbolic_outputs(
+    compilation: SymbolicEquationCompilation, name: str,
+) -> None:
+    """Record each authored equation and the outputs it declares on the book.
+
+    Posted on every call, cache hit or not, into the active book (the one the
+    compilation's own module tables were posted to).  The equation is a NOVEL
+    root; each output is DERIVED from its equation's cell, with the component
+    index and the form.  ``CONCORD``: the same set compiled again writes no
+    new cell.
+    """
+
+    import hashlib
+
+    from .concordance_declarations import (
+        INGEST_SOURCE, INGESTION, SYMBOLIC_EQUATION, SYMBOLIC_EQUATION_OUTPUT,
+        SymbolicEquationFact, SymbolicOutputFact, SymbolicOutputForm,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Novel, current_identity_book,
+    )
+
+    metadata = compilation.function.metadata
+    reprs = tuple(metadata.get("symbolic_equations") or ())
+    outputs = tuple(metadata.get("symbolic_outputs") or ())
+    if not reprs or not outputs:
+        return
+    program = symbolic_program_scope(compilation, name)
+    book = current_identity_book()
+    cells = {}
+    for index, (text, equation) in enumerate(zip(reprs, compilation.equations)):
+        lhs = equation.lhs
+        cells[index] = book.post(
+            SYMBOLIC_EQUATION, (program, index),
+            SymbolicEquationFact(
+                hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                tuple(int(extent) for extent in lhs.shape) if _is_matrix(lhs) else (),
+            ),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+    for output, equation_index, component, form in outputs:
+        book.post(
+            SYMBOLIC_EQUATION_OUTPUT, (program, str(output)),
+            SymbolicOutputFact(
+                int(equation_index), tuple(component), SymbolicOutputForm(form)),
+            stage=INGESTION, provenance=Derived((cells[int(equation_index)],)),
+            mode=Mode.CONCORD,
+        )
 
 
 def _pipeline_implementation() -> str:
@@ -379,6 +588,10 @@ def _pipeline_implementation() -> str:
 
     return callable_digest(
         _compile_sympy_equations_uncached,
+        declared_symbolic_outputs,
+        _scalar_output,
+        SymbolicOutputDeclaration,
+        matrix_component_name,
         ingest_sympy_expression,
         ingest_sympy_expressions,
         process_graph_to_ssa_instrs,
