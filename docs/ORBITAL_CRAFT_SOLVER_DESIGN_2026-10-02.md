@@ -39,7 +39,12 @@ manifestation in the dt system and compiler.
    activations animated.
 7. **Cost.** An alpha/beta mix of total average fuel-consumption rate and
    time to arrive, plus a steep ("big, scary") run-out-of-fuel penalty that
-   rises sharply as remaining fuel approaches zero.
+   rises sharply as remaining fuel approaches zero. Deviation from the plan
+   belongs in the cost too (user, same day), but in the live controller's
+   cost and the off-plan threshold, not the planner's: each re-plan starts
+   from the present state, so the planner's deviation is zero by
+   construction; the tracking controller weighs plan deviation against fuel
+   and the off-plan switch fires on it.
 8. **The seam is r() and F().** Whatever the craft becomes, it interfaces
    with the trajectory r() and the force F(). Everything up to that seam can
    be developed now, before any further craft question is answered; the
