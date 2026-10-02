@@ -870,14 +870,23 @@ def lower_probe(spec, process_graph_sink):
     """``--probe NAME[:annotated]``: one program of ``probe_emission_chain``
     (``probe_scalar_native_correctness.PROGRAMS``), lowered as that probe
     lowers it (same entry, contract and tensor reference), plus the resolved
-    process-graph sink for the core.  Returns (module, root symbol)."""
+    process-graph sink for the core.  Returns (module, root symbol).
+
+    ``--probe orbital``: the orbital transfer set as written, lowered by
+    ``probe_orbital_transfer.lower_for_viewer`` (its own builder: the
+    sanctioned sympy lane through ``piece_from_law``); it refuses with the
+    probe's recorded failures while no law of the set lowers."""
     import warnings
     sys.path.insert(0, str(Path(__file__).resolve().parent / "compiler_probes"))
+    name, _, flag = spec.partition(":")
+    if name == "orbital":
+        import probe_orbital_transfer as orbital
+        return orbital.lower_for_viewer(process_graph_sink)
     import probe_emission_chain as chain
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
-    name, _, flag = spec.partition(":")
     if name not in chain.native.PROGRAMS:
-        raise SystemExit(f"--probe {name!r}: one of {', '.join(chain.native.PROGRAMS)} (add :annotated)")
+        raise SystemExit(f"--probe {name!r}: one of {', '.join(chain.native.PROGRAMS)}, orbital "
+                         "(add :annotated)")
     template, dtype, _scalar, has_tensor = chain.native.PROGRAMS[name]
     annotation = ((": float" if dtype == "float64" else ": int") if flag == "annotated" else "")
     with warnings.catch_warnings():
@@ -2149,7 +2158,8 @@ def main(argv=None) -> None:
     source.add_argument("--graph", help="graph saved by --save-graph")
     source.add_argument("--probe", metavar="NAME[:annotated]",
                         help="lower one probe_emission_chain program (bump, chain, twice, cond, loop, scale, "
-                             "shared) and EMIT it, so the book holds the emission rows (the ring)")
+                             "shared; or orbital: the orbital transfer set via probe_orbital_transfer) "
+                             "and EMIT it, so the book holds the emission rows (the ring)")
     ap.add_argument("--emit", choices=("c", "llvm", "both"), default=None,
                     help="emit after lowering (--probe defaults to both; --case needs --emit-root)")
     ap.add_argument("--emit-root", metavar="SYMBOL", help="root function symbol to emit for --case --emit")

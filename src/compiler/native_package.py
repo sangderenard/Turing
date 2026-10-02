@@ -32,8 +32,14 @@ from .native_law_kernels import LLVMPiece, batch_contract
 
 def piece_from_law(compilation: Any, law: str, batch: int, *,
                    directory: str | Path | None = None,
-                   optimization: str = "O2") -> LLVMPiece:
-    """Lower one compiled SymPy law to an LLVM piece, on its own."""
+                   optimization: str = "O2",
+                   resolved_process_graph_sink=None) -> LLVMPiece:
+    """Lower one compiled SymPy law to an LLVM piece, on its own.
+
+    ``resolved_process_graph_sink`` is handed to ``lower_ast_source_to_ssa``
+    unchanged: a viewer that draws the lowering's process graph receives the
+    graph of this very lowering instead of lowering the source a second time.
+    """
 
     from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
         c_backend_repository_ssa_reference,
@@ -52,6 +58,7 @@ def piece_from_law(compilation: Any, law: str, batch: int, *,
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         name=law, runtime_closure_only=True,
         extraction_contract=batch_contract(law, argument_names, batch),
+        resolved_process_graph_sink=resolved_process_graph_sink,
     )
     entry = exports[0]
     function = module.functions[entry]
