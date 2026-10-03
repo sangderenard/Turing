@@ -223,13 +223,18 @@ class _Lowering:
         # ("add", "tanh") and repository Handler members ("Add", "Shl").
         self._by_name: dict[str, tuple[int, Mapping[str, Any]]] = {}
         self._by_handler: dict[str, tuple[int, Mapping[str, Any]]] = {}
+        handler_entries: dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
         for canonical_id, entry in enumerate(catalog):
             name = entry.get("name")
             handler = entry.get("handler")
             if isinstance(name, str) and name not in self._by_name:
                 self._by_name[name] = (canonical_id, entry)
-            if isinstance(handler, str) and handler not in self._by_handler:
-                self._by_handler[handler] = (canonical_id, entry)
+            if isinstance(handler, str):
+                handler_entries.setdefault(handler, []).append((canonical_id, entry))
+        self._by_handler = {
+            handler: entries[0] for handler, entries in handler_entries.items()
+            if len(entries) == 1 and handler != "Call"
+        }
 
     # -- bookkeeping ---------------------------------------------------------
 
@@ -391,7 +396,13 @@ class _Lowering:
         return KernelOperand("u", int(raw))
 
     def _lower_instr(self, instr: Instr, block: str) -> None:
-        entry = self._by_name.get(instr.op) or self._by_handler.get(instr.op)
+        # ssa_numeric_operators defines named tensor Calls through this exact
+        # attribute. The generic Handler alone never identifies a function.
+        if instr.op == "Call":
+            name = (instr.attributes or {}).get("tensor_operation")
+            entry = self._by_name.get(name) if isinstance(name, str) else None
+        else:
+            entry = self._by_name.get(instr.op) or self._by_handler.get(instr.op)
         if entry is None:
             self._shortfall(
                 instr.op, block,
