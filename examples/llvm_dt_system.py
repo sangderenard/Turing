@@ -68,7 +68,7 @@ import numpy as np
 from src.common.dt_system.dt_controller import STController, Targets, run_superstep
 from src.common.dt_system.dt_scaler import Metrics
 from src.common.dt_system.participants import StepSpans
-from src.common.dt_system.error_channels import DT_CHANNEL_NAMES
+from src.common.dt_system.error_channels import DT_CHANNEL_NAMES, channel_fields
 from src.common.tensors import AbstractTensor
 from src.common.dt_system.time_contracts import BIND, DILATE, HOLD, SUBCYCLE, ParticipantRegistry
 from src.compiler.native_law_kernels import LLVMPiece
@@ -222,22 +222,38 @@ def instantiate_pieces(pieces, state, schedule="sequential"):
                           outputs)
 
 
-def state_source(columns, participants=1):
+def declared_channel_layout(channel_names):
+    """Validate the program's build-time channel identities once per source use.
+
+    ``channel_fields`` owns the shared-prefix rule. Appended names must also be
+    unique and must not alias the existing named metric/publication outputs.
+    """
+    names = tuple(channel_names)
+    channel_fields({}, names=names)
+    if len(set(names)) != len(names):
+        raise ValueError("dt channel layouts require unique channel identities")
+    if set(names[len(DT_CHANNEL_NAMES):]).intersection(METRIC_FIELDS):
+        raise ValueError("appended dt channels must not alias existing metric outputs")
+    return names
+
+
+def state_source(columns, participants=1, *, channel_names=DT_CHANNEL_NAMES):
     """Spell ``PieceState`` for these columns: one span field per column,
     the ``dt`` column the step fills, and the window's telemetry span.
     ``copy_shallow``/``restore`` are the tire's: copies out, in-place back."""
 
+    channel_names = declared_channel_layout(channel_names)
     fields = (*columns, "dt")
     lines = ["class PieceState:"]
     lines.append(f"    def __init__(self, {', '.join(fields)}, telemetry):")
     for name in fields:
         lines.append(f"        self.{name} = {name}")
     lines.append("        self.telemetry = telemetry")
-    lines.append(f"        self.channel_names = {DT_CHANNEL_NAMES!r}")
+    lines.append(f"        self.channel_names = {channel_names!r}")
     for field in (*PUBLICATION_FIELDS, *COURANT_FIELDS):
         lines.append(f"        self.{field} = AbstractTensor.zeros(({participants},))")
     for field in ("pub_values", "pub_present", "pub_limits", "pub_limits_present"):
-        lines.append(f"        self.{field} = AbstractTensor.zeros(({participants * len(DT_CHANNEL_NAMES)},))")
+        lines.append(f"        self.{field} = AbstractTensor.zeros(({participants * len(channel_names)},))")
     lines.append("")
     lines.append("    def copy_shallow(self):")
     lines.append("        return (")
@@ -255,7 +271,7 @@ def state_source(columns, participants=1):
 SCHEDULES = ("sequential", "parallel")
 
 
-def piece_source(pieces, schedule="sequential"):
+def piece_source(pieces, schedule="sequential", *, channel_names=DT_CHANNEL_NAMES):
     """Spell ``advance_pieces(state, dt)`` for exactly these pieces.
 
     ``schedule`` is the round's read discipline, as ``dt_graph.RoundNode``
@@ -279,10 +295,17 @@ def piece_source(pieces, schedule="sequential"):
     if schedule not in SCHEDULES:
         raise NotImplementedError(
             f"schedule={schedule!r}: llvm_dt_system interprets {SCHEDULES}")
+    channel_names = declared_channel_layout(channel_names)
+    # The shared layout keeps its existing publication rules. Appended error
+    # channels are the program's declaration, so they are reduced and published
+    # from the law's exact named output rather than silently discarded by the
+    # old METRIC_FIELDS intersection. The same layout owns masks and ABI extents.
+    extra_channels = channel_names[len(DT_CHANNEL_NAMES):]
+    metric_fields = (*METRIC_FIELDS, *extra_channels)
     columns = column_names_of(pieces)
     lines = ["def advance_pieces(state, dt):"]
     lines.append("    state.dt[...] = dt")
-    folds = {name: [] for name in METRIC_FIELDS}
+    folds = {name: [] for name in metric_fields}
     deferred = []
     for index, piece in enumerate(pieces):
         arguments = ", ".join(f"state.{name}" for name in piece.argument_names)
@@ -312,7 +335,7 @@ def piece_source(pieces, schedule="sequential"):
     for index, piece in enumerate(pieces):
         published = set(piece.output_names)
         lines.append(f"    # -- {piece.entry}")
-        for name in METRIC_FIELDS:
+        for name in metric_fields:
             if name not in published:
                 continue
             reducer = "min" if name == "dt_limit" else "max"
@@ -371,11 +394,11 @@ def piece_source(pieces, schedule="sequential"):
         # span (flattened, offset ``participant * C + channel``): written as
         # that row slice, measures and presence mask, every attempt -- the
         # same values the per-element stores wrote, in one store each.
-        start = index * len(DT_CHANNEL_NAMES)
-        stop = start + len(DT_CHANNEL_NAMES)
-        measured = [name in published and name in METRIC_FIELDS for name in DT_CHANNEL_NAMES]
+        start = index * len(channel_names)
+        stop = start + len(channel_names)
+        measured = [name in published and name in metric_fields for name in channel_names]
         values = [f"m{index}_{name}" if flag else "0.0"
-                  for name, flag in zip(DT_CHANNEL_NAMES, measured)]
+                  for name, flag in zip(channel_names, measured)]
         lines.append(f"    state.pub_values[{start}:{stop}] = "
                      f"AbstractTensor.tensor([{', '.join(values)}])")
         lines.append(f"    state.pub_present[{start}:{stop}] = "
@@ -395,7 +418,7 @@ def piece_source(pieces, schedule="sequential"):
     # it came from -- the rows do.
     lines.append("")
     lines.append("    # the amalgamated report; the rows above are the decision")
-    for name in ("max_vel", "max_flux", "div_inf", "mass_err", "residual"):
+    for name in ("max_vel", "max_flux", "div_inf", "mass_err", "residual", *extra_channels):
         terms = [f"m{index}_{name}" for index, piece in enumerate(pieces)
                  if name in set(piece.output_names)]
         lines.append(f"    {name} = " + fold("max", terms, "0.0"))
@@ -415,12 +438,12 @@ def piece_source(pieces, schedule="sequential"):
     lines.append("        max_vel=max_vel, max_flux=max_flux, div_inf=div_inf,")
     lines.append("        mass_err=mass_err, dt_limit=dt_limit,")
     report = [name if any(name in p.output_names for p in pieces) else "0.0"
-              for name in DT_CHANNEL_NAMES]
+              for name in channel_names]
     # Only fields reduced above are part of the aggregate report.
-    report = [value if name in METRIC_FIELDS else "0.0"
-              for name, value in zip(DT_CHANNEL_NAMES, report)]
-    flags = [float(name in METRIC_FIELDS and any(name in p.output_names for p in pieces))
-             for name in DT_CHANNEL_NAMES]
+    report = [value if name in metric_fields else "0.0"
+              for name, value in zip(channel_names, report)]
+    flags = [float(name in metric_fields and any(name in p.output_names for p in pieces))
+             for name in channel_names]
     lines.append(f"        error_channels=AbstractTensor.tensor([{', '.join(report)}]),")
     lines.append(f"        error_present=AbstractTensor.tensor({flags}),")
     for field in (*PUBLICATION_FIELDS,
@@ -431,11 +454,12 @@ def piece_source(pieces, schedule="sequential"):
     return "\n".join(lines) + "\n"
 
 
-def generated_source(pieces, schedule="sequential"):
-    return state_source(column_names_of(pieces), len(pieces)) + "\n\n" + piece_source(pieces, schedule)
+def generated_source(pieces, schedule="sequential", *, channel_names=DT_CHANNEL_NAMES):
+    return (state_source(column_names_of(pieces), len(pieces), channel_names=channel_names)
+            + "\n\n" + piece_source(pieces, schedule, channel_names=channel_names))
 
 
-def bind_namespace(pieces, *, wrap=None, schedule="sequential"):
+def bind_namespace(pieces, *, wrap=None, schedule="sequential", channel_names=DT_CHANNEL_NAMES):
     """Exec the generated ``PieceState``/``advance_pieces`` for these pieces
     into a fresh namespace and return it, touching no module global.
 
@@ -457,7 +481,7 @@ def bind_namespace(pieces, *, wrap=None, schedule="sequential"):
         "DILATE": DILATE, "SUBCYCLE": SUBCYCLE,
         **bindings,
     }
-    exec(generated_source(pieces, schedule), namespace)
+    exec(generated_source(pieces, schedule, channel_names=channel_names), namespace)
     return namespace
 
 
@@ -487,7 +511,7 @@ def bind_program(namespace):
     return program
 
 
-def bind_pieces(pieces, *, wrap=None, schedule="sequential"):
+def bind_pieces(pieces, *, wrap=None, schedule="sequential", channel_names=DT_CHANNEL_NAMES):
     """Bind ``PieceState`` and ``advance_pieces`` for these pieces in this
     module: the Python path runs the very text the lowering is given.
 
@@ -495,7 +519,7 @@ def bind_pieces(pieces, *, wrap=None, schedule="sequential"):
     ``step_i`` to the lowering).  A persistent eager state never runs through
     these module globals; it carries its own program (``bind_program``)."""
 
-    namespace = bind_namespace(pieces, wrap=wrap, schedule=schedule)
+    namespace = bind_namespace(pieces, wrap=wrap, schedule=schedule, channel_names=channel_names)
     globals()["PieceState"] = namespace["PieceState"]
     globals()["advance_pieces"] = namespace["advance_pieces"]
     return {f"step_{index}": piece for index, piece in enumerate(pieces)}
@@ -667,7 +691,7 @@ class Subcycle:
 
     def __init__(self, piece_files, *, round_dt, dx, targets=None, controller=None,
                  name="subcycle", lead_windows=1.0, wait_timeout_s=0.05,
-                 coupling=None, omega_ref_rad_s=0.0):
+                 coupling=None, omega_ref_rad_s=0.0, channel_names=DT_CHANNEL_NAMES):
         self.name = str(name)
         #: What sits across the boundary to the consulting system: a joint
         #: kind or a declared ``time_field.TimeAdaptor``.  Undeclared is
@@ -690,7 +714,7 @@ class Subcycle:
         self.names = column_names_of(self.pieces)
         self.owned = owned_columns(self.pieces, self.names)
         self.ledger = WallCostLedger(str(piece.entry) for piece in self.pieces)
-        namespace = bind_namespace(self.pieces, wrap=self.ledger.wrap)
+        namespace = bind_namespace(self.pieces, wrap=self.ledger.wrap, channel_names=channel_names)
         self._state_class = namespace["PieceState"]
         self._advance = namespace["advance_pieces"]
         self.state = None
@@ -945,10 +969,10 @@ class RoundPiece:
 
     contract = BIND
 
-    def __init__(self, node, *, wrap=None):
+    def __init__(self, node, *, wrap=None, channel_names=DT_CHANNEL_NAMES):
         self.node = node
         self.entry = str(node.label)
-        pieces, self.schedule = interpret_round(node, wrap=wrap)
+        pieces, self.schedule = interpret_round(node, wrap=wrap, channel_names=channel_names)
         self.pieces = own_pieces(pieces)
         self.batch = self.pieces[0].batch
         self.names = column_names_of(self.pieces)
@@ -960,7 +984,7 @@ class RoundPiece:
         self.controller = control.ctrl
         self.dx = float(control.dx)
         self.dt_inner = float(node.plan.dt_init)
-        namespace = bind_namespace(self.pieces, wrap=wrap, schedule=self.schedule)
+        namespace = bind_namespace(self.pieces, wrap=wrap, schedule=self.schedule, channel_names=channel_names)
         self._advance = namespace["advance_pieces"]
         span, views, dt, telemetry = state_spans(self.names, None, self.batch)
         self.state = namespace["PieceState"](*views, dt, telemetry)
@@ -1013,7 +1037,7 @@ class RoundPiece:
         return tuple(getattr(self.state, name).copy() for name in self.owned)
 
 
-def interpret_round(node, *, wrap=None):
+def interpret_round(node, *, wrap=None, channel_names=DT_CHANNEL_NAMES):
     """``(pieces, schedule)`` for one ``dt_graph.RoundNode``.
 
     Children in order are the causal order.  An ``AdvanceNode`` leaf is the
@@ -1029,7 +1053,7 @@ def interpret_round(node, *, wrap=None):
     pieces = []
     for child in node.children:
         if isinstance(child, RoundNode):
-            pieces.append(RoundPiece(child, wrap=wrap))
+            pieces.append(RoundPiece(child, wrap=wrap, channel_names=channel_names))
         elif isinstance(child, AdvanceNode):
             pieces.append(require_piece(child.state.state, f"AdvanceNode {child.label!r}"))
         else:
@@ -1040,7 +1064,7 @@ def interpret_round(node, *, wrap=None):
 
 
 def instantiate_state(pieces, columns, *, targets, schedule="sequential",
-                      scope="lockstep", subcycles=()):
+                      scope="lockstep", subcycles=(), channel_names=DT_CHANNEL_NAMES):
     """The instantiation hook: make the dt system's state, once.
 
     Everything scoped to the state's lifetime happens here and nowhere else:
@@ -1057,7 +1081,8 @@ def instantiate_state(pieces, columns, *, targets, schedule="sequential",
     names = column_names_of(pieces)
     batch = pieces[0].batch
     ledger = WallCostLedger(str(piece.entry) for piece in pieces)
-    program = bind_program(bind_namespace(pieces, wrap=ledger.wrap, schedule=schedule))
+    program = bind_program(bind_namespace(pieces, wrap=ledger.wrap, schedule=schedule,
+                                         channel_names=channel_names))
     # One contiguous span; every column, ``dt`` and the telemetry are views
     # into it (``state_spans``).  The state owns it for its whole lifetime.
     span, views, dt, telemetry = state_spans(names, columns, batch)
@@ -1096,7 +1121,7 @@ def instantiate_state(pieces, columns, *, targets, schedule="sequential",
     return state
 
 
-def dt_system_from_graph(root, columns, *, rounds, subcycles=(), state=None):
+def dt_system_from_graph(root, columns, *, rounds, subcycles=(), state=None, channel_names=None):
     """Run ``dt_system`` as the ``dt_graph.RoundNode`` tree ``root`` defines.
 
     The root's ``plan.round_max`` is the window, its ``plan.dt_init`` the
@@ -1108,15 +1133,17 @@ def dt_system_from_graph(root, columns, *, rounds, subcycles=(), state=None):
     reused rather than rebuilt (see ``dt_system``).
     """
 
-    pieces, schedule = interpret_round(root)
+    channel_names = tuple(channel_names) if channel_names is not None else (
+        tuple(state.channel_names) if state is not None else DT_CHANNEL_NAMES)
+    pieces, schedule = interpret_round(root, channel_names=channel_names)
     control = root.controller
     return dt_system(pieces, columns, rounds=rounds, round_dt=float(root.plan.round_max),
                      dx=float(control.dx), targets=control.targets, controller=control.ctrl,
                      subcycles=subcycles, scope=str(root.label), schedule=schedule,
-                     dt_initial=float(root.plan.dt_init), state=state)
+                     dt_initial=float(root.plan.dt_init), state=state, channel_names=channel_names)
 
 
-def instantiate_system(root, columns, *, subcycles=()):
+def instantiate_system(root, columns, *, subcycles=(), channel_names=DT_CHANNEL_NAMES):
     """Instantiate a dt system from its ``dt_graph.RoundNode`` tree, once.
 
     The graph is interpreted once, the state made once, and the cascade
@@ -1128,13 +1155,18 @@ def instantiate_system(root, columns, *, subcycles=()):
     -- what ``dt_system_over`` hands ``run_superstep``), and the controller's
     continuation ``dt_next`` -- the first attempt of the next round, which
     is the dt system's own business, not the engine's.
+
+    ``channel_names`` is the explicit shared ABI prefix plus this program's
+    appended error names. Build the graph's Targets with
+    ``channel_fields(limits, names=channel_names, limits=True)`` so publication
+    and judgment use the same identities and extent.
     """
 
-    pieces, schedule = interpret_round(root)
+    pieces, schedule = interpret_round(root, channel_names=channel_names)
     control = root.controller
     state = instantiate_state(
         pieces, columns, targets=control.targets, schedule=schedule,
-        scope=str(root.label), subcycles=subcycles)
+        scope=str(root.label), subcycles=subcycles, channel_names=channel_names)
     state.controller = control.ctrl
     state.targets = control.targets
     state.dx = float(control.dx)
@@ -1177,7 +1209,7 @@ def advance_round(state, window=None, *, subcycles=()):
 
 def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, controller=None,
               subcycles=(), scope="lockstep", schedule="sequential", dt_initial=None,
-              state=None, rollback=None):
+              state=None, rollback=None, channel_names=None):
     """Load the pieces from their files and run ``rounds`` rounds of the dt
     system over them in Python, the way the native unit will be driven.
 
@@ -1199,6 +1231,8 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
     one ``StoreLedger`` per subcycle coupling tracking the energy build-up.
     """
 
+    channel_names = tuple(channel_names) if channel_names is not None else (
+        tuple(state.channel_names) if state is not None else DT_CHANNEL_NAMES)
     pieces = load_pieces(piece_files)
     names = column_names_of(pieces)
     subcycles = tuple(subcycles)
@@ -1229,8 +1263,10 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
         # discarding it.
         state = instantiate_state(
             pieces, columns, targets=targets, schedule=schedule, scope=scope,
-            subcycles=subcycles)
+            subcycles=subcycles, channel_names=channel_names)
     else:
+        if tuple(state.channel_names) != channel_names:
+            raise ValueError("persistent dt state has a different declared channel layout")
         bound = getattr(state, "bound_pieces", None)
         if bound != (tuple(names), str(schedule)):
             raise ValueError(
@@ -1294,25 +1330,32 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
 
 def configure_publication_limits(state, targets):
     """Build-time defaults for the declared participant/channel buffers."""
+    channels = len(state.channel_names)
+    if (int(targets.error_limits.shape[0]) != channels
+            or int(targets.error_limits_present.shape[0]) != channels):
+        raise ValueError("dt targets must use the state's declared channel layout")
     for index in range(int(state.pub_exchange_time.shape[0])):
-        start = index * len(DT_CHANNEL_NAMES)
-        stop = start + len(DT_CHANNEL_NAMES)
+        start = index * channels
+        stop = start + channels
         state.pub_limits[start:stop] = targets.error_limits
         state.pub_limits_present[start:stop] = targets.error_limits_present
 
 
-def dt_system_contract(entry, columns, batch, participants=1):
+def dt_system_contract(entry, columns, batch, participants=1, *, channel_names=DT_CHANNEL_NAMES):
     """The state's span fields plus the dt system's own records.
 
     ``Targets``, ``STController`` and ``Metrics`` are retained exactly as
     ``extraction_contracts/program_extraction.yaml`` declares them, the same
     way the managed vehicle contract retains them; ``PieceState`` is
     declared the way ``BalloonTireManagedState`` is: one mutable span per
-    field.
+    field. ``channel_names`` retains the shared ABI prefix and may append
+    program error names; supply that same layout to ``instantiate_system``
+    and ``channel_fields(..., names=channel_names, limits=True)`` for Targets.
     """
     from src.compiler.extraction_contract import ExtractionContract
     from src.compiler.native_law_kernels import _CONTRACTS
 
+    channel_names = declared_channel_layout(channel_names)
     policy = ExtractionContract(_CONTRACTS / "program_extraction.yaml")
     base = policy.program_abi.receipt()
     records = {name: base["records"][name] for name in ("Targets", "STController", "Metrics")}
@@ -1334,7 +1377,7 @@ def dt_system_contract(entry, columns, batch, participants=1):
             "rollback": scalar("bool"),
             "rollback_threshold_multiplier": scalar("float64"),
             **{name: span(participants) for name in (*PUBLICATION_FIELDS, *COURANT_FIELDS)},
-            **{name: span(participants * len(DT_CHANNEL_NAMES)) for name in
+            **{name: span(participants * len(channel_names)) for name in
                ("pub_values", "pub_present", "pub_limits", "pub_limits_present")},
         },
     }
@@ -1342,7 +1385,7 @@ def dt_system_contract(entry, columns, batch, participants=1):
         "identity": "src.common.dt_system.participants.StepSpans",
         "fields": {
             **{name: span(participants) for name in PUBLICATION_FIELDS},
-            **{name: span(participants * len(DT_CHANNEL_NAMES)) for name in
+            **{name: span(participants * len(channel_names)) for name in
                ("pub_values", "pub_present", "pub_limits", "pub_limits_present")},
         },
     }
@@ -1354,6 +1397,12 @@ def dt_system_contract(entry, columns, batch, participants=1):
     # than a Metrics returned by an engine.  Preserve the incumbent semantic
     # contract while applying StepSpans' storage/shape refinement.
     metrics_fields = records["Metrics"]["fields"]
+    for record, fields in (("Metrics", ("error_channels", "error_present")),
+                           ("Targets", ("error_limits", "error_limits_present"))):
+        for field_name in fields:
+            records[record]["fields"][field_name] = {
+                **records[record]["fields"][field_name], "shape": [len(channel_names)],
+            }
     for field_name, span_field in records["StepSpans"]["fields"].items():
         metrics_fields[field_name] = {
             **metrics_fields[field_name],
@@ -1373,7 +1422,7 @@ def dt_system_contract(entry, columns, batch, participants=1):
 
 def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimization="O2",
                    link="static", piece_mode="link", progress=None,
-                   trace=False, trace_full_values=False):
+                   trace=False, trace_full_values=False, channel_names=DT_CHANNEL_NAMES):
     """Lower ``dt_system_over`` to ``backend`` and return the compiled artifact.
 
     The pieces are bound by name (``step_i``) and called by name in the
@@ -1415,16 +1464,18 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
 
     progress(f"loading {len(piece_files)} compiled law piece(s)")
     pieces = [LLVMPiece.load(path) for path in piece_files]
-    bindings = bind_pieces(pieces)
+    channel_names = tuple(channel_names)
+    bindings = bind_pieces(pieces, channel_names=channel_names)
     batch = pieces[0].batch
     entry = "dt_system_over"
-    source = inspect.getsource(sys.modules[__name__]) + "\n\n" + generated_source(pieces)
+    source = inspect.getsource(sys.modules[__name__]) + "\n\n" + generated_source(pieces, channel_names=channel_names)
     module, _outputs, exports = lower_ast_source_to_ssa(
         source, entry,
         python_bindings={"AbstractTensor": AbstractTensor, **bindings},
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         runtime_closure_only=True, name="llvm_dt_system",
-        extraction_contract=dt_system_contract(entry, column_names_of(pieces), batch, len(pieces)),
+        extraction_contract=dt_system_contract(entry, column_names_of(pieces), batch, len(pieces),
+                                              channel_names=channel_names),
         progress=progress,
     )
     if piece_mode not in {"link", "inline"}:
@@ -1476,7 +1527,7 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
     else:
         raise ValueError(f"unknown backend {backend!r}")
     return NativeSystem(compiled, module, exports[0], pieces,
-                        columns=column_names_of(pieces), batch=batch)
+                        columns=column_names_of(pieces), batch=batch, channel_names=channel_names)
 
 
 class NativeSystem:
@@ -1494,13 +1545,14 @@ class NativeSystem:
     """
 
     def __init__(self, artifact, module, entry, pieces, *,
-                 columns=(), batch=1):
+                 columns=(), batch=1, channel_names=DT_CHANNEL_NAMES):
         self.artifact = artifact
         self.module = module
         self.entry = entry
         self.pieces = pieces
         #: the state's span fields, in the order ``PieceState`` takes them
         self.columns = tuple(columns)
+        self.channel_names = tuple(channel_names)
         #: cells per column; the batch the pieces were built at
         self.batch = int(batch)
 
@@ -1574,6 +1626,8 @@ class NativeSystem:
 
     def feeds(self, state, targets, controller, round_dt, dt_initial, dx):
         """The physical feed mapping, flattened onto root formals."""
+        if tuple(state.channel_names) != self.channel_names:
+            raise ValueError("native dt state has a different declared channel layout")
         from src.compiler.vehicle_python_compilation import (
             _managed_native_feeds_by_id,
         )
@@ -1626,7 +1680,7 @@ class NativeSystem:
                         if getattr(self.artifact, "library_path", None) else None),
             "batch": self.batch,
             "columns": list(self.columns),
-            "channel_names": list(DT_CHANNEL_NAMES),
+            "channel_names": list(self.channel_names),
             "laws": [str(piece.entry) for piece in self.pieces],
             "linked_llvm": [symbol for symbol, _ir
                             in getattr(self.artifact, "linked_llvm", ())],
