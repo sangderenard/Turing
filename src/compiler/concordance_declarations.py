@@ -2010,6 +2010,15 @@ EXTERNAL_FUNCTION = declare_page("external_function", (
 EXTERNAL_FUNCTION_NAME = declare_page("external_function_name", (
     RowField("program", K.SCOPE), RowField("name", K.NAME),
 ), ExternalFunctionNameFact)           # DERIVED(external_function cell); CONCORD
+@dataclass(frozen=True)
+class ExternalDerivativeFact:
+    #: The external the host declares as this external's derivative.
+    derivative: str
+
+
+EXTERNAL_DERIVATIVE = declare_page("external_derivative", (
+    RowField("program", K.SCOPE), RowField("name", K.NAME),
+), ExternalDerivativeFact)             # DERIVED(external cell, derivative external cell); CONCORD
 EXTERNAL_CALLSITE = declare_page("external_callsite", (
     RowField("program", K.SCOPE), RowField("output", K.NAME),
     RowField("call", K.LABEL),

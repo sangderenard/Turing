@@ -146,3 +146,70 @@ after `module_metadata["identity_book"] = ...`) and the `reference = ...`
 block in process_graph_autograd.lower_training_motion_to_repository_ssa.
 Worktree wtc (mine) removed. wtb was moved to e39ff7cf by someone else.
 Not committed.
+
+## 2026-10-03 (later) Walls down; rewrite for the new craft
+
+Coordinator: W1 (42a689a2 plan_callsites), W2 (eps marker, per-callsite
+folds), W3 (`reverse_compile_book`) fixed in turing 095a3c0c..51b4cebe; my
+binary_value fix committed. engine_toy changed under me: variable mass
+(N7.2), attitude in the actuation law, propellant supply, leapfrog kicks;
+tracker reads `plan.reference(t)` / `plan.impulses()` (348cb5d).
+
+orbital_collocation.py rewritten:
+- state per node: momentum(3), position(3), propellant mass(1); slice law =
+  the jumper's laws (N4.1, TS1.2/1.4 flow, N7.2, N1.1) stepped kick-drift-kick
+  with supply 1 (INVENTED: the slice-level form of the jumper's leapfrog).
+- planning design at a declared attitude (default identity).
+- cost prices thrusters as `orbital_tracker.fuel_price`'s rule (kg/(N s)
+  when the design burns propellant, else impulse).
+- `compile_reverse_rows` = ONE explicit-seed fused motion per row set inside
+  `reverse_compile_book`; one native run per seed.
+- CollocationPlan: reference(t), impulses() (each thrusting slice at its
+  midpoint), mu, ideal_delta_v, r2; collocation_replanner(problem, craft=).
+First slice compile (7 rows x 23 wrt, KDK): still compiling after 600 s
+CPU, 1.1 GB (tool moved it to the background; waiting for it).
+
+## 2026-10-03 Measurements so far (explicit-seed fused motion)
+
+- arrival rows (5 rows x 7 wrt): compile 96 s; values+5 seeds 0.19 ms per
+  call; vs sympy jacobian max rel 1.8e-16; repeated runs bit-identical.
+- slice rows, 2 thrusters: compile 476 s. Six-axis (6 thrusters, 7 rows x
+  27 wrt): compile 874 s; values+7 seeds 0.76 ms per call (scalar arena
+  reuse: prepare_artifact_execution once, indexed write/read; the first
+  version re-prepared per run: 241 ms per call).
+- sympy reference check of the 6-thruster slice: sympy evalf of the
+  unexpanded KDK tree did not finish in 15 min (faulthandler dump: all in
+  sympy evalf, not the compiler); killed. Verification moves to the
+  converged plan's own defects + the flight.
+- cost split: per-slice fuel motion (1 row, n_u+1 wrt) + trip-total motion
+  (J on I, T); dJ/dI, dJ/dT broadcast to slices on the host (the adjoint of
+  a sum). A single N-slice cost graph would compile in O(N) time.
+- compiled rows now persist across processes in %TEMP%/orbital_collocation_rows,
+  keyed by the laws' srepr and perforated_network_llvm._compiler_fingerprint
+  (the precedent for caching a compiled reverse).
+- first full test run: slice (6 thrusters) compiled 871.6 s and was cached;
+  at exactly 15:00 the faulthandler watchdog dump fired while the arrival
+  compile ran and the process died with "Windows fatal exception: access
+  violation" inside the dump (frames: identity_concordance.py:3867
+  _post_or_unsourced <- :3854 record_shape_transformation <-
+  glsl_deployment_strategy). Inferred, not proven: the crash is the
+  watchdog's frame walk racing the main thread (faulthandler's dump of a
+  running thread is documented as unsafe), not the compiler. Rerun with
+  the slice cached.
+
+## 2026-10-03 First convergence, then accuracy fix (substeps)
+
+N=40, one KDK step per slice: SLSQP 139 it, 992 Jacobians (7 ms each),
+solve 34 s, defect 2.3e-9, fuel 0.9983 x Hohmann, time 0.9981 x; ended
+"Positive directional derivative for linesearch". Flown by the tracker
+(six-axis): arrived (|r|-r2 27.7 m, |v|-vc 0.068 m/s, |r-r_ref| 6.4 m) but
+fuel 1.549 x plan. Cause (measured): the plan's per-slice discretization
+error is 994 m (one 85 s step vs 64 sub-steps of the same compiled law);
+the tracker trims onto that error. The "0.998 x Hohmann" was the coarse
+law's own error, not a better trip.
+Fix: a slice is `substeps` (16) steps of the compiled law; the slice
+Jacobian is the chain of each step's compiled Jacobian (forward accumulation
+of compiled derivatives; no new compile). Now: per-slice error 3.6 m vs 256
+sub-steps; SLSQP "Optimization terminated successfully" in 3 iterations, 7
+Jacobians, 0.9 s; defect 2.1e-12; fuel 1.0000 x Hohmann, time 1.0016 x;
+2 burns (247.45 and 239.37 m/s).

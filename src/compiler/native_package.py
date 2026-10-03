@@ -56,13 +56,12 @@ def piece_from_law(compilation: Any, law: str, batch: int, *,
     from .fortran_c_shell import lower_ast_source_to_ssa
     from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
     from .external_functions import externals_for_law
-    from .vehicle_python_compilation import symbolic_abstract_tensor_source
 
     metadata = compilation.function.metadata
     argument_names = tuple(metadata["argument_names"])
     output_names = tuple(metadata["output_names"])
-    source = symbolic_abstract_tensor_source(compilation, law)
-    declared_externals = externals_for_law(compilation, law, batch, source, externals)
+    compilation, source, declared_externals = externals_for_law(
+        compilation, law, batch, externals)
     module, outputs, exports = lower_ast_source_to_ssa(
         source, law,
         python_bindings={"AbstractTensor": AbstractTensor, **declared_externals},

@@ -277,6 +277,14 @@ OPERATOR_ALIASES = {
     # makes ingestion strip ``np`` before source pursuit can mistake the
     # extension callable for a native host boundary.
     "asarray": "tensor",
+    # ``AbstractTensor.get_tensor(data)`` is the class's own constructor with
+    # that same idempotent normalization (``data`` a sequence is built by
+    # ``_tensor_from_list``; an existing tensor keeps its backend).  The
+    # sympy quadrature's node/weight tables are spelled with it
+    # (``symbolic_process_graph.lower_integral_declaration``); unaliased it
+    # reached the planner as an opaque op with rank-0 extents and no
+    # repository emission (audit gap 10).
+    "get_tensor": "tensor",
     "abs_": "abs",
     "argmax_": "argmax",
     "argmin_": "argmin",

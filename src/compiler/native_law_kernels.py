@@ -166,19 +166,25 @@ class LLVMPiece:
     #: lifetime, is never persisted, and is absent on a freshly loaded piece.
     _execution: Any = field(default=None, repr=False, compare=False)
     _bound: Any = field(default=None, repr=False, compare=False)
+    #: Output names the instantiation placed in the containing system's own
+    #: spans (``instantiate(..., outputs=)``); runtime binding like the two
+    #: above, never persisted.
+    in_place: tuple = field(default=(), repr=False, compare=False)
 
     def __getstate__(self):
         state = dict(self.__dict__)
         state["_execution"] = None
         state["_bound"] = None
+        state["in_place"] = ()
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self.__dict__.setdefault("_execution", None)
         self.__dict__.setdefault("_bound", None)
+        self.__dict__.setdefault("in_place", ())
 
-    def instantiate(self, columns):
+    def instantiate(self, columns, outputs=None):
         """The instantiation hook: prepare this piece once, against its spans.
 
         ``columns`` maps each argument name to the span the containing system
@@ -188,6 +194,17 @@ class LLVMPiece:
         column that would have to be copied to become a contiguous float64
         span is refused: aliasing is the point of instantiating, and a hidden
         copy would be exactly the per-round marshalling this removes.
+
+        ``outputs`` (optional) maps output names to the spans the containing
+        system has decided those outputs land in -- the state's own column
+        views -- so the kernel stores into them in place.  Which outputs may
+        land in place is the containing system's decision (it knows its read
+        discipline); this piece only refuses what its ABI cannot honour.  An
+        output whose buffer is also one of its INPUT buffers (one SSA value
+        filling an input and an output, e.g. ``dt_prev_next`` = ``dt``), or
+        whose buffer fills more than one declared output, or whose declared
+        extent is not the span's, keeps its own buffer.  The names
+        that did land in place are ``in_place``.
         """
         from .ssa_llvm_backend import prepare_artifact_execution
 
@@ -200,10 +217,37 @@ class LLVMPiece:
                     f"{self.artifact.name}: column {name!r} is not a contiguous "
                     "float64 span; the piece cannot alias it")
             bound.append(span)
-        self._execution = prepare_artifact_execution(self.artifact, {
-            value_id: span for value_id, span in zip(self.argument_ids, bound)
-        })
+        feeds = {value_id: span for value_id, span in zip(self.argument_ids, bound)}
+        shapes = {
+            int(value_id): tuple(shape or ())
+            for value_id, shape in zip(self.artifact.buffer_order,
+                                       self.artifact.buffer_shapes)
+        }
+        sharing = {}
+        for value_id in self.output_ids.values():
+            sharing[int(value_id)] = sharing.get(int(value_id), 0) + 1
+        in_place = []
+        for name, given in dict(outputs or {}).items():
+            value_id = self.output_ids.get(name)
+            if value_id is None or int(value_id) in feeds:
+                continue
+            if sharing[int(value_id)] > 1:
+                # One SSA value fills several declared outputs; placing it in
+                # one column would make the others read that column, which a
+                # later write may change before they are read.
+                continue
+            span = np.asarray(given, dtype=np.float64)
+            if span is not given or (span.ndim and not span.flags.c_contiguous):
+                raise TypeError(
+                    f"{self.artifact.name}: output {name!r} span is not a "
+                    "contiguous float64 span; the piece cannot store into it")
+            if tuple(span.shape) != shapes.get(int(value_id)):
+                continue
+            feeds[int(value_id)] = span
+            in_place.append(name)
+        self._execution = prepare_artifact_execution(self.artifact, feeds)
         self._bound = tuple(bound)
+        self.in_place = tuple(in_place)
         return self._execution
 
     @classmethod

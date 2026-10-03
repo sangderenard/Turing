@@ -15,6 +15,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import sympy
 from sympy.matrices.expressions.matexpr import MatrixElement
+from sympy.core.function import AppliedUndef
 
 
 def matrix_component_name(base: str, index: Sequence[int]) -> str:
@@ -1088,6 +1089,23 @@ def ingest_sympy_expression(
             # whenever the interior is explicit SymPy, and its result ingests
             # through the ordinary add_node path like any other expression.
             derivative = sympy.diff(value.expr, *value.variables)
+            # A derivative of an external (an applied undefined Function) is
+            # the derivative external the host declared for it
+            # (``compile_sympy_equations(external_derivatives=...)``); one
+            # with none declared is refused by name -- graph reversal would
+            # only meet an opaque call there.
+            from .external_functions import (
+                UndeclaredExternalDerivative, derivatives_of_externals,
+                resolve_external_derivatives,
+            )
+
+            derivative = resolve_external_derivatives(
+                derivative, graph.G.graph.get("external_derivatives") or {})
+            undeclared = derivatives_of_externals(derivative)
+            if undeclared:
+                raise UndeclaredExternalDerivative(
+                    f"Derivative of external(s) {list(undeclared)} has no declared "
+                    f"derivative: {value!r}")
             if not derivative.has(sympy.Derivative):
                 result_id = add_node(derivative)
                 memo[value] = result_id
@@ -1368,6 +1386,10 @@ def ingest_sympy_expression(
         attributes: dict[str, Any] = {}
         if rule.operation == "Call":
             attributes["callee"] = function_name or type(value).__name__
+            if isinstance(value, AppliedUndef):
+                # Declared by what SymPy says the node is: a call to an
+                # external the host supplies (``external_functions``).
+                attributes["external_function"] = str(value.func.__name__)
         node_id = make_node(
             value,
             rule,

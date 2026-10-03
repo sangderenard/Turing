@@ -73,6 +73,102 @@ def _numeric_constant(value: Any) -> Any:
     return value
 
 
+def _declares_integer(annotation: Any) -> bool:
+    """True when a parameter annotation declares an integer and no float or
+    tensor: ``dim: 'int'``, ``dim: 'int | tuple[int, ...] | None'``."""
+
+    import ast
+
+    if annotation is inspect.Parameter.empty:
+        return False
+    text = annotation if isinstance(annotation, str) else getattr(
+        annotation, "__name__", str(annotation))
+    try:
+        names = {node.id for node in ast.walk(ast.parse(str(text), mode="eval"))
+                 if isinstance(node, ast.Name)}
+    except SyntaxError:
+        return False
+    return "int" in names and not names & {"float", "Any", "AbstractTensor", "object"}
+
+
+def _structural_operand(operation: str, position: int) -> bool:
+    """Whether operand ``position`` of tensor ``operation`` is structural.
+
+    Read from the operation's DECLARED signature on ``AbstractTensor`` (the
+    class the AbstractTensor stage calls): a parameter annotated as an
+    integer (an axis, a dimension, a count) is structural.  The operand
+    position maps onto the signature by the call form the materializer
+    spells (``TENSOR_CALL_FORMS``): a receiver call passes operand 0 as
+    ``self``."""
+
+    from ..common.tensors.abstraction import AbstractTensor
+    from .ssa_python_materializer import TENSOR_CALL_FORMS
+
+    if operation not in TENSOR_CALL_FORMS:
+        return False
+    try:
+        signature = inspect.signature(getattr(AbstractTensor, operation))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    parameters = [
+        parameter for parameter in signature.parameters.values()
+        if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)]
+    # A receiver call's operand 0 is ``self``, the signature's first
+    # parameter; a class (static) call has no ``self``.  Either way operand
+    # ``position`` is parameter ``position``.
+    if position >= len(parameters):
+        return False
+    return _declares_integer(parameters[position].annotation)
+
+
+def _tensor_operation_signatures() -> tuple[tuple[str, str], ...]:
+    """Every catalogued tensor operation's declared signature, as text."""
+
+    from ..common.tensors.abstraction import AbstractTensor
+    from .ssa_python_materializer import TENSOR_CALL_FORMS
+
+    rows = []
+    for operation in sorted(TENSOR_CALL_FORMS):
+        try:
+            rows.append((operation, str(inspect.signature(getattr(AbstractTensor, operation)))))
+        except (TypeError, ValueError, AttributeError):
+            rows.append((operation, ""))
+    return tuple(rows)
+
+
+def _structural_constants(graph: Any) -> frozenset[int]:
+    """Constant nodes every consumer reads as a structural integer operand.
+
+    aa5f1aac made every plain-int constant a float64 value (a Piecewise arm
+    ``1`` stored as ``i64 1`` read back as 5e-324).  A constant is a number
+    there because its consumer reads a value.  The quadrature's axis
+    constants (``unsqueeze(-1)``, ``sum(0)``) are read by consumers whose
+    declared parameter is an integer; floatified they became
+    ``unsqueeze(-1.0)`` and the AbstractTensor stage raised.  The consuming
+    operation's declared signature decides, never the value or a name; a
+    constant with any value consumer stays a number."""
+
+    structural = set()
+    for node_id, data in graph.G.nodes(data=True):
+        if str(data.get("type") or data.get("op") or "").casefold() not in {
+                "const", "constant"}:
+            continue
+        uses = []
+        for consumer in graph.G.successors(node_id):
+            consumer_data = graph.G.nodes[consumer]
+            operation = (consumer_data.get("attributes") or {}).get("tensor_operation")
+            for parent, role in consumer_data.get("parents") or ():
+                if int(parent) != int(node_id):
+                    continue
+                position = (int(str(role).split(":", 1)[1])
+                            if str(role).startswith("arg:") else None)
+                uses.append(bool(operation) and position is not None
+                            and _structural_operand(str(operation), position))
+        if uses and all(uses):
+            structural.add(int(node_id))
+    return frozenset(structural)
+
+
 @dataclass(frozen=True, slots=True)
 class SymbolicOutputDeclaration:
     """One declared output of an authored equation set.
@@ -174,6 +270,7 @@ def _compile_sympy_equations_uncached(
     schedule: str = "asap",
     publications: Sequence[SymbolicPublication] = (),
     dtype: str = "float64",
+    external_derivatives: Mapping[Any, Any] | None = None,
 ) -> SymbolicEquationCompilation:
     """Lower simultaneous named SymPy equations into repository SSA.
 
@@ -222,6 +319,11 @@ def _compile_sympy_equations_uncached(
     if dtype not in {"float32", "float64"}:
         raise ValueError("symbolic equation dtype must be float32 or float64")
     graph = ProcessGraph(materialize_memory=False, source_language="sympy")
+    # Each external's declared derivative external (the host's, e.g. the
+    # craft's velocity for its position): the ingestion's Derivative branch
+    # resolves a derivative of an external to it (``external_functions``).
+    derivatives = dict(external_derivatives or {})
+    graph.G.graph["external_derivatives"] = derivatives
     # The law's equations and declared outputs are on the book before the
     # graph exists, so every ingested node derives from its equation's output
     # cell (the same rows ``_post_symbolic_outputs`` posts per call).
@@ -233,6 +335,7 @@ def _compile_sympy_equations_uncached(
             (row.name, row.equation_index, row.component, row.form)
             for row in declarations
         ),
+        derivatives,
     )
     roots = ingest_sympy_expressions(
         graph,
@@ -277,6 +380,9 @@ def _compile_sympy_equations_uncached(
     # These equations are a floating physical model.  SymPy retains exact
     # integer/rational literals in the authored form, while the compiled ABI
     # consistently carries scalar f64 values across all native targets.
+    # A structural constant (an axis, a count: ``_structural_constants``)
+    # keeps its integer.
+    structural = _structural_constants(graph)
     for _node_id, data in graph.G.nodes(data=True):
         # A relation's result is not a value of the model, it is a
         # predicate, and blanket float64 erased that. The backend cannot
@@ -289,7 +395,10 @@ def _compile_sympy_equations_uncached(
             "dtype": "bool" if is_predicate_operation(spelling) else dtype,
             "shape": (),
         }
-        if str(data.get("type") or data.get("op") or "").casefold() in {
+        if int(_node_id) in structural:
+            data["tensor"]["dtype"] = "int64"
+            data.setdefault("attributes", {})["structural_constant"] = True
+        elif str(data.get("type") or data.get("op") or "").casefold() in {
             "const", "constant",
         }:
             attributes = data.setdefault("attributes", {})
@@ -367,7 +476,9 @@ def _compile_sympy_equations_uncached(
         if instruction.op in {"const", "Constant"}:
             attributes = dict(instruction.attributes)
             payload = attributes.get("constant", attributes.get("value"))
-            attributes["constant"] = _numeric_constant(payload)
+            attributes["constant"] = (
+                payload if attributes.get("structural_constant")
+                else _numeric_constant(payload))
             instruction = Instr(
                 "Const", list(instruction.args), instruction.res,
                 arg_roles=list(instruction.arg_roles),
@@ -431,10 +542,16 @@ def _compile_sympy_equations_uncached(
             # (name, arity) per undefined Function the outputs apply: each is
             # a declared external the host supplies at runtime
             # (``external_functions``).
-            "external_functions": tuple(
-                (row.name, row.arity)
-                for row in declared_external_functions(
-                    tuple(row.expression for row in declarations))),
+            # Read from the ingested graph: a derivative of an external
+            # calls its declared derivative external.
+            "external_functions": tuple(sorted({
+                (str(attributes["external_function"]), len(data.get("parents") or ()))
+                for _node_id, data in authored_graph.G.nodes(data=True)
+                for attributes in ((data.get("attributes") or {}),)
+                if attributes.get("external_function")})),
+            "external_derivatives": tuple(sorted(
+                (str(function.__name__), str(derivative.__name__))
+                for function, derivative in derivatives.items())),
             "symbolic_source": "sympy",
             "symbolic_dtype": dtype,
             "publications": tuple(
@@ -489,8 +606,15 @@ def compile_sympy_equations(
     schedule: str = "asap",
     publications: Sequence[SymbolicPublication] = (),
     dtype: str = "float64",
+    external_derivatives: Mapping[Any, Any] | None = None,
 ) -> SymbolicEquationCompilation:
     """Lower equations once, then reuse their persistent repository dual IR.
+
+    ``external_derivatives`` maps an undefined Function (an external the host
+    supplies) to the undefined Function the host declares as its derivative
+    (``{r1: v1, v1: a1}``): a Derivative of the external compiles as a call
+    to that external.  A Derivative of an external with none declared is
+    refused by name.
 
     The cache identity contains the canonical symbolic structure, ordered live
     parameter ABI (inherent in the equations), publications, dtype, scheduling
@@ -512,6 +636,13 @@ def compile_sympy_equations(
         ),
         "python_cache_tag": sys.implementation.cache_tag,
         "sympy_version": sympy.__version__,
+        # The structural-constant decision reads the declared signatures of
+        # the AbstractTensor operations (``_structural_operand``); a changed
+        # declaration must not be served a stale constant.
+        "tensor_operation_signatures": _tensor_operation_signatures(),
+        "external_derivatives": tuple(sorted(
+            (sympy.srepr(function), sympy.srepr(derivative))
+            for function, derivative in dict(external_derivatives or {}).items())),
     }
     cached = SympyDualIRCache(implementation).dual_ir(
         record,
@@ -521,6 +652,7 @@ def compile_sympy_equations(
             schedule=schedule,
             publications=publication_rows,
             dtype=dtype,
+            external_derivatives=external_derivatives,
         ),
     )
     if not isinstance(cached.value, SymbolicEquationCompilation):
@@ -532,6 +664,7 @@ def compile_sympy_equations(
             schedule=schedule,
             publications=publication_rows,
             dtype=dtype,
+            external_derivatives=external_derivatives,
         )
         value = replace(value, cache_identity=cached.identity, cache_hit=False)
     else:
@@ -573,6 +706,7 @@ def _post_symbolic_program(
     reprs: Sequence[str],
     equations: Sequence[sympy.Equality],
     outputs: Sequence[tuple],
+    derivatives: Mapping[Any, Any] | None = None,
 ) -> dict[str, Any]:
     """Post each authored equation (NOVEL root) and each declared output
     (DERIVED from its equation's cell) on the active book; return the
@@ -621,7 +755,7 @@ def _post_symbolic_program(
         program, tuple(equations), cells,
         tuple((row.name, row.equation_index, row.expression)
               for row in declared_symbolic_outputs(tuple(equations), name)),
-        output_cells,
+        output_cells, derivatives,
     )
     return output_cells
 
@@ -643,7 +777,10 @@ def _post_symbolic_outputs(
     outputs = tuple(metadata.get("symbolic_outputs") or ())
     if not reprs or not outputs:
         return
-    _post_symbolic_program(name, reprs, compilation.equations, outputs)
+    derivatives = {
+        sympy.Function(function): sympy.Function(derivative)
+        for function, derivative in metadata.get("external_derivatives") or ()}
+    _post_symbolic_program(name, reprs, compilation.equations, outputs, derivatives)
 
 
 def _pipeline_implementation() -> str:
@@ -655,6 +792,9 @@ def _pipeline_implementation() -> str:
         _scalar_output,
         SymbolicOutputDeclaration,
         declared_external_functions,
+        _structural_constants,
+        _structural_operand,
+        _declares_integer,
         matrix_component_name,
         ingest_sympy_expression,
         ingest_sympy_expressions,

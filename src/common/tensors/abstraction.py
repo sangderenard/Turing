@@ -758,7 +758,7 @@ class AbstractTensor:
 
     def sum(
         self,
-        dim=None,
+        dim: int | tuple[int, ...] | None = None,
         keepdim: bool = False,
         *,
         axis=None,

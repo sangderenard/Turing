@@ -619,7 +619,12 @@ class SSARecordTable:
         return (SSARecordTable, (dict(self.records),), {"owner": self.owner[0]})
 
     def __setstate__(self, state: dict) -> None:
-        self.__init__(dict(self.records), owner=state.get("owner"))
+        # A table pickled before ``__reduce__`` existed arrives with no
+        # ``__init__`` run and ``{"records": ...}`` as its state (see
+        # ``SSASequenceTable.__setstate__``).
+        records = (self.records if "records" in self.__dict__
+                   else state.get("records", {}))
+        self.__init__(dict(records), owner=state.get("owner"))
 
     def register(
         self, descriptor: SSARecordDescriptor, *,
@@ -1352,7 +1357,12 @@ class _SSALayoutTable:
         return (type(self), (dict(self._rows),), {"owner": self.owner[0]})
 
     def __setstate__(self, state: dict) -> None:
-        self.__init__(dict(self._rows), owner=state.get("owner"))
+        # A table pickled before ``__reduce__`` existed arrives with no
+        # ``__init__`` run and ``{"_rows": ...}`` as its state (see
+        # ``SSASequenceTable.__setstate__``).
+        rows = (self._rows if "_rows" in self.__dict__
+                else state.get("_rows", {}))
+        self.__init__(dict(rows), owner=state.get("owner"))
 
 
 class SSAStructTable(_SSALayoutTable):
@@ -1911,7 +1921,15 @@ class SSASequenceTable:
         )
 
     def __setstate__(self, state: dict) -> None:
-        self.__init__(dict(self.sequences), owner=state.get("owner"))
+        # ``__reduce__`` hands the sequences to ``__init__`` and only the
+        # owner here.  A table pickled before ``__reduce__`` existed (the
+        # durable artifacts/llvm_pieces of 2026-09-17) arrives through the
+        # default protocol instead: no ``__init__`` ran, and its state is
+        # ``{"sequences": ...}``.  Read them from the state in that case, or
+        # those pieces cannot be loaded at all.
+        sequences = (self.sequences if "sequences" in self.__dict__
+                     else state.get("sequences", {}))
+        self.__init__(dict(sequences), owner=state.get("owner"))
 
 
 @dataclass(frozen=True)

@@ -4266,6 +4266,27 @@ class _ControlSSABuilder:
             )
         return cells
 
+    def _concorded_resident(self, value_id: int) -> int:
+        """The resident ``value_id`` denotes under the CONCORDED planning
+        aliases (the ``control_value_alias`` PLANNING rows as resolved at
+        builder entry), never the live ``value_aliases`` view that loops
+        rewrite while their bodies lower."""
+
+        current = int(value_id)
+        seen: set[int] = set()
+        while current in self.concorded_value_aliases:
+            if current in seen:
+                raise ValueError(
+                    "cyclic durable planning concordance for "
+                    f"{self.function_name!r}: {current}"
+                )
+            seen.add(current)
+            target = int(self.concorded_value_aliases[current])
+            if target == current:
+                break
+            current = target
+        return current
+
     def _recorded_name_write(self, value_id: int) -> bool:
         """Whether the book records an authored write producing ``value_id``:
         a ``name_binding`` row under the read scope whose fact names it.
@@ -4274,6 +4295,14 @@ class _ControlSSABuilder:
         row is not a write the arm made (a merge node, a planner alias), so
         the arm takes the entered version; an arm id with one and no
         binding in this lowering is a version the builder cannot find.
+
+        An in-place store (``m[2] = ...``, ``m[:2] -= ...``) is the one
+        version that has BOTH: an authored ``name_binding`` row and a
+        PLANNING alias to the storage it writes (store versions are versions
+        of one storage).  The builder never binds such a version, so
+        ``_carried_name_arm`` resolves the arm through the concorded alias
+        chain before asking this question; this answer alone never decides
+        an in-place store arm.
         """
 
         if self.lexical_read_scope is None:
@@ -4320,6 +4349,24 @@ class _ControlSSABuilder:
         if value is not None:
             source = self._binding_cell(arm_id)
             return value, source if source is not None else self._value_cell(value)
+        # An in-place store version is aliased (``control_value_alias``,
+        # PLANNING) to the storage it writes and is never bound.
+        # ``m = call(); if c: m[2] = ...; if t > 0: m[:2] -= ...`` merges the
+        # inner ``if`` with arm = the ``m[:2]`` store and initial = the
+        # ``m[2]`` store: both resolve to the call result, so the arm
+        # carries the entered storage.  Resolve through the CONCORDED alias
+        # chain (not the live view loops rewrite) before the authored-write
+        # check; refuse only a distinct resolved version with no binding.
+        resident = self._concorded_resident(arm_id)
+        if resident == self._concorded_resident(initial_id):
+            return snapshot, snapshot_cell
+        if resident != arm_id:
+            value = self.external_values.get(resident)
+            if value is not None:
+                source = self._binding_cell(resident)
+                return value, (
+                    source if source is not None else self._value_cell(value)
+                )
         if not self._recorded_name_write(arm_id):
             # The book records no authored write of this value in the arm
             # (no ``name_binding`` row names it): the arm did not assign, the
@@ -9915,23 +9962,7 @@ class _ControlSSABuilder:
                     if updated_id in outputs
                 )
                 alias_source = self.value_aliases.get(updated_id)
-                def concorded_resident(value_id: int) -> int:
-                    current = int(value_id)
-                    seen: set[int] = set()
-                    while current in self.concorded_value_aliases:
-                        if current in seen:
-                            raise ValueError(
-                                "cyclic durable planning concordance for "
-                                f"{self.function_name!r}: {current}"
-                            )
-                        seen.add(current)
-                        target = int(
-                            self.concorded_value_aliases[current]
-                        )
-                        if target == current:
-                            break
-                        current = target
-                    return current
+                concorded_resident = self._concorded_resident
 
                 resident_id = concorded_resident(updated_id)
                 identity_occurrences = tuple(dict.fromkeys((

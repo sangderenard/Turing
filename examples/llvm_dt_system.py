@@ -137,17 +137,89 @@ def require_piece(item, where):
     return item
 
 
-def instantiate_pieces(pieces, state):
+def state_spans(names, columns, batch):
+    """The state's spans as views into ONE contiguous float64 span.
+
+    Returns ``(span, (column views...), dt, telemetry)``: a column per name in
+    ``names`` (one cell per lane, ``(batch,)``), the step's ``dt`` column and
+    the window's telemetry, laid end to end in that order.  ``columns``
+    supplies each column's initial value (``None``: zeros).  Every view is a
+    contiguous ``(batch,)`` float64 span, which is what ``PieceState``
+    declares per field and what a piece aliases at instantiation; the one
+    span is what the state lives in.  A column that is not one cell per lane
+    is refused rather than broadcast.
+    """
+
+    batch = int(batch)
+    count = len(names)
+    span = np.zeros(count * batch + batch + len(TELEMETRY_FIELDS), dtype=np.float64)
+    views = []
+    for index, name in enumerate(names):
+        view = span[index * batch:(index + 1) * batch]
+        if columns is not None:
+            value = np.asarray(columns[name], dtype=np.float64)
+            if value.shape != (batch,):
+                raise ValueError(
+                    f"column {name!r} has shape {value.shape}; a dt-system column "
+                    f"is one cell per lane, ({batch},)")
+            view[...] = value
+        views.append(view)
+    dt = span[count * batch:(count + 1) * batch]
+    telemetry = span[(count + 1) * batch:]
+    return span, tuple(views), dt, telemetry
+
+
+def own_pieces(pieces):
+    """The pieces as THIS state's participants.
+
+    An instantiated piece holds its runtime binding (an ``LLVMPiece``'s
+    prepared execution: pointer table, output buffers, the spans it aliases)
+    for the lifetime of the state it was instantiated against.  The same piece
+    object is routinely offered to several states -- a piece cache hands every
+    state built from one law the same object -- and a second state's
+    instantiation used to rebind it, so the first state's rounds missed the
+    bound path and prepared a fresh ABI on every call.  Each state therefore
+    takes its own shallow instance: the artifact, ids and SSA are shared, the
+    binding is the state's.  A ``RoundPiece`` is already one state's (it is
+    built per interpretation and owns a state) and is taken as it is.
+    """
+    import copy
+
+    return tuple(copy.copy(piece) if isinstance(piece, LLVMPiece) else piece
+                 for piece in pieces)
+
+
+def instantiate_pieces(pieces, state, schedule="sequential"):
     """The cascade: ask every piece to instantiate against ``state``'s spans.
 
     This is the one interaction that precedes every call.  Each piece is
     handed, by argument name, the span object it will receive on each round;
     what it prepares for its own lifetime (an artifact's public ABI, a nested
     round's aliased state, a participant's own pieces) is its business.
+
+    Under the ``sequential`` read discipline a piece's ``<name>_next`` output
+    lands in column ``name`` right after its call (``piece_source``).  When
+    the piece does not itself read ``name``, storing that output straight
+    into the column during the call is the same write, so the piece is also
+    handed those column views as ``outputs`` and its kernel stores in place;
+    the spelled ``state.<name>[...] = o`` is then a copy of the span onto
+    itself.  A piece that reads the column it writes keeps its own output
+    buffer (the kernel may read the input after storing the output), and
+    under ``parallel`` nothing lands in place (every piece reads the
+    start-of-step state, so a write may not land before the last call).
     """
 
+    columns = set(column_names_of(pieces))
     for piece in pieces:
-        piece.instantiate({name: getattr(state, name) for name in piece.argument_names})
+        outputs = {}
+        if schedule == "sequential":
+            for name in piece.output_names:
+                column = name[:-5]
+                if (name.endswith("_next") and column in columns
+                        and column not in piece.argument_names):
+                    outputs[name] = getattr(state, column)
+        piece.instantiate({name: getattr(state, name) for name in piece.argument_names},
+                          outputs)
 
 
 def state_source(columns, participants=1):
@@ -295,12 +367,19 @@ def piece_source(pieces, schedule="sequential"):
         else:
             lines.append(f"    state.pub_dt_courant[{index}] = 0.0")
             lines.append(f"    state.pub_dt_courant_present[{index}] = 0.0")
-        for channel, name in enumerate(DT_CHANNEL_NAMES):
-            slot = index * len(DT_CHANNEL_NAMES) + channel
-            measured = name in published and name in METRIC_FIELDS
-            value = f"m{index}_{name}" if measured else "0.0"
-            lines.append(f"    state.pub_values[{slot}] = {value}")
-            lines.append(f"    state.pub_present[{slot}] = {float(measured)}")
+        # This law's channel publication is ONE row of the (P, C) publication
+        # span (flattened, offset ``participant * C + channel``): written as
+        # that row slice, measures and presence mask, every attempt -- the
+        # same values the per-element stores wrote, in one store each.
+        start = index * len(DT_CHANNEL_NAMES)
+        stop = start + len(DT_CHANNEL_NAMES)
+        measured = [name in published and name in METRIC_FIELDS for name in DT_CHANNEL_NAMES]
+        values = [f"m{index}_{name}" if flag else "0.0"
+                  for name, flag in zip(DT_CHANNEL_NAMES, measured)]
+        lines.append(f"    state.pub_values[{start}:{stop}] = "
+                     f"AbstractTensor.tensor([{', '.join(values)}])")
+        lines.append(f"    state.pub_present[{start}:{stop}] = "
+                     f"AbstractTensor.tensor({[float(flag) for flag in measured]})")
 
     def fold(operator, terms, empty):
         if not terms:
@@ -382,9 +461,39 @@ def bind_namespace(pieces, *, wrap=None, schedule="sequential"):
     return namespace
 
 
+def bind_program(namespace):
+    """One state's program: this module's text plus that state's generated
+    text, bound together as the compiled lane binds them.
+
+    The lowering compiles ``inspect.getsource(<this module>) +
+    generated_source(pieces)`` as ONE module, so inside it ``dt_system_over``
+    names the ``advance_pieces`` spelled for that module's pieces.  Every
+    persistent state is spelled for its own pieces, so the eager lane does the
+    same per state: a namespace holding this module's globals and the state's
+    generated ``PieceState``/``advance_pieces``/``step_i``, and
+    ``dt_system_over`` -- the same code object, the program text unchanged --
+    bound to that namespace as its globals.  Nothing is written into this
+    module, so a state instantiated later never rebinds an earlier one's
+    program (it used to: ``bind_pieces`` assigned ``advance_pieces`` as a
+    module global, and every state ran the most recently spelled one).
+    """
+    import types
+
+    program = dict(globals())
+    program.update(namespace)
+    program["dt_system_over"] = types.FunctionType(
+        dt_system_over.__code__, program, dt_system_over.__name__,
+        dt_system_over.__defaults__, dt_system_over.__closure__)
+    return program
+
+
 def bind_pieces(pieces, *, wrap=None, schedule="sequential"):
     """Bind ``PieceState`` and ``advance_pieces`` for these pieces in this
-    module: the Python path runs the very text the lowering is given."""
+    module: the Python path runs the very text the lowering is given.
+
+    This is the compiled lane's binding (``lowered_system`` hands the returned
+    ``step_i`` to the lowering).  A persistent eager state never runs through
+    these module globals; it carries its own program (``bind_program``)."""
 
     namespace = bind_namespace(pieces, wrap=wrap, schedule=schedule)
     globals()["PieceState"] = namespace["PieceState"]
@@ -570,7 +679,7 @@ class Subcycle:
         #: reaction and the slip rate.  0.0: not a rotating coupling, so the
         #: store sees no power (the energy build-up stays at zero, honestly).
         self.omega_ref_rad_s = float(omega_ref_rad_s)
-        self.pieces = load_pieces(piece_files)
+        self.pieces = own_pieces(load_pieces(piece_files))
         self.round_dt = float(round_dt)
         self.dx = float(dx)
         self.targets = targets or Targets(cfl=0.5, div_max=1e9, mass_max=1e-3,
@@ -598,11 +707,9 @@ class Subcycle:
 
     def attach(self, columns):
         """Build this participant's own state from the shared columns."""
-        self.state = self._state_class(
-            *(np.array(columns[name], dtype=np.float64) for name in self.names),
-            np.zeros((self.pieces[0].batch,), dtype=np.float64),
-            np.zeros((len(TELEMETRY_FIELDS),), dtype=np.float64),
-        )
+        span, views, dt, telemetry = state_spans(self.names, columns, self.pieces[0].batch)
+        self.state = self._state_class(*views, dt, telemetry)
+        self.state.span = span
         self.state.participants = participant_registry(self.pieces)
         configure_publication_limits(self.state, self.targets)
         # An independent participant owns its state (it reads the consulting
@@ -841,7 +948,8 @@ class RoundPiece:
     def __init__(self, node, *, wrap=None):
         self.node = node
         self.entry = str(node.label)
-        self.pieces, self.schedule = interpret_round(node, wrap=wrap)
+        pieces, self.schedule = interpret_round(node, wrap=wrap)
+        self.pieces = own_pieces(pieces)
         self.batch = self.pieces[0].batch
         self.names = column_names_of(self.pieces)
         self.owned = owned_columns(self.pieces, self.names)
@@ -854,17 +962,15 @@ class RoundPiece:
         self.dt_inner = float(node.plan.dt_init)
         namespace = bind_namespace(self.pieces, wrap=wrap, schedule=self.schedule)
         self._advance = namespace["advance_pieces"]
-        self.state = namespace["PieceState"](
-            *(np.zeros(self.batch, dtype=np.float64) for _ in self.names),
-            np.zeros((self.batch,), dtype=np.float64),
-            np.zeros((len(TELEMETRY_FIELDS),), dtype=np.float64),
-        )
+        span, views, dt, telemetry = state_spans(self.names, None, self.batch)
+        self.state = namespace["PieceState"](*views, dt, telemetry)
+        self.state.span = span
         self.state.participants = participant_registry(self.pieces)
         configure_publication_limits(self.state, self.targets)
         #: time velocity of the last window: advanced / asked (1.0 when landed)
         self.tau = 1.0
 
-    def instantiate(self, columns):
+    def instantiate(self, columns, outputs=None):
         """The nested round's instantiation, from its parent's.
 
         The columns a nested round advances are its parent's columns: it lands
@@ -874,12 +980,15 @@ class RoundPiece:
         then checkpoints and restores exactly those spans, which is the
         dt_graph rule for a nested round that cannot land.  Then the cascade
         continues: its pieces instantiate against its (now aliased) state.
+        ``outputs`` is accepted for the piece API and not needed: every column
+        a nested round writes is one it reads, and its own pieces already
+        write the adopted spans.
         """
 
         for name in self.names:
             if name in columns:
                 setattr(self.state, name, columns[name])
-        instantiate_pieces(self.pieces, self.state)
+        instantiate_pieces(self.pieces, self.state, self.schedule)
 
     def __call__(self, *columns):
         *values, dt = columns
@@ -944,16 +1053,16 @@ def instantiate_state(pieces, columns, *, targets, schedule="sequential",
     ``copy_shallow``/``restore`` on it, never a replacement.
     """
 
-    pieces = tuple(pieces)
+    pieces = own_pieces(pieces)
     names = column_names_of(pieces)
     batch = pieces[0].batch
     ledger = WallCostLedger(str(piece.entry) for piece in pieces)
-    bind_pieces(pieces, wrap=ledger.wrap, schedule=schedule)
-    state = PieceState(
-        *(np.array(columns[name], dtype=np.float64) for name in names),
-        np.zeros((batch,), dtype=np.float64),
-        np.zeros((len(TELEMETRY_FIELDS),), dtype=np.float64),
-    )
+    program = bind_program(bind_namespace(pieces, wrap=ledger.wrap, schedule=schedule))
+    # One contiguous span; every column, ``dt`` and the telemetry are views
+    # into it (``state_spans``).  The state owns it for its whole lifetime.
+    span, views, dt, telemetry = state_spans(names, columns, batch)
+    state = program["PieceState"](*views, dt, telemetry)
+    state.span = span
     # The laws declare themselves once, in causal order, and the state carries
     # the registry so the controller can index the rows the step publishes.
     state.participants = participant_registry(pieces)
@@ -968,6 +1077,10 @@ def instantiate_state(pieces, columns, *, targets, schedule="sequential",
     # a new, uninstantiated participant every call).
     state.bound_pieces = (tuple(names), str(schedule))
     state.pieces = pieces
+    # The program this state was spelled for, bound per state: its rounds run
+    # ``dt_system_over`` over ITS ``advance_pieces``, whatever other states
+    # have been instantiated since (``bind_program``).
+    state.program = program
     # The rollback choice is the system's, declared once and read by
     # ``dt_system_over`` every round.  Undeclared is ``run_superstep``'s
     # no-save, in-place, no-retry lane, as this lane always ran;
@@ -979,7 +1092,7 @@ def instantiate_state(pieces, columns, *, targets, schedule="sequential",
     # Instantiation cascades: the containing system asks each piece to
     # instantiate against the spans it will be handed every round, so a piece
     # prepares its own lifetime-scoped storage once here and only runs later.
-    instantiate_pieces(pieces, state)
+    instantiate_pieces(pieces, state, schedule)
     return state
 
 
@@ -1157,7 +1270,8 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
                     if name in names:
                         getattr(state, name)[...] = value
             start = time.perf_counter()
-            total, dt = dt_system_over(state, targets, controller, round_dt, dt, dx)
+            total, dt = state.program["dt_system_over"](
+                state, targets, controller, round_dt, dt, dx)
             ledger.window(time.perf_counter() - start, float(total))
             world_s += float(total)
             for sub in subcycles:

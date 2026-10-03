@@ -72,34 +72,131 @@ def declared_external_functions(expressions: Sequence[Any]) -> tuple[ExternalDec
     return tuple(ExternalDeclaration(name, arities[name]) for name in sorted(arities))
 
 
+class UndeclaredExternalDerivative(TypeError):
+    """A Derivative of an external whose derivative the host did not declare."""
+
+
+def resolve_external_derivatives(expression: Any, derivatives: Mapping[Any, Any]) -> Any:
+    """Replace each derivative of an external by its declared derivative external.
+
+    ``derivatives`` maps an undefined Function class to the undefined
+    Function class the host declares as its derivative (``r1 -> v1``,
+    ``v1 -> a1``): ``Derivative(r1(s), (s, 2))`` is ``a1(s)``, and SymPy's
+    chain-rule form ``Subs(Derivative(r1(x), x), x, g)`` is ``v1(g)``.  A
+    derivative of an external with no declared derivative is refused naming
+    the external; there is no finite-difference fallback.  Only unary
+    externals carry a declared derivative (a partial derivative of a
+    multi-argument external is refused)."""
+
+    import sympy
+    from sympy.core.function import AppliedUndef
+
+    def nth(function, order: int, argument):
+        current = function
+        for _ in range(int(order)):
+            following = derivatives.get(current)
+            if following is None:
+                raise UndeclaredExternalDerivative(
+                    f"external {current.__name__!r} has no declared derivative "
+                    f"(needed for {function.__name__!r} order {order}); declare it "
+                    "with compile_sympy_equations(external_derivatives=...)")
+            current = following
+        return current(argument)
+
+    def derivative_of(node):
+        if not isinstance(node.expr, AppliedUndef):
+            return None
+        function = node.expr.func
+        if len(node.expr.args) != 1:
+            raise UndeclaredExternalDerivative(
+                f"external {function.__name__!r} takes {len(node.expr.args)} "
+                "arguments; a partial derivative of it has no declaration")
+        (argument,) = node.expr.args
+        orders = dict(node.variable_count)
+        if set(orders) != {argument}:
+            return sympy.S.Zero if argument not in orders and all(
+                variable not in argument.free_symbols for variable in orders) else None
+        return nth(function, orders[argument], argument)
+
+    def resolve(node):
+        if isinstance(node, sympy.Subs) and isinstance(node.expr, sympy.Derivative):
+            inner = derivative_of(node.expr)
+            if inner is not None:
+                return inner.xreplace(dict(zip(node.variables, node.point)))
+        if isinstance(node, sympy.Derivative):
+            inner = derivative_of(node)
+            if inner is not None:
+                return inner
+        return None
+
+    return expression.replace(lambda node: resolve(node) is not None, resolve)
+
+
+def derivatives_of_externals(expression: Any) -> tuple[str, ...]:
+    """Names of the externals still under a Derivative in ``expression``."""
+
+    import sympy
+    from sympy.core.function import AppliedUndef
+
+    return tuple(sorted({
+        str(node.expr.func.__name__)
+        for node in sympy.preorder_traversal(expression)
+        if isinstance(node, sympy.Derivative) and isinstance(node.expr, AppliedUndef)}))
+
+
+def resolved_derivative_form(expression: Any, derivatives: Mapping[Any, Any]) -> Any:
+    """``expression`` with every Derivative differentiated by SymPy and each
+    derivative of an external replaced by its declared derivative external:
+    the externals the ingestion will call.  Undeclared ones stay Derivatives."""
+
+    import sympy
+
+    def differentiate(node):
+        try:
+            return resolve_external_derivatives(
+                sympy.diff(node.expr, *node.variables), derivatives)
+        except UndeclaredExternalDerivative:
+            return node
+
+    return expression.replace(lambda node: isinstance(node, sympy.Derivative), differentiate)
+
+
 def post_external_functions(program: Any, equations: Sequence[Any],
                             equation_cells: Mapping[int, Any],
                             outputs: Sequence[tuple[str, int, Any]],
-                            output_cells: Mapping[str, Any]) -> dict[str, Any]:
+                            output_cells: Mapping[str, Any],
+                            derivatives: Mapping[Any, Any] | None = None) -> dict[str, Any]:
     """Post each declared external (NOVEL, minted) and each callsite (DERIVED).
 
     ``outputs`` is ``(output name, equation index, expression)`` per declared
-    output.  The external is NOVEL(DECLARE_EXTERNAL_FUNCTION) from the cell of
-    the first equation that applies it; its name row records the minted id
+    output.  The externals are those the outputs call once each Derivative
+    of an external is its declared derivative external (``derivatives``,
+    ``r1 -> v1``).  Each is NOVEL(DECLARE_EXTERNAL_FUNCTION) from the cell of
+    the first equation that calls it; its name row records the minted id
     (DERIVED from the external cell), so posting the same program again
-    reuses the identity instead of minting a second one.  Each distinct
-    application in an output is an ``external_callsite`` row DERIVED from the
-    external cell and the output cell.  Returns the external cells by name.
+    reuses the identity instead of minting a second one.  A declared
+    derivative is an ``external_derivative`` row DERIVED from the external's
+    and the derivative external's cells.  Each distinct call in an output is
+    an ``external_callsite`` row DERIVED from the external cell and the
+    output cell.  Returns the external cells by name.
     """
 
     import sympy
     from sympy.core.function import AppliedUndef
 
     from .concordance_declarations import (
-        DECLARE_EXTERNAL_FUNCTION, EXTERNAL_CALLSITE, EXTERNAL_FUNCTION,
-        EXTERNAL_FUNCTION_NAME, INGESTION, ExternalCallsiteFact,
-        ExternalFunctionFact,
+        DECLARE_EXTERNAL_FUNCTION, EXTERNAL_CALLSITE, EXTERNAL_DERIVATIVE,
+        EXTERNAL_FUNCTION, EXTERNAL_FUNCTION_NAME, INGESTION,
+        ExternalCallsiteFact, ExternalDerivativeFact, ExternalFunctionFact,
     )
     from .identity_concordance import NEW, Derived, Mode, Novel, current_identity_book
 
+    derivatives = dict(derivatives or {})
     book = current_identity_book()
-    declarations = declared_external_functions([eq.rhs for eq in equations]
-                                               + [eq.lhs for eq in equations])
+    resolved_equations = [
+        resolved_derivative_form(sympy.Tuple(eq.lhs, eq.rhs), derivatives)
+        for eq in equations]
+    declarations = declared_external_functions(resolved_equations)
     cells: dict[str, Any] = {}
     for declaration in declarations:
         named = book.latest_ref(EXTERNAL_FUNCTION_NAME, (program, declaration.name))
@@ -109,7 +206,7 @@ def post_external_functions(program: Any, equations: Sequence[Any],
             cells[declaration.name] = book.latest_ref(EXTERNAL_FUNCTION, (program, minted))
             continue
         first = next(
-            index for index, equation in enumerate(equations)
+            index for index, equation in enumerate(resolved_equations)
             if any(isinstance(node, AppliedUndef) and node.func.__name__ == declaration.name
                    for node in sympy.preorder_traversal(equation)))
         cell = book.post(
@@ -125,9 +222,17 @@ def post_external_functions(program: Any, equations: Sequence[Any],
             stage=INGESTION, provenance=Derived((cell,)), mode=Mode.CONCORD,
         )
         cells[declaration.name] = cell
+    for function, derivative in derivatives.items():
+        name, derived = str(function.__name__), str(derivative.__name__)
+        if name in cells and derived in cells:
+            book.post(
+                EXTERNAL_DERIVATIVE, (program, name), ExternalDerivativeFact(derived),
+                stage=INGESTION, provenance=Derived((cells[name], cells[derived])),
+                mode=Mode.CONCORD,
+            )
     for output, _equation_index, expression in outputs:
         seen = set()
-        for node in sympy.preorder_traversal(expression):
+        for node in sympy.preorder_traversal(resolved_derivative_form(expression, derivatives)):
             if not isinstance(node, AppliedUndef) or node in seen:
                 continue
             seen.add(node)
@@ -205,13 +310,21 @@ class ExternalFunction:
     constant_outputs: dict = field(default_factory=dict)
     batch: int = 1
     binding: str = RUNTIME_SLOT
+    #: The declared external this leaf specializes (``r1`` for the leaf
+    #: ``r1__s4``); the host binds by it.  Defaults to ``name``.
+    external: str = ""
+
+    def __post_init__(self):
+        if not self.external:
+            self.external = self.name
 
     def piece_record(self) -> dict[str, Any]:
         """The ``llvm_piece`` metadata fields that make the leaf a slot call."""
 
         return {
             "binding": RUNTIME_SLOT,
-            "external": self.name,
+            "external": self.external,
+            "leaf": self.name,
             "external_identity": None if self.identity is None else repr(self.identity),
             "argument_slots": tuple(
                 self.artifact.buffer_order.index(int(v)) for v in self.argument_ids),
@@ -248,7 +361,7 @@ def _signature_contract(entry: str, names: Sequence[str], shapes: Sequence[tuple
 def declare_external(name: str, signature: ExternalSignature, *,
                      implementation: Any = None,
                      derivative: ExternalFunction | None = None,
-                     identity: Any = None) -> ExternalFunction:
+                     identity: Any = None, external: str = "") -> ExternalFunction:
     """The piece-shaped leaf of external ``name`` at ``signature``.
 
     With an ``LLVMPiece`` implementation the leaf IS that piece's ABI and
@@ -285,6 +398,7 @@ def declare_external(name: str, signature: ExternalSignature, *,
             outputs=implementation.outputs, source=implementation.source,
             implementation=implementation, derivative=derivative,
             identity=identity, batch=int(getattr(implementation, "batch", 1)),
+            external=external or name,
         )
     if any(tuple(shape) != tuple(signature.result_shape)
            for shape in signature.argument_shapes):
@@ -329,79 +443,153 @@ def declare_external(name: str, signature: ExternalSignature, *,
         output_names=("result",), output_ids={"result": output_id},
         module=module, entry=entry, outputs=outputs, source=source,
         implementation=implementation, derivative=derivative, identity=identity,
+        external=external or name,
     )
 
 
-def external_callsite_shapes(source: str, entry: str, argument_names: Sequence[str],
-                             batch: int, names: Sequence[str]) -> dict[str, tuple]:
-    """Each external's (argument shapes, result shape) at its callsites.
+def _shape_tag(shape: tuple[int, ...]) -> str:
+    return "s" + "x".join(str(int(n)) for n in shape)
 
-    Read by running the law's own AbstractTensor stage once on batch columns,
-    with each external recording the shapes it is called at and answering
-    ones of its argument's shape.  An external called at two shapes is
-    refused (one specialization per external per law)."""
+
+def external_callsite_shapes(source: str, entry: str, argument_names: Sequence[str],
+                             batch: int, callsites: Mapping[str, str]) -> dict[str, tuple]:
+    """Each external callsite's (argument shapes, result shape).
+
+    ``callsites`` maps a callsite's callee spelling (one per call
+    instruction) to its external.  Read by running the law's own
+    AbstractTensor stage once on batch columns, each callsite recording the
+    shapes it is called at and answering ones of its argument's shape."""
 
     from src.common.tensors import AbstractTensor
 
     seen: dict[str, tuple] = {}
 
-    def recorder(name):
+    def recorder(spelling):
         def record(*arguments):
             shapes = tuple(tuple(int(n) for n in getattr(a, "shape", ()) or ())
                            for a in arguments)
             result = shapes[0] if shapes else ()
-            key = (shapes, result)
-            if seen.setdefault(name, key) != key:
-                raise ValueError(
-                    f"external {name!r} is called at two shapes: {seen[name]} and {key}")
+            seen[spelling] = (shapes, result)
             if not result:
                 return 1.0
             return AbstractTensor.get_tensor(np.ones(result))
         return record
 
     namespace: dict[str, Any] = {"AbstractTensor": AbstractTensor}
-    namespace.update({name: recorder(name) for name in names})
+    namespace.update({spelling: recorder(spelling) for spelling in callsites})
     exec(compile(source, f"<{entry}>", "exec"), namespace)
     columns = [AbstractTensor.get_tensor(np.full(batch, 0.75)) for _ in argument_names]
     namespace[entry](*columns)
     return seen
 
 
-def externals_for_law(compilation: Any, law: str, batch: int, source: str,
-                      supplied: Mapping[str, Any] | None = None) -> dict[str, ExternalFunction]:
-    """The declared externals of one compiled law, specialized at its callsites.
+def _respelled(compilation: Any, callees: Mapping[int, str]) -> Any:
+    """``compilation`` with each external Call (by result id) calling
+    ``callees[id]``; the cached compilation itself is not touched."""
 
-    ``supplied`` maps an external's name to its implementation (an
-    ``ExternalFunction``, an ``LLVMPiece`` or a host callable) or is absent:
-    the slot is then bound at load only."""
+    import dataclasses
 
-    declared = tuple(compilation.function.metadata.get("external_functions") or ())
+    from ..transmogrifier.ssa import BasicBlock, Instr
+
+    function = compilation.function
+    blocks = {}
+    for label, block in function.blocks.items():
+        instrs = []
+        for instruction in block.instrs:
+            if (instruction.op in {"Call", "call"} and instruction.res is not None
+                    and int(instruction.res.id) in callees):
+                instruction = Instr(
+                    instruction.op, list(instruction.args), instruction.res,
+                    arg_roles=list(instruction.arg_roles),
+                    attributes={**dict(instruction.attributes),
+                                "callee": callees[int(instruction.res.id)]},
+                    source_span=instruction.source_span,
+                )
+            instrs.append(instruction)
+        blocks[label] = BasicBlock(label, instrs)
+    specialized = copy.copy(function)
+    specialized.blocks = blocks
+    return dataclasses.replace(compilation, function=specialized)
+
+
+def externals_for_law(compilation: Any, law: str, batch: int,
+                      supplied: Mapping[str, Any] | None = None):
+    """The law's declared externals, one leaf per (external, callsite shape).
+
+    Returns ``(compilation, source, bindings)``: the compilation whose
+    external calls are spelled with their specialized leaf names (an
+    external called at one shape keeps its own name; one called at several,
+    ``r1`` at ``s`` and at ``0``, gets ``r1__s4`` and ``r1__s``), the
+    law's AbstractTensor source, and the leaf per name.  Each leaf is its own
+    slot; the host fills every slot of an external with its one
+    implementation (``bind_external_slots``).  ``supplied`` maps an external
+    to its implementation (an ``LLVMPiece`` the leaf takes its ABI from, a
+    host callable, or an ``ExternalFunction`` used as the leaf as is)."""
+
+    from .vehicle_python_compilation import symbolic_abstract_tensor_source
+
+    metadata = compilation.function.metadata
+    declared = dict((str(name), int(arity))
+                    for name, arity in metadata.get("external_functions") or ())
     if not declared:
-        return {}
+        return compilation, symbolic_abstract_tensor_source(compilation, law), {}
     supplied = dict(supplied or {})
-    names = tuple(str(name) for name, _arity in declared)
-    unspecialized = tuple(
-        name for name in names if not isinstance(supplied.get(name), ExternalFunction))
+    calls = [
+        instruction
+        for block in compilation.function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op in {"Call", "call"} and instruction.res is not None
+        and str(instruction.attributes.get("callee") or "") in declared]
+    probe_spellings = {
+        int(call.res.id): f"{call.attributes['callee']}__callsite_{index}"
+        for index, call in enumerate(calls)}
+    external_of = {
+        probe_spellings[int(call.res.id)]: str(call.attributes["callee"]) for call in calls}
+    probe = _respelled(compilation, probe_spellings)
     shapes = external_callsite_shapes(
-        source, law, tuple(compilation.function.metadata["argument_names"]), batch,
-        names) if unspecialized else {}
-    externals: dict[str, ExternalFunction] = {}
-    for name, arity in declared:
+        symbolic_abstract_tensor_source(probe, law), law,
+        tuple(metadata["argument_names"]), batch, external_of)
+    by_external: dict[str, dict[tuple, list[int]]] = {}
+    for call in calls:
+        spelling = probe_spellings[int(call.res.id)]
+        if spelling not in shapes:
+            raise ValueError(f"{law}: external callsite {spelling!r} never ran")
+        by_external.setdefault(external_of[spelling], {}).setdefault(
+            shapes[spelling], []).append(int(call.res.id))
+    callees: dict[int, str] = {}
+    bindings: dict[str, ExternalFunction] = {}
+    for name, specializations in sorted(by_external.items()):
         given = supplied.get(name)
-        if isinstance(given, ExternalFunction):
-            externals[name] = given
-            continue
-        if name not in shapes:
-            raise ValueError(f"{law}: external {name!r} is declared but never called")
-        argument_shapes, result_shape = shapes[name]
-        if len(argument_shapes) != int(arity):
-            raise ValueError(f"{law}: external {name!r} arity {arity} != callsite "
-                             f"{len(argument_shapes)}")
-        externals[name] = declare_external(
-            name, ExternalSignature(("float64",) * len(argument_shapes),
-                                    argument_shapes, "float64", result_shape),
-            implementation=given)
-    return externals
+        for (argument_shapes, result_shape), call_ids in sorted(specializations.items()):
+            leaf = name if len(specializations) == 1 else f"{name}__{_shape_tag(result_shape)}"
+            if len(argument_shapes) != declared[name]:
+                raise ValueError(f"{law}: external {name!r} arity {declared[name]} != "
+                                 f"callsite {len(argument_shapes)}")
+            if isinstance(given, ExternalFunction):
+                if len(specializations) != 1:
+                    raise ValueError(
+                        f"{law}: external {name!r} is called at "
+                        f"{len(specializations)} shapes; one ExternalFunction leaf "
+                        "cannot serve them")
+                bindings[leaf] = given
+            else:
+                bindings[leaf] = declare_external(
+                    leaf, ExternalSignature(("float64",) * len(argument_shapes),
+                                            argument_shapes, "float64", result_shape),
+                    implementation=given, external=name)
+            for call_id in call_ids:
+                callees[call_id] = leaf
+    # Each external's declared derivative external (orbital item 4): the
+    # leaf carries the derivative's leaf at the same shape, and its
+    # ``llvm_piece`` record names it.
+    leaves_of: dict[str, dict[tuple, ExternalFunction]] = {}
+    for leaf in bindings.values():
+        leaves_of.setdefault(leaf.external, {})[leaf.signature.result_shape] = leaf
+    for function, derivative in metadata.get("external_derivatives") or ():
+        for shape, leaf in leaves_of.get(function, {}).items():
+            leaf.derivative = leaves_of.get(derivative, {}).get(shape)
+    specialized = _respelled(compilation, callees)
+    return specialized, symbolic_abstract_tensor_source(specialized, law), bindings
 
 
 # -- the slot table in the C and LLVM lanes -----------------------------------

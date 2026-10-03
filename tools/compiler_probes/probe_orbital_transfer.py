@@ -73,28 +73,16 @@ BATCH = 4
 TOLERANCE = 1e-12
 
 # The user's work items for this set (2026-10-02), the ones still open.
-# Item 1 (matrices and complicated lhs) and item 3 (external functions
-# compiled as runtime-provided symbols: declared externals called through
-# the program's slot table, ``src/compiler/external_functions.py``) are
-# resolved and are not listed.
-WORK_ITEMS: dict[int, str] = {
-    2: "Greek-name sanitation (mu_1/mu_2 spelled with GREEK SMALL LETTER MU)",
-    4: "live differentiation/integration (Derivative of an applied undefined "
-       "Function: no graph-native adjoint rule for call; Integral quadrature: "
-       "get_tensor has no repository LLVM emission)",
-}
+# All resolved (2026-10-03): 1 matrices and complicated lhs; 2 Greek names
+# (the mu_i laws pass as written, no sanitation needed); 3 external
+# functions as runtime-slot externals; 4 derivatives of externals as their
+# declared derivative externals and the Integral as its declared quadrature
+# lowered natively (``CONTINUATION_orbital_item3_externals.md``).
+WORK_ITEMS: dict[int, str] = {}
 
-# law -> the open work items it needs before it can pass, by the constructs
-# it carries.  A law not listed must pass.  Item 2 is assigned by construct
-# presence only and is not observed: equation_of_motion_rhs carries the
-# Greek names and passes (2026-10-03); the laws still listed fail at item 4
-# first.
-LAW_BLOCKERS: dict[str, tuple[int, ...]] = {
-    "orbital_transfer_raw": (2, 4),
-    "equation_of_motion_lhs": (4,),
-    "total_energy_expression": (2, 4),
-    "force_cost_integral": (4,),
-}
+# law -> the open work items it needs before it can pass.  A law not listed
+# must pass; every law of the set passes.
+LAW_BLOCKERS: dict[str, tuple[int, ...]] = {}
 
 
 def blocker_reason(items) -> str:
@@ -211,21 +199,58 @@ def reference_bindings(program: dict):
     }
 
 
+def external_derivatives() -> dict:
+    """The host's declared derivative of each position external: velocity
+    ``v_i = dr_i/ds`` and acceleration ``a_i = dv_i/ds``.  The set takes
+    Derivatives of ``r_i`` only; the craft supplies its velocity and
+    acceleration as externals of their own."""
+    out = {}
+    for index in (1, 2, 3):
+        r, v, a = (sp.Function(f"{kind}{index}") for kind in ("r", "v", "a"))
+        out[r] = v
+        out[v] = a
+    return out
+
+
 def host_externals(concrete) -> dict:
     """The host's runtime implementations of the set's externals.
 
     The same concrete functions the reference uses, as numpy callables: what
     the craft's r()/F() seam supplies at runtime, bound into the compiled
-    program's slot table at load (``bind_external_slots``)."""
+    program's slot table at load (``bind_external_slots``).  Each declared
+    derivative external is the derivative of the host's own function (the
+    host knows its velocity)."""
+    bodies = {str(function.__name__): body for function, body in concrete.items()}
+    for function, derivative in external_derivatives().items():
+        body = bodies.get(str(function.__name__))
+        if body is not None:
+            (variable,) = body.variables
+            bodies[str(derivative.__name__)] = sp.Lambda(variable, sp.diff(body.expr, variable))
     out = {}
-    for function, body in concrete.items():
-        out[str(function.__name__)] = sp.lambdify(body.variables, body.expr, modules="numpy")
+    for name, body in bodies.items():
+        function = sp.lambdify(body.variables, body.expr, modules="numpy")
+        out[name] = (lambda f: lambda *args: np.broadcast_to(
+            np.asarray(f(*args), dtype=np.float64), np.shape(args[0])))(function)
     return out
 
 
 def reference_columns(names, batch=BATCH) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(20261002)
     return {name: rng.uniform(0.5, 2.0, batch) for name in names}
+
+
+def declared_quadrature(integral):
+    """``integral`` as the compiler's declared rule: weights times the
+    integrand at the nodes mapped onto each finite axis."""
+    from src.compiler.symbolic_process_graph import _gauss_legendre_rule
+
+    rule = _gauss_legendre_rule()
+    body = integral.function
+    for variable, lower, upper in integral.limits:
+        half, mid = (upper - lower) / 2, (upper + lower) / 2
+        body = sp.Add(*(weight * half * body.xreplace({variable: mid + half * node})
+                        for node, weight in rule))
+    return body
 
 
 def reference_values(compilation, law, columns, concrete) -> dict[str, np.ndarray]:
@@ -247,6 +272,12 @@ def reference_values(compilation, law, columns, concrete) -> dict[str, np.ndarra
         for function, body in concrete.items():
             expr = expr.replace(function, body)
         expr = expr.doit()
+        # An Integral SymPy cannot integrate in closed form is compiled as its
+        # DECLARED lowering, the Gauss-Legendre rule of
+        # ``symbolic_process_graph.lower_integral_declaration``; the reference
+        # applies that same rule, so the check is of the lowering, not of the
+        # rule's own truncation error.
+        expr = expr.replace(lambda node: isinstance(node, sp.Integral), declared_quadrature)
         symbols = sorted(expr.free_symbols, key=lambda symbol: symbol.name)
         missing = [str(symbol) for symbol in symbols if str(symbol) not in columns]
         if missing:
@@ -304,7 +335,8 @@ def run_law(law, equations, failures, concrete, sink=None):
     from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 
     try:
-        compilation = compile_sympy_equations(list(equations), name=law)
+        compilation = compile_sympy_equations(
+            list(equations), name=law, external_derivatives=external_derivatives())
     except Exception as error:  # noqa: BLE001 -- recorded verbatim
         _record(failures, law, "compile_sympy_equations", equations, error)
         return None
@@ -405,7 +437,7 @@ def main() -> int:
     for (stage, where), count in sorted(by_stage.items()):
         print(f"  {count} x {stage} raised in {where}")
     print()
-    print("work list (open items; items 1 (matrices, complicated lhs) and 3 (externals) resolved):")
+    print("work list (open items; items 1-4 resolved):")
     for item, text in WORK_ITEMS.items():
         blocked = [law for law, items in LAW_BLOCKERS.items() if item in items]
         print(f"  {item}. {text}")

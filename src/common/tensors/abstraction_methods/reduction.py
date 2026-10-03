@@ -14,7 +14,7 @@ def _wrap_scalar(result):
 
 def max(
     self,
-    dim=None,
+    dim: int | tuple[int, ...] | None = None,
     keepdim: bool = False,
     *,
     axis=None,
@@ -59,7 +59,7 @@ def argmin(self, dim: Optional[int] = None, keepdim: bool = False):
 
 def prod(
     self,
-    dim=None,
+    dim: int | tuple[int, ...] | None = None,
     keepdim: bool = False,
     *,
     axis=None,

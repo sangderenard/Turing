@@ -188,3 +188,46 @@ findings 0,1,0,1,5,0,0 (unchanged).
   callsite rows are at the symbolic level.
 - The Fortran lane does not read `llvm_piece`; it would emit the NaN
   declaration body.
+
+# Next lane (coordinator, after c03ae4e6): regression 0, item 4, craft probe
+
+## 2026-10-03: step 0, structural constants (aa5f1aac regression) FIXED
+
+Rule (`symbolic_equation_compiler._structural_constants`): a constant node
+keeps its integer (dtype int64, attribute `structural_constant`) when EVERY
+consumer reads it at a parameter its operation's declared `AbstractTensor`
+signature annotates as an integer (`_structural_operand`: operand position
+= signature position, receiver calls pass operand 0 as `self`;
+`_declares_integer` parses the annotation). Any value consumer keeps it a
+float64 number (the aa5f1aac Piecewise arm). Declarations added:
+`AbstractTensor.sum/prod/max` `dim: int | tuple[int, ...] | None` (was
+unannotated; `unsqueeze` already declared `dim: int`). The compile cache
+record now carries `tensor_operation_signatures` (observed: a stale cache
+entry served `sum(0.0)` after the annotation changed). Result:
+force_cost_integral materializes `t2 = -1`, `t3 = 0` again.
+Tests: `tests/test_symbolic_structural_constants.py` (Piecewise arms stay
+float; quadrature axis constants int and the AbstractTensor stage matches
+5-point Gauss-Legendre to 1e-13) -- 2 passed.
+
+## 2026-10-03: item 4a, derivatives of externals -> declared derivative externals
+
+`compile_sympy_equations(..., external_derivatives={r1: v1, v1: a1, ...})`
+(undefined Function -> undefined Function the host declares as its
+derivative). The ingestion's Derivative branch (`symbolic_process_graph`)
+runs `sympy.diff` first, then `external_functions.resolve_external_derivatives`:
+`Derivative(r1(s), (s, 2))` -> `a1(s)`, the chain-rule form
+`Subs(Derivative(r1(x), x), x, g)` -> `v1(g)`. A derivative of an external
+with none declared raises `UndeclaredExternalDerivative` naming it (no
+finite differences; graph reversal would only meet an opaque call). What is
+left (a Derivative of compiled content) goes to the existing graph reversal
+unchanged. Call nodes from an `AppliedUndef` now carry
+`attributes["external_function"]`; `metadata["external_functions"]` is read
+from the ingested graph (so it includes v_i / a_i), plus
+`metadata["external_derivatives"]`; the cache record carries the map.
+Book: new page `external_derivative` (program, name) DERIVED from the
+external's and its derivative's cells; callsites are posted on the resolved
+form. `externals_for_law` links `ExternalFunction.derivative`.
+Probe: `probe_orbital_transfer.external_derivatives()` declares
+`r_i -> v_i -> a_i`; `host_externals` supplies v_i / a_i as the derivatives
+of the host's own r_i. Results: equation_of_motion_lhs rel err 0.0,
+total_energy_expression 2.2e-16 (C and LLVM).

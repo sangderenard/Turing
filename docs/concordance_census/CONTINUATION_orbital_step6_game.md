@@ -86,3 +86,13 @@ Do not edit the other `orbital_*.py` (other agents own them).
   machine writes no PNG and exits 0).
 - 2026-10-03: headless burn shot verified (--burn-shots): -x/-y plumes
   leave the +x/+y mounts during the arrival burn. Tests: 7 passed (66 s).
+- 2026-10-03: coordinator update (MachineCraft 6b20ed8, batched stations,
+  fly() on/off-plan). CHECKED FIRST: tests/test_orbital_jumper.py::
+  test_interleaved_states_each_run_their_own_program -> still XFAIL
+  (strict), i.e. the llvm_dt_system defect (bind_pieces module global:
+  every state runs the program of the LAST instantiated state) is live.
+  The requested game has a MachineCraft state + a batch-N station state =
+  two different programs in one process -> it bites by construction.
+  STOPPED per instruction; no game changes made for this update. Current
+  orbital_game.py is unaffected (craft + 4 batch-1 stations all build the
+  identical six-thruster/one-center program).

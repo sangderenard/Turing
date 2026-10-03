@@ -55,6 +55,13 @@ class PlanClosure:
     # ordinary runtime SSA. Keep that fact separate from the static shape so
     # an empty tuple cannot silently turn a span into rank-zero arithmetic.
     value_ranks: tuple[tuple[int, int], ...] = ()
+    # A captured value made by a shape-only operation outside the region
+    # (``t1.unsqueeze(-1)``) is fed the storage of its source; the formal is a
+    # VIEW of that storage with its own extents.  ``(value_id,
+    # storage_value_id, view_shape, operation)`` per such capture: the formal
+    # declares ``ssa_storage_view`` so call-metadata propagation keeps the
+    # view's shape instead of restamping the storage owner's.
+    value_views: tuple[tuple[int, int, tuple[int, ...], str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -234,6 +241,10 @@ def plan_region_to_ssa_instrs(
     rank_of = {
         int(value_id): int(rank) for value_id, rank in region.value_ranks
     }
+    view_of = {
+        int(value_id): (int(storage), tuple(int(e) for e in shape), str(operation))
+        for value_id, storage, shape, operation in region.value_views
+    }
     # The graph domain is deliberately permissive and often records scalar
     # control values with its default numerical dtype.  Operator semantics are
     # authoritative where they are stricter: comparisons/logical operations
@@ -410,6 +421,16 @@ def plan_region_to_ssa_instrs(
                 shape_of.get(value_id, ())
             ) else {},
         )
+        view = view_of.get(value_id)
+        if view is not None and tuple(made.shape) == view[1]:
+            made.accounting = {
+                **dict(made.accounting or {}),
+                "ssa_storage_view": {
+                    "storage_value_id": view[0],
+                    "view_shape": view[1],
+                    "operation": view[2],
+                },
+            }
         values[value_id] = made
         return made
 
@@ -661,6 +682,7 @@ def reduce_hierarchy_identities(
                 closure.closure_id,
                 closure.value_shapes,
                 closure.value_ranks,
+                closure.value_views,
             )
 
         updated = rewrite(current)
@@ -729,6 +751,7 @@ def assign_hierarchy_ids(
             closure_id,
             closure.value_shapes,
             closure.value_ranks,
+            closure.value_views,
         )
 
     planned = number(root)

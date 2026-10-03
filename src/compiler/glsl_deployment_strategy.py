@@ -3586,6 +3586,25 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
+                if operation in {
+                    "sum", "prod", "min", "max", "any", "all",
+                    "unsqueeze", "squeeze",
+                }:
+                    # The result extents of a reduction or an axis insertion
+                    # are settled by the graph's tensor descriptor
+                    # (``_tensor_descriptor``, which also posts them on the
+                    # book) -- the same record ``value_ranks`` below reads.
+                    # Re-deriving them here read only an ``axis``/``dim``
+                    # ATTRIBUTE: the orbital quadrature's positional
+                    # ``t26.sum(t3)`` became rank 0 while the descriptor said
+                    # (4,), and ``t1.unsqueeze(t2)`` kept its source's (5,)
+                    # while the descriptor said (5, 1).
+                    settled = _tensor_descriptor(graph, int(current))
+                    if settled is not None and descriptor_states_a_shape(settled):
+                        logical = tuple(int(e) for e in (settled.get("shape") or ()))
+                        _shape_dtype_cache[current] = (logical, dtype)
+                        states[current] = 2
+                        continue
                 if operation in {"sum", "prod", "min", "max", "any", "all"}:
                     axis = attributes.get("axis", attributes.get("dim"))
                     source_shape = next(
@@ -3639,6 +3658,32 @@ def _build_shell_hierarchy_plan(
             for descriptor in (_tensor_descriptor(graph, int(value_id)),)
             if descriptor is not None
         )
+        # A capture produced by a shape-only operation outside the region is
+        # fed its source's storage (the operation has no runtime existence);
+        # the formal is a view of it (``PlanClosure.value_views``).
+        value_views = []
+        for value_id in region_captures:
+            capture = graph.G.nodes.get(int(value_id), {})
+            capture_operation = str(
+                (capture.get("attributes") or {}).get("tensor_operation")
+                or capture.get("op") or capture.get("type") or ""
+            ).casefold()
+            if capture_operation not in _SHAPE_ONLY_VIEW_OPERATIONS:
+                continue
+            storage = next((
+                int(parent) for parent, role in capture.get("parents") or ()
+                if str(role).casefold() in {
+                    "operand", "value", "base", "input", "self", "receiver",
+                } and int(parent) in graph.G
+            ), None)
+            descriptor = _tensor_descriptor(graph, int(value_id))
+            if storage is None or descriptor is None or not descriptor_states_a_shape(descriptor):
+                continue
+            value_views.append((
+                int(value_id), storage,
+                tuple(int(e) for e in descriptor.get("shape") or ()),
+                capture_operation,
+            ))
         _concord_consumer_operands(graph, region_nodes, region_captures)
         _concord_item_operands(graph, region_captures)
         items.append(PlanClosure(
@@ -3647,6 +3692,7 @@ def _build_shell_hierarchy_plan(
             items=(*const_lines, *compute_lines),
             value_shapes=value_shapes,
             value_ranks=value_ranks,
+            value_views=tuple(value_views),
         ))
     control_values = set(_control_dependency_value_ids(
         getattr(shell, "shell_control_program", None)
@@ -3949,6 +3995,7 @@ def _refresh_hierarchy_control_captures(
         closure.closure_id,
         closure.value_shapes,
         closure.value_ranks,
+        closure.value_views,
     )
 
 
@@ -19439,6 +19486,17 @@ def _tensor_descriptor(
     return answer
 
 
+#: Shape-only operations (no runtime existence, alias in every target): the
+#: likeness table's ``_SHAPE_ONLY`` set (``ssa_llvm_backend``).
+def _shape_only_view_operations() -> frozenset[str]:
+    from .ssa_llvm_backend import _SHAPE_ONLY
+
+    return frozenset(_SHAPE_ONLY)
+
+
+_SHAPE_ONLY_VIEW_OPERATIONS = _shape_only_view_operations()
+
+
 def _tensor_descriptor_rule(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -20377,6 +20435,27 @@ def _tensor_descriptor_rule(
             if source is not None:
                 attributes = data.get("attributes") or {}
                 axis = attributes.get("axis", attributes.get("dim"))
+                if axis is None:
+                    # ``x.sum(0)``: the reduction axis is the first positional
+                    # argument (``AbstractTensor.sum(self, dim, keepdim)``),
+                    # read as the literal its node carries -- the same
+                    # reading the unsqueeze rule below gives its position.
+                    # Observed: the orbital quadrature ``t26.sum(t3)`` over a
+                    # (5, 4) operand settled as rank 0 here (axis ignored),
+                    # and the kernel's 4-element result landed in a scalar.
+                    positional = [
+                        int(parent)
+                        for parent, role in data.get("parents") or ()
+                        if str(role).casefold() == "arg:0"
+                        and int(parent) in graph.G
+                    ]
+                    if positional:
+                        node = graph.G.nodes[positional[0]]
+                        literal = node.get("constant")
+                        if literal is None:
+                            literal = (node.get("attributes") or {}).get("value")
+                        if isinstance(literal, int) and not isinstance(literal, bool):
+                            axis = int(literal)
                 keepdim = bool(attributes.get(
                     "keepdim", attributes.get("keepdims", False)
                 ))
