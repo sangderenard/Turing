@@ -1322,7 +1322,8 @@ def _post_backward_rule_definitions(
     helpers: tuple, helper_sources: tuple[str, ...],
 ) -> dict[str, Any]:
     """Post this book's ``backward_rule_definition`` roots and return the
-    generated source's top-level definition name -> its declaration cell.
+    generated source's top-level definition name -> its declaration
+    identity (a ``SourceDefinition``; each book resolves it to its cell).
 
     The rule graph is generated text, so its source constructs are the
     declarations it is generated from: one NOVEL(INGEST_SOURCE) root per
@@ -1338,21 +1339,24 @@ def _post_backward_rule_definitions(
 
     from .concordance_declarations import (
         BACKWARD_RULE_DEFINITION, BackwardRuleDefinitionFact,
-        BackwardRuleKind, INGESTION, INGEST_SOURCE,
+        BackwardRuleKind,
     )
-    from .identity_concordance import Mode, Novel, current_identity_book
-
-    book = current_identity_book()
+    from ..transmogrifier.graph.graph_express2 import (
+        SourceDefinition, resolve_source_definition,
+    )
 
     def post(registry: str, name: str, kind: Any, text: str) -> Any:
-        return book.post(
+        # The returned value is the definition's IDENTITY, not this book's
+        # cell: ``build_from_ast`` stamps it on AST objects that outlive the
+        # book, and each book resolves it to its own cell (edges lane C).
+        definition = SourceDefinition(
             BACKWARD_RULE_DEFINITION, (registry, name),
             BackwardRuleDefinitionFact(
                 kind, hashlib.sha256(text.encode("utf-8")).hexdigest(),
             ),
-            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
-            mode=Mode.CONCORD,
         )
+        resolve_source_definition(definition)
+        return definition
 
     cells: dict[str, Any] = {}
     for helper, text in zip(helpers, helper_sources):

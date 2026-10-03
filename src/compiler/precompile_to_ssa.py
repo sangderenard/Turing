@@ -4564,6 +4564,16 @@ class _ControlSSABuilder:
         if value is not None:
             source = self._binding_cell(arm_id)
             return value, source if source is not None else self._value_cell(value)
+        if arm_id in self.constant_value_ids:
+            # An authored literal (``rejected = False`` in the arm): no
+            # region publishes it; the control function owns it.  Resolve it
+            # as the provisional formal ``_materialize_control_constants``
+            # turns into this function's own ``Const`` -- as a folded
+            # ``flag = True; break`` is resolved on its break edge and an
+            # owned literal output is resolved at the exit.
+            value = self.external_value(arm_id)
+            source = self._binding_cell(arm_id)
+            return value, source if source is not None else self._value_cell(value)
         # An in-place store version is aliased (``control_value_alias``,
         # PLANNING) to the storage it writes and is never bound.
         # ``m = call(); if c: m[2] = ...; if t > 0: m[:2] -= ...`` merges the

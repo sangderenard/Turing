@@ -2544,12 +2544,22 @@ def enrich_represented_conditionals(
 
 def _insert_before_marker(
     block: "ControlBlock", anchor: int | None, inserted: "ControlBlock",
+    encloses: "Callable[[int, int], bool] | None" = None,
 ) -> tuple["ControlBlock", bool]:
     """Insert ``inserted`` immediately before the ``anchor`` region marker.
 
     Walks sequences and the bodies of conditionals/loops; returns the
     rewritten block and whether the anchor was found.  ``anchor=None``
     never matches, so the caller appends at the end of the scope instead.
+
+    ``encloses(container, inserted)`` -- source conditional ids, answered
+    from the authored source by the caller -- says whether a conditional
+    lexically holds the inserted one.  A conditional that holds the anchor
+    marker in an arm but does NOT lexically hold the inserted conditional is
+    a later sibling: the inserted block goes before that conditional, never
+    into its arm.  (``if rejected and allow: rejected = False`` then
+    ``if rejected: x = x * 0.5; continue``: the anchor is the first region
+    after the guard, which lives in the second conditional's arm.)
     """
 
     if anchor is None:
@@ -2568,7 +2578,9 @@ def _insert_before_marker(
                 children.append(child)
                 continue
             if not found:
-                child, found = _insert_before_marker(child, anchor, inserted)
+                child, found = _insert_before_marker(
+                    child, anchor, inserted, encloses,
+                )
             children.append(child)
         return SequenceBlock(tuple(children)), found
     if isinstance(block, StatementBlock):
@@ -2576,13 +2588,34 @@ def _insert_before_marker(
             return SequenceBlock((inserted, block)), True
         return block, False
     if isinstance(block, ConditionalBlock):
-        body, found = _insert_before_marker(block.body, anchor, inserted)
+        body, found = _insert_before_marker(
+            block.body, anchor, inserted, encloses,
+        )
         orelse = block.orelse
         if not found and orelse is not None:
-            orelse, found = _insert_before_marker(orelse, anchor, inserted)
+            orelse, found = _insert_before_marker(
+                orelse, anchor, inserted, encloses,
+            )
+        if found and encloses is not None and block.source_node_id is not None:
+            inserted_ids = tuple(
+                int(item.source_node_id)
+                for item in (
+                    inserted.blocks if isinstance(inserted, SequenceBlock)
+                    else (inserted,)
+                )
+                if isinstance(item, ConditionalBlock)
+                and item.source_node_id is not None
+            )
+            if inserted_ids and not any(
+                encloses(int(block.source_node_id), inserted_id)
+                for inserted_id in inserted_ids
+            ):
+                return SequenceBlock((inserted, block)), True
         return replace(block, body=body, orelse=orelse), found
     if isinstance(block, (LoopBlock, WhileBlock)):
-        body, found = _insert_before_marker(block.body, anchor, inserted)
+        body, found = _insert_before_marker(
+            block.body, anchor, inserted, encloses,
+        )
         return replace(block, body=body), found
     return block, False
 
@@ -3326,8 +3359,15 @@ def overlay_scheduled_control(
     controls: Iterable[ControlProgram],
     *,
     known_nesting: "Mapping[int, Iterable[int]] | None" = None,
+    lexical_encloses: "Callable[[int, int], bool] | None" = None,
 ) -> ControlProgram:
     """Overlay planned control blocks on the flat scheduled region order.
+
+    ``lexical_encloses(container, inner)``, if given, answers from the
+    authored source whether conditional ``container`` lexically holds
+    conditional ``inner`` (both source node ids); anchored region-less
+    conditionals are then never placed inside a sibling's arm
+    (``_insert_before_marker``).
 
     ``known_nesting``, if given, maps a control's index (into ``controls``)
     to the indices of controls known -- by real structure, not inferred
@@ -3629,6 +3669,29 @@ def overlay_scheduled_control(
         if index in visiting:
             raise ValueError("cyclic loop-control containment")
         root = controls[index].root
+        # Region-less children declared nested in this control (a guard
+        # clause inside an arm or a loop body) are placed before their
+        # anchor region within this root, or appended to it.  They are
+        # placed BEFORE the region-owning children are embedded: the anchor
+        # is the first region lexically after the child, and when that
+        # region belongs to a sibling construct (``if rejected and allow:
+        # rejected = False`` followed by ``if rejected: x = x * 0.5;
+        # continue`` in a while body) the marker would otherwise already sit
+        # inside the sibling's arm, and the child -- whose merge the
+        # sibling's test reads -- was nested into that arm.
+        for child in sorted(direct_children.get(index, ())):
+            control = controls[child]
+            if not _anchored_control(control):
+                continue
+            child_root = nested_root(child, visiting | {index})
+            root, found = _insert_before_marker(
+                root, control.anchor_region, child_root, lexical_encloses,
+            )
+            if not found:
+                root = SequenceBlock((
+                    *(root.blocks if isinstance(root, SequenceBlock) else (root,)),
+                    child_root,
+                ))
         candidates = [
             child
             for child, child_regions in enumerate(controlled_sets)
@@ -3685,22 +3748,6 @@ def overlay_scheduled_control(
                     f"parent={tuple(controls[index].region_indices)!r}, "
                     f"child={tuple(controls[child].region_indices)!r}"
                 )
-        # Region-less children declared nested in this control (a guard
-        # clause inside an arm or a loop body) are placed before their
-        # anchor region within this root, or appended to it.
-        for child in sorted(direct_children.get(index, ())):
-            control = controls[child]
-            if not _anchored_control(control):
-                continue
-            child_root = nested_root(child, visiting | {index})
-            root, found = _insert_before_marker(
-                root, control.anchor_region, child_root
-            )
-            if not found:
-                root = SequenceBlock((
-                    *(root.blocks if isinstance(root, SequenceBlock) else (root,)),
-                    child_root,
-                ))
         nested_roots[index] = root
         return root
 

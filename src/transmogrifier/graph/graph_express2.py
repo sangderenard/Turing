@@ -186,12 +186,19 @@ def _annotate_visual_source_owners(tree: ast.AST, *, module_name=None):
             node._turing_source_span_row = (
                 self.module_name, self.qualname, tuple(self.path),
             )
+            # Always written: CPython shares operator / context singletons
+            # (``ast.Is()``, ``ast.Load()``) across every parsed tree, so a
+            # stamp left by another tree's build would otherwise be read here
+            # (edges lane C: an ``Is`` in ``_energy_time_limit`` derived from
+            # ``bw_clamp``).
             if cells_by_name:
                 cell = cells_by_name.get(self.qualname.split(".")[0])
                 node._turing_source_cells = (
                     (cell,) if cell is not None
                     else tuple(dict.fromkeys(cells_by_name.values()))
                 )
+            else:
+                node._turing_source_cells = ()
 
         def visit(self, node):
             if isinstance(node, ast.AST):
@@ -225,6 +232,8 @@ def _annotate_visual_source_owners(tree: ast.AST, *, module_name=None):
                 cell = cells_by_name.get(str(identity[1]).split(".")[0])
                 if cell is not None:
                     node._turing_source_cells = (cell,)
+            else:
+                node._turing_source_cells = ()
             owners[identity] = node
             saved = (self.module_name, self.qualname, self.path)
             self.module_name, self.qualname = identity
@@ -1029,6 +1038,47 @@ def _span_fact(node):
     )
 
 
+@dataclass(frozen=True)
+class SourceDefinition:
+    """The book-independent identity of a declaration that generated source
+    derives from: a declared root page, its row and its fact.
+
+    Stamped on AST objects instead of a book cell (edges lane C): AST
+    objects outlive books (CPython's operator / context singletons are
+    shared by every tree in the process), so a ``Ref`` stored on one points
+    into whichever book built it, and a later book derived from a cell it
+    does not have.  ``resolve_source_definition`` turns this into the
+    CURRENT book's cell."""
+
+    page: Any
+    row: tuple
+    fact: Any
+
+
+def resolve_source_definition(item):
+    """The current book's cell for ``item``: a ``Ref`` is returned as is (a
+    caller's explicit cell in this book); a ``SourceDefinition`` resolves
+    to its row's latest cell, posting the NOVEL(INGEST_SOURCE) root here
+    when this book does not have it yet (the same row and fact every book
+    posts for that declaration)."""
+
+    if not isinstance(item, SourceDefinition):
+        return item
+    from ...compiler.concordance_declarations import INGESTION, INGEST_SOURCE
+    from ...compiler.identity_concordance import (
+        Mode, Novel, current_identity_book,
+    )
+
+    book = current_identity_book()
+    cell = book.latest_ref(item.page, item.row)
+    if cell is not None:
+        return cell
+    return book.post(
+        item.page, item.row, item.fact, stage=INGESTION,
+        provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+    )
+
+
 def post_source_span(owner_definition, node, *, stage=None, source_cells=None):
     """Post ``node``'s ``source_span`` root and return its cell (plan 60, 1.5).
 
@@ -1068,6 +1118,10 @@ def post_source_span(owner_definition, node, *, stage=None, source_cells=None):
             owner_definition, "_turing_source_cells", None,
         )
     book = current_identity_book()
+    if source_cells:
+        source_cells = tuple(
+            resolve_source_definition(item) for item in source_cells
+        )
     fact = _span_fact(node)
     latest = book.latest_ref(SOURCE_SPAN, row)
     if latest is not None:
@@ -4458,6 +4512,58 @@ class ProcessGraph:
             provenance=Derived((statement_span,)), mode=Mode.CONCORD,
         )
 
+    def _post_field_value_use(self, src_id, tgt_id):
+        """A non-AST field value (``keyword.arg``, ``Attribute.attr``,
+        ``FunctionDef.name``: a ``str``, an ``int``, ``None``) gets its
+        ``ingestion_value`` row from the AST node whose field it is (edges
+        lane C).
+
+        Such a value is one node per Python object (``ensure_node`` keys by
+        ``id``), so an interned ``'dim'`` is shared by every keyword that
+        spells it; no single span is its source.  Every connect to an AST
+        endpoint is one authored use: the row is posted (first use) or
+        re-posted with the same fact (CONCORD: no new cell, one more edge),
+        DERIVED from that AST endpoint's ``ingestion_value`` cell.  Without
+        an ingestion scope, or with no AST endpoint, nothing is posted and
+        ``node_identity_cell`` keeps its Unsourced fallback."""
+
+        scope = self.G.graph.get("ingestion_value_scope")
+        if scope is None:
+            return
+        source_map = getattr(self, "node_map", {}) or {}
+        source_object = source_map.get(src_id)
+        target_object = source_map.get(tgt_id)
+        source_ast = isinstance(source_object, ast.AST)
+        target_ast = isinstance(target_object, ast.AST)
+        if source_ast == target_ast:
+            return
+        value, holder = (tgt_id, src_id) if source_ast else (src_id, tgt_id)
+        if value not in source_map:
+            return
+        from ...compiler.concordance_declarations import (
+            INGESTION, INGESTION_VALUE, NodeFact,
+        )
+        from ...compiler.identity_concordance import (
+            Derived, Mode, current_identity_book,
+        )
+
+        book = current_identity_book()
+        holder_cell = book.latest_ref(INGESTION_VALUE, (scope, int(holder)))
+        if holder_cell is None:
+            return
+        row = (scope, int(value))
+        fact = book.page(INGESTION_VALUE).latest(row)
+        if fact is None:
+            data = self.G.nodes[value]
+            fact = NodeFact(
+                str(data.get("type") or ""), str(data.get("op") or ""),
+                str(data.get("label") or ""),
+            )
+        book.post(
+            INGESTION_VALUE, row, fact, stage=INGESTION,
+            provenance=Derived((holder_cell,)), mode=Mode.CONCORD,
+        )
+
     def connect(self, src_id, tgt_id, producer_role, consumer_role, store_id=None):
         with self.graph_mutation():
             edge = Edge(
@@ -4478,6 +4584,7 @@ class ProcessGraph:
 
             if 'children' not in self.G.nodes[src_id]:
                 self.G.nodes[src_id]['children'] = []
+            self._post_field_value_use(src_id, tgt_id)
             parents = list(self.G.nodes[tgt_id].get('parents') or ())
             if src_id not in [p for p, _ in parents]:
                 _set_operands(
@@ -4944,6 +5051,8 @@ class ProcessGraph:
         # the book cell of the declaration it was generated from): every node
         # of that definition carries its declaration cell, the module all of
         # them, and ``post_source_span`` derives the spans from them.
+        # The values are ``SourceDefinition`` identities, never book cells:
+        # the stamps outlive this book (see ``SourceDefinition``).
         if source_cells:
             for statement in getattr(tree, "body", ()):
                 cell = source_cells.get(getattr(statement, "name", None))
@@ -4955,6 +5064,9 @@ class ProcessGraph:
                 source_cells.values()
             ))
             tree._turing_source_cells_by_name = dict(source_cells)
+        else:
+            tree._turing_source_cells = ()
+            tree._turing_source_cells_by_name = None
 
         retained = () if retain is None else (
             (retain,) if inspect.isclass(retain) else tuple(retain)
@@ -5571,9 +5683,22 @@ class ProcessGraph:
                     # Step 9 (plan 100, 1.2): the store's one operand edge
                     # is a row; the one writer materializes ``parents``,
                     # ``children`` and the networkx edge.
-                    from ...common.tensors.topological_reducer import _set_operands
-                    from ...compiler.concordance_declarations import INGEST_EDGE
+                    from ...common.tensors.topological_reducer import (
+                        _posted_node_identity_cell, _set_operands,
+                        post_derived_node_identity,
+                    )
+                    from ...compiler.concordance_declarations import (
+                        INGEST_EDGE, INGESTION,
+                    )
 
+                    # The Store fills an output slot of ``nid``: its row
+                    # derives from the producer's cell (edges lane C).
+                    if self.G.graph.get("ingestion_value_scope") is not None:
+                        post_derived_node_identity(
+                            self, store_node_id,
+                            (_posted_node_identity_cell(self, nid),),
+                            stage=INGESTION,
+                        )
                     _set_operands(
                         self, store_node_id, [(nid, 'result')],
                         cause=INGEST_EDGE, edge_payload={'extra': [edge]},

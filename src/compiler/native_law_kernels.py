@@ -285,6 +285,11 @@ class LawKernel:
     constant_outputs: dict = field(default_factory=dict)
     calls: int = 0
     seconds: float = 0.0
+    #: The compiler that built it (``PieceCompilerRecord``); a record from
+    #: before compiler records loads with None, which is stale.
+    compiler: Any = None
+    #: ``<version dir>/<dll>`` relative to the kernel's cache directory.
+    library: str = ""
 
     def __call__(self, columns: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
         from .ssa_llvm_backend import prepare_artifact_execution
@@ -616,40 +621,114 @@ def _cache_key(compilation: Any, law: str, batch: int, backend: str) -> str:
     return digest[:20]
 
 
-def law_kernel(compilation: Any, law: str, batch: int, backend: str) -> LawKernel:
-    """Compiled kernel for (law, batch): from the disk cache or lowered now."""
+def law_kernel(compilation: Any, law: str, batch: int, backend: str, *,
+               serve_stale: bool | None = None) -> LawKernel:
+    """Compiled kernel for (law, batch): from the disk cache or lowered now.
+
+    The key is the stage source (``_cache_key``), so a kernel survives a
+    compiler edit.  The kernel therefore carries the compiler that built it
+    (``PieceCompilerRecord``, as an ``LLVMPiece`` does) and a load compares
+    it with the sources on disk (``piece_staleness``): a stale kernel, or one
+    with no record, is rebuilt by default; ``serve_stale=True`` or
+    ``TURING_LAW_NATIVE_SERVE_STALE=1`` serves it.  Each event is posted on
+    the piece-cache book beside the kernel (``post_piece_book``: staleness
+    row, build row DERIVED from it when it is its rebuild).
+
+    Publish is atomic: the DLL is built in a private ``.build-*`` directory,
+    renamed to an immutable ``v-<sha256(dll)[:16]>`` version directory (a
+    loaded DLL is never overwritten), and ``kernel.pkl`` -- which names its
+    version directory -- is written to a unique temporary and ``os.replace``d.
+    """
+
+    import shutil
+    import uuid
 
     from .ssa_llvm_backend import compile_artifact
 
     key = _cache_key(compilation, law, batch, backend)
     directory = cache_root() / law / f"{backend}_b{batch}_{key}"
     record = directory / "kernel.pkl"
+    if serve_stale is None:
+        serve_stale = os.environ.get("TURING_LAW_NATIVE_SERVE_STALE", "").casefold() in {
+            "1", "true", "yes", "on"}
+    stale: tuple[str, ...] | None = None
+    stale_record = None
     if record.is_file():
+        cached = None
         try:
             with record.open("rb") as handle:
-                kernel = pickle.load(handle)
-            libraries = sorted(directory.glob("*.dll"))
-            if libraries:
-                kernel.artifact.library_path = libraries[0]
-                kernel.artifact._entry = None
-                _log(f"{law}: batch {batch} kernel from cache {directory.name}")
-                return kernel
-        except Exception as error:  # a stale or foreign record is rebuilt
+                cached = pickle.load(handle)
+            version = getattr(cached, "library", "") or ""
+            library = directory / version if version else None
+            if library is None or not library.is_file():
+                # A record from before version directories names no DLL of
+                # its own; its compiler is unknown.
+                cached.compiler = None
+            else:
+                cached.artifact.library_path = library
+                cached.artifact._entry = None
+        except Exception as error:  # an unreadable record is rebuilt
             _log(f"{law}: cache record unreadable ({type(error).__name__}), rebuilding")
+            cached = None
+        if cached is not None:
+            changed = piece_staleness(cached)
+            if not changed:
+                _log(f"{law}: batch {batch} kernel from cache {directory.name}")
+                return cached
+            stale, stale_record = tuple(changed), getattr(cached, "compiler", None)
+            if serve_stale and getattr(cached, "library", ""):
+                post_piece_book(directory, law, batch, key, stale=stale,
+                                stale_record=stale_record, decision="served")
+                _log(f"{law}: SERVING STALE batch {batch} kernel {directory.name}: "
+                     f"{len(stale)} module(s) changed: {', '.join(stale[:8])}")
+                return cached
+            _log(f"{law}: batch {batch} kernel stale ({len(stale)} module(s) changed: "
+                 f"{', '.join(stale[:4])}), rebuilding")
     started = time.time()
-    kernel = _lower_law(compilation, law, batch, backend)
     directory.mkdir(parents=True, exist_ok=True)
-    compile_artifact(kernel.artifact, directory=directory, optimization="O2")
-    _log(f"{law}: batch {batch} lowered+compiled ({backend}) in "
-         f"{time.time() - started:.1f}s -> {directory}")
+    build = directory / f".build-{os.getpid()}-{uuid.uuid4().hex[:12]}"
     try:
+        kernel = _lower_law(compilation, law, batch, backend)
+        build.mkdir(parents=True, exist_ok=True)
+        compile_artifact(kernel.artifact, directory=build, optimization="O2")
+        # Which compiler built it: recorded when the build finished.
+        kernel.compiler = route_compiler_record()
+        built = Path(kernel.artifact.library_path)
+        version = directory / (
+            "v-" + hashlib.sha256(built.read_bytes()).hexdigest()[:16])
+        if version.exists():
+            # Another builder published the identical DLL; take it.
+            shutil.rmtree(build, ignore_errors=True)
+        else:
+            try:
+                os.replace(build, version)
+            except OSError:
+                if not version.exists():
+                    raise
+                shutil.rmtree(build, ignore_errors=True)
+        kernel.library = f"{version.name}/{built.name}"
+        kernel.artifact.library_path = version / built.name
         entry = kernel.artifact._entry
         kernel.artifact._entry = None
-        with record.open("wb") as handle:
-            pickle.dump(kernel, handle)
-        kernel.artifact._entry = entry
-    except Exception as error:
-        _log(f"{law}: kernel record not cached ({type(error).__name__}: {error})")
+        temporary = directory / f"kernel.pkl.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("wb") as handle:
+                pickle.dump(kernel, handle)
+            os.replace(temporary, record)
+        finally:
+            temporary.unlink(missing_ok=True)
+            kernel.artifact._entry = entry
+    except BaseException as error:
+        shutil.rmtree(build, ignore_errors=True)
+        if stale is not None:
+            post_piece_book(directory, law, batch, key, stale=stale,
+                            stale_record=stale_record,
+                            decision=f"rebuild_failed: {type(error).__name__}")
+        raise
+    post_piece_book(directory, law, batch, key, built=kernel, stale=stale,
+                    stale_record=stale_record, decision="rebuilt")
+    _log(f"{law}: batch {batch} lowered+compiled ({backend}) in "
+         f"{time.time() - started:.1f}s -> {version}")
     return kernel
 
 

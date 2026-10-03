@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import uuid
 from typing import Any, Mapping
 
 from joblib.externals import cloudpickle
@@ -197,7 +198,11 @@ class AOTCheckpointStore:
     def store(self, phase: str, implementation: str, value: Any) -> Path:
         payload_path, manifest_path = self._paths(phase)
         self.directory.mkdir(parents=True, exist_ok=True)
-        discriminator = f"{os.getpid()}.tmp"
+        # pid + thread + uuid: two threads of one process (or a reused pid)
+        # writing the same phase never share a temporary file.
+        discriminator = (
+            f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+        )
         payload_temporary = payload_path.with_suffix(f".pkl.{discriminator}")
         manifest_temporary = manifest_path.with_suffix(f".json.{discriminator}")
         try:

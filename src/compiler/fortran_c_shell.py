@@ -2880,7 +2880,6 @@ def _linked_caller_member(
     caller_sequences: Any,
     caller_formal_ids: Collection[int] = (),
     linked_sequence_members: set[int] | None = None,
-    grow_caller_field: Any = None,
 ) -> int | None:
     """The caller value a callee record member is, by recorded ids only.
 
@@ -3054,10 +3053,6 @@ def _linked_caller_member(
                     resolved.add(int(caller_member))
                     sequence_members.add(int(caller_member))
                 continue
-        if caller_field is None and grow_caller_field is not None:
-            caller_field = grow_caller_field(
-                int(caller_record_id), field, member, callee_id,
-            )
         if caller_field is None:
             raise ValueError(
                 f"{caller_symbol} callsite {record.callsite_id}: callee "
@@ -5751,6 +5746,53 @@ def _sequence_record_binding_value_ids(
     )))
 
 
+def _row_column_identity(
+    declared_records: Any, parameter_name: str, leaf_path: str,
+) -> str:
+    """The storage identity of a keyed field's pooled row column:
+    ``<declared owner record identity>.<field>[].<leaf>``."""
+
+    owner = dict(dict(declared_records or {}).get(str(parameter_name)) or {})
+    return f"{owner.get('identity') or parameter_name}.{leaf_path}"
+
+
+def _record_field_incoming_slot(
+    symbol: str, parameter: str, field_name: str, cells: Any,
+) -> int | None:
+    """The incoming slot of a written-but-never-read mutable scalar field
+    of a declared record parameter, by its ``record_field_incoming_slot``
+    row (minted once, NOVEL(NESTED_RECORD_PART, the write's field-state
+    cells)).  ``None`` when no cell names the write."""
+
+    from .concordance_declarations import (
+        NESTED_RECORD_PART, RECORD_FIELD_INCOMING_SLOT, SHELL_HANDOFF,
+        SSA_VALUE,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Ref, current_identity_book,
+    )
+    from .precompile_to_ssa import _mint_ssa_id
+
+    book = current_identity_book()
+    row = (str(symbol), str(parameter), str(field_name))
+    existing = book.page(RECORD_FIELD_INCOMING_SLOT).latest(row)
+    if existing is not None:
+        return int(existing)
+    operands = tuple(cell for cell in (cells or ()) if isinstance(cell, Ref))
+    if not operands:
+        return None
+    scope = (str(symbol), "record_field_incoming_slot")
+    value_id = _mint_ssa_id(
+        book, scope, NESTED_RECORD_PART, operands, stage=SHELL_HANDOFF,
+    )
+    book.post(
+        RECORD_FIELD_INCOMING_SLOT, row, int(value_id), stage=SHELL_HANDOFF,
+        provenance=Derived((book.latest_ref(SSA_VALUE, (scope, value_id)),)),
+        mode=Mode.CONCORD,
+    )
+    return int(value_id)
+
+
 def _annotated_parameter_record_identity(
     function_identity: str, parameter: str,
 ) -> str | None:
@@ -5823,10 +5865,18 @@ def _annotated_parameter_record_identity(
             break
     if class_cell is None or len(span_cells) != 1:
         return None
-    record_cells = [
-        target for target, _stage in book.edges_out_of(span_cells[0])
+    # The span ROW is the construct (``post_source_span``: a later stage's
+    # revision is a new cell of the same row), so the class declaration and
+    # the contract's record class may derive from different cells of it.
+    span_row = span_cells[0].row
+    record_cells = list(dict.fromkeys(
+        target
+        for column, _fact in book.page(SOURCE_SPAN).history(span_row)
+        for target, _stage in book.edges_out_of(
+            type(span_cells[0])(span_cells[0].page, span_row, column)
+        )
         if target.page.name == SOURCE_RECORD_CLASS.name
-    ]
+    ))
     if len(record_cells) != 1:
         return None
     identity = str(record_cells[0].row[0])
@@ -9841,8 +9891,22 @@ def _promote_conditional_sequence_aliases(
     def promote(block):
         if isinstance(block, ConditionalBlock):
             scalar = []
+            # ``carried_field_cells`` is index-aligned with
+            # ``carried_aliases`` (the control builder zips them).  A
+            # promoted alias leaves ``carried_aliases``, so its field cells
+            # leave with it, in lockstep (as the retained-values projection
+            # in control_source does).  Dropping only the alias shifted every
+            # later alias onto its predecessor's cells: ``rejected = False``
+            # after ``m.unresolved_report = list(lines)`` was lowered as the
+            # field merge of ``unresolved_report`` (dt_controller
+            # step_with_dt_control_used; ConcordanceRefusal on
+            # ssa_field_version in ``_carried_field_arm``).
+            scalar_field_cells = []
+            field_cells = tuple(block.carried_field_cells) + (None,) * (
+                len(block.carried_aliases) - len(block.carried_field_cells)
+            )
             sequences = list(block.carried_sequence_aliases)
-            for carried in block.carried_aliases:
+            for carried, cells in zip(block.carried_aliases, field_cells):
                 true_id, false_id, initial_id, merged_id = map(int, carried)
                 initial_resident = resident_by_value.get(initial_id)
                 initial_kind = kind_by_value.get(initial_id)
@@ -9859,6 +9923,7 @@ def _promote_conditional_sequence_aliases(
                     or false_kind != initial_kind
                 ):
                     scalar.append(carried)
+                    scalar_field_cells.append(cells)
                     continue
                 destination = int(initial_resident)
                 sequences.append((
@@ -9876,6 +9941,7 @@ def _promote_conditional_sequence_aliases(
                     None if block.orelse is None else promote(block.orelse)
                 ),
                 carried_aliases=tuple(scalar),
+                carried_field_cells=tuple(scalar_field_cells),
                 carried_sequence_aliases=tuple(sequences),
             )
         if isinstance(block, SequenceBlock):
@@ -15419,54 +15485,6 @@ def _propagate_record_field_demand(
             if item.res is not None
         })
 
-        def grow(caller_record_id, callee_field, member, callee_id):
-            # The bound caller record has not materialized this declared
-            # field (lazy materialization).  It is the caller's own field:
-            # mint its one formal and register it on the caller record, so
-            # the link is written where the member is minted.
-            from ..transmogrifier.ssa import SSARecordFieldStorage
-            if member[0] != "value" or callee_field.storage not in {
-                SSARecordFieldStorage.SCALAR, SSARecordFieldStorage.SPAN,
-            }:
-                return None
-            table = all_record_tables.get(str(caller_symbol))
-            descriptor = table.records.get(int(caller_record_id))
-            sibling = next((
-                caller_values[int(value_id)]
-                for sibling_field in descriptor.fields
-                for value_id in sibling_field.value_ids
-                if int(value_id) in caller_values
-                and (caller_values[int(value_id)].accounting or {}).get(
-                    "program_abi_parameter"
-                ) is not None
-            ), None)
-            sibling_accounting = dict(
-                {} if sibling is None else sibling.accounting or {}
-            )
-            formal_accounting = dict(formal.accounting or {})
-            grown = SSAValue(
-                GLOBAL_MONOTONIC_IDS.mint(),
-                dtype=formal.dtype,
-                shape=tuple(formal.shape or ()),
-                device=formal.device,
-                accounting={
-                    **formal_accounting,
-                    **{
-                        key: sibling_accounting[key]
-                        for key in ("program_abi_parameter", "program_abi_record")
-                        if key in sibling_accounting
-                    },
-                    "program_abi_field_written": False,
-                },
-            )
-            caller.args.append(grown)
-            caller_values[int(grown.id)] = grown
-            grown_field = replace(callee_field, value_ids=(int(grown.id),))
-            table.register(replace(
-                descriptor, fields=(*descriptor.fields, grown_field),
-            ))
-            return grown_field
-
         member_id = _linked_caller_member(
             str(caller_symbol), record, int(formal.id),
             all_record_tables.get(str(callee_symbol)),
@@ -15474,7 +15492,6 @@ def _propagate_record_field_demand(
             all_sequence_tables.get(str(callee_symbol)),
             all_sequence_tables.get(str(caller_symbol)),
             {int(value.id) for value in caller.args},
-            grow_caller_field=grow,
         )
         return None if member_id is None else caller_values.get(int(member_id))
 
@@ -16621,6 +16638,7 @@ def _class_surface_ssa_program(
         FRAME_SCAFFOLD, FRAME_STORAGE_CLONE, GRAPH_ID_WITHOUT_CANONICAL_CELL,
         NESTED_RECORD_PART, PLANNER_OUTPUT_UNROUTED, PLANNING_VALUE,
         RECORD_ABI_MATERIALIZATION, RECORD_DESCRIPTOR, RECORD_FIELD_RESIDENT,
+        ROW_LEAF_VIEW,
         RECORD_FORWARDING, RECORD_MEMBER, RECORD_PARAMETER_ROW_HANDLE,
         RECORD_PARAMETER_VALUE, RECORD_STORAGE_ALIAS, REPLACEMENT_SLOT,
         RESIDENCY_FROM_NAME_MATCH, RESIDENT_CHOSEN_BY_ORDER,
@@ -18230,6 +18248,28 @@ def _class_surface_ssa_program(
                     replace(conditional_control, anchor_region=anchor)
                 )
             conditional_controls = tuple(anchored_controls)
+
+            def lexical_encloses(container_id: int, inner_id: int) -> bool:
+                # The same AST containment rule as ``parent_by_child`` above;
+                # an expression the graph cannot name is answered True so the
+                # anchor walk keeps its descent.
+                container = source_expressions.get(int(container_id))
+                if container is None:
+                    container = _source_control_expression(
+                        graph_obj, int(container_id)
+                    )
+                inner = source_expressions.get(int(inner_id))
+                if inner is None:
+                    inner = _source_control_expression(graph_obj, int(inner_id))
+                if container is None or inner is None:
+                    return True
+                return _ast_source_signature(inner) in {
+                    _ast_source_signature(member) for statement in (
+                        *getattr(container, "body", ()),
+                        *getattr(container, "orelse", ()),
+                    ) for member in ast.walk(statement)
+                }
+
             control = overlay_scheduled_control(
                 control.region_indices,
                 (control, *conditional_controls),
@@ -18237,6 +18277,7 @@ def _class_surface_ssa_program(
                     parent: tuple(children)
                     for parent, children in direct_children.items()
                 },
+                lexical_encloses=lexical_encloses,
             )
             from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
             def marker_counts(block, counts):
@@ -19401,9 +19442,29 @@ def _class_surface_ssa_program(
                     and any(int(parent) in receivers and str(role) == "value"
                             for parent, role in data.get("parents") or ())
                 ]
-                if not getters:
+                written_cells = tuple(
+                    (data.get("attributes") or {}).get("field_state_cell")
+                    for node_id, data in graph_obj.nodes(data=True)
+                    if str(data.get("type") or data.get("op")).casefold() == "setattr"
+                    and (data.get("attributes") or {}).get("attribute") == field_name
+                    and any(int(parent) in receivers and str(role) == "object"
+                            for parent, role in data.get("parents") or ())
+                )
+                if getters:
+                    field_id = min(getters)
+                elif written_cells:
+                    # Written, never read (``item.momentum = v`` in a callee
+                    # that returns nothing): the Store's destination is the
+                    # field's incoming slot, minted here and adopted by
+                    # record-ABI materialization.  Skipping it dropped the
+                    # write (the caller's column kept its old value).
+                    field_id = _record_field_incoming_slot(
+                        symbol, str(parameter), str(field_name), written_cells,
+                    )
+                    if field_id is None:
+                        continue
+                else:
                     continue
-                field_id = min(getters)
                 for node_id, data in graph_obj.nodes(data=True):
                     if (str(data.get("type") or data.get("op")).casefold() != "setattr"
                             or (data.get("attributes") or {}).get("attribute") != field_name):
@@ -23880,8 +23941,17 @@ def _class_surface_ssa_program(
                 ).casefold()
                 if operation != "indexed":
                     continue
+                # The field's reads are one storage (``record_storage_alias``
+                # coalesces a second ``self.items`` GetAttr onto the first):
+                # resolve the base through the same alias row the owner ids
+                # were resolved through.  ``for k in tuple(self.items):
+                # item = self.items[k]`` indexes the second read; matching
+                # the raw id missed the row and left the lookup result a
+                # plain record with link-grown leaves (writes lost).
                 if not any(
-                    int(graph.nodes[parent].get("value_id", parent))
+                    resolve_record_storage(int(
+                        graph.nodes[parent].get("value_id", parent)
+                    ))
                     in owner_ids
                     and str(role) in {
                         "value", "base", "operand", "object",
@@ -23970,8 +24040,20 @@ def _class_surface_ssa_program(
                     nested_path,
                     nested_storage_identity,
                 )
+                # A keyed row is materialized with EVERY scalar and
+                # fixed-shape span leaf of its declared record: a callee the
+                # row reaches may read or write a leaf this function never
+                # touches, and the leaf's column is this frame's storage
+                # (the linker used to grow it on demand at the call).
+                declared_row_leaf = row_handle_id is not None and (
+                    str(nested_field.get("storage") or "") == "scalar"
+                    or (
+                        str(nested_field.get("storage") or "") == "span"
+                        and nested_field.get("shape") is not None
+                    )
+                )
                 if not candidates:
-                    if not access_receipts:
+                    if not access_receipts and not declared_row_leaf:
                         continue
                     current_identity_book().page(
                         "numeral_leaf_materialization_concordance"
@@ -24128,6 +24210,7 @@ def _class_surface_ssa_program(
                 ))
                 physical_ids = []
                 pooled_column_value = None
+                row_leaf_pointer = None
                 if nested_storage == "table" and row_handle_id is not None:
                     columns = tuple(
                         dict(column)
@@ -24518,6 +24601,7 @@ def _class_surface_ssa_program(
                                 },
                             )
                             if nested_storage == "scalar":
+                                row_leaf_pointer = pointer
                                 setup = [
                                     Instr(
                                         "GetElementPtr", [column, row_handle],
@@ -24718,6 +24802,10 @@ def _class_surface_ssa_program(
                                 for candidate_id in candidate_ids:
                                     values.pop(candidate_id, None)
                                 values[result_id] = result
+                                if row_leaf_pointer is not None:
+                                    values[int(row_leaf_pointer.id)] = (
+                                        row_leaf_pointer
+                                    )
                                 physical_ids.append(result_id)
                 for value_id in candidates:
                     if physical_ids:
@@ -24775,6 +24863,30 @@ def _class_surface_ssa_program(
                 }.get(nested_storage)
                 if descriptor_storage is None:
                     continue
+                if (
+                    row_leaf_pointer is not None
+                    and int(row_leaf_pointer.id) in values
+                ):
+                    # The row's scalar leaf IS the element pointer into its
+                    # declared row column, selected by the handle: a callee
+                    # writing the leaf writes the column.  (Naming the
+                    # loaded value made the callee's Store land in a local;
+                    # ``Rules._set_momentum(item, ...)`` kept 0.0.)  The
+                    # view is DERIVED from the column's and the handle's
+                    # cells on ``row_leaf_view``.
+                    physical_ids = [int(row_leaf_pointer.id)]
+                    _frame_post(
+                        ROW_LEAF_VIEW,
+                        (str(symbol), int(row_leaf_pointer.id)),
+                        str(nested_path),
+                        stage=RECORD_ABI_MATERIALIZATION,
+                        cells=(
+                            _frame_value_cell(
+                                function, int(pooled_column_value.id),
+                            ),
+                            _frame_value_cell(function, int(row_handle_id)),
+                        ),
+                    )
                 nested_fields.append(SSARecordFieldDescriptor(
                     str(nested_name),
                     descriptor_storage,
@@ -24786,14 +24898,20 @@ def _class_surface_ssa_program(
                     writable=mutable,
                 ))
                 if pooled_column_value is not None:
-                    # The pooled column is the row field's storage.  Naming
-                    # it as a member of this row record, under the leaf's own
-                    # storage identity, is what lets the frame linker bind it
-                    # to the caller's resident column for the same leaf.
+                    # The pooled column is the rows' storage, owned by the
+                    # keyed field: its identity is the column's
+                    # (``<owner>.<field>[].<leaf>``), never the row leaf's.
+                    # One key for both let a dict keyed by storage identity
+                    # bind a callee's row leaf to the whole column.  Callee
+                    # and caller row records and the declared row columns
+                    # all name the column this way, so the frame linker
+                    # still pairs columns with columns.
                     nested_fields.append(SSARecordFieldDescriptor(
                         f"{nested_name}.column",
                         SSARecordFieldStorage.SPAN,
-                        storage_identity=f"{schema_identity}.{nested_name}",
+                        storage_identity=_row_column_identity(
+                            declared_records, parameter_name, nested_path,
+                        ),
                         value_ids=(int(pooled_column_value.id),),
                         dtype=(
                             None if nested_dtype is None
@@ -24927,7 +25045,9 @@ def _class_surface_ssa_program(
                 row_fields.append(SSARecordFieldDescriptor(
                     str(leaf_name),
                     SSARecordFieldStorage.SPAN,
-                    storage_identity=f"{schema_identity}.{leaf_name}",
+                    storage_identity=_row_column_identity(
+                        declared_records, parameter_name, leaf_path,
+                    ),
                     value_ids=(int(column.id),),
                     dtype=leaf_dtype,
                     writable=leaf_mutable,
@@ -25065,10 +25185,19 @@ def _class_surface_ssa_program(
                 if not candidate_ids:
                     if not access_receipts:
                         continue
-                    # No authored read names the incoming value: mint its
-                    # formal NOVEL through the record-abi minter, the
-                    # declared parameter record's cell as operand.
-                    candidate_ids = (GLOBAL_MONOTONIC_IDS.mint(),)
+                    # No authored read names the incoming value.  A write
+                    # the control handoff gave a Store already minted the
+                    # slot (``record_field_incoming_slot``): that is the
+                    # formal.  Otherwise mint it NOVEL through the
+                    # record-abi minter, the declared record's cell as
+                    # operand.
+                    incoming_slot = current_identity_book().page(
+                        "record_field_incoming_slot"
+                    ).latest((str(symbol), str(parameter_name), str(field_name)))
+                    candidate_ids = (
+                        (int(incoming_slot),) if incoming_slot is not None
+                        else (GLOBAL_MONOTONIC_IDS.mint(),)
+                    )
                 if (
                     "sequence" in access_receipts
                     and storage not in {"keyed", "table", "record"}
@@ -30557,87 +30686,6 @@ def _class_surface_ssa_program(
             caller_function = all_functions[caller_symbol]
             sequence_members: set[int] = set()
 
-            def grow_pooled_row_column(
-                caller_record_id: int, callee_field: Any, member: Any,
-                callee_id: int,
-            ) -> Any:
-                """A pooled row leaf the caller's row record never read.
-
-                Woodshop ``_advance_newton_dt_system`` -> callsite 42 ->
-                ``_ensure_newton_dt_system``: the callee owns the rows of
-                ``items`` as declared row columns (every fixed-shape leaf,
-                ``custody`` among them); the caller indexes ``items`` and
-                its row record (``items[]``, paired by
-                ``call_record_pair_concordance``) holds columns only for the
-                leaves it reads.  Both are the same pooled representation
-                of one declared field, so the caller's column for the leaf
-                is the caller's own: mint it NOVEL(DECLARED_ROW_COLUMN,
-                the callee column's cell) and register it on that row
-                record.  Anything else is not grown.
-                """
-
-                from ..transmogrifier.ssa import SSARecordFieldStorage, SSAValue
-
-                accounting = dict(callee_formal.accounting or {})
-                table = all_record_tables.get(caller_symbol)
-                descriptor = (
-                    None if table is None
-                    else table.records.get(int(caller_record_id))
-                )
-                if (
-                    descriptor is None
-                    or member[0] != "value"
-                    or callee_field.storage is not SSARecordFieldStorage.SPAN
-                    or accounting.get("program_abi_row_identity") is None
-                    or str(accounting.get("program_abi_record") or "")
-                    != str(descriptor.identity)
-                ):
-                    return None
-                column_id = _frame_mint(
-                    caller_function, DECLARED_ROW_COLUMN,
-                    (_frame_value_cell(callee_function, int(callee_id)),),
-                    dtype=callee_formal.dtype,
-                    shape=tuple(callee_formal.shape or ()),
-                    stage=FRAME_LINK,
-                )
-                caller_parameter = next((
-                    (value.accounting or {}).get("program_abi_parameter")
-                    for value in caller_function.args
-                    if int(value.id) in {
-                        int(value_id)
-                        for field in descriptor.fields
-                        for value_id in field.value_ids
-                    }
-                    and (value.accounting or {}).get("program_abi_parameter")
-                    is not None
-                ), None)
-                column = SSAValue(
-                    int(column_id),
-                    dtype=callee_formal.dtype,
-                    shape=tuple(callee_formal.shape or ()),
-                    device=callee_formal.device,
-                    accounting={
-                        **accounting,
-                        **(
-                            {"program_abi_parameter": caller_parameter}
-                            if caller_parameter is not None else {}
-                        ),
-                        "program_abi_field_written": False,
-                    },
-                )
-                caller_function.args.append(column)
-                grown = replace(
-                    callee_field,
-                    name=f"{callee_field.name}.column"
-                    if not str(callee_field.name).endswith(".column")
-                    else callee_field.name,
-                    value_ids=(int(column.id),),
-                )
-                table.register(replace(
-                    descriptor, fields=(*descriptor.fields, grown),
-                ))
-                return grown
-
             member = _linked_caller_member(
                 str(caller_symbol), discovery_record, int(callee_formal.id),
                 all_record_tables.get(callee_symbol),
@@ -30646,7 +30694,6 @@ def _class_surface_ssa_program(
                 all_sequence_tables.get(caller_symbol),
                 {int(argument.id) for argument in caller_function.args},
                 sequence_members,
-                grow_caller_field=grow_pooled_row_column,
             )
             if member is None:
                 return None
@@ -46354,8 +46401,19 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     or exception, before the call returns or the exception propagates.  The
     book itself costs nothing beyond what the passes were already doing --
     they were minting these facts anyway; this only keeps them.
+
+    ``identity_book=`` (opt-in) resumes the caller's book instead of opening
+    a fresh one: one compiled program is one book, from its symbolic rows
+    through its external leaves' lowerings and its own lowering to emission
+    (``piece_from_law``, ``symbolic_equation_compiler.symbolic_program_book``).
+    A DETACHED book is never resumed (it counts as no book, the
+    ``emission_concordance.emission_book`` rule); the compile opens its own.
     """
     from .identity_concordance import begin_identity_book, end_identity_book
+
+    resumed_book = kwargs.pop("identity_book", None)
+    if resumed_book is not None and getattr(resumed_book, "detached", False):
+        resumed_book = None
 
     # Whole-program lowering can run for hours. Every major phase already
     # reports through this callback, but a missing callback used to discard
@@ -46367,7 +46425,7 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
             f"[compiler] {message}", file=sys.stderr, flush=True,
         )
 
-    _, _token = begin_identity_book()
+    _, _token = begin_identity_book(resumed_book)
     ok = False
     try:
         result = _lower_ast_source_to_ssa_impl(*args, **kwargs)

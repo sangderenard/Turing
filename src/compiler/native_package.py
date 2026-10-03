@@ -48,6 +48,13 @@ def piece_from_law(compilation: Any, law: str, batch: int, *,
     ``LLVMPiece`` the leaf takes its ABI from, a host callable, or an
     ``ExternalFunction``); the slots are filled at load with
     ``external_functions.bind_external_slots``.
+
+    One compiled program is one book: the leaves and the law are lowered on
+    the program's book (``symbolic_equation_compiler.compilation_program_
+    book``), which holds its symbolic rows; each lowered external call is
+    posted there DERIVED from its symbolic callsite rows
+    (``external_functions.post_lowered_external_calls``), and the emitters
+    derive the slot-call units from those rows.
     """
 
     from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
@@ -55,13 +62,15 @@ def piece_from_law(compilation: Any, law: str, batch: int, *,
     )
     from .fortran_c_shell import lower_ast_source_to_ssa
     from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
-    from .external_functions import externals_for_law
+    from .external_functions import externals_for_law, post_lowered_external_calls
+    from .symbolic_equation_compiler import compilation_program_book
 
     metadata = compilation.function.metadata
     argument_names = tuple(metadata["argument_names"])
     output_names = tuple(metadata["output_names"])
+    book = compilation_program_book(compilation)
     compilation, source, declared_externals = externals_for_law(
-        compilation, law, batch, externals)
+        compilation, law, batch, externals, book=book)
     module, outputs, exports = lower_ast_source_to_ssa(
         source, law,
         python_bindings={"AbstractTensor": AbstractTensor, **declared_externals},
@@ -69,7 +78,9 @@ def piece_from_law(compilation: Any, law: str, batch: int, *,
         name=law, runtime_closure_only=True,
         extraction_contract=batch_contract(law, argument_names, batch),
         resolved_process_graph_sink=resolved_process_graph_sink,
+        identity_book=book,
     )
+    post_lowered_external_calls(module, compilation, source, book)
     entry = exports[0]
     function = module.functions[entry]
     artifact = compile_artifact(

@@ -365,7 +365,8 @@ def _signature_contract(entry: str, names: Sequence[str], shapes: Sequence[tuple
 def declare_external(name: str, signature: ExternalSignature, *,
                      implementation: Any = None,
                      derivative: ExternalFunction | None = None,
-                     identity: Any = None, external: str = "") -> ExternalFunction:
+                     identity: Any = None, external: str = "",
+                     book: Any = None) -> ExternalFunction:
     """The piece-shaped leaf of external ``name`` at ``signature``.
 
     With an ``LLVMPiece`` implementation the leaf IS that piece's ABI and
@@ -375,7 +376,11 @@ def declare_external(name: str, signature: ExternalSignature, *,
     NaN of the result's shape: the body is never emitted (the leaf is a slot
     call in every lane that honours ``llvm_piece``), and a lane that did run
     it would produce NaN, never a plausible number.  Buffers are the
-    arguments then the result; one extent, the result's element count."""
+    arguments then the result; one extent, the result's element count.
+
+    ``book`` (the program's book, ``symbolic_program_book``): the signature
+    module is lowered on it, so the ids it mints keep their mint edges in
+    the book the program is judged by."""
 
     from .extraction_contract import llvm_piece_of
 
@@ -426,6 +431,7 @@ def declare_external(name: str, signature: ExternalSignature, *,
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         name=f"external_{name}", runtime_closure_only=True,
         extraction_contract=_signature_contract(name, names, signature.argument_shapes),
+        identity_book=book,
     )
     entry = exports[0]
     root = module.functions[entry]
@@ -517,7 +523,8 @@ def _respelled(compilation: Any, callees: Mapping[int, str]) -> Any:
 
 
 def externals_for_law(compilation: Any, law: str, batch: int,
-                      supplied: Mapping[str, Any] | None = None):
+                      supplied: Mapping[str, Any] | None = None, *,
+                      book: Any = None):
     """The law's declared externals, one leaf per (external, callsite shape).
 
     Returns ``(compilation, source, bindings)``: the compilation whose
@@ -528,7 +535,18 @@ def externals_for_law(compilation: Any, law: str, batch: int,
     slot; the host fills every slot of an external with its one
     implementation (``bind_external_slots``).  ``supplied`` maps an external
     to its implementation (an ``LLVMPiece`` the leaf takes its ABI from, a
-    host callable, or an ``ExternalFunction`` used as the leaf as is)."""
+    host callable, or an ``ExternalFunction`` used as the leaf as is).
+
+    ``book`` (the program's book): each leaf is posted on it as an
+    ``external_leaf`` row, NOVEL from its external's declaration cell
+    (``post_external_leaf``).  The leaf itself is still lowered on its OWN
+    book: a second ``lower_ast_source_to_ssa`` on one book collides with the
+    first (whole-book readers such as ``concord_compiler_frame_formals``
+    read every row as the current module's -- KeyError on the first leaf's
+    planned region; ``function_address`` is keyed by name alone).  So the
+    leaf's minted ids have no mint cell here and get no
+    ``external_leaf_value`` row yet
+    (``CONTINUATION_symbolic_cache_and_external_rows.md``)."""
 
     from .vehicle_python_compilation import symbolic_abstract_tensor_source
 
@@ -581,6 +599,9 @@ def externals_for_law(compilation: Any, law: str, batch: int,
                     leaf, ExternalSignature(("float64",) * len(argument_shapes),
                                             argument_shapes, "float64", result_shape),
                     implementation=given, external=name)
+            if book is not None:
+                bindings[leaf].identity = post_external_leaf(
+                    book, compilation, bindings[leaf])
             for call_id in call_ids:
                 callees[call_id] = leaf
     # Each external's declared derivative external (orbital item 4): the
@@ -594,6 +615,246 @@ def externals_for_law(compilation: Any, law: str, batch: int,
             leaf.derivative = leaves_of.get(derivative, {}).get(shape)
     specialized = _respelled(compilation, callees)
     return specialized, symbolic_abstract_tensor_source(specialized, law), bindings
+
+
+# -- the leaf and its lowered calls on the program's book ---------------------
+
+def _external_cell(book: Any, program: Any, external: str) -> Any:
+    from .concordance_declarations import EXTERNAL_FUNCTION, EXTERNAL_FUNCTION_NAME
+
+    named = book.page(EXTERNAL_FUNCTION_NAME).latest((program, str(external)))
+    if named is None:
+        raise LookupError(
+            f"external {external!r} has no external_function_name row for program "
+            f"{program!r} on this book; the program's symbolic rows are not here")
+    return book.latest_ref(EXTERNAL_FUNCTION, (program, int(named.external_id)))
+
+
+def _mint_cells(book: Any) -> dict[int, Any]:
+    """Minted id -> the cell its Novel post wrote (the mint page's target)."""
+    from .identity_concordance import MINT_PAGE
+
+    page = book.pages.get(MINT_PAGE.name)
+    if page is None:
+        return {}
+    return {int(row[1]): book._ref_from_key(row[0])
+            for row in page.rows() if row[1] is not None}
+
+
+def _leaf_functions(module: Any, entry: str) -> tuple[str, ...]:
+    """The leaf root and the functions its lowering made for it (its
+    planned regions): what it calls, transitively, inside ``module``."""
+    seen: list[str] = []
+    stack = [str(entry)]
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in module.functions:
+            continue
+        seen.append(name)
+        for block in module.functions[name].blocks.values():
+            for instruction in block.instrs:
+                if instruction.op in {"Call", "call"}:
+                    stack.append(str(instruction.attributes.get("callee") or ""))
+    return tuple(seen)
+
+
+def post_external_leaf(book: Any, compilation: Any, leaf: ExternalFunction) -> Any:
+    """Post ``leaf`` on the program's book; returns its ``external_leaf`` cell.
+
+    The leaf is NOVEL(``specialize_external_leaf``) from its external's
+    declaration cell.  Each MINTED id in the leaf's functions is an
+    ``external_leaf_value`` row DERIVED from the leaf cell and the cell of
+    the Novel post that minted it (the leaf was lowered on this book, so
+    that cell is here).  An id with no mint cell on this book (an
+    ``LLVMPiece`` implementation lowered by another compile) gets no row;
+    the audit keeps reporting it."""
+
+    from .concordance_declarations import (
+        EXTERNAL_LEAF, EXTERNAL_LEAF_VALUE, EXTERNAL_LOWERING,
+        SPECIALIZE_EXTERNAL_LEAF, ExternalLeafFact, ExternalLeafValueFact,
+    )
+    from .identity_concordance import MINTED, Derived, Mode, Novel, has_flag
+    from .symbolic_equation_compiler import symbolic_program_scope
+
+    program = symbolic_program_scope(compilation, str(compilation.function.name))
+    declaration = _external_cell(book, program, leaf.external)
+    cell = book.post(
+        EXTERNAL_LEAF, (program, str(leaf.name)),
+        ExternalLeafFact(
+            str(leaf.external),
+            tuple(tuple(int(n) for n in shape) for shape in leaf.signature.argument_shapes),
+            tuple(int(n) for n in leaf.signature.result_shape)),
+        stage=EXTERNAL_LOWERING,
+        provenance=Novel(SPECIALIZE_EXTERNAL_LEAF, (declaration,)),
+        mode=Mode.CONCORD,
+    )
+    mints = _mint_cells(book)
+    for function_name in _leaf_functions(leaf.module, leaf.entry):
+        function = leaf.module.functions[function_name]
+        ids: set[int] = set()
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                for value in (instruction.res, *instruction.args):
+                    value_id = getattr(value, "id", None)
+                    if isinstance(value_id, int) and has_flag(value_id, MINTED):
+                        ids.add(int(value_id))
+        for value_id in sorted(ids):
+            mint = mints.get(value_id)
+            if mint is None:
+                continue
+            book.post(
+                EXTERNAL_LEAF_VALUE, (str(function_name), value_id),
+                ExternalLeafValueFact(str(leaf.name)),
+                stage=EXTERNAL_LOWERING, provenance=Derived((cell, mint)),
+                mode=Mode.CONCORD,
+            )
+    return cell
+
+
+def post_lowered_external_calls(module: Any, compilation: Any, source: str,
+                                book: Any) -> dict[tuple[str, int], Any]:
+    """One ``external_call_lowering`` row per lowered call of an external
+    leaf in ``module``, on the program's book.
+
+    The lowered call is joined to its symbolic call by the statement it was
+    lowered from: the stage source spells the symbolic Call ``t<id> =
+    <leaf>(...)`` (``ssa_python_materializer``), and the lowered Call's
+    ``source_span`` names that line.  The row is DERIVED from every
+    ``external_callsite`` row of the symbolic call (one per output that
+    reads it), the leaf's ``external_leaf`` cell and the call result's own
+    identity cell.  A lowered leaf call that cannot be joined raises: an
+    external call with no symbolic origin is not admitted."""
+
+    import ast
+
+    from .concordance_declarations import (
+        EXTERNAL_CALLSITE, EXTERNAL_CALL_LOWERING, EXTERNAL_LEAF,
+        EXTERNAL_LOWERING, ExternalCallLoweringFact,
+    )
+    from .emission_concordance import value_cell
+    from .identity_concordance import Derived, Mode
+    from .symbolic_equation_compiler import symbolic_program_scope
+
+    program = symbolic_program_scope(compilation, str(compilation.function.name))
+    leaves = {
+        name: function.metadata["llvm_piece"]
+        for name, function in module.functions.items()
+        if (function.metadata.get("llvm_piece") or {}).get("binding") == RUNTIME_SLOT}
+    if not leaves:
+        return {}
+    # stage source line -> symbolic Call result id
+    line_value: dict[int, int] = {}
+    for node in ast.walk(ast.parse(source)):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and node.targets[0].id.startswith("t")
+                and node.targets[0].id[1:].isdigit()):
+            line_value[int(node.lineno)] = int(node.targets[0].id[1:])
+    symbolic_calls = {
+        int(instruction.res.id): instruction
+        for block in compilation.function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op in {"Call", "call"} and instruction.res is not None
+        and instruction.attributes.get("external_function")}
+    callsite_rows: dict[str, list] = {}
+    page = book.pages.get(EXTERNAL_CALLSITE.name)
+    for row in (() if page is None else page.rows()):
+        if row[0] == program:
+            callsite_rows.setdefault(str(row[2]), []).append(
+                book.latest_ref(EXTERNAL_CALLSITE, row))
+    posted: dict[tuple[str, int], Any] = {}
+    for function_name, function in module.functions.items():
+        if function_name in leaves:
+            continue
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                callee = str(instruction.attributes.get("callee") or "")
+                if instruction.op not in {"Call", "call"} or callee not in leaves:
+                    continue
+                record = leaves[callee]
+                result = (value_cell(book, function, instruction.res)
+                          if instruction.res is not None else None)
+                line = _authored_call_line(book, result, set(line_value))
+                symbolic = symbolic_calls.get(line_value.get(line, -1))
+                form = None if symbolic is None else symbolic.attributes.get(
+                    "external_callsite")
+                sources = list(callsite_rows.get(str(form), ()))
+                if not sources:
+                    raise LookupError(
+                        f"{function_name}: lowered call of external leaf {callee!r} "
+                        f"(authored line {line!r}, result cell {result!r}) joins no "
+                        "symbolic external_callsite row")
+                leaf_cell = book.latest_ref(EXTERNAL_LEAF, (program, str(record["leaf"])))
+                if leaf_cell is not None:
+                    sources.append(leaf_cell)
+                if result is not None:
+                    sources.append(result)
+                result_id = int(instruction.res.id) if instruction.res is not None else -1
+                posted[(str(function_name), result_id)] = book.post(
+                    EXTERNAL_CALL_LOWERING, (str(function_name), result_id),
+                    ExternalCallLoweringFact(str(record["external"]), str(record["leaf"])),
+                    stage=EXTERNAL_LOWERING,
+                    provenance=Derived(tuple(dict.fromkeys(sources))),
+                    mode=Mode.CONCORD,
+                )
+    return posted
+
+
+def _authored_call_line(book: Any, cell: Any, lines: set[int]) -> int:
+    """The stage-source line of the authored ``Call`` a lowered value came
+    from, read by walking the book back from the value's identity cell
+    (inbound edges, and a Novel cell's mint operands) to the ``source_span``
+    roots it reaches.  The one line among ``lines`` whose span is a Call;
+    -1 when the walk reaches none, or more than one (never a guess)."""
+
+    from .concordance_declarations import SOURCE_SPAN
+
+    if cell is None:
+        return -1
+    seen = {cell.key}
+    frontier = [cell]
+    found: set[int] = set()
+    while frontier:
+        ref = frontier.pop()
+        if ref.page.name == SOURCE_SPAN.name:
+            fact = book.page(SOURCE_SPAN).latest(ref.row)
+            if getattr(fact, "kind", None) == "Call" and int(fact.lineno) in lines:
+                found.add(int(fact.lineno))
+            continue
+        sources = [source for source, _stage in book.edges_into(ref)]
+        mint = book.mint_of(ref)
+        if mint is not None:
+            sources.extend(mint[1])
+        for source in sources:
+            if source.key not in seen:
+                seen.add(source.key)
+                frontier.append(source)
+    return found.pop() if len(found) == 1 else -1
+
+
+def lowered_external_call_cells(book: Any, function_name: str = "",
+                                instruction: Any = None, leaf: str = "") -> tuple:
+    """The ``external_call_lowering`` cells an emitter derives a slot-call
+    unit from: the one of ``instruction`` in ``function_name`` (the LLVM
+    lane emits the slot call at the call site), or every lowered call of
+    ``leaf`` (the C lane emits it once, in the leaf's shim)."""
+
+    from .concordance_declarations import EXTERNAL_CALL_LOWERING
+
+    if book is None:
+        return ()
+    page = book.pages.get(EXTERNAL_CALL_LOWERING.name)
+    if page is None:
+        return ()
+    if instruction is not None:
+        res = getattr(instruction, "res", None)
+        row = (str(function_name), int(res.id) if res is not None else -1)
+        ref = book.latest_ref(EXTERNAL_CALL_LOWERING, row)
+        return () if ref is None else (ref,)
+    return tuple(
+        book.latest_ref(EXTERNAL_CALL_LOWERING, row) for row in page.rows()
+        if page.latest(row).leaf == str(leaf))
 
 
 # -- the slot table in the C and LLVM lanes -----------------------------------

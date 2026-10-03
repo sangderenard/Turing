@@ -781,9 +781,20 @@ def tensor_operation_name(node: Any) -> Optional[str]:
             # concrete package never survives into ProcessGraph/SSA.
             node._abstract_tensor_frontend_reference = canonical
             if canonical == "tensor":
-                node.func = ast.copy_location(
+                replacement = ast.copy_location(
                     ast.Name(id=canonical, ctx=ast.Load()), func,
                 )
+                # The Name now IS the construct at ``func``'s path: it takes
+                # that path's lexical stamps, so its ``source_span`` row is
+                # a revision of the replaced construct's row, not a node
+                # with no row (edges lane C).
+                for stamp in (
+                    "_turing_source_span_row", "_turing_source_scope",
+                    "_turing_source_class", "_turing_source_cells",
+                ):
+                    if hasattr(func, stamp):
+                        setattr(replacement, stamp, getattr(func, stamp))
+                node.func = replacement
         elif isinstance(func, ast.Name) and func.id != canonical:
             func.id = canonical
         return canonical

@@ -1551,7 +1551,8 @@ def emit_ssa_module_to_c(
     # Declared externals (``external_functions``): runtime-slot leaves called
     # through the slot table this module exports and the host fills at load.
     from .external_functions import (
-        c_slot_call, c_slot_runtime, external_slot_rows, runtime_slot_functions,
+        c_slot_call, c_slot_runtime, external_slot_rows,
+        lowered_external_call_cells, runtime_slot_functions,
     )
 
     slot_functions = runtime_slot_functions(module, reachable)
@@ -2315,6 +2316,12 @@ def emit_ssa_module_to_c(
             recorder.unit(
                 UnitKind.CALL, "\n".join(shim),
                 args=(*function.args, *native_outputs[fn]), spelling=symbol,
+                # A slot call is the emission of every lowered call of this
+                # external leaf: DERIVED from their ``external_call_lowering``
+                # rows (which derive from the symbolic callsite rows).
+                extra_cells=(lowered_external_call_cells(
+                    emission, leaf=str(piece.get("leaf") or fn))
+                    if runtime_slot else ()),
             )
             recorder.unit(UnitKind.RETURN, "}")
             definitions.append("\n".join((

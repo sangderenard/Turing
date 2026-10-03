@@ -196,3 +196,36 @@ descriptor queries by +510 s, mean history scan 10 columns.
   round 1 at +969 s with 275 contracts, round 2 at +1092 s with 406.
   Progress is real; the run continues past the 30-minute mark per the rule
   (record where it is and keep going).
+
+## 2026-10-03 -- HEAD + both fixes: result (NOT full-native; next wall is in precompile_to_ssa)
+
+Run 12:21 ended at +1323 s (22 min) with a raise during SSA control
+lowering of `step_with_dt_control_used__specialized_*` (region 99, inside a
+while loop):
+
+    fortran_c_shell._class_surface_ssa_program (19502)
+      -> precompile_to_ssa.lower_control_sections_to_ssa (16283)
+      -> ... lower_while (10427) -> ... _carried_field_arm (4474) -> book.post
+    ConcordanceRefusal: post ssa_field_version
+      (('lexical_reads:step_with_dt_control_used|fork', 5),
+       Ref('reducer_field_state', (((..step_with_dt_control_used, 0), 'ingestion'),
+           <id>, 'unresolved_report'), 0)):
+      REVISE without a changed source
+
+- That is `Metrics.unresolved_report`, the field the frontier memory already
+  lists as open (table storage, no physical ABI columns).  precompile_to_ssa.py
+  belongs to another lane; not touched here.
+- Peak private memory of the run: about 6.8 GB (2 GB+ more than earlier
+  runs; the probe's per-call counters add little).  The contract was the
+  program's own (`lowered_system` -> `dt_system_contract`, with the full-native
+  execution file), not None.
+- Targeted tests, HEAD + both fixes: test_pruned_loop_return,
+  test_shell_reference_tables, test_sequence_contract_concordance,
+  test_callsite_formal_shape_concordance: 5 failed / 38 passed.  The same 5
+  fail on clean HEAD (3 from the earlier run, 2 shell-table tests re-run on
+  clean HEAD 12:5x).  Worktree removed.
+
+Timeline for this lowering: before the fix, the dt_system_over ->
+run_superstep callsite never finished (30 min and more, still stuck).  After
+the fix it clears in about 30 s, deployment ends at +496 s, and SSA lowering
+runs until the precompile_to_ssa wall at +1323 s.

@@ -2137,6 +2137,25 @@ PARAMETER_RECORD_CLASS = declare_page("parameter_record_class", (
     RowField("parameter", K.NAME),
 ), str)                                # DERIVED; CONCORD
 
+#: The incoming slot of a declared record parameter's mutable scalar field
+#: that is written but never read (``item.momentum = v``): minted at the
+#: control handoff (the write's Store needs a destination before record-ABI
+#: materialization runs) and adopted by materialization as the field's
+#: formal.  Fact: the minted SSA id, DERIVED from its ``ssa_value`` cell.
+RECORD_FIELD_INCOMING_SLOT = declare_page("record_field_incoming_slot", (
+    RowField("function", K.NAME), RowField("parameter", K.NAME),
+    RowField("field", K.NAME),
+), int)                                # DERIVED; CONCORD
+
+#: A keyed row's scalar leaf as the element pointer into its declared row
+#: column, selected by the row handle (user decision (A), carried to
+#: materialization).  Row: (function, the pointer's SSA id); fact: the leaf's
+#: field path; DERIVED(the column's ``ssa_value`` cell, the handle's cell),
+#: so a write through the view is traceable to the column.
+ROW_LEAF_VIEW = declare_page("row_leaf_view", (
+    RowField("function", K.NAME), RowField("view", K.VALUE_ID),
+), str)                                # DERIVED; CONCORD
+
 # ----------------------------------------------------------------------------
 # Graph-native differentiation edges (lane B, 2026-10-03).
 #
@@ -2398,3 +2417,161 @@ __all__ =[name for name in dir() if not name.startswith("_") and name not in {
     "ast", "dataclass", "Enum", "Any", "Ref", "RowField", "K", "Unresolved",
     "declare_page", "declare_reason", "declare_stage", "declare_transform",
 }]
+
+
+# ----------------------------------------------------------------------------
+# Symbolic compile cache provenance (2026-10-03,
+# ``docs/concordance_census/CONTINUATION_symbolic_cache_and_external_rows.md``).
+#
+# The symbolic dual-IR / symbolic-program cache (``sympy_dual_ir_cache``) was
+# keyed on the symbolic modules alone, so it served a compilation another
+# compiler tree had built (the phasing regression was hidden by it).  Each
+# stored compilation now carries the piece cache's compiler record
+# (``native_law_kernels.PieceCompilerRecord``) and every lookup posts:
+# ``symbolic_cache_staleness`` (layer, cache identity): a stored entry whose
+# recorded compiler differs from the sources on disk, and what was done
+# (``rebuilt`` by default, ``served`` on opt-in, ``rebuild_failed: <Error>``);
+# NOVEL(``symbolic_cache_stale_check``) root.
+# ``symbolic_cache_build`` (layer, cache identity): the compiler record of
+# the compilation returned; DERIVED from the staleness row when it is that
+# row's rebuild, else NOVEL(``symbolic_cache_build``) root.
+# The facts are the piece cache's own (one mechanism, two caches).
+# ----------------------------------------------------------------------------
+
+from .native_law_kernels import PieceBuildFact, PieceStalenessFact  # noqa: E402
+
+SYMBOLIC_CACHE = declare_stage("symbolic_cache")
+SYMBOLIC_CACHE_BUILD_TRANSFORM = declare_transform("symbolic_cache_build", 0)
+SYMBOLIC_CACHE_STALE_CHECK = declare_transform("symbolic_cache_stale_check", 0)
+SYMBOLIC_CACHE_BUILD = declare_page("symbolic_cache_build", (
+    RowField("layer", K.NAME), RowField("cache_identity", K.NAME),
+), PieceBuildFact)                     # NOVEL root or DERIVED(staleness row)
+SYMBOLIC_CACHE_STALENESS = declare_page("symbolic_cache_staleness", (
+    RowField("layer", K.NAME), RowField("cache_identity", K.NAME),
+), PieceStalenessFact)                 # NOVEL(SYMBOLIC_CACHE_STALE_CHECK) root
+
+__all__ += [
+    "PieceBuildFact", "PieceStalenessFact", "SYMBOLIC_CACHE",
+    "SYMBOLIC_CACHE_BUILD_TRANSFORM", "SYMBOLIC_CACHE_STALE_CHECK",
+    "SYMBOLIC_CACHE_BUILD", "SYMBOLIC_CACHE_STALENESS",
+]
+
+
+# ----------------------------------------------------------------------------
+# Edges lane C (2026-10-03,
+# ``docs/concordance_census/CONTINUATION_edges_lane_C.md``): the reducer's
+# synthesized ``ingestion_value`` rows (plan 70, step-3 worklist) derive from
+# what they stand for.
+#
+# ``static_symbol_definition`` (module, qualname, receiver): the definition a
+# compiler-only reference names when it is NOT a function-table entry (a
+# builtin, an imported function, a class, a module, a bound method).  It is
+# the referenced object's own declared identity, read from the object
+# (``__module__`` / ``__qualname__``, the receiver's for a bound method);
+# DERIVED from that definition's row when the book has one
+# (``backward_rule_definition`` / ``class_declaration`` under the same
+# module and qualname), else a NOVEL(INGEST_SOURCE) root: an external
+# declaration ingested by reference.  CONCORD; digest = sha256 of the code
+# object's bytecode and names for a Python function, None otherwise.
+# ``static_reference_use`` (ingestion scope, use, reference node): one row per
+# authored occurrence that resolved to a (shared, cached) StaticReference
+# node; DERIVED(the occurrence's ingestion cell, the definition cell, the
+# reference node's cell).  CONCORD.
+# ----------------------------------------------------------------------------
+
+
+class StaticSymbolKind(Enum):
+    FUNCTION = "function"
+    BUILTIN = "builtin"
+    CLASS = "class"
+    MODULE = "module"
+    BOUND_METHOD = "bound_method"
+    OTHER = "other"
+
+
+@dataclass(frozen=True)
+class StaticSymbolFact:
+    kind: StaticSymbolKind
+    digest: str | None
+
+
+@dataclass(frozen=True)
+class StaticReferenceUseFact:
+    #: the compiler path the occurrence resolved to (``np.sum``,
+    #: ``AbstractTensor.where``), as the reference node's label states it.
+    path: str
+
+
+STATIC_SYMBOL_DEFINITION = declare_page("static_symbol_definition", (
+    RowField("module", K.SCOPE), RowField("qualname", K.NAME),
+    RowField("receiver", K.LABEL),
+), StaticSymbolFact)                   # NOVEL(INGEST_SOURCE) root or DERIVED
+STATIC_REFERENCE_USE = declare_page("static_reference_use", (
+    RowField("ingestion_scope", K.SCOPE), RowField("use_id", K.VALUE_ID),
+    RowField("reference_id", K.VALUE_ID),
+), StaticReferenceUseFact)             # DERIVED(use, definition, node); CONCORD
+#: A compiler-only reference whose object declares neither a module nor a
+#: name: there is no definition to derive from.
+STATIC_SYMBOL_UNDECLARED = declare_reason("static_symbol_undeclared")
+
+__all__ += [
+    "StaticSymbolKind", "StaticSymbolFact", "StaticReferenceUseFact",
+    "STATIC_SYMBOL_DEFINITION", "STATIC_REFERENCE_USE",
+    "STATIC_SYMBOL_UNDECLARED",
+]
+
+
+# ----------------------------------------------------------------------------
+# External leaves and lowered external calls (2026-10-03, item 2 of
+# ``CONTINUATION_symbolic_cache_and_external_rows.md``).  One compiled
+# program is one book (``symbolic_equation_compiler.symbolic_program_book``):
+# the leaves and the law are lowered on it.
+#
+# ``external_leaf`` (program, leaf): one specialization of a declared
+# external at one callsite shape, NOVEL(``specialize_external_leaf``) from
+# the ``external_function`` declaration cell.
+# ``external_leaf_value`` (leaf function, value): each id the leaf's lowering
+# minted, DERIVED from the ``external_leaf`` cell and the id's own mint cell.
+# ``external_call_lowering`` (function, call result): each lowered call of
+# an external leaf, DERIVED from every symbolic ``external_callsite`` row of
+# that call, the ``external_leaf`` cell and the call result's identity cell.
+# The C and LLVM slot-call emission units derive from it.
+# ----------------------------------------------------------------------------
+
+SPECIALIZE_EXTERNAL_LEAF = declare_transform("specialize_external_leaf", 1)
+EXTERNAL_LOWERING = declare_stage("external_lowering")
+
+
+@dataclass(frozen=True)
+class ExternalLeafFact:
+    external: str
+    argument_shapes: tuple
+    result_shape: tuple
+
+
+@dataclass(frozen=True)
+class ExternalLeafValueFact:
+    leaf: str
+
+
+@dataclass(frozen=True)
+class ExternalCallLoweringFact:
+    external: str
+    leaf: str
+
+
+EXTERNAL_LEAF = declare_page("external_leaf", (
+    RowField("program", K.SCOPE), RowField("leaf", K.NAME),
+), ExternalLeafFact)                   # NOVEL(SPECIALIZE_EXTERNAL_LEAF, external cell); CONCORD
+EXTERNAL_LEAF_VALUE = declare_page("external_leaf_value", (
+    RowField("function", K.NAME), RowField("value", K.VALUE_ID),
+), ExternalLeafValueFact)              # DERIVED(leaf cell, the id's mint cell); CONCORD
+EXTERNAL_CALL_LOWERING = declare_page("external_call_lowering", (
+    RowField("function", K.NAME), RowField("call", K.VALUE_ID),
+), ExternalCallLoweringFact)           # DERIVED(callsite rows, leaf cell, result cell); CONCORD
+
+__all__ += [
+    "SPECIALIZE_EXTERNAL_LEAF", "EXTERNAL_LOWERING", "ExternalLeafFact",
+    "ExternalLeafValueFact", "ExternalCallLoweringFact", "EXTERNAL_LEAF",
+    "EXTERNAL_LEAF_VALUE", "EXTERNAL_CALL_LOWERING",
+]

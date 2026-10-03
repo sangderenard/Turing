@@ -7846,6 +7846,23 @@ def _dispatch_subgraph(
             parents=[],
             children=[],
         )
+        # The Store publishes ``output_id``: its row derives from the stored
+        # value's cell (edges lane C).  Its destination is the region's
+        # output publication (``dispatch_store``, posted with the region);
+        # no ``storage_root`` row exists yet at planning time.
+        from ..common.tensors.topological_reducer import (
+            node_identity_cell as _node_identity_cell,
+            post_derived_node_identity as _post_derived_node_identity,
+        )
+        from .concordance_declarations import (
+            PLANNER_REGION_CARVE as _PLANNER_REGION_CARVE,
+        )
+
+        _post_derived_node_identity(
+            subgraph, store_id,
+            (_node_identity_cell(subgraph, int(output_id)),),
+            stage=_PLANNER_REGION_CARVE,
+        )
         _set_operands(
             subgraph, store_id, [(output_id, "value")],
             cause=_DISPATCH_STORE_TRANSFORM,

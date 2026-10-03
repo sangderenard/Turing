@@ -692,6 +692,10 @@ def compile_sympy_equations(
 
     authored = tuple(equations)
     publication_rows = tuple(publications)
+    # One compiled program is one book, from these symbolic rows through to
+    # emission (``symbolic_program_book``; ``piece_from_law`` lowers on it).
+    symbolic_program_book(
+        str(name), tuple(sympy.srepr(equation) for equation in authored))
     implementation = _pipeline_implementation()
     record = {
         "name": str(name),
@@ -753,6 +757,53 @@ def symbolic_program_scope(
 
     reprs = tuple(compilation.function.metadata.get("symbolic_equations") or ())
     return _symbolic_program_key(name, reprs)
+
+
+def symbolic_program_book(name: str, reprs: Sequence[str]) -> Any:
+    """The one book of the symbolic program (``name``, ``reprs``): its
+    symbolic rows, its external leaves' lowerings, its law lowering and its
+    emission all post here (2026-10-03, coordinator: one compiled program is
+    one book).
+
+    The active book is this program's book when it was opened for this
+    program, or when it is an enclosing compile's book (a program compiled
+    inside another compile is part of it).  Otherwise -- no book, the
+    DETACHED default (never resumed: the ``emission_concordance.
+    emission_book`` rule), a standalone reverse compile's book, or another
+    symbolic program's -- a fresh book is opened, marked with the program,
+    and left current for the lowering the caller runs next, as a standalone
+    reverse acquisition leaves its book (``process_graph_autograd``).  Two
+    programs never share a book."""
+
+    from .identity_concordance import _ACTIVE_IDENTITY_BOOK, begin_identity_book
+
+    program = _symbolic_program_key(name, reprs)
+    current = _ACTIVE_IDENTITY_BOOK.get()
+    if (
+        current is not None
+        and not getattr(current, "detached", False)
+        and not getattr(current, "standalone_reverse_compile", False)
+        and getattr(current, "symbolic_program", program) == program
+    ):
+        return current
+    book, _token = begin_identity_book()
+    book.symbolic_program = program
+    return book
+
+
+def compilation_program_book(compilation: SymbolicEquationCompilation) -> Any:
+    """The book of a compiled program, for its lowering (``piece_from_law``).
+
+    The program's own book when it is active; else (a compilation carried
+    from elsewhere, or another program compiled since) a fresh program book
+    on which the program's symbolic rows are posted again (``CONCORD``, the
+    same rows ``compile_sympy_equations`` posts on a cache hit)."""
+
+    name = str(compilation.function.name)
+    reprs = tuple(compilation.function.metadata.get("symbolic_equations") or ())
+    book = symbolic_program_book(name, reprs)
+    _post_symbolic_outputs(compilation, name)
+    return book
 
 
 def _symbolic_program_key(name: str, reprs: Sequence[str]) -> tuple[str, str]:

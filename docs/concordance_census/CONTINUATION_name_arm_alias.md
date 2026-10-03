@@ -276,3 +276,65 @@ record 0 has identity `WorldMachine` (storage identities
 `item: WorldMachine` annotation; the caller binds its `items[]` row record
 (identity `woodshop.WorldMachine`, columns). The forwarding pass records
 "bound record identities differ". Two identities, one class.
+
+### Callsite 84 fixed by decision (A): annotation -> class -> contract record
+
+Page `parameter_record_class` (module, function, parameter) -> contract
+record identity, DERIVED(`parameter_annotation` cell, the
+`class_declaration` cell the annotation names in its module, the
+`source_record_class_concordance` cell). Writer and reader
+`fortran_c_shell._annotated_parameter_record_identity`; the two record-ABI
+selection sites replace an annotated parameter's inferred view by that
+contract record's receipt, and the record-forwarding identity check reads
+the joined identity from the book. Join detail that mattered: the class
+declaration and the contract's record class derive from DIFFERENT cells of
+one `source_span` row (the span was revised between stages); the row is the
+construct, so the join reads every column of it. A class with a span but no
+`class_declaration` row gets one, DERIVED from its span. Seconds-long repro:
+scratch `rhmod/rhworld.py` (`Rules._set_momentum(item: Body)`): the
+forwarding edge `(step self items[]) -> (_set_momentum item)` now exists.
+Not yet verified natively: the repro's `_set_momentum` momentum formal is
+still `linked_caller_member` Unresolved / `argument_binding` minted from
+absence, so the write may not reach the caller's column.
+
+### Next wall (held): `_sync_newton_lanes` -> `center_xyz`, frame link round 1
+
+    callee woodshop_outer_physics__center_xyz formal ... is sequence member
+    ('column', 0) of 'woodshop.WorldMachine.orientation_deg_xyz'; the bound
+    caller record 10 names no such member
+
+The callee holds the fixed-shape span leaf `orientation_deg_xyz` (shape
+[3]) as a sequence descriptor; the caller's row record holds it as the
+row-selected view plus the pooled `.column`. Representation decision.
+
+### Write-back check (coordinator, 2026-10-03 night): a miscompile, pre-existing
+
+Repro (scratch `rhmod/rhworld.py` + `probe_rh.py --run`, real contract base
+`program_extraction.yaml` + ABI): `Rules.step` loops `self.items`, calls the
+staticmethod `_set_momentum(item, item.mass * dt)`. CPython momentum
+[0.5, 1.0, 1.5]; native C and LLVM [0, 0, 0], here and on clean a2020e0b.
+
+Chain, observed:
+1. Minimal form, no rows: `def outer(item, dt): item.momentum =
+   item.mass * dt; return dt` with `momentum` a mutable scalar field. The
+   SetAttr survives reduction; the control handoff
+   (`_class_surface_ssa_program`, scalar field writes) builds a Store only
+   when the field has a getter (`if not getters: continue`). Written,
+   never read: no Store, write dropped (no Mul either).
+   FIXED: page `record_field_incoming_slot` (function, parameter, field)
+   -> minted id; `_record_field_incoming_slot` mints it at the handoff
+   NOVEL(NESTED_RECORD_PART, the SetAttr's field-state cells) as the
+   Store's destination, and record-ABI materialization adopts it as the
+   field's formal (it minted a fresh one before). Now `outer` and a callee
+   `setm(item, v)` both Store into the field formal.
+2. Rows: the caller's `item = self.items[identity]` is lowered through the
+   `ssa_sequence_*_lookup` call, and its row record (5) is NOT the
+   declared-row-column record (mass/momentum `.column` spans). At the call
+   the link grows a fresh scalar formal for `momentum` on record 5 (the
+   field-demand `grow`), i.e. caller storage minted from nothing: the
+   callee's Store lands there. Still 0.0. OPEN.
+
+Gates after (1): audit 0,1,0,1,5,0,0; identity tests 15 passed 1 xfailed;
+test_precompile_to_ssa 13/91 same set; test_native_record_read_order 1
+failed / 3 passed, the same variant (`first_write`) failing on clean
+a2020e0b; probes 0 failures.

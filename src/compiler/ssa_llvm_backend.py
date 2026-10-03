@@ -1225,7 +1225,7 @@ def _emit_repository_call_module(
     # through the slot table this module exports and the host fills at load.
     from .external_functions import (
         external_slot_rows, llvm_slot_call, llvm_slot_runtime,
-        runtime_slot_functions,
+        lowered_external_call_cells, runtime_slot_functions,
     )
 
     slot_functions = runtime_slot_functions(module, tuple(piece_records))
@@ -3650,6 +3650,19 @@ def _emit_repository_call_module(
                             body.extend(llvm_slot_call(
                                 entry_name, external_slot_index[symbol], len(slot_functions),
                                 tag, table, extents_table))
+                            # The slot call is this lowered external call's
+                            # emission: DERIVED from its
+                            # ``external_call_lowering`` row, which derives
+                            # from the symbolic callsite rows.
+                            span.take(
+                                UnitKind.CALL, result=instruction.res,
+                                args=tuple(instruction.args or ()),
+                                spelling=f"{piece['external']} slot "
+                                f"{external_slot_index[symbol]}",
+                                instruction=instruction,
+                                extra_cells=lowered_external_call_cells(
+                                    emission, name, instruction),
+                            )
                         else:
                             body.append(
                                 f"  call void @{piece['symbol']}(ptr {table}, ptr {extents_table})")

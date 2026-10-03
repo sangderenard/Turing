@@ -6,6 +6,7 @@ import ast
 import builtins
 import copy
 from dataclasses import MISSING, dataclass, fields, is_dataclass
+from dataclasses import field as _dataclass_field, replace as _dataclass_replace
 import hashlib
 import importlib
 import inspect
@@ -587,6 +588,40 @@ def node_identity_cell(graph: Any, node_id: int) -> Any:
         ),
         stage=REDUCTION, provenance=Unsourced(SYNTHESIZED_NO_SOURCE),
         mode=Mode.CONCORD,
+    )
+
+
+def post_derived_node_identity(
+    graph: Any, node_id: int, cells: Iterable[Any], *, stage: Any,
+) -> Any:
+    """Post a synthesized node's ``ingestion_value`` row DERIVED from
+    ``cells`` (what the node stands for) in the scope ``node_identity_cell``
+    reads first, and return its cell (edges lane C).
+
+    For writers that add a node outside ``new_node`` (a dispatch Store, an
+    output Store): call before the node's operands are written, so
+    ``_set_operands`` finds the consumer's row instead of posting its
+    Unsourced fallback.  A node that already has a row, a graph with no
+    ingestion scope, or no cell: nothing is posted (``None`` / the
+    existing cell)."""
+
+    from ...compiler.identity_concordance import Mode
+
+    existing = _posted_node_identity_cell(graph, int(node_id))
+    if existing is not None:
+        return existing
+    scopes = node_ingestion_scopes(graph)
+    cells = tuple(dict.fromkeys(cell for cell in cells if cell is not None))
+    if not scopes or not cells:
+        return None
+    data = getattr(graph, "G", graph).nodes.get(node_id) or {}
+    return current_identity_book().post(
+        _INGESTION_VALUE, (scopes[0], int(node_id)),
+        _NodeFact(
+            str(data.get("type") or ""), str(data.get("op") or ""),
+            str(data.get("label") or ""),
+        ),
+        stage=stage, provenance=_Derived(cells), mode=Mode.CONCORD,
     )
 
 
@@ -1594,10 +1629,114 @@ def _known_parameter_memory_contracts(
 
 @dataclass(frozen=True)
 class _StaticPythonReference:
-    """Ephemeral resolved Python object; never emitted as a graph value."""
+    """Ephemeral resolved Python object; never emitted as a graph value.
+
+    ``occurrence``: the authored AST expression whose resolution produced
+    this reference (the use).  A StaticReference node is cached per object
+    and shared by every use, so the node's row derives from the referenced
+    definition and each use posts its own ``static_reference_use`` row from
+    this occurrence (edges lane C).  Not part of equality."""
 
     value: Any
     path: str
+    occurrence: Any = _dataclass_field(default=None, compare=False, hash=False)
+
+
+def _static_symbol_definition_cell(target: Any) -> Any:
+    """The ``static_symbol_definition`` cell of a compiler-only reference
+    that is not a function-table entry, or ``None`` when the object declares
+    no module and no name (edges lane C).
+
+    The row is the object's own declared identity: ``(__module__,
+    __qualname__, receiver)``, the receiver being the bound object's
+    declared identity for a bound method (two receivers of one function are
+    two symbols).  DERIVED from the book's row for the same definition when
+    one exists (``backward_rule_definition`` for a helper compiled beside the
+    rules, ``class_declaration`` for a class ingested from source); else the
+    NOVEL(INGEST_SOURCE) root of an external declaration ingested by
+    reference."""
+
+    from ...compiler.concordance_declarations import (
+        BACKWARD_RULE_DEFINITION, CLASS_DECLARATION, INGESTION, INGEST_SOURCE,
+        STATIC_SYMBOL_DEFINITION, StaticSymbolFact, StaticSymbolKind,
+    )
+    from ...compiler.identity_concordance import Novel
+
+    def declared(obj: Any) -> tuple[str, str] | None:
+        if isinstance(obj, types.ModuleType):
+            return (str(obj.__name__), "")
+        module = getattr(obj, "__module__", None)
+        qualname = getattr(obj, "__qualname__", None) or getattr(
+            obj, "__name__", None,
+        )
+        if not isinstance(module, str) or not isinstance(qualname, str):
+            return None
+        return (module, qualname)
+
+    receiver = ""
+    function = target
+    if inspect.ismethod(target) or (
+        isinstance(target, types.BuiltinMethodType)
+        and getattr(target, "__self__", None) is not None
+        and not isinstance(target.__self__, types.ModuleType)
+    ):
+        bound = target.__self__
+        bound_identity = declared(bound if isinstance(bound, type) else type(bound))
+        receiver = "" if bound_identity is None else ".".join(bound_identity)
+        function = getattr(target, "__func__", target)
+    identity = declared(function)
+    if identity is None:
+        return None
+    if isinstance(target, types.ModuleType):
+        kind = StaticSymbolKind.MODULE
+    elif receiver:
+        kind = StaticSymbolKind.BOUND_METHOD
+    elif isinstance(target, type):
+        kind = StaticSymbolKind.CLASS
+    elif isinstance(target, types.FunctionType):
+        kind = StaticSymbolKind.FUNCTION
+    elif isinstance(target, types.BuiltinFunctionType):
+        kind = StaticSymbolKind.BUILTIN
+    else:
+        kind = StaticSymbolKind.OTHER
+    code = getattr(function, "__code__", None)
+    digest = (
+        hashlib.sha256(
+            code.co_code + repr(tuple(code.co_names)).encode("utf-8")
+        ).hexdigest()
+        if isinstance(code, types.CodeType) else None
+    )
+    book = current_identity_book()
+    row = (*identity, receiver)
+    existing = book.latest_ref(STATIC_SYMBOL_DEFINITION, row)
+    if existing is not None:
+        return existing
+    upstream = tuple(
+        cell for cell in (
+            book.latest_ref(BACKWARD_RULE_DEFINITION, identity),
+            book.latest_ref(CLASS_DECLARATION, identity),
+        )
+        if cell is not None
+    )
+    return book.post(
+        STATIC_SYMBOL_DEFINITION, row, StaticSymbolFact(kind, digest),
+        stage=INGESTION,
+        provenance=(
+            _Derived(upstream) if upstream else Novel(INGEST_SOURCE, ())
+        ),
+        mode=_Mode.CONCORD,
+    )
+
+
+def _occurrence_cell(graph: Any, occurrence: Any) -> Any:
+    """The cell of an authored occurrence (the AST node a use resolved
+    from): its posted ingestion / canonical cell, else its ``source_span``
+    cell, else ``None``.  Never posts a fallback row."""
+
+    if not isinstance(occurrence, ast.AST):
+        return None
+    cell = _posted_node_identity_cell(graph, id(occurrence))
+    return cell if cell is not None else _post_source_span(occurrence)
 
 
 def _reference_has_pursuable_source(value: Any) -> bool:
@@ -3012,6 +3151,30 @@ def _untranslated_operand(
             "expected_operands": int(expected),
         },
     )
+    # The stand-in's ``ingestion_value`` row (edges lane C): DERIVED from
+    # the consumer that lacks the operand and the absent operand's own row
+    # when the book still has it (a node reduced away keeps its row).
+    scopes = node_ingestion_scopes(graph)
+    if scopes:
+        from ...compiler.concordance_declarations import REDUCTION
+        from ...compiler.identity_concordance import Mode
+
+        cells = tuple(dict.fromkeys(
+            cell for cell in (
+                _posted_node_identity_cell(graph, int(consumer_id)),
+                _posted_node_identity_cell(graph, int(absent_id)),
+            )
+            if cell is not None
+        ))
+        if cells:
+            current_identity_book().post(
+                _INGESTION_VALUE, (scopes[0], int(placeholder_id)),
+                _NodeFact(
+                    UNTRANSLATED_NODE_TYPE,
+                    UNTRANSLATED_NODE_TYPE.lower(), label,
+                ),
+                stage=REDUCTION, provenance=_Derived(cells), mode=Mode.CONCORD,
+            )
     record_translation_shortfall(
         graph,
         pass_name="process-graph-operands",
@@ -3463,6 +3626,9 @@ def _normalize_lexical_values(
     loop_target_bindings_by_ast: dict[int, int] = {}
     static_reference_nodes: dict[tuple[int, str], int] = {}
     first_class_function_nodes: dict[int, int] = {}
+    # StaticReference node -> the definition cell its row derives from; every
+    # use row cites it (edges lane C).
+    static_reference_definition_cells: dict[int, Any] = {}
     materialized_attribute_nodes: dict[int, int] = {}
     static_constant_nodes: dict[str, int] = {}
     # The reducer's field state is on the book (page ``reducer_field_state``,
@@ -3866,6 +4032,7 @@ def _normalize_lexical_values(
         source: Any = None,
         source_cell: Any = None,
         cause: Any = _REDUCER_SYNTHESIS,
+        unsourced_reason: Any = None,
     ) -> int:
         # ``cause``: the Transform the caller names for this node's operand
         # edges (plan 100, 1.2); ``REDUCER_SYNTHESIS`` for a caller that
@@ -3924,17 +4091,26 @@ def _normalize_lexical_values(
         # else Unsourced(SYNTHESIZED_NO_SOURCE) under the latch -- the
         # latch lists every caller that passes no source (Phis, captured
         # Inputs, static constants) as step 3's worklist.
-        span = (
-            source_cell if isinstance(source_cell, _Ref)
-            else _post_source_span(source)
-        )
+        # ``source_cell`` may be several cells (edges lane C): a Phi derives
+        # from its incoming values, a StaticReference from its definition.
+        if isinstance(source_cell, _Ref):
+            cells = (source_cell,)
+        elif isinstance(source_cell, tuple):
+            cells = tuple(dict.fromkeys(
+                cell for cell in source_cell if isinstance(cell, _Ref)
+            ))
+        else:
+            cells = ()
+        if not cells:
+            span = _post_source_span(source)
+            cells = () if span is None else (span,)
         current_identity_book().post(
             _INGESTION_VALUE, (ingestion_read_scope, int(node_id)),
             _NodeFact(str(node_type), str(node_type.lower()), str(label)),
             stage=_REDUCTION,
             provenance=(
-                _Derived((span,)) if span is not None
-                else _Unsourced(_SYNTHESIZED_NO_SOURCE)
+                _Derived(cells) if cells
+                else _Unsourced(unsourced_reason or _SYNTHESIZED_NO_SOURCE)
             ),
             mode=_Mode.CONCORD,
         )
@@ -3984,7 +4160,9 @@ def _normalize_lexical_values(
             mode=_Mode.CONCORD,
         )
 
-    def input_value(name: str, *, binding_kind: str) -> int:
+    def input_value(
+        name: str, *, binding_kind: str, occurrence: Any = None,
+    ) -> int:
         value = environment.get(name)
         if value is not None:
             return value
@@ -4034,11 +4212,19 @@ def _normalize_lexical_values(
         # external name has no arg and stays Unsourced under the latch).
         argument = parameter_argument(name)
         argument_span = _post_source_span(argument)
+        # No ``ast.arg``: a captured / external / exception name.  The Input
+        # stands for the free name the authored ``occurrence`` reads (the
+        # handler that binds an exception name); its row derives from that
+        # occurrence's cell (edges lane C).  A module global's binding is
+        # Python state the book never ingests, so the read is the source.
         value = new_node(
             "Input",
             name,
             attributes=attributes,
-            source_cell=argument_span,
+            source_cell=(
+                argument_span if argument_span is not None
+                else _occurrence_cell(graph, occurrence)
+            ),
         )
         environment[name] = value
         identity_bindings.setdefault(name, []).append(value)
@@ -4217,10 +4403,19 @@ def _normalize_lexical_values(
             cells=(_post_source_span(target),),
         )
 
-    def static_constant(name: str, value: Any) -> int:
+    def static_constant(
+        name: str, value: Any, *, occurrence: Any = None,
+        definition: Any = None,
+    ) -> int:
+        """One Constant per compile-time binding ``name``, shared by every
+        read.  Edges lane C: the node's row derives from the receiver's
+        definition cell (``definition``, an attribute of a static object)
+        and the first reading ``occurrence``; every read, cached or new,
+        posts its own ``static_reference_use`` row."""
+
         existing = static_constant_nodes.get(name)
         if existing is not None:
-            return existing
+            return post_static_reference_use(occurrence, existing, name)
         python_special_case = interpret_python_static_value(
             value,
             path=name,
@@ -4254,9 +4449,12 @@ def _normalize_lexical_values(
             "Constant",
             name,
             attributes=attributes,
+            source_cell=(definition, _occurrence_cell(graph, occurrence)),
         )
+        if definition is not None:
+            static_reference_definition_cells[int(node_id)] = definition
         static_constant_nodes[name] = node_id
-        return node_id
+        return post_static_reference_use(occurrence, node_id, name)
 
     def is_static_literal(value: Any) -> bool:
         if value is None or value is Ellipsis or isinstance(
@@ -4273,8 +4471,58 @@ def _normalize_lexical_values(
             )
         return False
 
+    def function_address_cell(address: int) -> Any:
+        """The table's ``function_address`` cell for ``address``, or None."""
+
+        try:
+            entry = function_table.entry(int(address))
+        except KeyError:
+            return None
+        return current_identity_book().latest_ref(
+            _FUNCTION_ADDRESS, (str(entry.qualified_name),),
+        )
+
+    def post_static_reference_use(
+        occurrence: Any, node_id: int, path: str,
+    ) -> int:
+        """One ``static_reference_use`` row for the authored occurrence that
+        resolved to the shared StaticReference ``node_id`` (edges lane C):
+        DERIVED(the occurrence's cell, the definition cell, the node's
+        cell).  A reference with no authored occurrence (made by the
+        reducer, not read from source) posts nothing.  Returns
+        ``node_id``."""
+
+        from ...compiler.concordance_declarations import (
+            STATIC_REFERENCE_USE, StaticReferenceUseFact,
+        )
+
+        use_cell = _occurrence_cell(graph, occurrence)
+        if use_cell is None:
+            return node_id
+        cells = tuple(dict.fromkeys(
+            cell for cell in (
+                use_cell,
+                static_reference_definition_cells.get(int(node_id)),
+                _posted_node_identity_cell(graph, int(node_id)),
+            )
+            if cell is not None
+        ))
+        current_identity_book().post(
+            STATIC_REFERENCE_USE,
+            (ingestion_read_scope, int(id(occurrence)), int(node_id)),
+            StaticReferenceUseFact(str(path)),
+            stage=_REDUCTION, provenance=_Derived(cells), mode=_Mode.CONCORD,
+        )
+        return node_id
+
     def static_reference_node(reference: _StaticPythonReference) -> int:
-        """Materialize one compiler reference without exposing its Python value."""
+        """Materialize one compiler reference without exposing its Python value.
+
+        The node is cached per object and shared by every use: its
+        ``ingestion_value`` row derives from the referenced definition (the
+        table's ``function_address`` row, else the object's
+        ``static_symbol_definition`` row), and every use posts its own
+        ``static_reference_use`` row from ``reference.occurrence``."""
 
         key = (id(reference.value), reference.path)
         existing = static_reference_nodes.get(key)
@@ -4282,7 +4530,9 @@ def _normalize_lexical_values(
             cached = graph.G.nodes[existing]
             if (cached.get("type") == "StaticReference" and
                     (cached.get("attributes") or {}).get("static_python_reference") == reference.path):
-                return existing
+                return post_static_reference_use(
+                    reference.occurrence, existing, reference.path,
+                )
         # Lexical normalization can remove an already-resolved reference
         # projection. Recreate its compiler symbol from the real reference;
         # the cache must never publish a removed or repurposed graph node.
@@ -4334,21 +4584,45 @@ def _normalize_lexical_values(
             attributes["function_ref"] = function_reference.address
         if class_descriptor is not None:
             attributes["class_ref"] = target_name
+        from ...compiler.concordance_declarations import (
+            STATIC_SYMBOL_UNDECLARED,
+        )
+
+        definition_cell = (
+            function_address_cell(function_reference.address)
+            if function_reference is not None else None
+        )
+        if definition_cell is None:
+            definition_cell = _static_symbol_definition_cell(target)
         node_id = new_node(
             "StaticReference",
             reference.path,
             attributes=attributes,
+            source_cell=definition_cell,
+            unsourced_reason=STATIC_SYMBOL_UNDECLARED,
         )
+        if definition_cell is not None:
+            static_reference_definition_cells[int(node_id)] = definition_cell
         static_reference_nodes[key] = node_id
-        return node_id
+        return post_static_reference_use(
+            reference.occurrence, node_id, reference.path,
+        )
 
-    def first_class_function_node(name: str, reference: Any) -> int:
-        """Represent a source function used as data by its table address."""
+    def first_class_function_node(
+        name: str, reference: Any, *, occurrence: Any = None,
+    ) -> int:
+        """Represent a source function used as data by its table address.
+
+        Cached per address and shared by every use: the node's
+        ``ingestion_value`` row derives from the table's ``function_address``
+        row, and each authored ``occurrence`` posts its own
+        ``static_reference_use`` row (edges lane C)."""
 
         address = int(reference.address)
         existing = first_class_function_nodes.get(address)
         if existing is not None:
-            return existing
+            return post_static_reference_use(occurrence, existing, name)
+        definition_cell = function_address_cell(address)
         node_id = new_node(
             "StaticReference",
             name,
@@ -4357,12 +4631,16 @@ def _normalize_lexical_values(
                 "first_class_function_ref": address,
                 "reference_kind": "function_subgraph",
             },
+            source_cell=definition_cell,
+            unsourced_reason=_HELPER_CALLER_UNROUTED,
         )
+        if definition_cell is not None:
+            static_reference_definition_cells[int(node_id)] = definition_cell
         # The node IS the function's address: DERIVED from the table's
         # ``function_address`` row and the node's own cell (plan 60, 3.8).
         post_callable_identity(int(node_id), address)
         first_class_function_nodes[address] = node_id
-        return node_id
+        return post_static_reference_use(occurrence, node_id, name)
 
     def post_callable_identity(node_id: int, address: int) -> None:
         """One CONCORD ``callable_identity_concordance`` row ``(numeric
@@ -4401,6 +4679,9 @@ def _normalize_lexical_values(
             target_identity = id(target)
             value = loop_target_bindings_by_ast.get(target_identity)
             if value is None:
+                # The loop target binds this Input: its row derives from the
+                # target's own cell (edges lane C), never from a span stamp
+                # that would make the Input lexically owned.
                 value = new_node(
                     "Input",
                     target.id,
@@ -4408,6 +4689,7 @@ def _normalize_lexical_values(
                         "binding_name": target.id,
                         "binding_kind": "loop",
                     },
+                    source_cell=_occurrence_cell(graph, target),
                 )
                 loop_target_bindings_by_ast[target_identity] = value
                 identity_bindings.setdefault(target.id, []).append(value)
@@ -4803,10 +5085,17 @@ def _normalize_lexical_values(
                     return _StaticPythonReference(
                         static_parameter_bindings[expression.id],
                         expression.id,
+                        occurrence=expression,
                     )
                 static_reference = static_environment.get(expression.id)
                 if static_reference is not None:
                     _remove_node(graph, node_id)
+                    if isinstance(static_reference, _StaticPythonReference):
+                        # This read is the use, not the binding that stored
+                        # the reference (edges lane C).
+                        return _dataclass_replace(
+                            static_reference, occurrence=expression,
+                        )
                     return static_reference
                 producer_id = environment.get(expression.id)
                 if (
@@ -4816,6 +5105,7 @@ def _normalize_lexical_values(
                     producer_id = input_value(
                         expression.id,
                         binding_kind="closure",
+                        occurrence=expression,
                     )
                 static_value = static_bindings.get(expression.id)
                 function_reference = (
@@ -4831,6 +5121,7 @@ def _normalize_lexical_values(
                     return first_class_function_node(
                         expression.id,
                         function_reference,
+                        occurrence=expression,
                     )
                 if (
                     producer_id is None
@@ -4851,6 +5142,7 @@ def _normalize_lexical_values(
                     return _StaticPythonReference(
                         static_value,
                         expression.id,
+                        occurrence=expression,
                     )
                 if (
                     producer_id is None
@@ -4861,6 +5153,7 @@ def _normalize_lexical_values(
                     constant_id = static_constant(
                         expression.id,
                         static_value,
+                        occurrence=expression,
                     )
                     _redirect_value(graph, node_id, constant_id)
                     return constant_id
@@ -4902,6 +5195,7 @@ def _normalize_lexical_values(
                         element_ids = tuple(
                             first_class_function_node(
                                 str(item.__name__), reference,
+                                occurrence=expression,
                             )
                             for item, reference in zip(
                                 static_value, references,
@@ -4919,6 +5213,7 @@ def _normalize_lexical_values(
                             expression.id,
                             table if isinstance(static_value, tuple)
                             else list(table),
+                            occurrence=expression,
                         )
                         graph.G.nodes[constant_id].setdefault(
                             "attributes", {},
@@ -4935,6 +5230,7 @@ def _normalize_lexical_values(
                             if expression.id in exception_local_names
                             else "external"
                         ),
+                        occurrence=expression,
                     )
                 # Which binding each consumer read is a fact of this read,
                 # not of the value: two names can hold one value (``second
@@ -4958,6 +5254,7 @@ def _normalize_lexical_values(
                 receiver = _StaticPythonReference(
                     static_bindings[expression.value.id],
                     expression.value.id,
+                    occurrence=expression.value,
                 )
             else:
                 receiver = resolve_expression(expression.value)
@@ -4983,6 +5280,10 @@ def _normalize_lexical_values(
                         constant_id = static_constant(
                             f"{receiver.path}.{expression.attr}",
                             value,
+                            occurrence=expression,
+                            definition=_static_symbol_definition_cell(
+                                receiver.value,
+                            ),
                         )
                         _redirect_value(graph, node_id, constant_id)
                         return constant_id
@@ -4990,6 +5291,7 @@ def _normalize_lexical_values(
                     return _StaticPythonReference(
                         value,
                         f"{receiver.path}.{expression.attr}",
+                        occurrence=expression,
                     )
             elif isinstance(receiver, int):
                 expression_id = id(expression)
@@ -6593,6 +6895,7 @@ def _normalize_lexical_values(
                             if body_statement.target.id in exception_local_names
                             else "external"
                         ),
+                        occurrence=body_statement.target,
                     )
             elif (
                 isinstance(body_statement.target, ast.Subscript)
@@ -7067,6 +7370,9 @@ def _normalize_lexical_values(
                             merged_attributes["producer_kind"] = (
                                 "aggregate_phi"
                             )
+                        # A Phi is its incoming values selected by the test
+                        # at this ``if``: its row derives from their cells
+                        # and the statement's span (edges lane C).
                         merged_value = new_node(
                             "Phi",
                             name,
@@ -7075,6 +7381,12 @@ def _normalize_lexical_values(
                                 (test_value, "test"),
                                 (body_value, "body"),
                                 (else_value, "orelse"),
+                            ),
+                            source_cell=(
+                                node_identity_cell(graph, int(test_value)),
+                                node_identity_cell(graph, int(body_value)),
+                                node_identity_cell(graph, int(else_value)),
+                                _post_source_span(body_statement),
                             ),
                         )
                         environment[name] = merged_value
@@ -7411,6 +7723,7 @@ def _normalize_lexical_values(
                     input_value(
                         handler.name,
                         binding_kind="exception",
+                        occurrence=handler,
                     )
                 for nested in handler.body:
                     reduce_statement(nested)

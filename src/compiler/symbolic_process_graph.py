@@ -1443,6 +1443,10 @@ def ingest_sympy_expression(
                 # Declared by what SymPy says the node is: a call to an
                 # external the host supplies (``external_functions``).
                 attributes["external_function"] = str(value.func.__name__)
+                # The call's authored form: the key of its ``external_
+                # callsite`` rows (``post_external_functions``), which the
+                # lowered call's ``external_call_lowering`` row derives from.
+                attributes["external_callsite"] = sympy.srepr(value)
         node_id = make_node(
             value,
             rule,
