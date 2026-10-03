@@ -73,8 +73,8 @@ SYMPY_PROCESS_GRAPH_TRANSLATIONS: Mapping[object, SympyProcessGraphRule] = (
         sympy.log: SympyProcessGraphRule("Log"),
         sympy.floor: SympyProcessGraphRule("Floor"),
         sympy.ceiling: SympyProcessGraphRule("Ceil"),
-        sympy.Min: SympyProcessGraphRule("Min"),
-        sympy.Max: SympyProcessGraphRule("Max"),
+        sympy.Min: SympyProcessGraphRule("minimum"),
+        sympy.Max: SympyProcessGraphRule("maximum"),
         sympy.Equality: SympyProcessGraphRule("Eq", ("left", "right")),
         sympy.Unequality: SympyProcessGraphRule("Ne", ("left", "right")),
         sympy.StrictLessThan: SympyProcessGraphRule("Lt", ("left", "right")),
@@ -691,11 +691,138 @@ def _plug_reductions() -> None:
 _plug_reductions()
 
 
+class _SympyIngestionProvenance:
+    """The identity-book rows one SymPy ingestion posts (plan 60's ingestion
+    roots, for the SymPy source language).
+
+    The graph's ``ingestion_value_scope`` is minted here exactly as
+    ``graph_express2.build_from_ast`` mints it for an AST build (a graph that
+    already carries one keeps it: ingestion ids are unique across the graph).
+    Each authored expression is one ``symbolic_ingested_expression`` row:
+    DERIVED from the caller's equation cell when the caller has one (the
+    ``symbolic_equation_output`` cell ``compile_sympy_equations`` posts), else
+    a NOVEL(INGEST_SOURCE) root -- the expression IS the authored source, as
+    a ``symbolic_equation`` row is.  Each distinct authored subexpression is a
+    ``symbolic_subexpression`` row keyed by the argument path of its first
+    occurrence, DERIVED from its parent's cell.
+
+    ``node_cells`` answers, for one value being ingested, the exact cells its
+    ``ingestion_value`` row derives from: the value's own occurrence cells
+    when it is authored, else those of the innermost authored subexpression
+    whose ingestion made it (``context``).  Membership is SymPy structural
+    equality (the memo's own key), never a spelling.
+    """
+
+    def __init__(
+        self,
+        graph: Any,
+        expressions: Sequence[sympy.Basic],
+        output_names: Sequence[str],
+        sources: Sequence[Any] | None,
+    ) -> None:
+        from .concordance_declarations import (
+            INGEST_SOURCE, INGESTION, SYMBOLIC_INGESTED_EXPRESSION,
+            SYMBOLIC_SUBEXPRESSION, SymbolicExpressionFact,
+            SymbolicSubexpressionFact,
+        )
+        from .identity_concordance import (
+            Derived, Mode, Novel, current_identity_book,
+        )
+
+        if sources is not None and len(sources) != len(expressions):
+            raise ValueError(
+                "SymPy expression sources must match the expression count"
+            )
+        book = current_identity_book()
+        self.book = book
+        scope = graph.G.graph.get("ingestion_value_scope")
+        if scope is None:
+            scope = book.mint_scope("ingestion:sympy", INGESTION)
+            graph.G.graph["ingestion_value_scope"] = scope
+        self.scope = scope
+        self.context: list[sympy.Basic] = []
+        self.occurrences: dict[sympy.Basic, list[Any]] = {}
+        base = book.page(SYMBOLIC_INGESTED_EXPRESSION).scope_row_count(scope)
+        for offset, (expression, output) in enumerate(
+            zip(expressions, output_names)
+        ):
+            index = base + offset
+            expression_cell = book.post(
+                SYMBOLIC_INGESTED_EXPRESSION, (scope, index),
+                SymbolicExpressionFact(str(output)),
+                stage=INGESTION,
+                provenance=(
+                    Derived((sources[offset],)) if sources is not None
+                    else Novel(INGEST_SOURCE, ())
+                ),
+                mode=Mode.CONCORD,
+            )
+            seen: set[sympy.Basic] = set()
+            pending = [(sympy.sympify(expression), (), expression_cell)]
+            while pending:
+                value, path, parent_cell = pending.pop()
+                if value in seen:
+                    continue
+                seen.add(value)
+                cell = book.post(
+                    SYMBOLIC_SUBEXPRESSION, (scope, index, path),
+                    SymbolicSubexpressionFact(type(value).__name__),
+                    stage=INGESTION, provenance=Derived((parent_cell,)),
+                    mode=Mode.CONCORD,
+                )
+                self.occurrences.setdefault(value, []).append(cell)
+                arguments = tuple(getattr(value, "args", ()) or ())
+                for position in range(len(arguments) - 1, -1, -1):
+                    argument = arguments[position]
+                    if isinstance(argument, sympy.Basic):
+                        pending.append((argument, (*path, position), cell))
+
+    def is_authored(self, value: sympy.Basic) -> bool:
+        return value in self.occurrences
+
+    def node_cells(self, value: sympy.Basic) -> tuple[Any, ...]:
+        cells = self.occurrences.get(value)
+        if cells is None and self.context:
+            cells = self.occurrences[self.context[-1]]
+        return tuple(cells or ())
+
+    def post_node(
+        self,
+        node_id: int,
+        node_type: Any,
+        operation: Any,
+        label: Any,
+        value: sympy.Basic,
+        extra_cells: Sequence[Any] = (),
+    ) -> Any:
+        """Post node ``node_id``'s ``ingestion_value`` row (stage INGESTION,
+        CONCORD), DERIVED from ``node_cells(value)`` plus ``extra_cells``;
+        a node with neither is ``Unsourced(SYNTHESIZED_NO_SOURCE)``."""
+
+        from .concordance_declarations import (
+            INGESTION, INGESTION_VALUE, NodeFact, SYNTHESIZED_NO_SOURCE,
+        )
+        from .identity_concordance import Derived, Mode, Unsourced
+
+        cells = tuple(dict.fromkeys((*self.node_cells(value), *extra_cells)))
+        return self.book.post(
+            INGESTION_VALUE, (self.scope, int(node_id)),
+            NodeFact(str(node_type), str(operation), str(label)),
+            stage=INGESTION,
+            provenance=(
+                Derived(cells) if cells
+                else Unsourced(SYNTHESIZED_NO_SOURCE)
+            ),
+            mode=Mode.CONCORD,
+        )
+
+
 def ingest_sympy_expression(
     graph: Any,
     expression: sympy.Basic,
     *,
     strict: bool = False,
+    _provenance: _SympyIngestionProvenance | None = None,
 ) -> int:
     """Translate a SymPy tree back into canonical ProcessGraph operations.
 
@@ -708,6 +835,15 @@ def ingest_sympy_expression(
     """
 
     expression = sympy.sympify(expression)
+    # The book rows of this ingestion: the graph's ingestion scope, the
+    # authored expression and subexpression cells every node derives from.
+    # ``ingest_sympy_expressions`` hands its own (several authored
+    # expressions under one construction envelope); a single expression is
+    # its own authored source.
+    provenance = (
+        _provenance if _provenance is not None
+        else _SympyIngestionProvenance(graph, (expression,), ("result",), None)
+    )
     graph.domain_shape = (1,)
     graph.roots = []
     memo: dict[sympy.Basic, int] = {}
@@ -723,6 +859,7 @@ def ingest_sympy_expression(
         parent_ids: Sequence[int],
         roles: Sequence[str],
         attributes: Mapping[str, Any] | None = None,
+        source_cells: Sequence[Any] = (),
     ) -> int:
         nonlocal next_id
         node_id = next_id
@@ -750,6 +887,13 @@ def ingest_sympy_expression(
             children=[],
         )
         graph.node_map[node_id] = value
+        # The node's ``ingestion_value`` row, at birth (as ``ensure_node``
+        # posts an AST node's): DERIVED from the authored subexpression it
+        # ingests, else from the one whose ingestion made it.
+        provenance.post_node(
+            node_id, node_type, operation, graph.G.nodes[node_id]["label"],
+            value, source_cells,
+        )
         for parent_id, role in parents:
             graph.G.add_edge(parent_id, node_id)
             graph.G.nodes[parent_id].setdefault("children", []).append(
@@ -817,7 +961,22 @@ def ingest_sympy_expression(
         return declaration.lowering(declaration, graph, ingest)
 
     def add_node(value: sympy.Basic) -> int:
+        # An authored subexpression is the source context of every node its
+        # ingestion makes that is not itself authored (a pairwise fold link,
+        # a respelling, a closed form, a declared lowering's literals).
         value = sympy.sympify(value)
+        if value in memo:
+            return memo[value]
+        authored = provenance.is_authored(value)
+        if authored:
+            provenance.context.append(value)
+        try:
+            return ingest_value(value)
+        finally:
+            if authored:
+                provenance.context.pop()
+
+    def ingest_value(value: sympy.Basic) -> int:
         if value in memo:
             return memo[value]
 
@@ -976,6 +1135,13 @@ def ingest_sympy_expression(
             #                       under unit_output_seed=True (the default
             #                       obtain_graph_reverse uses) this is the
             #                       constant 1.0, not a forward-graph alias.
+            # Every folded node is a copy of one backward node: its row is
+            # DERIVED from that node's cell in the backward graph's scope
+            # (and from the Derivative being ingested, its context).
+            from ..common.tensors.topological_reducer import (
+                node_identity_cell,
+            )
+
             remap: dict[int, int] = {}
             for node_id, data in backward.G.nodes(data=True):
                 attrs = data.get("attributes") or {}
@@ -989,6 +1155,7 @@ def ingest_sympy_expression(
                         sympy.Integer(1),
                         SympyProcessGraphRule("const", node_type="Constant"),
                         (), (), {"value": 1},
+                        source_cells=(node_identity_cell(backward, node_id),),
                     )
 
             import networkx as nx
@@ -1030,7 +1197,10 @@ def ingest_sympy_expression(
                 if attributes.get("callee_ref") is not None:
                     attributes["callee_ref"] = _rehomed_callee_ref(attributes["callee_ref"])
                 placeholder = sympy.Symbol(f"_adjoint_{node_id}_{data.get('label', 'grad')}")
-                new_id = make_node(placeholder, rule, parent_ids, roles, attributes)
+                new_id = make_node(
+                    placeholder, rule, parent_ids, roles, attributes,
+                    source_cells=(node_identity_cell(backward, node_id),),
+                )
                 if data.get("tensor"):
                     graph.G.nodes[new_id]["tensor"] = dict(data["tensor"])
                 remap[node_id] = new_id
@@ -1167,7 +1337,7 @@ def ingest_sympy_expression(
         # exact binary arity.  Preserve the authored expression as a stable
         # left-associated ProcessGraph chain instead of asking each backend to
         # invent its own n-ary convention.
-        if rule.operation in {"Add", "Mul", "Min", "Max"} and len(arguments) > 2:
+        if rule.operation in {"Add", "Mul", "minimum", "maximum"} and len(arguments) > 2:
             left = add_node(arguments[0])
             accumulated = arguments[0]
             for index, argument in enumerate(arguments[1:], start=1):
@@ -1225,6 +1395,7 @@ def ingest_sympy_expressions(
     *,
     output_names: Sequence[str] | None = None,
     strict: bool = False,
+    expression_sources: Sequence[Any] | None = None,
 ) -> tuple[int, ...]:
     """Ingest a named expression set as one shared canonical ProcessGraph.
 
@@ -1233,6 +1404,12 @@ def ingest_sympy_expressions(
     result.  The tuple is only a construction envelope: it is removed again,
     and its operands become the graph's actual deployment roots.  Thus no
     invented tuple operation reaches repository SSA or a backend.
+
+    ``expression_sources`` (optional, one book ``Ref`` per expression): the
+    cell each expression is the output of -- the law's equation, as
+    ``compile_sympy_equations`` posts it.  Each expression's ingestion row
+    is DERIVED from it; without it the expression is its own NOVEL root.
+    The envelope is the one node with no source.
     """
 
     authored = tuple(sympy.sympify(expression) for expression in expressions)
@@ -1250,6 +1427,10 @@ def ingest_sympy_expressions(
 
     tuple_root = ingest_sympy_expression(
         graph, sympy.Tuple(*authored), strict=strict,
+        _provenance=_SympyIngestionProvenance(
+            graph, authored, names,
+            None if expression_sources is None else tuple(expression_sources),
+        ),
     )
     tuple_data = graph.G.nodes[tuple_root]
     if tuple_data.get("op") != "Tuple":

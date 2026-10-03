@@ -60,6 +60,7 @@ from .oop_schema import (
     MethodSchema,
     schemas_from_ssa_class_table,
 )
+from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
 from .ssa_llvm_backend import _BINARY as _LIKENESS_BINARY
 from .ssa_llvm_backend import _UNARY as _LIKENESS_UNARY
 
@@ -536,7 +537,19 @@ class _BodyMaterializer:
             self.assign(result, self.operand(instruction.args[0]))
             return
 
-        if operation in _BINARY_SPELLING:
+        # The planner spells a tensor operation acting on scalars through
+        # ``TENSOR_OPERATION_SCALAR_SPELLING`` and leaves graph-native
+        # spellings (``maximum``/``minimum`` from an ingested graph) as they
+        # are; the two are the same operation, so the scalar lookup reads
+        # through that one table exactly as ``ssa_reference_evaluator`` does.
+        # Only the scalar tables use the respelling: an op that has no scalar
+        # form here keeps its own name for the tensor-catalogue fallback.
+        scalar_operation = TENSOR_OPERATION_SCALAR_SPELLING.get(
+            operation.casefold(), operation,
+        )
+
+        if scalar_operation in _BINARY_SPELLING:
+            operation = scalar_operation
             left_value, right_value = instruction.args[0], instruction.args[1]
             left = self.operand(left_value)
             right = self.operand(right_value)
@@ -563,7 +576,8 @@ class _BodyMaterializer:
             self._mark_constant(result, constant=both_constant)
             return
 
-        if operation in _UNARY_SPELLING:
+        if scalar_operation in _UNARY_SPELLING:
+            operation = scalar_operation
             operand_value = instruction.args[0]
             operand = self.operand(operand_value)
             operand_constant = self._is_constant(operand_value)

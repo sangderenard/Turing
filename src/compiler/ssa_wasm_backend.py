@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ..transmogrifier.ssa import Function, IRModule
+from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
 from .output_publication import (
     function_output_publications,
     publication_surface_plan,
@@ -176,7 +177,11 @@ def emit_ssa_function_to_wasm(
         builder.local_get(locals_by_id[int(value_id)])
 
     for instruction in function.blocks["entry"].instrs:
+        # Ingested scalar SSA arrives with graph-native spellings
+        # (``maximum``/``minimum``); read them through the one table every
+        # SSA reader shares, as ``ssa_c_backend.emit_ssa_function_to_c`` does.
         op = str(instruction.op)
+        op = TENSOR_OPERATION_SCALAR_SPELLING.get(op.casefold(), op)
         if op == "Ret":
             outputs = tuple(int(value.id) for value in instruction.args)
             continue

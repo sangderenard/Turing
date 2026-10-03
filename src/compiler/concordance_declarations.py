@@ -1897,6 +1897,63 @@ SYMBOLIC_EQUATION_OUTPUT = declare_page("symbolic_equation_output", (
     RowField("program", K.SCOPE), RowField("output", K.NAME),
 ), SymbolicOutputFact)                 # DERIVED(symbolic_equation cell); CONCORD
 
+# ----------------------------------------------------------------------------
+# SymPy ingestion and graph-native differentiation (collocation Jacobian,
+# docs/DIFFERENTIATION_FEASIBILITY_2026-10-02.md item 1).
+#
+# Writers: ``symbolic_process_graph.ingest_sympy_expression(s)`` mints the
+# graph's ``ingestion_value_scope`` (as ``graph_express2.build_from_ast``
+# does) and posts, per ingested expression, one ``symbolic_ingested_
+# expression`` row -- DERIVED from the caller's equation cell (the
+# ``symbolic_equation_output`` cell ``compile_sympy_equations`` posts) or a
+# NOVEL(INGEST_SOURCE) root when the caller has no equation -- and one
+# ``symbolic_subexpression`` row per distinct authored subexpression, keyed
+# by the argument path of its first occurrence and DERIVED from its parent's
+# cell.  Every node's ``ingestion_value`` row is DERIVED from the cells of the
+# authored subexpression it ingests (every expression it occurs in), or of
+# the innermost authored subexpression whose ingestion made it (a pairwise
+# fold link, a respelling, a declared lowering).  Only the construction
+# envelope has no source: ``Unsourced(SYNTHESIZED_NO_SOURCE)``.
+#
+# ``process_graph_autograd``: the backward graph mints its own scope; each
+# adjoint node is NOVEL(ADJOINT_OF, (forward node's cell,)) at stage ADJOINT.
+# A forward graph with no identity scope has no cell to name:
+# ``Unsourced(FORWARD_GRAPH_UNSCOPED)``.  ``fuse_forward_loss_backward``
+# mints the motion's scope; every motion row is DERIVED from the forward or
+# backward cell it was copied from (stage FORWARD_LOSS_BACKWARD_FUSION).
+# ----------------------------------------------------------------------------
+
+ADJOINT = declare_stage("adjoint")
+FORWARD_LOSS_BACKWARD_FUSION = declare_stage("forward_loss_backward_fusion")
+
+#: An adjoint node made for one forward node by its backward rule (the
+#: seed, the rule call and its result projections, rule constants, gradient
+#: accumulation, shape reductions).  Operand: the forward node's cell.
+ADJOINT_OF = declare_transform("adjoint_of", 1)
+
+FORWARD_GRAPH_UNSCOPED = declare_reason("forward_graph_unscoped")
+
+
+@dataclass(frozen=True)
+class SymbolicExpressionFact:
+    #: The declared output name the expression is ingested for.
+    output: str
+
+
+@dataclass(frozen=True)
+class SymbolicSubexpressionFact:
+    #: The SymPy head of the subexpression (``type(value).__name__``).
+    head: str
+
+
+SYMBOLIC_INGESTED_EXPRESSION = declare_page("symbolic_ingested_expression", (
+    RowField("ingestion_scope", K.SCOPE), RowField("expression", K.INDEX),
+), SymbolicExpressionFact)             # DERIVED(equation cell) | NOVEL(INGEST_SOURCE) root; CONCORD
+SYMBOLIC_SUBEXPRESSION = declare_page("symbolic_subexpression", (
+    RowField("ingestion_scope", K.SCOPE), RowField("expression", K.INDEX),
+    RowField("path", K.LABEL),
+), SymbolicSubexpressionFact)          # DERIVED(parent subexpression / expression cell); CONCORD
+
 __all__ =[name for name in dir() if not name.startswith("_") and name not in {
     "ast", "dataclass", "Enum", "Any", "Ref", "RowField", "K", "Unresolved",
     "declare_page", "declare_reason", "declare_stage", "declare_transform",

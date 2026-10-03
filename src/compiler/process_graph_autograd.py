@@ -1502,8 +1502,55 @@ class _AdjointBindingGraphBuilder:
         )
 
 
+def _graph_node_cell(graph: ProcessGraph, node_id: int) -> Any:
+    """``node_id``'s identity cell in ``graph`` (``node_identity_cell``), or
+    None when ``graph`` carries no identity scope at all (built by neither
+    an ingestion nor lexical normalization): it has no cell to name."""
+
+    from ..common.tensors.topological_reducer import (
+        node_identity_cell, node_ingestion_scopes,
+    )
+
+    if not node_ingestion_scopes(graph):
+        return None
+    return node_identity_cell(graph, int(node_id))
+
+
+def _post_copied_node(
+    book: Any, scope: Any, node_id: int, data: Mapping[str, Any],
+    source_cell: Any,
+) -> Any:
+    """Post a fused-motion node's ``ingestion_value`` row DERIVED from the
+    exact cell it was copied from (stage FORWARD_LOSS_BACKWARD_FUSION); a
+    copy of a node from an unscoped graph has no cell:
+    ``Unsourced(FORWARD_GRAPH_UNSCOPED)``."""
+
+    from .concordance_declarations import (
+        FORWARD_GRAPH_UNSCOPED, FORWARD_LOSS_BACKWARD_FUSION, INGESTION_VALUE,
+        NodeFact,
+    )
+    from .identity_concordance import Derived, Mode, Unsourced
+
+    return book.post(
+        INGESTION_VALUE, (scope, int(node_id)),
+        NodeFact(
+            str(data.get("type") or ""), str(data.get("op") or ""),
+            str(data.get("label") or ""),
+        ),
+        stage=FORWARD_LOSS_BACKWARD_FUSION,
+        provenance=(
+            Derived((source_cell,)) if source_cell is not None
+            else Unsourced(FORWARD_GRAPH_UNSCOPED)
+        ),
+        mode=Mode.CONCORD,
+    )
+
+
 class _AdjointBuilder:
     def __init__(self, forward: ProcessGraph) -> None:
+        from .concordance_declarations import ADJOINT
+        from .identity_concordance import current_identity_book
+
         self.forward = forward
         registry_graph = _compiled_backward_rule_process_graph()
         self.backward = ProcessGraph(
@@ -1513,6 +1560,14 @@ class _AdjointBuilder:
                 registry_graph.external_function_table
             ),
         )
+        # The backward graph's own ingestion scope (as ``build_from_ast``
+        # mints a build's): every adjoint node's row is posted in it at
+        # birth by ``add``.
+        self.book = current_identity_book()
+        self.backward.G.graph["ingestion_value_scope"] = self.book.mint_scope(
+            "ingestion:adjoint", ADJOINT,
+        )
+        self.forward_cells: dict[int, Any] = {}
         self.next_id = 0
         self.saved: dict[int, int] = {}
         self.saved_storage: dict[int, str] = {}
@@ -1549,10 +1604,50 @@ class _AdjointBuilder:
             store_id=None,
             schema_version=1,
         )
+        self._post_adjoint_row(node_id, op, label or op, source_forward_id)
         for parent, role in parent_items:
             self.backward.G.add_edge(parent, node_id, role=role)
             self.backward.G.nodes[parent]["children"].append((node_id, role))
         return node_id
+
+    def _post_adjoint_row(
+        self, node_id: int, op: str, label: str, source_forward_id: int | None,
+    ) -> Any:
+        """Post adjoint node ``node_id``'s ``ingestion_value`` row: NOVEL
+        (ADJOINT_OF, operand = the cell of the forward node whose backward
+        rule made it), stage ADJOINT.  The row carries the builder's own
+        dense id, so the post mints no id and records the transform edge.
+        A forward graph with no identity scope has no cell to name:
+        ``Unsourced(FORWARD_GRAPH_UNSCOPED)``."""
+
+        from .concordance_declarations import (
+            ADJOINT, ADJOINT_OF, FORWARD_GRAPH_UNSCOPED, INGESTION_VALUE,
+            NodeFact,
+        )
+        from .identity_concordance import Mode, Novel, Unsourced
+
+        if source_forward_id is None:
+            raise ProcessGraphAutogradError(
+                f"adjoint node {node_id} ({op}) names no forward node its "
+                "backward rule was made for"
+            )
+        forward_id = int(source_forward_id)
+        if forward_id not in self.forward_cells:
+            self.forward_cells[forward_id] = _graph_node_cell(
+                self.forward, forward_id,
+            )
+        forward_cell = self.forward_cells[forward_id]
+        return self.book.post(
+            INGESTION_VALUE,
+            (self.backward.G.graph["ingestion_value_scope"], int(node_id)),
+            NodeFact(str(op), str(op), str(label)),
+            stage=ADJOINT,
+            provenance=(
+                Novel(ADJOINT_OF, (forward_cell,)) if forward_cell is not None
+                else Unsourced(FORWARD_GRAPH_UNSCOPED)
+            ),
+            mode=Mode.CONCORD,
+        )
 
     def input(
         self, name: str, *, kind: str, source_forward_id: int,
@@ -2210,6 +2305,17 @@ def fuse_forward_loss_backward(
             backward.external_function_table
         ),
     )
+    from .concordance_declarations import FORWARD_LOSS_BACKWARD_FUSION
+    from .identity_concordance import current_identity_book
+
+    # The motion's own ingestion scope.  Every motion node is a copy: forward
+    # nodes keep their forward ids, backward nodes are renumbered past them,
+    # and each row is DERIVED from the exact cell the node was copied from.
+    book = current_identity_book()
+    motion_scope = book.mint_scope(
+        "ingestion:training_motion", FORWARD_LOSS_BACKWARD_FUSION,
+    )
+    motion.G.graph["ingestion_value_scope"] = motion_scope
     forward_keep: set[int] = set()
     for loss_id in adjoint.output_value_ids:
         forward_keep |= nx.ancestors(forward.G, loss_id) | {loss_id}
@@ -2227,6 +2333,10 @@ def fuse_forward_loss_backward(
         data["attributes"] = attrs
         data["extra_args"] = copy.deepcopy(attrs)
         motion.G.add_node(int(node_id), **data)
+        _post_copied_node(
+            book, motion_scope, int(node_id), data,
+            _graph_node_cell(forward, int(node_id)),
+        )
     for left, right, edge in forward.G.subgraph(forward_keep).edges(data=True):
         motion.G.add_edge(int(left), int(right), **copy.deepcopy(dict(edge)))
         role = str(edge.get("role") or "value")
@@ -2276,6 +2386,12 @@ def fuse_forward_loss_backward(
         data["attributes"] = attrs
         data["extra_args"] = copy.deepcopy(attrs)
         motion.G.add_node(new_id, **data)
+        # A unit seed becomes the constant 1.0 here; its row still derives
+        # from the seed cell it replaces.
+        _post_copied_node(
+            book, motion_scope, new_id, data,
+            _graph_node_cell(backward, node_id),
+        )
         if node_id in output_by_seed:
             seed_ids[output_by_seed[node_id]] = new_id
 

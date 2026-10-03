@@ -23,6 +23,7 @@ from ..transmogrifier.dtype_layout import (
     c_lane_storage_for_llvm_type,
 )
 from ..transmogrifier.ssa import Function, IRModule
+from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
 from .output_publication import (
     function_output_publications,
     publication_surface_plan,
@@ -408,7 +409,12 @@ def emit_ssa_function_to_c(
         return value
 
     for instruction in function.blocks["entry"].instrs:
+        # Ingested scalar SSA arrives with graph-native spellings
+        # (``maximum``/``minimum``); the scalar dispatch below reads them
+        # through the one table every SSA reader shares, as
+        # ``ssa_reference_evaluator._operation_name`` does.
         op = str(instruction.op)
+        op = TENSOR_OPERATION_SCALAR_SPELLING.get(op.casefold(), op)
         if op == "Const" and instruction.res is not None:
             value = float(instruction.attributes.get("constant", instruction.attributes.get("value")))
             constants[int(instruction.res.id)] = value

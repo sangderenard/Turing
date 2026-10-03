@@ -1176,6 +1176,7 @@ def _piece_module_parts(llvm_ir: str) -> tuple[dict[str, str], dict[str, str]]:
 
 
 from .hierarchical_plan import (  # noqa: E402
+    TENSOR_OPERATION_SCALAR_SPELLING,
     is_predicate_operation,
 )
 
@@ -6203,6 +6204,13 @@ def emit_ssa_function_to_llvm(
                 scalars[result_id] = (register, target_type)
                 continue
 
+            # Ingested scalar SSA keeps graph-native spellings
+            # (``maximum``/``minimum``); the scalar lookup reads them through
+            # the one table every SSA reader shares, as
+            # ``ssa_reference_evaluator._operation_name`` does.
+            operation = TENSOR_OPERATION_SCALAR_SPELLING.get(
+                str(operation).casefold(), operation,
+            )
             template = scalar_likeness(
                 str(operation),
                 precision_section=bool(

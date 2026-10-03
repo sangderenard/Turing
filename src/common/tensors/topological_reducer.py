@@ -524,6 +524,22 @@ def post_scalar_parameter(
     )
 
 
+def node_ingestion_scopes(graph: Any) -> tuple[Any, ...]:
+    """The scopes ``node_identity_cell`` reads a node's ``ingestion_value``
+    row in, in order: this reduction's ``operand_position_scope``, then the
+    build's ``ingestion_value_scope``.  Empty: the graph has no identity
+    scope, and ``node_identity_cell`` refuses it."""
+
+    metadata = getattr(getattr(graph, "G", graph), "graph", {}) or {}
+    return tuple(
+        scope for scope in (
+            metadata.get("operand_position_scope"),
+            metadata.get("ingestion_value_scope"),
+        )
+        if scope is not None
+    )
+
+
 def node_identity_cell(graph: Any, node_id: int) -> Any:
     """The cell that identifies graph node ``node_id`` (plan 60, seam 1).
 
@@ -552,13 +568,7 @@ def node_identity_cell(graph: Any, node_id: int) -> Any:
             cell = book.latest_ref(CANONICAL_VALUE, (scope, node_id))
             if cell is not None:
                 return cell
-    scopes = tuple(
-        scope for scope in (
-            metadata.get("operand_position_scope"),
-            metadata.get("ingestion_value_scope"),
-        )
-        if scope is not None
-    )
+    scopes = node_ingestion_scopes(graph)
     for scope in scopes:
         cell = book.latest_ref(INGESTION_VALUE, (scope, node_id))
         if cell is not None:

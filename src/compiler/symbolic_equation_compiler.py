@@ -214,11 +214,24 @@ def _compile_sympy_equations_uncached(
     if dtype not in {"float32", "float64"}:
         raise ValueError("symbolic equation dtype must be float32 or float64")
     graph = ProcessGraph(materialize_memory=False, source_language="sympy")
+    # The law's equations and declared outputs are on the book before the
+    # graph exists, so every ingested node derives from its equation's output
+    # cell (the same rows ``_post_symbolic_outputs`` posts per call).
+    output_cells = _post_symbolic_program(
+        name,
+        tuple(sympy.srepr(equation) for equation in authored),
+        authored,
+        tuple(
+            (row.name, row.equation_index, row.component, row.form)
+            for row in declarations
+        ),
+    )
     roots = ingest_sympy_expressions(
         graph,
         tuple(row.expression for row in declarations),
         output_names=output_names,
         strict=True,
+        expression_sources=tuple(output_cells[row.name] for row in declarations),
     )
     # Input columns are declared by the importer (a Symbol by its name, an
     # element of a MatrixSymbol by ``matrix_component_name``).  Two inputs
@@ -523,13 +536,69 @@ def symbolic_program_scope(
     authored equations), the ``program`` field of ``symbolic_equation`` and
     ``symbolic_equation_output`` rows."""
 
+    reprs = tuple(compilation.function.metadata.get("symbolic_equations") or ())
+    return _symbolic_program_key(name, reprs)
+
+
+def _symbolic_program_key(name: str, reprs: Sequence[str]) -> tuple[str, str]:
+    """(law name, digest of the authored equations' sreprs): the one key
+    ``symbolic_program_scope`` reads back from a compilation's metadata and
+    ``_post_symbolic_program`` posts under before ingestion."""
+
     import hashlib
 
-    reprs = tuple(compilation.function.metadata.get("symbolic_equations") or ())
     return (
         str(name),
         hashlib.sha256("\n".join(reprs).encode("utf-8")).hexdigest(),
     )
+
+
+def _post_symbolic_program(
+    name: str,
+    reprs: Sequence[str],
+    equations: Sequence[sympy.Equality],
+    outputs: Sequence[tuple],
+) -> dict[str, Any]:
+    """Post each authored equation (NOVEL root) and each declared output
+    (DERIVED from its equation's cell) on the active book; return the
+    output cells by output name.  ``CONCORD``: posting the same set again
+    writes no new cell, so the pre-ingestion post and the per-call post of
+    ``_post_symbolic_outputs`` agree."""
+
+    import hashlib
+
+    from .concordance_declarations import (
+        INGEST_SOURCE, INGESTION, SYMBOLIC_EQUATION, SYMBOLIC_EQUATION_OUTPUT,
+        SymbolicEquationFact, SymbolicOutputFact, SymbolicOutputForm,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Novel, current_identity_book,
+    )
+
+    program = _symbolic_program_key(name, reprs)
+    book = current_identity_book()
+    cells = {}
+    for index, (text, equation) in enumerate(zip(reprs, equations)):
+        lhs = equation.lhs
+        cells[index] = book.post(
+            SYMBOLIC_EQUATION, (program, index),
+            SymbolicEquationFact(
+                hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                tuple(int(extent) for extent in lhs.shape) if _is_matrix(lhs) else (),
+            ),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+    output_cells = {}
+    for output, equation_index, component, form in outputs:
+        output_cells[str(output)] = book.post(
+            SYMBOLIC_EQUATION_OUTPUT, (program, str(output)),
+            SymbolicOutputFact(
+                int(equation_index), tuple(component), SymbolicOutputForm(form)),
+            stage=INGESTION, provenance=Derived((cells[int(equation_index)],)),
+            mode=Mode.CONCORD,
+        )
+    return output_cells
 
 
 def _post_symbolic_outputs(
@@ -544,43 +613,12 @@ def _post_symbolic_outputs(
     new cell.
     """
 
-    import hashlib
-
-    from .concordance_declarations import (
-        INGEST_SOURCE, INGESTION, SYMBOLIC_EQUATION, SYMBOLIC_EQUATION_OUTPUT,
-        SymbolicEquationFact, SymbolicOutputFact, SymbolicOutputForm,
-    )
-    from .identity_concordance import (
-        Derived, Mode, Novel, current_identity_book,
-    )
-
     metadata = compilation.function.metadata
     reprs = tuple(metadata.get("symbolic_equations") or ())
     outputs = tuple(metadata.get("symbolic_outputs") or ())
     if not reprs or not outputs:
         return
-    program = symbolic_program_scope(compilation, name)
-    book = current_identity_book()
-    cells = {}
-    for index, (text, equation) in enumerate(zip(reprs, compilation.equations)):
-        lhs = equation.lhs
-        cells[index] = book.post(
-            SYMBOLIC_EQUATION, (program, index),
-            SymbolicEquationFact(
-                hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                tuple(int(extent) for extent in lhs.shape) if _is_matrix(lhs) else (),
-            ),
-            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
-            mode=Mode.CONCORD,
-        )
-    for output, equation_index, component, form in outputs:
-        book.post(
-            SYMBOLIC_EQUATION_OUTPUT, (program, str(output)),
-            SymbolicOutputFact(
-                int(equation_index), tuple(component), SymbolicOutputForm(form)),
-            stage=INGESTION, provenance=Derived((cells[int(equation_index)],)),
-            mode=Mode.CONCORD,
-        )
+    _post_symbolic_program(name, reprs, compilation.equations, outputs)
 
 
 def _pipeline_implementation() -> str:

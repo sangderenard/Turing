@@ -3193,8 +3193,13 @@ def apply_precision_pipeline(
         # Outside a compile this call is its own transaction: its facts
         # describe this module only, so they go in the module's own book
         # (``identity_book(module)`` reads them back after the fact).
+        # A detached book attached to the module counts as no book (the
+        # ``emission_concordance.emission_book`` rule): re-activating it would
+        # land back in this branch forever.
         metadata = getattr(module, "metadata", None)
         own = None if metadata is None else metadata.get("identity_book")
+        if own is not None and getattr(own, "detached", False):
+            own = None
         token = _ACTIVE_IDENTITY_BOOK.set(own) if own is not None else None
         if token is None:
             own, token = begin_identity_book()
