@@ -235,6 +235,11 @@ def _local(value_id: int) -> str:
 
 
 def _constant(literal: Any) -> str:
+    if isinstance(literal, float):
+        # Python's float repr spells infinities as free names (inf/-inf).
+        # Its AST literal printer preserves the exact numeric constant as
+        # 1e309/-1e309, so subsequent source ingestion owns its producer.
+        return ast.unparse(ast.Constant(value=literal))
     return repr(literal)
 
 
@@ -1729,4 +1734,3 @@ def materialize_precision_sections(
         main.step(instruction)
     main.finish(returned)
     return [section_function], main.statements or [ast.Pass()], (main.uses_math or section.uses_math)
-

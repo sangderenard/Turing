@@ -68,7 +68,7 @@ def _numeric_constant(value: Any) -> Any:
         return float(value)
     if isinstance(value, sympy.Integer):
         return float(value)
-    if isinstance(value, (sympy.Rational, sympy.Float)):
+    if isinstance(value, sympy.Number):
         return float(value)
     return value
 
