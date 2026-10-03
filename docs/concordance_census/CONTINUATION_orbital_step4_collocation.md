@@ -1,420 +1,124 @@
-# Continuation: orbital craft step 4, the collocation planner
+# Continuation: orbital craft step 4, the collocation planner (condensed)
 
-Task: `engine_toy/orbital_collocation.py` + `engine_toy/tests/test_orbital_collocation.py`.
-Design: `docs/ORBITAL_CRAFT_SOLVER_DESIGN_2026-10-02.md` (decisions 4, 7; build
-step 4). Jacobian: compiled graph-native reverse, unit-seed VJP, one motion per
-residual row (explicit-seed fused motion is another agent's lane). Owned files:
-those two only. Not owned: orbital_tracker/jumper/actuation (report hooks).
-Do not commit.
+Full 420-line working log: `git show 17e69599:docs/concordance_census/CONTINUATION_orbital_step4_collocation.md`.
+Code: `engine_toy/orbital_collocation.py`, tests `engine_toy/tests/test_orbital_collocation.py`
+(9 passed at hand-off). Design: `docs/ORBITAL_CRAFT_SOLVER_DESIGN_2026-10-02.md`
+(decisions 4, 7; build step 4). Landed in engine_toy commits 77f4496 and 3afe283.
 
-## 2026-10-03 session start
+## Status
 
-State at start: turing has uncommitted `src/compiler/precompile_to_ssa.py`,
-`docs/concordance_census/CONTINUATION_name_arm_alias.md`,
-`tools/compiler_probes/probe_nested_inplace_arm.py` (other lanes; not mine).
-No orbital_collocation.py existed.
+The planner works. A nominal LEO 7000 -> 8000 km transfer plans in ~0.6 s at
+Hohmann fuel (1.0000 x) and 1.0010 x Hohmann time. A live re-plan after a
+300 m/s kick takes 1-2 s (was 205 s with SLSQP on the full transcription).
+Tracker flights of the plans arrive within ~5-16 m and ~0.03 m/s of target.
 
-Read: design doc, DIFFERENTIATION_FEASIBILITY, probe_collocation_jacobian.py,
-CONTINUATION_jacobian_compile_fixes.md (its last entry: on the probe slice the
-12 `Indexed(Call bw_*)` grads are DROPPED by lowering, and it says this is NOT
-seed-specific -- one output, unit seed, same shortfalls).
+## Architecture
 
-Observed by reading: `orbital_tracker.tracking_command`/`fly` call
-`orbital_plan.reference(plan, t)` (a module function over HohmannPlan legs).
-A non-Hohmann plan cannot be flown by the tracker without a hook there.
+- Transcription: N nodes (N=40), node state = momentum(3), position(3),
+  propellant mass(1). A slice is `substeps` = 16 kick-drift-kick steps of the
+  jumper's own laws (N4.1, TS1.2/1.4 flow, N7.2, N1.1), supply 1. The slice
+  Jacobian is the chain of each step's compiled Jacobian (forward accumulation;
+  no extra compile). Per-slice error 3.6 m vs 256 sub-steps (one 85 s step was
+  994 m off, which made the plan unflyable: 1.55 x fuel).
+- Laws: jumper's builders + `eq_KE1_3` vis-viva arrival rows + decision-7 cost
+  (alpha*I/T-style time term, beta, kappa barrier, fuel budget). Planning design
+  at a declared attitude (default identity); thrusters priced by
+  `orbital_tracker.fuel_price`'s rule. Hohmann warm start.
+- Jacobians: `compile_reverse_rows` = ONE explicit-seed fused reverse motion per
+  row set inside `reverse_compile_book`, one native run per seed. Scalar arena
+  reused (`prepare_artifact_execution` once); re-preparing per call cost 241 ms
+  vs 0.76 ms.
+- Solver (default): `_Condensed` / `solve_structured`. Burn slices own a
+  duration and per-thruster impulse w = u*dt (throttle box as linear rows);
+  coast slices form arcs of equal slices sharing one duration; nodes follow by
+  forward substitution (defects zero by construction). SLSQP then runs over
+  (n_u+1)*burns + arcs variables (15 for 2 burns) and 5 arrival rows. The burn
+  structure grows by the switching function (primer vector, one adjoint sweep
+  through the stored Jacobians); multipliers by min-norm least squares.
+- Old path kept as the measured reference: `plan_transfer(method="SLSQP")`
+  (full transcription + least-squares polish of defects when infeasible).
+- `CollocationPlan`: `reference(t)`, `impulses()`; `collocation_replanner(problem, craft=)`; live re-plan warms from the plan's remainder (`remainder_warm_start`). `fixed_first=True` exists, default off (never feasible).
+- Tracker protocol: thrusting slices read impulsively (coast from node k to the
+  slice midpoint, back from node k+1; impulses() = that step at the midpoint).
+  Slices under 1 m/s (`THRUST_THRESHOLD_M_S`) are coasts. Ramped references and
+  16 sub-step impulses per slice both fail with the tracker (11 km / 130 km off).
 
-## 2026-10-03 BLOCKER: the unit-seed compiled VJP is broken too (not seed-specific)
+## Key numbers
 
-Observed (scratch `unit_row.py`: probe `slice_laws(0)` row 0 alone ->
-`ingest_sympy_expressions(strict)` -> `compile_process_graph_backward(
-packaging="combined", unit_loss_seed=True)` -> `lower_training_motion_to_
-repository_ssa` -> `emit_ssa_function_to_llvm` -> `compile_artifact`, ~12 s):
-- lowering shortfalls (), LLVM shortfalls (), native builds.
-- loss_0 native -199679.20679840667 vs sympy -199679.20679840664 (forward OK).
-- 7 of 8 grad outputs (grad_29/33/2/10/15/0/5) are NOT in `buffer_order`;
-  the one present (grad_23, r0_x) reads 0 (ref -0.0232). buffer_order carries
-  backward intermediates (182, 180, 185, ...) as formals.
-Same shape as CONTINUATION_jacobian_compile_fixes.md "KeyError 806 lane".
+| item | value |
+|---|---|
+| compile, arrival rows (5 x 7 wrt) | 96 s; 0.19 ms per call |
+| compile, slice rows 6 thrusters (7 rows x 27 wrt) | 874 s; 0.76 ms per call (7 seeds) |
+| compiled slice Jacobian in a solve | 24-46 ms (chain of substeps) |
+| nominal, condensed | 16 it, 0.6 s, fuel 1.0000 x H, T 1.0010 x |
+| machine proxy (six 4 kN biprop axes) | 21 it, 0.8 s, 486.2 m/s (H 486.8); flight 182.0 kg vs 139.9 planned (1.30 x; tracker's Hohmann machine test reads 1.38 x) |
 
-Observed: `tests/test_llvm_training_runtime.py::test_graph_reverse_is_a_compiled_parametric_vjp`
-(AbstractTensor left*right VJP, ~8 s) FAILS at clean HEAD de609156
-(worktree C:\Users\alber\AppData\Local\Temp\wtc): `KeyError: 7` (grad 7 not
-in the execution buffers). So the whole graph-reverse compile route is red,
-AbstractTensor and sympy alike, unit seed and explicit seed alike.
 
-Bisect (git bisect run on that test, bc5b347a good .. de609156 bad, wtc):
-first bad commit **534a4941 "Fix concordant numeric solve compilation"**
-(2026-09-22; fortran_c_shell, glsl_deployment_strategy +617, identity_concordance,
-precompile_to_ssa, ssa_call_input_adapters, tensor_ssa_lowering, ...).
-e39ff7cf (its parent side) passes. 87b37d5d skipped (RecursionError).
-Not contained (2169-line commit; the same symptom is another agent's active
-lane), so not fixed here. The grads fall to the structural-recovery fallback
-`fortran_c_shell.py:21121-21132` (`basic-index-contract`) because the planned
-region does not publish them; which hunk of 534a4941 drops them: UNKNOWN.
+Live re-plan from the plan's remainder (300 m/s kick): 1.2-2.0 s at kicks 302/600/1500 s, dv 409.5/453.2/536.2 vs Hohmann-from-present 690/813/918; a cold start costs the same dv in ~2 s.
+Kick flight (kick at 600 s): one re-plan, 451.3 m/s, final |r - r_ref| 4.4 m.
 
-## 2026-10-03 File/hunk narrowing of 534a4941 (wtc worktree, overlays on e39ff7cf)
+## Cost-weight sensitivity (condensed solver; ratios to Hohmann)
 
-One file at a time from 534a4941 onto e39ff7cf, same test: only
-`src/compiler/glsl_deployment_strategy.py` turns it red (`KeyError: 7`); the
-other 8 files each pass alone. Hunks (git diff -U0, 27 hunks): hunks 0-9
-applied = pass; 0-14 = KeyError 7; 0-12 = NameError publish_return_members
-(hunk 3 adds a 162-line block that hunks 10-14 move out of
-`_propagate_callsite_tensor_specializations`); 0-13 HUNG (>600 s, killed).
-So the drop lives in the `_propagate_callsite_tensor_specializations` /
-`publish_return_members` rework (534a4941 lines ~15990-16450). Stopped
-narrowing there; wtc restored to de609156 clean.
+Defaults: alpha = T_Hohmann/budget; beta = alpha*I_H/T_H^2 (dJ/dT = 0 at the Hohmann warm start); kappa 1e-3; budget 2e6 N s.
 
-## 2026-10-03 Observed at HEAD on the tiny VJP (scratch trace_members.py, hook only)
+| weights | nominal fuel | nominal T | kick dv (m/s) |
+|---|---|---|---|
+| default | 1.0000 | 1.0010 | 411.1 |
+| alpha x10 | 1.020 | 1.919 | 385.0 |
+| beta x10 | 1.831 | 0.662 | 622.2 |
+| kappa 1e-5..1e-1, budget 1.2/1.05 x H | 1.0000 | 1.001 | 411 |
 
-`compile_native_graph_reverse(left*right)`: motion grads {0: 7, 1: 8}, seed
-{2: 3}; final `buffer_order (0, 1, 2)` -- grads 7, 8 AND seed 3 all absent.
-Hook on `glsl_deployment_strategy._publish_callsite_return_members`
-(HEAD :17427): backward rule `Call 6` (kind tuple, 2 descriptors) is
-published as an aggregate on the first fixed-point round, incumbent () ->
-leaves (7, 8): the existing `Indexed(6, const)` grad nodes are REUSED
-(`resident_direct_projection`), gaining `authored_call_result_projection`;
-no new nodes. Rounds 2-3: unchanged. Before 534a4941 this publication was
-gated by `_tensor_descriptor(caller, node) is None` (hunk @@ -16229), so the
-backward Call kept its own descriptor and was never turned into an aggregate
-producer. Inferred, NOT traced: the aggregate-producer view of a backward
-rule Call is what keeps its Indexed members (the grads) out of the planned
-region's outputs, so lowering's structural fallback refuses them
-(`basic-index-contract`: the members carry no `basic_index_axes`). The link
-between the publication and the region's output list is the missing link.
-Stopped here: not contained; same symptom is the KeyError-806 lane's.
+Only the alpha:beta ratio matters; it sets the trip length. kappa and the
+budget do nothing until the tank nears empty (barrier is a safety rail).
+Defaults stay: scale-free (J ~ 0.5-1 for any craft), Hohmann is a stationary
+point in time so the planner deviates only for real gains, and they sit at the
+knee (x3 either way buys < 6 % fuel or < 7 % time for 35-75 % of the other).
+Re-plans recompute weights from the present (budget = propellant left); freezing them saves <0.2 % fuel and lengthens trips 12-35 %.
 
-## 2026-10-03 FIX (contained): reference-copy collision in the training-motion lowering
+## Root causes found
 
-Observed: every graph-reverse motion whose backward uses `pow` (sympy
-`sqrt(x**2+y**2)`, `x/y`) died in `lower_training_motion_to_repository_ssa`
-at `tensor_ssa_lowering.py:5745` "repository SSA function collision for
-'binary_value'". Cause (read + confirmed by the fix): `_class_surface_ssa_program`
-deep-copies its `tensor_ssa_reference` (fortran_c_shell.py, c9607d25) and links
-the COPY's Function objects; `process_graph_autograd.py` then lowered the
-remaining tensor calls from the cached ORIGINAL (`c_backend_repository_ssa_reference`
-is lru_cached) -> two `binary_value` objects, one name.
-Fix: fortran_c_shell records the copy as `module_metadata["tensor_ssa_reference"]`;
-`lower_training_motion_to_repository_ssa` links from `module.metadata
-["tensor_ssa_reference"]` (raises if absent). x*y - c still compiles with
-correct values (13, d/dx 5, d/dy 3, d/dc -1).
-Regression check: tests/test_process_graph_autograd.py 4 failed / 20 passed
-both at clean HEAD (wtc) and with the fix, same 4 tests.
-tests/test_symbolic_fluid_native_runtime.py fails identically at clean HEAD
-(ConcordanceRefusal planner_specialization 'advance'), not this fix.
+- Why SLSQP on the full transcription stalled (not scaling: Jacobian cond 79):
+  (1) ~35 exactly flat directions (how a coast arc is split among slices only
+  changes discretization) plus the bilinear throttle x duration valley in every
+  slice; (2) the compiled reverse of the throttle clamp Min(Max(u,lo),hi) reads
+  a tie as the average of both sides, so on the box edge (u=0 coasts, u=1 full
+  burns, where SLSQP iterates live) every throttle column is HALF its inside
+  value (-10043 vs -20086). `_Transcription.inside` handles (2) but alone did
+  not fix SLSQP. Condensing over a burn structure removes both. Ruled out: trust-constr+SR1, tied coast durations.
+- Compiler walls from the first lane, all fixed: W1 grads absent from
+  buffer_order (42a689a2 plan_callsites; bisected to 534a4941, glsl_deployment_
+  strategy `_propagate_callsite_tensor_specializations`/`publish_return_members`
+  rework); W2 pow backward lacked LLVM emission (eps marker, per-callsite
+  folds); W3 second compile in one process refused (`reverse_compile_book`);
+  W2/W3 landed in turing 095a3c0c..51b4cebe. Also fixed here: `binary_value`
+  reference-copy collision (fortran_c_shell records
+  `module_metadata["tensor_ssa_reference"]`, `lower_training_motion_to_
+  repository_ssa` links from it; committed).
+- MachineCraft.propellant_kg fixed (no piece reads propellant_mass; dt keeps only read columns). Same class, NOT fixed: `MachineCraft.propellant_supply`.
 
-## 2026-10-03 Next walls (not contained; recorded, not fixed)
+## Open items
 
-W2. With the collision fixed, a pow backward reaches LLVM emission and stops:
-`training_motion__bw_pow__specialized_*: Call: operation has no repository
-LLVM emission` and `training_motion__unbroadcast__specialized_*: Call: ...`.
-The unemitted Calls (scratch powcall.py, x/y): in unbroadcast, a Call with
-`tensor_operation='extent'` and no callee; in bw_pow, `Call __plan_callsite_3__`
-with no args. Repro (fresh process, ~15 s):
-`compile_reverse_rows("p", [x / y], [x, y])` in engine_toy/orbital_collocation.py.
-W3. Two compiles in one process share state: the second compile is refused
-(`call_link_order_concordance disagreement`, `call_result_projection_concordance
-disagreement`, `ConcordanceRefusal ... REVISE without a changed source`) when
-both post into the one detached book. `orbital_collocation.compile_reverse_rows`
-now opens one book per row (`begin_identity_book`/`end_identity_book`), which
-fixes x*y-c followed by x*x*y+c ... except the second (pow) compile then stops
-at `precompile_to_ssa.py:4671` "region 6 reads carried initial 56 through an
-operand no lexical_read_binding row attributes" (precompile_to_ssa.py is dirty
-from another lane; NOT baselined clean). Inferred: process-global state beyond
-the book (e.g. the lru_cached backward-rule closure graph) leaks across compiles.
-W1 (above) still stands for graphs that do lower: grads absent from buffer_order.
+- ROW CACHE: compiled rows persist in `%TEMP%\orbital_collocation_rows`, keyed
+  on the laws' srepr plus `perforated_network_llvm._compiler_fingerprint`
+  (laws only). They were built before several compiler fixes. Rebuild once on
+  current HEAD (about 15 min compile) and make the cache check
+  `PieceCompilerRecord` so a stale compile cannot be served.
+- Tracker threshold: the spinning craft triggers a re-plan at t=12 s (eps 0.0318
+  > 0.03 during the first burn; 0.5 s re-plan, same plan). Tracker behaviour,
+  not the planner's.
+- `ENGINE_TOY_PIECE_SERVE_STALE=1` was used for all runs (other lanes' uncommitted edits mark pieces stale; a rebuild while another process holds the DLL fails lld-link "Permission denied"). Re-confirm without it.
+- INVENTED defaults (not from a source): supply 1 in the slice law; substeps 16;
+  N=40; THRUST_THRESHOLD_M_S = 1; polish budget 1000 nfev (old path); the weight
+  rule for alpha/beta/kappa and budget 2e6 N s; `pointing_proxy` planning design
+  (six +/- world-axis thrusters at 1e4 N for the jumper kick case).
 
-## 2026-10-03 State of the deliverable
+## Traps
 
-engine_toy/orbital_collocation.py written: transcription, laws (jumper's own
-builders + eq_KE1_3 vis-viva arrival + decision-7 cost), Hohmann warm start,
-SLSQP over the compiled rows, CollocationPlan + reference(). Jacobian behind
-`compile_reverse_rows` (one unit-seed motion per row today).
-engine_toy/tests/test_orbital_collocation.py: 2 compile-free tests PASS
-(arrival rows vanish on the circle to 1e-14; warm start = Hohmann burns through
-the actuation matrix to 1e-6). Convergence test: ERROR at slice row 0, W2
-(230 s). Flight test additionally needs a tracker hook: `orbital_tracker`
-calls `orbital_plan.reference(plan, t)` (HohmannPlan legs only).
-
-## 2026-10-03 Coordination note
-
-At wrap-up HEAD is b3ad7e17 and other lanes have uncommitted edits in the same
-files: fortran_c_shell.py (a plan_callsite marker retirement fix for the
-bw_log graph-reverse motion -- the `__plan_callsite_N__` half of W2) and
-glsl_deployment_strategy.py (likely W1). My compiler edits are ONLY:
-fortran_c_shell.py `module_metadata["tensor_ssa_reference"] = ...` (+comment,
-after `module_metadata["identity_book"] = ...`) and the `reference = ...`
-block in process_graph_autograd.lower_training_motion_to_repository_ssa.
-Worktree wtc (mine) removed. wtb was moved to e39ff7cf by someone else.
-Not committed.
-
-## 2026-10-03 (later) Walls down; rewrite for the new craft
-
-Coordinator: W1 (42a689a2 plan_callsites), W2 (eps marker, per-callsite
-folds), W3 (`reverse_compile_book`) fixed in turing 095a3c0c..51b4cebe; my
-binary_value fix committed. engine_toy changed under me: variable mass
-(N7.2), attitude in the actuation law, propellant supply, leapfrog kicks;
-tracker reads `plan.reference(t)` / `plan.impulses()` (348cb5d).
-
-orbital_collocation.py rewritten:
-- state per node: momentum(3), position(3), propellant mass(1); slice law =
-  the jumper's laws (N4.1, TS1.2/1.4 flow, N7.2, N1.1) stepped kick-drift-kick
-  with supply 1 (INVENTED: the slice-level form of the jumper's leapfrog).
-- planning design at a declared attitude (default identity).
-- cost prices thrusters as `orbital_tracker.fuel_price`'s rule (kg/(N s)
-  when the design burns propellant, else impulse).
-- `compile_reverse_rows` = ONE explicit-seed fused motion per row set inside
-  `reverse_compile_book`; one native run per seed.
-- CollocationPlan: reference(t), impulses() (each thrusting slice at its
-  midpoint), mu, ideal_delta_v, r2; collocation_replanner(problem, craft=).
-First slice compile (7 rows x 23 wrt, KDK): still compiling after 600 s
-CPU, 1.1 GB (tool moved it to the background; waiting for it).
-
-## 2026-10-03 Measurements so far (explicit-seed fused motion)
-
-- arrival rows (5 rows x 7 wrt): compile 96 s; values+5 seeds 0.19 ms per
-  call; vs sympy jacobian max rel 1.8e-16; repeated runs bit-identical.
-- slice rows, 2 thrusters: compile 476 s. Six-axis (6 thrusters, 7 rows x
-  27 wrt): compile 874 s; values+7 seeds 0.76 ms per call (scalar arena
-  reuse: prepare_artifact_execution once, indexed write/read; the first
-  version re-prepared per run: 241 ms per call).
-- sympy reference check of the 6-thruster slice: sympy evalf of the
-  unexpanded KDK tree did not finish in 15 min (faulthandler dump: all in
-  sympy evalf, not the compiler); killed. Verification moves to the
-  converged plan's own defects + the flight.
-- cost split: per-slice fuel motion (1 row, n_u+1 wrt) + trip-total motion
-  (J on I, T); dJ/dI, dJ/dT broadcast to slices on the host (the adjoint of
-  a sum). A single N-slice cost graph would compile in O(N) time.
-- compiled rows now persist across processes in %TEMP%/orbital_collocation_rows,
-  keyed by the laws' srepr and perforated_network_llvm._compiler_fingerprint
-  (the precedent for caching a compiled reverse).
-- first full test run: slice (6 thrusters) compiled 871.6 s and was cached;
-  at exactly 15:00 the faulthandler watchdog dump fired while the arrival
-  compile ran and the process died with "Windows fatal exception: access
-  violation" inside the dump (frames: identity_concordance.py:3867
-  _post_or_unsourced <- :3854 record_shape_transformation <-
-  glsl_deployment_strategy). Inferred, not proven: the crash is the
-  watchdog's frame walk racing the main thread (faulthandler's dump of a
-  running thread is documented as unsafe), not the compiler. Rerun with
-  the slice cached.
-
-## 2026-10-03 First convergence, then accuracy fix (substeps)
-
-N=40, one KDK step per slice: SLSQP 139 it, 992 Jacobians (7 ms each),
-solve 34 s, defect 2.3e-9, fuel 0.9983 x Hohmann, time 0.9981 x; ended
-"Positive directional derivative for linesearch". Flown by the tracker
-(six-axis): arrived (|r|-r2 27.7 m, |v|-vc 0.068 m/s, |r-r_ref| 6.4 m) but
-fuel 1.549 x plan. Cause (measured): the plan's per-slice discretization
-error is 994 m (one 85 s step vs 64 sub-steps of the same compiled law);
-the tracker trims onto that error. The "0.998 x Hohmann" was the coarse
-law's own error, not a better trip.
-Fix: a slice is `substeps` (16) steps of the compiled law; the slice
-Jacobian is the chain of each step's compiled Jacobian (forward accumulation
-of compiled derivatives; no new compile). Now: per-slice error 3.6 m vs 256
-sub-steps; SLSQP "Optimization terminated successfully" in 3 iterations, 7
-Jacobians, 0.9 s; defect 2.1e-12; fuel 1.0000 x Hohmann, time 1.0016 x;
-2 burns (247.45 and 239.37 m/s).
-
-## 2026-10-03 Nominal green; kick re-plan in progress
-
-Full test file run: nominal plan "Optimization terminated successfully",
-10 iterations, 22 Jacobians in 0.9 s (40 ms each), solve 2.8 s, defect
-2.2e-12, fuel 1.0000 x Hohmann, time 1.0016 x Hohmann, 2 burns. Flown by
-orbital_tracker.fly (six-axis jumper, round 10 s): |r - r_ref| 11.9 m,
-|v - v_ref| 0.014 m/s, |r| - r2 7.2 m, |v| - v_circ 0.0004 m/s; fuel
-5.7545e5 N s = 1.182 x the plan (the Hohmann tracker test's bound is 1.2 x
-ideal).
-Kick (step-5 scenario, main+RCS spinning craft, 300 m/s radial at
-t_burn1 + 302 s; planning design = pointing_proxy: six +/- world-axis
-thrusters at the main engine's 1e4 N / bipropellant): SLSQP stalls at the
-iteration limit on a flat optimum (collapsed end slices); dv the same
-411.9-412.5 m/s across 300/600/1500 iterations, ftol 1e-9..1e-12, dt floor
-0.05/10 s; trust-constr with a zero Hessian is worse (889 m/s, infeasible).
-Added: least-squares polish of the defects (same compiled Jacobian) when
-the optimizer stops infeasible. Re-plan dv 412.1 m/s vs Hohmann-from-present
-693.4 m/s (its burn 1 from the kicked velocity + burn 2). Flight: two
-re-plans (eps 0.0303 > 0.03 during the plan's final burn); ended |r - r_ref|
-7.8 m but |r| - r2 1661 m -- investigating the second plan.
-
-## 2026-10-03 Kick re-plan green
-
-Two tracker-protocol fixes, both in CollocationPlan (no tracker edit):
-1. Thrusting slices read impulsively: reference = coast from node k to the
-   slice midpoint, coast BACK from node k+1 after it; impulses() = that
-   step at the midpoint. A ramping reference through a long partial-throttle
-   slice was double counted by the tracker's arming rule (v_ref + dv - v);
-   measured: the plan's 243 m/s final burn never flew, eps 0.0346 crossed
-   the off band, a second re-plan followed and the craft ended 11 km off.
-   (Splitting each slice into 16 sub-step impulses was tried and is worse:
-   the tracker cannot fly 0.15 s burns on 10 s rounds -- 130 km off.)
-2. Slices under 1 m/s are coasts (THRUST_THRESHOLD_M_S): the polished
-   plan's 0.0-0.9 m/s residue slices each became a burn the craft slewed to.
-Result (kick test): one re-plan; SLSQP 300 it (limit) + 200 least-squares
-polish evaluations, 108 s, defect 9.5e-10; planned 412.1 m/s vs
-Hohmann-from-present 693.4 m/s (its burn 1 from the kicked velocity + burn
-2); trip 2392 s; burns 66.8 / 40.6 / 60.1 / 244.4 m/s; propellant after the
-kick 134.4 kg; arrival |r| - r2 11.0 m, |v| - v_circ -0.014 m/s,
-|r - r_ref| 5.7 m. Final burn flown 2943.5-2966 s centred on 2953.5 s.
-Memory note: one full-suite run died with numpy _ArrayMemoryError (1.2 MiB):
-commit charge had 3.2 GB free with other lanes' compiles running.
-
-## 2026-10-03 Cost-weight sensitivity (LEO 7000 -> 8000 km, six-axis, N=40)
-
-Defaults: alpha = T_Hohmann / budget (1.62e-3), beta balanced at the warm
-start (7.51e-5), kappa 1e-3, budget 2e6 N s. Ratios to Hohmann:
-| weights | SLSQP | fuel | time | burn slices | defect |
-| default | ok, 10 it | 1.0000 | 1.0016 | 2 | 2.2e-12 |
-| alpha x0.1 | limit 300 | 1.8131 | 0.6671 | 3 | 1.6e-7 |
-| alpha x10 | limit 300 | 1.0333 | 1.3165 | 7 | 7.2e-11 |
-| beta x0.1 | limit 300 | 1.0101 | 1.1322 | 8 | 3.4e-13 |
-| beta x10 | limit 300 | 1.7307 | 0.6907 | 5 | 8.1e-7 |
-| kappa 1e-5 | stop 15 it | 1.0000 | 1.0016 | 2 | 1.6e-12 |
-| kappa 1e-1 | ok, 20 it | 1.0000 | 1.0016 | 2 | 2.9e-13 |
-| budget 1.2 x H fuel | ok, 10 it | 1.0000 | 1.0016 | 2 | 3.6e-12 |
-The alpha:beta ratio sets the trip: x10 either way trades ~70 % more fuel
-for a 1/3 shorter trip, or ~1-3 % more fuel for a 13-32 % longer one
-(alpha I/T rewards stretching the trip; Hohmann is the fuel floor). kappa
-and the budget do nothing while the tank is far from empty. Off-default
-runs stop at the iteration limit: their numbers are feasible (defects
-<= 8e-7 before polish), not certified optimal.
-
-## 2026-10-03 State at hand-off: all 6 tests green
-
-engine_toy/tests/test_orbital_collocation.py (6 tests). Last runs, with
-ENGINE_TOY_PIECE_SERVE_STALE=1 (another lane's uncommitted catalogue edit
-marks the Hohmann piece stale; rebuilding it while another process held the
-DLL failed with lld-link "Permission denied"): full file 5 passed + kick
-failing only on defect 1.1e-8 > 1e-8 (polish budget 200); polish budget
-raised to 1000 nfev; kick rerun 1 passed.
-- nominal: 10 SLSQP it, 22 Jacobians (24-46 ms each), solve 2.4-3.0 s;
-  fuel 1.0000 x Hohmann, time 1.0016 x; flown arrival 7.2 m, 0.0004 m/s;
-  fuel 1.182 x plan.
-- kick: re-plan 411.4 m/s (Hohmann-from-present 693.4 m/s), trip 2374 s,
-  300 it + 1000 polish nfev = 204.5 s, defect 1.6e-12; one re-plan;
-  arrival |r| - r2 8.8 m, |v| - v_circ 0.0000, |r - r_ref| 8.0 m;
-  propellant after the kick 135.4 kg.
-- machine craft (pointing_proxy of its design: six 4 kN biprop axes):
-  plan 300 it (limit), defect 4.7e-12, 486.3 m/s (Hohmann 486.8);
-  planned 139.9 kg; flown: 2 burns, 182.2 kg all tanks (1.30 x plan;
-  the tracker's own Hohmann machine test reads biprop 1.38 x ideal);
-  arrival 16.5 m, -0.047 m/s; 0 re-plans.
-Hooks needed (not my files): MachineCraft.propellant_kg raises (inherits
-the jumper property reading a propellant_mass column the machine lacks);
-the replanner therefore reads propellant as craft.mass_kg - design dry mass.
-
-## 2026-10-03 (later) Stall diagnosis, condensed solve, live re-plan, hook
-
-Run with ENGINE_TOY_PIECE_SERVE_STALE=1 throughout (other lanes' compiler
-edits mark the jumper/plan pieces stale; two forgotten-flag runs rebuilt
-the small orbital_plan_* pieces, no failure). No faulthandler crash this
-session (dumps armed at 900 s, none fired). No new compile of collocation
-rows: everything below reuses %TEMP%\orbital_collocation_rows.
-
-Stall diagnosis (kick re-plan state captured from the step-5 flight at
-t=602 s, then planner-only):
-- NOT scaling: constraint Jacobian cond 79 (sv 3.9 / 0.05), gradients
-  O(0.1-1) per block.
-- Cost per SLSQP iteration: ~0.25 s, of which 0.07 s is the compiled
-  Jacobian (24 ms) x 3.2 line-search evaluations and ~0.18 s is SLSQP's
-  dense LSQ on 560 x 285. 300 it = 73-82 s.
-- The real cause is the problem's shape: (1) ~35 exactly flat directions
-  (the split of each coast arc among its slices changes only
-  discretization) plus the bilinear throttle x duration valley of every
-  slice; (2) the compiled reverse of the laws' throttle clamp
-  Min(Max(u,lo),hi) reads a tie as the average of both sides: on the box
-  edge (u=0 coasts, u=1 full burns) every throttle column of the slice and
-  fuel Jacobians is HALF its inside value (-10043 vs -20086). SLSQP iterates
-  sit on those edges. Fixing (2) alone (`_Transcription.inside`: derivative
-  read 1e-9 inside the box, values at u) did not save SLSQP: still 300 it,
-  defects swinging to 0.3; restarted from its own polished optimum it
-  creeps 0.94910 -> 0.94841 over 300 more iterations.
-- Also tried and rejected: trust-constr + SR1 (barrier stuck at 0.1, 1000 it,
-  infeasible); a structured SQP (per-slice damped BFGS, 2x2 BFGS on (I, T),
-  sparse elastic QP by Mehrotra IP) -- reaches feasible 405-407 m/s plans but
-  creeps on the same flat directions (150 it, 15-25 s); tied coast
-  durations under SLSQP alone -- still 300 it.
-
-Method (orbital_collocation._Condensed / solve_structured): condense the
-transcription over a burn structure. Burn slices own a duration and
-per-thruster IMPULSE w = u dt (throttle box as linear rows); coast slices
-form arcs of equal slices sharing one duration; nodes follow by forward
-substitution of the block-bidiagonal defects (zero by construction);
-derivatives by forward accumulation of the compiled slice Jacobians. Then
-SLSQP on (n_u+1)*burns + arcs variables (15 for 2 burns) and 5 arrival
-rows. Structure grows by the switching function (primer vector: one adjoint
-sweep back through the same stored Jacobians), multipliers by min-norm
-least squares (SLSQP's own are arbitrary on the two in-plane-degenerate
-plane rows and produced a spurious switch). Two traps found: an upper/lower
-box row duplicating the w>=0 bound made SLSQP stop at iteration 1 on a
-promoted zero-impulse burn; the plan rows' arbitrary multipliers.
-
-Numbers, before (SLSQP full transcription) -> after (condensed):
-| case | before | after |
-| nominal LEO->8000 six-axis | 10 it, 2.5-3 s, 1.0000 x H | 16 it, 0.6 s, 1.0000 x H fuel, T 1.0010 x |
-| kick state @602 (Hohmann origin) | 300 it + 1000 polish, 204 s, 411.4 m/s | 68 it, 2.0-2.7 s, 411.1 m/s, 116.18 kg, 3 burns, defect 1e-12 |
-| machine proxy | 300 it + polish, 486.3 m/s | 21 it, 0.8 s, 486.2 m/s, defect 8e-12 |
-
-Live re-plan (from a collocation plan's REMAINDER, 300 m/s radial kick off
-the plan's own reference; remainder_warm_start keeps the remaining burns,
-merges coasts into arcs, adds a zero-impulse burn now):
-| kick at | solve | dv | Hohmann-from-present | cold (Hohmann) start |
-| 302 s | 1.66 s | 409.5 | 690.1 | 1.96 s, same cost |
-| 600 s | 1.97 s | 453.2 | 812.8 | 2.01 s, same cost |
-| 1500 s | 1.23 s | 536.2 | 918.3 | 1.69 s, same cost |
-Continuation with the remainder's durations fixed first (impulses only)
-never reached feasibility (defects 0.02-0.04: the old timing cannot absorb
-a 300 m/s kick) and added 0.5-1.4 s; it stays available as
-fixed_first=True, default off.
-Kick flight (test, now flying a collocation plan, kick at 600 s): re-plan
-1.9 s from the remainder, 451.3 m/s vs Hohmann-from-present 811.4, burns
-94/81/277 m/s flown, final |r - r_ref| 4.4 m. NOTE: the spinning craft
-also triggers a re-plan at t=12 s (eps 0.0318 > 0.03 during the first
-burn, 0.5 s re-plan, same plan) -- tracker threshold behaviour, not mine.
-Machine flight: 21 it plan, 0 re-plans, arrival 14.7 m, -0.031 m/s; fuel
-182.0 kg vs 139.9 planned (unchanged ratio, tracker's).
-
-Weights (condensed solver), ratios to Hohmann (nominal) / to the kick
-state's Hohmann (kick re-plan):
-| weights | nominal fuel | nominal T | nominal s | kick fuel | kick T | kick dv | kick s |
-| default | 1.0000 | 1.0010 | 0.63 | 0.4380 | 0.7310 | 411.1 | 2.0 |
-| alpha x0.1 | 1.8262 | 0.6627 | 0.52 | 0.6953 | 0.4796 | 619.8 | 0.7 |
-| alpha x0.3 | 1.1080 | 0.9375 | 0.93 | 0.5162 | 0.5691 | 435.2 | 0.7 |
-| alpha x3 | 1.0170 | 1.3523 | 3.89 | 0.4398 | 1.0570 | 412.9 | 3.2 |
-| alpha x10 | 1.0199 | 1.9189 | 6.52 | 0.4120 | 1.9380 | 385.0 | 6.3 |
-| beta x0.1 | 1.0263 | 1.7501 | 3.22 | 0.4139 | 1.8103 | 386.9 | 4.5 |
-| beta x0.3 | 1.0057 | 1.6634 | 4.93 | 0.4421 | 1.0873 | 415.3 | 3.3 |
-| beta x3 | 1.0534 | 0.9674 | 0.32 | 0.5046 | 0.5822 | 421.0 | 0.5 |
-| beta x10 | 1.8306 | 0.6616 | 0.35 | 0.6976 | 0.4788 | 622.2 | 0.5 |
-| kappa 1e-5 / 1e-1 | 1.0000 | 1.001 | 0.27 | 0.438 | 0.731 | 411.1/410.8 | 2.2/1.8 |
-| budget 1.2 / 1.05 x H | 1.0000 | 1.001 | 0.5-0.6 | 0.438 | 0.731 | 411.1 | 1.9 |
-Every row converges now (before: every off-default row hit the limit).
-Only alpha/beta matters; it is their RATIO that sets the trip. Proposed
-defaults: keep the present rule (alpha = T_Hohmann / budget; beta =
-alpha I_H / T_H^2, so dJ/dT = 0 on the Hohmann warm start). Rationale:
-it is scale-free (J ~ 0.5-1 for every craft), it makes Hohmann a
-stationary point in time so the planner deviates only for real fuel or
-time gains, and it sits at the knee: x3 either way buys < 6 % fuel or
-< 7 % time for 35-75 % of the other. Re-plans recompute the weights from
-the present (budget = propellant left): measured at kicks 602/900/1800 s,
-freezing the original trip's weights instead saves 0.0-0.18 kg (<0.2 %)
-and lengthens the trip 12-35 % and the solve 0.3-1.6 s, so per-re-plan
-weights stay. kappa and the budget do nothing until the tank nears empty
-(the barrier is the safety rail, not a weight to tune).
-
-Hook fixed: MachineCraft.propellant_kg (orbital_craft_machine.py) = sum of
-tank{t}_propellant columns (the mass-properties law's inputs). Cause: the
-machine momentum piece writes propellant_mass_next but no piece READS
-propellant_mass, and the dt system only keeps read columns
-(llvm_dt_system.column_names_of), so the inherited jumper property raised
-AttributeError (the tracker's _seam getattr silently read inf for it).
-Verified 696.0 kg = 240 + 396 + 60. collocation_replanner now reads
-craft.propellant_kg (workaround removed); the machine test asserts it
-equals the tank sum and tracks the tanks after flight. Same bug class,
-NOT fixed (not asked): MachineCraft.propellant_supply also reads a column
-(propellant_supply) no machine piece reads.
-
-Tests: engine_toy/tests/test_orbital_collocation.py, 9 passed (6 planner
-22 s; 3 flights 96 s + kick rerun 34 s). New: parametrized
-test_kick_replan_from_the_remainder_is_live (< 5 s, cost <= cold start,
-dv < Hohmann-from-present); nominal asserts solve < 5 s and fuel = Hohmann
-to 1e-3. plan_transfer(method="SLSQP") is kept as the measured reference.
-Not committed.
+- Do not trust a plan's low fuel until it is flown or run at 256 sub-steps: the
+  early "0.998 x Hohmann" was discretization error.
+- Do not re-split a slice into sub-step impulses for the tracker, and do not
+  hand it a ramped reference over a long partial-throttle slice.
+- Do not add a second box row duplicating the w>=0 bound: SLSQP stops at
+  iteration 1 on a promoted zero-impulse burn. Do not read SLSQP's multipliers
+  on the two in-plane-degenerate plane rows (arbitrary; spurious switch).
+- Compiles take 8-15 min and 1+ GB; never launch one without being asked.
