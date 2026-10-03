@@ -789,3 +789,123 @@ _propagate_callsite_tensor_specializations fixed point:
   where the () member descriptor is finally produced is NOT yet traced.
 Repro (stops itself): scratchpad kx806_rounds.py (200 s) / kx806_trap.py (60 s).
 Second-compile refusal: not started.
+
+## 2026-10-03 Coordinator: keep (i), fix the loop at its identity
+
+(i) committed as a checkpoint. Task: trace the () member descriptor from
+call_result_descriptor for the bw_mul copy; the return member must DERIVE
+from the callee's return value cell; make _publish_callsite_return_members
+post its write so a disagreement is a REVISE refusal, not a spin.
+call_result_descriptor for bw_mul copies: early rounds outputs None; later rounds the copy's nested unbroadcast Call 5/8 carries tensor {shape ()} and that is published. Trapping the writer of Call 5's tensor in the copy.
+Writer of the () on the bw_mul copy's Call 5 (trap): the round loop's
+single-result branch (~:18158, `data["tensor"] = replacement`) running with
+caller = the CATALOGUE bw_mul (it is in `graphs`, and receives merged
+planner descriptors via ~:18430 `_apply_callsite_tensor_descriptors(callee,
+additions)`), node 5 = its `unbroadcast(g*y, x.shape)` call. Each round's
+bw_mul propagation copy is extracted from that catalogue graph and inherits
+Call 5's {shape ()}. So the stale call-level () originates in
+call_result_descriptor(catalogue bw_mul, 5, unbroadcast). Tracing that next.
+Distinct unbroadcast propagation copies seen (kx806_ubin.py): besides the
+exact ones, a copy with G (2,3), target_shape descriptor (2,) and NO literal
+(specs {}) is made from catalogue bw_mul's Call 5 in some rounds; catalogue
+bw_mul's Call 5 then gets {shape ()} at ~:18158. Catalogue bw_mul's x.shape
+const is (2,3) when dumped. Checking what that non-literal copy returns.
+Trap on CATALOGUE bw_mul Call 5 (kx806_cat5.py): round 1 sets (2,3) (correct);
+~:18433 `_apply_callsite_tensor_descriptors(catalogue bw_mul, additions)`
+invalidates it (pop); the next ~:18158 write sets () although the catalogue
+state is then correct (g,x,y (2,3); Mul 3 (2,3); target const (2,3)). So
+call_result_descriptor(catalogue bw_mul, 5, unbroadcast) answers () from
+correct inputs. Checking the expanded unbroadcast copy's output answer.
+
+## 2026-10-03 ROOT of the () member: shared (function, value) row beats the copy's own node
+
+kx806_ub23.py: the expanded unbroadcast copy for bw_mul (target (2,3)) has
+its reshape node 1 with tensor {shape (2,3)} (written by
+_expand_specialized_unbroadcast_identity), but `_tensor_descriptor(copy, 1)`
+answers {shape ()} (proof None): the concorded shape-transformation row
+('unbroadcast', 1). Every expansion mints its reshape at id input_id+1 = 1, so
+the bw_add copies (target ()) and the bw_mul copies (target (2,3)) share one
+row keyed by the authored name; the earlier () wins. The gates that refuse the
+shared row (formal_conflict / localized_formal / specialized_operator /
+polymorphic_specialization) do not fire: reshape is not a listed operator, and
+G=() is never published as a formal shape (only non-empty shapes are), so no
+FORMAL_SHAPE_CONFLICT exists for unbroadcast's G.
+Chain: shared row () -> copy output () -> call_result_descriptor ()
+-> catalogue bw_mul Call 5 () (~:18158) -> bw_mul copies inherit () ->
+member publication () vs fold re-derivation (2,3) -> endless rounds.
+
+## 2026-10-03 Fix applied: rank-0 formal shapes are published
+
+glsl_deployment_strategy.py: the two formal-shape publications (fixed point
+~:18290, callsite copy ~:23952) gated on non-empty extents; they now gate on
+`descriptor_states_a_shape` (a () with a known dtype is a stated shape). Then
+unbroadcast's G () vs (2,3) records FORMAL_SHAPE_CONFLICT and copies stop
+reading the shared row (polymorphic_specialization). Testing with timeout.
+scalar-loss [True] now fails FAST (9.6 s) with the HEAD refusal (expand_reduction 'axis'); the fixed point terminates.
+Reverse test 1 passed (8.9 s); orbital 4p/7xf. Now the expand_reduction 'axis' refusal (single compile, fresh process).
+
+## 2026-10-03 The expand_reduction 'axis' refusal (single compile): observed
+
+kx806_axis.py: catalogue row planner_specialization
+(('lexical_reads:expand_reduction', 0), 'axis'):
+1. top-level strategize: Unresolved(SPECIALIZATION_DYNAMIC_ARGUMENT) from
+   cells (canonical_value(bw_sum, 0)) -- bw_sum's formal `axis` passed on.
+2. nested strategize (~:28920), after bw_sum's own `axis` formal got its
+   planner specialization (None): SpecializationFact(None, LITERAL) from the
+   SAME cell set -> "REVISE without a changed source".
+The cause of the change (bw_sum's planner_specialization row for `axis`) is
+not among the argument cells: `_argument_identity_cells` adds the
+PROVEN_LITERAL cell for a folded Constant but nothing for an Input the planner
+specialized, whereas `_fold_literal_source_cells` does add that Input's
+planner_specialization cell. Fix: `_argument_identity_cells` adds the
+planner_specialization cell of a planner-fed Input (same lookup).
+Observed (kx806_axis.py, AIC hook): in the second propagation bw_sum's
+`axis` node is already a folded `Constant None` (structural_specialization),
+and its argument cells are only canonical_value: replace() posts PROVEN_LITERAL
+only for int/float/bool/str/tuple, never None, so the fold left no cause cell.
+(The `_argument_identity_cells` Input-cell addition was not the observed path;
+REVERTED.) Fix: replace() posts PROVEN_LITERAL for `None` as well.
+PROVEN_LITERAL hook: no post for ('bw_sum', 0): replace()'s 'already recorded' test (literal_page.latest(row) != value) reads a missing row as None == None. Now also posts when the row has no cell.
+Fix: replace() also posts when `book.latest_ref(PROVEN_LITERAL, row)` is None.
+Result: native_scalar_loss_adjoint[True] gets past the refusal, compiles and
+runs; FAILS FAST (24 s) on the numeric check: gradients stay NaN (the test's
+poison fill), i.e. the gradient buffers are never written. New frontier.
+Linear motion test now passes the refusal too and fails fast (12 s) further on: 'concorded source/SSA shape disagreement for (training_motion__unbroadcast__specialized_bc87d5b45e7b, 0): ssa=(3, 2), concordance=(2, 2)'.
+Reverse test still passes but took 155 s (was 9-13 s). Investigating the slowdown.
+Re-timed: reverse test 1 passed in 13.6 s (the 155 s run was transient; the rounds wrapper shows 3 rounds, 11 s). Running the probe.
+Probe: RESULT jacobian max_rel 4.138e-16 (green). Orbital 4p/7xf (19 s). Next: _publish_callsite_return_members posting.
+
+## 2026-10-03 Second compile in one process: precise repro
+
+`pytest tests/test_native_scalar_loss_adjoint.py` (both params, one process,
+15 s): [True] fails on the numeric check (NaN grads, as alone); [False] then
+fails with ConcordanceRefusal planner_specialization
+(('lexical_reads:unbroadcast', 0), 'target_shape') "REVISE without a changed
+source". [False] ALONE fails only on the numeric check (12 s). So the refusal
+is state carried from the first compile.
+
+## 2026-10-03 STATUS (uncommitted, on top of 0519095d)
+
+This lane's hunks, all in glsl_deployment_strategy.py:
+- @@18291: fixed-point formal-shape publication gates on
+  descriptor_states_a_shape (rank-0 shapes published) -> FORMAL_SHAPE_CONFLICT
+  for unbroadcast G ()/(2,3); ends the non-terminating fixed point.
+- @@23952/@@23954: same gate in _callsite_specialized_shell_type.
+- @@21754/@@21768: replace() posts PROVEN_LITERAL for None, and treats a
+  missing row as "not recorded" (was read as None) -> ends the
+  expand_reduction 'axis' REVISE refusal.
+Checks: probe max_rel 4.138e-16; reverse test 1 passed (13.6 s); orbital
+4p/7xf; native_scalar_loss_adjoint[True] fails FAST (24 s) on NaN gradients
+(new frontier: gradient buffers never written); linear motion fails fast
+(12 s) on an unbroadcast copy shape disagreement ((3,2) vs (2,2)).
+Not done: _publish_callsite_return_members still writes its raw page with
+page.set (undeclared page "callsite_projection_specialization", no readers).
+Posting it DERIVED from the call cell would refuse legitimate per-round
+refinements (same cell, refined fact); a sound post needs the callee return
+value's cell, which the function is not given. Question raised.
+Second-compile refusal: the reverse-compile path never calls
+begin_identity_book, so every compile in a process shares one detached book,
+and the lru_cached BACKWARD_RULES graph keeps its scopes across compiles.
+Repro above (whole test file, 15 s). Where a reverse compile's book begins
+(and whether the cached rule graph re-posts into each book) is a design
+decision; raised.

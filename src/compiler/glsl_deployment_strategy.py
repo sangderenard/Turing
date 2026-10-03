@@ -18288,7 +18288,16 @@ def _propagate_callsite_tensor_specializations(
                         # in ``planner_tensor_descriptors`` made it local to
                         # one catalogue graph; a fresh specialization then
                         # reverted the same formal to an unknown scalar.
-                        if tuple(descriptor.get("shape") or ()):
+                        # A rank-0 descriptor with a known dtype is a
+                        # stated shape (``descriptor_states_a_shape``), not
+                        # "recovery stopped".  Publishing only non-empty
+                        # extents hid the disagreement between unbroadcast's
+                        # G = () (bw_add) and G = (2, 3) (bw_mul) callsites:
+                        # no FORMAL_SHAPE_CONFLICT, so every expansion copy
+                        # read the shared ('unbroadcast', 1) row and the
+                        # (2, 3) reshape answered (), which spun the
+                        # return-member fixed point forever.
+                        if descriptor_states_a_shape(descriptor):
                             formal_shape_changed = _publish_formal_shape(
                                 str(callee.G.graph.get("function_name")),
                                 str(parameter),
@@ -21751,7 +21760,12 @@ def _fold_callsite_structural_values(
         # DERIVED from the operand cells the fold evaluated (and the node's
         # own identity cell); a fold with no cell to name posts
         # ``Unsourced(RAW_PRIMITIVE)`` under the latch.
-        if isinstance(value, (int, float, bool, str, tuple)):
+        # ``None`` is a proven literal too (``axis=None``): without its row a
+        # folded ``bw_sum`` formal ``axis`` left no cause cell, and
+        # expand_reduction's ``axis`` row went Unresolved(dynamic) ->
+        # LITERAL(None) from the identical cell set ("REVISE without a
+        # changed source").
+        if value is None or isinstance(value, (int, float, bool, str, tuple)):
             from .concordance_declarations import (
                 PLANNER_STRUCTURAL_FOLD, PROVEN_LITERAL,
             )
@@ -21765,7 +21779,12 @@ def _fold_callsite_structural_values(
             )
             book = current_identity_book()
             literal_page = book.pages.get(PROVEN_LITERAL.name)
-            if literal_page is None or literal_page.latest(literal_row) != value:
+            # "No row yet" must not read as "row says None".
+            if (
+                literal_page is None
+                or book.latest_ref(PROVEN_LITERAL, literal_row) is None
+                or literal_page.latest(literal_row) != value
+            ):
                 if literal_sources:
                     round_cells.append(_post_if_changed(
                         PROVEN_LITERAL, literal_row, value,
@@ -23949,9 +23968,11 @@ def _callsite_specialized_shell_type(
                     specialization_cells[parameter],
                 )
         proven_descriptor = tensor_descriptors.get(parameter)
-        if proven_descriptor is not None and tuple(
-            proven_descriptor.get("shape") or ()
+        if proven_descriptor is not None and descriptor_states_a_shape(
+            proven_descriptor
         ):
+            # A stated rank-0 shape is a fact too; see the fixed-point
+            # publication in _propagate_callsite_tensor_specializations.
             _publish_formal_shape(
                 str(original.G.graph.get("function_name")),
                 parameter,
