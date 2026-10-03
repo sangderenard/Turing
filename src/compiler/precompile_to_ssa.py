@@ -31,6 +31,20 @@ from .identity_concordance import (
     proven_shape_contract_of,
 )
 from .concordance_declarations import (
+    PARAMETER_ABI_DECLARATION,
+    PARAMETER_ABI_KIND,
+    PARAMETER_ABI_UNDECLARED,
+    ParameterAbiKind,
+    STORAGE_FORMAL,
+    STORAGE_PRODUCED,
+    STORAGE_PRODUCER_UNROUTED,
+    STORAGE_ROOT,
+    STORAGE_ROOT_STAGE,
+    STORAGE_ROOT_UNKNOWN,
+    StorageRootFact,
+    StorageRootKind,
+)
+from .concordance_declarations import (
     ADDRESS,
     ARM_VERSION_MISSING,
     BINDING_WITHDRAWN,
@@ -1016,6 +1030,207 @@ def _function_root_cell(book: Any, scope: Any) -> Ref:
         provenance=Novel(CONTROL_FUNCTION_ROOT, ()),
         mode=Mode.CONCORD,
     )
+
+
+#: Instructions whose result is a view of argument 0's storage (an element,
+#: an address into it, a store version of it), not new storage.
+_STORAGE_VIEW_OPERATIONS = frozenset({
+    "Indexed", "IndexedStore", "GetElementPtr", "Load",
+})
+
+
+def _post_storage_roots(
+    book: Any, scope: Any, lexical_read_scope: Any, *,
+    formals: Mapping[int, Any], instructions: Iterable[Instr],
+    aliases: Mapping[int, int], wanted: Iterable[int],
+) -> dict[int, Ref]:
+    """Post the ``storage_root`` row of every value in ``wanted`` (and of the
+    values its row derives from) and return the cells by value id.
+
+    ``formals``: value id -> the formal's binding cell (or None).  A formal
+    is a FORMAL root, an instruction result a PRODUCED root, unless the
+    instruction is a view (``_STORAGE_VIEW_OPERATIONS``, or a result that
+    declares ``ssa_storage_view``) or the value is a planning alias: those
+    are VIEW rows DERIVED from the root cell of the storage they view.
+    A value with neither is ``Unresolved(STORAGE_ROOT_UNKNOWN)``.
+    """
+
+    producers: dict[int, Instr] = {}
+    for instruction in instructions:
+        if instruction.res is not None:
+            producers.setdefault(int(instruction.res.id), instruction)
+    read_scope = (
+        None if lexical_read_scope is None else tuple(lexical_read_scope)
+    )
+
+    def canonical_cell(value_id: int) -> Ref | None:
+        if read_scope is None:
+            return None
+        return book.latest_ref(CANONICAL_VALUE, (read_scope, int(value_id)))
+
+    cells: dict[int, Ref] = {}
+    resolving: set[int] = set()
+
+    def root(value_id: int) -> Ref:
+        value_id = int(value_id)
+        if value_id in cells:
+            return cells[value_id]
+        row = (scope, value_id)
+        if value_id in resolving:
+            # A store version feeding its own base through a carried edge:
+            # the cycle names no producer.
+            cells[value_id] = book.post(
+                STORAGE_ROOT, row, Unresolved(STORAGE_ROOT_UNKNOWN),
+                stage=STORAGE_ROOT_STAGE,
+                provenance=Unsourced(STORAGE_ROOT_UNKNOWN), mode=Mode.CONCORD,
+            )
+            return cells[value_id]
+        resolving.add(value_id)
+        try:
+            if value_id in formals:
+                source = formals[value_id] or canonical_cell(value_id)
+                cell = book.post(
+                    STORAGE_ROOT, row,
+                    StorageRootFact(StorageRootKind.FORMAL),
+                    stage=STORAGE_ROOT_STAGE,
+                    provenance=(
+                        Novel(STORAGE_FORMAL, (source,)) if source is not None
+                        else Unsourced(STORAGE_PRODUCER_UNROUTED)
+                    ),
+                    mode=Mode.CONCORD,
+                )
+            elif value_id in aliases and int(aliases[value_id]) != value_id:
+                cell = book.post(
+                    STORAGE_ROOT, row, StorageRootFact(StorageRootKind.VIEW),
+                    stage=STORAGE_ROOT_STAGE,
+                    provenance=Derived((root(int(aliases[value_id])),)),
+                    mode=Mode.CONCORD,
+                )
+            elif value_id in producers:
+                instruction = producers[value_id]
+                viewed = (
+                    instruction.args
+                    and (
+                        str(instruction.op) in _STORAGE_VIEW_OPERATIONS
+                        or isinstance(
+                            (instruction.res.accounting or {}).get(
+                                "ssa_storage_view"
+                            ),
+                            Mapping,
+                        )
+                    )
+                )
+                if viewed:
+                    cell = book.post(
+                        STORAGE_ROOT, row,
+                        StorageRootFact(StorageRootKind.VIEW),
+                        stage=STORAGE_ROOT_STAGE,
+                        provenance=Derived((root(int(instruction.args[0].id)),)),
+                        mode=Mode.CONCORD,
+                    )
+                else:
+                    source = canonical_cell(value_id)
+                    cell = book.post(
+                        STORAGE_ROOT, row,
+                        StorageRootFact(StorageRootKind.PRODUCED),
+                        stage=STORAGE_ROOT_STAGE,
+                        provenance=(
+                            Novel(STORAGE_PRODUCED, (source,))
+                            if source is not None
+                            else Unsourced(STORAGE_PRODUCER_UNROUTED)
+                        ),
+                        mode=Mode.CONCORD,
+                    )
+            else:
+                cell = book.post(
+                    STORAGE_ROOT, row, Unresolved(STORAGE_ROOT_UNKNOWN),
+                    stage=STORAGE_ROOT_STAGE,
+                    provenance=Unsourced(STORAGE_ROOT_UNKNOWN),
+                    mode=Mode.CONCORD,
+                )
+        finally:
+            resolving.discard(value_id)
+        cells[value_id] = cell
+        return cell
+
+    for value_id in wanted:
+        root(int(value_id))
+    return cells
+
+
+def _storage_formal_root(book: Any, cell: Ref) -> Ref | None:
+    """Walk ``cell``'s DERIVED edges on ``storage_root`` to its root; the
+    root's cell when it is a FORMAL's storage, else ``None``."""
+
+    page = book.page(STORAGE_ROOT)
+    seen: set = set()
+    frontier = [cell]
+    while frontier:
+        ref = frontier.pop()
+        if ref.key in seen:
+            continue
+        seen.add(ref.key)
+        fact = page.latest(ref.row)
+        if isinstance(fact, StorageRootFact):
+            if fact.kind is StorageRootKind.FORMAL:
+                return ref
+            if fact.kind is StorageRootKind.PRODUCED:
+                continue
+        frontier.extend(
+            source for source, _stage in book.edges_into(ref)
+            if source.page.name == STORAGE_ROOT.name
+        )
+    return None
+
+
+def post_parameter_abi_kinds(
+    book: Any, lexical_read_scope: Any, parameters: Iterable[str], *,
+    value_abi: Mapping[str, Any], record_abi: Mapping[str, Any],
+) -> dict[str, Ref]:
+    """Post each parameter's ``parameter_abi_kind`` row at the signature
+    and return the cells by name.
+
+    The declaration is the extraction contract's (``value_abi``: a
+    ProgramABI value binding; ``record_abi``: a record binding, the
+    receiver included).  A declared kind is NOVEL(PARAMETER_ABI_DECLARATION,
+    (version-0 ``name_binding`` cell,)); a parameter nothing declares, or a
+    storage spelling outside ``ParameterAbiKind``, is
+    ``Unresolved(PARAMETER_ABI_UNDECLARED)`` derived from that cell.
+    """
+
+    cells: dict[str, Ref] = {}
+    if lexical_read_scope is None:
+        return cells
+    read_scope = tuple(lexical_read_scope)
+    for name in dict.fromkeys(map(str, parameters)):
+        binding = book.latest_ref(NAME_BINDING, (lexical_read_scope, name, 0))
+        if name in record_abi:
+            spelling = "record"
+        else:
+            spelling = str(dict(value_abi.get(name) or {}).get("storage") or "")
+        try:
+            kind = ParameterAbiKind(spelling)
+        except ValueError:
+            kind = None
+        row = (read_scope, name)
+        if kind is not None and binding is not None:
+            fact, provenance = kind, Novel(PARAMETER_ABI_DECLARATION, (binding,))
+        elif binding is not None:
+            fact = Unresolved(PARAMETER_ABI_UNDECLARED, (binding,))
+            provenance = Derived((binding,))
+        else:
+            fact = kind if kind is not None else Unresolved(PARAMETER_ABI_UNDECLARED)
+            provenance = Unsourced(PARAMETER_ABI_UNDECLARED)
+        existing = book.latest_ref(PARAMETER_ABI_KIND, row)
+        if existing is not None and book.page(PARAMETER_ABI_KIND).latest(row) == fact:
+            cells[name] = existing
+            continue
+        cells[name] = book.post(
+            PARAMETER_ABI_KIND, row, fact, stage=STORAGE_ROOT_STAGE,
+            provenance=provenance,
+            mode=Mode.CONCORD if existing is None else Mode.REVISE,
+        )
+    return cells
 
 
 def _mint_ssa_id(
@@ -13887,6 +14102,8 @@ def lower_control_sections_to_ssa(
     tensor_ssa_reference: Any = None,
     resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
     progress: Callable[[str], None] | None = None,
+    parameter_value_abi: Mapping[str, Any] | None = None,
+    parameter_record_abi: Mapping[str, Any] | None = None,
 ) -> tuple[
     IRModule,
     tuple[SSALoweringShortfall, ...],
@@ -14285,11 +14502,72 @@ def lower_control_sections_to_ssa(
         )
         # The same heterogeneous contract is required when source pursuit has
         # specialized away the owning loop and left its payload as a direct
-        # method input.  Its uses, not its spelling, prove the two columns.
+        # method input.  Its uses name the candidates; the declared fact is
+        # STORAGE IDENTITY: a candidate is a payload only when its
+        # ``storage_root`` row reaches a formal's storage cell along DERIVED
+        # edges (a view, index or alias of input storage).  ``m = x * 1.0``
+        # is new storage (a PRODUCED root) and mints no row column; this
+        # used to be decided by "no known shape yet", which classified it a
+        # payload and left an unbound row formal (Woodshop ``_resolve_floor``:
+        # ``velocity = momentum / mass; if velocity[2] < 0.0: momentum[2]``).
+        from .identity_concordance import current_identity_book
+
+        storage_book = current_identity_book()
+        storage_scope = storage_book.mint_scope(
+            f"storage_root:{control_name}", STORAGE_ROOT_STAGE,
+        )
+        storage_formals: dict[int, Any] = {}
+        formal_names: dict[int, str] = {}
+        for parameter_name in function_parameters:
+            history = (identity_table or {}).get(str(parameter_name), ())
+            if not history:
+                continue
+            formal_names[int(history[0])] = str(parameter_name)
+            storage_formals[int(history[0])] = (
+                None if lexical_read_scope is None
+                else storage_book.latest_ref(
+                    NAME_BINDING,
+                    (lexical_read_scope, str(parameter_name), 0),
+                )
+            )
+        if self_value_id is not None:
+            storage_formals.setdefault(int(self_value_id), None)
+            formal_names.setdefault(int(self_value_id), "self")
+        # A formal-rooted candidate needs a row column only when its formal
+        # is declared as a record / row handle carrying the payload (or
+        # nothing declares it).  A declared span is its own binding: it is
+        # already a named formal.  The ``parameter_abi_kind`` row is the
+        # authority (``y = x * a; y[0] = x[1] + b`` with ``x`` a span).
+        abi_kinds = post_parameter_abi_kinds(
+            storage_book, lexical_read_scope, formal_names.values(),
+            value_abi=dict(parameter_value_abi or {}),
+            record_abi=dict(parameter_record_abi or {}),
+        )
+        abi_kind_page = storage_book.page(PARAMETER_ABI_KIND)
+
+        def carries_payload(root_cell: Ref | None) -> bool:
+            if root_cell is None:
+                return False
+            name = formal_names.get(int(root_cell.row[1]))
+            cell = None if name is None else abi_kinds.get(name)
+            kind = None if cell is None else abi_kind_page.latest(cell.row)
+            return not isinstance(kind, ParameterAbiKind) or (
+                kind is ParameterAbiKind.RECORD
+            )
+
+        payload_candidates = (
+            (indexed_base_ids & scalar_use_ids) - declared_sequence_ids
+        )
+        storage_roots = _post_storage_roots(
+            storage_book, storage_scope, lexical_read_scope,
+            formals=storage_formals, instructions=semantic_instructions,
+            aliases=planning_aliases, wanted=sorted(payload_candidates),
+        )
         variant_projected_target_ids.update(
-            (indexed_base_ids & scalar_use_ids)
-            - declared_sequence_ids
-            - statically_shaped_ids
+            value_id for value_id in payload_candidates
+            if carries_payload(
+                _storage_formal_root(storage_book, storage_roots[value_id])
+            )
         )
         for planned in hierarchy_plan.items:
             if not (
@@ -14321,11 +14599,23 @@ def lower_control_sections_to_ssa(
         )
         for selected_id in selected_nested_sequence_ids:
             region_value_meta[selected_id] = Meta((), "int")
+        # Mod and FloorDiv are integer only when integer evidence reaches
+        # them (an index result, or all-integer operands), like Add/Mul:
+        # Python ``%`` and ``//`` on floats are float.  As unconditional
+        # integer seeds they retyped the whole float cone of a float Mod to
+        # int64: orbital_game_phasing ``t36 = t32 % (2*pi)`` made the
+        # sign() Select feeding t32 an int64 region result, its 1.0 arm was
+        # cast to i64 and read back by where_double as 4.9e-324, and
+        # t_wait came out 0 instead of 4995.3 s (2026-10-03,
+        # docs/concordance_census/CONTINUATION_phasing_regression.md).
         integer_ops = {
-            "And", "Or", "Xor", "Shl", "Shr", "FloorDiv", "Mod",
-            "bitand", "bitor", "bitxor", "shl", "shr", "floordiv", "mod",
+            "And", "Or", "Xor", "Shl", "Shr",
+            "bitand", "bitor", "bitxor", "shl", "shr",
         }
-        arithmetic_ops = {"Add", "Sub", "Mul", "add", "sub", "mul"}
+        arithmetic_ops = {
+            "Add", "Sub", "Mul", "add", "sub", "mul",
+            "FloorDiv", "Mod", "floordiv", "mod",
+        }
         changed = True
         while changed:
             changed = False

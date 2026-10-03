@@ -442,6 +442,77 @@ def test_record_projection_alias_moves_return_receipt_with_its_slot():
     assert graph.graph['return_record_field_states'][span] == ((11, 'flag', 3),)
 
 
+#: The reduction scope the synthetic graphs' receipts are keyed by.
+READ_SCOPE = ('lexical_reads:test_ssa_record_return_state', 0)
+SPAN = (10, 0, 10, 10)
+OTHER_SPAN = (20, 0, 20, 10)
+
+
+@pytest.fixture(autouse=True)
+def compile_book():
+    """Every test runs in its own identity book, as a compile does."""
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+
+    book, token = begin_identity_book()
+    try:
+        yield book
+    finally:
+        end_identity_book(token)
+
+
+def post_return_site(function, graph, span, states):
+    """Post what the reducer and control builder post for one authored
+    return site: the site's ``source_span`` root, each returned field's
+    ``reducer_field_state`` (value = the graph value's ``canonical_value``
+    cell) and its ``return_site_field_state`` row, and each version value's
+    ``ssa_value`` row DERIVED from its canonical cell.  ``states`` is
+    ``{(receiver, field): version value}``.  Returns the site cell, which a
+    return edge names in ``return_site_cell``."""
+    import hashlib
+    from src.compiler.concordance_declarations import (
+        CANONICAL_VALUE, INGESTION, INGEST_SOURCE, REDUCER_FIELD_STATE,
+        RETURN_SITE_FIELD_STATE, SOURCE_SPAN, SSA_VALUE, FieldState,
+        FieldStateKind, SSAValueFact, SSAValueOrigin, SpanFact,
+    )
+    from src.compiler.identity_concordance import (
+        Derived, Mode, Novel, current_identity_book,
+    )
+    from src.compiler.ssa_record_return_state import function_scope_of
+
+    book = current_identity_book()
+    graph.graph['lexical_read_scope'] = READ_SCOPE
+    site = book.post(
+        SOURCE_SPAN, ('test_ssa_record_return_state', function.name, tuple(span)),
+        SpanFact('Return', *span, hashlib.sha256(repr(span).encode()).hexdigest()),
+        stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+    )
+    for (receiver, field), version in states.items():
+        value_row = (READ_SCOPE, int(version.id))
+        value_cell = book.latest_ref(CANONICAL_VALUE, value_row) or book.post(
+            CANONICAL_VALUE, value_row, (), stage=INGESTION,
+            provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+        )
+        field_state = book.post(
+            REDUCER_FIELD_STATE, (READ_SCOPE, int(receiver), str(field)),
+            FieldState(FieldStateKind.WRITTEN, value_cell, value_cell),
+            stage=INGESTION, provenance=Derived((value_cell, site)), mode=Mode.REVISE,
+        )
+        book.post(
+            RETURN_SITE_FIELD_STATE, (READ_SCOPE, site, int(receiver), str(field)),
+            field_state, stage=INGESTION, provenance=Derived((field_state, site)),
+            mode=Mode.CONCORD,
+        )
+        ssa_row = (function_scope_of(function), int(version.id))
+        if book.latest_ref(SSA_VALUE, ssa_row) is None:
+            book.post(
+                SSA_VALUE, ssa_row,
+                SSAValueFact(version.dtype, tuple(version.shape or ()),
+                             SSAValueOrigin.ADOPTED_GRAPH_ID),
+                stage=INGESTION, provenance=Derived((value_cell,)), mode=Mode.REVISE,
+            )
+    return site
+
+
 def fixture():
     initial, change, false, merged, returned = [SSAValue(i, 'bool') for i in range(5)]
     function = Function('root', [initial, change], {
@@ -460,30 +531,59 @@ def fixture():
             Instr('Ret', [initial, returned], None)]),
     })
     graph = nx.DiGraph()
-    graph.graph['return_record_field_states'] = {(10, 0, 10, 10): ((100, 'flag', merged.id),)}
-    graph.graph['return_slot_values'] = {(10, 0, 10, 10): (100,)}
+    graph.graph['return_record_field_states'] = {SPAN: ((100, 'flag', merged.id),)}
+    graph.graph['return_slot_values'] = {SPAN: (100,)}
+    # The return edge names its own site, as the control builder stamps it.
+    site = post_return_site(function, graph, SPAN, {(100, 'flag'): merged})
+    function.blocks['merge'].instrs[-1].attributes['return_site_cell'] = site
     return function, graph, initial, merged, returned
+
+
+def test_scalar_receipt_without_a_book_is_not_a_selection():
+    # The receipt view alone (no reduction scope, no rows) names version 3,
+    # but nothing on a book joins it to the site: the lookup keeps the
+    # incoming field rather than select by rule.
+    function, graph, initial, merged, _ = fixture()
+    del graph.graph['lexical_read_scope']
+    del function.blocks['merge'].instrs[-1].attributes['return_site_cell']
+    assert scalar_return_field_versions(function, graph)(100, 'flag', 'merge', initial) is initial
+
+
+def test_scalar_receipt_joined_on_the_book_publishes_its_version(compile_book):
+    from src.compiler.concordance_declarations import SSA_FIELD_VERSION
+    function, graph, initial, merged, _ = fixture()
+    assert scalar_return_field_versions(function, graph)(100, 'flag', 'merge', initial) is merged
+    versions = compile_book.pages[SSA_FIELD_VERSION.name]
+    assert [versions.latest(row) for row in versions.rows()] == [merged.id]
 
 
 def test_scalar_receipt_requires_exact_receiver_and_dominance():
     function, graph, initial, merged, _ = fixture()
     function.blocks['changed'].instrs[-1].attributes['return_source_value_ids'] = (100,)
+    function.blocks['changed'].instrs[-1].attributes['return_site_cell'] = (
+        function.blocks['merge'].instrs[-1].attributes['return_site_cell'])
     resolve = scalar_return_field_versions(function, graph)
     assert resolve(100, 'flag', 'merge', initial) is merged
     assert resolve(100, 'flag', 'changed', initial) is initial
     assert resolve(101, 'flag', 'merge', initial) is initial
     assert resolve(100, 'other', 'merge', initial) is initial
-    graph.graph['return_record_field_states'][(20, 0, 20, 10)] = ((100, 'flag', 2),)
-    graph.graph['return_slot_values'][(20, 0, 20, 10)] = (100,)
+    graph.graph['return_record_field_states'][OTHER_SPAN] = ((100, 'flag', 2),)
+    graph.graph['return_slot_values'][OTHER_SPAN] = (100,)
+    # An edge that names no site, with two sites returning the same slots
+    # and disagreeing on the version: no proof.
+    del function.blocks['merge'].instrs[-1].attributes['return_site_cell']
     assert scalar_return_field_versions(function, graph)(100, 'flag', 'merge', initial) is initial
 
 
 def test_return_edge_selects_its_own_site_among_distinct_return_slots():
     function, graph, initial, merged, _ = fixture()
-    graph.graph['return_slot_values'][(20, 0, 20, 10)] = (100, 200)
-    graph.graph['return_record_field_states'][(20, 0, 20, 10)] = ((100, 'flag', 2),)
+    graph.graph['return_slot_values'][OTHER_SPAN] = (100, 200)
+    graph.graph['return_record_field_states'][OTHER_SPAN] = ((100, 'flag', 2),)
+    false = function.blocks['entry'].instrs[0].res
+    other_site = post_return_site(function, graph, OTHER_SPAN, {(100, 'flag'): false})
     assert scalar_return_field_versions(function, graph)(100, 'flag', 'merge', initial) is merged
     function.blocks['merge'].instrs[-1].attributes['return_source_value_ids'] = (100, 200)
+    function.blocks['merge'].instrs[-1].attributes['return_site_cell'] = other_site
     # Terminal constants are exact edge state, just like conditional versions.
     assert scalar_return_field_versions(function, graph)(100, 'flag', 'merge', initial).id == 2
 
@@ -576,10 +676,12 @@ def test_loop_reexecution_kills_the_previous_field_version():
     function, graph, initial, merged, _ = fixture()
     function.blocks['entry'].instrs.insert(0, Instr('Call', [initial], None,
                                                   attributes={'callee': 'mutate_before_definition'}))
+    site = function.blocks['merge'].instrs[-1].attributes['return_site_cell']
     function.blocks['merge'].instrs[-1] = Instr('CondBr', [function.args[1]], None,
         attributes={'true_target': 'entry', 'false_target': 'return_edge'})
     function.blocks['return_edge'] = BasicBlock('return_edge', [Instr('Br', [], None,
-        attributes={'target': 'exit', 'return_source_value_ids': (100,)})])
+        attributes={'target': 'exit', 'return_source_value_ids': (100,),
+                    'return_site_cell': site})])
     function.blocks['exit'].instrs[0].attributes['incoming_blocks'] = ('return_edge',)
     assert scalar_return_field_versions(function, graph)(100, 'flag', 'return_edge', initial) is merged
 

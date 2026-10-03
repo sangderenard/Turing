@@ -369,7 +369,7 @@ DISPATCH_STORE = declare_transform("dispatch_store", 1)
 SPECIALIZATION_DYNAMIC_ARGUMENT = declare_reason("specialization_dynamic_argument")
 SPECIALIZATION_CALLSITES_DISAGREE = declare_reason("specialization_callsites_disagree")
 SPECIALIZATION_NOT_SOURCE_STATIC = declare_reason("specialization_not_source_static")
-#: A call declares the argument a tensor (``argument_roles`` gradient/operand):
+#: A call declares the argument a tensor (its ``callsite_argument_role`` row is GRADIENT/OPERAND):
 #: the literal belongs to that callsite's copy, never to the shared definition.
 SPECIALIZATION_TENSOR_ARGUMENT = declare_reason("specialization_tensor_argument")
 FORMAL_LITERAL_CONFLICT = declare_reason("formal_literal_conflict")
@@ -2023,6 +2023,376 @@ EXTERNAL_CALLSITE = declare_page("external_callsite", (
     RowField("program", K.SCOPE), RowField("output", K.NAME),
     RowField("call", K.LABEL),
 ), ExternalCallsiteFact)               # DERIVED(external cell, output cell); CONCORD
+
+# ----------------------------------------------------------------------------
+# Indexed-store sites (name-arm alias lane, 2026-10-03).
+#
+# Writer: the reducer's indexed assignment (``bind_target``, ``ast.Subscript``)
+# when the store cannot be the authored target's own node (``m[:2] -= t``:
+# the target Subscript is the read).  The store's identity is one
+# ``indexed_store_site`` row NOVEL(INDEXED_STORE_SITE, (target span cell,
+# effect cell)) with a minted id; the effect cell is the one node cell (or
+# ``cell_set`` row) of the nodes at the authored effect (the target read and
+# the stored value).  The store node's ``ingestion_value`` row is DERIVED
+# from the site cell.  Readers (branch membership, placement) reach the span
+# only through that edge; the span orders, the cell identifies.
+# ----------------------------------------------------------------------------
+
+#: An indexed store with no authored node of its own.  Operands: the
+#: ``source_span`` cell of the authored target, the effect cell.
+INDEXED_STORE_SITE_MINT = declare_transform("indexed_store_site", 2)
+
+
+@dataclass(frozen=True)
+class IndexedStoreSiteFact:
+    #: The ``source_span`` cell of the authored store target.
+    span: Ref
+
+
+INDEXED_STORE_SITE = declare_page("indexed_store_site", (
+    RowField("reduction_scope", K.SCOPE), RowField("site", K.VALUE_ID),
+), IndexedStoreSiteFact)               # NOVEL(INDEXED_STORE_SITE_MINT); CONCORD
+
+# ----------------------------------------------------------------------------
+# Storage roots (name-arm alias lane, 2026-10-03; coordinator decision).
+#
+# Writer: ``precompile_to_ssa.lower_control_sections_to_ssa``, before the
+# variant-payload classification.  One ``storage_root`` row per value the
+# classification reads, in the control function's scope:
+# - FORMAL: a parameter's (or the receiver's) own storage, a root
+#   NOVEL(STORAGE_FORMAL, (its version-0 ``name_binding`` cell or its
+#   ``canonical_value`` cell,));
+# - PRODUCED: new storage made by an instruction, a root
+#   NOVEL(STORAGE_PRODUCED, (the result's ``canonical_value`` cell,));
+# - VIEW: an index / element / store version / alias of another value's
+#   storage, DERIVED from that value's ``storage_root`` cell.
+# Reader: the classification.  A value is a "payload left as a direct method
+# input" iff its root, walked along DERIVED edges on this page, is FORMAL.
+# A value with no producer the writer can name is ``Unresolved``.
+# ----------------------------------------------------------------------------
+
+
+class StorageRootKind(Enum):
+    FORMAL = "formal"
+    PRODUCED = "produced"
+    VIEW = "view"
+
+
+@dataclass(frozen=True)
+class StorageRootFact:
+    kind: StorageRootKind
+
+
+STORAGE_ROOT_STAGE = declare_stage("storage_root")
+STORAGE_FORMAL = declare_transform("storage_formal", 1)
+STORAGE_PRODUCED = declare_transform("storage_produced", 1)
+#: The writer could name no producer cell for a value (no canonical row).
+STORAGE_PRODUCER_UNROUTED = declare_reason("storage_producer_unrouted")
+#: A value the classification reads that no instruction of this function
+#: produces and that is no parameter (a control-produced value).
+STORAGE_ROOT_UNKNOWN = declare_reason("storage_root_unknown")
+
+STORAGE_ROOT = declare_page("storage_root", (
+    RowField("function_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), StorageRootFact)                    # FORMAL/PRODUCED NOVEL, VIEW DERIVED; CONCORD
+
+
+class ParameterAbiKind(Enum):
+    """A parameter's declared ProgramABI storage kind.  Members spell the
+    contract's own ``storage`` vocabulary; a spelling outside it is posted
+    ``Unresolved``."""
+
+    SCALAR = "scalar"
+    SPAN = "span"
+    RECORD = "record"
+    KEYED = "keyed"
+    SEQUENCE = "sequence"
+    TABLE = "table"
+    REFERENCE = "reference"
+
+
+#: The extraction contract declares a parameter's ABI kind at the function
+#: signature.  Operand: the parameter's version-0 ``name_binding`` cell.
+PARAMETER_ABI_DECLARATION = declare_transform("parameter_abi_declaration", 1)
+#: No declaration (contract or record ABI) names this parameter.
+PARAMETER_ABI_UNDECLARED = declare_reason("parameter_abi_undeclared")
+
+#: Writer: ``precompile_to_ssa.post_parameter_abi_kinds`` at the control
+#: handoff; reader: the variant-payload rule (a FORMAL storage root makes a
+#: row column only when its formal is RECORD or undeclared).
+PARAMETER_ABI_KIND = declare_page("parameter_abi_kind", (
+    RowField("read_scope", K.SCOPE), RowField("parameter", K.NAME),
+), ParameterAbiKind)                   # NOVEL(PARAMETER_ABI_DECLARATION) | Unresolved; CONCORD
+
+#: An annotated parameter's class joined to the contract record that
+#: declares it (user decision (A), 2026-10-03): DERIVED(the
+#: ``parameter_annotation`` cell, the ``class_declaration`` cell the
+#: annotation names in its module, the ``source_record_class_concordance``
+#: cell derived from that class's span).  The fact is the contract record's
+#: identity; two names for one class are one identity through these edges.
+#: Writer and reader: ``fortran_c_shell`` (record ABI selection, the
+#: record-forwarding identity check).
+PARAMETER_RECORD_CLASS = declare_page("parameter_record_class", (
+    RowField("module", K.SCOPE), RowField("function", K.NAME),
+    RowField("parameter", K.NAME),
+), str)                                # DERIVED; CONCORD
+
+# ----------------------------------------------------------------------------
+# Graph-native differentiation edges (lane B, 2026-10-03).
+#
+# Writers (``process_graph_autograd``):
+# - ``abstract_tensor_program_to_process_graph`` mints the forward graph's
+#   ``ingestion_value_scope`` and posts one ``abstract_tensor_program_value``
+#   root per SSATensorProgram value it reads (NOVEL(INGEST_SOURCE): the
+#   recorded program IS the source construct); every node's
+#   ``ingestion_value`` row is DERIVED from the program value(s) it ingests.
+# - ``_AdjointBuilder.registry_rule`` posts one ``callsite_argument_role``
+#   row per argument of each backward-rule Call: GRADIENT DERIVED from the
+#   gradient argument's adjoint cell, OPERAND from the bound forward value's
+#   cell, METADATA from the forward operator's cell (an operator attribute)
+#   or the rule formal's cells (a signature default).
+#   ``fuse_forward_loss_backward`` re-posts each copied Call's rows in the
+#   motion scope DERIVED from the backward rows.
+# Reader: ``glsl_deployment_strategy._propagate_callsite_planner_
+# specializations`` (the catalogue fold) reads the row and cites its cell.
+# ----------------------------------------------------------------------------
+
+
+class ArgumentRole(Enum):
+    #: The upstream gradient ``g`` (argument 0 of every backward rule).
+    GRADIENT = "gradient"
+    #: A forward value the rule differentiates through (a tensor).
+    OPERAND = "operand"
+    #: An operator attribute or signature default (axis, keepdim, shape).
+    METADATA = "metadata"
+
+
+@dataclass(frozen=True)
+class ArgumentRoleFact:
+    role: ArgumentRole
+
+
+@dataclass(frozen=True)
+class AbstractTensorValueFact:
+    #: The recorded instruction (``Arg`` for a function argument).
+    op: str
+    #: The repository kernel a ``Call`` names ("" otherwise).
+    callee: str
+    shape: tuple
+    dtype: str
+
+
+CALLSITE_ARGUMENT_ROLE = declare_page("callsite_argument_role", (
+    RowField("ingestion_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+    RowField("argument", K.INDEX),
+), ArgumentRoleFact)                   # DERIVED(gradient / forward operand / operator or formal cells); CONCORD
+ABSTRACT_TENSOR_PROGRAM_VALUE = declare_page("abstract_tensor_program_value", (
+    RowField("ingestion_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), AbstractTensorValueFact)            # NOVEL(INGEST_SOURCE) root; CONCORD
+
+# The compiled BACKWARD_RULES graph is built from source the compiler writes
+# itself (``_build_backward_rule_process_graph``).  Its source constructs are
+# the registry declarations: each book posts one ``backward_rule_definition``
+# root per rule and per helper (NOVEL(INGEST_SOURCE), keyed by registry and
+# name, fact = digest of the declaration), and the generated text's
+# ``source_span`` rows are DERIVED from the definition they were generated
+# from (``build_from_ast(source_cells=...)``), never roots of their own.
+
+
+class BackwardRuleKind(Enum):
+    #: A ``BACKWARD_RULES`` entry (its ``python`` declaration).
+    RULE = "rule"
+    #: A helper whose Python source is compiled beside the rules.
+    HELPER = "helper"
+
+
+@dataclass(frozen=True)
+class BackwardRuleDefinitionFact:
+    kind: BackwardRuleKind
+    #: sha256 of the declaration (the registry's ``python`` entry for a
+    #: rule, ``inspect.getsource`` for a helper).
+    digest: str
+
+
+BACKWARD_RULE_DEFINITION = declare_page("backward_rule_definition", (
+    RowField("registry", K.SCOPE), RowField("name", K.NAME),
+), BackwardRuleDefinitionFact)         # NOVEL(INGEST_SOURCE) root; CONCORD
+
+# ----------------------------------------------------------------------------
+# Edges lane A (2026-10-03): three decisions made without an edge.
+#
+# 1. ``ir_indexing._propagate_scalar_dtypes``: whether a scalar integer keeps
+#    its width or widens to int64.  One ``scalar_integer_width`` row per
+#    (function scope, ssa id) the rule applied to: KEPT_DECLARED DERIVED from
+#    the Const's ``ssa_value`` cell (whose fact states the declared dtype);
+#    WIDENED NOVEL(INFERRED_INTEGER_WIDEN, (the value's ``ssa_value`` cell,)).
+# 2. ``fortran_c_shell`` ABI settlement (``note_shape``): every shape a
+#    planned-graph COPY states for one of its values is that copy's own
+#    ``copy_value_shape`` row (row keyed by the copy's ``lexical_read_scope``,
+#    else, for a graph-native reverse, its ``ingestion_value_scope``);
+#    two statements that disagree for one authored value are a
+#    ``value_shape_polymorphism`` row DERIVED from the disagreeing statement
+#    cells.  The completed-module seam reads that row, not a fact label.
+# 3. ``ssa_record_return_state.scalar_return_field_versions``: a version
+#    found without an ``ssa_field_version`` cell is published only when the
+#    book joins the SSA value's identity to the site state's value cell;
+#    otherwise the selection is ``Unresolved(VERSION_NOT_ON_BOOK)``.
+# ----------------------------------------------------------------------------
+
+SCALAR_DTYPE_SETTLEMENT = declare_stage("scalar_dtype_settlement")
+#: An integer whose width was inferred (a Cast target, a Load, integer
+#: arithmetic) widened to int64.  Operand: the value's ``ssa_value`` cell.
+INFERRED_INTEGER_WIDEN = declare_transform("inferred_integer_widen", 1)
+#: A Const declaring an integer width whose result has no ``ssa_value`` cell
+#: (a repository kernel's ``llvm_literal``): the width is kept, the row is
+#: Unsourced until the importer posts the Const's identity.
+CONST_DECLARED_WIDTH_NOT_ON_BOOK = declare_reason(
+    "const_declared_width_not_on_book"
+)
+#: A widened integer whose value has no ``ssa_value`` cell to transform.
+WIDENED_VALUE_NOT_ON_BOOK = declare_reason("widened_value_not_on_book")
+
+
+class IntegerWidthDecision(Enum):
+    KEPT_DECLARED = "kept_declared"
+    WIDENED = "widened"
+
+
+@dataclass(frozen=True)
+class IntegerWidthFact:
+    decision: IntegerWidthDecision
+    #: The width before the decision (the declared or inferred dtype).
+    source_dtype: str
+    #: The width the value carries after it.
+    dtype: str
+
+
+SCALAR_INTEGER_WIDTH = declare_page("scalar_integer_width", (
+    RowField("function_scope", K.SCOPE), RowField("ssa_id", K.VALUE_ID),
+), IntegerWidthFact)                   # DERIVED(Const ssa_value) | NOVEL(INFERRED_INTEGER_WIDEN); CONCORD
+
+LINKED_VALUE_ABI_SETTLEMENT = declare_stage("linked_value_abi_settlement")
+#: A copy's statement with no book cell to derive from (a ProgramABI contract
+#: of a value with no ``canonical_value`` cell in that copy, a propagation
+#: whose caller value has neither a statement nor a canonical cell).
+SHAPE_STATEMENT_SOURCE_NOT_ON_BOOK = declare_reason(
+    "shape_statement_source_not_on_book"
+)
+
+
+@dataclass(frozen=True)
+class CopyShapeFact:
+    #: What stated it (``contract``, ``from <caller> value <id>``, ...).
+    label: str
+    shape: tuple
+    dtype: str
+    storage: str
+
+
+@dataclass(frozen=True)
+class ShapePolymorphismFact:
+    #: The disagreeing shapes, one per statement cell the row derives from.
+    shapes: tuple
+
+
+COPY_VALUE_SHAPE = declare_page("copy_value_shape", (
+    RowField("copy_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), CopyShapeFact)                      # DERIVED(the value's canonical_value / ingestion_value cell, the caller's statement cell); REVISE
+VALUE_SHAPE_POLYMORPHISM = declare_page("value_shape_polymorphism", (
+    RowField("function", K.NAME), RowField("value_id", K.VALUE_ID),
+), ShapePolymorphismFact)              # DERIVED(disagreeing copy_value_shape cells); REVISE
+
+#: A return-site version found by id (no ``ssa_field_version`` cell) whose
+#: SSA identity the book does not join to the site state's value cell.
+VERSION_NOT_ON_BOOK = declare_reason("version_not_on_book")
+RETURN_VERSION_REASONS = (*RETURN_VERSION_REASONS, VERSION_NOT_ON_BOOK)
+
+# Repository kernels imported from LLVM (``llvm_repository_ssa``).  The
+# import is cached process-wide, so each book posts the identities when a
+# compile first reads a kernel (``post_repository_kernel_identity``): one
+# ``repository_kernel_definition`` root per kernel (NOVEL(INGEST_SOURCE),
+# row (``"llvm_repository"``, kernel name), fact = sha256 of the kernel's
+# LLVM text), one ``repository_kernel_value`` row per imported value
+# (argument, constant, instruction result) at its position in the kernel,
+# DERIVED from the root, and the value's ``ssa_value`` row DERIVED from that.
+
+
+@dataclass(frozen=True)
+class RepositoryKernelDefinitionFact:
+    #: sha256 of the kernel's LLVM text.
+    digest: str
+
+
+@dataclass(frozen=True)
+class RepositoryKernelValueFact:
+    #: ``argument``, ``constant`` or ``instruction``.
+    kind: str
+    #: The LLVM spelling (a constant's literal, an argument's or
+    #: instruction's name).
+    text: str
+
+
+REPOSITORY_KERNEL_DEFINITION = declare_page("repository_kernel_definition", (
+    RowField("registry", K.SCOPE), RowField("kernel", K.NAME),
+), RepositoryKernelDefinitionFact)     # NOVEL(INGEST_SOURCE) root; CONCORD
+REPOSITORY_KERNEL_VALUE = declare_page("repository_kernel_value", (
+    RowField("kernel", K.SCOPE), RowField("position", K.INDEX),
+), RepositoryKernelValueFact)          # DERIVED(kernel definition cell); CONCORD
+
+# ----------------------------------------------------------------------------
+# SymPy ingestion decisions (orbital items 0 and 4; ``symbolic_equation_
+# compiler`` and ``symbolic_process_graph``).
+#
+# ``tensor_operation_parameter`` (operation, position): one row per
+# positional parameter of a catalogued ``AbstractTensor`` operation, NOVEL
+# from its declared signature (``DECLARED_SIGNATURE``).
+# ``constant_role`` (ingestion scope, constant node): whether a SymPy
+# constant is a structural integer (an axis, a dimension) or a float64
+# number, DERIVED from the constant's ``ingestion_value`` cell, every
+# consumer's cell and, for each structural use, the consuming operation's
+# ``tensor_operation_parameter`` cell.  The constant's dtype is read back
+# from this row.
+# ``symbolic_transform`` (ingestion scope, result node): a declared lowering
+# of an authored construct -- a derivative of an external resolved to its
+# declared derivative external, an Integral lowered as its quadrature --
+# DERIVED from the authored construct's cells, the declaration's cells and
+# the result node's cell.
+# ----------------------------------------------------------------------------
+
+DECLARED_SIGNATURE = declare_transform("declared_signature", 0)
+
+
+@dataclass(frozen=True)
+class TensorParameterFact:
+    parameter: str
+    annotation: str
+    #: The annotation declares an integer and no float/tensor.
+    integer: bool
+
+
+@dataclass(frozen=True)
+class ConstantRoleFact:
+    #: ``structural`` (kept an integer) or ``numeric`` (a float64 value).
+    role: str
+    dtype: str
+
+
+@dataclass(frozen=True)
+class SymbolicTransformFact:
+    #: ``resolve_external_derivative`` / ``integral_quadrature``.
+    transform: str
+    detail: str
+
+
+TENSOR_OPERATION_PARAMETER = declare_page("tensor_operation_parameter", (
+    RowField("operation", K.NAME), RowField("position", K.INDEX),
+), TensorParameterFact)                # NOVEL(DECLARED_SIGNATURE) root; CONCORD
+CONSTANT_ROLE = declare_page("constant_role", (
+    RowField("ingestion_scope", K.SCOPE), RowField("constant", K.VALUE_ID),
+), ConstantRoleFact)                   # DERIVED(constant, consumers, parameter cells); CONCORD
+SYMBOLIC_TRANSFORM = declare_page("symbolic_transform", (
+    RowField("ingestion_scope", K.SCOPE), RowField("result", K.VALUE_ID),
+), SymbolicTransformFact)              # DERIVED(authored, declaration, result cells); CONCORD
 
 __all__ =[name for name in dir() if not name.startswith("_") and name not in {
     "ast", "dataclass", "Enum", "Any", "Ref", "RowField", "K", "Unresolved",

@@ -19,8 +19,9 @@ of ``m`` takes version B as its true arm.  Before the fix
 binding, saw B's authored ``name_binding`` row and refused it with
 ``carried-name-arm-missing``.
 
-The probe lowers the program, emits C, runs it natively for every branch
-combination and compares with CPython executing the same source.
+The probe lowers the program, emits C and LLVM, runs each natively for
+every branch combination and compares with CPython executing the same
+source.
 
     python -u tools/compiler_probes/probe_nested_inplace_arm.py
 """
@@ -112,23 +113,43 @@ def main() -> int:
         return 1
     BUILD.mkdir(parents=True, exist_ok=True)
     artifact.compile(BUILD / NAME)
+
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact, emit_ssa_function_to_llvm,
+        prepare_artifact_execution,
+    )
+
+    llvm_artifact = emit_ssa_function_to_llvm(module, root.name)
+    if llvm_artifact.shortfalls:
+        print(f"FAIL LLVM emission incomplete: {llvm_artifact.shortfalls}")
+        return 1
+    llvm_native = compile_artifact(
+        llvm_artifact, directory=BUILD / f"{NAME}_llvm",
+    )
+    lanes = (
+        ("C", lambda feeds: artifact.prepare_execution(feeds).run()),
+        ("LLVM", lambda feeds: prepare_artifact_execution(
+            llvm_native, feeds,
+        ).run()),
+    )
     failures = 0
-    for a, b in CASES:
-        expected = python_result(a, b)
-        feeds = {
-            int(named["x"]): X.copy(),
-            int(named["a"]): np.asarray(a, dtype=np.float64),
-            int(named["b"]): np.asarray(b, dtype=np.float64),
-        }
-        result = artifact.prepare_execution(feeds).run()
-        actual = np.asarray(result.buffers[outputs[root.name][0].id])
-        equal = (
-            actual.size == expected.size
-            and np.array_equal(actual.reshape(-1), expected.reshape(-1))
-        )
-        failures += 0 if equal else 1
-        print(f"{'ok  ' if equal else 'FAIL'} a={a} b={b} "
-              f"python={expected.tolist()} native={actual.tolist()}")
+    for lane, run in lanes:
+        for a, b in CASES:
+            expected = python_result(a, b)
+            feeds = {
+                int(named["x"]): X.copy(),
+                int(named["a"]): np.asarray(a, dtype=np.float64),
+                int(named["b"]): np.asarray(b, dtype=np.float64),
+            }
+            result = run(feeds)
+            actual = np.asarray(result.buffers[outputs[root.name][0].id])
+            equal = (
+                actual.size == expected.size
+                and np.array_equal(actual.reshape(-1), expected.reshape(-1))
+            )
+            failures += 0 if equal else 1
+            print(f"{'ok  ' if equal else 'FAIL'} {lane:4} a={a} b={b} "
+                  f"python={expected.tolist()} native={actual.tolist()}")
     print("failures:", failures)
     return 1 if failures else 0
 

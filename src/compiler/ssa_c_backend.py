@@ -3457,9 +3457,30 @@ def emit_ssa_module_to_c(
                     body.append(f"        goto {_c_label(target)};")
                     continue
                 if op in {"CondBr", "condbr"}:
-                    condition = scalar_operand(instruction.args[0])
                     on_true = str(instruction.attributes.get("true_target"))
                     on_false = str(instruction.attributes.get("false_target"))
+                    # A branch takes ONE truth value; scalar_operand reads
+                    # element 0 of a shaped value, so a (4,) mask would branch
+                    # every lane on lane 0.  Same refusal as the LLVM lane.
+                    condition_shape = tuple(
+                        getattr(instruction.args[0], "shape", ()) or ())
+                    if (
+                        condition_shape
+                        and all(hasattr(extent, "__index__")
+                                for extent in condition_shape)
+                        and math.prod(condition_shape) > 1
+                    ):
+                        shortfalls.append(CEmissionShortfall(
+                            op,
+                            "conditional branch on a multi-element condition "
+                            f"%t{int(instruction.args[0].id)} shape "
+                            f"{condition_shape!r} ({math.prod(condition_shape)} "
+                            f"elements) -> {on_true}/{on_false} in {fn}: a "
+                            "branch takes one truth value; elementwise "
+                            "selection is where",
+                        ))
+                        continue
+                    condition = scalar_operand(instruction.args[0])
                     if condition is None:
                         continue
                     if trace_this_function:

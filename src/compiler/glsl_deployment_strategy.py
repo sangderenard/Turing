@@ -87,6 +87,7 @@ from .hierarchical_plan import (
 from ..common.tensors.topological_reducer import (
     _append_operand,
     _set_operands,
+    indexed_store_site_span,
 )
 # Step 9 (plan 100, 1.2): the causes this module's operand rewrites record.
 from .concordance_declarations import (
@@ -8358,6 +8359,13 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
             if span.get("line") is not None:
                 effect_span_nodes.setdefault(tuple(span.get(key) for key in
                     ("line", "column", "end_line", "end_column")), set()).add(int(node_id))
+        if not source_positioned(expression) and str(data.get("type") or "") == "IndexedStore":
+            # An indexed store with no authored node of its own: its site
+            # is the ``indexed_store_site`` book cell its identity derives
+            # from; the site's span only places it.
+            site_span = indexed_store_site_span(graph, int(node_id))
+            if site_span is not None:
+                effect_span_nodes.setdefault(site_span, set()).add(int(node_id))
     memberships: dict[int, set[tuple[int, str]]] = {}
     structurally_specialized = frozenset(map(
         int,
@@ -16354,6 +16362,27 @@ def _argument_identity_cells(graph: Any, node_id: int) -> tuple:
     )
     if literal is not None:
         cells.append(literal)
+    if data.get("type") == "Input":
+        # A formal passed straight on is source-static when the caller's own
+        # formal was specialized (``_source_static_value`` reads the
+        # caller's ``planner_specializations``).  That decision is the
+        # caller's ``planner_specialization`` row; cite it, so the callee's
+        # row changes only with a cause.  Without it, dt_system_over's
+        # lowering posted ``_propose_dt_pen``'s ``distribution`` as
+        # dynamic, then -- once step_with_dt_control_used's ``distribution``
+        # was specialized in the same pass -- as LITERAL from the same two
+        # cells, and the book refused the causeless revision
+        # (CONTINUATION_dt_compile_stall.md).
+        from .concordance_declarations import PLANNER_SPECIALIZATION_PAGE
+
+        scope = graph.G.graph.get("lexical_read_scope")
+        binding = (data.get("attributes") or {}).get("binding_name")
+        if scope is not None and binding:
+            decided = current_identity_book().latest_ref(
+                PLANNER_SPECIALIZATION_PAGE, (tuple(scope), str(binding)),
+            )
+            if decided is not None:
+                cells.append(decided)
     if isinstance(expression, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
         for parent, _role in data.get("parents") or ():
             cells.extend(_argument_identity_cells(graph, int(parent)))
@@ -17150,6 +17179,7 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                     continue
                 parameter = str(parameter)
                 bound_parameters.add(parameter)
+                role_cells: tuple = ()
                 if _source_static_value(caller, int(parent)):
                     try:
                         value = _source_static_literal(caller, int(parent))
@@ -17167,33 +17197,44 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                         # never resolved and ``unbroadcast(..., p.shape)``
                         # kept a shape loop whose iterable ``extent`` LLVM
                         # cannot emit.  Rule: a formal whose argument the
-                        # call declares ``gradient``/``operand``
-                        # (``argument_roles``, written by the adjoint
-                        # builder) is specialized only in its callsite copy
-                        # (``_callsite_specialized_shell_type``), which keeps
-                        # literal and descriptor together.  ``metadata``
-                        # arguments and undeclared calls fold as before.
-                        declared_roles = tuple(
-                            attributes.get("argument_roles") or ()
+                        # call declares GRADIENT/OPERAND (its
+                        # ``callsite_argument_role`` row, posted by the
+                        # adjoint builder) is specialized only in its
+                        # callsite copy (``_callsite_specialized_shell_type``),
+                        # which keeps literal and descriptor together.
+                        # METADATA arguments and undeclared calls fold as
+                        # before.  The row's cell is cited by the
+                        # ``planner_specialization`` row either way.
+                        from .concordance_declarations import ArgumentRole
+                        from .process_graph_autograd import (
+                            declared_argument_role,
                         )
+
                         position = (
                             int(role[4:])
                             if role.startswith("arg:") and role[4:].isdigit()
                             else None
                         )
-                        if (
-                            position is not None
-                            and position < len(declared_roles)
-                            and str(declared_roles[position])
-                            in {"gradient", "operand"}
-                        ):
-                            value = tensor_argument
+                        declared = (
+                            None if position is None
+                            else declared_argument_role(
+                                caller, int(_node_id), position,
+                            )
+                        )
+                        if declared is not None:
+                            role_cells = (declared[1],)
+                            if declared[0] in {
+                                ArgumentRole.GRADIENT, ArgumentRole.OPERAND,
+                            }:
+                                value = tensor_argument
                 else:
                     value = dynamic_argument
                 candidates.setdefault(
                     (int(reference), parameter), []
                 ).append((
-                    value, _argument_identity_cells(caller, int(parent)), False,
+                    value,
+                    (*_argument_identity_cells(caller, int(parent)), *role_cells),
+                    False,
                 ))
             # Omitted arguments are just as exact as authored literal
             # arguments: Python binds them to the signature default before

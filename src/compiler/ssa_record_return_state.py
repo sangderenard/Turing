@@ -1682,7 +1682,7 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         SSA_FIELD_VERSION,
         VERSION_DOES_NOT_DOMINATE_RETURN,
         VERSION_IS_FORMAL_SHAPED_OR_MISTYPED,
-        VERSION_NOT_CONST_OR_CARRIED_PHI,
+        VERSION_NOT_ON_BOOK,
         VERSION_NOT_UNIQUELY_DEFINED,
         FieldState,
         FieldStateKind,
@@ -1981,6 +1981,63 @@ def scalar_return_field_versions(function, source_graph, functions=None):
                 return formal, formal_cell, field_state_cell
         return None
 
+    def derives_from(cell, target, depth=8):
+        """Whether ``cell`` reaches ``target`` along posted edges (DERIVED
+        sources and NOVEL mint operands), at most ``depth`` steps back."""
+        book = current_identity_book()
+        frontier, seen = [cell], {cell}
+        for _depth in range(depth):
+            if target in seen:
+                return True
+            step = []
+            for current in frontier:
+                sources = [source for source, _stage in book.edges_into(current)]
+                mint = book.mint_of(current)
+                if mint is not None:
+                    sources.extend(mint[1])
+                step.extend(
+                    source for source in sources
+                    if isinstance(source, Ref) and source not in seen
+                )
+            if not step:
+                break
+            frontier = step
+            seen.update(step)
+        return target in seen
+
+    def publish_joined_version(read, value):
+        """The ``ssa_field_version`` cells published for ``value`` at each
+        return-site state in ``read`` whose value cell the SSA value's
+        identity cell derives from; () unless every state joins."""
+        if scope is None:
+            return ()
+        value_cell = ssa_value_identity_cell(function, int(value.id))
+        states = [cell for cell in read
+                  if isinstance(cell, Ref) and cell.page == RETURN_SITE_FIELD_STATE]
+        if value_cell is None or not states:
+            return ()
+        joins = []
+        for state_cell in states:
+            field_state_cell = cell_fact(state_cell)
+            if not isinstance(field_state_cell, Ref):
+                return ()
+            field_state = cell_fact(field_state_cell)
+            if (not isinstance(field_state, FieldState)
+                    or not isinstance(field_state.value, Ref)
+                    or not derives_from(value_cell, field_state.value)):
+                return ()
+            joins.append(field_state_cell)
+        book = current_identity_book()
+        return tuple(
+            book.post(
+                SSA_FIELD_VERSION, (scope, field_state_cell), int(value.id),
+                stage=RECORD_RETURN_VERSION,
+                provenance=Derived((field_state_cell, value_cell)),
+                mode=Mode.CONCORD,
+            )
+            for field_state_cell in joins
+        )
+
     def entered_version(site, receiver, slots, fallback, exit_with):
         """The version current at a site that records no write of the
         field: the receiver's entered field value -- its ProgramABI formal,
@@ -2102,11 +2159,23 @@ def scalar_return_field_versions(function, source_graph, functions=None):
                         for cell in read)
         if definition is None and not published:
             return exit_with(VERSION_NOT_UNIQUELY_DEFINED, read)
-        if not published and not (definition.op == 'Const' or (
-                definition.op == 'Phi'
-                and (definition.attributes or {}).get('binding') == 'conditional_carried')):
-            return exit_with(VERSION_NOT_CONST_OR_CARRIED_PHI, read)
-        if published:
+        # A version found by id (the receipt view or the field state's value
+        # id) with no ``ssa_field_version`` cell is admitted only when the
+        # book joins it: the SSA value's identity cell derives, along posted
+        # edges, from each site state's value cell.  The join is published
+        # as the state's version (DERIVED(field-state cell, value cell)) and
+        # the selection derives from it.  No join -- including a graph with
+        # no reduction scope, where nothing can be joined or keyed -- is
+        # Unresolved(VERSION_NOT_ON_BOOK): a selection with no edge is not a
+        # selection.  (408155a7 admitted any Const or conditional-carried
+        # Phi here by rule; lane A, 2026-10-03, removed it.)
+        joined = ()
+        if not published:
+            joined = publish_joined_version(read, value)
+            if not joined:
+                return exit_with(VERSION_NOT_ON_BOOK, read)
+            read = (*read, *joined)
+        if published or joined:
             # The published version begins at its authored assignment effect
             # (the Store stamped with the version row's field-state cell),
             # not where its right-hand side was evaluated: a Const RHS may

@@ -3145,6 +3145,41 @@ class IdentityPage:
     #: made outside a book has none, so its writes cannot be tagged or
     #: latched.
     book: Any = field(default=None, repr=False, compare=False)
+    #: The page's own index of ``cells``, kept by ``_stamp`` (the one cell
+    #: writer): each column's position in ``columns``, and each row's
+    #: columns in that order.  ``history`` reads a row's cells through it
+    #: instead of walking every column the page has ever had, which made
+    #: every read O(all revisions on the page).  Same cells, same order.
+    column_positions: dict[int, int] = field(
+        default_factory=dict, repr=False, compare=False,
+    )
+    row_columns: dict[Any, list[int]] = field(
+        default_factory=dict, repr=False, compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        # A page built with cells already in hand indexes them once here.
+        if self.cells and not self.row_columns:
+            self._reindex()
+
+    def __setstate__(self, state: dict) -> None:
+        # A page pickled before the index existed is indexed on arrival.
+        self.__dict__.update(state)
+        if "row_columns" not in state or "column_positions" not in state:
+            self._reindex()
+
+    def _reindex(self) -> None:
+        self.column_positions = {
+            column: position for position, column in enumerate(self.columns)
+        }
+        self.row_columns = {}
+        for row, column in self.cells:
+            if column not in self.column_positions:
+                self.column_positions[column] = len(self.columns)
+                self.columns.append(column)
+            self.row_columns.setdefault(row, []).append(column)
+        for columns in self.row_columns.values():
+            columns.sort(key=self.column_positions.__getitem__)
 
     def _stamp(self, row: Any, column: int, fact: Any) -> None:
         """Write one cell at the current clock reading without ticking.
@@ -3152,8 +3187,18 @@ class IdentityPage:
         ``IdentityBook.post`` writes a fact and its edges through this so
         they share one reading; it ticks the clock once afterwards.
         """
-        if column not in self.columns:
+        positions = self.column_positions
+        if len(positions) != len(self.columns):
+            self._reindex()
+        position = positions.get(column)
+        if position is None:
+            position = positions[column] = len(self.columns)
             self.columns.append(column)
+        if (row, column) not in self.cells:
+            columns = self.row_columns.setdefault(row, [])
+            columns.append(column)
+            if len(columns) > 1 and positions[columns[-2]] > position:
+                columns.sort(key=positions.__getitem__)
         self.cells[(row, column)] = fact
         self.stamps[(row, column)] = self.clock[0]
         if isinstance(row, tuple) and row:
@@ -3269,10 +3314,12 @@ class IdentityPage:
 
     def history(self, row: Any) -> tuple[tuple[int, Any], ...]:
         """This row's fact at every column it was recorded on, in order."""
+        if len(self.column_positions) != len(self.columns):
+            self._reindex()
+        cells = self.cells
         return tuple(
-            (column, self.cells[(row, column)])
-            for column in self.columns
-            if (row, column) in self.cells
+            (column, cells[(row, column)])
+            for column in self.row_columns.get(row, ())
         )
 
     def spans(self, row: Any) -> tuple[tuple[int, int, Any], ...]:
@@ -3881,7 +3928,41 @@ def record_shape_transformation(
     state_row = (target_scope, target_id)
     state_fact = ("resolved", target, edge_row)
     state_ref = book.latest_ref(SHAPE_STATE_PAGE, state_row)
-    if state_ref is None or book.page(SHAPE_STATE_PAGE).latest(state_row) != state_fact:
+    incumbent = (
+        None if state_ref is None
+        else book.page(SHAPE_STATE_PAGE).latest(state_row)
+    )
+    # One projection per identity, many edges into it.  A target derived
+    # from several sources (a binary operator's lhs and rhs) receives one
+    # edge per source, all carrying the SAME target state.  The edges are
+    # the graph and each is on the edge and dependents pages above with its
+    # own source cell; the state row is the projection and names the edge it
+    # was resolved through.  A second edge that agrees with a live
+    # incumbent edge corroborates that projection; it does not re-resolve
+    # it.  Revising the state per edge made the two agreeing edges
+    # overwrite each other on every descriptor query: the llvm_dt_system
+    # air+pool lowering, dt_system_over -> run_superstep callsite, revised
+    # (step_0, 42) `Pow` 4,239 times alternating lhs/rhs with the shape
+    # fixed at (1,) float64, and the page grew without bound
+    # (CONTINUATION_dt_compile_stall.md).  A DIFFERENT target state is not
+    # a corroboration and takes the revision path below.
+    if (
+        isinstance(incumbent, tuple)
+        and len(incumbent) == 3
+        and incumbent[0] == "resolved"
+        and incumbent[1] == target
+        and incumbent[2] != edge_row
+        and isinstance(incumbent[2], tuple)
+        and tuple(incumbent[2][:2]) == state_row
+    ):
+        incumbent_edge = book.page(SHAPE_EDGE_PAGE).latest(incumbent[2])
+        if (
+            isinstance(incumbent_edge, tuple)
+            and len(incumbent_edge) == 2
+            and incumbent_edge[1] == target
+        ):
+            return target
+    if state_ref is None or incumbent != state_fact:
         previous = concordant_shape_transformation_state(
             target_scope, target_id,
         )

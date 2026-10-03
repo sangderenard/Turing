@@ -5751,6 +5751,98 @@ def _sequence_record_binding_value_ids(
     )))
 
 
+def _annotated_parameter_record_identity(
+    function_identity: str, parameter: str,
+) -> str | None:
+    """The contract record an annotated parameter's class is, by book rows.
+
+    ``Rules._set_momentum(item: Body)``: the ``parameter_annotation`` row
+    names ``Body`` in its module; Python resolves that name to the module's
+    ``class_declaration`` row ``(module, "Body")``; the class's
+    ``source_span`` cell is the one the contract's
+    ``source_record_class_concordance`` row (``rhworld.Body``) derives
+    from.  The joined identity is posted as a ``parameter_record_class``
+    row DERIVED from those three cells and returned; ``None`` when any
+    link is absent.  A class with a span but no ``class_declaration`` row
+    gets one, DERIVED from that span, as ``_class_schema_from_ast`` posts
+    them.  No identity is compared by spelling.
+    """
+
+    from .concordance_declarations import (
+        CLASS_DECLARATION, ClassFact, INGESTION, PARAMETER_ANNOTATION,
+        PARAMETER_RECORD_CLASS, SOURCE_RECORD_CLASS, SOURCE_SPAN,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from ..transmogrifier.graph.graph_express2 import source_span_row
+
+    book = current_identity_book()
+    annotations = book.pages.get(PARAMETER_ANNOTATION.name)
+    if annotations is None:
+        return None
+    rows = [
+        row for row in annotations.rows()
+        if row[1] == str(function_identity) and row[2] == str(parameter)
+    ]
+    if len(rows) != 1:
+        return None
+    annotation_row = rows[0]
+    module = annotation_row[0]
+    spelling = str(annotations.latest(annotation_row) or "")
+    if not spelling.isidentifier():
+        return None
+    record_classes = book.pages.get(SOURCE_RECORD_CLASS.name)
+    class_row = (module, spelling)
+    class_cell = book.latest_ref(CLASS_DECLARATION, class_row)
+    span_cells: list = []
+    if class_cell is not None:
+        span_cells = [
+            source for source, _stage in book.edges_into(class_cell)
+            if source.page.name == SOURCE_SPAN.name
+        ]
+    elif record_classes is not None:
+        # The class was ingested as a contract record but never described
+        # by the map IR: post its declaration at the class definition.
+        for row in record_classes.rows():
+            definition = record_classes.latest(row)
+            span_row = (
+                None if not isinstance(definition, ast.ClassDef)
+                else source_span_row(None, definition)
+            )
+            if span_row is None or tuple(span_row[:2]) != class_row:
+                continue
+            span_cell = book.latest_ref(SOURCE_SPAN, span_row)
+            if span_cell is None:
+                continue
+            class_cell = book.post(
+                CLASS_DECLARATION, class_row,
+                ClassFact(str(definition.name), ()),
+                stage=INGESTION, provenance=Derived((span_cell,)),
+                mode=Mode.CONCORD,
+            )
+            span_cells = [span_cell]
+            break
+    if class_cell is None or len(span_cells) != 1:
+        return None
+    record_cells = [
+        target for target, _stage in book.edges_out_of(span_cells[0])
+        if target.page.name == SOURCE_RECORD_CLASS.name
+    ]
+    if len(record_cells) != 1:
+        return None
+    identity = str(record_cells[0].row[0])
+    row = (module, str(function_identity), str(parameter))
+    if book.page(PARAMETER_RECORD_CLASS).latest(row) != identity:
+        book.post(
+            PARAMETER_RECORD_CLASS, row, identity, stage=INGESTION,
+            provenance=Derived((
+                book.latest_ref(PARAMETER_ANNOTATION, annotation_row),
+                class_cell, record_cells[0],
+            )),
+            mode=Mode.CONCORD,
+        )
+    return identity
+
+
 def _authored_dataclass_record_views(
     tree: ast.Module,
 ) -> dict[str, dict[str, Mapping[str, Any]]]:
@@ -16725,40 +16817,179 @@ def _class_surface_ssa_program(
     # then refused the other copy's SSA ("concorded source/SSA shape
     # disagreement ... ssa=(3, 2), concordance=(2, 2)").  Two copies stating
     # different shapes for one authored value is polymorphism, exactly as
-    # two callsites of one graph are below: the row says so, and stays so.
-    shape_row_writers: dict[tuple, tuple[int, tuple]] = {}
-    cross_copy_polymorphic: set[tuple] = set()
+    # two callsites of one graph are below.
+    #
+    # Both are posted facts (lane A, 2026-10-03).  Every statement is the
+    # stating copy's own ``copy_value_shape`` row, keyed by that copy's
+    # ``lexical_read_scope`` (copies never share it), DERIVED from the
+    # value's ``canonical_value`` cell in that copy and, for a statement
+    # carried over a call edge, the caller's statement cell (else the
+    # caller value's canonical cell).  Polymorphism is the authored row's
+    # ``value_shape_polymorphism`` fact, DERIVED from the disagreeing
+    # statement cells; the completed-module seam and
+    # ``tensor_ssa_lowering._shape_polymorphic_function`` read that row.  A
+    # proven-polymorphic row gets no further ``value_shape`` entries (the
+    # ledger carries no "polymorphic" label).
+    from .concordance_declarations import (
+        CANONICAL_VALUE as _SHAPE_CANONICAL_VALUE,
+        COPY_VALUE_SHAPE as _COPY_VALUE_SHAPE,
+        INGESTION_VALUE as _SHAPE_INGESTION_VALUE,
+        LINKED_VALUE_ABI_SETTLEMENT as _LINKED_VALUE_ABI_SETTLEMENT,
+        SHAPE_STATEMENT_SOURCE_NOT_ON_BOOK as _SHAPE_STATEMENT_UNSOURCED,
+        VALUE_SHAPE_POLYMORPHISM as _VALUE_SHAPE_POLYMORPHISM,
+        CopyShapeFact as _CopyShapeFact,
+        ShapePolymorphismFact as _ShapePolymorphismFact,
+    )
+    from .identity_concordance import (
+        Derived as _ShapeDerived,
+        Mode as _ShapeMode,
+        Unsourced as _ShapeUnsourced,
+    )
 
-    def note_shape(owner: Any, value_id: int, fact: Any) -> None:
+    #: Read index over the book: authored row -> the ``copy_value_shape``
+    #: rows stating it (each copy's own row; the facts live on the book).
+    copy_statement_rows: dict[tuple, list[tuple]] = {}
+
+    def _copy_scope(owner: Any) -> tuple:
+        """The copy's own scope and the page its value identities live on:
+        the post-relabel ``lexical_read_scope`` (``canonical_value``), else,
+        for a graph built without a source reduction (a graph-native
+        reverse), its ``ingestion_value_scope`` (``ingestion_value``)."""
+        scope = owner.graph.get("lexical_read_scope")
+        if scope is not None:
+            return tuple(scope), _SHAPE_CANONICAL_VALUE
+        scope = owner.graph.get("ingestion_value_scope")
+        if scope is not None:
+            return tuple(scope), _SHAPE_INGESTION_VALUE
+        raise ValueError(
+            "ABI settlement: planned graph "
+            f"{owner.graph.get('function_name')!r} has neither a "
+            "lexical_read_scope nor an ingestion_value_scope to key its "
+            "shape statements"
+        )
+
+    def _identity_cell(owner: Any, value_id: int) -> Any:
+        scope, page = _copy_scope(owner)
+        return shape_identity_book.latest_ref(page, (scope, int(value_id)))
+
+    def _statement_cell(owner: Any, value_id: int) -> Any:
+        return shape_identity_book.latest_ref(
+            _COPY_VALUE_SHAPE, (_copy_scope(owner)[0], int(value_id)),
+        )
+
+    def _cell_fact(ref: Any) -> Any:
+        return shape_identity_book.pages[ref.page.name].cells.get(
+            (ref.row, ref.column)
+        )
+
+    def post_shape_statement(
+        owner: Any, value_id: int, fact: Any, source: Any,
+    ) -> Any:
+        """The stating copy's ``copy_value_shape`` cell for ``fact``."""
+        row = (_copy_scope(owner)[0], int(value_id))
+        statement = _CopyShapeFact(
+            str(fact[0]), tuple(fact[1] or ()), str(fact[2] or ""),
+            str(fact[3] or ""),
+        )
+        latest = shape_identity_book.latest_ref(_COPY_VALUE_SHAPE, row)
+        if latest is not None and _cell_fact(latest) == statement:
+            return latest
+        cells = [_identity_cell(owner, value_id)]
+        if source is not None:
+            source_owner, source_id = source
+            cells.append(
+                _statement_cell(source_owner, source_id)
+                or _identity_cell(source_owner, source_id)
+            )
+        cells = tuple(dict.fromkeys(cell for cell in cells if cell is not None))
+        ref = shape_identity_book.post(
+            _COPY_VALUE_SHAPE, row, statement,
+            stage=_LINKED_VALUE_ABI_SETTLEMENT,
+            provenance=(
+                _ShapeDerived(cells) if cells
+                else _ShapeUnsourced(_SHAPE_STATEMENT_UNSOURCED)
+            ),
+            mode=_ShapeMode.REVISE,
+        )
+        authored = (str(owner.graph.get("function_name")), int(value_id))
+        rows = copy_statement_rows.setdefault(authored, [])
+        if row not in rows:
+            rows.append(row)
+        return ref
+
+    def post_shape_polymorphism(authored: tuple, cells: tuple) -> None:
+        """``value_shape_polymorphism`` for ``authored``, DERIVED from the
+        disagreeing statement ``cells``."""
+        cells = tuple(dict.fromkeys(cell for cell in cells if cell is not None))
+        shapes = {tuple(_cell_fact(cell).shape) for cell in cells}
+        latest = shape_identity_book.latest_ref(
+            _VALUE_SHAPE_POLYMORPHISM, authored,
+        )
+        if latest is not None:
+            recorded = set(_cell_fact(latest).shapes)
+            if shapes <= recorded:
+                return
+            shapes |= recorded
+        shape_identity_book.post(
+            _VALUE_SHAPE_POLYMORPHISM, authored,
+            _ShapePolymorphismFact(tuple(sorted(shapes, key=repr))),
+            stage=_LINKED_VALUE_ABI_SETTLEMENT,
+            provenance=_ShapeDerived(cells), mode=_ShapeMode.REVISE,
+        )
+
+    def note_shape(
+        owner: Any, value_id: int, fact: Any, *, source: Any = None,
+        callsites_disagree: bool = False,
+    ) -> None:
+        """Record one copy's shape statement for ``value_id``.
+
+        ``source`` is the ``(caller graph, caller value id)`` a statement
+        carried over a call edge came from.  ``callsites_disagree`` is the
+        within-copy case (two callsites of this copy stated different
+        shapes): the polymorphism derives from this copy's standing
+        statement and the new caller's statement.  A row the book proves
+        polymorphic gets no further ``value_shape`` entries; its readers
+        read ``value_shape_polymorphism``."""
         row = (str(owner.graph.get("function_name")), int(value_id))
-        if row in cross_copy_polymorphic and str(fact[0]) != "polymorphic":
-            return
         stated = tuple(fact[1] or ())
-        writer = shape_row_writers.get(row)
-        if (
-            str(fact[0]) != "polymorphic"
-            and stated
-            and writer is not None
-            and writer[0] != id(owner)
-            and writer[1]
-            and writer[1] != stated
-        ):
-            cross_copy_polymorphic.add(row)
-            fact = ("polymorphic", *tuple(fact[1:]))
-        elif str(fact[0]) != "polymorphic" and stated:
-            shape_row_writers[row] = (id(owner), stated)
-        previous = shape_page.latest(row)
+        if callsites_disagree:
+            source_owner, source_id = source
+            caller_cell = _statement_cell(source_owner, source_id)
+            if caller_cell is None or tuple(_cell_fact(caller_cell).shape) != stated:
+                caller_cell = post_shape_statement(source_owner, source_id, (
+                    f"argument of {owner.graph.get('function_name')}"
+                    f" value {int(value_id)}",
+                    stated, fact[2], fact[3],
+                ), None)
+            post_shape_polymorphism(row, (
+                _statement_cell(owner, value_id), caller_cell,
+            ))
+            return
+        if shape_identity_book.latest_ref(
+            _VALUE_SHAPE_POLYMORPHISM, row,
+        ) is not None:
+            return
+        if stated:
+            cell = post_shape_statement(owner, value_id, fact, source)
+            disagreeing = tuple(
+                other for other_row in copy_statement_rows.get(row, ())
+                if other_row != cell.row
+                for other in (shape_identity_book.latest_ref(
+                    _COPY_VALUE_SHAPE, other_row,
+                ),)
+                if other is not None
+                and tuple(_cell_fact(other).shape)
+                and tuple(_cell_fact(other).shape) != stated
+            )
+            if disagreeing:
+                post_shape_polymorphism(row, (cell, *disagreeing))
+                return
         # A fact is the shape, not who said it.  Two callsites agreeing is one
         # fact recorded once; otherwise every additional caller reads as a
         # change and a round trip between equal shapes reads as oscillation.
-        if previous is not None:
-            same_payload = tuple(previous[1:]) == tuple(fact[1:])
-            state_transition = (
-                str(previous[0]) == "polymorphic"
-                or str(fact[0]) == "polymorphic"
-            ) and str(previous[0]) != str(fact[0])
-            if same_payload and not state_transition:
-                return
+        previous = shape_page.latest(row)
+        if previous is not None and tuple(previous[1:]) == tuple(fact[1:]):
+            return
         shape_page.set(row, len(shape_page.history(row)), fact)
     planned_graphs_by_shell: dict[int, Any] = {}
     for planned_shell in planned_shells:
@@ -17061,7 +17292,7 @@ def _class_surface_ssa_program(
                     tuple(source.get("shape") or ()),
                     str(source.get("dtype") or ""),
                     str(source.get("storage") or ""),
-                ))
+                ), source=(caller_graph, int(caller_id)))
                 changed = True
                 continue
             if marker in polymorphic_formals:
@@ -17138,7 +17369,7 @@ def _class_surface_ssa_program(
                             tuple(value or ()),
                             str(source.get("dtype") or ""),
                             str(source.get("storage") or ""),
-                        ))
+                        ), source=(caller_graph, int(caller_id)))
                     if key in {"shape", "rank"} and (
                         marker in polymorphic_formals
                     ):
@@ -17188,11 +17419,13 @@ def _class_surface_ssa_program(
                     ):
                         existing.pop("rank", None)
                     note_shape(callee_graph, int(callee_id), (
-                        "polymorphic",
+                        f"callsite {caller_graph.graph.get('function_name')}"
+                        f" value {int(caller_id)}",
                         tuple(value),
                         str(source.get("dtype") or ""),
                         str(source.get("storage") or ""),
-                    ))
+                    ), source=(caller_graph, int(caller_id)),
+                        callsites_disagree=True)
                     if marker not in polymorphic_formals:
                         polymorphic_formals.add(marker)
                         changed = True
@@ -19629,6 +19862,14 @@ def _class_surface_ssa_program(
                     )
                 ),
                 progress=report,
+                # The declarations ``post_parameter_abi_kinds`` posts as
+                # ``parameter_abi_kind`` rows at the signature.
+                parameter_value_abi=dict(
+                    graph_obj.graph.get("parameter_value_abi") or {}
+                ),
+                parameter_record_abi=dict(
+                    graph_obj.graph.get("parameter_record_abi") or {}
+                ),
             )
         )
         if os.environ.get("TURING_DEBUG_OUTPUT_LOADS"):
@@ -23140,11 +23381,30 @@ def _class_surface_ssa_program(
                 ))
                 continue
             callee_record = declared_record_parameter(callee_key)
-            if str(caller_identity) != str(callee_record.get("identity")):
+            # An annotated callee parameter's identity is the book's
+            # ``parameter_record_class`` join (annotation -> class
+            # declaration -> contract record), read here, not respelled.
+            callee_graph_metadata = source_graphs_by_symbol[
+                str(callee_key[0])
+            ].graph
+            callee_function_name = str(
+                callee_graph_metadata.get("function_name") or ""
+            )
+            callee_owner = callee_graph_metadata.get("method_owner")
+            joined_identity = _annotated_parameter_record_identity(
+                f"{callee_owner}.{callee_function_name}"
+                if callee_owner else callee_function_name,
+                str(callee_key[1]),
+            )
+            callee_identity = (
+                joined_identity if joined_identity is not None
+                else str(callee_record.get("identity"))
+            )
+            if str(caller_identity) != str(callee_identity):
                 record_forwarding_unresolved.concord(unresolved_row, (
                     "bound record identities differ",
                     (caller_key, str(caller_identity)),
-                    (callee_key, str(callee_record.get("identity"))),
+                    (callee_key, str(callee_identity)),
                 ))
                 continue
             record_forwarding_edges[(caller_key, callee_key)] = (
@@ -30296,6 +30556,88 @@ def _class_surface_ssa_program(
                 return None
             caller_function = all_functions[caller_symbol]
             sequence_members: set[int] = set()
+
+            def grow_pooled_row_column(
+                caller_record_id: int, callee_field: Any, member: Any,
+                callee_id: int,
+            ) -> Any:
+                """A pooled row leaf the caller's row record never read.
+
+                Woodshop ``_advance_newton_dt_system`` -> callsite 42 ->
+                ``_ensure_newton_dt_system``: the callee owns the rows of
+                ``items`` as declared row columns (every fixed-shape leaf,
+                ``custody`` among them); the caller indexes ``items`` and
+                its row record (``items[]``, paired by
+                ``call_record_pair_concordance``) holds columns only for the
+                leaves it reads.  Both are the same pooled representation
+                of one declared field, so the caller's column for the leaf
+                is the caller's own: mint it NOVEL(DECLARED_ROW_COLUMN,
+                the callee column's cell) and register it on that row
+                record.  Anything else is not grown.
+                """
+
+                from ..transmogrifier.ssa import SSARecordFieldStorage, SSAValue
+
+                accounting = dict(callee_formal.accounting or {})
+                table = all_record_tables.get(caller_symbol)
+                descriptor = (
+                    None if table is None
+                    else table.records.get(int(caller_record_id))
+                )
+                if (
+                    descriptor is None
+                    or member[0] != "value"
+                    or callee_field.storage is not SSARecordFieldStorage.SPAN
+                    or accounting.get("program_abi_row_identity") is None
+                    or str(accounting.get("program_abi_record") or "")
+                    != str(descriptor.identity)
+                ):
+                    return None
+                column_id = _frame_mint(
+                    caller_function, DECLARED_ROW_COLUMN,
+                    (_frame_value_cell(callee_function, int(callee_id)),),
+                    dtype=callee_formal.dtype,
+                    shape=tuple(callee_formal.shape or ()),
+                    stage=FRAME_LINK,
+                )
+                caller_parameter = next((
+                    (value.accounting or {}).get("program_abi_parameter")
+                    for value in caller_function.args
+                    if int(value.id) in {
+                        int(value_id)
+                        for field in descriptor.fields
+                        for value_id in field.value_ids
+                    }
+                    and (value.accounting or {}).get("program_abi_parameter")
+                    is not None
+                ), None)
+                column = SSAValue(
+                    int(column_id),
+                    dtype=callee_formal.dtype,
+                    shape=tuple(callee_formal.shape or ()),
+                    device=callee_formal.device,
+                    accounting={
+                        **accounting,
+                        **(
+                            {"program_abi_parameter": caller_parameter}
+                            if caller_parameter is not None else {}
+                        ),
+                        "program_abi_field_written": False,
+                    },
+                )
+                caller_function.args.append(column)
+                grown = replace(
+                    callee_field,
+                    name=f"{callee_field.name}.column"
+                    if not str(callee_field.name).endswith(".column")
+                    else callee_field.name,
+                    value_ids=(int(column.id),),
+                )
+                table.register(replace(
+                    descriptor, fields=(*descriptor.fields, grown),
+                ))
+                return grown
+
             member = _linked_caller_member(
                 str(caller_symbol), discovery_record, int(callee_formal.id),
                 all_record_tables.get(callee_symbol),
@@ -30304,6 +30646,7 @@ def _class_surface_ssa_program(
                 all_sequence_tables.get(caller_symbol),
                 {int(argument.id) for argument in caller_function.args},
                 sequence_members,
+                grow_caller_field=grow_pooled_row_column,
             )
             if member is None:
                 return None
@@ -35131,11 +35474,28 @@ def _class_surface_ssa_program(
                             selected_positions,
                             selected_outputs,
                         )):
+                            # The output index Const and its element address
+                            # are NOVEL(FRAME_SCAFFOLD) rows under the caller,
+                            # from the callee output they project (lane A,
+                            # 2026-10-03: the index was a bare id, so its
+                            # declared ``int`` width had no cell to derive
+                            # its ``scalar_integer_width`` row from).
+                            projected_cell = _frame_value_cell(
+                                callee, int(callee_output.id),
+                            )
                             index_value = SSAValue(
-                                mint_compiler_value_id(), dtype="int",
+                                mint_compiler_value_id(
+                                    caller, FRAME_SCAFFOLD, (projected_cell,),
+                                    dtype="int",
+                                ),
+                                dtype="int",
                             )
                             address = SSAValue(
-                                mint_compiler_value_id(), dtype="ptr",
+                                mint_compiler_value_id(
+                                    caller, FRAME_SCAFFOLD, (projected_cell,),
+                                    dtype="ptr",
+                                ),
+                                dtype="ptr",
                             )
                             caller_node = caller_graph.nodes.get(
                                 int(caller_id), {}
@@ -41910,6 +42270,9 @@ def _class_surface_ssa_program(
     # after the ordinary metadata propagation pass has run. Materialize the
     # concorded fact onto every final occurrence here, at the completed-module
     # seam, so native backends see the same rank the call linker proved.
+    from .concordance_declarations import (
+        VALUE_SHAPE_POLYMORPHISM as _VALUE_SHAPE_POLYMORPHISM_PAGE,
+    )
     from .identity_concordance import (
         authored_function_name as _authored_shape_owner,
         current_identity_book as _current_shape_book,
@@ -41936,11 +42299,19 @@ def _class_surface_ssa_program(
         ):
             _occurrences.setdefault(int(_value.id), []).append(_value)
         for _value_id, _values in _occurrences.items():
+            # A value whose copies (or callsites) stated different shapes
+            # has no single shape to materialize: the ABI settlement posted
+            # it on ``value_shape_polymorphism`` DERIVED from the disagreeing
+            # ``copy_value_shape`` cells.  Read that row, never a label on
+            # the ``value_shape`` ledger.
+            if _shape_book_instance.latest_ref(
+                _VALUE_SHAPE_POLYMORPHISM_PAGE, (_owner, int(_value_id)),
+            ) is not None:
+                continue
             _fact = _value_shape_page.latest((_owner, int(_value_id)))
             if not (
                 isinstance(_fact, tuple)
                 and len(_fact) >= 4
-                and str(_fact[0]) != "polymorphic"
                 and tuple(_fact[1] or ())
             ):
                 continue
@@ -44995,6 +45366,22 @@ def _lower_ast_source_to_ssa_impl(
                 ).items()
                 if parameter in parameters
             }
+            # An annotated parameter whose class the contract declares is
+            # that contract record (user decision (A)): the identity is the
+            # book's ``parameter_record_class`` join, so the keyed-field
+            # row-handle rule sees ONE identity for the class.
+            if extraction_policy is not None:
+                for parameter in tuple(selected):
+                    joined = _annotated_parameter_record_identity(
+                        qualified_function_name, parameter,
+                    )
+                    contract_record = None if joined is None else next((
+                        record for record in
+                        extraction_policy.program_abi.records.values()
+                        if str(record.identity) == joined
+                    ), None)
+                    if contract_record is not None:
+                        selected[parameter] = contract_record.receipt()
             selected.update({
                 parameter: record.receipt()
                 for parameter, record in records.items()
@@ -45132,6 +45519,22 @@ def _lower_ast_source_to_ssa_impl(
                 ).items()
                 if parameter in parameters
             }
+            # An annotated parameter whose class the contract declares is
+            # that contract record (user decision (A)): the identity is the
+            # book's ``parameter_record_class`` join, so the keyed-field
+            # row-handle rule sees ONE identity for the class.
+            if extraction_policy is not None:
+                for parameter in tuple(selected):
+                    joined = _annotated_parameter_record_identity(
+                        qualified_function_name, parameter,
+                    )
+                    contract_record = None if joined is None else next((
+                        record for record in
+                        extraction_policy.program_abi.records.values()
+                        if str(record.identity) == joined
+                    ), None)
+                    if contract_record is not None:
+                        selected[parameter] = contract_record.receipt()
             selected.update({
                 parameter: record.receipt()
                 for parameter, record in records.items()

@@ -315,51 +315,28 @@ _SHAPED_SSA_OPERATIONS = {
 
 
 def _shape_polymorphic_function(function_name: str) -> bool:
-    """Whether call-edge settlement proved multiple shapes for this helper."""
+    """Whether call-edge settlement proved multiple shapes for this helper.
 
-    try:
-        from .identity_concordance import (
-            authored_function_name,
-            current_identity_book,
-        )
-        authored_name = authored_function_name(function_name)
-        page = current_identity_book().page(
-            "linked_value_abi_polymorphism"
-        )
-        if any(
-            isinstance(row, tuple)
-            and len(row) >= 2
-            and authored_function_name(row[0]) == authored_name
-            for row in page.rows()
-        ):
-            return True
-        # The whole-program ABI fixed point owns the durable shape ledger.
-        # Its polymorphic marker must survive even when the two callsites'
-        # last concrete payload equals the marker's payload.
-        page = current_identity_book().page("value_shape")
-        return any(
-            isinstance(row, tuple)
-            and len(row) >= 2
-            and authored_function_name(row[0]) == authored_name
-            and (
-                any(
-                    isinstance(fact, tuple)
-                    and fact
-                    and str(fact[0]) == "polymorphic"
-                    for _column, fact in page.history(row)
-                )
-                or len({
-                    tuple(fact[1])
-                    for _column, fact in page.history(row)
-                    if isinstance(fact, tuple)
-                    and len(fact) > 1
-                    and tuple(fact[1] or ())
-                }) > 1
-            )
-            for row in page.rows()
-        )
-    except Exception:
+    Read from the book: the ABI settlement posts every proof on
+    ``value_shape_polymorphism`` (row (authored function, value), DERIVED
+    from the disagreeing ``copy_value_shape`` statements, cross-copy and
+    cross-callsite alike).  No label on the ``value_shape`` ledger is read
+    (lane A, 2026-10-03)."""
+
+    from .concordance_declarations import VALUE_SHAPE_POLYMORPHISM
+    from .identity_concordance import (
+        authored_function_name,
+        current_identity_book,
+    )
+
+    authored_name = authored_function_name(function_name)
+    page = current_identity_book().pages.get(VALUE_SHAPE_POLYMORPHISM.name)
+    if page is None:
         return False
+    return any(
+        authored_function_name(row[0]) == authored_name
+        for row in page.rows()
+    )
 
 
 def _settle_operand_shapes(
@@ -1648,7 +1625,26 @@ def propagate_repository_ssa_call_metadata(
                             changed |= settle_specialized_formal_descriptor(
                                 callee_name, formal, semantic_actual,
                             )
-                        changed |= enrich(function, int(actual.id), formal)
+                        # A shared in-place kernel (it declares an output
+                        # argument; the call carries none) owns only that
+                        # argument's storage.  Its other formals are filled
+                        # by every caller, so their shape is no fact about
+                        # this caller's actual.  ``m[2] = m[2] * 0.5;
+                        # m[:2] -= t``: ``index_assign_double``'s ``values``
+                        # formal took (2,) from the second store and was
+                        # written back onto the first store's scalar, which
+                        # then stored element 0 of a 2-span (0.0).
+                        kernel_output = (callee.metadata or {}).get(
+                            "ssa_output_argument"
+                        )
+                        if (
+                            specialized_call
+                            or kernel_output is None
+                            or int(kernel_output) == position
+                        ):
+                            changed |= enrich(
+                                function, int(actual.id), formal,
+                            )
 
                     callee_returns = returned(callee)
                     declared = tuple(map(

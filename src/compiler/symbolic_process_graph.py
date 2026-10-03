@@ -17,6 +17,9 @@ import sympy
 from sympy.matrices.expressions.matexpr import MatrixElement
 from sympy.core.function import AppliedUndef
 
+from ..common.tensors.topological_reducer import _set_operands
+from .concordance_declarations import INGEST_EDGE, REMOVE_NODE, REPLACE_INPUTS
+
 
 def matrix_component_name(base: str, index: Sequence[int]) -> str:
     """The declared scalar name of component ``index`` of matrix ``base``.
@@ -580,8 +583,14 @@ def _place_axis(ingest, node_id: int, position: int, rank: int) -> int:
     ordinary law value (shape ``(batch,)``) broadcasts against every axis.
     """
 
-    minus_one = ingest.add_node(sympy.Integer(-1))
-    zero = ingest.add_node(sympy.Integer(0))
+    # The axes are their own constants (``literal``: not memoized), never the
+    # law's ``-1`` / ``0`` numbers: one value read both as an axis and as a
+    # number could be neither (``symbolic_equation_compiler.
+    # _structural_constants`` keeps a constant an integer only when every
+    # consumer reads it as one).  Observed: the whole orbital set shares
+    # ``-1`` with ``-mu * ...`` and its quadrature read ``unsqueeze(-1.0)``.
+    minus_one = ingest.literal(-1)
+    zero = ingest.literal(0)
     for _ in range(position):
         node_id = ingest.op("unsqueeze", (node_id, zero))
     for _ in range(rank - position):
@@ -590,7 +599,7 @@ def _place_axis(ingest, node_id: int, position: int, rank: int) -> int:
 
 
 def _reduce_axes(ingest, term: int, rank: int, reduction: str) -> int:
-    zero = ingest.add_node(sympy.Integer(0))
+    zero = ingest.literal(0)    # the axis, its own constant (``_place_axis``)
     for _ in range(rank):
         term = ingest.op("prod" if reduction == "product" else "sum", (term, zero))
     return term
@@ -679,7 +688,12 @@ def lower_integral_declaration(declaration, graph, ingest) -> int:
         weighted = weighted * weight_symbol * half
     term = ingest.bound(weighted * declaration.fields["integrand"],
                         {**bindings, **weight_bindings})
-    return _reduce_axes(ingest, term, rank, "sum")
+    result = _reduce_axes(ingest, term, rank, "sum")
+    # The transform edge: the authored Integral lowered as its declared
+    # quadrature (``symbolic_transform``).
+    ingest.transform(result, "integral_quadrature",
+                     f"gauss_legendre_{len(rule)}x{rank}", declaration.sympy)
+    return result
 
 
 def _plug_reductions() -> None:
@@ -884,7 +898,7 @@ def ingest_sympy_expression(
                 if operation in _LOGICAL_FUNCTIONS
                 else {}
             ),
-            parents=parents,
+            parents=[],
             children=[],
         )
         graph.node_map[node_id] = value
@@ -895,11 +909,13 @@ def ingest_sympy_expression(
             node_id, node_type, operation, graph.G.nodes[node_id]["label"],
             value, source_cells,
         )
-        for parent_id, role in parents:
-            graph.G.add_edge(parent_id, node_id)
-            graph.G.nodes[parent_id].setdefault("children", []).append(
-                (node_id, role)
-            )
+        # Every operand edge is a row first (as ``build_from_ast`` writes
+        # one): ``_set_operands`` is the one writer of ``parents``,
+        # ``children`` and the networkx edge, and posts each position's
+        # Append on ``identity_transition`` DERIVED(operand cell, consumer
+        # cell) under this ingestion's scope.
+        if parents:
+            _set_operands(graph, node_id, parents, cause=INGEST_EDGE)
         return node_id
 
     _unbound = object()
@@ -950,6 +966,30 @@ def ingest_sympy_expression(
     ingest.bound = bound
     ingest.op = tensor_operation
     ingest.literal = literal
+
+    def post_transform(result_id: int, transform: str, detail: str,
+                       authored: sympy.Basic, extra_cells: Sequence[Any] = ()) -> None:
+        """Post the ``symbolic_transform`` row of a declared lowering:
+        DERIVED from the authored construct's cells (``authored``, or the
+        innermost authored subexpression being ingested), the
+        declaration's cells and the result node's cell."""
+        from .concordance_declarations import (
+            INGESTION, INGESTION_VALUE, SYMBOLIC_TRANSFORM, SymbolicTransformFact,
+        )
+        from .identity_concordance import Derived, Mode
+
+        book = provenance.book
+        result_cell = book.latest_ref(INGESTION_VALUE, (provenance.scope, int(result_id)))
+        cells = tuple(dict.fromkeys((
+            *provenance.node_cells(authored), *extra_cells,
+            *((result_cell,) if result_cell is not None else ()))))
+        book.post(
+            SYMBOLIC_TRANSFORM, (provenance.scope, int(result_id)),
+            SymbolicTransformFact(str(transform), str(detail)),
+            stage=INGESTION, provenance=Derived(cells), mode=Mode.CONCORD,
+        )
+
+    ingest.transform = post_transform
 
     def lower_declared(value: sympy.Basic) -> int:
         from . import bitops
@@ -1099,8 +1139,10 @@ def ingest_sympy_expression(
                 resolve_external_derivatives,
             )
 
+            resolved: list[str] = []
             derivative = resolve_external_derivatives(
-                derivative, graph.G.graph.get("external_derivatives") or {})
+                derivative, graph.G.graph.get("external_derivatives") or {},
+                resolved=resolved)
             undeclared = derivatives_of_externals(derivative)
             if undeclared:
                 raise UndeclaredExternalDerivative(
@@ -1109,6 +1151,17 @@ def ingest_sympy_expression(
             if not derivative.has(sympy.Derivative):
                 result_id = add_node(derivative)
                 memo[value] = result_id
+                if resolved:
+                    # The derivative of each external became a call to its
+                    # declared derivative external: the transform edge from
+                    # the authored Derivative and the host's declaration
+                    # (``external_derivative`` rows) to the result.
+                    declared = graph.G.graph.get("external_derivative_cells") or {}
+                    names = tuple(sorted(set(resolved)))
+                    post_transform(
+                        result_id, "resolve_external_derivative",
+                        ",".join(names), value,
+                        tuple(declared[name] for name in names if name in declared))
                 return result_id
             # SymPy could not reduce the interior: it holds content SymPy
             # cannot see into (an applied undefined function, a bound table
@@ -1461,11 +1514,10 @@ def ingest_sympy_expressions(
     if len(roots) != len(authored):
         raise RuntimeError("SymPy expression-set envelope lost an output")
 
-    for root in roots:
-        children = graph.G.nodes[root].get("children") or []
-        graph.G.nodes[root]["children"] = [
-            child for child in children if int(child[0]) != int(tuple_root)
-        ]
+    # The envelope's operand positions retire through the one writer (which
+    # drops the roots' ``children`` entries and the edges) before the node
+    # goes.
+    _set_operands(graph, tuple_root, [], cause=REMOVE_NODE)
     graph.G.remove_node(tuple_root)
     graph.node_map.pop(tuple_root, None)
     graph.roots = list(roots)
@@ -1922,15 +1974,12 @@ def ingest_sympy_process_model(
         node_id = next_id
         next_id += 1
         payload = copy.deepcopy(dict(data))
-        payload["parents"] = list(parents)
+        payload["parents"] = []
         payload["children"] = []
         graph.G.add_node(node_id, **payload)
         graph.node_map[node_id] = expression
-        for parent_id, role in parents:
-            graph.G.add_edge(parent_id, node_id)
-            graph.G.nodes[parent_id].setdefault("children", []).append(
-                (node_id, role)
-            )
+        if parents:
+            _set_operands(graph, node_id, list(parents), cause=INGEST_EDGE)
         return node_id
 
     # Inputs have no equations, so materialize their carried specifications
@@ -2034,12 +2083,14 @@ def ingest_sympy_process_model(
                 constant=copy.deepcopy(spec.constant),
             )
             if len(root_data.get("parents") or ()) == len(spec.parents):
-                root_data["parents"] = [
+                # roles respelled to the spec's: positions move, through
+                # the one writer
+                _set_operands(graph, root_id, [
                     (parent_id, role)
                     for (parent_id, _old_role), (_old_parent, role) in zip(
                         root_data["parents"], spec.parents
                     )
-                ]
+                ], cause=REPLACE_INPUTS)
         root_data["tensor"] = copy.deepcopy(dict(spec.tensor))
         root_data["bit_quanta"] = copy.deepcopy(dict(spec.bit_quanta))
         root_data.setdefault("attributes", {})[
@@ -2138,11 +2189,10 @@ def symbolically_reduce_process_graph(
         attributes={"symbolically_reduced": True},
         constant=None,
         tensor=dict(rebuilt.G.nodes[output_id].get("tensor") or {}),
-        parents=[(output_id, "value")],
+        parents=[],
         children=[],
     )
-    rebuilt.G.add_edge(output_id, store_id)
-    rebuilt.G.nodes[output_id]["children"].append((store_id, "value"))
+    _set_operands(rebuilt, store_id, [(output_id, "value")], cause=INGEST_EDGE)
     rebuilt.roots = [store_id]
     rebuilt.G.graph.update(
         source_kind="sympy_reduction",

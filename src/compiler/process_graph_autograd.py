@@ -196,12 +196,45 @@ def abstract_tensor_program_to_process_graph(
             "SSA AbstractTensor program has no entry block"
         )
 
+    from .concordance_declarations import (
+        ABSTRACT_TENSOR_PROGRAM_VALUE, AbstractTensorValueFact, INGESTION,
+        INGEST_SOURCE, INGESTION_VALUE, NodeFact,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Novel, current_identity_book,
+    )
+
     graph = ProcessGraph(materialize_memory=False)
     constants: dict[int, Any] = {}
     named_values = {
         int(getattr(getattr(value, "data", value), "value").id): str(name)
         for name, value in bindings.items()
     }
+    # The forward graph's own ingestion scope (as ``build_from_ast`` and
+    # sympy ingestion mint theirs).  The recorded SSATensorProgram is the
+    # source: each value it records that this bridge reads is one
+    # ``abstract_tensor_program_value`` root, and each node's
+    # ``ingestion_value`` row is DERIVED from the program values it ingests
+    # (posted below once the reachable graph is known).  Adjoint rows are
+    # then NOVEL(ADJOINT_OF, (forward cell,)), never
+    # ``Unsourced(FORWARD_GRAPH_UNSCOPED)``.
+    book = current_identity_book()
+    scope = book.mint_scope("ingestion:abstract_tensor", INGESTION)
+    program_cells: dict[int, Any] = {}
+    node_sources: dict[int, tuple[int, ...]] = {}
+
+    def post_program_value(
+        value_id: int, op: str, callee: str, shape: Any, dtype: Any,
+    ) -> None:
+        program_cells[int(value_id)] = book.post(
+            ABSTRACT_TENSOR_PROGRAM_VALUE, (scope, int(value_id)),
+            AbstractTensorValueFact(
+                str(op), str(callee), tuple(map(int, shape or ())),
+                str(dtype or "float64"),
+            ),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
 
     def add_node(
         value_id: int,
@@ -212,8 +245,12 @@ def abstract_tensor_program_to_process_graph(
         dtype: str | None = "float64",
         attributes: Mapping[str, Any] | None = None,
         constant: Any = None,
+        sources: Iterable[int] = (),
     ) -> None:
         value_id = int(value_id)
+        node_sources[value_id] = tuple(dict.fromkeys(
+            (value_id, *map(int, sources))
+        ))
         parent_ids = tuple(map(int, parents))
         parent_items = tuple(
             (parent, f"arg{index}")
@@ -244,6 +281,7 @@ def abstract_tensor_program_to_process_graph(
     for position, value in enumerate(function.args):
         value_id = int(value.id)
         name = named_values.get(value_id, f"argument_{position}")
+        post_program_value(value_id, "Arg", "", value.shape, value.dtype)
         add_node(
             value_id, "input", shape=value.shape, dtype=value.dtype,
             attributes={
@@ -264,6 +302,9 @@ def abstract_tensor_program_to_process_graph(
     }
 
     def const_value(value: Any) -> Any:
+        # A structural constant (opcode, dim, indices) decides the node being
+        # read: its program value is one of that node's sources.
+        read_values.append(int(value.id))
         try:
             return constants[int(value.id)]
         except KeyError as error:
@@ -280,6 +321,9 @@ def abstract_tensor_program_to_process_graph(
             if payload is None:
                 payload = instruction.attributes.get("value")
             constants[int(result.id)] = copy.deepcopy(payload)
+            post_program_value(
+                int(result.id), instruction.op, "", result.shape, result.dtype,
+            )
             add_node(
                 int(result.id), "const", shape=result.shape,
                 dtype=result.dtype, constant=payload,
@@ -287,6 +331,9 @@ def abstract_tensor_program_to_process_graph(
             )
             continue
         if instruction.op in {"reshape", "view"} and result is not None:
+            post_program_value(
+                int(result.id), instruction.op, "", result.shape, result.dtype,
+            )
             add_node(
                 int(result.id),
                 "reshape",
@@ -307,6 +354,13 @@ def abstract_tensor_program_to_process_graph(
         operation = None
         parents: tuple[int, ...] = ()
         attributes: dict[str, Any] = {}
+        # Program values beyond the result itself that decide this node:
+        # the broadcast buffers whose operands it recovers and, for a
+        # recognized mean, the sum and its denominator.
+        read_values: list[int] = []
+        post_program_value(
+            int(result.id), instruction.op, callee, result.shape, result.dtype,
+        )
         if callee == "matmul_double":
             operation, parents = "matmul", (int(args[0].id), int(args[1].id))
         elif callee == "fill_double":
@@ -413,6 +467,12 @@ def abstract_tensor_program_to_process_graph(
             # equal-shape kernel ABI.  ProcessGraph arithmetic owns the higher
             # implicit-broadcast semantics, so recover the original operands
             # and differentiate that semantic operation only once.
+            read_values.extend(
+                int(parent) for parent in parents
+                if parent in graph.G
+                and _operation(graph.G.nodes[parent]) == "broadcast_to"
+                and _parents(graph, parent)
+            )
             parents = tuple(
                 int(_parents(graph, parent)[0])
                 if parent in graph.G
@@ -444,10 +504,12 @@ def abstract_tensor_program_to_process_graph(
                 except (TypeError, ValueError):
                     denominator_scalar = float("nan")
                 if denominator_scalar == float(element_count):
+                    read_values.extend((int(numerator), int(denominator)))
                     operation, parents = "mean", (int(source),)
         add_node(
             int(result.id), operation, parents,
             shape=result.shape, dtype=result.dtype, attributes=attributes,
+            sources=read_values,
         )
 
     root_ids = tuple(int(value.value.id) for value in tensor_values)
@@ -462,7 +524,22 @@ def abstract_tensor_program_to_process_graph(
         reachable |= nx.ancestors(graph.G, root_id) | {root_id}
     graph.G = graph.G.subgraph(reachable).copy()
     graph.roots = list(dict.fromkeys(root_ids))
+    for node_id in sorted(graph.G.nodes):
+        data = graph.G.nodes[node_id]
+        book.post(
+            INGESTION_VALUE, (scope, int(node_id)),
+            NodeFact(
+                str(data.get("type") or ""), str(data.get("op") or ""),
+                str(data.get("label") or ""),
+            ),
+            stage=INGESTION,
+            provenance=Derived(tuple(
+                program_cells[value] for value in node_sources[int(node_id)]
+            )),
+            mode=Mode.CONCORD,
+        )
     graph.G.graph.update({
+        "ingestion_value_scope": scope,
         "graph_kind": "abstract_tensor_semantic_forward",
         "semantic_authority": "SSATensorProgram authored call recipes",
         "python_backward_callbacks": False,
@@ -1241,6 +1318,60 @@ def _compiled_backward_rule_process_graph() -> ProcessGraph:
     return graph
 
 
+def _post_backward_rule_definitions(
+    helpers: tuple, helper_sources: tuple[str, ...],
+) -> dict[str, Any]:
+    """Post this book's ``backward_rule_definition`` roots and return the
+    generated source's top-level definition name -> its declaration cell.
+
+    The rule graph is generated text, so its source constructs are the
+    declarations it is generated from: one NOVEL(INGEST_SOURCE) root per
+    ``BACKWARD_RULES`` entry (row ``("BACKWARD_RULES", opname)``, digest of
+    the entry's ``python`` declaration, which is what
+    ``_registry_function_source`` reads) and one per helper (row
+    ``(module, qualname)``, digest of the ``inspect.getsource`` text compiled
+    beside the rules).  Every book has the same rows with the same facts, so
+    the rebuild in a new book re-identifies each rule by its row instead of
+    re-minting the graph from nothing."""
+
+    import hashlib
+
+    from .concordance_declarations import (
+        BACKWARD_RULE_DEFINITION, BackwardRuleDefinitionFact,
+        BackwardRuleKind, INGESTION, INGEST_SOURCE,
+    )
+    from .identity_concordance import Mode, Novel, current_identity_book
+
+    book = current_identity_book()
+
+    def post(registry: str, name: str, kind: Any, text: str) -> Any:
+        return book.post(
+            BACKWARD_RULE_DEFINITION, (registry, name),
+            BackwardRuleDefinitionFact(
+                kind, hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            ),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+
+    cells: dict[str, Any] = {}
+    for helper, text in zip(helpers, helper_sources):
+        cells[str(helper.__name__)] = post(
+            str(helper.__module__), str(helper.__qualname__),
+            BackwardRuleKind.HELPER, text,
+        )
+    for opname, rule in BACKWARD_RULES.items():
+        python_rule = dict(rule.get("python") or {})
+        cells[f"bw_{opname}"] = post(
+            "BACKWARD_RULES", str(opname), BackwardRuleKind.RULE,
+            repr((
+                tuple(map(str, python_rule.get("parameters") or ())),
+                str(python_rule.get("body") or ""),
+            )),
+        )
+    return cells
+
+
 def _build_backward_rule_process_graph() -> ProcessGraph:
     """Compile the authored backward registry into one graph function table.
 
@@ -1275,13 +1406,17 @@ def _build_backward_rule_process_graph() -> ProcessGraph:
         normalize_index,
         flat_index_ids,
     )
+    helper_sources = tuple(
+        textwrap.dedent(inspect.getsource(helper)) for helper in helpers
+    )
     source = "\n\n".join((
-        *(textwrap.dedent(inspect.getsource(helper)) for helper in helpers),
+        *helper_sources,
         *(
             _registry_function_source(opname, rule)
             for opname, rule in BACKWARD_RULES.items()
         ),
     ))
+    source_cells = _post_backward_rule_definitions(helpers, helper_sources)
     graph = ProcessGraph(materialize_memory=False)
     graph.python_bindings = {
         **vars(registry),
@@ -1293,6 +1428,7 @@ def _build_backward_rule_process_graph() -> ProcessGraph:
         graph.build_from_ast(
             ast.parse(source, filename="<abstract-tensor-backward-rules>"),
             resolve_unresolved_parents=False,
+            source_cells=source_cells,
         )
     reduce_abstract_tensor_topology(graph)
     missing = tuple(
@@ -1569,6 +1705,96 @@ def _post_copied_node(
     )
 
 
+def _copy_argument_roles(
+    book: Any, source: ProcessGraph, source_id: int, scope: Any, target_id: int,
+) -> None:
+    """Re-post the ``callsite_argument_role`` rows of ``source``'s Call
+    ``source_id`` for its copy ``target_id`` in ``scope``, each DERIVED from
+    the row it copies (stage FORWARD_LOSS_BACKWARD_FUSION): the copy's own
+    declaration, joined to the backward builder's by an edge."""
+
+    from .concordance_declarations import (
+        CALLSITE_ARGUMENT_ROLE, FORWARD_LOSS_BACKWARD_FUSION,
+    )
+    from .identity_concordance import Derived, Mode
+
+    source_scope = source.G.graph.get("ingestion_value_scope")
+    if source_scope is None:
+        return
+    page = book.pages.get(CALLSITE_ARGUMENT_ROLE.name)
+    if page is None:
+        return
+    index = 0
+    while True:
+        cell = book.latest_ref(
+            CALLSITE_ARGUMENT_ROLE, (source_scope, int(source_id), index),
+        )
+        if cell is None:
+            return
+        book.post(
+            CALLSITE_ARGUMENT_ROLE, (scope, int(target_id), index),
+            page.latest(cell.row),
+            stage=FORWARD_LOSS_BACKWARD_FUSION,
+            provenance=Derived((cell,)), mode=Mode.CONCORD,
+        )
+        index += 1
+
+
+def declared_argument_role(graph: Any, node_id: int, position: int) -> Any:
+    """The declared role of argument ``position`` of Call ``node_id`` in
+    ``graph``, as ``(ArgumentRole, Ref)`` -- the ``callsite_argument_role``
+    row and its cell -- or None when no row declares it (a Call made from
+    authored source).  Read only: the node's identity cell is looked up
+    (canonical, then ingestion rows; nothing is posted), and when the row
+    is not keyed by that cell the identity's DERIVED edges are followed back
+    to the cell the declaration was posted for (a relabel or a copy)."""
+
+    from ..common.tensors.topological_reducer import node_ingestion_scopes
+    from .concordance_declarations import (
+        CALLSITE_ARGUMENT_ROLE, CANONICAL_VALUE, INGESTION_VALUE,
+    )
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    page = book.pages.get(CALLSITE_ARGUMENT_ROLE.name)
+    if page is None:
+        return None
+    metadata = getattr(getattr(graph, "G", graph), "graph", {}) or {}
+    node_id = int(node_id)
+    frontier: list = []
+    if metadata.get("canonical_value_ids") and metadata.get(
+        "lexical_read_scope"
+    ) is not None:
+        cell = book.latest_ref(
+            CANONICAL_VALUE, (metadata["lexical_read_scope"], node_id),
+        )
+        if cell is not None:
+            frontier.append(cell)
+    for scope in node_ingestion_scopes(graph):
+        cell = book.latest_ref(INGESTION_VALUE, (scope, node_id))
+        if cell is not None:
+            frontier.append(cell)
+    identity_pages = {INGESTION_VALUE.name, CANONICAL_VALUE.name}
+    seen: set = set()
+    while frontier:
+        cell = frontier.pop(0)
+        if cell.key in seen:
+            continue
+        seen.add(cell.key)
+        if cell.page.name == INGESTION_VALUE.name:
+            role = book.latest_ref(
+                CALLSITE_ARGUMENT_ROLE,
+                (cell.row[0], int(cell.row[1]), int(position)),
+            )
+            if role is not None:
+                return page.latest(role.row).role, role
+        frontier.extend(
+            source for source, _stage in book.edges_into(cell)
+            if source.page.name in identity_pages
+        )
+    return None
+
+
 class _AdjointBuilder:
     def __init__(self, forward: ProcessGraph) -> None:
         from .concordance_declarations import ADJOINT
@@ -1743,6 +1969,8 @@ class _AdjointBuilder:
         arguments: list[int] = [int(gradient)]
         argument_names: list[str] = ["g"]
         argument_forward_sources: list[int | None] = [None]
+        #: Argument position -> rule formal whose signature default it binds.
+        default_formals: dict[int, str] = {}
         parent_names: list[str] = []
         parent_cursor = 0
         for specification in parameter_specs[1:]:
@@ -1786,6 +2014,7 @@ class _AdjointBuilder:
                 arguments.append(self.constant(default, forward_id))
                 argument_names.append(name)
                 argument_forward_sources.append(None)
+                default_formals[len(arguments) - 1] = name
                 continue
             raise ProcessGraphAutogradError(
                 f"BACKWARD_RULES[{opname!r}] parameter {name!r} has no "
@@ -1797,18 +2026,6 @@ class _AdjointBuilder:
                 f"{len(parents)} forward operands at node {forward_id}"
             )
         entry = self.backward.function_table.entry(f"bw_{opname}")
-        # Each argument's role, declared where it is bound: ``gradient``
-        # (the upstream g), ``operand`` (a forward value the rule
-        # differentiates through, a tensor), or ``metadata`` (an operator
-        # attribute or signature default: axis, keepdim, shape, ...).  The
-        # planner reads this declaration instead of guessing tensor-ness
-        # from whether a shape descriptor happens to exist.
-        argument_roles = tuple(
-            "gradient" if index == 0
-            else "operand" if source is not None
-            else "metadata"
-            for index, source in enumerate(argument_forward_sources)
-        )
         call = self.add(
             "Call",
             tuple(
@@ -1820,9 +2037,12 @@ class _AdjointBuilder:
                 "callee_ref": int(entry.reference.address),
                 "backward_rule": opname,
                 "argument_names": tuple(argument_names),
-                "argument_roles": argument_roles,
             },
             source_forward_id=forward_id,
+        )
+        self._post_argument_roles(
+            call, entry.graph, forward_id, arguments,
+            argument_forward_sources, argument_names, default_formals,
         )
         for index, source in enumerate(argument_forward_sources):
             if source is not None:
@@ -1851,6 +2071,80 @@ class _AdjointBuilder:
             )
             results.append((int(parent), int(value)))
         return tuple(results)
+
+    def _forward_cell(self, forward_id: int) -> Any:
+        forward_id = int(forward_id)
+        if forward_id not in self.forward_cells:
+            self.forward_cells[forward_id] = _graph_node_cell(
+                self.forward, forward_id,
+            )
+        return self.forward_cells[forward_id]
+
+    def _post_argument_roles(
+        self,
+        call: int,
+        rule_graph: Any,
+        forward_id: int,
+        arguments: list[int],
+        argument_forward_sources: list[int | None],
+        argument_names: list[str],
+        default_formals: Mapping[int, str],
+    ) -> None:
+        """Declare each argument's role of backward-rule Call ``call`` on
+        page ``callsite_argument_role`` (scope, call, argument), stage
+        ADJOINT, DERIVED from where the builder bound it:
+
+        - argument 0, GRADIENT: the upstream gradient's adjoint cell;
+        - OPERAND: the cell of the forward value bound to the formal;
+        - METADATA from an operator attribute: the forward operator's cell;
+        - METADATA from a signature default: the rule formal's cells in the
+          compiled rule graph (``_formal_identity_cells``: the Input's
+          identity cell and its default's ``scalar_parameter`` row).
+
+        A forward graph with no identity scope has no forward cell:
+        ``Unsourced(FORWARD_GRAPH_UNSCOPED)``.  The planner's catalogue fold
+        reads these rows (``declared_argument_role``) and cites them."""
+
+        from .concordance_declarations import (
+            ADJOINT, ArgumentRole, ArgumentRoleFact, CALLSITE_ARGUMENT_ROLE,
+            FORWARD_GRAPH_UNSCOPED, INGESTION_VALUE,
+        )
+        from .glsl_deployment_strategy import _formal_identity_cells
+        from .identity_concordance import Derived, Mode, Unsourced
+
+        scope = self.backward.G.graph["ingestion_value_scope"]
+        for index, source in enumerate(argument_forward_sources):
+            if index == 0:
+                role = ArgumentRole.GRADIENT
+                cells = (self.book.latest_ref(
+                    INGESTION_VALUE, (scope, int(arguments[0])),
+                ),)
+            elif source is not None:
+                role = ArgumentRole.OPERAND
+                cells = (self._forward_cell(source),)
+            elif index in default_formals:
+                role = ArgumentRole.METADATA
+                cells = tuple(_formal_identity_cells(
+                    rule_graph, default_formals[index],
+                ))
+                if not cells:
+                    raise ProcessGraphAutogradError(
+                        f"backward rule formal {argument_names[index]!r} of "
+                        f"call {call} has no identity cell for its default"
+                    )
+            else:
+                role = ArgumentRole.METADATA
+                cells = (self._forward_cell(forward_id),)
+            self.book.post(
+                CALLSITE_ARGUMENT_ROLE, (scope, int(call), int(index)),
+                ArgumentRoleFact(role),
+                stage=ADJOINT,
+                provenance=(
+                    Derived(cells) if all(cell is not None for cell in cells)
+                    else Unsourced(FORWARD_GRAPH_UNSCOPED)
+                ),
+                mode=Mode.CONCORD,
+            )
 
     def unary(self, op: str, value: int, source: int) -> int:
         return self.add(
@@ -2428,6 +2722,7 @@ def fuse_forward_loss_backward(
             book, motion_scope, new_id, data,
             _graph_node_cell(backward, node_id),
         )
+        _copy_argument_roles(book, backward, node_id, motion_scope, new_id)
         if node_id in output_by_seed:
             seed_ids[output_by_seed[node_id]] = new_id
 

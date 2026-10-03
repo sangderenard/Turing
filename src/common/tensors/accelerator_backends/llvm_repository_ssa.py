@@ -136,14 +136,23 @@ class _FunctionImporter:
         self.values: dict[tuple[str, str], SSAValue] = {}
         self.constants: dict[tuple[str, str], SSAValue] = {}
         self.constant_attributes: dict[int, dict[str, Any]] = {}
+        #: Every value this import numbers, by id: (position in the kernel,
+        #: kind, LLVM spelling).  The kernel's identity rows are posted from
+        #: it per compile book (``post_repository_kernel_identity``).
+        self.value_origins: dict[int, tuple[int, str, str]] = {}
         self.shortfalls: list[LLVMRepositorySSAShortfall] = []
         self.blocks = {
             str(block.name): BasicBlock(str(block.name))
             for block in llvm_function.blocks
         }
 
-    def fresh(self, dtype: str | None) -> SSAValue:
+    def fresh(
+        self, dtype: str | None, kind: str = "synthetic", text: str = "",
+    ) -> SSAValue:
         value = SSAValue(self.next_value_id, dtype=dtype)
+        self.value_origins[int(value.id)] = (
+            len(self.value_origins), str(kind), str(text),
+        )
         self.next_value_id += 1
         return value
 
@@ -157,7 +166,9 @@ class _FunctionImporter:
     def define_values(self) -> list[SSAValue]:
         arguments = []
         for argument in self.llvm_function.arguments:
-            value = self.fresh(str(argument.type))
+            value = self.fresh(
+                str(argument.type), "argument", str(argument.name),
+            )
             self.values[self._value_key(argument)] = value
             arguments.append(value)
         for block in self.llvm_function.blocks:
@@ -171,7 +182,7 @@ class _FunctionImporter:
                 if str(instruction.type) == "void":
                     continue
                 self.values[self._value_key(instruction)] = self.fresh(
-                    str(instruction.type)
+                    str(instruction.type), "instruction", str(instruction.name),
                 )
         return arguments
 
@@ -181,7 +192,9 @@ class _FunctionImporter:
         key = self._value_key(operand)
         if key in self.constants:
             return
-        value = self.fresh(str(operand.type))
+        value = self.fresh(
+            str(operand.type), "constant", str(operand).strip(),
+        )
         self.constants[key] = value
         self.constant_attributes[value.id] = {
             "llvm_literal": str(operand).strip(),
@@ -195,7 +208,7 @@ class _FunctionImporter:
             return self.constants[key]
         # Global storage and declarations are ABI roots, not instructions in
         # the current function.  Preserve them as explicit Load arguments.
-        value = self.fresh(str(operand.type))
+        value = self.fresh(str(operand.type), "global", str(operand.name))
         self.values[key] = value
         return value
 
@@ -320,7 +333,7 @@ class _FunctionImporter:
             )
             if not is_last:
                 self.blocks[next_name] = BasicBlock(next_name)
-            condition = self.fresh("i1")
+            condition = self.fresh("i1", "switch_condition", next_name)
             current.instrs.extend((
                 Instr(
                     Handler.Eq.value,
@@ -372,6 +385,8 @@ class _FunctionImporter:
         return_type = str(self.llvm_function.global_value_type).split(
             "(", 1
         )[0].strip()
+        import hashlib
+
         metadata: dict[str, Any] = {
             "llvm_argument_names": tuple(
                 str(argument.name) for argument in self.llvm_function.arguments
@@ -379,7 +394,14 @@ class _FunctionImporter:
             "llvm_return_dtype": return_type,
         }
         if return_type != "void":
-            metadata["return_value"] = self.fresh(return_type)
+            metadata["return_value"] = self.fresh(return_type, "return", "")
+        # The kernel's source record, read by ``post_repository_kernel_identity``
+        # in each compile book: the digest of its LLVM text and where every
+        # value it numbered sits in it.  Provenance only; no decision reads it.
+        metadata["llvm_repository_kernel"] = (
+            hashlib.sha256(str(self.llvm_function).encode("utf-8")).hexdigest(),
+            dict(self.value_origins),
+        )
         return (
             Function(
                 str(self.llvm_function.name),
@@ -430,8 +452,84 @@ def import_llvm_to_repository_ssa(
     )
 
 
+def post_repository_kernel_identity(function: Any, book: Any = None) -> bool:
+    """Post an imported kernel's identity rows on ``book`` (default: the
+    active compile's), once per book.
+
+    The import is cached process-wide (``c_backend_repository_ssa_reference``
+    is an ``lru_cache``), so its Function objects reach many books; each
+    book gets one ``repository_kernel_definition`` root per kernel,
+    NOVEL(INGEST_SOURCE) keyed by the kernel name with the digest of its LLVM
+    text, one ``repository_kernel_value`` row per imported value at its
+    position in the kernel DERIVED from the root, and the value's
+    ``ssa_value`` row DERIVED from that.  False when ``function`` is not an
+    imported kernel."""
+
+    from ....compiler.concordance_declarations import (
+        INGESTION, INGEST_SOURCE, REPOSITORY_KERNEL_DEFINITION,
+        REPOSITORY_KERNEL_VALUE, SSA_VALUE, RepositoryKernelDefinitionFact,
+        RepositoryKernelValueFact, SSAValueFact, SSAValueOrigin,
+    )
+    from ....compiler.identity_concordance import (
+        Derived, Mode, Novel, current_identity_book,
+    )
+    from ....compiler.ssa_record_return_state import function_scope_of
+
+    record = (getattr(function, "metadata", None) or {}).get(
+        "llvm_repository_kernel"
+    )
+    if record is None:
+        return False
+    if book is None:
+        book = current_identity_book()
+    digest, origins = record
+    kernel = str(function.name)
+    root_row = ("llvm_repository", kernel)
+    if book.latest_ref(REPOSITORY_KERNEL_DEFINITION, root_row) is not None:
+        return True
+    root = book.post(
+        REPOSITORY_KERNEL_DEFINITION, root_row,
+        RepositoryKernelDefinitionFact(str(digest)),
+        stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
+    values: dict[int, SSAValue] = {int(value.id): value for value in function.args}
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            for value in (*instruction.args, instruction.res):
+                if value is not None:
+                    values.setdefault(int(value.id), value)
+    returned = function.metadata.get("return_value")
+    if returned is not None:
+        values.setdefault(int(returned.id), returned)
+    scope = function_scope_of(function)
+    for value_id, (position, kind, text) in sorted(
+        origins.items(), key=lambda item: item[1][0],
+    ):
+        value = values.get(int(value_id))
+        if value is None:
+            continue
+        cell = book.post(
+            REPOSITORY_KERNEL_VALUE, (root_row, int(position)),
+            RepositoryKernelValueFact(str(kind), str(text)),
+            stage=INGESTION, provenance=Derived((root,)), mode=Mode.CONCORD,
+        )
+        if book.latest_ref(SSA_VALUE, (scope, int(value_id))) is None:
+            book.post(
+                SSA_VALUE, (scope, int(value_id)),
+                SSAValueFact(
+                    value.dtype, tuple(value.shape or ()),
+                    SSAValueOrigin.MINTED,
+                ),
+                stage=INGESTION, provenance=Derived((cell,)),
+                mode=Mode.REVISE,
+            )
+    return True
+
+
 __all__ = [
     "LLVMRepositorySSAResult",
     "LLVMRepositorySSAShortfall",
     "import_llvm_to_repository_ssa",
+    "post_repository_kernel_identity",
 ]

@@ -175,7 +175,43 @@ def _propagate_scalar_dtypes(functions) -> None:
         "LAnd", "LOr", "LNot", "LXor",
     }
 
+    from .concordance_declarations import (
+        CONST_DECLARED_WIDTH_NOT_ON_BOOK, INFERRED_INTEGER_WIDEN,
+        IntegerWidthDecision, IntegerWidthFact, SCALAR_DTYPE_SETTLEMENT,
+        SCALAR_INTEGER_WIDTH, SSA_VALUE, WIDENED_VALUE_NOT_ON_BOOK,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Novel, Unsourced, current_identity_book,
+    )
+    from .ssa_record_return_state import function_scope_of
+
+    narrow_integers = {"int", "int8", "int16", "int32", "i32", "i64"}
+    book = current_identity_book()
+
+    from ..common.tensors.accelerator_backends.llvm_repository_ssa import (
+        post_repository_kernel_identity,
+    )
+
     for function in functions.values():
+        scope = function_scope_of(function)
+        # An imported repository kernel's values get their identity rows on
+        # this book (its definition root and per-value rows) before any
+        # decision here reads them.
+        post_repository_kernel_identity(function, book)
+
+        def value_cell(value_id: int):
+            """The value's ``ssa_value`` cell and its fact, or (None, None)."""
+            ref = book.latest_ref(SSA_VALUE, (scope, int(value_id)))
+            if ref is None:
+                return None, None
+            return ref, book.pages[SSA_VALUE.name].cells.get(
+                (ref.row, ref.column)
+            )
+
+        # The keep/widen statement for each result the integer-width rule
+        # applied to, posted on ``scalar_integer_width`` once the fixed point
+        # settles: (decision, source dtype, settled dtype, source cell).
+        width_decisions: dict[int, tuple] = {}
         values: dict[int, list[SSAValue]] = {}
         instructions = []
         for value in function.args:
@@ -286,21 +322,71 @@ def _propagate_scalar_dtypes(functions) -> None:
                 # kernel read as i32 [2, 0]: zero output extent, the
                 # broadcast temporary never written, and the linear
                 # forward/loss/backward motion ran NaN from ``x @ W + b``.
-                declared_const = bool(
-                    instruction.op == "Const"
-                    and str(instruction.res.dtype or "")
-                    in _DECLARED_LITERAL_DTYPES
-                    and inferred == str(instruction.res.dtype or "")
-                )
-                if not declared_const and inferred in {
-                    "int", "int8", "int16", "int32", "i32", "i64",
-                }:
-                    inferred = "int64"
+                #
+                # The decision is a posted row (lane A, 2026-10-03), one per
+                # (function scope, result) on ``scalar_integer_width``:
+                # KEPT_DECLARED is DERIVED from the Const's ``ssa_value``
+                # cell, whose fact states the declared width (the minter
+                # posted it: ``tensor_ssa_lowering``'s ``int_vector``, the
+                # control builder's literals).  A Const the book never saw
+                # (a repository kernel's ``llvm_literal``, imported with no
+                # ``ssa_value`` rows) keeps its declared width as before but
+                # the row is ``Unsourced(CONST_DECLARED_WIDTH_NOT_ON_BOOK)``:
+                # the audit's worklist names the importer that owes the cell.
+                # WIDENED is NOVEL(INFERRED_INTEGER_WIDEN) from the value's
+                # own ``ssa_value`` cell.  The book and the instruction
+                # disagreeing about a declared width is a missing edge: raise.
+                if inferred in narrow_integers:
+                    declared = str(instruction.res.dtype or "")
+                    if (
+                        instruction.op == "Const"
+                        and declared in _DECLARED_LITERAL_DTYPES
+                        and inferred == declared
+                    ):
+                        declared_cell, declared_fact = value_cell(result_id)
+                        if declared_cell is not None and str(
+                            getattr(declared_fact, "dtype", None)
+                        ) != declared:
+                            raise ValueError(
+                                "declared integer width disagreement for "
+                                f"{(scope, result_id)!r}: instruction="
+                                f"{declared!r}, book={declared_fact!r}"
+                            )
+                        width_decisions[result_id] = (
+                            IntegerWidthDecision.KEPT_DECLARED,
+                            declared, declared, declared_cell,
+                        )
+                    else:
+                        width_decisions[result_id] = (
+                            IntegerWidthDecision.WIDENED,
+                            str(inferred), "int64", value_cell(result_id)[0],
+                        )
+                        inferred = "int64"
                 if inferred is not None and dtype_of.get(result_id) != inferred:
                     dtype_of[result_id] = str(inferred)
                     changed = True
             if not changed:
                 break
+
+        for result_id, (
+            decision, source_dtype, dtype, source_cell,
+        ) in width_decisions.items():
+            fact = IntegerWidthFact(decision, source_dtype, dtype)
+            if source_cell is None:
+                provenance = Unsourced(
+                    CONST_DECLARED_WIDTH_NOT_ON_BOOK
+                    if decision is IntegerWidthDecision.KEPT_DECLARED
+                    else WIDENED_VALUE_NOT_ON_BOOK
+                )
+            elif decision is IntegerWidthDecision.KEPT_DECLARED:
+                provenance = Derived((source_cell,))
+            else:
+                provenance = Novel(INFERRED_INTEGER_WIDEN, (source_cell,))
+            book.post(
+                SCALAR_INTEGER_WIDTH, (scope, int(result_id)), fact,
+                stage=SCALAR_DTYPE_SETTLEMENT, provenance=provenance,
+                mode=Mode.CONCORD,
+            )
 
         for value_id, dtype in dtype_of.items():
             for value in values.get(value_id, ()):

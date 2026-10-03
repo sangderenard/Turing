@@ -76,7 +76,8 @@ class UndeclaredExternalDerivative(TypeError):
     """A Derivative of an external whose derivative the host did not declare."""
 
 
-def resolve_external_derivatives(expression: Any, derivatives: Mapping[Any, Any]) -> Any:
+def resolve_external_derivatives(expression: Any, derivatives: Mapping[Any, Any],
+                                 resolved: list | None = None) -> Any:
     """Replace each derivative of an external by its declared derivative external.
 
     ``derivatives`` maps an undefined Function class to the undefined
@@ -100,6 +101,9 @@ def resolve_external_derivatives(expression: Any, derivatives: Mapping[Any, Any]
                     f"external {current.__name__!r} has no declared derivative "
                     f"(needed for {function.__name__!r} order {order}); declare it "
                     "with compile_sympy_equations(external_derivatives=...)")
+            if resolved is not None:
+                # every declaration the chain read (r1 -> v1, v1 -> a1)
+                resolved.append(str(current.__name__))
             current = following
         return current(argument)
 

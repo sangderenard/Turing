@@ -91,34 +91,49 @@ def _declares_integer(annotation: Any) -> bool:
     return "int" in names and not names & {"float", "Any", "AbstractTensor", "object"}
 
 
-def _structural_operand(operation: str, position: int) -> bool:
-    """Whether operand ``position`` of tensor ``operation`` is structural.
+def _operation_parameter_cell(operation: str, position: int) -> Any:
+    """The book cell of operand ``position`` of tensor ``operation``'s
+    declared parameter, or None when the operation declares none there.
 
     Read from the operation's DECLARED signature on ``AbstractTensor`` (the
-    class the AbstractTensor stage calls): a parameter annotated as an
-    integer (an axis, a dimension, a count) is structural.  The operand
-    position maps onto the signature by the call form the materializer
-    spells (``TENSOR_CALL_FORMS``): a receiver call passes operand 0 as
-    ``self``."""
+    class the AbstractTensor stage calls) and posted as a
+    ``tensor_operation_parameter`` row (NOVEL from the declaration): the
+    parameter, its annotation and whether it declares an integer.  The
+    operand position maps onto the signature by the call form the
+    materializer spells (``TENSOR_CALL_FORMS``): a receiver call's operand 0
+    is ``self``, the signature's first parameter, so operand ``position`` is
+    parameter ``position`` either way."""
 
     from ..common.tensors.abstraction import AbstractTensor
+    from .concordance_declarations import (
+        DECLARED_SIGNATURE, INGESTION, TENSOR_OPERATION_PARAMETER,
+        TensorParameterFact,
+    )
+    from .identity_concordance import Mode, Novel, current_identity_book
     from .ssa_python_materializer import TENSOR_CALL_FORMS
 
     if operation not in TENSOR_CALL_FORMS:
-        return False
+        return None
     try:
         signature = inspect.signature(getattr(AbstractTensor, operation))
     except (TypeError, ValueError, AttributeError):
-        return False
+        return None
     parameters = [
         parameter for parameter in signature.parameters.values()
         if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)]
-    # A receiver call's operand 0 is ``self``, the signature's first
-    # parameter; a class (static) call has no ``self``.  Either way operand
-    # ``position`` is parameter ``position``.
     if position >= len(parameters):
-        return False
-    return _declares_integer(parameters[position].annotation)
+        return None
+    parameter = parameters[position]
+    annotation = (
+        "" if parameter.annotation is inspect.Parameter.empty
+        else str(parameter.annotation))
+    return current_identity_book().post(
+        TENSOR_OPERATION_PARAMETER, (str(operation), int(position)),
+        TensorParameterFact(parameter.name, annotation,
+                            _declares_integer(parameter.annotation)),
+        stage=INGESTION, provenance=Novel(DECLARED_SIGNATURE, ()),
+        mode=Mode.CONCORD,
+    )
 
 
 def _tensor_operation_signatures() -> tuple[tuple[str, str], ...]:
@@ -136,37 +151,72 @@ def _tensor_operation_signatures() -> tuple[tuple[str, str], ...]:
     return tuple(rows)
 
 
-def _structural_constants(graph: Any) -> frozenset[int]:
-    """Constant nodes every consumer reads as a structural integer operand.
+def _post_constant_roles(graph: Any) -> dict[int, Any]:
+    """Post each constant node's role and return the rows by node.
 
     aa5f1aac made every plain-int constant a float64 value (a Piecewise arm
     ``1`` stored as ``i64 1`` read back as 5e-324).  A constant is a number
     there because its consumer reads a value.  The quadrature's axis
     constants (``unsqueeze(-1)``, ``sum(0)``) are read by consumers whose
     declared parameter is an integer; floatified they became
-    ``unsqueeze(-1.0)`` and the AbstractTensor stage raised.  The consuming
-    operation's declared signature decides, never the value or a name; a
-    constant with any value consumer stays a number."""
+    ``unsqueeze(-1.0)`` and the AbstractTensor stage raised.
 
-    structural = set()
+    The decision is a ``constant_role`` row: ``structural`` (int64) when
+    every use is at a parameter its operation declares an integer, else
+    ``numeric`` (float64).  It is DERIVED from the constant's
+    ``ingestion_value`` cell, every consumer's cell and the declared
+    parameter cell of every use that has one; the caller reads the dtype
+    back from the row.  Never the value, never a name."""
+
+    from .concordance_declarations import (
+        CONSTANT_ROLE, INGESTION, INGESTION_VALUE, ConstantRoleFact,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+
+    book = current_identity_book()
+    scope = graph.G.graph.get("ingestion_value_scope")
+    if scope is None:
+        raise RuntimeError("constant roles need the ingestion's value scope")
+    scope = tuple(scope)
+    rows: dict[int, Any] = {}
     for node_id, data in graph.G.nodes(data=True):
         if str(data.get("type") or data.get("op") or "").casefold() not in {
                 "const", "constant"}:
             continue
+        constant_cell = book.latest_ref(INGESTION_VALUE, (scope, int(node_id)))
+        if constant_cell is None:
+            raise RuntimeError(f"constant node {node_id} has no ingestion_value row")
+        sources = [constant_cell]
         uses = []
         for consumer in graph.G.successors(node_id):
             consumer_data = graph.G.nodes[consumer]
+            consumer_cell = book.latest_ref(INGESTION_VALUE, (scope, int(consumer)))
+            if consumer_cell is not None:
+                sources.append(consumer_cell)
             operation = (consumer_data.get("attributes") or {}).get("tensor_operation")
             for parent, role in consumer_data.get("parents") or ():
                 if int(parent) != int(node_id):
                     continue
                 position = (int(str(role).split(":", 1)[1])
                             if str(role).startswith("arg:") else None)
-                uses.append(bool(operation) and position is not None
-                            and _structural_operand(str(operation), position))
-        if uses and all(uses):
-            structural.add(int(node_id))
-    return frozenset(structural)
+                parameter_cell = (
+                    _operation_parameter_cell(str(operation), position)
+                    if operation and position is not None else None)
+                if parameter_cell is not None:
+                    sources.append(parameter_cell)
+                uses.append(
+                    parameter_cell is not None
+                    and book.page(parameter_cell.page).latest(parameter_cell.row).integer)
+        structural = bool(uses) and all(uses)
+        fact = ConstantRoleFact(
+            "structural" if structural else "numeric",
+            "int64" if structural else "float64")
+        book.post(
+            CONSTANT_ROLE, (scope, int(node_id)), fact, stage=INGESTION,
+            provenance=Derived(tuple(dict.fromkeys(sources))), mode=Mode.CONCORD,
+        )
+        rows[int(node_id)] = book.page(CONSTANT_ROLE).latest((scope, int(node_id)))
+    return rows
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +387,19 @@ def _compile_sympy_equations_uncached(
         ),
         derivatives,
     )
+    # The host's derivative declarations as book cells: a resolved
+    # Derivative's ``symbolic_transform`` row derives from them.
+    from .concordance_declarations import EXTERNAL_DERIVATIVE
+    from .identity_concordance import current_identity_book
+
+    program_key = _symbolic_program_key(
+        name, tuple(sympy.srepr(equation) for equation in authored))
+    graph.G.graph["external_derivative_cells"] = {
+        str(function.__name__): cell
+        for function in derivatives
+        for cell in (current_identity_book().latest_ref(
+            EXTERNAL_DERIVATIVE, (program_key, str(function.__name__))),)
+        if cell is not None}
     roots = ingest_sympy_expressions(
         graph,
         tuple(row.expression for row in declarations),
@@ -380,9 +443,10 @@ def _compile_sympy_equations_uncached(
     # These equations are a floating physical model.  SymPy retains exact
     # integer/rational literals in the authored form, while the compiled ABI
     # consistently carries scalar f64 values across all native targets.
-    # A structural constant (an axis, a count: ``_structural_constants``)
+    # A structural constant (an axis, a count) keeps its integer: the
+    # ``constant_role`` row (``_post_constant_roles``) decides.
     # keeps its integer.
-    structural = _structural_constants(graph)
+    constant_roles = _post_constant_roles(graph)
     for _node_id, data in graph.G.nodes(data=True):
         # A relation's result is not a value of the model, it is a
         # predicate, and blanket float64 erased that. The backend cannot
@@ -395,9 +459,12 @@ def _compile_sympy_equations_uncached(
             "dtype": "bool" if is_predicate_operation(spelling) else dtype,
             "shape": (),
         }
-        if int(_node_id) in structural:
-            data["tensor"]["dtype"] = "int64"
+        role = constant_roles.get(int(_node_id))
+        if role is not None and role.role == "structural":
+            # read from the row; the attribute cites it
+            data["tensor"]["dtype"] = role.dtype
             data.setdefault("attributes", {})["structural_constant"] = True
+            data["attributes"]["constant_role_row"] = int(_node_id)
         elif str(data.get("type") or data.get("op") or "").casefold() in {
             "const", "constant",
         }:
@@ -784,16 +851,25 @@ def _post_symbolic_outputs(
 
 
 def _pipeline_implementation() -> str:
-    """Digest of the lowering implementation every cached layer depends on."""
+    """Digest of the lowering implementation every cached layer depends on.
+
+    The ingestion module and the externals module are digested whole: the
+    declared lowerings (quadrature axes, reductions, derivative resolution)
+    live in helpers the named callables reach, and a stale entry served the
+    old axis constants after ``_place_axis`` changed."""
+
+    from . import external_functions, symbolic_process_graph
 
     return callable_digest(
+        symbolic_process_graph,
+        external_functions,
         _compile_sympy_equations_uncached,
         declared_symbolic_outputs,
         _scalar_output,
         SymbolicOutputDeclaration,
         declared_external_functions,
-        _structural_constants,
-        _structural_operand,
+        _post_constant_roles,
+        _operation_parameter_cell,
         _declares_integer,
         matrix_component_name,
         ingest_sympy_expression,

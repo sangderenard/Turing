@@ -75,6 +75,181 @@ def cache_root() -> Path:
     return root
 
 
+# ---------------------------------------------------------------------------
+# Compiler identity of a built piece.
+#
+# A piece cache keyed by its equations alone survives compiler fixes: the
+# batch-4 propellant-supply piece kept a scalar branch on lane 0 after
+# ssa_python_materializer learned to spell Select as ``where`` (2026-10-03,
+# docs/concordance_census/CONTINUATION_batch_piecewise_lane0.md).  The build
+# therefore RECORDS which compiler made it -- a content digest per ``src.*``
+# module loaded when the build finished -- on the piece and as one book row.
+# It is a record, not a cache key: a load compares it with the sources on
+# disk and names the modules that changed.
+# ---------------------------------------------------------------------------
+
+_SRC_ROOT = Path(__file__).resolve().parents[1]
+#: Per-process content digests by absolute path: each source file is hashed
+#: at most once per process, so the check on every cached load is a dict read.
+_SOURCE_DIGESTS: dict[str, str | None] = {}
+#: Per-process verdicts by record (frozen, hashable): the same record is
+#: checked once per process.
+_STALENESS: dict[Any, tuple[str, ...]] = {}
+
+
+@dataclass(frozen=True)
+class PieceCompilerRecord:
+    """The compiler a piece was built by: ``(module, path relative to the
+    turing root, sha256 of its content)`` for every ``src.*`` module loaded
+    when the build finished (the route's import closure, plus whatever else
+    the building process had loaded -- a superset can only over-report
+    staleness, never hide it), and one digest over all of them."""
+
+    digest: str
+    modules: tuple[tuple[str, str, str], ...]
+
+
+def _source_digest(path: Path) -> str | None:
+    key = str(path)
+    if key not in _SOURCE_DIGESTS:
+        try:
+            _SOURCE_DIGESTS[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            _SOURCE_DIGESTS[key] = None
+    return _SOURCE_DIGESTS[key]
+
+
+def _combined_digest(modules) -> str:
+    return hashlib.sha256("\n".join(
+        f"{name} {relative} {digest}" for name, relative, digest in modules
+    ).encode("utf-8")).hexdigest()
+
+
+def route_compiler_record() -> PieceCompilerRecord:
+    """The compiler identity of a build finishing now in this process."""
+    modules = []
+    for name, module in sorted(sys.modules.items()):
+        if module is None or not (name == "src" or name.startswith("src.")):
+            continue
+        filename = getattr(module, "__file__", None)
+        if not filename or not str(filename).endswith(".py"):
+            continue
+        path = Path(filename).resolve()
+        try:
+            relative = path.relative_to(_SRC_ROOT.parent).as_posix()
+        except ValueError:
+            continue  # an ``src`` package that is not this compiler's
+        digest = _source_digest(path)
+        if digest is not None:
+            modules.append((name, relative, digest))
+    modules = tuple(modules)
+    return PieceCompilerRecord(_combined_digest(modules), modules)
+
+
+def piece_staleness(piece: Any) -> tuple[str, ...]:
+    """The modules whose source differs from the compiler that built
+    ``piece``; empty when the piece is current.  A piece with no record
+    (built before records existed) is stale by name: its compiler is
+    unknown, which is not the same as current."""
+    record = getattr(piece, "compiler", None)
+    if not isinstance(record, PieceCompilerRecord):
+        return ("<no compiler record>",)
+    verdict = _STALENESS.get(record)
+    if verdict is None:
+        root = _SRC_ROOT.parent
+        verdict = _STALENESS[record] = tuple(
+            name for name, relative, digest in record.modules
+            if _source_digest(root / relative) != digest
+        )
+    return verdict
+
+
+@dataclass(frozen=True)
+class PieceBuildFact:
+    """Book fact of one piece build: the compiler record it carries."""
+
+    compiler_digest: str
+    module_digests: tuple[tuple[str, str, str], ...]
+
+
+@dataclass(frozen=True)
+class PieceStalenessFact:
+    """Book fact of a cached piece found stale on load, and what was done:
+    ``"rebuilt"`` (default) or ``"served"`` (opt-in)."""
+
+    decision: str
+    changed_modules: tuple[str, ...]
+    recorded_digest: str | None
+
+
+_PIECE_VOCABULARY: dict[str, Any] = {}
+
+
+def _piece_vocabulary() -> dict[str, Any]:
+    """The declared pages/stage/transforms the piece cache posts with
+    (declarations are idempotent; this lane owns these names)."""
+    if not _PIECE_VOCABULARY:
+        from .identity_concordance import (
+            RowField, RowFieldKind as K, declare_page, declare_stage,
+            declare_transform)
+
+        row = (RowField("piece", K.NAME), RowField("batch", K.INDEX),
+               RowField("equations_key", K.LABEL))
+        _PIECE_VOCABULARY.update(
+            build_page=declare_page("piece_build", row, PieceBuildFact),
+            stale_page=declare_page("piece_staleness", row, PieceStalenessFact),
+            stage=declare_stage("piece_cache"),
+            build=declare_transform("piece_build", 0),
+            stale_check=declare_transform("piece_stale_check", 0),
+        )
+    return _PIECE_VOCABULARY
+
+
+def post_piece_book(directory: Any, piece_id: str, batch: int, key: str, *,
+                    built: Any = None, stale: tuple[str, ...] | None = None,
+                    stale_record: Any = None, decision: str = "rebuilt") -> Any:
+    """Post one piece-cache event on its own book and write the book beside
+    the piece (``<piece_id>.book.log``, or ``.stale.book.log`` for a served
+    stale piece).
+
+    ``stale`` (changed modules) posts the staleness row as a root
+    (``piece_stale_check``); ``built`` (the new piece) posts the build row,
+    DERIVED from that staleness row when the build is its rebuild, else a
+    root (``piece_build``).  Returns the book."""
+    from .identity_concordance import (
+        Derived, Mode, Novel, begin_identity_book, end_identity_book,
+        render_identity_book)
+
+    vocabulary = _piece_vocabulary()
+    row = (str(piece_id), int(batch), str(key))
+    book, token = begin_identity_book()
+    try:
+        cause = None
+        if stale is not None:
+            cause = book.post(
+                vocabulary["stale_page"], row,
+                PieceStalenessFact(
+                    str(decision), tuple(stale),
+                    getattr(stale_record, "digest", None)),
+                stage=vocabulary["stage"],
+                provenance=Novel(vocabulary["stale_check"], ()),
+                mode=Mode.CONCORD)
+        if built is not None:
+            record = built.compiler
+            book.post(
+                vocabulary["build_page"], row,
+                PieceBuildFact(record.digest, record.modules),
+                stage=vocabulary["stage"],
+                provenance=(Derived((cause,)) if cause is not None
+                            else Novel(vocabulary["build"], ())),
+                mode=Mode.CONCORD)
+    finally:
+        end_identity_book(token)
+    name = f"{piece_id}.book.log" if built is not None else f"{piece_id}.stale.book.log"
+    Path(directory, name).write_text(render_identity_book(book), encoding="utf-8")
+    return book
+
+
 def batch_contract(entry: str, argument_names: tuple[str, ...], batch: int):
     """The extraction contract that declares every law input as a batch span."""
 
@@ -161,6 +336,9 @@ class LLVMPiece:
     #: links the piece ingests this def for the call's signature and arity
     #: only; its body is never lowered again -- the link supplies the SSA.
     source: str | None = None
+    #: The compiler that built this piece (``PieceCompilerRecord``), stamped
+    #: by ``piece_from_law``; None on a piece built before records existed.
+    compiler: Any = None
     #: Runtime binding made by the instantiation hook: the prepared execution
     #: and the exact spans it was prepared against.  Lives for the state's
     #: lifetime, is never persisted, and is absent on a freshly loaded piece.
@@ -180,6 +358,7 @@ class LLVMPiece:
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+        self.__dict__.setdefault("compiler", None)
         self.__dict__.setdefault("_execution", None)
         self.__dict__.setdefault("_bound", None)
         self.__dict__.setdefault("in_place", ())

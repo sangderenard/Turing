@@ -2708,6 +2708,27 @@ def _emit_repository_call_module(
                         name, operation, "conditional branch has an unknown target",
                     ))
                     continue
+                # A branch takes ONE truth value.  A multi-element condition
+                # (authored `a if column else b` at batch 4: CondBr on a (4,)
+                # mask) used to load element 0 and branch every lane on it;
+                # the merge then copied a full column out of a one-element
+                # arm.  Refuse it by name; elementwise selection is `where`.
+                condition_shape = tuple(
+                    getattr(instruction.args[0], "shape", ()) or ())
+                if (
+                    condition_shape
+                    and all(hasattr(extent, "__index__") for extent in condition_shape)
+                    and _math.prod(condition_shape) > 1
+                ):
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        "conditional branch on a multi-element condition "
+                        f"%{int(instruction.args[0].id)} shape "
+                        f"{condition_shape!r} ({_math.prod(condition_shape)} "
+                        f"elements) -> {true_target}/{false_target}: a branch "
+                        "takes one truth value; elementwise selection is where",
+                    ))
+                    continue
                 condition = load_as(instruction.args[0], "i1", f"{tag}.condition")
                 capture_block_history(block_name, tag)
                 body.append(

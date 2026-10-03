@@ -231,3 +231,139 @@ Probe: `probe_orbital_transfer.external_derivatives()` declares
 `r_i -> v_i -> a_i`; `host_externals` supplies v_i / a_i as the derivatives
 of the host's own r_i. Results: equation_of_motion_lhs rel err 0.0,
 total_energy_expression 2.2e-16 (C and LLVM).
+
+## 2026-10-03: item 4b, the Integral lowers natively (audit gap 10)
+
+Repro (seconds, AST lane): `t1 = AbstractTensor.get_tensor(<5 nodes>);
+t4 = t1.unsqueeze(-1); t12 = L * t4; t27 = t12.sum(0)` with L a (4,) span.
+Four defects, each fixed at its owner:
+1. `get_tensor(<literal sequence>)` reached the planner as an opaque op
+   (rank-0 extents, "get_tensor: operation has no repository LLVM
+   emission"). `OPERATOR_ALIASES["get_tensor"] = "tensor"`
+   (`operator_catalog.py`): the class's own constructor has the same
+   idempotent normalization `asarray -> tensor` was aliased for; the
+   canonical `tensor` path gives the literal Const its (5,) shape.
+   (`test_public_abstract_tensor_api_is_explicitly_classified` fails before
+   and after: atan2/complex/interp/... are unclassified, unrelated.)
+2. `_tensor_descriptor_rule` (reductions) read the axis only from an
+   `axis`/`dim` ATTRIBUTE; positional `x.sum(0)` settled rank 0. Now reads
+   the `arg:0` literal, the same reading the unsqueeze rule gives.
+3. Region `value_shapes` (`glsl_deployment_strategy` `_value_shape_dtype`)
+   re-derived reduction / axis-insertion extents with its own rule (sum ->
+   `()`, unsqueeze -> source shape) while `value_ranks` beside it read the
+   descriptor. For sum/prod/min/max/any/all/unsqueeze/squeeze it now takes
+   the descriptor's settled shape (one record, not two).
+4. A capture made by a shape-only op outside the region (`t1.unsqueeze`) is
+   fed its source's storage; `propagate_repository_ssa_call_metadata`
+   restamped the formal (5, 1) with the feed's (5,) (trapped at
+   `tensor_ssa_lowering.py:1203`). `PlanClosure.value_views` (new field,
+   carried through the three PlanClosure rebuilds) records (capture,
+   storage, view shape, op); the planner's formal declares
+   `ssa_storage_view`, which the existing enrichment rule already honours.
+Reference side (probe): an Integral SymPy cannot integrate is evaluated as
+its declared Gauss-Legendre rule (`declared_quadrature`), the lowering's
+meaning, so the check is of the lowering, not of the rule's truncation.
+force_cost_integral: rel err 1.4e-16 (C and LLVM).
+
+## 2026-10-03: item 4c, several callsite shapes per external
+
+orbital_transfer_raw calls r1 at s (4,), at 0 and at L. `externals_for_law`
+now reads the shape per callsite (each Call respelled `name__callsite_k`
+for one eager run of the AbstractTensor stage), groups by shape, and gives
+each (external, shape) its own leaf and slot (`r1__s4`, `r1__s`; a single
+shape keeps the bare name). The respelling is applied to a copy of the
+compilation (`_respelled`), never the cached one. The leaf's
+`llvm_piece` record carries `external` (the declared name the host binds
+by) and `leaf`; `bind_external_slots` fills every slot of an external with
+its one implementation, wrapped per slot ABI. Derivative leaves link per
+shape.
+
+## 2026-10-03: the whole set compiles
+
+`tests/test_orbital_transfer_compile.py`: 12 passed, 0 xfailed (was 8/4).
+`WORK_ITEMS` and `LAW_BLOCKERS` are empty: items 1-4 resolved; item 2
+(Greek names) needed no change (mu_i laws pass as written).
+orbital_transfer_raw (16 inputs, all four Equalities): rel err 1.8e-15.
+Gate: emission chain failures 0; concordance audit 0,1,0,1,5,0,0
+(unchanged); regression set vs a clean HEAD worktree (408155a7, short
+path, removed after): identical failure sets in test_precompile_to_ssa
+(13), test_symbolic_fluid_native_runtime (1), test_aggregate_call_identity
+(4), test_symbolic_equation_compiler (1), test_symbolic_process_graph (3);
+translation scorecard 11/19 both; test_ssa_fusion_regions,
+test_region_kernel_dedup, test_abstract_tensor_indexing pass.
+
+## 2026-10-03: step 2, the craft and the benchmark are one system
+
+`tools/compiler_probes/probe_orbital_craft_binding.py` (~3 min): the whole
+set (the three Equalities as written plus `total_energy` and `force_cost`
+named) compiled once (LLVM and C), externals bound at load to a LIVE
+`OrbitalJumper` (Earth + Moon, 1000 kg, raw force (0, 0, 2) N via `F()`, 6
+rounds to t = 1457 s): r_i/v_i from `r()`, a_i = (the craft's compiled
+N4.1 piece at that position + applied force) / m, F_i = `applied_force()` / m;
+s = recorded instants only (no interpolation; F, constant over the run,
+also answers the quadrature nodes). Both lanes:
+- equation of motion residual a - (F_grav1 + F_grav2 + F) <= 1.1e-16 |a|
+  (the set's gravity IS the craft's catalogue N4.1);
+- r(0) - r_start, r(L) - r_end exactly 0;
+- total energy vs numpy at the craft states 2.6e-16 (craft drift over the
+  run 1.2e-7, the integrator's);
+- m * force_cost vs the craft's own fuel_impulse 1.6e-15.
+Found on the way: in the whole set the quadrature's axis `-1` was the same
+memoized node as the law's `-1` (`-mu * ...`), so its role was mixed
+(numeric) and `unsqueeze(-1.0)` returned. `_place_axis` / `_reduce_axes`
+now make their own axis constants (`ingest.literal`). And the compile
+cache did not digest the helpers the lowering reaches: the digest now
+covers the `symbolic_process_graph` and `external_functions` modules whole.
+
+## 2026-10-03: concordance rows for every decision (user rule)
+
+- Constant role: `constant_role` row (ingestion scope, constant node),
+  DERIVED from the constant's `ingestion_value` cell, every consumer's cell
+  and, per structural use, the consuming op's `tensor_operation_parameter`
+  cell (NOVEL(`declared_signature`) row per declared positional parameter:
+  name, annotation, integer). `_post_constant_roles` posts and the dtype is
+  read back from the row (the attribute `constant_role_row` cites it).
+- Operand edges: sympy `make_node`, the envelope removal, and
+  `ingest_sympy_process_model` / `symbolically_reduce_process_graph` node
+  builds now write operands only through `_set_operands`
+  (`INGEST_EDGE` / `REMOVE_NODE` / `REPLACE_INPUTS`). Whole set: 215
+  operand edges, 238 `identity_transition` rows in the ingestion scope
+  (appends plus the envelope's retires).
+- Transforms: `symbolic_transform` row (ingestion scope, result node) for
+  each Derivative of an external resolved to its declared derivative(s)
+  (DERIVED from the authored Derivative's subexpression cell, every
+  `external_derivative` declaration the chain read, the result cell) and
+  for the Integral's quadrature (DERIVED from the authored Integral's cell
+  and the result cell). Whole set: 6 + 1 rows.
+- Pages (appended to `concordance_declarations.py`): `tensor_operation_
+  parameter`, `constant_role`, `symbolic_transform`; transform
+  `declared_signature`; earlier `external_function`,
+  `external_function_name`, `external_derivative`, `external_callsite`.
+
+Gate:
+- `audit_identity_concordance.py`: findings 0,1,0,1,5,0,0 and unsourced
+  facts/identities IDENTICAL to a clean 408155a7 worktree with every file
+  of this lane overlaid (4083/2831/3800/4546/4431/197/2952). The main
+  tree shows different unsourced counts (view 4022, energy 3862, ...):
+  those come from other lanes' uncommitted work, not from these files.
+- Whole-set compile book: `ingestion_value` unsourced 13, unchanged (the
+  envelope plus 12 rows of other graphs built during the compile).
+- Tests: orbital 12/12, structural constants 2/2; symbolic process graph /
+  equation compiler failure sets identical to baseline (3, 1).
+  One `equation_of_motion_rhs` run hit `LLVM ERROR: out of memory` while
+  other lanes were building; it passes alone.
+
+## Open
+
+- `get_tensor` lowering is by the catalogue alias (`get_tensor -> tensor`),
+  not a backend table entry; the C/LLVM backends see the canonical
+  `tensor` Const path. If a `_TENSOR` entry is wanted instead, say so.
+- The externals' signature modules (NaN-bodied leaves) mint ~8 ids each
+  outside a Novel post (`unsourced-identity` in the lowered module's
+  report: 96 for the whole set) -- the AST lane's generic minting, not
+  ingestion; not addressed.
+- The probe's F host answers quadrature nodes only because the commanded
+  force is constant over the run; a varying force needs the craft's
+  recorded F history at those nodes (refused today).
+- Lowered SSA call instructions do not carry the external-call identity as
+  a row; the book has it at the symbolic level (callsite rows).

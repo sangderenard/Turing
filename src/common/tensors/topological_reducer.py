@@ -16,7 +16,7 @@ import re
 import symtable
 import textwrap
 import types
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import networkx as nx
 
@@ -588,6 +588,119 @@ def node_identity_cell(graph: Any, node_id: int) -> Any:
         stage=REDUCTION, provenance=Unsourced(SYNTHESIZED_NO_SOURCE),
         mode=Mode.CONCORD,
     )
+
+
+def _posted_node_identity_cell(graph: Any, node_id: int) -> Any:
+    """``node_identity_cell`` without its Unsourced fallback: the node's
+    posted ``canonical_value`` / ``ingestion_value`` cell, or ``None``."""
+
+    from ...compiler.concordance_declarations import (
+        CANONICAL_VALUE, INGESTION_VALUE,
+    )
+
+    book = current_identity_book()
+    metadata = getattr(getattr(graph, "G", graph), "graph", {}) or {}
+    if metadata.get("canonical_value_ids"):
+        scope = metadata.get("lexical_read_scope")
+        if scope is not None:
+            cell = book.latest_ref(CANONICAL_VALUE, (scope, int(node_id)))
+            if cell is not None:
+                return cell
+    for scope in node_ingestion_scopes(graph):
+        cell = book.latest_ref(INGESTION_VALUE, (scope, int(node_id)))
+        if cell is not None:
+            return cell
+    return None
+
+
+def post_indexed_store_site(
+    graph: Any, scope: Any, target: Any, effect_node_ids: Iterable[int],
+) -> Any:
+    """Mint the identity of an indexed store that has no authored node of
+    its own (``m[:2] -= t``: the target Subscript node is the read).
+
+    One ``indexed_store_site`` row ``(scope, NEW)``, NOVEL(
+    INDEXED_STORE_SITE_MINT, (target span cell, effect cell)): rooted at the
+    authored target's ``source_span`` row, with the nodes at the authored
+    effect (the target read, the stored value) as provenance -- one node
+    cell, or a ``cell_set`` row DERIVED from several.  ``None`` when the
+    target is no stamped source construct (a synthesized target): the
+    store then stays ``Unsourced`` and the latch lists it.
+    """
+
+    from ...compiler.concordance_declarations import (
+        CELL_SET, INDEXED_STORE_SITE, INDEXED_STORE_SITE_MINT,
+        IndexedStoreSiteFact,
+    )
+    from ...compiler.identity_concordance import NEW, Novel
+
+    span = _post_source_span(target)
+    if span is None:
+        return None
+    book = current_identity_book()
+    effects = tuple(dict.fromkeys(
+        node_identity_cell(graph, int(node))
+        for node in effect_node_ids
+        if node is not None and int(node) in getattr(graph, "G", graph)
+    ))
+    if not effects:
+        return None
+    if len(effects) == 1:
+        effect = effects[0]
+    else:
+        effect = book.post(
+            CELL_SET, (scope, book.page(CELL_SET).scope_row_count(scope) + 1),
+            tuple(cell.key for cell in effects),
+            stage=_REDUCTION, provenance=_Derived(effects), mode=_Mode.CONCORD,
+        )
+    return book.post(
+        INDEXED_STORE_SITE, (scope, NEW), IndexedStoreSiteFact(span),
+        stage=_REDUCTION,
+        provenance=Novel(INDEXED_STORE_SITE_MINT, (span, effect)),
+        mode=_Mode.CONCORD,
+    )
+
+
+def indexed_store_site_span(
+    graph: Any, node_id: int,
+) -> tuple[int, int, int, int] | None:
+    """The authored span positions of an indexed store's site, read from
+    the book: node identity cell -> (``canonical_value`` ->)
+    ``ingestion_value`` -> ``indexed_store_site`` along posted edges, then
+    the site's ``source_span`` cell.  ``None`` when the node's identity
+    does not derive from a site.  The positions only order; the site cell
+    is the identity."""
+
+    from ...compiler.concordance_declarations import (
+        CANONICAL_VALUE, INDEXED_STORE_SITE, INGESTION_VALUE, SOURCE_SPAN,
+    )
+
+    book = current_identity_book()
+    cell = _posted_node_identity_cell(graph, node_id)
+    identity_pages = {CANONICAL_VALUE.name, INGESTION_VALUE.name}
+    frontier = [cell] if cell is not None else []
+    seen: set = set()
+    while frontier:
+        ref = frontier.pop()
+        if ref.key in seen:
+            continue
+        seen.add(ref.key)
+        if ref.page.name == INDEXED_STORE_SITE.name:
+            site = book.page(INDEXED_STORE_SITE).latest(ref.row)
+            span = book.page(SOURCE_SPAN).latest(site.span.row)
+            if span is None or span.lineno < 0:
+                return None
+            return (
+                int(span.lineno), int(span.col_offset),
+                int(span.end_lineno), int(span.end_col_offset),
+            )
+        if ref.page.name not in identity_pages:
+            continue
+        frontier.extend(
+            source for source, _stage in book.edges_into(ref)
+            if source.page.name in identity_pages | {INDEXED_STORE_SITE.name}
+        )
+    return None
 
 
 def specialize_python_precision_widths(graph: Any) -> bool:
@@ -6261,7 +6374,19 @@ def _normalize_lexical_values(
                 or node_id == value
                 or nx.has_path(graph.G, node_id, value)
             ):
-                node_id = new_node("IndexedStore", "indexed_store")
+                # The store has no authored node of its own (the target
+                # Subscript's node is the read, ``m[:2] -= t``).  Its
+                # identity is a minted ``indexed_store_site`` cell rooted at
+                # the target's span with the effect nodes as provenance,
+                # and the store node's row derives from that cell: branch
+                # membership and placement read the site through the edge.
+                site_cell = post_indexed_store_site(
+                    graph, ingestion_read_scope, target,
+                    (id(target), value),
+                )
+                node_id = new_node(
+                    "IndexedStore", "indexed_store", source_cell=site_cell,
+                )
             node_data = graph.G.nodes[node_id]
             node_data["type"] = "IndexedStore"
             node_data["op"] = "IndexedStore"

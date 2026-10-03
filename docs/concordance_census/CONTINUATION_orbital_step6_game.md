@@ -96,3 +96,110 @@ Do not edit the other `orbital_*.py` (other agents own them).
   STOPPED per instruction; no game changes made for this update. Current
   orbital_game.py is unaffected (craft + 4 batch-1 stations all build the
   identical six-thruster/one-center program).
+
+## 2026-10-03 (after a2020e0b) the game on the machine craft
+
+Files: engine_toy/orbital_game.py, engine_toy/tests/test_orbital_game.py
+(only). Uncommitted.
+
+- Craft = `MachineCraft([center], orbital_craft(), ...)`; round 2 s and
+  `TrackingGains(attitude_frequency_rad_s=0.2)` = the configuration of
+  tests/test_orbital_tracker.py::test_machine_craft_transfer_arrives_with_
+  gimballed_burns (MACHINE_GAINS, ROUND_S). The old six-axis 100 kN design,
+  STATION_DESIGN, craft_part_geometry and craft_body_corners are gone.
+- Stations = ONE `OrbitalJumper([center], mass_kg=1e3, batch=N)` (plain
+  thrusterless lanes), advanced in ONE round per frame (`stations.advance(
+  window)`). Lanes vs their analytic circles after the Kestrel flight:
+  1.5 / 0.5 / 0.1 / 0.0 m. The batch-4 propellant-supply lane-0 defect does
+  NOT show here (no thrusters, no propellant).
+- fly() gets the tracker's own `hohmann_replanner` (planner "hohmann";
+  collocation: none wired, see hooks), so `FlightReport.on_plan` /
+  `.replans` are live; the game keeps the last report (`game.report`,
+  `on_plan()`, `replans()`), draws the plan RED when OFF PLAN, says
+  "OFF PLAN: re-plan n", and reads the FLOWN plan (`tracker_mode(craft).
+  plan` while its origin is the order's plan) for the curve, the burn
+  windows and the arrival time.
+- Drawing: `craft_drawing(craft, loaded_cm) -> CraftDrawing`: parts =
+  `craft.thruster_geometry()` (mount about the CURRENT CoM, exhaust at the
+  CURRENT gimbal state, delivered throttle), all placed about the fixed
+  prism centre (machine_package.measure_prism) so the CoM moves; tanks
+  filled to their contents; CoM marker (quartered disc) + ring at the
+  loaded CoM. The shift is mm on a metre craft, so the inset draws it x10
+  (COM_SHIFT_MAGNIFICATION, labelled). Plume length by declared role (main
+  1, brake 0.6, RCS 0.35), drawn on top of the body.
+- Readout: propellant per tank (kg, % of loaded), main gimbal tilt from the
+  gimbal STATE and from the tracker's last `TrackingCommand.gimbal_rad`,
+  CoM moved (mm), groups by declared role (main / retro / RCS): firing now
+  (delivered throttle) and fired over the frame (impulse delta), tracker
+  ON/OFF PLAN + re-plans, wall seconds per frame.
+- FRAME TIME (one 120 s frame during the phasing wait, pieces cached,
+  median): before (HEAD 0b9ed22: six-axis craft at 10 s rounds + 4 batch-1
+  stations chunked by 10 s) 3.02 s; after 1.65 s = stations 1.03 s (one
+  batch-4 round at dx 5e3) + craft ~0.6 s (60 rounds of 2 s with
+  allocation). Construction 14.9 s (cached).
+- RENDEZVOUS, default click (Kestrel, 7000 -> 9000 km; wait 1h23m15s,
+  transfer 59m20s), measured at t_burn2 + ARRIVAL_SETTLE_S (300 s):
+  * 120 s frames: 200.8 m @ 3.03 m/s; plan deviation 200.7 m; ON PLAN, 0
+    re-plans (max eps 4.7e-4); biprop 244.5 kg = 1.021 x TS2.1 ideal
+    239.5 kg; hydrazine 24.1 kg; main gimbal up to 2.80 deg; retro never
+    lit; CoM moved 20.0 mm. Before (old craft): 26.0 m @ 0.386 m/s.
+  * 60 s frames (the default warp, the headless run): 76.4 m @ 1.30 m/s.
+  * after the 300 s mark the craft is still trimming: +100 s 42.4 m /
+    0.686 m/s, +200 s 11.2 m / 0.151, +300 s 4.3 m / 0.041, then a
+    deadband limit cycle 1-9 m / ~0.03 m/s (coast_position_deadband 1e-6
+    x 9e6 m = 9 m).
+  Cause as read (tracker-owned, not changed): burn 1 closed with
+  remaining -1.37 m/s (overdelivered). The 4 kN main cannot throttle below
+  its 0.4 deadband: 0.4 x 4000 N x 2 s / 900 kg ~ 3.5 m/s per round, so a
+  burn closes at round granularity. fly() also clips its last round to the
+  frame boundary, so the frame length moves the round grid against the
+  burn times; that is why 60 s and 120 s frames differ. ARRIVAL_SETTLE_S
+  (300 s, from the old 100 kN craft) is short for this craft; changing it
+  is a measurement choice I left for the user.
+- Tests (tests/test_orbital_game.py, 7 passed, ~3 min):
+  test_click_flies_the_machine_craft_to_the_target (8000 km probe + a
+  second lane: 450.1 m @ 4.01 m/s, biprop 1.113 x ideal, ON PLAN,
+  stations 1.25 / 0.10 m off their circles) and
+  test_drawing_reads_the_machine_parts_gimbal_and_centre_of_mass
+  (geometry = thruster_geometry about the prism centre, main exhaust at
+  the tilted gimbal state, CoM moved after a 20 s main burn, tank fills).
+- Shared piece cache, two transient faults while other lanes were running
+  (not mine, recorded): (1) `LLVMPiece.load` raised MemoryError in
+  pickle.load on orbital_machine_actuation (passes on a retry, so read
+  as a partly-written .piece); (2) after the catalogue's piece-staleness
+  change (equation_piece now rebuilds a cached piece whose compiler sources
+  changed), lld-link "Permission denied" writing orbital_craft_actuation_t0
+  b1's DLL while tests/test_orbital_jumper.py was rebuilding the same piece
+  in another process. The cache has no write lock and no atomic
+  rename.
+
+HOOKS NEEDED (other owners):
+- orbital_collocation: a re-planner the game can build from (mu, r2) or
+  from the order's plan (`collocation_replanner` takes a
+  CollocationProblem), so the collocation planner gets ON/OFF PLAN too.
+- orbital_tracker: burn close at round granularity vs the main deadband
+  (see above); `fly()`'s last round clipped to `until_s` puts the round
+  grid on the caller's frame boundaries.
+- honorary_engine_equation_catalogue.equation_piece: lock + atomic write
+  of the .piece/.dll so concurrent lanes do not read partial pieces or
+  collide on the DLL.
+
+## 2026-10-03 12:00 REGRESSION (turing, not mine): phasing piece rebuilt wrong
+
+- The catalogue's new staleness check rebuilt `orbital_game_phasing` (book
+  row: decision 'rebuilt', '<no compiler record>') at 12:00 against the
+  current turing tree (HEAD 822a753b "elementwise Select ... is where()",
+  plus many uncommitted src/compiler edits from other lanes). The new
+  piece returns t_wait = 0 and phase = 0 for the Kestrel case
+  (lead_angle 0.5088 is still right; expected t_wait 4995.3 s). The Mod /
+  sign / Abs part of eq_PH1_4 is what broke.
+- tests/test_orbital_game.py phasing: 3 of 4 cases FAIL now (2 passed:
+  the lowering case and the co-orbital refusal); they passed at about 11:40
+  with the old piece. Repro (seconds): `phasing(MU, 7e6, 9e6,
+  hohmann_plan(MU,7e6,9e6).transfer_time, pi, 2.2, 0.0)`.
+- The shots in engine_toy/shots/orbital_game_machine_*.png were rendered
+  AFTER the rebuild: burn 1 fires at t=0 (unphased), the tracker goes OFF
+  PLAN and re-plans once (the shots show the red OFF PLAN state), and there
+  is no arrival within the 24 shots. The phased run before the rebuild (the
+  numbers above) arrived 76.4 m @ 1.30 m/s at the 60 s warp. To get phased
+  shots again: fix the compiler, then rerun the same command.

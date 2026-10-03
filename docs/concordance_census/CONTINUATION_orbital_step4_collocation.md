@@ -213,3 +213,90 @@ of compiled derivatives; no new compile). Now: per-slice error 3.6 m vs 256
 sub-steps; SLSQP "Optimization terminated successfully" in 3 iterations, 7
 Jacobians, 0.9 s; defect 2.1e-12; fuel 1.0000 x Hohmann, time 1.0016 x;
 2 burns (247.45 and 239.37 m/s).
+
+## 2026-10-03 Nominal green; kick re-plan in progress
+
+Full test file run: nominal plan "Optimization terminated successfully",
+10 iterations, 22 Jacobians in 0.9 s (40 ms each), solve 2.8 s, defect
+2.2e-12, fuel 1.0000 x Hohmann, time 1.0016 x Hohmann, 2 burns. Flown by
+orbital_tracker.fly (six-axis jumper, round 10 s): |r - r_ref| 11.9 m,
+|v - v_ref| 0.014 m/s, |r| - r2 7.2 m, |v| - v_circ 0.0004 m/s; fuel
+5.7545e5 N s = 1.182 x the plan (the Hohmann tracker test's bound is 1.2 x
+ideal).
+Kick (step-5 scenario, main+RCS spinning craft, 300 m/s radial at
+t_burn1 + 302 s; planning design = pointing_proxy: six +/- world-axis
+thrusters at the main engine's 1e4 N / bipropellant): SLSQP stalls at the
+iteration limit on a flat optimum (collapsed end slices); dv the same
+411.9-412.5 m/s across 300/600/1500 iterations, ftol 1e-9..1e-12, dt floor
+0.05/10 s; trust-constr with a zero Hessian is worse (889 m/s, infeasible).
+Added: least-squares polish of the defects (same compiled Jacobian) when
+the optimizer stops infeasible. Re-plan dv 412.1 m/s vs Hohmann-from-present
+693.4 m/s (its burn 1 from the kicked velocity + burn 2). Flight: two
+re-plans (eps 0.0303 > 0.03 during the plan's final burn); ended |r - r_ref|
+7.8 m but |r| - r2 1661 m -- investigating the second plan.
+
+## 2026-10-03 Kick re-plan green
+
+Two tracker-protocol fixes, both in CollocationPlan (no tracker edit):
+1. Thrusting slices read impulsively: reference = coast from node k to the
+   slice midpoint, coast BACK from node k+1 after it; impulses() = that
+   step at the midpoint. A ramping reference through a long partial-throttle
+   slice was double counted by the tracker's arming rule (v_ref + dv - v);
+   measured: the plan's 243 m/s final burn never flew, eps 0.0346 crossed
+   the off band, a second re-plan followed and the craft ended 11 km off.
+   (Splitting each slice into 16 sub-step impulses was tried and is worse:
+   the tracker cannot fly 0.15 s burns on 10 s rounds -- 130 km off.)
+2. Slices under 1 m/s are coasts (THRUST_THRESHOLD_M_S): the polished
+   plan's 0.0-0.9 m/s residue slices each became a burn the craft slewed to.
+Result (kick test): one re-plan; SLSQP 300 it (limit) + 200 least-squares
+polish evaluations, 108 s, defect 9.5e-10; planned 412.1 m/s vs
+Hohmann-from-present 693.4 m/s (its burn 1 from the kicked velocity + burn
+2); trip 2392 s; burns 66.8 / 40.6 / 60.1 / 244.4 m/s; propellant after the
+kick 134.4 kg; arrival |r| - r2 11.0 m, |v| - v_circ -0.014 m/s,
+|r - r_ref| 5.7 m. Final burn flown 2943.5-2966 s centred on 2953.5 s.
+Memory note: one full-suite run died with numpy _ArrayMemoryError (1.2 MiB):
+commit charge had 3.2 GB free with other lanes' compiles running.
+
+## 2026-10-03 Cost-weight sensitivity (LEO 7000 -> 8000 km, six-axis, N=40)
+
+Defaults: alpha = T_Hohmann / budget (1.62e-3), beta balanced at the warm
+start (7.51e-5), kappa 1e-3, budget 2e6 N s. Ratios to Hohmann:
+| weights | SLSQP | fuel | time | burn slices | defect |
+| default | ok, 10 it | 1.0000 | 1.0016 | 2 | 2.2e-12 |
+| alpha x0.1 | limit 300 | 1.8131 | 0.6671 | 3 | 1.6e-7 |
+| alpha x10 | limit 300 | 1.0333 | 1.3165 | 7 | 7.2e-11 |
+| beta x0.1 | limit 300 | 1.0101 | 1.1322 | 8 | 3.4e-13 |
+| beta x10 | limit 300 | 1.7307 | 0.6907 | 5 | 8.1e-7 |
+| kappa 1e-5 | stop 15 it | 1.0000 | 1.0016 | 2 | 1.6e-12 |
+| kappa 1e-1 | ok, 20 it | 1.0000 | 1.0016 | 2 | 2.9e-13 |
+| budget 1.2 x H fuel | ok, 10 it | 1.0000 | 1.0016 | 2 | 3.6e-12 |
+The alpha:beta ratio sets the trip: x10 either way trades ~70 % more fuel
+for a 1/3 shorter trip, or ~1-3 % more fuel for a 13-32 % longer one
+(alpha I/T rewards stretching the trip; Hohmann is the fuel floor). kappa
+and the budget do nothing while the tank is far from empty. Off-default
+runs stop at the iteration limit: their numbers are feasible (defects
+<= 8e-7 before polish), not certified optimal.
+
+## 2026-10-03 State at hand-off: all 6 tests green
+
+engine_toy/tests/test_orbital_collocation.py (6 tests). Last runs, with
+ENGINE_TOY_PIECE_SERVE_STALE=1 (another lane's uncommitted catalogue edit
+marks the Hohmann piece stale; rebuilding it while another process held the
+DLL failed with lld-link "Permission denied"): full file 5 passed + kick
+failing only on defect 1.1e-8 > 1e-8 (polish budget 200); polish budget
+raised to 1000 nfev; kick rerun 1 passed.
+- nominal: 10 SLSQP it, 22 Jacobians (24-46 ms each), solve 2.4-3.0 s;
+  fuel 1.0000 x Hohmann, time 1.0016 x; flown arrival 7.2 m, 0.0004 m/s;
+  fuel 1.182 x plan.
+- kick: re-plan 411.4 m/s (Hohmann-from-present 693.4 m/s), trip 2374 s,
+  300 it + 1000 polish nfev = 204.5 s, defect 1.6e-12; one re-plan;
+  arrival |r| - r2 8.8 m, |v| - v_circ 0.0000, |r - r_ref| 8.0 m;
+  propellant after the kick 135.4 kg.
+- machine craft (pointing_proxy of its design: six 4 kN biprop axes):
+  plan 300 it (limit), defect 4.7e-12, 486.3 m/s (Hohmann 486.8);
+  planned 139.9 kg; flown: 2 burns, 182.2 kg all tanks (1.30 x plan;
+  the tracker's own Hohmann machine test reads biprop 1.38 x ideal);
+  arrival 16.5 m, -0.047 m/s; 0 re-plans.
+Hooks needed (not my files): MachineCraft.propellant_kg raises (inherits
+the jumper property reading a propellant_mass column the machine lacks);
+the replanner therefore reads propellant as craft.mass_kg - design dry mass.

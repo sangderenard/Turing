@@ -27,7 +27,7 @@ from typing import Any, Mapping, Sequence
 
 from src.common.tensors import AbstractTensor
 
-from .native_law_kernels import LLVMPiece, batch_contract
+from .native_law_kernels import LLVMPiece, batch_contract, route_compiler_record
 
 
 def piece_from_law(compilation: Any, law: str, batch: int, *,
@@ -110,6 +110,9 @@ def piece_from_law(compilation: Any, law: str, batch: int, *,
         artifact, argument_names, tuple(parameter_ids[name] for name in argument_names),
         output_names, output_ids, constant_outputs, batch,
         module=module, entry=entry, outputs=outputs, source=source,
+        # Which compiler built it: recorded, not a cache key (a load
+        # compares it with the sources on disk; piece_staleness).
+        compiler=route_compiler_record(),
     )
 
 

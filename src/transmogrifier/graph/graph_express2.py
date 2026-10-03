@@ -165,6 +165,10 @@ def _annotate_visual_source_owners(tree: ast.AST, *, module_name=None):
     if module_name is None:
         module_name = "<string>"
     owners = {}
+    # Generated source (``build_from_ast(source_cells=...)``): each node is
+    # stamped with the declaration cell of the top-level definition it lies
+    # in -- re-stamped here so nodes a rewrite made since are covered too.
+    cells_by_name = getattr(tree, "_turing_source_cells_by_name", None)
 
     class OwnerVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
@@ -182,6 +186,12 @@ def _annotate_visual_source_owners(tree: ast.AST, *, module_name=None):
             node._turing_source_span_row = (
                 self.module_name, self.qualname, tuple(self.path),
             )
+            if cells_by_name:
+                cell = cells_by_name.get(self.qualname.split(".")[0])
+                node._turing_source_cells = (
+                    (cell,) if cell is not None
+                    else tuple(dict.fromkeys(cells_by_name.values()))
+                )
 
         def visit(self, node):
             if isinstance(node, ast.AST):
@@ -211,6 +221,10 @@ def _annotate_visual_source_owners(tree: ast.AST, *, module_name=None):
                 )
             node._turing_source_module, node._turing_source_qualname = identity
             node._turing_source_span_row = (*identity, ())
+            if cells_by_name:
+                cell = cells_by_name.get(str(identity[1]).split(".")[0])
+                if cell is not None:
+                    node._turing_source_cells = (cell,)
             owners[identity] = node
             saved = (self.module_name, self.qualname, self.path)
             self.module_name, self.qualname = identity
@@ -1015,7 +1029,7 @@ def _span_fact(node):
     )
 
 
-def post_source_span(owner_definition, node, *, stage=None):
+def post_source_span(owner_definition, node, *, stage=None, source_cells=None):
     """Post ``node``'s ``source_span`` root and return its cell (plan 60, 1.5).
 
     The root is ``Novel(INGEST_SOURCE, ())``: a source construct mints no
@@ -1027,18 +1041,32 @@ def post_source_span(owner_definition, node, *, stage=None):
     positions) is a revision of the root with the posting stage, never a
     second row: the row is the construct, the fact is what it says now.
     Returns ``None`` when ``node`` has no row (see ``source_span_row``).
+
+    Source the compiler generated from declarations already on the book
+    (the BACKWARD_RULES text) is no root: ``source_cells`` -- given here or
+    stamped on the node by ``build_from_ast(source_cells=...)`` -- are the
+    declaration cells it was generated from, and the span is DERIVED from
+    them (a revision also from the span cell it rewrites).  ``None``, the
+    default, is an authored file: the span is the root, as above.
     """
 
     from ...compiler.concordance_declarations import (
         INGESTION, INGEST_SOURCE, SOURCE_SPAN,
     )
     from ...compiler.identity_concordance import (
-        Mode, Novel, current_identity_book,
+        Derived, Mode, Novel, current_identity_book,
     )
 
     row = source_span_row(owner_definition, node)
     if row is None:
         return None
+    if source_cells is None:
+        # A node a rewrite made inside a generated definition (an annotation
+        # normalizer's new BinOp) carries no stamp; its row is keyed by that
+        # owner definition, so the owner's declaration cell is its source.
+        source_cells = getattr(node, "_turing_source_cells", None) or getattr(
+            owner_definition, "_turing_source_cells", None,
+        )
     book = current_identity_book()
     fact = _span_fact(node)
     latest = book.latest_ref(SOURCE_SPAN, row)
@@ -1049,10 +1077,16 @@ def post_source_span(owner_definition, node, *, stage=None):
         mode = Mode.REVISE
     else:
         mode = Mode.CONCORD
+    if source_cells:
+        provenance = Derived((
+            *source_cells, *(() if latest is None else (latest,)),
+        ))
+    else:
+        provenance = Novel(INGEST_SOURCE, ())
     return book.post(
         SOURCE_SPAN, row, fact,
         stage=INGESTION if stage is None else stage,
-        provenance=Novel(INGEST_SOURCE, ()), mode=mode,
+        provenance=provenance, mode=mode,
     )
 
 
@@ -4798,6 +4832,7 @@ class ProcessGraph:
         progress=None,
         boundary_namespace=None,
         source_language=None,
+        source_cells=None,
         **kwargs,
     ):
         """Import Python source as a structural AST ProcessGraph.
@@ -4905,6 +4940,21 @@ class ProcessGraph:
         # definitions lives in: the name Python itself gives the program
         # (plan 60, section 1.1).  Stored once so every helper reads one value.
         tree._turing_source_module = str(filename or "<string>")
+        # Generated source (``source_cells``: top-level definition name ->
+        # the book cell of the declaration it was generated from): every node
+        # of that definition carries its declaration cell, the module all of
+        # them, and ``post_source_span`` derives the spans from them.
+        if source_cells:
+            for statement in getattr(tree, "body", ()):
+                cell = source_cells.get(getattr(statement, "name", None))
+                if cell is None:
+                    continue
+                for descendant in ast.walk(statement):
+                    descendant._turing_source_cells = (cell,)
+            tree._turing_source_cells = tuple(dict.fromkeys(
+                source_cells.values()
+            ))
+            tree._turing_source_cells_by_name = dict(source_cells)
 
         retained = () if retain is None else (
             (retain,) if inspect.isclass(retain) else tuple(retain)
