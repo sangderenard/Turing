@@ -58,6 +58,13 @@ class SymbolicEquationCompilation:
 
 
 def _numeric_constant(value: Any) -> Any:
+    # ProcessGraph spells SymPy's singletons (One, Zero, NegativeOne) as
+    # Python ints.  Left as ints, a node this module declares float64 kept
+    # an integer payload, and a consumer that stores the constant into a
+    # value slot (a Piecewise Select arm) stored ``i64 1`` and read it back
+    # as the double 5e-324.  A predicate's bool is not a number here.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return float(value)
     if isinstance(value, sympy.Integer):
         return float(value)
     if isinstance(value, (sympy.Rational, sympy.Float)):
