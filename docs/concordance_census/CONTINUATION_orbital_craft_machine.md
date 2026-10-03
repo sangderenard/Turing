@@ -299,3 +299,46 @@ HOOKS NEEDED (not made; other owners):
    3.334 m/s); LEO->GEO 27.8 m / 0.241 m/s, fuel 1.0813 x ideal, 2813
    substeps (was 159.2 m / 0.220 m/s, 1.0630 x, 8991); game rendezvous
    18.6 m, 0.27 m/s.
+
+## 2026-10-03 (after 348cb5d) allocator during burns: saturated RCS, retro, "sign flip"
+
+- Repro (scratch burn_repro.py): machine at rest, 3997 N along +x, zero
+  torque, 2 s round. Before: main 0.999, gimbal (-1.45, -0.68) deg, EIGHT
+  RCS at full (sum 7.94), |tau| 0.47.
+- Not a sign/identity fault: the reported wrench equals machine_wrench of
+  the returned throttles/gimbals bit-for-bit, and the dt laws equal that
+  formula to 1e-13 (test_states_slew_...). At rest a +5 pitch during the
+  burn came back +4.50 (RCS saturated, so torque authority was gone); the
+  flight sign flip is the same saturation seen from a different state.
+- Cause: the craft's centre of mass is 2.37 deg off the main engine's line,
+  so +x force with zero torque is NOT achievable by the main engine. The
+  objective (force miss / T_max vs torque miss / tau_max, propellant at
+  fuel_weight 1e-4) honestly preferred spending RCS (and a retro's
+  differential yaw) to keep the force on +x over accepting the 165 N lean.
+  The tracker's own contract (`_MachineActuation.pointing`) expects the
+  opposite: asked for thrust along the axis with no torque, the gimbal
+  turns through the CM and the thrust leans; the tracker points THAT line.
+- Fix (orbital_actuation.allocate_wrench, by declared roles):
+  * a propulsive set (main OR brake: never both, the brake opposes the
+    main) lights only when the FORCE lights it (the set alone, torque
+    unweighted); otherwise the RCS answer the whole wrench (translation);
+  * a lit gimballed engine first settles its own moment by its gimbal (the
+    set alone, whole wrench: TVC), started also from the closed-form trim
+    `_trim_angles` (inverse Cardan through the CM);
+  * then the set's throttles and the RCS together, gimbals held, the RCS
+    held to ZERO net force by an equality constraint (couples only), so the
+    RCS take the torque the set leaves and never buy back the lean.
+  A design without roles is the single problem as before.
+- Measured: burn repro |F| 3993.2 N along the trim line, gimbal 2.354 deg,
+  |tau| 0.0075 N m, RCS sum 0.086, brake off. During the burn asked
+  (0,5,0) -> 4.9947, (0,-5,0) -> -5.0053, (0,0,5) -> 4.9947, roll 5 ->
+  4.9947 (RCS couples), 20 pitch -> 19.9947. Brake request -600 N: short
+  0.42 N (retros + RCS couple cancelling the CM moment).
+  Test: test_a_burn_is_the_gimballed_main_engine_and_torque_keeps_its_sign.
+- Speed: 5-15 ms per call after the first (the first carries ~0.5 s of
+  SLSQP warm-up); was 100-400 ms.
+- tests/test_orbital_tracker.py::test_machine_craft_transfer_arrives_with_
+  gimballed_burns: PASS in 55 s. Bipropellant 139.55 kg = 0.997 x TS2.1
+  ideal (139.96), hydrazine 22.26 kg; burns 271.9-348.0 s and
+  3507.3-3560.0 s; RCS sum <= 0.11 while firing; worst pointing while
+  firing 0.070 rad; final 0.91 m / 0.034 m/s.
