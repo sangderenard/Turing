@@ -266,8 +266,12 @@ output-extent defect. After the targeted compiler correction, all three
 native actuator tests pass in 11.70 s, including arbitrary interval splits
 and command reversal. The compiler's same-book 9-to-1-to-9 law checks pass
 with exact shape provenance and strict disagreement rejection at the same
-call occurrence. The broader final compiler gate remains pending; no new
-law name or identity-book reset bypassed the defect.
+call occurrence. Turing commit `31285882` contains the correction. The final
+broader gate reports 34 passed and five failures matching the untouched
+baseline; no new law name or identity-book reset bypassed the defect.
+Root-workspace commit `aadda11` contains the separately verified native ramp
+integral and its three tests. The tracker itself remains uncommitted pending
+the full flight gates.
 
 Output-only `<column>_next` publications exposed another concrete ownership
 gap: `column_names_of` previously collected only piece arguments. Turing
@@ -283,3 +287,24 @@ cut. The coupled builders now integrate `applied_force / mass` at their
 actual library stages into registered delta-v columns, and the tracker reads
 their endpoint difference. This removes that host quadrature, but the full
 frame-partition flight gate still needs to run.
+
+The first complete production-craft compile was stopped at the documented
+roughly 6 GB process ceiling. Its first 19 pieces (properties, inverse,
+actuator bound, and all 16 callback groups) finished and cached. The combined
+endpoint law reached 4,516 graph nodes and 8,015 edges at
+`fold-callsite-structural-values-after-tensors`; the last recorded working
+set was 7,164,207,104 bytes. No runtime assertion ran. The ceiling was missed
+at the first over-limit observation, then enforced; this is a stopped gate,
+not a physics failure or a completed build. Endpoint partitioning is being
+reviewed against the existing sequential equation-piece contract before
+another native compile. No new whole craft bank is authorized by this result.
+
+Read-only accounting of the 19 completed `.piece` files found 714,433,717
+bytes on disk. Loading them individually and traversing their reachable
+Python objects gave a summed 6,006,139,090 bytes, including 5,911,052,738
+bytes in identity books. These are approximate sums, not an exact allocation
+profile of the stopped process. Each law owns a distinct symbolic-program
+book; the ordinary in-memory piece cache retains them all. Both the piece's
+module and its artifact emission keep provenance alive. Thus partitioning the
+endpoint alone does not remove the memory retained by the completed bank.
+No books or concordance edges have been discarded to evade this constraint.

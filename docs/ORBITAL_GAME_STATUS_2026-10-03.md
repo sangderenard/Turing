@@ -12,16 +12,24 @@ flight acceptance is still pending. Detailed trace and measured gates:
 
 Verified Turing changes: appended metric-channel transport (`3202f8ba`),
 participant energy contracts taking precedence over the legacy aggregate
-fallback (`8ab64810`), and output-only state registration (`302dcbc3`). The
+fallback (`8ab64810`), output-only state registration (`302dcbc3`), and exact
+same-book batch-shape revisions (`31285882`). The
 small coupled native rotor gate passes with actual rejection and rollback;
 it does not establish complete craft/game acceptance or concordance closure.
 
 The tracker no longer predicts dt substeps. Its exact native throttle-ramp
-observable passes three focused tests; flight progress now reads the applied
+observable passes three focused tests and is committed as `aadda11` in the
+root workspace; flight progress now reads the applied
 delta-v integrated by the same library stages. The frame-comparison gate
 remains pending. Collocation adapter edits and prior screenshots remain
 unverified as game acceptance. Gravity is still exerted only by the declared
 fixed centers; craft and stations have no mutual gravity or backreaction.
+
+The first production craft compile finished 19 pieces, then exceeded the
+documented roughly 6 GB process ceiling while compiling its combined endpoint
+law. It was stopped before runtime assertions. Endpoint dependencies and the
+memory retained by completed pieces' compiler books are being inspected;
+no full craft correctness or performance result is available yet.
 
 The remainder of this report records the inherited state and historical
 measurements, which must not be treated as results for the new integration.
