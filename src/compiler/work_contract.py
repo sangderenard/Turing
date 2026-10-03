@@ -31,7 +31,8 @@ The presets
 ``deploy``   ``develop`` plus the inexact identity set (sqrt family). Changes
              bits within documented bounds (the fluid's mass_err <= 1e-15
              gate held); still no contraction, so results are stable across
-             hosts.
+             hosts. The binary is tuned for this host (-march=native); the
+             portable lanes are WASM and WebGL/WebGPU.
 ``fast``     Everything: inexact identities, multiply-add contraction, host
              target named. Bit-stability across machines is explicitly
              surrendered (fma availability differs by CPU). ~10x measured.
@@ -234,10 +235,14 @@ PRESETS: dict[str, WorkContract] = {
         "deploy", register_reuse=True, inexact_identities=True,
         contract_multiply_add=False,
         # -O3 raises the optimizer's effort without changing semantics.
-        # Deliberately NO -march=native here: deploy's documented meaning
-        # is "inexact set, STABLE ACROSS HOSTS", and native tuning is the
-        # opposite of host-stable.
-        compiler_flags=("-O3",),
+        # Native code is tuned for THIS host (user, 2026-10-02: "let native be
+        # fully optimized"; portability comes from the WASM and WebGL/WebGPU
+        # lanes, not from a portable native target). `zig cc` already targets
+        # the host CPU when no target is named (verified: AVX-512, AVX2 and
+        # FMA enabled with no flag on Zen 4); -march=native states it so the
+        # intent is written, not implied by a toolchain default. Contraction
+        # stays off here, so tuning does not change results.
+        compiler_flags=("-O3", "-march=native"),
         deployment="auto",
     ),
     "fast": WorkContract(
