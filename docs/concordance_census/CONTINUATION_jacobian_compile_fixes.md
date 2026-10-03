@@ -685,3 +685,107 @@ Hunks owned by this lane:
   identity + propellant_supply 1 in slice_laws).
 - process_graph_autograd.py @@2723: the planner lane's, not mine.
 - precompile_to_ssa.py: not this lane.
+
+## 2026-10-03 Coordinator decision: (i)
+
+Committed by main session (all but precompile_to_ssa.py). Now: the adjoint
+builder DECLARES per argument of each backward-rule Call its role (tensor
+operand/gradient vs metadata constant); (b) reads that declaration, no
+descriptor inference. Then: trace the per-callsite fold row's cells; rerun
+probe, 13 s reverse test, orbital 4/7, linear motion test and
+native_scalar_loss_adjoint[True] (with timeout).
+
+## 2026-10-03 (i) applied
+
+- process_graph_autograd.py registry_rule: Call attributes gain
+  `argument_roles` (index 0 "gradient"; a bound forward source "operand";
+  metadata/default constants "metadata"), from the builder's own
+  argument_forward_sources.
+- glsl_deployment_strategy.py (b): blocks the catalogue fold only when the
+  call's `argument_roles[arg:i]` is gradient/operand; the descriptor test is
+  gone. Undeclared (AST) calls and metadata args fold as at HEAD.
+- concordance_declarations.py: reason comment updated.
+Running the blast-radius hook on the linear test next.
+Linear motion test with (i): only `bw_mean g` is blocked (g is a const
+unit seed = gradient role); fails with the HEAD failure mode again
+(ConcordanceRefusal expand_reduction 'axis', 8 s).
+native_scalar_loss_adjoint[True] with (i): still no result in 300 s (timeout 124). Taking a stack dump at 150 s next.
+
+## 2026-10-03 scalar-loss hang: attribution
+
+Stack at 150 s (current tree): inside
+_propagate_callsite_tensor_specializations (glsl ~:18069) ->
+call_result_descriptor (~:17785) -> _fold_callsite_structural_values ->
+_tensor_descriptor -> record_shape_transformation -> _post_or_unsourced.
+Overlays on wtb at aa5f1aac (fast refusal there):
+- + all non-glsl files of this lane: still the fast HEAD refusal.
+- + current glsl with the plan_callsites gate reverted: HANG (>200 s).
+- + also (b) reverted: back to the fast HEAD refusal (13 s).
+So (b) is what moves this test off the refusal; the refusal was masking a
+downstream non-termination (or extreme slowness) in the 534a4941 fixed point.
+wtb restored to aa5f1aac clean. Sampling repeatedly to see if it progresses.
+
+## 2026-10-03 scalar-loss "hang" = non-terminating fixed point (observed)
+
+kx806_rounds.py (wraps _propagate_callsite_tensor_specializations' _progress):
+rounds 3..184+ all report changed=True, return_members=2, every other
+mutation 0, state_digest a24b0b2c18fbeee2 identical (repeats_round=3),
+~2 s/round (book history scans grow). So the return-member publication
+(534a4941's _publish_callsite_return_members) reports a change each round
+without changing state. Reading it.
+Repeating publication: bw_mul calls 29 and 30 (x*x: both operands one value) in scalar_loss_join_reverse; settled branch (incumbent leaves present, 2 descriptors) returns changed every round.
+Observed per round for bw_mul call 29 (x*x): call_result_descriptor says
+members are shape () (desc), while leaves 31/32 hold {shape (2,3)} again at
+the start of each round; the publication rewrites them to () (changed=True)
+and something rewrites them back to (2,3). Two writers disagree about one
+value; trapping the (2,3) writer next.
+Trap on leaf 31's `tensor` (kx806_trap.py): alternating writers every round:
+- _fold_callsite_structural_values (~:22105) sets {shape (2,3)} (it re-derives
+  an `indexed` node's descriptor when the stored shape is empty);
+- _publish_callsite_return_members (~:17512, settled branch) sets {shape ()}
+  from call_result_descriptor.
+(2,3) is the true gradient shape of `left`; the () member descriptor from
+call_result_descriptor is the wrong record. Tracing why next.
+Descriptors handed to each bw_mul propagation copy are correct (g, x, y all
+(2,3)); its published member descriptors still come out (). Inferred, not
+traced: the copy's output descriptor is read from a row keyed by the
+authored function name (shared by every bw_mul copy). Parking this; doing
+the requested checks first.
+
+## 2026-10-03 Per-callsite fold row: traced (x**3*y, kx806_foldrow.py)
+
+For each bw_pow callsite copy (scope ('lexical_reads:bw_pow|fork', k)):
+- `_post_copy_planner_specializations` posts planner_specialization
+  ((fork k), 'p') = 3 DERIVED from the caller's argument cell
+  Ref('ingestion_value', (('ingestion:training_motion', 0), 2), 0) (motion
+  const 2, the exponent).
+- the copy's fold of formal p posts PROVEN_LITERAL from
+  `_fold_literal_source_cells` = (Ref('canonical_value', ((fork k), 1)) = the
+  formal p's own cell, Ref('planner_specialization', ((fork k), 'p'))).
+So the fold row derives from the formal's cell and, through the
+planner_specialization row, the caller's argument cell. Confirmed by
+observation; no change needed. (Each copy forks a new scope; 5+ forks for
+one bw_pow callsite, i.e. the fixed point re-copies it per round.)
+Probe with (i): RESULT jacobian max_rel 4.138e-16, median 0 (unchanged).
+Reverse test 1 passed (12.8 s); orbital 4 passed / 7 xfailed. Back to the scalar-loss non-termination.
+
+## 2026-10-03 STATUS after (i)
+
+GREEN: probe max_rel 4.138e-16 (median 0); reverse test 1 passed (12.8 s);
+orbital 4 passed / 7 xfailed; linear motion test back to its HEAD failure
+mode (ConcordanceRefusal expand_reduction 'axis', 8 s); per-callsite fold row
+traced (formal cell + planner_specialization DERIVED from caller arg cell).
+RED (worse than HEAD): native_scalar_loss_adjoint[True] does not terminate.
+(i) blocks only `bw_add g` (the unit seed, gradient role) at catalogue level;
+the run then passes HEAD's refusal and enters a non-terminating
+_propagate_callsite_tensor_specializations fixed point:
+- bw_mul calls 29/30 (left*left, right*right) republish members every round;
+- leaf 31's tensor alternates: _fold_callsite_structural_values (~:22105)
+  writes (2,3) (true), _publish_callsite_return_members (~:17512) writes ()
+  from call_result_descriptor;
+- the bw_mul propagation copy gets correct inputs (g,x,y all (2,3)), but its
+  outputs (nested `unbroadcast` Calls 5/8) have no descriptor after the
+  copy's fold (desc None); no proven_shape_contract exists for (bw_mul,5);
+  where the () member descriptor is finally produced is NOT yet traced.
+Repro (stops itself): scratchpad kx806_rounds.py (200 s) / kx806_trap.py (60 s).
+Second-compile refusal: not started.

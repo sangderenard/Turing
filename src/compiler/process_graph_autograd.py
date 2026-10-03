@@ -1774,6 +1774,18 @@ class _AdjointBuilder:
                 f"{len(parents)} forward operands at node {forward_id}"
             )
         entry = self.backward.function_table.entry(f"bw_{opname}")
+        # Each argument's role, declared where it is bound: ``gradient``
+        # (the upstream g), ``operand`` (a forward value the rule
+        # differentiates through, a tensor), or ``metadata`` (an operator
+        # attribute or signature default: axis, keepdim, shape, ...).  The
+        # planner reads this declaration instead of guessing tensor-ness
+        # from whether a shape descriptor happens to exist.
+        argument_roles = tuple(
+            "gradient" if index == 0
+            else "operand" if source is not None
+            else "metadata"
+            for index, source in enumerate(argument_forward_sources)
+        )
         call = self.add(
             "Call",
             tuple(
@@ -1785,6 +1797,7 @@ class _AdjointBuilder:
                 "callee_ref": int(entry.reference.address),
                 "backward_rule": opname,
                 "argument_names": tuple(argument_names),
+                "argument_roles": argument_roles,
             },
             source_forward_id=forward_id,
         )

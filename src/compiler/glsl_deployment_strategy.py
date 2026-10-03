@@ -17109,20 +17109,37 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                     except ValueError:
                         value = not_source_static
                     else:
-                        # A literal the caller ALSO describes as a tensor is
+                        # A literal the caller DECLARES a tensor argument is
                         # two facts about one value.  Folding it here
                         # rewrites the shared definition with the literal
                         # alone: in the graph-reverse motion of ``x**3*y``
-                        # every caller passes bw_pow's ``p`` as 3 and as a
-                        # shape-() float64 tensor; the catalogue fold made
-                        # ``p`` a bare ``Constant 3`` before any callsite
-                        # copy existed, so ``p.shape`` never resolved and
-                        # ``unbroadcast(..., p.shape)`` kept a shape loop
-                        # whose iterable ``extent`` LLVM cannot emit.  Rule:
-                        # such a formal is specialized only in its callsite
-                        # copy (``_callsite_specialized_shell_type``), which
-                        # keeps literal and descriptor together.
-                        if _tensor_descriptor(caller, int(parent)) is not None:
+                        # the backward Call passes bw_pow's ``p`` as 3 and
+                        # declares it an ``operand`` (a forward tensor); the
+                        # catalogue fold made ``p`` a bare ``Constant 3``
+                        # before any callsite copy existed, so ``p.shape``
+                        # never resolved and ``unbroadcast(..., p.shape)``
+                        # kept a shape loop whose iterable ``extent`` LLVM
+                        # cannot emit.  Rule: a formal whose argument the
+                        # call declares ``gradient``/``operand``
+                        # (``argument_roles``, written by the adjoint
+                        # builder) is specialized only in its callsite copy
+                        # (``_callsite_specialized_shell_type``), which keeps
+                        # literal and descriptor together.  ``metadata``
+                        # arguments and undeclared calls fold as before.
+                        declared_roles = tuple(
+                            attributes.get("argument_roles") or ()
+                        )
+                        position = (
+                            int(role[4:])
+                            if role.startswith("arg:") and role[4:].isdigit()
+                            else None
+                        )
+                        if (
+                            position is not None
+                            and position < len(declared_roles)
+                            and str(declared_roles[position])
+                            in {"gradient", "operand"}
+                        ):
                             value = tensor_argument
                 else:
                     value = dynamic_argument

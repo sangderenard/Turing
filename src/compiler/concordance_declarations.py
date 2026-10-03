@@ -369,8 +369,8 @@ DISPATCH_STORE = declare_transform("dispatch_store", 1)
 SPECIALIZATION_DYNAMIC_ARGUMENT = declare_reason("specialization_dynamic_argument")
 SPECIALIZATION_CALLSITES_DISAGREE = declare_reason("specialization_callsites_disagree")
 SPECIALIZATION_NOT_SOURCE_STATIC = declare_reason("specialization_not_source_static")
-#: A caller passes the formal as a described tensor (shape/dtype): the
-#: literal belongs to that callsite's copy, never to the shared definition.
+#: A call declares the argument a tensor (``argument_roles`` gradient/operand):
+#: the literal belongs to that callsite's copy, never to the shared definition.
 SPECIALIZATION_TENSOR_ARGUMENT = declare_reason("specialization_tensor_argument")
 FORMAL_LITERAL_CONFLICT = declare_reason("formal_literal_conflict")
 FORMAL_SHAPE_CONFLICT = declare_reason("formal_shape_conflict")
