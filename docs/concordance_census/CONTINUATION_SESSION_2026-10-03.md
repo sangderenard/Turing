@@ -1,5 +1,11 @@
 # Session continuation report, 2026-10-03 (orbital demo push) — FINAL, all activity stopped
 
+Later ownership work resumed on `wip/2026-10-03-inflight`. Its current
+source-to-execution trace, verified commits, and open production gates are
+recorded in [ORBITAL_DT_METRICS_2026-10-03.md](ORBITAL_DT_METRICS_2026-10-03.md)
+and [the game status](../ORBITAL_GAME_STATUS_2026-10-03.md). The shutdown
+description and numerical results below remain a historical snapshot.
+
 Everything below is the state at shutdown. All agents were stopped, all compile
 processes were killed, and nothing is running. Unverified work is on the branch
 `wip/2026-10-03-inflight` in BOTH repos (turing and the root repo); `main` and

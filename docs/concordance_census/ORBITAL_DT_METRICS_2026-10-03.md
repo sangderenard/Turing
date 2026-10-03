@@ -1,6 +1,67 @@
 # Orbital craft dt metric audit — 2026-10-03
 
-This is a source audit of `engine_toy/orbital_jumper.py`,
+Current work uses the actual library RK4 algorithm and the existing dt
+state, window, rejection, and rollback mechanisms. Native rotor and
+configured pure-torque checks pass, as do isolated production actuator,
+derivative, and energy-publication checks. Full craft and game acceptance
+remain open. The completed-piece memory accumulation now has a verified
+archive/runtime split; a complete fresh production build is still pending. The later
+sections record the ownership trace, verified compiler commits, failures,
+and measured gates. The first section preserves the audit that motivated
+the correction; its missing-publication findings describe the old source.
+
+## Compiler audit archives and runtime retention
+
+The user elected disk storage for the full compiler books instead of raising
+the existing approximately 6 GB process ceiling. Turing `c73c2a26` adds
+`LLVMPiece.for_runtime()` and explicit `retain_compilation` save/load options.
+Copies retain exact column ABI, native LLVM text (including validation), entry
+identity and `PieceCompilerRecord`; they release SSA/source/output metadata and
+the artifact's emission book without mutating the full original. Runtime-only
+pieces explicitly refuse source linking, which requires the full archive.
+Retention disposition is recorded on the existing piece-build book row.
+
+Root commit `c4b4fd2` adds `equation_piece(..., retain_compilation=False)`:
+compile with concordance as before, persist the complete `.piece` archive,
+publish a separate `.runtime.piece`, and retain only the latter in memory.
+Normal runtime loads use that smaller file. A current full cache can supply
+the first runtime index; existing archives are not overwritten by compact
+pieces. The two orbital dt factories opt in in the still-unverified physics
+working tree, with an explicit retention option for compiler callers.
+
+Verification: four native compiler-payload tests pass in 2.84 s (peak process
+memory 1,626,808,320 bytes); two native full/runtime cache tests pass in 9.03 s
+(peak 1,630,035,968 bytes). These cover repeated execution into registered
+columns, constants, source stamps, original archive preservation, both cache
+creation orders, legacy loading and source-link refusal. The original tiny
+law's concordance report is unchanged: zero structural findings and 1,128
+unsourced facts, OPEN. Full native craft acceptance remains pending.
+
+A read-only comparison loaded the same 19 historical production archives
+(714,433,717 bytes) one at a time with `retain_compilation=False`, retained all
+19 runtime pieces and collected unreachable cycles. No stale DLL was executed
+and no archive was modified. Peak sampled RSS was 766,705,664 bytes; ending
+RSS was 435,572,736 bytes. Compact serialization totaled 7,879,555 bytes and
+preserved 6,883,464 characters of LLVM text plus the compiler records. All 19
+passed absence checks for module/source/outputs/emission. The older full-graph
+estimate below is a summed reachable-object size, not measured process RSS.
+This comparison establishes retained-load behavior, not peak memory during
+a complete fresh bank compilation.
+
+That read-only measurement used `turing/.venv/Scripts/python.exe` (Python
+3.11.7), sampling Windows working set every 50 ms; native regression builds
+used system Python 3.11. The separate streaming compression check on the
+largest original (`stage13`) reduced 61,223,411 bytes to 10,470,417 bytes with
+zlib level 1 in 0.229 s. This was a no-write archive-size measurement; no
+compressed cache format or loaded-memory improvement is claimed from it.
+
+Memory-mapping a pickle would still reconstruct its Python objects when
+unpickled. Compression can reduce archive bytes and I/O, but does not eliminate
+those live objects; no alternate file-backed book implementation was added.
+
+## Initial source audit (before the integration correction)
+
+This initial source audit covers `engine_toy/orbital_jumper.py`,
 `engine_toy/orbital_craft_machine.py`, and the existing dt contract in
 `src/common/dt_system`. It records declared outputs; it does not claim a
 compiled runtime measurement.
@@ -308,3 +369,75 @@ book; the ordinary in-memory piece cache retains them all. Both the piece's
 module and its artifact emission keep provenance alive. Thus partitioning the
 endpoint alone does not remove the memory retained by the completed bank.
 No books or concordance edges have been discarded to evade this constraint.
+
+The endpoint source now has separate precommit metrics and diagnostics,
+one canonical physical commit, then the original mass-property and inverse
+laws at distinct postcommit participant occurrences. A source dependency
+check found no precommit write intersecting the canonical commit's inputs.
+The 27-piece declaration builds in 12.625 seconds; its largest endpoint
+group has 1,038 distinct SymPy nodes. This is source evidence only.
+
+The first isolated native check failed: the actual stage-zero law evaluates
+to delivered throttle one for command one, old state zero, and infinite
+slew, but the native piece returned zero. The finite-slew initial-state
+case passed. This check took 40.16 seconds and its sampled peak working set
+was 1,487,339,520 bytes. The source-to-native infinity comparison is being
+traced before any correction; no physics tolerance was changed.
+
+Turing commit `147dd2be` fixes the traced literal ownership loss. The
+symbolic SSA Const retained SymPy `oo`, which Python source materialization
+spelled as an unresolved name. In the production artifact this became
+unproduced formal 10; its nonfeed buffer was initialized to zero. The
+existing numeric normalization and AST literal printer now preserve positive
+and negative infinity as `1e309` and `-1e309`. All four native equality and
+publication cases pass. The adjacent gate reports 55 passed and six
+failures, all reproduced identically on pristine `e068ce59`. The two tiny
+equality audits retain zero structural findings, with unsourced facts
+1,256 -> 1,254 and 1,263 -> 1,252; their status remains OPEN. Actual
+production-piece reruns follow this fix, with normal compiler-stamp
+invalidation of older artifacts.
+
+The isolated production fixture also omitted the base `thruster_columns`
+initialization for throttle bounds. Its zero-filled maximum correctly
+clamped the command to zero, so the production failure alone did not isolate
+the infinity defect. The rebuilt production source already contains the
+correct `1e309` literal. That fixture is being corrected through the existing
+initializer before interpreting the production result. The separate tiny
+native reproductions and literal-ownership trace above remain valid.
+
+With both existing initializers supplied, the actual production stage-zero
+native check passes in 21.45 seconds: finite-rate old-state evaluation,
+instantaneous ignition and cutoff, and instantaneous gimbal commands. The
+isolated fixture now zeros only declared scratch and asserts that every
+physical input has an explicit value. Full-bank verification is still open.
+
+All three actual production energy-publication pieces pass independently
+on the corrected compiler (about 21.3 seconds and 597 MB peak per process):
+stored energy, exchange power, and the positive-infinity source bound match.
+The actual derivative piece also passes (74.75 seconds, 1,329,561,600 bytes
+sampled peak). Its analytical mass-drain case publishes mechanical work
+`-1.45 W` and absolute exchange `1.45 W`; inertia flux remains in its exchange
+publication. Opposing wheel motors publish net electrical input `2.104 W`,
+copper loss `0.104 W`, and absolute electrical exchange `10.04 W`.
+
+The base craft's 10-second pure-torque run exposed an insufficient new
+default for the incremental Gram-error channel. At `1e-9`, 86 attempts gave
+`max|R^T R-I| = 1.17688078171696e-8`, failing the preserved `1e-14` physical
+requirement. With only the existing caller target changed to `1e-17`, the
+same native bank and forty 0.25-second outer windows produce
+`2.3314683517128287e-15` Gram drift, determinant `0.9999999999999976`, and
+angle `2.399999999999658` against the continuum `2.4`. The run took 13.672
+seconds including loading, with 7,003 attempts and 5,594 Gram rejections;
+sampled peak was 1,395,056,640 bytes. The real controller refined the first
+0.25-second proposal through 0.125 to 0.0625 seconds. This measured target
+is being adopted as the production default; the physical tolerance remains
+unchanged. No attitude projection, replacement integrator, or precision
+workaround was used. Rejection cost remains a performance concern.
+
+The complete updated pure-torque pytest subsequently passes at that new
+default in 19.82 seconds (1,399,357,440 bytes sampled peak), including all
+retained physical bounds and the rotating-thrust integral identity. Only
+old exact substep-count/Cayley-formula expectations were removed. The actual
+production endpoint-metrics piece also passes its controlled variable-mass
+case in 78.82 seconds, with 1,287,823,360 bytes sampled peak. Its raw-row
+concordance findings remain OPEN; these numerical passes do not close them.

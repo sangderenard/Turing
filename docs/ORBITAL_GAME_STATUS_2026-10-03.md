@@ -13,7 +13,8 @@ flight acceptance is still pending. Detailed trace and measured gates:
 Verified Turing changes: appended metric-channel transport (`3202f8ba`),
 participant energy contracts taking precedence over the legacy aggregate
 fallback (`8ab64810`), output-only state registration (`302dcbc3`), and exact
-same-book batch-shape revisions (`31285882`). The
+same-book batch-shape revisions (`31285882`), and owned native infinity
+literals (`147dd2be`). The
 small coupled native rotor gate passes with actual rejection and rollback;
 it does not establish complete craft/game acceptance or concordance closure.
 
@@ -27,9 +28,13 @@ fixed centers; craft and stations have no mutual gravity or backreaction.
 
 The first production craft compile finished 19 pieces, then exceeded the
 documented roughly 6 GB process ceiling while compiling its combined endpoint
-law. It was stopped before runtime assertions. Endpoint dependencies and the
-memory retained by completed pieces' compiler books are being inspected;
-no full craft correctness or performance result is available yet.
+law. It was stopped before runtime assertions. The endpoint is now partitioned
+through the existing piece contract. Turing `c73c2a26` and root `c4b4fd2`
+separate full compiler archives on disk from runtime piece retention; six
+native tests pass. The same 19 archived pieces occupy 7.9 MB when serialized
+for execution, with a measured sequential-load peak of 767 MB RSS and ending
+RSS of 436 MB. Full archives remain intact. A fresh complete craft build and
+full craft correctness/performance results remain pending.
 
 The remainder of this report records the inherited state and historical
 measurements, which must not be treated as results for the new integration.
