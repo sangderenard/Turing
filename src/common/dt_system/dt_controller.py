@@ -83,13 +83,21 @@ def _shadow_dt_limit(dt_tensor, metrics: Metrics, targets: "Targets"):
 
 
 def _energy_time_limit(metrics: Metrics, targets: "Targets"):
-    """The energy time limit and its presence, as two numerical outputs.
+    """The legacy aggregate energy limit and presence, as numerical outputs.
 
     Absence must cross the helper boundary explicitly. An optional Python
     return loses its presence in native linking and reads back as a present
     zero, which would clamp the next step to zero.
     """
 
+    # The participant publication owns this law when its declared spans exist.
+    # A compiled piece publishing stored E=1, exchangeable E=64, P=128 and
+    # fraction=1/4 used to get the aggregate 1/512 s pin under EVERY contract,
+    # overriding its BIND 1/8 s exchange bound and DILATE/SUBCYCLE exclusions.
+    # The aggregate energy remains an observable and a judged channel when
+    # configured; it is an energy scheduling fallback only without participants.
+    if int(metrics.pub_exchange_time.shape[0]) > 0:
+        return 0.0, 0.0
     fraction = getattr(targets, "energy_exchange_fraction", None)
     if fraction is None:
         return 0.0, 0.0
@@ -104,6 +112,10 @@ def _energy_time_limit(metrics: Metrics, targets: "Targets"):
 
 
 def _no_exchange_observed(metrics: Metrics, targets: "Targets") -> bool:
+    # HOLD is explicit on a participant row. A zero aggregate power must not
+    # invent HOLD for an explicitly BINDing, dilating or subcycling participant.
+    if int(metrics.pub_exchange_time.shape[0]) > 0:
+        return False
     fraction = getattr(targets, "energy_exchange_fraction", None)
     channels = metrics.error_channels
     return (
