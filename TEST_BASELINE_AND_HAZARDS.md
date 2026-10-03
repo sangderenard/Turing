@@ -1,5 +1,25 @@
 # Test baseline and hazards — read before running any test
 
+2026-10-03 return-site identity proposal (written against 3559a8f, ported onto
+854e145c): the focused `test_record_return_site_identity`,
+`test_ssa_record_return_state`, `test_control_source`,
+`test_pruned_loop_return`, `test_native_record_return_state` batch is 58 passed,
+1 xfailed (`static_branch`, HELD: an untouched declared field is not a record
+output), 1 failed in 140.8 s. The failure,
+`test_child_record_conditional_write_reaches_return`, is pre-existing at
+854e145c: unpickling `ArgumentBindingFact` (a tuple subclass whose `__new__`
+takes two arguments) in the native child raises TypeError. The new file's
+native matrix (core O0/O2, seven O0 variants, 20 s child bounds) passes except
+the held variant. Port record and every resolution:
+`docs/concordance_census/CONTINUATION_return_site_port.md`; the proposal's own
+account (its baseline, not this head): `docs/RECORD_RETURN_SITE_IDENTITY_FIX_2026-10-03.md`.
+
+The proposal also reports, on its baseline, `test_native_loop_arm_return`
+stopping at `run_all` with 10 id-scale findings, and shared identity-book
+`function_address` collisions in combined loop-composer (6 passed / 1 failed)
+and reducer field-state (3 passed / 1 failed) batches whose failing tests
+pass alone. Those were not re-measured during the port.
+
 2026-09-15 shaped-view and integer-operator repairs: four compiler defects were
 found by comparing compiled output against eager `AbstractTensor` execution,
 and each is now covered by `tests/test_native_shaped_view_lowering.py`

@@ -1011,8 +1011,11 @@ def evaporate_unrolled_loops(
         # ProcessGraph value/callsite id while retaining its exact callee and
         # argument edges, so ordinary post-unroll callsite specialization can
         # publish each occurrence independently.
+        # Source returns are terminal edges too: evaporating their loop
+        # erases every authored exit it owns (``for ...: if c: return m``).
         blocked_by_control = any(
-            member.loop.control_sites for member in selected_plans
+            member.loop.control_sites or member.loop.return_controls
+            for member in selected_plans
         )
         blocked_by_call = any(
             any((graph.G.nodes[node_id].get("attributes") or {}).get(key)

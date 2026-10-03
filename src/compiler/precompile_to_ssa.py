@@ -6471,6 +6471,10 @@ class _ControlSSABuilder:
                 )
                 self.emit(Handler.Store, [value, destination], attributes={
                     "source_effect_node_id": block.effect_node_id,
+                    # The write's own field-state cell: the version published
+                    # below begins at THIS effect (record-return selection
+                    # starts its intervening-write scan after it).
+                    "field_state_cell": block.field_state_cell,
                     "binding": "scalar_record_field_assignment",
                 })
             # The write IS one ``reducer_field_state`` cell (its WRITTEN

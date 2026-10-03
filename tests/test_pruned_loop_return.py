@@ -24,3 +24,9 @@ while True:
     graph.G.graph['planner_specializations'] = {'rollback': True}
     description = LoopComposer(LoopBackendCapabilities(backend='c',native_while=True)).describe(graph,4)
     assert len(description.return_controls) == 1
+    # The surviving exit is the LIVE authored site (its construct's span;
+    # no reducer ran here, so there is no site cell), never the pruned arm
+    # that happens to share the record slot.
+    _hint, _chain, slots, (site_cell, span) = description.return_controls[0]
+    assert slots == (1, 2)
+    assert span == key(live)

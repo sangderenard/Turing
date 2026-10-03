@@ -1518,6 +1518,21 @@ def repair_non_dominating_record_phi_uses(function):
 
 
 def publish_scalar_record_return_fields(module):
+    """Publish against the module's own book, including after serialization.
+
+    A pickled module carries its book on ``module.metadata``; replay must
+    read the receipts' rows from THAT book, never an unrelated ambient one,
+    and restore the caller's ambient book afterward."""
+    from .identity_concordance import begin_identity_book, end_identity_book, identity_book
+
+    _book, token = begin_identity_book(identity_book(module))
+    try:
+        return _publish_scalar_record_return_fields(module)
+    finally:
+        end_identity_book(token)
+
+
+def _publish_scalar_record_return_fields(module):
     """Publish checked return versions after call signatures and CFG settle.
 
     Preserve physical return identities and recover initial storage from the
@@ -1670,6 +1685,7 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         VERSION_NOT_CONST_OR_CARRIED_PHI,
         VERSION_NOT_UNIQUELY_DEFINED,
         FieldState,
+        FieldStateKind,
     )
     from .identity_concordance import (
         Derived, Mode, Ref, RowFieldKind, Unresolved, current_identity_book,
@@ -1930,6 +1946,41 @@ def scalar_return_field_versions(function, source_graph, functions=None):
             return None
         return cell_value_id(field_state.value)
 
+    def observed_formal(state_cell):
+        """The ProgramABI formal an OBSERVED site state names, joined
+        through the book: the formal's ``ssa_value`` cell must derive
+        (transitively, along posted edges) from the state's value cell --
+        the authored read of the incoming field.  Never an id match: the
+        state's value cell is a source-graph identity, the formal an SSA
+        one.  ``(formal, formal cell, field-state cell)`` or None."""
+        field_state_cell = cell_fact(state_cell)
+        if not isinstance(field_state_cell, Ref):
+            return None
+        field_state = cell_fact(field_state_cell)
+        if (not isinstance(field_state, FieldState)
+                or field_state.kind is not FieldStateKind.OBSERVED):
+            return None
+        book = current_identity_book()
+        for formal in function.args:
+            formal_cell = ssa_value_identity_cell(function, int(formal.id))
+            if formal_cell is None:
+                continue
+            frontier, seen = [formal_cell], {formal_cell}
+            for _depth in range(8):
+                if field_state.value in seen:
+                    return formal, formal_cell, field_state_cell
+                frontier = [
+                    source for cell in frontier
+                    for source, _stage in book.edges_into(cell)
+                    if isinstance(source, Ref) and source not in seen
+                ]
+                if not frontier:
+                    break
+                seen.update(frontier)
+            if field_state.value in seen:
+                return formal, formal_cell, field_state_cell
+        return None
+
     def entered_version(site, receiver, slots, fallback, exit_with):
         """The version current at a site that records no write of the
         field: the receiver's entered field value -- its ProgramABI formal,
@@ -1995,6 +2046,32 @@ def scalar_return_field_versions(function, source_graph, functions=None):
                 if isinstance(posted, int):
                     version_id = int(posted)
             candidates = definitions.get(int(version_id), ())
+            if not candidates and not versions:
+                # The site OBSERVED the incoming field (an authored read, no
+                # write on this path): its version is the formal that read
+                # became.  Publish that as the state's ``ssa_field_version``
+                # DERIVED(field-state cell, formal cell), so the selection
+                # is a version cell like every written site's.
+                entered = observed_formal(state_cell)
+                if entered is not None:
+                    formal, formal_cell, field_state_cell = entered
+                    current_identity_book().post(
+                        SSA_FIELD_VERSION, (scope, field_state_cell), int(formal.id),
+                        stage=RECORD_RETURN_VERSION,
+                        provenance=Derived((field_state_cell, formal_cell)),
+                        mode=Mode.CONCORD,
+                    )
+                    versions = version_cells((state_cell,))
+                    read = (state_cell, *versions)
+                    version_id = int(formal.id)
+            if not candidates and versions:
+                # A published version that no instruction defines is a
+                # formal of this function (both are SSA ids of one
+                # function): it is defined at entry.
+                formal = next((arg for arg in function.args
+                               if int(arg.id) == int(version_id)), None)
+                if formal is not None:
+                    candidates = ((entry, formal),)
         else:
             sites = [span for span, values in
                      (source_graph.graph.get('return_slot_values') or {}).items()
@@ -2016,12 +2093,38 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         if len(candidates) != 1:
             return exit_with(VERSION_NOT_UNIQUELY_DEFINED, read)
         owner, value = candidates[0]
-        definition = instructions[int(value.id)]
-        if not (definition.op == 'Const' or (
+        definition = instructions.get(int(value.id))
+        # A version the book records for this exact state (an
+        # ``ssa_field_version`` cell in ``read``) is the published version
+        # itself, whatever instruction produced it; the Const / carried-Phi
+        # admission only guards a version recovered without one.
+        published = any(isinstance(cell, Ref) and cell.page == SSA_FIELD_VERSION
+                        for cell in read)
+        if definition is None and not published:
+            return exit_with(VERSION_NOT_UNIQUELY_DEFINED, read)
+        if not published and not (definition.op == 'Const' or (
                 definition.op == 'Phi'
                 and (definition.attributes or {}).get('binding') == 'conditional_carried')):
             return exit_with(VERSION_NOT_CONST_OR_CARRIED_PHI, read)
-        if (int(value.id) in formal_ids or value.shape
+        if published:
+            # The published version begins at its authored assignment effect
+            # (the Store stamped with the version row's field-state cell),
+            # not where its right-hand side was evaluated: a Const RHS may
+            # live at entry, and the write itself is not an intervening one.
+            version_state = next(
+                cell.row[1] for cell in reversed(read)
+                if isinstance(cell, Ref) and cell.page == SSA_FIELD_VERSION
+            )
+            effects = [
+                (name, operation)
+                for name, body in function.blocks.items()
+                for operation in body.instrs
+                if operation.op == 'Store'
+                and (operation.attributes or {}).get('field_state_cell') == version_state
+            ]
+            if len(effects) == 1:
+                owner, definition = effects[0]
+        if ((int(value.id) in formal_ids and not published) or value.shape
                 or (value.dtype != fallback.dtype and not (
                     fallback.dtype == 'bool' and boolean_phi_tree(value, set())))):
             return exit_with(VERSION_IS_FORMAL_SHAPED_OR_MISTYPED, read)
@@ -2054,7 +2157,7 @@ def scalar_return_field_versions(function, source_graph, functions=None):
                     nx.ancestors(tail_cfg, predecessor) | {predecessor})
                 for block_name in relevant:
                     operations = function.blocks[block_name].instrs
-                    if block_name == owner:
+                    if block_name == owner and definition is not None:
                         operations = operations[operations.index(definition) + 1:]
                     for operation in operations:
                         writes_slot = (operation.res is not None

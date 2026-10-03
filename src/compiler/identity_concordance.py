@@ -1022,6 +1022,7 @@ class CorrelationTable:
                 found.extend(
                     self._stale_carried_read_findings(str(name), function)
                 )
+        found.extend(self._return_site_edge_findings(module))
         found.extend(self._sequence_descriptor_findings(module))
         found.extend(self._binding_kind_findings(module))
         found.extend(self._source_field_identity_findings(module))
@@ -2021,6 +2022,52 @@ class CorrelationTable:
                 "same-type numeric operator changed receiver, argument, "
                 f"descriptor, or authored target: {distinct!r}",
             ))
+        return found
+
+    @staticmethod
+    def _return_site_edge_findings(module: Any) -> list[Finding]:
+        """An emitted return edge must carry its reducer site's exact slots.
+
+        A value identity cannot identify the authored exit: three ``return
+        m`` sites have equal slots and distinct control/field-state owners.
+        The site is the ``return_site_cell`` the control builder stamped on
+        the edge; its slots are the ``return_site_slot`` rows posted for that
+        cell under the function's ``record_return_state_scope``, read from
+        the module's own book (so a pickled module is checked against the
+        rows it was built from, not a span-keyed copy).
+        """
+        from .concordance_declarations import RETURN_SITE_SLOT
+        from ..common.tensors.topological_reducer import _return_slot_receipt
+
+        book = identity_book(module)
+        page = book.pages.get(RETURN_SITE_SLOT.name)
+        found = []
+        for name, function in module.functions.items():
+            scope = function.metadata.get("record_return_state_scope")
+            if not scope:
+                continue
+            by_site: dict = {}
+            if page is not None:
+                for row in page.scope_rows(tuple(scope)):
+                    by_site.setdefault(row[1], []).append((row, page.latest(row)))
+            receipts = {
+                site: _return_slot_receipt(book, tuple(rows))
+                for site, rows in by_site.items()
+            }
+            for block in function.blocks.values():
+                if not block.instrs:
+                    continue
+                attrs = block.instrs[-1].attributes or {}
+                slots = attrs.get("return_source_value_ids")
+                if slots is None:
+                    continue
+                site = attrs.get("return_site_cell")
+                if site not in receipts or receipts[site] != tuple(slots):
+                    found.append(Finding(
+                        "return-site-edge-disagreement", str(name), None,
+                        f"{block.name}: return site {site!r} carries {tuple(slots)!r}; "
+                        f"the reducer records {receipts.get(site)!r}",
+                    ))
         return found
 
     @staticmethod
@@ -4295,8 +4342,8 @@ _ACTIVE_IDENTITY_BOOK: contextvars.ContextVar[IdentityBook | None] = (
 )
 
 
-def begin_identity_book() -> tuple[IdentityBook, contextvars.Token]:
-    """Start a fresh book for one compile and make it current.
+def begin_identity_book(book: IdentityBook | None = None) -> tuple[IdentityBook, contextvars.Token]:
+    """Make a fresh compile book (or an explicitly resumed module book) current.
 
     Returns the book and a reset token.  A nested compile (one
     ``lower_ast_source_to_ssa`` invoked while another is already on the
@@ -4305,7 +4352,7 @@ def begin_identity_book() -> tuple[IdentityBook, contextvars.Token]:
     recorded before the nested one started.  The token lets ``end_identity_
     book`` restore exactly the PREVIOUS value instead of blanking it.
     """
-    book = IdentityBook()
+    book = IdentityBook() if book is None else book
     token = _ACTIVE_IDENTITY_BOOK.set(book)
     return book, token
 
