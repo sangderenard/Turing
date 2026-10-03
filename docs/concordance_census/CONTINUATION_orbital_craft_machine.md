@@ -232,3 +232,70 @@ HOOKS NEEDED (not made; other owners):
   delivered throttle) when the craft has it; body box: `craft.design.
   body_size_m` is the machine prism.
 - Machine craft is batch 1 only (MachineCraft).
+
+## 2026-10-03 (after 6b20ed8) kick weight, dt recovery, fuel price, allocator speed
+
+1. KICK WEIGHT (orbital_jumper.leapfrog_momentum, used by both momentum
+   pieces). Column `dt_prev` (written by the momentum piece) and
+   `momentum_carry_*`. Gravity (force - applied) is kicked at the node by
+   (dt_prev + dt)/2; the interval rate (applied - flow p/m, constant over the
+   substep that computed it) is kicked half now, half carried into the next
+   kick. dt_prev = 0 at start makes the first kick the half kick, so the
+   initial-momentum seeding is gone; r() = (p + carry + dt_prev/2
+   F_grav(x)) / m. (A single weighted kick of the TOTAL force failed
+   test_seam_r: an applied force starting at a round boundary got kicked
+   over half of the step before it -- 8.42 vs 8.0.)
+   Measured, one LEO period, 5 s rounds vs a 3.3 s CFL step (every round
+   ends clipped), same dt control, dt alone vs mean-step weight:
+   |r-R| 18965 m -> 101.7 m, |v_r| 20.3 -> 0.055 m/s, energy 7.3e-6 ->
+   2.1e-10 (1173 substeps). Against 6b20ed8 as committed (2332 substeps):
+   2093 m, 6.61 m/s, 7.7e-7 -> the above. Circular-orbit test: energy drift
+   4.3e-9 -> 4.1e-11. Test: test_clipped_rounds_coast_one_orbit_with_the_
+   mean_step_kick.
+2. DT RECOVERY. What the controller reads (dt_controller /
+   participants.exchange_time_bound): a HOLD anywhere caps growth; an
+   undeclared piece that publishes no energy/power IS HOLD; and an
+   amalgamated power_w <= 0 holds (_no_exchange_observed). So publishing
+   energy/power alone cannot grow dt while every other piece is HOLD.
+   Mechanism used (existing): pieces declare `contract = BIND`
+   (llvm_dt_system.RoundPiece precedent, "absence reads as no bound"),
+   orbital_jumper.declare_binding, every orbital and machine piece.
+   Publications: the momentum piece publishes energy_j = |p|^2/2m and
+   power_w = |F_grav . v| ONLY when there are gravity centers.
+   DEVIATIONS from the request, measured:
+   - thrust power |F . v| and the rotation's |tau . omega| vs omega.I.omega/2
+     were built and published first: their exchange time is t/2 from rest
+     and -> 0 as a braking burn or despin brings speed through zero.
+     Measured: test_each_single_thruster (brake after a burn) "advanced 0.1
+     of 1.0"; despin to rest pinned dt_next to 9.5e-7 s and the round could
+     not land. Neither is published (thrust/torque are interval forces on a
+     store filled from zero; the rotation's bound is the attitude dt_limit).
+   - with no center, a published zero gravity power would hold dt for ever
+     (_no_exchange_observed), so nothing is published there.
+   Measured (spin couple 1 N x 2 m, 10 s rounds, substeps per round):
+   free space spin/despin/coast [1, 58, 96, 115, 78, 39, 1, 1, 1] (was
+   ... 115, 115, 115, 115 for ever); in orbit (7000 km, 1.02 v_circ):
+   [..., 39, 2, 1, 1, 1]. Test: test_dt_grows_back_once_a_spin_stops.
+   Side effect: the PI controller now grows dt up to its own dt_max = dx /
+   max_vel (cfl 1), above the 0.5 CFL proposal: 5 s rounds run at ~4.97 s
+   substeps (was the 3.31 s initial proposal held). That is the dt system's
+   controller as is.
+3. FUEL PRICE: allocate_wrench prices fuel_weight * q_k / q_ref, q_k the
+   TS1.2 flow at full throttle, q_ref the strongest burner's (reactionless:
+   0; no burner at all: per newton as before). Test:
+   test_fuel_is_priced_by_propellant_flow_not_by_newtons (two 100 N on one
+   line, 310 s vs 230 s, 80 N request: biprop 0.799, monoprop 0.000).
+4. SPEED (same answers): objective vectorised (fixed thrusters' columns
+   precomputed; gimbals rebuilt per evaluation; inline cross). 9-case bench
+   vs saved reference: |du| <= 1.2e-11, |dgimbal| <= 1e-14, rel dcost <=
+   4e-15. Per call: mean 452 ms -> 118 ms; steady cases 16-99 ms (the first
+   call carries ~500 ms of SLSQP warm-up). Remaining cost is SLSQP itself
+   over 8 deadband branches; branch caching was NOT done (it can change the
+   answer).
+5. Suites: owned 30 passed, 1 xfail; tracker + game 15 passed (the two
+   tracker failures recorded above now pass): rotating craft final 5.5 m /
+   0.0345 m/s, propellant 1.047 x TS2.1 (was 334.5 m / 3.333 m/s, 1.1185 x
+   before r() sync); kick/re-plan final 4.8 m / 0.035 m/s (was 335.2 m /
+   3.334 m/s); LEO->GEO 27.8 m / 0.241 m/s, fuel 1.0813 x ideal, 2813
+   substeps (was 159.2 m / 0.220 m/s, 1.0630 x, 8991); game rendezvous
+   18.6 m, 0.27 m/s.
