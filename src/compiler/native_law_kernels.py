@@ -28,6 +28,7 @@ Environment:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import os
 import pickle
@@ -170,6 +171,7 @@ class PieceBuildFact:
 
     compiler_digest: str
     module_digests: tuple[tuple[str, str, str], ...]
+    retain_compilation: bool = True
 
 
 @dataclass(frozen=True)
@@ -238,7 +240,8 @@ def post_piece_book(directory: Any, piece_id: str, batch: int, key: str, *,
             record = built.compiler
             book.post(
                 vocabulary["build_page"], row,
-                PieceBuildFact(record.digest, record.modules),
+                PieceBuildFact(record.digest, record.modules,
+                               getattr(built, "retain_compilation", True)),
                 stage=vocabulary["stage"],
                 provenance=(Derived((cause,)) if cause is not None
                             else Novel(vocabulary["build"], ())),
@@ -353,6 +356,9 @@ class LLVMPiece:
     #: spans (``instantiate(..., outputs=)``); runtime binding like the two
     #: above, never persisted.
     in_place: tuple = field(default=(), repr=False, compare=False)
+    #: False elects a runtime-only copy: SSA/source and the artifact's
+    #: emission book are absent. The ABI, LLVM text and compiler stamp remain.
+    retain_compilation: bool = True
 
     def __getstate__(self):
         state = dict(self.__dict__)
@@ -364,6 +370,7 @@ class LLVMPiece:
     def __setstate__(self, state):
         self.__dict__.update(state)
         self.__dict__.setdefault("compiler", None)
+        self.__dict__.setdefault("retain_compilation", True)
         self.__dict__.setdefault("_execution", None)
         self.__dict__.setdefault("_bound", None)
         self.__dict__.setdefault("in_place", ())
@@ -442,22 +449,62 @@ class LLVMPiece:
             dict(kernel.output_ids), dict(kernel.constant_outputs), kernel.batch,
         )
 
-    def save(self, path) -> None:
-        """Persist the piece as one file: artifact, ids, names, SSA and source."""
+    def for_runtime(self, *, retain_compilation: bool = False) -> "LLVMPiece":
+        """Return an unbound copy, optionally retaining its compiler payload.
+
+        The default omits repository SSA, authored source, output metadata and
+        the artifact emission book. Exact ABI, full LLVM text, compiler stamps
+        and entry identity survive. The original piece and shared artifact are
+        untouched; requesting retention cannot restore already omitted data.
+        """
+        piece = copy.copy(self)
+        piece.artifact = copy.copy(self.artifact)
+        # Native handles and prepared spans belong to a live execution, not a
+        # persisted piece. Reset only the copied artifact, even after the
+        # original has run and holds non-pickleable ctypes function pointers.
+        for name in ("_entry", "_library", "_validation_error_reset",
+                     "_validation_error_take"):
+            setattr(piece.artifact, name, None)
+        piece._execution = None
+        piece._bound = None
+        piece.in_place = ()
+        piece.output_ids = dict(self.output_ids)
+        piece.constant_outputs = dict(self.constant_outputs)
+        piece.retain_compilation = bool(
+            retain_compilation and getattr(self, "retain_compilation", True))
+        if not piece.retain_compilation:
+            piece.module = None
+            piece.source = None
+            piece.outputs = None
+            piece.artifact.emission = None
+        return piece
+
+    def save(self, path, *, retain_compilation: bool = True) -> None:
+        """Persist a copy, retaining SSA/source and audit payload by default.
+
+        ``retain_compilation=False`` writes the same executable ABI and LLVM
+        text without the compiler payload. Existing archives are not modified.
+        """
         import pickle
 
         with open(path, "wb") as stream:
-            pickle.dump(self, stream)
+            pickle.dump(
+                self.for_runtime(retain_compilation=retain_compilation), stream)
 
     @classmethod
-    def load(cls, path) -> "LLVMPiece":
+    def load(cls, path, *, retain_compilation: bool = True) -> "LLVMPiece":
+        """Load a piece; optionally omit retained compiler/audit payload.
+
+        A runtime-only archive cannot recover omitted data by requesting True.
+        Legacy archives default to retaining their compiler payload.
+        """
         import pickle
 
         with open(path, "rb") as stream:
             piece = pickle.load(stream)
         if not isinstance(piece, cls):
             raise TypeError(f"{path}: not an LLVMPiece")
-        return piece
+        return piece if retain_compilation else piece.for_runtime()
 
     def __call__(self, *columns):
         from .ssa_llvm_backend import prepare_artifact_execution

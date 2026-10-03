@@ -44813,6 +44813,15 @@ def _lower_ast_source_to_ssa_impl(
         PieceLookupLinker().visit(module)
         ast.fix_missing_locations(module)
 
+    # A runtime-only election intentionally drops the repository SSA and
+    # authored definition. The normal piece link needs both; silently skipping
+    # it would make source pursuit ingest LLVMPiece's execution implementation.
+    for name, value in python_bindings.items():
+        piece = llvm_piece_of(value)
+        if piece is not None and not getattr(piece, "retain_compilation", True):
+            raise ValueError(
+                f"LLVM piece {name!r} is runtime-only (retain_compilation=False); "
+                "source linking requires a piece with retained compiler metadata")
     linked_pieces = {
         str(name): piece
         for name, value in python_bindings.items()
