@@ -139,9 +139,12 @@ def llvm_piece_of(value: Any) -> Any | None:
     artifact = getattr(value, "artifact", None)
     if artifact is None:
         return None
+    from .external_functions import ExternalSlotABI
     from .ssa_llvm_backend import LLVMFunctionArtifact
 
-    if not isinstance(artifact, LLVMFunctionArtifact):
+    # A declared external (``external_functions.ExternalFunction``) is the
+    # same piece-shaped leaf with a slot ABI in place of a compiled artifact.
+    if not isinstance(artifact, (LLVMFunctionArtifact, ExternalSlotABI)):
         return None
     if not hasattr(value, "argument_ids") or not hasattr(value, "output_ids"):
         return None
@@ -1467,13 +1470,17 @@ class ExtractionContract:
         if cached is not None:
             return cached
         buffer_order = tuple(int(v) for v in artifact.buffer_order)
+        # A declared external is bound at load into the program's slot table
+        # (``external_functions``): declared native code, and the program
+        # makes no callback into the host beyond its declared slots.
+        runtime_slot = str(getattr(piece, "binding", "static-link")) == "runtime-slot"
         parameters = {
-            "loader": "static-link",
+            "loader": "runtime-slot" if runtime_slot else "static-link",
             "symbol_resolution": {
                 "symbol": str(artifact.name),
                 "llvm_ir": str(artifact.llvm_ir),
             },
-            "callbacks": (),
+            "callbacks": "reject" if runtime_slot else (),
             "execution": "native",
             "shell_capability": None,
             "shell_abi": None,

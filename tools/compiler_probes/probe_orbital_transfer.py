@@ -42,10 +42,14 @@ its laws to XPASS and forces both tables to be edited.  Item 1 (matrices
 and complicated lhs) is resolved: a matrix-valued Equality declares one
 output per component and a non-name lhs its residual
 (``symbolic_equation_compiler.declared_symbolic_outputs``); a MatrixElement
-of a MatrixSymbol is an input column (``symbolic_process_graph``).
+of a MatrixSymbol is an input column (``symbolic_process_graph``).  Item 3
+(externals) is resolved: each undefined Function is a declared external
+the compiled program calls through its slot table, filled at load from
+``host_externals`` (``src/compiler/external_functions.py``).
 History and verbatim messages:
-``docs/concordance_census/CONTINUATION_orbital_probe.md`` and
-``CONTINUATION_orbital_step1_matrices.md``.
+``docs/concordance_census/CONTINUATION_orbital_probe.md``,
+``CONTINUATION_orbital_step1_matrices.md`` and
+``CONTINUATION_orbital_item3_externals.md``.
 
     python -u tools/compiler_probes/probe_orbital_transfer.py
 """
@@ -69,28 +73,27 @@ BATCH = 4
 TOLERANCE = 1e-12
 
 # The user's work items for this set (2026-10-02), the ones still open.
-# Item 1 (matrices and complicated lhs) is resolved and is not listed.
+# Item 1 (matrices and complicated lhs) and item 3 (external functions
+# compiled as runtime-provided symbols: declared externals called through
+# the program's slot table, ``src/compiler/external_functions.py``) are
+# resolved and are not listed.
 WORK_ITEMS: dict[int, str] = {
     2: "Greek-name sanitation (mu_1/mu_2 spelled with GREEK SMALL LETTER MU)",
-    3: "external functions compiled as runtime-provided symbols "
-       "(r1(s), F1(s) are applied undefined Functions; ingest emits an "
-       "unbound Call)",
     4: "live differentiation/integration (Derivative of an applied undefined "
-       "Function: no graph-native adjoint rule for call)",
+       "Function: no graph-native adjoint rule for call; Integral quadrature: "
+       "get_tensor has no repository LLVM emission)",
 }
 
 # law -> the open work items it needs before it can pass, by the constructs
 # it carries.  A law not listed must pass.  Item 2 is assigned by construct
-# presence only: every Greek-carrying law also needs item 3, so its own
-# failure (if any) is not observed yet.
+# presence only and is not observed: equation_of_motion_rhs carries the
+# Greek names and passes (2026-10-03); the laws still listed fail at item 4
+# first.
 LAW_BLOCKERS: dict[str, tuple[int, ...]] = {
-    "orbital_transfer_raw": (2, 3, 4),
-    "equation_of_motion_lhs": (3, 4),
-    "equation_of_motion_rhs": (2, 3),
-    "total_energy_expression": (2, 3, 4),
-    "force_cost_integral": (3,),
-    "initial_condition_lhs": (3,),
-    "terminal_condition_lhs": (3,),
+    "orbital_transfer_raw": (2, 4),
+    "equation_of_motion_lhs": (4,),
+    "total_energy_expression": (2, 4),
+    "force_cost_integral": (4,),
 }
 
 
@@ -208,6 +211,18 @@ def reference_bindings(program: dict):
     }
 
 
+def host_externals(concrete) -> dict:
+    """The host's runtime implementations of the set's externals.
+
+    The same concrete functions the reference uses, as numpy callables: what
+    the craft's r()/F() seam supplies at runtime, bound into the compiled
+    program's slot table at load (``bind_external_slots``)."""
+    out = {}
+    for function, body in concrete.items():
+        out[str(function.__name__)] = sp.lambdify(body.variables, body.expr, modules="numpy")
+    return out
+
+
 def reference_columns(names, batch=BATCH) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(20261002)
     return {name: rng.uniform(0.5, 2.0, batch) for name in names}
@@ -283,6 +298,7 @@ def book_report(module, entry, graphs) -> int:
 
 def run_law(law, equations, failures, concrete, sink=None):
     """Returns the piece (lowered and emitted) or None."""
+    from src.compiler.external_functions import bind_external_slots
     from src.compiler.native_package import piece_from_law
     from src.compiler.symbolic_equation_compiler import compile_sympy_equations
     from src.compiler.ssa_c_backend import emit_ssa_module_to_c
@@ -318,6 +334,11 @@ def run_law(law, equations, failures, concrete, sink=None):
     columns = reference_columns(arguments)
     try:
         expected = reference_values(compilation, law, columns, concrete)
+        externals = host_externals(concrete)
+        if piece.artifact.external_slots:
+            bind_external_slots(piece.artifact, externals)
+        if c_artifact.external_slots:
+            bind_external_slots(c_artifact, externals)
         llvm = dict(zip(piece.output_names, piece(*(columns[name] for name in arguments))))
         execution = c_artifact.prepare_execution(
             {value_id: columns[name] for name, value_id in zip(arguments, piece.argument_ids)})
@@ -384,7 +405,7 @@ def main() -> int:
     for (stage, where), count in sorted(by_stage.items()):
         print(f"  {count} x {stage} raised in {where}")
     print()
-    print("work list (open items; item 1, matrices and complicated lhs, resolved):")
+    print("work list (open items; items 1 (matrices, complicated lhs) and 3 (externals) resolved):")
     for item, text in WORK_ITEMS.items():
         blocked = [law for law, items in LAW_BLOCKERS.items() if item in items]
         print(f"  {item}. {text}")

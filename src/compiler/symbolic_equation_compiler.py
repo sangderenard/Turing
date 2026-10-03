@@ -24,6 +24,7 @@ from .symbolic_process_graph import (
     ingest_sympy_expressions,
     matrix_component_name,
 )
+from .external_functions import declared_external_functions
 from .sympy_dual_ir_cache import SympyDualIRCache
 from ..common.tensors.accelerator_backends.aot_checkpoint import callable_digest
 from ..common.tensors.accelerator_backends.artifact_cache import implementation_digest
@@ -427,6 +428,13 @@ def _compile_sympy_equations_uncached(
             # (column, MatrixSymbol, shape, element index) per input column
             # that is an element of a MatrixSymbol.
             "matrix_element_inputs": matrix_element_inputs,
+            # (name, arity) per undefined Function the outputs apply: each is
+            # a declared external the host supplies at runtime
+            # (``external_functions``).
+            "external_functions": tuple(
+                (row.name, row.arity)
+                for row in declared_external_functions(
+                    tuple(row.expression for row in declarations))),
             "symbolic_source": "sympy",
             "symbolic_dtype": dtype,
             "publications": tuple(
@@ -605,6 +613,16 @@ def _post_symbolic_program(
             stage=INGESTION, provenance=Derived((cells[int(equation_index)],)),
             mode=Mode.CONCORD,
         )
+    # Undefined Functions the outputs apply: declared externals (NOVEL,
+    # minted) and their callsites (DERIVED), ``external_functions``.
+    from .external_functions import post_external_functions
+
+    post_external_functions(
+        program, tuple(equations), cells,
+        tuple((row.name, row.equation_index, row.expression)
+              for row in declared_symbolic_outputs(tuple(equations), name)),
+        output_cells,
+    )
     return output_cells
 
 
@@ -636,6 +654,7 @@ def _pipeline_implementation() -> str:
         declared_symbolic_outputs,
         _scalar_output,
         SymbolicOutputDeclaration,
+        declared_external_functions,
         matrix_component_name,
         ingest_sympy_expression,
         ingest_sympy_expressions,

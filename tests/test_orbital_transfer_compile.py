@@ -94,3 +94,49 @@ def test_matrix_equality_declares_one_output_per_component_on_the_book():
         assert (fact.equation_index, fact.component, fact.form) == (
             0, (row, 0), SymbolicOutputForm.RESIDUAL)
         assert [source for source, _stage in book.edges_into(cell)] == [equation]
+
+
+def test_undefined_functions_are_declared_externals_on_the_book():
+    """Work item 3 at the identity: the raw ``initial_condition`` Equality
+    applies r1, r2, r3.  Each is declared an external (NOVEL, minted, from
+    the equation cell); each application is a callsite DERIVED from the
+    external cell and its output cell; a second post reuses the identity."""
+    from src.compiler.concordance_declarations import (
+        DECLARE_EXTERNAL_FUNCTION, EXTERNAL_CALLSITE, EXTERNAL_FUNCTION,
+        EXTERNAL_FUNCTION_NAME, SYMBOLIC_EQUATION, SYMBOLIC_EQUATION_OUTPUT,
+    )
+    from src.compiler.identity_concordance import current_identity_book
+    from src.compiler.symbolic_equation_compiler import (
+        compile_sympy_equations, symbolic_program_scope,
+    )
+
+    name = "orbital_initial_condition_externals"
+    compilation = compile_sympy_equations([PROGRAM["initial_condition"]], name=name)
+    assert compilation.function.metadata["external_functions"] == (
+        ("r1", 1), ("r2", 1), ("r3", 1))
+
+    book = current_identity_book()
+    program = symbolic_program_scope(compilation, name)
+    equation = book.latest_ref(SYMBOLIC_EQUATION, (program, 0))
+    minted = {}
+    for external in ("r1", "r2", "r3"):
+        named = book.page(EXTERNAL_FUNCTION_NAME).latest((program, external))
+        assert named is not None
+        cell = book.latest_ref(EXTERNAL_FUNCTION, (program, named.external_id))
+        assert cell is not None
+        transform, operands = book.mint_of(cell)
+        assert transform == DECLARE_EXTERNAL_FUNCTION and operands == (equation,)
+        minted[external] = (named.external_id, cell)
+    for row, external in enumerate(("r1", "r2", "r3")):
+        output = f"{name}_0_{row}_0"
+        output_cell = book.latest_ref(SYMBOLIC_EQUATION_OUTPUT, (program, output))
+        call = sp.srepr(sp.Function(external)(0))
+        callsite = book.latest_ref(EXTERNAL_CALLSITE, (program, output, call))
+        assert callsite is not None
+        assert {source for source, _stage in book.edges_into(callsite)} == {
+            minted[external][1], output_cell}
+
+    compile_sympy_equations([PROGRAM["initial_condition"]], name=name)
+    for external, (external_id, _cell) in minted.items():
+        assert book.page(EXTERNAL_FUNCTION_NAME).latest(
+            (program, external)).external_id == external_id

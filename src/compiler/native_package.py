@@ -33,12 +33,21 @@ from .native_law_kernels import LLVMPiece, batch_contract
 def piece_from_law(compilation: Any, law: str, batch: int, *,
                    directory: str | Path | None = None,
                    optimization: str = "O2",
-                   resolved_process_graph_sink=None) -> LLVMPiece:
+                   resolved_process_graph_sink=None,
+                   externals: Mapping[str, Any] | None = None) -> LLVMPiece:
     """Lower one compiled SymPy law to an LLVM piece, on its own.
 
     ``resolved_process_graph_sink`` is handed to ``lower_ast_source_to_ssa``
     unchanged: a viewer that draws the lowering's process graph receives the
     graph of this very lowering instead of lowering the source a second time.
+
+    The law's declared externals (its undefined Functions,
+    ``metadata["external_functions"]``) are bound as runtime-slot leaves
+    specialized at their callsites (``external_functions.externals_for_law``).
+    ``externals`` optionally names an implementation per external (an
+    ``LLVMPiece`` the leaf takes its ABI from, a host callable, or an
+    ``ExternalFunction``); the slots are filled at load with
+    ``external_functions.bind_external_slots``.
     """
 
     from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
@@ -46,15 +55,17 @@ def piece_from_law(compilation: Any, law: str, batch: int, *,
     )
     from .fortran_c_shell import lower_ast_source_to_ssa
     from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
+    from .external_functions import externals_for_law
     from .vehicle_python_compilation import symbolic_abstract_tensor_source
 
     metadata = compilation.function.metadata
     argument_names = tuple(metadata["argument_names"])
     output_names = tuple(metadata["output_names"])
     source = symbolic_abstract_tensor_source(compilation, law)
+    declared_externals = externals_for_law(compilation, law, batch, source, externals)
     module, outputs, exports = lower_ast_source_to_ssa(
         source, law,
-        python_bindings={"AbstractTensor": AbstractTensor},
+        python_bindings={"AbstractTensor": AbstractTensor, **declared_externals},
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         name=law, runtime_closure_only=True,
         extraction_contract=batch_contract(law, argument_names, batch),

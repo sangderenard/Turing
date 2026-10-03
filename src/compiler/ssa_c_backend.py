@@ -872,6 +872,10 @@ class CModuleExecution:
 
     def run(self) -> "CModuleExecution":
         self.artifact.entry()(self._pointers, self._extents)
+        if self.artifact.external_slots:
+            from .external_functions import check_external_faults
+
+            check_external_faults(self.artifact)
         return self
 
 
@@ -933,6 +937,10 @@ class CModuleArtifact:
     #: ``link="dynamic"``, which links against these instead of recompiling
     #: ``linked_llvm``.
     linked_libraries: tuple[tuple[str, str], ...] = ()
+    #: Declared externals this module calls through its exported slot table
+    #: (``external_functions.external_slot_rows``); the host fills them at
+    #: load with ``external_functions.bind_external_slots``.
+    external_slots: tuple = ()
     library_path: Path | None = None
     _entry: Any = field(default=None, repr=False)
     #: Directories the OS loader must search for dynamically linked pieces,
@@ -1540,6 +1548,14 @@ def emit_ssa_module_to_c(
 
     name = str(entry_name or function_name)
     reachable = _module_call_closure(module, function_name)
+    # Declared externals (``external_functions``): runtime-slot leaves called
+    # through the slot table this module exports and the host fills at load.
+    from .external_functions import (
+        c_slot_call, c_slot_runtime, external_slot_rows, runtime_slot_functions,
+    )
+
+    slot_functions = runtime_slot_functions(module, reachable)
+    external_slot_index = {fn: index for index, fn in enumerate(slot_functions)}
 
     # A tensor reference kernel the module imported from authored LLVM text
     # (``binary_value``, ``binary_scalar_double``) is no lowering: its row's
@@ -2267,18 +2283,27 @@ def emit_ssa_module_to_c(
                         "Call", f"LLVM piece {symbol!r} extent {(value_id, kind, axis)!r} "
                         f"is not static in {fn}"))
                     extent_values.append("0")
-            extern_line = f"extern void {symbol}(void **buffers, int32_t *extents);"
-            if extern_line not in prototypes:
-                prototypes.append(extern_line)
-                recorder.unit(UnitKind.PROTOTYPE, extern_line, spelling=symbol)
-            linked_llvm.append((symbol, str(piece["llvm_ir"])))
-            linked_libraries.append((symbol, str(piece.get("library_path") or "")))
+            runtime_slot = piece.get("binding") == "runtime-slot"
+            if runtime_slot:
+                if function_return_type != "void":
+                    shortfalls.append(CEmissionShortfall(
+                        "Call", f"external {piece['external']!r} leaf returns "
+                        f"{function_return_type}, not through its buffers"))
+                call_lines = c_slot_call(name, external_slot_index[fn])
+            else:
+                extern_line = f"extern void {symbol}(void **buffers, int32_t *extents);"
+                if extern_line not in prototypes:
+                    prototypes.append(extern_line)
+                    recorder.unit(UnitKind.PROTOTYPE, extern_line, spelling=symbol)
+                linked_llvm.append((symbol, str(piece["llvm_ir"])))
+                linked_libraries.append((symbol, str(piece.get("library_path") or "")))
+                call_lines = [f"    {symbol}(piece_buffers, piece_extents);"]
             shim = [
                 f"    void *piece_buffers[{max(len(slots), 1)}] = {{"
                 + ", ".join(slots or ["NULL"]) + "};",
                 f"    int32_t piece_extents[{max(len(extent_values), 1)}] = {{"
                 + ", ".join(extent_values or ["0"]) + "};",
-                f"    {symbol}(piece_buffers, piece_extents);",
+                *call_lines,
             ]
             prototypes.append(
                 f"static {function_return_type} {_c_symbol(fn)}("
@@ -5673,6 +5698,8 @@ def emit_ssa_module_to_c(
         ),
         *deployment_support,
         "",
+        *(c_slot_runtime(name, len(slot_functions)) if slot_functions else ()),
+        "",
         *prototypes,
         "",
         *definitions,
@@ -5709,6 +5736,7 @@ def emit_ssa_module_to_c(
         reason=VALUE_WITHOUT_IDENTITY_CELL, stage=EMISSION_C,
     )
     return CModuleArtifact(
+        external_slots=external_slot_rows(module, slot_functions),
         linked_llvm=tuple(linked_llvm),
         linked_libraries=tuple(linked_libraries),
         name=name,

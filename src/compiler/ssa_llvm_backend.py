@@ -1221,6 +1221,15 @@ def _emit_repository_call_module(
 
     reachable, kernels_used = _internal_call_closure(module, function_name)
     piece_records = _piece_symbols(module)
+    # Declared externals (``external_functions``): runtime-slot leaves called
+    # through the slot table this module exports and the host fills at load.
+    from .external_functions import (
+        external_slot_rows, llvm_slot_call, llvm_slot_runtime,
+        runtime_slot_functions,
+    )
+
+    slot_functions = runtime_slot_functions(module, tuple(piece_records))
+    external_slot_index = {fn: index for index, fn in enumerate(slot_functions)}
     linked_pieces: dict[str, str] = {}
     shortfalls: list[LLVMEmissionShortfall] = []
     from .ir_identities import precision_backend_shortfalls
@@ -3616,9 +3625,14 @@ def _emit_repository_call_module(
                                 f"ptr {extents_table}, i64 {extent_index}")
                             body.append(
                                 f"  store i32 {extent}, ptr %piece.extent.{tag}.{extent_index}, align 4")
-                        body.append(
-                            f"  call void @{piece['symbol']}(ptr {table}, ptr {extents_table})")
-                        linked_pieces[str(piece["symbol"])] = str(piece["llvm_ir"])
+                        if piece.get("binding") == "runtime-slot":
+                            body.extend(llvm_slot_call(
+                                entry_name, external_slot_index[symbol], len(slot_functions),
+                                tag, table, extents_table))
+                        else:
+                            body.append(
+                                f"  call void @{piece['symbol']}(ptr {table}, ptr {extents_table})")
+                            linked_pieces[str(piece["symbol"])] = str(piece["llvm_ir"])
                     else:
                         internal_call_records.append((
                             internal_symbols.get(name),
@@ -4283,6 +4297,11 @@ def _emit_repository_call_module(
     # linked piece that carried it, the intrinsic table, or the authored
     # kernel library (``extract_llvm_function`` / ``_declaration``).
     symbol_origins: dict[str, tuple] = {}
+    if slot_functions:
+        for symbol, text in llvm_slot_runtime(
+                entry_name, len(slot_functions)).items():
+            definitions[symbol] = text
+            symbol_origins[symbol] = ("intrinsic",)
     for piece_symbol, piece_ir in linked_pieces.items():
         piece_declarations, piece_definitions = _piece_module_parts(piece_ir)
         declarations.update(piece_declarations)
@@ -4433,6 +4452,7 @@ def _emit_repository_call_module(
     )
     return LLVMFunctionArtifact(
         name=entry_name,
+        external_slots=external_slot_rows(module, slot_functions),
         llvm_ir=llvm_ir + "\n",
         buffer_order=tuple(buffer_order),
         buffer_shapes=tuple(buffer_shapes),
@@ -4484,6 +4504,10 @@ class LLVMFunctionArtifact:
     #: silently dropped -- a watch that vanishes reads as "this value is
     #: fine", which is the failure mode this whole mechanism exists to end.
     watch_shortfalls: tuple[tuple[int, str], ...] = ()
+    #: Declared externals this module calls through its exported slot table
+    #: (``external_functions.external_slot_rows``); the host fills them at
+    #: load with ``external_functions.bind_external_slots``.
+    external_slots: tuple = ()
     _entry: _Any = _field(default=None, repr=False)
     _library: _Any = _field(default=None, repr=False)
     _validation_error_reset: _Any = _field(default=None, repr=False)
@@ -4557,6 +4581,10 @@ class LLVMExecution:
             raise RuntimeError(
                 f"LLVM runtime validation failed with code {validation_error}"
             )
+        if self.artifact.external_slots:
+            from .external_functions import check_external_faults
+
+            check_external_faults(self.artifact)
         return self
 
 
@@ -5401,9 +5429,25 @@ def emit_ssa_function_to_llvm(
     repository_closure, _authored_leaves = _internal_call_closure(
         module, function_name
     )
+    # A linked LLVM piece (or runtime-slot external) is a leaf the closure
+    # deliberately does not follow, so a root whose only callee is a piece
+    # has a closure of one; only the module emitter renders a piece call.
+    # Observed: ``initial_condition_lhs`` (root = three calls to the
+    # externals r1/r2/r3 at a literal 0, no planned region) reached the
+    # single-function path and asked the kernel library for the leaf.
+    calls_piece = any(
+        bool(callee.metadata.get("llvm_piece"))
+        for block in module.functions[function_name].blocks.values()
+        for instruction in block.instrs
+        if instruction.op in {"Call", "call"}
+        for callee in (module.functions.get(
+            str(instruction.attributes.get("callee") or "")),)
+        if callee is not None
+    )
     if (
         len(repository_closure) > 1
         or len(module.functions[function_name].blocks) > 1
+        or calls_piece
     ):
         return _emit_repository_call_module(
             module,

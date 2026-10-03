@@ -44345,7 +44345,14 @@ def _lower_ast_source_to_ssa_impl(
                 "extent_order": tuple(
                     (int(v), str(kind), None if axis is None else int(axis))
                     for v, kind, axis in piece.artifact.extent_order),
+                "binding": str(getattr(piece, "binding", "static-link")),
             }
+            # A declared external is the same leaf bound at load: the lanes
+            # call it through the program's slot table
+            # (``external_functions``), never by a linked symbol.
+            piece_record = getattr(piece, "piece_record", None)
+            if piece_root.metadata["llvm_piece"]["binding"] == "runtime-slot":
+                piece_root.metadata["llvm_piece"].update(piece_record())
             linked_repository_ssa[piece_binding_name] = (
                 piece.module, str(piece.entry), dict(piece.outputs or {}),
             )

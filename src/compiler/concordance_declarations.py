@@ -1968,6 +1968,53 @@ SYMBOLIC_SUBEXPRESSION = declare_page("symbolic_subexpression", (
     RowField("path", K.LABEL),
 ), SymbolicSubexpressionFact)          # DERIVED(parent subexpression / expression cell); CONCORD
 
+# ----------------------------------------------------------------------------
+# External functions (orbital work item 3, ``external_functions``).
+#
+# Writer: ``external_functions.post_external_functions`` (called by
+# ``compile_sympy_equations``).  Each undefined SymPy Function an equation set
+# applies is an ``external_function`` row NOVEL(DECLARE_EXTERNAL_FUNCTION,
+# (the first applying equation's cell,)) with a minted id; its
+# ``external_function_name`` row (program, name) records that id, DERIVED
+# from the external cell, so a second post of the program reuses it.  Every
+# distinct application in a declared output is an ``external_callsite`` row
+# DERIVED from the external cell and the output cell.
+# ----------------------------------------------------------------------------
+
+#: An undefined Function declared as a runtime-supplied external.  Operand:
+#: the cell of the equation that first applies it.
+DECLARE_EXTERNAL_FUNCTION = declare_transform("declare_external_function", 1)
+
+
+@dataclass(frozen=True)
+class ExternalFunctionFact:
+    name: str
+    arity: int
+
+
+@dataclass(frozen=True)
+class ExternalFunctionNameFact:
+    #: The minted id of the external's ``external_function`` row.
+    external_id: int
+
+
+@dataclass(frozen=True)
+class ExternalCallsiteFact:
+    external: str
+    arity: int
+
+
+EXTERNAL_FUNCTION = declare_page("external_function", (
+    RowField("program", K.SCOPE), RowField("external", K.VALUE_ID),
+), ExternalFunctionFact)               # NOVEL(DECLARE_EXTERNAL_FUNCTION, equation cell); CONCORD
+EXTERNAL_FUNCTION_NAME = declare_page("external_function_name", (
+    RowField("program", K.SCOPE), RowField("name", K.NAME),
+), ExternalFunctionNameFact)           # DERIVED(external_function cell); CONCORD
+EXTERNAL_CALLSITE = declare_page("external_callsite", (
+    RowField("program", K.SCOPE), RowField("output", K.NAME),
+    RowField("call", K.LABEL),
+), ExternalCallsiteFact)               # DERIVED(external cell, output cell); CONCORD
+
 __all__ =[name for name in dir() if not name.startswith("_") and name not in {
     "ast", "dataclass", "Enum", "Any", "Ref", "RowField", "K", "Unresolved",
     "declare_page", "declare_reason", "declare_stage", "declare_transform",
