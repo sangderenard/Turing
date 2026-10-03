@@ -440,6 +440,25 @@ class _BodyMaterializer:
             mask, when_true, when_false = (
                 self.operand(argument) for argument in instruction.args
             )
+            if (
+                self.tensor_vocabulary
+                and TENSOR_CALL_FORMS.get("where") is True
+                and not self._is_constant(instruction.args[0])
+            ):
+                # SSA ``Select`` is elementwise.  In the tensor vocabulary the
+                # mask is a column, and Python's ``a if mask else b`` is one
+                # branch for the whole column: the lowering spells it as
+                # control flow on the mask's FIRST element and copies the
+                # whole column out of whichever arm it took, so a batched
+                # Piecewise returned lane 0's arm for every lane (and read
+                # past a one-element constant arm).  The catalogued
+                # ``where`` is the elementwise Select.
+                self.assign(
+                    result,
+                    f"{_TENSOR_RECEIVER}.where({mask}, {when_true}, {when_false})",
+                )
+                self._mark_constant(result, constant=False)
+                return
             self.assign(
                 result, f"({when_true} if {mask} else {when_false})"
             )
