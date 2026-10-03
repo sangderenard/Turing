@@ -201,3 +201,66 @@ Uncommitted.
   (test_attitude_dt_limit_keeps_a_spin_per_step_small): unbounded 1.66596
   rad per 22 s window (2 substeps), bounded 2.197204 rad (18 substeps).
   Tracker file: 8 tests.
+
+## 2026-10-03 after 6b20ed8 (co-temporal r()) and 3d6d74c (mean-step kick)
+
+Coordinator items, in order:
+1. Re-derived against the honest r(): the stagger floors are gone; bands are
+   coast_position_deadband * |r_ref| and coast_velocity_deadband * |v_ref|,
+   defaults 1e-6 / 1e-5 (7 m, 0.075 m/s at 7000 km; the jumper's coast error
+   is 6.9 m/orbit). Sweep on the main+RCS transfer (fuel x TS2.1 ideal):
+   0/0 1.104, 1e-6/1e-5 1.061, 2e-6/5e-5 1.079, 4e-6/1e-4 1.082,
+   1e-5/1e-4 1.186, 1e-5/3e-4 1.214, 3e-5/3e-4 1.278: wider is WORSE.
+   Noise source found: burn 2 armed with the engine 2.94 rad off (a trim had
+   pointed it away), fired 26 s late -> 6.3 km error -> 28 kg of trims. Fix:
+   the slew lead is now the attitude PD's own settling time from the present
+   angle ((1+zwt)e^-zwt = alignment/angle) + 2 rounds (was a fixed 6/w_a).
+2. fly() skips craft.throttle when craft.applies_allocation; declared on
+   OrbitalJumper (False) and MachineCraft (True).
+3. attitude_torque_demand takes the full inertia tensor (craft.inertia_tensor();
+   OrbitalJumper.inertia_tensor() added = diag of its principal moments).
+4. New `Actuation` object in orbital_tracker: allocate (applying), probe
+   (machine: apply=False), inertia, can_torque (machine: probe a pure torque),
+   capacity (fixed design: the LP; machine: probe the pointing thruster's
+   thrust along its axis with zero torque, read the achieved force; cached),
+   pointing (machine: the ACHIEVED thrust line, which leans off +x because
+   the gimbal cancels the CoM moment).
+5. Stand-in prices fuel by propellant mass (fuel_price: T_k/(Isp g0),
+   scaled so the most efficient kind's strongest thruster costs 1; ideal-only
+   designs keep impulse pricing).
+6. Machine-craft test added.
+
+Tracker changes found by the machine run:
+- Capacity probe asks for the pointing thruster's own thrust (asking for the
+  sum also lit the forward RCS and left no torque authority).
+- Burns light within burn_alignment_rad (0.05) and, once lit, burn on within
+  burn_release_rad (0.2): pausing every round made fire/pause cycles.
+- A trim that must turn more than burn_release_rad requests torque only
+  until it is within it (asking for force meanwhile, the machine allocator
+  spent it sideways on brakes/RCS and never turned: tumbling trims).
+
+MEASURED (tests/test_orbital_tracker.py 9 passed, 307 s; jumper/actuation/plan
+27 passed + 1 xfail; craft_machine 12 passed; game (read-only) 7 passed):
+- rotating main+RCS: 159.77 kg = 1.0797 x ideal (limit 1.15; was 1.28 on
+  the honest r() before re-deriving); final |r - r_ref| 2.1 m, 0.034 m/s.
+- kick: one off (602 s, eps 0.0386), one on (656 s); final 4.6 m,
+  v_r -0.032 m/s (limit 5.0; was 5.25).
+- LEO->GEO six-axis: 1.0813 x ideal; final 27.8 m, 0.24 m/s.
+- game: rendezvous 18.6 m, 0.27 m/s (was 4753 m, 8.4 m/s); 1.4004 x ideal.
+- MACHINE CRAFT 7000 -> 8000 km (2 s rounds, w_a 0.2): arrives |r| - r2
+  -0.40 m, |r - r_ref| 0.95 m, 0.035 m/s. Bipropellant 189.3 kg = 1.353 x
+  TS2.1 ideal 139.96 kg, plus hydrazine 28.5 kg. Main gimbal up to 0.034
+  rad. By phase/role (commanded): burn main 139.6 kg (= ideal), burn RCS
+  7.8, burn brake 3.7, trims 73 (main 38, brake 11, RCS 24).
+
+OPEN (allocator lane, orbital_actuation.allocate_wrench):
+- With the main engine lit the allocation saturates the RCS: static repro,
+  machine craft at rest, allocate(F = 3997 N along +x, tau = 0, round_s 2,
+  apply=False): main 1.0, RCS throttle sum 7.94 (of 16), achieved torque
+  -0.47 N m about y; in flight it also lights a retro (0.25-0.49) against
+  the main. With the RCS spent, a requested pitch torque (+5 N m) came back
+  -5 N m while the main fired, so the attitude drifts to the 0.2 rad
+  release gate during every burn (burn 1 took 94 s for a 55 s plan), the
+  thrust leans up to 0.2 rad, and trims pay 73 kg to clean up. This is the
+  1.35 x; the burns themselves cost the ideal.
+- Machine allocate costs 0.1-0.4 s/call; the machine test takes ~4 min.
