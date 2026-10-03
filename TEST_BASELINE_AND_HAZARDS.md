@@ -398,6 +398,42 @@ pre-existing and independent of the namespace/indexing fixes on top.
 | `tests/test_compiled_linalg.py` (current tree, 2026-09-01) | **`test_jacobi_rotation_arithmetic_computes_natively` fails numerically; a later test in the same file hard-crashes the process** | The test runs the LLVM lane (`compile_artifact`), which the 2026-09-01 deployment/extent work does not touch (its only LLVM edit is an IndexError->shortfall guard). The signature — a compiled rotation kernel with partially-wrong elements — matches the long-open "native re-reads a load across an in-place store" aliasing defect already pinned for rotation/swap kernels. The 2026-08-19 "6 passed, 1 xfailed" row above predates substantial dirty-tree movement. No clean-worktree ancestry comparison was commissioned. |
 | `tests/test_ir_sequence_tables.py` (current tree, 2026-09-01) | **1 failed, 35 passed** | `test_compiled_retained_loop_mutates_caller_sequence_record` asserts `artifact.c_source_path.read_text() == ""` — an in-progress/spec expectation (source file consumed?) from commit 839a40d. Unrelated to deployment outlining (which never runs without an explicit pass call or `deployment=auto` contract). |
 
+## 2026-10-03 NumPy scatter source-precision repair
+
+At `3559a8fdcae91ea773dbb433a23f9bad9b9c117a`, the integer-tensor scatter
+fast path cast `src` to the destination dtype before `np.add.at`. This lost
+the representable `0.5` residual of float32 `16777216` plus float64
+`-16777215.5`, and returned `-1` for int64 `-1` plus float64 `0.8` where
+NumPy and the list-index path return `0`. Source values now retain their
+dtype until NumPy casts each accumulated result into the destination.
+
+`tests/test_numpy_scatter_precision.py` was added and run before changing
+the implementation: **54 failed, 46 passed**. After the one-line repair:
+**100 passed**. The matrix compares exact values, shapes and dtypes with
+`np.add.at` and the public list-index path, covering integer/float and
+float32/float64 inputs, integer sources into float32, repeated and unique
+destinations, every axis in 1D–3D including a negative axis, empty indices,
+scalar/singleton broadcasts, same-dtype controls, and unchanged operands.
+
+Adjacent files, run separately: `test_scatter_reduction` **13 passed**,
+`test_abstract_tensor_indexing` **2 passed**, `test_tensor_basic_ops`
+**18 passed**, `test_dtype_promotion` **4 passed**,
+`test_tensor_list_coercion` **2 passed**, `test_tensor_int_cast` **4 passed**,
+and `test_tensor_grad` **3 passed**. Total final targeted coverage:
+**146 passed**, with no skips or expected failures.
+
+Environment: Linux, Python 3.12.14, NumPy 2.3.5, pytest 9.1.1. Command from
+the worktree root, replacing the test path for each adjacent file:
+
+```sh
+PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 TENSOR_FACULTY=NUMPY /tmp/turing-fix-venv/bin/python -u -c 'import sys; sys.modules["torch"] = None; import pytest; raise SystemExit(pytest.main(sys.argv[1:]))' tests/test_numpy_scatter_precision.py -q --tb=short
+```
+
+The optional `nodus_tensor_core` library was absent and emitted its normal
+warning. These are Python/NumPy backend checks; no native-arena, Windows,
+accelerator or full-suite parity is claimed. PyTorch was not imported or
+installed. No tolerances, reduction policy, dispatch or promotion rules changed.
+
 ## The manifest — known-good at `af00599` plus the current working tree
 
 2026-09-05 focused threading/loop checks: `test_literal_seeded_counter_executes_native_iterations`

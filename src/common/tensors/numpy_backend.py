@@ -1001,7 +1001,10 @@ class NumPyTensorOperations(AbstractTensor):
         import numpy as np
         out = np.array(self.data, copy=True)
         idx = np.asarray(self._AbstractTensor__unwrap(index)).astype(np.int64).reshape(-1)
-        values = np.asarray(self._AbstractTensor__unwrap(src), dtype=out.dtype)
+        # Preserve source precision until np.add.at casts each accumulated result.
+        # Pre-casting float64 -16777215.5 loses the 0.5 residual when added to
+        # float32 16777216; pre-casting 0.8 makes int64 -1 stay -1 instead of 0.
+        values = np.asarray(self._AbstractTensor__unwrap(src))
         indexer = (slice(None),) * (dim % out.ndim) + (idx,)
         np.add.at(out, indexer, values)
         return out
