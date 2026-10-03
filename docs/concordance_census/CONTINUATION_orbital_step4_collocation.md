@@ -300,3 +300,121 @@ raised to 1000 nfev; kick rerun 1 passed.
 Hooks needed (not my files): MachineCraft.propellant_kg raises (inherits
 the jumper property reading a propellant_mass column the machine lacks);
 the replanner therefore reads propellant as craft.mass_kg - design dry mass.
+
+## 2026-10-03 (later) Stall diagnosis, condensed solve, live re-plan, hook
+
+Run with ENGINE_TOY_PIECE_SERVE_STALE=1 throughout (other lanes' compiler
+edits mark the jumper/plan pieces stale; two forgotten-flag runs rebuilt
+the small orbital_plan_* pieces, no failure). No faulthandler crash this
+session (dumps armed at 900 s, none fired). No new compile of collocation
+rows: everything below reuses %TEMP%\orbital_collocation_rows.
+
+Stall diagnosis (kick re-plan state captured from the step-5 flight at
+t=602 s, then planner-only):
+- NOT scaling: constraint Jacobian cond 79 (sv 3.9 / 0.05), gradients
+  O(0.1-1) per block.
+- Cost per SLSQP iteration: ~0.25 s, of which 0.07 s is the compiled
+  Jacobian (24 ms) x 3.2 line-search evaluations and ~0.18 s is SLSQP's
+  dense LSQ on 560 x 285. 300 it = 73-82 s.
+- The real cause is the problem's shape: (1) ~35 exactly flat directions
+  (the split of each coast arc among its slices changes only
+  discretization) plus the bilinear throttle x duration valley of every
+  slice; (2) the compiled reverse of the laws' throttle clamp
+  Min(Max(u,lo),hi) reads a tie as the average of both sides: on the box
+  edge (u=0 coasts, u=1 full burns) every throttle column of the slice and
+  fuel Jacobians is HALF its inside value (-10043 vs -20086). SLSQP iterates
+  sit on those edges. Fixing (2) alone (`_Transcription.inside`: derivative
+  read 1e-9 inside the box, values at u) did not save SLSQP: still 300 it,
+  defects swinging to 0.3; restarted from its own polished optimum it
+  creeps 0.94910 -> 0.94841 over 300 more iterations.
+- Also tried and rejected: trust-constr + SR1 (barrier stuck at 0.1, 1000 it,
+  infeasible); a structured SQP (per-slice damped BFGS, 2x2 BFGS on (I, T),
+  sparse elastic QP by Mehrotra IP) -- reaches feasible 405-407 m/s plans but
+  creeps on the same flat directions (150 it, 15-25 s); tied coast
+  durations under SLSQP alone -- still 300 it.
+
+Method (orbital_collocation._Condensed / solve_structured): condense the
+transcription over a burn structure. Burn slices own a duration and
+per-thruster IMPULSE w = u dt (throttle box as linear rows); coast slices
+form arcs of equal slices sharing one duration; nodes follow by forward
+substitution of the block-bidiagonal defects (zero by construction);
+derivatives by forward accumulation of the compiled slice Jacobians. Then
+SLSQP on (n_u+1)*burns + arcs variables (15 for 2 burns) and 5 arrival
+rows. Structure grows by the switching function (primer vector: one adjoint
+sweep back through the same stored Jacobians), multipliers by min-norm
+least squares (SLSQP's own are arbitrary on the two in-plane-degenerate
+plane rows and produced a spurious switch). Two traps found: an upper/lower
+box row duplicating the w>=0 bound made SLSQP stop at iteration 1 on a
+promoted zero-impulse burn; the plan rows' arbitrary multipliers.
+
+Numbers, before (SLSQP full transcription) -> after (condensed):
+| case | before | after |
+| nominal LEO->8000 six-axis | 10 it, 2.5-3 s, 1.0000 x H | 16 it, 0.6 s, 1.0000 x H fuel, T 1.0010 x |
+| kick state @602 (Hohmann origin) | 300 it + 1000 polish, 204 s, 411.4 m/s | 68 it, 2.0-2.7 s, 411.1 m/s, 116.18 kg, 3 burns, defect 1e-12 |
+| machine proxy | 300 it + polish, 486.3 m/s | 21 it, 0.8 s, 486.2 m/s, defect 8e-12 |
+
+Live re-plan (from a collocation plan's REMAINDER, 300 m/s radial kick off
+the plan's own reference; remainder_warm_start keeps the remaining burns,
+merges coasts into arcs, adds a zero-impulse burn now):
+| kick at | solve | dv | Hohmann-from-present | cold (Hohmann) start |
+| 302 s | 1.66 s | 409.5 | 690.1 | 1.96 s, same cost |
+| 600 s | 1.97 s | 453.2 | 812.8 | 2.01 s, same cost |
+| 1500 s | 1.23 s | 536.2 | 918.3 | 1.69 s, same cost |
+Continuation with the remainder's durations fixed first (impulses only)
+never reached feasibility (defects 0.02-0.04: the old timing cannot absorb
+a 300 m/s kick) and added 0.5-1.4 s; it stays available as
+fixed_first=True, default off.
+Kick flight (test, now flying a collocation plan, kick at 600 s): re-plan
+1.9 s from the remainder, 451.3 m/s vs Hohmann-from-present 811.4, burns
+94/81/277 m/s flown, final |r - r_ref| 4.4 m. NOTE: the spinning craft
+also triggers a re-plan at t=12 s (eps 0.0318 > 0.03 during the first
+burn, 0.5 s re-plan, same plan) -- tracker threshold behaviour, not mine.
+Machine flight: 21 it plan, 0 re-plans, arrival 14.7 m, -0.031 m/s; fuel
+182.0 kg vs 139.9 planned (unchanged ratio, tracker's).
+
+Weights (condensed solver), ratios to Hohmann (nominal) / to the kick
+state's Hohmann (kick re-plan):
+| weights | nominal fuel | nominal T | nominal s | kick fuel | kick T | kick dv | kick s |
+| default | 1.0000 | 1.0010 | 0.63 | 0.4380 | 0.7310 | 411.1 | 2.0 |
+| alpha x0.1 | 1.8262 | 0.6627 | 0.52 | 0.6953 | 0.4796 | 619.8 | 0.7 |
+| alpha x0.3 | 1.1080 | 0.9375 | 0.93 | 0.5162 | 0.5691 | 435.2 | 0.7 |
+| alpha x3 | 1.0170 | 1.3523 | 3.89 | 0.4398 | 1.0570 | 412.9 | 3.2 |
+| alpha x10 | 1.0199 | 1.9189 | 6.52 | 0.4120 | 1.9380 | 385.0 | 6.3 |
+| beta x0.1 | 1.0263 | 1.7501 | 3.22 | 0.4139 | 1.8103 | 386.9 | 4.5 |
+| beta x0.3 | 1.0057 | 1.6634 | 4.93 | 0.4421 | 1.0873 | 415.3 | 3.3 |
+| beta x3 | 1.0534 | 0.9674 | 0.32 | 0.5046 | 0.5822 | 421.0 | 0.5 |
+| beta x10 | 1.8306 | 0.6616 | 0.35 | 0.6976 | 0.4788 | 622.2 | 0.5 |
+| kappa 1e-5 / 1e-1 | 1.0000 | 1.001 | 0.27 | 0.438 | 0.731 | 411.1/410.8 | 2.2/1.8 |
+| budget 1.2 / 1.05 x H | 1.0000 | 1.001 | 0.5-0.6 | 0.438 | 0.731 | 411.1 | 1.9 |
+Every row converges now (before: every off-default row hit the limit).
+Only alpha/beta matters; it is their RATIO that sets the trip. Proposed
+defaults: keep the present rule (alpha = T_Hohmann / budget; beta =
+alpha I_H / T_H^2, so dJ/dT = 0 on the Hohmann warm start). Rationale:
+it is scale-free (J ~ 0.5-1 for every craft), it makes Hohmann a
+stationary point in time so the planner deviates only for real fuel or
+time gains, and it sits at the knee: x3 either way buys < 6 % fuel or
+< 7 % time for 35-75 % of the other. Re-plans recompute the weights from
+the present (budget = propellant left): measured at kicks 602/900/1800 s,
+freezing the original trip's weights instead saves 0.0-0.18 kg (<0.2 %)
+and lengthens the trip 12-35 % and the solve 0.3-1.6 s, so per-re-plan
+weights stay. kappa and the budget do nothing until the tank nears empty
+(the barrier is the safety rail, not a weight to tune).
+
+Hook fixed: MachineCraft.propellant_kg (orbital_craft_machine.py) = sum of
+tank{t}_propellant columns (the mass-properties law's inputs). Cause: the
+machine momentum piece writes propellant_mass_next but no piece READS
+propellant_mass, and the dt system only keeps read columns
+(llvm_dt_system.column_names_of), so the inherited jumper property raised
+AttributeError (the tracker's _seam getattr silently read inf for it).
+Verified 696.0 kg = 240 + 396 + 60. collocation_replanner now reads
+craft.propellant_kg (workaround removed); the machine test asserts it
+equals the tank sum and tracks the tanks after flight. Same bug class,
+NOT fixed (not asked): MachineCraft.propellant_supply also reads a column
+(propellant_supply) no machine piece reads.
+
+Tests: engine_toy/tests/test_orbital_collocation.py, 9 passed (6 planner
+22 s; 3 flights 96 s + kick rerun 34 s). New: parametrized
+test_kick_replan_from_the_remainder_is_live (< 5 s, cost <= cold start,
+dv < Hohmann-from-present); nominal asserts solve < 5 s and fuel = Hohmann
+to 1e-3. plan_transfer(method="SLSQP") is kept as the measured reference.
+Not committed.
