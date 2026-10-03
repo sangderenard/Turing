@@ -3881,6 +3881,7 @@ def record_shape_transformation(
     source_state: Any,
     target_state: Any,
     role: Any = "value",
+    source_cells: tuple[Ref, ...] = (),
 ) -> tuple[Any, ...] | None:
     """Append one exact source-to-target shape transformation to the book.
 
@@ -3914,7 +3915,7 @@ def record_shape_transformation(
         source_ref = book.latest_ref(SHAPE_STATE_PAGE, (source_scope, source_id))
         edge_ref = _post_or_unsourced(
             book, SHAPE_EDGE_PAGE, edge_row, edge_fact, stage_object,
-            () if source_ref is None else (source_ref,),
+            source_cells or (() if source_ref is None else (source_ref,)),
             SHAPE_SOURCE_NOT_ON_BOOK,
         )
     # The same edge, read from its source end: which targets were derived
@@ -4830,8 +4831,25 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
 
     functions = getattr(module, "functions", {}) or {}
     book = identity_book(module)
-    incoming_page = book.page("formal_actual_concordance")
+    from .concordance_declarations import (
+        FORMAL_ACTUAL_OCCURRENCE, FRAME_BINDING, FRAME_SOURCE_CELL_ABSENT, SSA_VALUE,
+    )
+    # Persisted books own their vocabulary. Add this scoped relation through
+    # the registry API, keeping earlier six-field rows intact and unclaimed.
+    occurrence_page = book.registry.declare_page(
+        FORMAL_ACTUAL_OCCURRENCE.name, FORMAL_ACTUAL_OCCURRENCE.row_fields,
+        FORMAL_ACTUAL_OCCURRENCE.fact_type,
+    )
+
+    def caller_scope(function: Any) -> str:
+        return str(
+            function.metadata.get("tensor_shape_concordance_scope")
+            or function.name
+        )
+
+    incoming_page = book.page(occurrence_page)
     for caller_name, caller in functions.items():
+        scope = caller_scope(caller)
         for block_name, block in caller.blocks.items():
             for instruction_index, instruction in enumerate(block.instrs):
                 if instruction.op not in {"Call", "call"}:
@@ -4843,13 +4861,27 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                 for position, (formal, actual) in enumerate(zip(
                     callee.args, instruction.args,
                 )):
-                    incoming_page.concord(
+                    # One law can be lowered repeatedly on its book. The
+                    # control scope, already minted by the SSA builder, owns
+                    # this call occurrence; a physical function name alone
+                    # conflates its separately minted scalar/frame actuals.
+                    actual_cell = book.latest_ref(
+                        SSA_VALUE, (scope, int(actual.id)),
+                    )
+                    book.post(
+                        occurrence_page,
                         (
                             callee_name, int(formal.id), str(caller_name),
                             str(block_name), int(instruction_index),
-                            int(position),
+                            int(position), scope,
                         ),
                         int(actual.id),
+                        stage=FRAME_BINDING,
+                        provenance=(
+                            Derived((actual_cell,)) if actual_cell is not None
+                            else Unsourced(FRAME_SOURCE_CELL_ABSENT)
+                        ),
+                        mode=Mode.CONCORD,
                     )
 
     receipts: list[dict] = []
@@ -4896,6 +4928,8 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
             source_rows = tuple(
                 row for row in incoming_page.scope_rows(str(function_name))
                 if int(row[1]) == formal_id
+                and str(row[2]) in functions
+                and row[6] == caller_scope(functions[str(row[2])])
             )
             source_facts = tuple(
                 incoming_page.latest(row) for row in source_rows

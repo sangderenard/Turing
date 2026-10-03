@@ -16818,6 +16818,11 @@ def _class_surface_ssa_program(
     # callee. These facts come only from explicit ABI declarations and exact
     # PlanCall argument bindings; no extent is inferred or guessed here.
     linked_value_abi_by_graph: dict[int, dict[int, dict[str, Any]]] = {}
+    graph_wrappers = {
+        id(planned_shell.process_graph.G): planned_shell.process_graph
+        for planned_shell in planned_shells
+        if getattr(planned_shell, "process_graph", None) is not None
+    }
     # The concordance is where a shape becomes readable across stages, so
     # every fact this phase settles is written there as it is settled: the
     # declared contract, each propagation over a call edge, and each formal
@@ -16855,13 +16860,21 @@ def _class_surface_ssa_program(
         LINKED_VALUE_ABI_SETTLEMENT as _LINKED_VALUE_ABI_SETTLEMENT,
         SHAPE_STATEMENT_SOURCE_NOT_ON_BOOK as _SHAPE_STATEMENT_UNSOURCED,
         VALUE_SHAPE_POLYMORPHISM as _VALUE_SHAPE_POLYMORPHISM,
+        VALUE_SHAPE as _VALUE_SHAPE,
         CopyShapeFact as _CopyShapeFact,
         ShapePolymorphismFact as _ShapePolymorphismFact,
+        ValueShapeFact as _ValueShapeFact,
     )
     from .identity_concordance import (
         Derived as _ShapeDerived,
         Mode as _ShapeMode,
         Unsourced as _ShapeUnsourced,
+        invalidate_proven_shape as _invalidate_abi_shape,
+        record_proven_shape as _record_abi_shape,
+        record_shape_transformation as _record_abi_shape_transformation,
+    )
+    shape_identity_book.registry.declare_page(
+        _VALUE_SHAPE.name, _VALUE_SHAPE.row_fields, _VALUE_SHAPE.fact_type,
     )
 
     #: Read index over the book: authored row -> the ``copy_value_shape``
@@ -17006,9 +17019,50 @@ def _class_surface_ssa_program(
         # fact recorded once; otherwise every additional caller reads as a
         # change and a round trip between equal shapes reads as oscillation.
         previous = shape_page.latest(row)
-        if previous is not None and tuple(previous[1:]) == tuple(fact[1:]):
+        if isinstance(previous, _ValueShapeFact) and tuple(previous[1:]) == tuple(fact[1:]):
             return
-        shape_page.set(row, len(shape_page.history(row)), fact)
+        if previous is not None and tuple(previous[1] or ()) != stated:
+            from .glsl_deployment_strategy import (
+                _invalidate_tensor_descriptor_dependents,
+            )
+
+            # Withdraw proofs derived from the former ABI before any later
+            # descriptor query can reuse them. The graph's exact parent
+            # edges, rather than an output extent override, own this change.
+            source_nodes = tuple(
+                int(node_id) for node_id, data in owner.nodes(data=True)
+                if int(data.get("value_id", node_id)) == int(value_id)
+            )
+            _invalidate_tensor_descriptor_dependents(
+                graph_wrappers[id(owner)], source_nodes,
+                "declared_abi_shape_revision",
+            )
+            _invalidate_abi_shape(
+                row[0], int(value_id), int(value_id),
+                "declared_abi_shape_revision",
+            )
+        # A second lowering of one law may declare a different batch ABI on
+        # the same book. Its copy statement is the cause of this revision;
+        # downstream SSA materialization must read this exact cell.
+        cell = post_shape_statement(owner, value_id, fact, source)
+        shape_cell = shape_identity_book.post(
+            _VALUE_SHAPE, row, _ValueShapeFact(*fact),
+            stage=_LINKED_VALUE_ABI_SETTLEMENT,
+            provenance=_ShapeDerived((cell,)), mode=_ShapeMode.REVISE,
+        )
+        if stated:
+            descriptor = {"shape": stated, "dtype": str(fact[2] or ""),
+                          "rank": len(stated)}
+            # Publish the declared input before graph descriptor queries.
+            # With only dependent withdrawal, those queries still read the
+            # old input projection and re-derived the old batch's outputs.
+            _record_abi_shape_transformation(
+                row[0], int(value_id), row[0], int(value_id),
+                stage=_LINKED_VALUE_ABI_SETTLEMENT.name,
+                operation="program_abi_contract", source_state=descriptor,
+                target_state=descriptor, source_cells=(shape_cell,),
+            )
+            _record_abi_shape(row[0], int(value_id), stated, fact[2], None)
     planned_graphs_by_shell: dict[int, Any] = {}
     for planned_shell in planned_shells:
         planned_graph = getattr(
@@ -17159,11 +17213,6 @@ def _class_surface_ssa_program(
         _tensor_descriptor,
         descriptor_states_a_shape as _descriptor_states_a_shape,
     )
-    graph_wrappers = {
-        id(planned_shell.process_graph.G): planned_shell.process_graph
-        for planned_shell in planned_shells
-        if getattr(planned_shell, "process_graph", None) is not None
-    }
     # A formal proved to have no single shape.  Kept OUTSIDE the contract:
     # contracts are copied wholesale onto the next callee, so a marker stored
     # in one would travel a call edge per round and mark formals downstream
@@ -42319,13 +42368,27 @@ def _class_surface_ssa_program(
     # seam, so native backends see the same rank the call linker proved.
     from .concordance_declarations import (
         VALUE_SHAPE_POLYMORPHISM as _VALUE_SHAPE_POLYMORPHISM_PAGE,
+        VALUE_SHAPE as _VALUE_SHAPE_PAGE,
+        SSA_SHAPE_MATERIALIZATION as _SSA_SHAPE_MATERIALIZATION_PAGE,
+        SSA_SHAPE_MATERIALIZATION_STAGE as _SSA_SHAPE_MATERIALIZATION_STAGE,
+        SSAShapeMaterializationFact as _SSAShapeMaterializationFact,
     )
     from .identity_concordance import (
+        Derived as _MaterializationDerived,
+        Mode as _MaterializationMode,
         authored_function_name as _authored_shape_owner,
         current_identity_book as _current_shape_book,
     )
 
     _shape_book_instance = _current_shape_book()
+    _shape_book_instance.registry.declare_page(
+        _SSA_SHAPE_MATERIALIZATION_PAGE.name,
+        _SSA_SHAPE_MATERIALIZATION_PAGE.row_fields,
+        _SSA_SHAPE_MATERIALIZATION_PAGE.fact_type,
+    )
+    _shape_book_instance.registry.declare_stage(
+        _SSA_SHAPE_MATERIALIZATION_STAGE.name,
+    )
     _value_shape_page = _shape_book_instance.page("value_shape")
     _ssa_shape_page = _shape_book_instance.page(
         "ssa_shape_materialization"
@@ -42382,16 +42445,25 @@ def _class_surface_ssa_program(
                     "shape_materialized_from_concordance": True,
                 })
             _row = (str(_function_name), int(_value_id))
-            _proposed = (_shape, _dtype, _storage, _owner)
+            _proposed = _SSAShapeMaterializationFact(
+                _shape, _dtype, _storage, _owner,
+            )
             _incumbent = _ssa_shape_page.latest(_row)
-            if _incumbent is not None and tuple(_incumbent) != _proposed:
-                raise ValueError(
-                    "SSA shape materialization concordance disagreement for "
-                    f"{_row!r}: recorded={_incumbent!r}, "
-                    f"proposed={_proposed!r}"
-                )
-            if _incumbent is None:
-                _ssa_shape_page.set(_row, 0, _proposed)
+            # Same authored law, same book: a changed batch contract has a
+            # new value_shape cell. REVISE requires that explicit cause;
+            # it never excuses an SSA/source mismatch (checked above).
+            _shape_cell = _shape_book_instance.latest_ref(
+                _VALUE_SHAPE_PAGE, (_owner, int(_value_id)),
+            )
+            _shape_book_instance.post(
+                _SSA_SHAPE_MATERIALIZATION_PAGE, _row, _proposed,
+                stage=_SSA_SHAPE_MATERIALIZATION_STAGE,
+                provenance=_MaterializationDerived((_shape_cell,)),
+                mode=(
+                    _MaterializationMode.CONCORD if _incumbent == _proposed
+                    else _MaterializationMode.REVISE
+                ),
+            )
             _shape_materializations.append(_row)
     if _shape_materializations:
         lowered_module.metadata["ssa_shape_materializations"] = tuple(

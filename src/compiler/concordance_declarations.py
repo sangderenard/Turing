@@ -21,7 +21,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, NamedTuple
 
 from .identity_concordance import (
     Ref,
@@ -1416,7 +1416,13 @@ FORMAL_ACTUAL = declare_page("formal_actual_concordance", (
     RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
     RowField("caller", K.NAME), RowField("block", K.NAME),
     RowField("instruction", K.INDEX), RowField("position", K.INDEX),
-), int)                                # CONCORD
+), int)                                # legacy unscoped occurrence; CONCORD
+FORMAL_ACTUAL_OCCURRENCE = declare_page("formal_actual_occurrence_concordance", (
+    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
+    RowField("caller", K.NAME), RowField("block", K.NAME),
+    RowField("instruction", K.INDEX), RowField("position", K.INDEX),
+    RowField("caller_scope", K.SCOPE),
+), int)                                # DERIVED(actual ssa_value); CONCORD
 #: ``TransformationLedger`` (routed by ``propose(..., sources=)``): the
 #: retained (rule, proof, target) per identity, REVISE; every proposal as an
 #: event dict, CONCORD; each rejection once, by its full key, CONCORD.
@@ -2320,6 +2326,31 @@ COPY_VALUE_SHAPE = declare_page("copy_value_shape", (
 VALUE_SHAPE_POLYMORPHISM = declare_page("value_shape_polymorphism", (
     RowField("function", K.NAME), RowField("value_id", K.VALUE_ID),
 ), ShapePolymorphismFact)              # DERIVED(disagreeing copy_value_shape cells); REVISE
+
+
+class ValueShapeFact(NamedTuple):
+    """The ABI shape ledger's existing tuple, with declared field types."""
+
+    label: str
+    shape: tuple
+    dtype: str
+    storage: str
+
+
+class SSAShapeMaterializationFact(NamedTuple):
+    shape: tuple
+    dtype: str
+    storage: str
+    authored_owner: str
+
+
+VALUE_SHAPE = declare_page("value_shape", (
+    RowField("function", K.NAME), RowField("value_id", K.VALUE_ID),
+), ValueShapeFact)                     # DERIVED(copy_value_shape); REVISE
+SSA_SHAPE_MATERIALIZATION = declare_page("ssa_shape_materialization", (
+    RowField("function", K.NAME), RowField("ssa_id", K.VALUE_ID),
+), SSAShapeMaterializationFact)        # DERIVED(value_shape); REVISE
+SSA_SHAPE_MATERIALIZATION_STAGE = declare_stage("ssa_shape_materialization")
 
 #: A return-site version found by id (no ``ssa_field_version`` cell) whose
 #: SSA identity the book does not join to the site state's value cell.
