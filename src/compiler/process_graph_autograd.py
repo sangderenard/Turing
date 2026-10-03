@@ -17,7 +17,7 @@ from __future__ import annotations
 import ast
 import copy
 import contextlib
-from functools import lru_cache
+import contextvars
 import inspect
 import io
 import re
@@ -1217,8 +1217,31 @@ def _registry_function_source(opname: str, rule: Mapping[str, Any]) -> str:
     ))
 
 
-@lru_cache(maxsize=1)
+#: The compiled BACKWARD_RULES graph, memoized PER IDENTITY BOOK.  Its
+#: build mints the scopes and posts the rows every later stage derives from
+#: (``lexical_reads:bw_sum`` and friends).  A process-wide memo carried those
+#: scopes into the next compile's book, so a second reverse compile in one
+#: process re-posted planner rows on scopes the first compile owned and the
+#: book refused them ("REVISE without a changed source" on
+#: ``(('lexical_reads:unbroadcast', 0), 'target_shape')``).  Each book gets a
+#: complete graph of its own: the memo holds (book, graph) for the active
+#: book only and rebuilds -- re-posting every row under fresh scopes -- when
+#: a new compile's book is current.
+_BACKWARD_RULE_GRAPH_MEMO: list = []
+
+
 def _compiled_backward_rule_process_graph() -> ProcessGraph:
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    if _BACKWARD_RULE_GRAPH_MEMO and _BACKWARD_RULE_GRAPH_MEMO[0][0] is book:
+        return _BACKWARD_RULE_GRAPH_MEMO[0][1]
+    graph = _build_backward_rule_process_graph()
+    _BACKWARD_RULE_GRAPH_MEMO[:] = [(book, graph)]
+    return graph
+
+
+def _build_backward_rule_process_graph() -> ProcessGraph:
     """Compile the authored backward registry into one graph function table.
 
     This is source-to-ProcessGraph translation of the repository's existing
@@ -2514,6 +2537,55 @@ def compile_process_graph_backward(
     )
 
 
+#: The book the enclosing reverse compile opened (``reverse_compile_book``).
+_REVERSE_COMPILE_BOOK: contextvars.ContextVar = contextvars.ContextVar(
+    "reverse_compile_book", default=None,
+)
+
+
+def _owns_new_reverse_book() -> bool:
+    """Whether a reverse compile starting now must open its own book.
+
+    Not when an enclosing reverse compile already opened one, and not when a
+    forward compile owns the current book (a Derivative folded during sympy
+    ingestion is part of THAT compile).  Yes when the current book is the
+    detached default or one a previous standalone reverse compile opened:
+    two programs' compiles never share a book.
+    """
+
+    from .identity_concordance import current_identity_book
+
+    current = current_identity_book()
+    if _REVERSE_COMPILE_BOOK.get() is current:
+        return False
+    return bool(
+        getattr(current, "detached", False)
+        or getattr(current, "standalone_reverse_compile", False)
+    )
+
+
+@contextlib.contextmanager
+def reverse_compile_book():
+    """One identity book for one reverse compile (ingest + differentiate +
+    fuse + lower), opened at its public entry as ``lower_ast_source_to_ssa``
+    opens the forward compile's, and closed when the entry returns."""
+
+    from .identity_concordance import (
+        begin_identity_book, current_identity_book, end_identity_book,
+    )
+
+    if not _owns_new_reverse_book():
+        yield current_identity_book()
+        return
+    book, token = begin_identity_book()
+    marker = _REVERSE_COMPILE_BOOK.set(book)
+    try:
+        yield book
+    finally:
+        _REVERSE_COMPILE_BOOK.reset(marker)
+        end_identity_book(token)
+
+
 def obtain_graph_reverse(
     source: Any,
     *,
@@ -2548,6 +2620,14 @@ def obtain_graph_reverse(
             raise TypeError(
                 "AbstractTensor graph-reverse acquisition requires bindings"
             )
+        if _owns_new_reverse_book():
+            # A standalone reverse acquisition is one program's compile: it
+            # ingests here, so its book starts here and stays current for
+            # the lowering its caller runs next (until the next compile).
+            from .identity_concordance import begin_identity_book
+
+            standalone, _token = begin_identity_book()
+            standalone.standalone_reverse_compile = True
         forward = abstract_tensor_program_to_process_graph(
             source, bindings=bindings,
         )
@@ -2817,4 +2897,5 @@ __all__ = [
     "isolate_process_program_adjoint_regions",
     "lower_training_motion_to_repository_ssa",
     "obtain_graph_reverse",
+    "reverse_compile_book",
 ]

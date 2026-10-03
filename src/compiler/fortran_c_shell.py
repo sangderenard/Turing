@@ -16718,8 +16718,35 @@ def _class_surface_ssa_program(
     shape_identity_book = _shape_book()
     shape_page = shape_identity_book.page("value_shape")
 
+    # Which planned graph stated each row's current shape.  The row is keyed
+    # by the AUTHORED function name, which every callsite copy shares: two
+    # copies of ``unbroadcast`` with G = (3, 2) and G = (2, 2) both wrote
+    # ('unbroadcast', 0), the last one won, and the completed-module seam
+    # then refused the other copy's SSA ("concorded source/SSA shape
+    # disagreement ... ssa=(3, 2), concordance=(2, 2)").  Two copies stating
+    # different shapes for one authored value is polymorphism, exactly as
+    # two callsites of one graph are below: the row says so, and stays so.
+    shape_row_writers: dict[tuple, tuple[int, tuple]] = {}
+    cross_copy_polymorphic: set[tuple] = set()
+
     def note_shape(owner: Any, value_id: int, fact: Any) -> None:
         row = (str(owner.graph.get("function_name")), int(value_id))
+        if row in cross_copy_polymorphic and str(fact[0]) != "polymorphic":
+            return
+        stated = tuple(fact[1] or ())
+        writer = shape_row_writers.get(row)
+        if (
+            str(fact[0]) != "polymorphic"
+            and stated
+            and writer is not None
+            and writer[0] != id(owner)
+            and writer[1]
+            and writer[1] != stated
+        ):
+            cross_copy_polymorphic.add(row)
+            fact = ("polymorphic", *tuple(fact[1:]))
+        elif str(fact[0]) != "polymorphic" and stated:
+            shape_row_writers[row] = (id(owner), stated)
         previous = shape_page.latest(row)
         # A fact is the shape, not who said it.  Two callsites agreeing is one
         # fact recorded once; otherwise every additional caller reads as a

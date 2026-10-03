@@ -556,6 +556,17 @@ LOOP_CONTINUATION_REWIRE_PAGE = declare_page("loop_continuation_rewire_concordan
 PROVEN_LITERAL = declare_page("proven_literal", (
     RowField("function", K.NAME), RowField("value", K.VALUE_ID),
 ), object)                             # mode REVISE
+#: One member of an aggregate call's return, per caller COPY (its
+#: ``lexical_read_scope``): the member's descriptor receipt.  Written by
+#: ``_publish_callsite_return_members`` DERIVED from the callee return
+#: value's cells, and by the structural fold's re-derivation of the same
+#: member DERIVED from the member's own shape cells.  A changed fact with no
+#: changed source is the two writers disagreeing: the book refuses it.
+#: Mode REVISE.
+CALLSITE_RETURN_MEMBER = declare_page("callsite_return_member", (
+    RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+    RowField("index", K.INDEX), RowField("member", K.VALUE_ID),
+), object)
 SOURCE_CONTROL_SPECIALIZATION = declare_page(
     "source_control_specialization_concordance", (
         RowField("function", K.NAME), RowField("control", K.VALUE_ID),

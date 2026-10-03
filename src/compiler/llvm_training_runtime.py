@@ -10,6 +10,7 @@ selecting a group therefore changes only which declared parameters are stepped.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import hashlib
 import json
 from pathlib import Path
@@ -208,6 +209,22 @@ def compile_graph_reverse_to_wasm(
     )
 
 
+def _one_reverse_compile_book(function):
+    """Run one public reverse-compile entry inside its own identity book
+    (``process_graph_autograd.reverse_compile_book``): ingest, differentiate,
+    fuse and lower are one program's compile and share one complete book."""
+
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        from .process_graph_autograd import reverse_compile_book
+
+        with reverse_compile_book():
+            return function(*args, **kwargs)
+
+    return wrapped
+
+
+@_one_reverse_compile_book
 def compile_native_graph_reverse(
     output: Any,
     *,
@@ -278,6 +295,7 @@ def compile_native_graph_reverse(
     )
 
 
+@_one_reverse_compile_book
 def compile_native_training_schedule(
     output: Any,
     *,

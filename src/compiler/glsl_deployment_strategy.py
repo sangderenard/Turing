@@ -17464,8 +17464,53 @@ def _invalidate_tensor_descriptor_dependents(
             changed = True
 
 
+def _post_callsite_return_member(
+    caller: Any, call_id: int, index: int, member_id: int, descriptor: Any,
+    cells: tuple, *, stage: Any,
+) -> Any:
+    """Post one aggregate-call member's descriptor on ``callsite_return_member``.
+
+    The row is keyed by the caller COPY's ``lexical_read_scope`` (copies of
+    one function never share it), the call, the slot and the member value.
+    Both writers of a member's shape post here -- the return publication
+    from the callee return value's cells, the structural fold from the
+    member's own shape cells -- so a disagreement between them is a REVISE
+    with no changed source, which the book refuses, instead of an endless
+    fixed point (scalar_loss_join: bw_mul members flipping () <-> (2, 3)).
+    """
+
+    from .concordance_declarations import CALLSITE_RETURN_MEMBER
+    from .identity_concordance import (
+        Mode, RAW_PRIMITIVE, Unsourced, current_identity_book,
+    )
+
+    scope = caller.G.graph.get("lexical_read_scope")
+    scope = (
+        tuple(scope) if scope is not None
+        else ("function", str(caller.G.graph.get("function_name") or ""))
+    )
+    row = (scope, int(call_id), int(index), int(member_id))
+    fact = _callsite_descriptor_receipt(descriptor)
+    cells = tuple(cell for cell in cells if cell is not None)
+    if cells:
+        return _post_if_changed(
+            CALLSITE_RETURN_MEMBER, row, fact, stage=stage, cells=cells,
+        )
+    book = current_identity_book()
+    latest = book.latest_ref(CALLSITE_RETURN_MEMBER, row)
+    if latest is not None and book.pages[
+        CALLSITE_RETURN_MEMBER.name
+    ].latest(row) == fact:
+        return latest
+    return book.post(
+        CALLSITE_RETURN_MEMBER, row, fact, stage=stage,
+        provenance=Unsourced(RAW_PRIMITIVE), mode=Mode.REVISE,
+    )
+
+
 def _publish_callsite_return_members(
     caller: Any, node_id: int, descriptors: Any, kind: str,
+    return_cells: tuple = (),
 ) -> bool:
     """Materialize or enrich the exact projections of one aggregate call.
 
@@ -17483,16 +17528,21 @@ def _publish_callsite_return_members(
         int, attributes.get("aggregate_leaf_value_ids") or (),
     ))
 
+    from .concordance_declarations import PLANNER_TENSOR_SPECIALIZATION
     from .identity_concordance import current_identity_book
 
-    page = current_identity_book().page("callsite_projection_specialization")
     caller_name = str(caller.G.graph.get("function_name") or "")
+    return_cells = tuple(return_cells)
 
     def record(index: int, leaf_id: int, action: str, descriptor: Any) -> None:
-        row = (caller_name, node_id, int(index), int(leaf_id))
-        fact = (str(action), _callsite_descriptor_receipt(descriptor))
-        if page.latest(row) != fact:
-            page.set(row, len(page.history(row)), fact)
+        # DERIVED from the callee return value's cells for this slot (its
+        # identity cell and its shape-state cell): a refined member is a
+        # changed source; a changed member from an unchanged source is not.
+        _post_callsite_return_member(
+            caller, node_id, int(index), int(leaf_id), descriptor,
+            tuple(return_cells[index]) if index < len(return_cells) else (),
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+        )
 
     if (
         len(incumbent_leaves) == len(descriptors)
@@ -17708,6 +17758,10 @@ def _propagate_callsite_tensor_specializations(
         )
     )
 
+    #: (caller graph, call node) -> per-slot callee return value cells of
+    #: the latest ``call_result_descriptor`` answer for that call.
+    return_cells_by_call: dict[tuple[int, int], tuple] = {}
+
     def call_result_descriptor(
         caller: Any,
         node_id: int,
@@ -17784,6 +17838,31 @@ def _propagate_callsite_tensor_specializations(
         if not _expand_specialized_unbroadcast_identity(specialized):
             _fold_callsite_structural_values(specialized)
         output_descriptors: list[dict[str, Any] | None] = []
+        # Per published slot, the callee return value's cells: its identity
+        # cell and its shape-state cell, read after the descriptor query
+        # that (re)states it.  The member publication derives from these.
+        output_cells: list[tuple] = []
+
+        def return_value_cells(value_id: int) -> tuple:
+            from ..common.tensors.topological_reducer import node_identity_cell
+            from .identity_concordance import (
+                SHAPE_STATE_PAGE, current_identity_book,
+            )
+
+            cells = []
+            try:
+                cells.append(node_identity_cell(specialized, int(value_id)))
+            except ValueError:
+                pass
+            state = current_identity_book().latest_ref(SHAPE_STATE_PAGE, (
+                str(specialized.G.graph.get("function_name")),
+                int(specialized.G.nodes[int(value_id)].get(
+                    "value_id", value_id,
+                )),
+            ))
+            if state is not None:
+                cells.append(state)
+            return tuple(cells)
         identities = specialized.G.graph.get("identity_table") or {}
         for output_name in specialized.G.graph.get("function_outputs") or ():
             output_ids = tuple(identities.get(str(output_name), ()))
@@ -17794,6 +17873,7 @@ def _propagate_callsite_tensor_specializations(
             ), None)
             if value_id is None:
                 output_descriptors.append(None)
+                output_cells.append(())
                 continue
             nested = (
                 specialized.G.nodes[value_id].get("attributes") or {}
@@ -17802,7 +17882,10 @@ def _propagate_callsite_tensor_specializations(
                 output_descriptors.extend(
                     copy.deepcopy(tuple(nested))
                 )
+                nested_cells = return_value_cells(value_id)
+                output_cells.extend(nested_cells for _item in tuple(nested))
             else:
+                described_id = value_id
                 descriptor = _structured_output_descriptor(
                     specialized, value_id,
                 )
@@ -17824,8 +17907,10 @@ def _propagate_callsite_tensor_specializations(
                             descriptor_states_a_shape(alternative)
                         ):
                             descriptor = alternative
+                            described_id = int(candidate)
                             break
                 output_descriptors.append(descriptor)
+                output_cells.append(return_value_cells(described_id))
 
         # A generator returns no value; its product is the row it yields.
         # Describe every yield site's tuple members on this exact callsite
@@ -17932,6 +18017,9 @@ def _propagate_callsite_tensor_specializations(
             else (tuple(item.get("shape") or ()), str(item.get("dtype") or ""))
             for item in output_descriptors
         ))
+        return_cells_by_call[(id(caller.G), int(node_id))] = tuple(
+            output_cells
+        )
         return (
             tuple(copy.deepcopy(output_descriptors))
             if any(any_descriptor(item) for item in output_descriptors)
@@ -18138,6 +18226,9 @@ def _propagate_callsite_tensor_specializations(
                         return_members_changed = _publish_callsite_return_members(
                             caller, int(_node_id), result_descriptors,
                             next(iter(return_kinds)),
+                            return_cells=return_cells_by_call.get(
+                                (id(caller.G), int(_node_id)), (),
+                            ),
                         )
                         changed |= return_members_changed
                         mutation_counts["return_members"] += int(
@@ -18947,8 +19038,32 @@ def _structured_output_descriptor(graph: Any, value_id: int) -> Any:
             _structured_output_descriptor(graph, leaf) for leaf in leaves
         )
     descriptor = _tensor_descriptor(graph, value_id)
-    from .identity_concordance import proven_shape_contract_of
+    from .identity_concordance import (
+        Unresolved as _Unresolved,
+        authored_function_name,
+        current_identity_book,
+        proven_shape_contract_of,
+    )
 
+    # The shared proof is keyed by the AUTHORED name, so every callsite copy
+    # of one function reads the same row.  When two call edges disagree on a
+    # formal's shape (FORMAL_SHAPE_CONFLICT), the function is polymorphic and
+    # that row is some other copy's answer: ``unbroadcast`` copies with
+    # G = () (bw_add) read ('unbroadcast', 1) = (2, 3), cemented by the
+    # G = (2, 3) copies, and published bw_add's scalar gradients as (2, 3)
+    # (scalar_loss_join: NaN gradients).  A polymorphic copy answers with its
+    # own descriptor -- the same rule ``_tensor_descriptor`` applies.
+    if graph.G.graph.get("planner_tensor_descriptors"):
+        owner = authored_function_name(graph.G.graph.get("function_name"))
+        formal_page = current_identity_book().page("formal_shape")
+        if any(
+            isinstance(formal_row, tuple)
+            and len(formal_row) >= 2
+            and authored_function_name(formal_row[0]) == owner
+            and isinstance(formal_page.latest(formal_row), _Unresolved)
+            for formal_row in formal_page.rows()
+        ):
+            return descriptor
     proof = proven_shape_contract_of(
         graph.G.graph.get("function_name"),
         int(graph.G.nodes[value_id].get("value_id", value_id)),
@@ -22122,6 +22237,54 @@ def _fold_callsite_structural_values(
                 # the proven fact on the producer as well as returning it
                 # through _tensor_descriptor so later region cuts retain it.
                 data["tensor"] = copy.deepcopy(inherited_descriptor)
+                # A member of an aggregate call's return is also written by
+                # ``_publish_callsite_return_members``.  Post this
+                # re-derivation on the same ``callsite_return_member`` row,
+                # DERIVED from the member's own identity and shape-state
+                # cells, so the two writers meet on the book.
+                if (data.get("attributes") or {}).get(
+                    "authored_call_result_projection"
+                ):
+                    base_id = next((
+                        int(parent)
+                        for parent, role in data.get("parents") or ()
+                        if str(role) == "base" and int(parent) in graph.G
+                    ), None)
+                    base_leaves = () if base_id is None else tuple(map(int, (
+                        graph.G.nodes[base_id].get("attributes") or {}
+                    ).get("aggregate_leaf_value_ids") or ()))
+                    if int(node_id) in base_leaves:
+                        from ..common.tensors.topological_reducer import (
+                            node_identity_cell,
+                        )
+                        from .concordance_declarations import (
+                            PLANNER_STRUCTURAL_FOLD,
+                        )
+                        from .identity_concordance import (
+                            SHAPE_STATE_PAGE, current_identity_book,
+                        )
+
+                        member_cells = []
+                        try:
+                            member_cells.append(
+                                node_identity_cell(graph, int(node_id))
+                            )
+                        except ValueError:
+                            pass
+                        member_cells.append(
+                            current_identity_book().latest_ref(
+                                SHAPE_STATE_PAGE, (
+                                    str(graph.G.graph.get("function_name")),
+                                    int(data.get("value_id", node_id)),
+                                ),
+                            )
+                        )
+                        _post_callsite_return_member(
+                            graph, base_id,
+                            base_leaves.index(int(node_id)), int(node_id),
+                            inherited_descriptor, tuple(member_cells),
+                            stage=PLANNER_STRUCTURAL_FOLD,
+                        )
             # The semantic operator name is the authored tensor operation
             # (``greater_equal`` for ``>=``), not only the AST spelling.
             comparison_operations = {

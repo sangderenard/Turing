@@ -909,3 +909,100 @@ and the lru_cached BACKWARD_RULES graph keeps its scopes across compiles.
 Repro above (whole test file, 15 s). Where a reverse compile's book begins
 (and whether the cached rule graph re-posts into each book) is a design
 decision; raised.
+
+## 2026-10-03 Coordinator decisions D1, D2 (fixes committed by main session)
+
+D1: pass the callee return value's cell into _publish_callsite_return_members;
+member writes post DERIVED from it on a DECLARED page (no raw page.set); the
+fold's re-derivation posts on the same row.
+D2: a reverse compile's book begins at its public entry
+(obtain_graph_reverse / compile_native_graph_reverse); the cached
+backward-rule graph re-posts its rows into each new book, no scopes carried.
+Then: NaN gradients (native_scalar_loss_adjoint), linear (3,2)/(2,2).
+
+## 2026-10-03 D1 written (not yet run)
+
+- concordance_declarations.py: page CALLSITE_RETURN_MEMBER
+  (caller_scope SCOPE, call VALUE_ID, index INDEX, member VALUE_ID) -> object.
+- glsl_deployment_strategy.py:
+  * `_post_callsite_return_member` helper (row keyed by the caller COPY's
+    lexical_read_scope, fact = descriptor receipt, `_post_if_changed`).
+  * `call_result_descriptor` collects per slot the callee return value's
+    cells (node_identity_cell + SHAPE_STATE latest_ref of the value actually
+    described) into `return_cells_by_call`; the publication receives them.
+  * `_publish_callsite_return_members(..., return_cells=)`: record() posts
+    DERIVED from them (raw page "callsite_projection_specialization" gone).
+  * structural fold (~:22105) re-derivation of an aggregate member posts on
+    the same row DERIVED from the member's identity + shape-state cells.
+D1 verified: reverse test 1 passed (10.3 s); scalar-loss [True] same NaN numeric failure (no refusal); left*right posts 2 callsite_return_member rows ((2,), float64).
+
+## 2026-10-03 D2 written
+
+- process_graph_autograd.py: `_compiled_backward_rule_process_graph` memo is
+  per identity book (rebuilt, re-posting all rows under fresh scopes, when a
+  new book is current; ~2.5 s); the lru_cache is gone.
+  `reverse_compile_book()` context manager + `_owns_new_reverse_book()`:
+  open a book unless an enclosing reverse compile owns the current one or a
+  forward compile does (sympy Derivative folding). obtain_graph_reverse's
+  AbstractTensor branch opens a standalone book (stays current for the
+  caller's lowering) when it owns a new compile. A ProcessGraph source never
+  opens one (its ingestion rows are already in the current book).
+- llvm_training_runtime.py: compile_native_graph_reverse and
+  compile_native_training_schedule run inside reverse_compile_book().
+D2 verified on the repro: both params in one process now fail ONLY on the numeric check (no refusal), 30 s. Next: NaN gradients.
+NaN anatomy (kx806_nan.py): grads 35/36 ARE in buffer_order and Ret. Root calls bw_add copy with NO args (g=1.0 folded) and loads its members 25/26 as shape (2,3); for scalar losses they must be (). bw_sum/expand chain then runs on (2,3). Checking the member rows.
+The (2,3) member post on call 24 comes from the publication with a NEW source: shape_transformation_state ('bw_add', 4) revision 8 = (2,3), read in bw_add fork 5. Shared authored row again. Trapping its writer.
+Writer found: catalogue bw_add's unbroadcast call (G (), target ()) is
+answered (2,3) because `_structured_output_descriptor` overrides the copy's
+own correct () descriptor with `proven_shape_contract_of('unbroadcast', 1)` =
+(2,3): cemented by the bw_mul expansion copies (non-empty extents only are
+cemented), and keyed by the authored name shared by every copy. Its comment
+says conflicting specializations answer None, but nothing records the
+()-vs-(2,3) conflict there.
+Fix applied: _structured_output_descriptor skips the shared authored proof when the copy's authored function has a FORMAL_SHAPE_CONFLICT (same gate as _tensor_descriptor's polymorphic_specialization).
+native_scalar_loss_adjoint[True]: 1 PASSED (15 s).
+tests/test_native_scalar_loss_adjoint.py (both params, ONE process = two compiles): 2 passed (31 s).
+Linear test still: unbroadcast__specialized_bc87d5b45e7b value 0 ssa (3,2) vs concordance (2,2). Tracing.
+Root (read): fortran_c_shell `note_shape` keys value_shape rows by the
+planned graph's function_name = the AUTHORED name shared by every callsite
+copy; two unbroadcast copies (G (3,2) and (2,2)) wrote ('unbroadcast', 0),
+last writer won, and the completed-module seam (~:41926) refused the other
+copy. "polymorphic" was only set when ONE graph's formal got two shapes.
+Fix: note_shape remembers which planned graph stated each row's shape; a
+DIFFERENT graph stating a different shape marks the row polymorphic (sticky),
+which the seam already skips.
+Linear test now compiles; fails numerically: loss NaN at test line 376 (expected 0.576425).
+Linear native run (kx806_lin.py): loss NaN, grad_1/grad_2 NaN, grad_3 = 0 (expected nonzero). ABI has no extents; forward regions look structurally right (matmul, broadcast b, add, sub, mul, sum/4).
+Watch: 5 (matmul) correct; 6 = 5 + broadcast(b) is NaN -> the b broadcast_double in forward region_1.
+Linear root: two hidden formals 2305..160/163 (shape (1,), not in buffer_order) feed the bw_mean copy: Call [160, 163] -> 21 bw_mean. (Watch reads final buffer contents, so 6=NaN may be a later overwrite; not conclusive.)
+Linear: call-arity / frame-storage mismatch (observed, kx806_lin.py):
+- bw_mean copy `training_motion__bw_mean__specialized_d19f9a5a7acd` has ONE
+  formal (2305..154, linked_call_frame_storage for its expand_reduction
+  callsite 11) and calls expand_reduction with NO args;
+- the root calls it as `Call [2305..160, 2305..163] -> 21` (TWO hidden
+  formals, linked_call_frame_storage for bw_mean callsite 21), and those two
+  are root formals NOT in the artifact buffer_order.
+A call passing 2 actuals to a 1-formal function and root formals outside the
+ABI would corrupt pointers; consistent with NaN even in forward buffers.
+Not traced further (frame linker). Running the green checks next.
+
+## 2026-10-03 STATUS (uncommitted on top of ccba325c)
+
+GREEN: probe max_rel 4.138e-16; reverse test 1 passed (8.9 s); orbital
+4p/7xf; tests/test_native_scalar_loss_adjoint.py 2 passed in ONE process
+(two reverse compiles, D2).
+RED: linear motion test compiles but runs NaN (call-arity/frame-storage
+mismatch above, not yet traced).
+This lane's hunks:
+- concordance_declarations.py @@558: CALLSITE_RETURN_MEMBER page (D1).
+- glsl_deployment_strategy.py: @@17466 helper _post_callsite_return_member;
+  @@17468..17492 publication posts DERIVED from return cells (D1);
+  @@17710..18140 return_cells_by_call / output_cells in call_result_descriptor
+  and passing them (D1); @@18950/@@18951 _structured_output_descriptor skips
+  the shared authored proof for a polymorphic copy (NaN fix);
+  @@22124 fold re-derivation posts on the member row (D1).
+- fortran_c_shell.py @@16720/@@16722: note_shape cross-copy polymorphism.
+- process_graph_autograd.py: per-book rule-graph memo, reverse_compile_book,
+  obtain_graph_reverse standalone book, __all__ (D2).
+- llvm_training_runtime.py: _one_reverse_compile_book on both entries (D2).
+Not mine: precompile_to_ssa.py, examples/llvm_dt_system.py, other docs.
