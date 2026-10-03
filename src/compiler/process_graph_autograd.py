@@ -2720,7 +2720,14 @@ def lower_training_motion_to_repository_ssa(
         settle_shape_only_repository_returns,
         wire_repository_ssa_region_products,
     )
-    reference = tensor_ssa_reference or c_backend_repository_ssa_reference()
+    # The program was linked from the reference copy that
+    # ``_class_surface_ssa_program`` owns; link the remaining tensor calls
+    # from that same copy (one Function object per helper name).
+    reference = module.metadata.get("tensor_ssa_reference")
+    if reference is None:
+        raise ProcessGraphAutogradError(
+            "repository SSA program did not record its tensor SSA reference"
+        )
     wire_repository_ssa_region_products(module)
     settle_shape_only_repository_returns(module)
     propagate_repository_ssa_call_metadata(module)

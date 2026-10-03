@@ -16590,6 +16590,14 @@ def _class_surface_ssa_program(
     # fact settled later, both about the same numbered value, land on pages
     # that can be read against each other.
     module_metadata["identity_book"] = current_identity_book()
+    # The program's linked reference functions ARE this copy's Function
+    # objects.  A caller that lowers more tensor calls into the returned
+    # module (``lower_training_motion_to_repository_ssa``) must link from
+    # this same copy: linking ``binary_value`` from the cached original next
+    # to the copy's ``binary_value`` raised "repository SSA function
+    # collision" for every graph-reverse motion whose backward used ``pow``
+    # (sqrt(x**2 + y**2), x / y), since c9607d25 introduced the copy.
+    module_metadata["tensor_ssa_reference"] = tensor_ssa_reference
     # Destructuring normalization is the operation that establishes which
     # authored target each evaluate-once aggregate position denotes.  Publish
     # that fact when the normalized source enters this compile; later stages
@@ -30730,6 +30738,30 @@ def _class_surface_ssa_program(
                         if int(value.id) != int(caller_result_id)
                     ]
                     caller_values[int(caller_result_id)] = result
+                    # The Const IS this callsite's executable occurrence, as a
+                    # native Call is for a "native_call" record; its planning
+                    # marker must leave with it.  Marker retirement elsewhere
+                    # keys on "native_call" only, so in the graph-reverse
+                    # motion of ``log(x)*y`` the bw_log callee kept
+                    # ``Call [] -> 2 {callee: '__plan_callsite_2__'}`` beside
+                    # ``Const 1e-12 -> 2``: two definitions of id 2, and
+                    # LLVM refused the marker ("no repository LLVM
+                    # emission").  Rule: a decomposition that inserts the
+                    # replacing instruction retires the marker of exactly
+                    # that plan_callsite_id.
+                    for block in caller.blocks.values():
+                        block.instrs = [
+                            instruction
+                            for instruction in block.instrs
+                            if not (
+                                instruction.attributes.get(
+                                    "plan_callsite_marker"
+                                )
+                                and int(instruction.attributes.get(
+                                    "plan_callsite_id", -1
+                                )) == int(record.callsite_id)
+                            )
+                        ]
                     rebuilt.append(replace(
                         record,
                         resolution="decomposed",

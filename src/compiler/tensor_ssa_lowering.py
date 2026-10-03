@@ -4957,6 +4957,27 @@ def lower_tensor_calls_to_repository_ssa(
                     conformed = []
                     for operand in data_args:
                         if tuple(operand.shape or ()) == tuple(result.shape or ()):
+                            # ``where_double`` reads DOUBLE buffers.  A
+                            # shape-matched scalar literal of another dtype
+                            # is respelled as its float64 constant, the same
+                            # rule the broadcast branch below applies.  In
+                            # BACKWARD_RULES["maximum"] (``where(y>x, 1,
+                            # ...)``, scalar operands) the int64 literal 1
+                            # crossed as raw bytes and read 4.9e-324, so
+                            # d Max(0,u)*y / du at y=2 came out 1e-323.
+                            payload = constants.get(int(operand.id))
+                            if (
+                                not tuple(operand.shape or ())
+                                and isinstance(payload, (int, float))
+                                and not isinstance(payload, bool)
+                                and str(operand.dtype or "").casefold()
+                                not in {"double", "float64"}
+                            ):
+                                respelled, respelled_def = constant(
+                                    float(payload), "float64"
+                                )
+                                prefix.append(respelled_def)
+                                operand = respelled
                             conformed.append(operand)
                             continue
                         temporary = fresh(

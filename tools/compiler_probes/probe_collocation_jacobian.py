@@ -87,8 +87,10 @@ def slice_laws(k: int = 0):
     import sympy as sp
     import honorary_engine_equation_catalogue as honorary
     import orbital_jumper as oj
-    from orbital_actuation import (AXES, actuation_force_rhs, six_axis_jumper,
-                                   thrust_magnitude, thruster_symbols)
+    from orbital_actuation import (AXES, PROPELLANT_SUPPLY,
+                                   actuation_force_rhs, attitude_symbols,
+                                   six_axis_jumper, thrust_magnitude,
+                                   thruster_symbols)
 
     design = six_axis_jumper(MAX_THRUST, MASS)
     n_u = design.thruster_count
@@ -97,6 +99,13 @@ def slice_laws(k: int = 0):
     momentum = {a: sp.Symbol(f"momentum_{a}") for a in AXES}
 
     constants = {mass: MASS}
+    # Step 7 (engine_toy 861ccb4) put the attitude R and propellant_supply
+    # into the actuation law.  This slice keeps the earlier law's meaning
+    # with the library's own defaults: identity attitude (as
+    # ``actuation_matrix(attitude=None)``) and supply 1 (tank not limiting).
+    for (row, col), symbol in attitude_symbols().items():
+        constants[symbol] = 1 if row == col else 0
+    constants[PROPELLANT_SUPPLY] = 1
     for index, (center, mu) in enumerate(CENTERS):
         csym, musym = oj._center_symbols(index)
         constants[musym] = mu

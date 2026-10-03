@@ -17067,7 +17067,8 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
     )
     from .concordance_declarations import (
         SPECIALIZATION_CALLSITES_DISAGREE, SPECIALIZATION_DYNAMIC_ARGUMENT,
-        SPECIALIZATION_NOT_SOURCE_STATIC, SpecializationFact,
+        SPECIALIZATION_NOT_SOURCE_STATIC, SPECIALIZATION_TENSOR_ARGUMENT,
+        SpecializationFact,
         SpecializationSource,
     )
     from .identity_concordance import Unresolved
@@ -17076,6 +17077,7 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
     candidates: dict[tuple[int, str], list[tuple[Any, tuple, bool]]] = {}
     dynamic_argument = object()
     not_source_static = object()
+    tensor_argument = object()
     for caller in graphs:
         for _node_id, data in caller.G.nodes(data=True):
             attributes = data.get("attributes") or {}
@@ -17106,6 +17108,22 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                         value = _source_static_literal(caller, int(parent))
                     except ValueError:
                         value = not_source_static
+                    else:
+                        # A literal the caller ALSO describes as a tensor is
+                        # two facts about one value.  Folding it here
+                        # rewrites the shared definition with the literal
+                        # alone: in the graph-reverse motion of ``x**3*y``
+                        # every caller passes bw_pow's ``p`` as 3 and as a
+                        # shape-() float64 tensor; the catalogue fold made
+                        # ``p`` a bare ``Constant 3`` before any callsite
+                        # copy existed, so ``p.shape`` never resolved and
+                        # ``unbroadcast(..., p.shape)`` kept a shape loop
+                        # whose iterable ``extent`` LLVM cannot emit.  Rule:
+                        # such a formal is specialized only in its callsite
+                        # copy (``_callsite_specialized_shell_type``), which
+                        # keeps literal and descriptor together.
+                        if _tensor_descriptor(caller, int(parent)) is not None:
+                            value = tensor_argument
                 else:
                     value = dynamic_argument
                 candidates.setdefault(
@@ -17159,6 +17177,11 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
         if any(value is dynamic_argument for value in values):
             _post_planner_specialization(callee, parameter, Unresolved(
                 SPECIALIZATION_DYNAMIC_ARGUMENT, read=cells,
+            ), cells)
+            continue
+        if any(value is tensor_argument for value in values):
+            _post_planner_specialization(callee, parameter, Unresolved(
+                SPECIALIZATION_TENSOR_ARGUMENT, read=cells,
             ), cells)
             continue
         first = values[0]
@@ -22363,14 +22386,30 @@ def _fold_callsite_structural_values(
                         )))
                     except ValueError:
                         result_shape = None
-                    if result_shape is not None:
+                    # The result dtype is the promotion of the two VALUE arms
+                    # (``np.where`` semantics, and the elementwise-binary
+                    # rule's ``np.result_type`` above), never the first
+                    # non-bool operand: BACKWARD_RULES["maximum"]'s
+                    # ``where(x<y, 0, 0.5)`` was typed int64 from the literal
+                    # 0, cast 0.5 to 0, and the outer where/Mul then made
+                    # d Max(0,u)*y / du read 0.0 instead of y.
+                    value_arms = [
+                        str(descriptor.get("dtype") or "unknown")
+                        for descriptor in (
+                            operand_descriptors[1:]
+                            if len(operand_descriptors) == 3
+                            else operand_descriptors
+                        )
+                    ]
+                    known_arms = [
+                        dtype for dtype in value_arms if dtype != "unknown"
+                    ]
+                    if result_shape is not None and known_arms:
                         data["tensor"] = {
                             "shape": result_shape,
-                            "dtype": next((
-                                descriptor["dtype"]
-                                for descriptor in operand_descriptors
-                                if descriptor["dtype"] != "bool"
-                            ), operand_descriptors[0]["dtype"]),
+                            "dtype": str(np.result_type(
+                                *(np.dtype(dtype) for dtype in known_arms)
+                            )),
                         }
             if tensor_candidate in {"gather", "index_select"}:
                 source_descriptor = next((
@@ -24692,7 +24731,28 @@ class ProcessGraphGLSLDeployment:
                 # the selector's projection values as fictitious results.
                 # The authored AST node is the exact distinction; no name,
                 # position, or later linker repair is involved.
-                if not isinstance(data.get("expr_obj"), ast.Call):
+                #
+                # A graph-native node has no authored AST (``expr_obj`` is
+                # None): the adjoint builder's ``Call bw_mul`` (op "Call",
+                # ``callee_ref`` -> the BACKWARD_RULES graph) in a fused
+                # training motion.  Its declared op is its only declaration
+                # of an activation.  Requiring an ``ast.Call`` here dropped
+                # every backward rule call: no callsite shell, the call
+                # result settled ``call-result-unavailable``, its seed input
+                # left the ABI and its Indexed gradients left the outputs
+                # (left*right VJP: buffer_order (0, 1, 2), grads 7/8 gone).
+                # Rule: an AST node is an activation iff it is an
+                # ``ast.Call``; a node with no AST iff its declared op is
+                # "call".  AST nodes keep the AST rule because an AST graph
+                # also holds op "call" nodes that are not activations
+                # (short-circuited boolop operands).
+                expression = data.get("expr_obj")
+                if expression is None:
+                    if str(
+                        data.get("op") or data.get("type") or ""
+                    ).casefold() != "call":
+                        continue
+                elif not isinstance(expression, ast.Call):
                     continue
                 reference = attributes.get("callee_ref")
                 if reference is None:
