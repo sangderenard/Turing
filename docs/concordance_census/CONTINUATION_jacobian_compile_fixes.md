@@ -1006,3 +1006,52 @@ This lane's hunks:
   obtain_graph_reverse standalone book, __all__ (D2).
 - llvm_training_runtime.py: _one_reverse_compile_book on both entries (D2).
 Not mine: precompile_to_ssa.py, examples/llvm_dt_system.py, other docs.
+
+## 2026-10-03 Next: linear-motion NaN in the frame linker (51b4cebe committed)
+
+Task: trace why the root passes bw_mean two linked_call_frame_storage actuals
+while the copy declares one, why bw_mean calls expand_reduction with none,
+and why the root's two are not in buffer_order. Join formals and actuals via
+book rows (call-frame storage identity), never by position.
+CORRECTION (kx806_arity.py, census after lowering AND after LLVM emit): there
+is no arity mismatch. bw_mean declares TWO linked storage formals (154, 157)
+and the root passes two (160, 163); the root's two are passed by the entry
+wrapper as `root.frame.*` (wrapper-owned), not public buffers, which is why
+they are absent from buffer_order. My earlier "one formal" read was wrong.
+(The formals are dead: expand_reduction takes none.) So the NaN is elsewhere;
+watching the backward values next.
+
+## 2026-10-03 Linear NaN ROOT (observed): shape vectors retyped int32 -> int64
+
+Watching every root value: 5 (matmul) correct, 6 = 5 + broadcast(b) NaN.
+Forward region_1 calls broadcast_double(b, tmp, src_shape, src_ndim,
+out_shape, out_ndim). The kernel reads shape arrays as i32
+(`getelementptr inbounds i32, ptr %output_shape`), but the shape vectors are
+Consts of dtype int64 (`alloca i64, i64 2`; store i64 2, i64 2). [2,2] as i64
+read as i32 is [2,0]: total extent 0, tmp never written, garbage -> NaN.
+tensor_ssa_lowering's `int_vector` mints these as dtype "int32"; something
+retypes them to int64. Trapping the retype next.
+Writer: tensor_ssa_lowering `int_vector` mints the shape vectors int32 (:2239,
+for broadcast_double); ir_indexing.py `_propagate_scalar_dtypes` (:293, from
+lower_indexing_to_ssa_addressing :144) then retypes them int64. Reading it.
+Rule conflict in ir_indexing._propagate_scalar_dtypes: the Sep-26 rule says a
+Const's declared scalar dtype is its identity, but the older (839a40d1,
+Aug 22) normalization right after it widens every int/int32/i32 to int64,
+declared or not. Fix: the widening skips a Const whose declared dtype was
+kept. Testing.
+Linear motion test: 1 PASSED (12.3 s). Running the green checks.
+Reverse 1 passed (7.7 s); scalar-loss 2 passed (19.9 s); orbital 4p/7xf (20 s). Probe next.
+Probe: RESULT jacobian max_rel 4.138e-16 (green).
+Gate: tests/test_precompile_to_ssa.py 13 failed / 91 passed with the ir_indexing change, IDENTICAL failure set to clean 51b4cebe (wtb overlay of ir_indexing.py only). Cheap gate files next.
+Gate files: test_abstract_tensor_indexing 2 passed; test_compiled_linalg 7
+passed; test_ir_sequence_tables 3 failed / 36 passed, the SAME 3 failures at
+clean 51b4cebe (wtb).
+
+## 2026-10-03 STATUS: linear motion test green (uncommitted)
+
+Only hunk of this step: src/compiler/ir_indexing.py
+`_propagate_scalar_dtypes` -- a Const keeps its declared integer width; only
+inferred integers widen to int64. The frame-linker suspicion was wrong (no
+arity mismatch; root frame storage is wrapper-owned).
+Green: linear motion 1 passed; reverse 1 passed; scalar-loss 2/2; orbital
+4p/7xf; probe max_rel 4.138e-16. Gate unchanged vs clean HEAD.

@@ -278,7 +278,21 @@ def _propagate_scalar_dtypes(functions) -> None:
                         inferred = "int64"
                 elif instruction.op in {"Div", "Sqrt", "Exp", "Log"}:
                     inferred = "float64"
-                if inferred in {
+                # A Const's DECLARED integer width is its identity (rule
+                # above) and survives; only an inferred integer widens to
+                # int64.  tensor_ssa_lowering mints kernel shape vectors as
+                # declared int32 (``int_vector``), the width broadcast_double
+                # reads; widening them here stored [2, 2] as i64 which the
+                # kernel read as i32 [2, 0]: zero output extent, the
+                # broadcast temporary never written, and the linear
+                # forward/loss/backward motion ran NaN from ``x @ W + b``.
+                declared_const = bool(
+                    instruction.op == "Const"
+                    and str(instruction.res.dtype or "")
+                    in _DECLARED_LITERAL_DTYPES
+                    and inferred == str(instruction.res.dtype or "")
+                )
+                if not declared_const and inferred in {
                     "int", "int8", "int16", "int32", "i32", "i64",
                 }:
                     inferred = "int64"
