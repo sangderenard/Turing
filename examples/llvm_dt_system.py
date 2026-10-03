@@ -98,12 +98,24 @@ COURANT_FIELDS = ("pub_energy_courant", "pub_energy_courant_present",
 
 
 def column_names_of(pieces):
-    """Every column some piece reads, in first-appearance order (``dt`` is
-    the step's own column and is not one of them)."""
+    """Every physical column the pieces read or publish, in stable order.
+
+    Read columns retain their established first-appearance order.  A declared
+    ``<name>_next`` output also owns ``name`` even when no piece reads it; such
+    output-only columns follow the read columns in first-appearance order.
+    ``dt`` remains the step's own column, never a participant state column.
+    """
 
     names = []
     for piece in pieces:
         for name in piece.argument_names:
+            if name != "dt" and name not in names:
+                names.append(name)
+    for piece in pieces:
+        for output in piece.output_names:
+            if not output.endswith("_next"):
+                continue
+            name = output[:-5]
             if name != "dt" and name not in names:
                 names.append(name)
     return tuple(names)
