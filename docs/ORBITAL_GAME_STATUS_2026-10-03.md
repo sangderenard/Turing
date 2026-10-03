@@ -36,6 +36,14 @@ for execution, with a measured sequential-load peak of 767 MB RSS and ending
 RSS of 436 MB. Full archives remain intact. A fresh complete craft build and
 full craft correctness/performance results remain pending.
 
+Adaptive growth is now the default in the existing dt entry points, and the
+LLVM-piece bridge carries the graph's growth choice into its owned state and
+native record contract. The previous bridge silently omitted that choice.
+The focused gate passes 31 tests (20.31 s, peak 1.98 GB), including actual
+native growth, rollback, exact windows, and bool-field transport. Orbital
+flight gates are being rerun against this correction. No blanket no-growth
+cap or replacement timestep algorithm was introduced.
+
 The remainder of this report records the inherited state and historical
 measurements, which must not be treated as results for the new integration.
 

@@ -253,10 +253,10 @@ class SalinePressureAPI:
         )
         return dt_next
 
-    def step_super(self, round_max: float, dt_init: float, hooks=None, *, allow_increase_mid_round: bool = False) -> SuperstepResult:
+    def step_super(self, round_max: float, dt_init: float, hooks=None, *, allow_increase_mid_round: bool = True) -> SuperstepResult:
         """Advance exactly ``round_max`` time using superstep plan/result.
 
-        This preserves non-increasing dt within the sequence and returns a
+        The controller may grow or shrink dt within the sequence and returns a
         :class:`~src.common.dt.SuperstepResult` describing the outcome.
         """
         from src.common.sim_hooks import SimHooks

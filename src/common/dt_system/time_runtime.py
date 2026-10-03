@@ -42,7 +42,7 @@ class TimeWindowRequest:
     t_end: float
     dt_initial: float
     event_times: tuple[float, ...] = ()
-    allow_increase_mid_window: bool = False
+    allow_increase_mid_window: bool = True
 
     def validate(self) -> None:
         values = (self.t_start, self.t_end, self.dt_initial, *self.event_times)

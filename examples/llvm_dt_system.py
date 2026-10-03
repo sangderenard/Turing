@@ -262,6 +262,7 @@ def state_source(columns, participants=1, *, channel_names=DT_CHANNEL_NAMES):
         lines.append(f"        self.{name} = {name}")
     lines.append("        self.telemetry = telemetry")
     lines.append(f"        self.channel_names = {channel_names!r}")
+    lines.append("        self.allow_increase_mid_round = True")
     for field in (*PUBLICATION_FIELDS, *COURANT_FIELDS):
         lines.append(f"        self.{field} = AbstractTensor.zeros(({participants},))")
     for field in ("pub_values", "pub_present", "pub_limits", "pub_limits_present"):
@@ -557,7 +558,9 @@ def dt_system_over(state, targets, controller, round_dt, dt_initial, dx):
     The caller owns ``state``/``targets``/``controller`` across rounds; the
     round's results are published on ``state.telemetry``.
 
-    Rollback is the system's declared choice, carried on the state:
+    Adaptive growth and rollback are declared choices carried on the state:
+    ``allow_increase_mid_round`` follows the graph's node/plan choice, or an
+    explicit ``dt_system`` argument, and is True for a standalone state.
     ``instantiate_system`` records the graph's ``SuperstepPlan.rollback``
     (and its ``rollback_threshold_multiplier``) there, ``dt_system`` records
     an explicit ``rollback=`` there, and this function only reads them.  A
@@ -568,6 +571,7 @@ def dt_system_over(state, targets, controller, round_dt, dt_initial, dx):
 
     advanced, dt_next, metrics = run_superstep(
         state, round_dt, dt_initial, dx, targets, controller, advance_pieces,
+        allow_increase_mid_round=state.allow_increase_mid_round,
         rollback=state.rollback,
         rollback_threshold_multiplier=state.rollback_threshold_multiplier)
     publish_window(state, advanced, dt_next, metrics, round_dt)
@@ -703,7 +707,8 @@ class Subcycle:
 
     def __init__(self, piece_files, *, round_dt, dx, targets=None, controller=None,
                  name="subcycle", lead_windows=1.0, wait_timeout_s=0.05,
-                 coupling=None, omega_ref_rad_s=0.0, channel_names=DT_CHANNEL_NAMES):
+                 coupling=None, omega_ref_rad_s=0.0, channel_names=DT_CHANNEL_NAMES,
+                 allow_increase_mid_round=True):
         self.name = str(name)
         #: What sits across the boundary to the consulting system: a joint
         #: kind or a declared ``time_field.TimeAdaptor``.  Undeclared is
@@ -721,6 +726,7 @@ class Subcycle:
         self.targets = targets or Targets(cfl=0.5, div_max=1e9, mass_max=1e-3,
                                           energy_exchange_fraction=0.2)
         self.controller = controller or STController(dt_min=self.round_dt * 1e-6)
+        self.allow_increase_mid_round = bool(allow_increase_mid_round)
         self.lead_windows = float(lead_windows)
         self.wait_timeout_s = float(wait_timeout_s)
         self.names = column_names_of(self.pieces)
@@ -778,7 +784,8 @@ class Subcycle:
                 start = time.perf_counter()
                 advanced, dt, metrics = run_superstep(
                     self.state, self.round_dt, dt, self.dx, self.targets,
-                    self.controller, self._advance)
+                    self.controller, self._advance,
+                    allow_increase_mid_round=self.allow_increase_mid_round)
                 publish_window(self.state, advanced, dt, metrics, self.round_dt)
                 self.ledger.window(time.perf_counter() - start, float(advanced))
                 with self.condition:
@@ -1037,6 +1044,8 @@ class RoundPiece:
         advanced, self.dt_inner, metrics = run_superstep(
             self.state, window, self.dt_inner, self.dx, self.targets,
             self.controller, self._advance,
+            allow_increase_mid_round=bool(
+                self.node.allow_increase_mid_round or self.node.plan.allow_increase_mid_round),
             rollback=bool(self.node.plan.rollback),
             rollback_threshold_multiplier=float(
                 self.node.plan.rollback_threshold_multiplier))
@@ -1152,7 +1161,9 @@ def dt_system_from_graph(root, columns, *, rounds, subcycles=(), state=None, cha
     return dt_system(pieces, columns, rounds=rounds, round_dt=float(root.plan.round_max),
                      dx=float(control.dx), targets=control.targets, controller=control.ctrl,
                      subcycles=subcycles, scope=str(root.label), schedule=schedule,
-                     dt_initial=float(root.plan.dt_init), state=state, channel_names=channel_names)
+                     dt_initial=float(root.plan.dt_init), state=state, channel_names=channel_names,
+                     allow_increase_mid_round=bool(
+                         root.allow_increase_mid_round or root.plan.allow_increase_mid_round))
 
 
 def instantiate_system(root, columns, *, subcycles=(), channel_names=DT_CHANNEL_NAMES):
@@ -1163,6 +1174,7 @@ def instantiate_system(root, columns, *, subcycles=(), channel_names=DT_CHANNEL_
     formerly rebuilt or tracked on every step: the graph's controller,
     targets and ``dx``, its schedule and scope, its default window
     (``plan.round_max``) and first attempt (``plan.dt_init``), the plan's
+    adaptive growth choice (the node or plan's ``allow_increase_mid_round``),
     rollback choice (``plan.rollback``, ``plan.rollback_threshold_multiplier``
     -- what ``dt_system_over`` hands ``run_superstep``), and the controller's
     continuation ``dt_next`` -- the first attempt of the next round, which
@@ -1185,6 +1197,8 @@ def instantiate_system(root, columns, *, subcycles=(), channel_names=DT_CHANNEL_
     state.scope = str(root.label)
     state.round_window = float(root.plan.round_max)
     state.dt_init = float(root.plan.dt_init)
+    state.allow_increase_mid_round = bool(
+        root.allow_increase_mid_round or root.plan.allow_increase_mid_round)
     state.rollback = bool(root.plan.rollback)
     state.rollback_threshold_multiplier = float(root.plan.rollback_threshold_multiplier)
     state.dt_next = None
@@ -1221,7 +1235,7 @@ def advance_round(state, window=None, *, subcycles=()):
 
 def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, controller=None,
               subcycles=(), scope="lockstep", schedule="sequential", dt_initial=None,
-              state=None, rollback=None, channel_names=None):
+              state=None, rollback=None, channel_names=None, allow_increase_mid_round=None):
     """Load the pieces from their files and run ``rounds`` rounds of the dt
     system over them in Python, the way the native unit will be driven.
 
@@ -1230,6 +1244,9 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
     state came from ``instantiate_system``, else ``False`` (no-save,
     in-place, no-retry) as this lane always ran; ``True``/``False`` declares
     it on the state, where ``dt_system_over`` reads it every round.
+
+    ``allow_increase_mid_round=None`` uses the state's declared choice (adaptive
+    by default, or the graph's choice). An explicit bool updates that same field.
 
     ``subcycles`` are independent participants (``Subcycle``).  Each round
     the lockstep system consults them without waiting, reads their owned
@@ -1301,6 +1318,8 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
         # An explicit request is declared on the state, where
         # ``dt_system_over`` reads it; ``None`` leaves the state's own choice.
         state.rollback = bool(rollback)
+    if allow_increase_mid_round is not None:
+        state.allow_increase_mid_round = bool(allow_increase_mid_round)
     ledger = state.wall_cost_ledger
     time_record = state.time_velocity
     for sub in subcycles:
@@ -1387,6 +1406,7 @@ def dt_system_contract(entry, columns, batch, participants=1, *, channel_names=D
             # The system's declared rollback choice rides on the state, so the
             # lowered round reads the same declared field the eager one does.
             "rollback": scalar("bool"),
+            "allow_increase_mid_round": scalar("bool"),
             "rollback_threshold_multiplier": scalar("float64"),
             **{name: span(participants) for name in (*PUBLICATION_FIELDS, *COURANT_FIELDS)},
             **{name: span(participants * len(channel_names)) for name in

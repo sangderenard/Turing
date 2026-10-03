@@ -4,8 +4,8 @@
 This module defines small dataclasses used to describe a *superstep* request
 ("plan") and its corresponding outcome ("result"). A superstep advances a
 simulation by a precise time window using one or more micro-steps chosen by an
-adaptive controller, while enforcing a non-increasing dt policy within the
-sequence (unless explicitly disabled). The final micro-step lands exactly on the
+adaptive controller. Timestep proposals may grow or shrink within the sequence.
+An explicit compatibility opt-out holds growth. The final micro-step lands exactly on the
 requested window via a remainder.
 
 Glossary
@@ -13,9 +13,8 @@ Glossary
 - round_max: Target time window for a frame/loop iteration (e.g., 1/60s).
 - dt_init: Initial dt proposal from the controller before starting the round.
 - dt_next: Controller's proposed dt to start the next round.
-- non-increasing policy: Within one round, attempted dt is not allowed to grow
-  (it may shrink due to stability or remainder clamping). This preserves
-  predictiveness without requiring sequence rebuilds.
+- adaptive policy: Within one round, the controller proposes the next dt from
+  the measured response. Stability bounds and exact landing still clamp it.
 
 Usage
 -----
@@ -47,10 +46,9 @@ class SuperstepPlan:
         The initial dt to attempt on the first micro-step (usually the
         controller's proposed dt from the previous frame).
     allow_increase_mid_round:
-        If True, allow dt to grow during the sequence. Defaults to False for
-        physically conservative behaviour. Enabling this may be useful for
-        game-style time dilation but can reduce predictiveness unless the
-        entire sequence is rebuilt.
+        If True (default), use the controller's next proposal whether it grows
+        or shrinks. False retains the legacy non-increasing interior policy.
+        Error rejection, physical bounds and exact landing apply in both modes.
     eps:
         Numerical tolerance for deciding when the target window has been
         satisfied.
@@ -77,7 +75,7 @@ class SuperstepPlan:
     """
     round_max: float | AbstractTensor
     dt_init: float | AbstractTensor
-    allow_increase_mid_round: bool = False
+    allow_increase_mid_round: bool = True
     eps: float = 1e-15
     event_boundaries: tuple[float, ...] = ()
     rollback: bool = True

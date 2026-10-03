@@ -146,7 +146,7 @@ class RoundNode:
     plan: SuperstepPlan
     controller: ControllerNode
     children: List[Union[AdvanceNode, "RoundNode"]] = field(default_factory=list)
-    allow_increase_mid_round: bool = False
+    allow_increase_mid_round: bool = True
     # Optional scheduling: 'sequential' (default), 'interleave', 'parallel'
     schedule: str = "sequential"
     # Optional nonlinear distribution hook: (metrics, targets, dx) -> dt_penalty scalar
@@ -737,14 +737,15 @@ class GraphBuilder:
         dt: float,
         engines: List[EngineRegistration],
         *,
-        allow_increase_mid_round: bool = False,
+        allow_increase_mid_round: bool = True,
         schedule: str = "sequential",
         realtime_config: RealtimeConfig = None,
         realtime_state: RealtimeState = None,
         parent_label: str = None,
         state_table: Any = None,
     ) -> RoundNode:
-        plan = SuperstepPlan(round_max=float(dt), dt_init=float(dt))
+        plan = SuperstepPlan(round_max=float(dt), dt_init=float(dt),
+                             allow_increase_mid_round=allow_increase_mid_round)
         controller = ControllerNode(ctrl=self.ctrl, targets=self.targets, dx=self.dx)
         state_stub = StateNode(state=None)
         children: List[Union[AdvanceNode, RoundNode]] = []
@@ -798,10 +799,11 @@ class GraphBuilder:
                     )
 
                 e_round = RoundNode(
-                    plan=SuperstepPlan(round_max=float(dt), dt_init=float(dt)),
+                    plan=SuperstepPlan(round_max=float(dt), dt_init=float(dt),
+                                       allow_increase_mid_round=allow_increase_mid_round),
                     controller=ControllerNode(ctrl=self.ctrl, targets=self.targets, dx=self.dx),
                     children=[make_adv_with_bisect(reg, unique_label)],
-                    allow_increase_mid_round=False,
+                    allow_increase_mid_round=allow_increase_mid_round,
                     schedule="sequential",
                     label=f"bisect-round:{unique_label}",
                     state_table=state_table,
@@ -834,7 +836,7 @@ class GraphBuilder:
                 nested_round = GraphBuilder(ctrl=e_ctrl, targets=reg.targets, dx=reg.dx).round(
                     dt=dt,
                     engines=[reg],
-                    allow_increase_mid_round=False,
+                    allow_increase_mid_round=allow_increase_mid_round,
                     schedule="sequential",
                     realtime_config=realtime_config,
                     realtime_state=realtime_state,

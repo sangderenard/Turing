@@ -120,8 +120,8 @@ class SPHAdapter(BathAdapter):
             "surface_batches": [],
         }
 
-    def step_super(self, round_max: float, allow_increase_mid_round: bool = False) -> SuperstepResult:
-        """Advance exactly one frame window with a non-increasing dt policy.
+    def step_super(self, round_max: float, allow_increase_mid_round: bool = True) -> SuperstepResult:
+        """Advance exactly one frame window with adaptive timestep proposals.
 
         Returns a :class:`~src.common.dt.SuperstepResult` and updates internal
         controller state and time accumulator.
@@ -227,7 +227,7 @@ class MACAdapter(BathAdapter):
                 state["surface_batches"] = []
         return state
 
-    def step_super(self, round_max: float, allow_increase_mid_round: bool = False) -> SuperstepResult:
+    def step_super(self, round_max: float, allow_increase_mid_round: bool = True) -> SuperstepResult:
         if self.dt_targets is None:
             cfl = float(getattr(self.sim, "cfl", getattr(self.sim.p, "cfl", 0.5)) or 0.5)
             self.dt_targets = Targets(cfl=cfl, div_max=1e30, mass_max=1e30)
@@ -338,7 +338,7 @@ class HybridAdapter(BathAdapter):
                 state["surface_batches"] = []
         return state
 
-    def step_super(self, round_max: float, allow_increase_mid_round: bool = False) -> SuperstepResult:
+    def step_super(self, round_max: float, allow_increase_mid_round: bool = True) -> SuperstepResult:
         if self.dt_targets is None:
             cfl = float(getattr(self.sim.params, "cfl", 0.5) or 0.5)
             self.dt_targets = Targets(cfl=cfl, div_max=1e30, mass_max=1e30)

@@ -59,6 +59,39 @@ Memory-mapping a pickle would still reconstruct its Python objects when
 unpickled. Compression can reduce archive bytes and I/O, but does not eliminate
 those live objects; no alternate file-backed book implementation was added.
 
+The previously pending postcommit properties and inverse checks now pass in
+the runtime-payload configuration (two tests, 113.95 s, peak 1,441,718,272
+bytes). COM matches within `1e-12`; inertia retains `rel=1e-11, abs=1e-10`;
+inverse times spin-free inertia matches identity within `1e-12` with zero
+relative tolerance. The copper-updated coupled rotor gate also passes
+(48.94 s, peak 1,006,317,568 bytes): 140 attempts, world angular-momentum
+drift `2.30317515257e-9 Nms`, copper ledger `0.013 J`, and electrical minus
+copper minus mechanical work below `1e-12 J`. Raw concordance debt remains
+OPEN (properties/inverse each 19 findings; rotor 21). These isolated and
+small-system results do not establish the full 27-piece craft flight.
+
+## Adaptive growth correction in progress
+
+The user rejected a blanket no-growth policy. The proposed change that would
+have retained a smaller accepted retry as the round's cap was stopped before
+any production edit, and the new tests imposing that requirement were removed.
+Earlier attempt sequences remain observations, not a specification to enforce.
+
+The false `SuperstepPlan.allow_increase_mid_round` default originates in
+`aeb6b7c8` (2025-08-16), whose message is "intigrating dynamic dt controller,
+bugs remain". More directly relevant, `llvm_dt_system.dt_system_over` and
+`RoundPiece` did not forward the graph's growth choice at all, and the
+PieceState ABI did not carry it. OrbitalJumper also inherited the false plan
+default. Existing direct graph and managed-time paths already support growth;
+the managed tire source explicitly enables it.
+
+The repair now enables existing adaptive defaults and forwards that choice
+through the LLVM-piece state/ABI. OrbitalJumper explicitly requests it. No
+new step-size algorithm or no-growth cap is being added. Declared physical
+limits, rollback, fixed outer windows and explicitly pinned operation remain
+the acceptance contract. Verification on this configuration is pending;
+earlier pure-torque and rotor attempt counts describe the old configuration.
+
 ## Initial source audit (before the integration correction)
 
 This initial source audit covers `engine_toy/orbital_jumper.py`,
@@ -441,3 +474,38 @@ old exact substep-count/Cayley-formula expectations were removed. The actual
 production endpoint-metrics piece also passes its controlled variable-mass
 case in 78.82 seconds, with 1,287,823,360 bytes sampled peak. Its raw-row
 concordance findings remain OPEN; these numerical passes do not close them.
+
+## Adaptive growth correction
+
+The user explicitly rejected a blanket no-growth policy. The inherited false
+default dates to `aeb6b7c8` (2025-08-16, "intigrating dynamic dt controller,
+bugs remain"). An additional bridge omission made the orbital plan's choice
+ineffective: `instantiate_system`, generated PieceState, its native ABI, and
+`dt_system_over` did not carry `allow_increase_mid_round`. The proposed retry
+cap correction was stopped before any production edit. No such cap was added.
+
+The existing adaptive policy is now the default in the plan, controller,
+graph builder, time request, and bath/cell entry points. The LLVM-piece bridge
+carries the declared choice through instantiated, direct, nested, and
+subcycle paths. Explicit legacy opt-out and pinned operation remain supported;
+physical HOLD, energy bounds, rejection, rollback, and exact window landing
+retain their existing meaning. No new proposal or rejection formula is used.
+
+The bounded regression gate passes 31 tests in 20.31 seconds, with sampled
+peak max(working set, private bytes) 1,980,862,464 bytes. It includes all nine
+cases in `tests/dt_system/test_dt_adaptive_growth.py`, selected controller and
+superstep cases, the 50-seed scheduler Monte Carlo gate, graph tests, the
+managed event request, LLVM piece/channel tests, and native participant
+BIND/HOLD/DILATE/SUBCYCLE checks. The native law demonstrates growth from
+0.03125 to 0.21875 within a 0.25 window; the rejection case attempts 0.25,
+0.125, 0.0625, 0.1875, restoring registered x to zero for each rejected
+attempt and finishing at x = 0.25. The typed bool also crosses the sanctioned
+source compiler into actual C execution and determines a written state span.
+That ABI proof does not compile the entire coordinator.
+
+The two new audits have zero structural findings and zero unsourced ids,
+with 1,472 and 1,680 unsourced facts respectively; concordance debt remains
+OPEN. An earlier broader test batch was interrupted without a summary and
+is not counted as a completed gate. Full orbital gates are being rerun with
+these corrected defaults. Other optional graph-policy transport gaps
+(distribution, event boundaries, epsilon, and schedule lattice) remain OPEN.

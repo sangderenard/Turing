@@ -292,7 +292,7 @@ def assert_non_increasing(seq, *, msg_prefix: str = ""):
 
 
 @pytest.mark.dt
-def test_superstep_exact_landing_and_monotone():
+def test_explicit_legacy_growth_optout_lands_exactly():
     # Constant velocity → constant CFL; PI may adjust dt but must not increase inside round.
     dx = 1.0
     targets = Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6)
@@ -308,7 +308,7 @@ def test_superstep_exact_landing_and_monotone():
         attempted.append(float(dt))
         return make_advance(vel_fn)(state_local, dt)
 
-    plan = SuperstepPlan(round_max=1.0, dt_init=0.30)
+    plan = SuperstepPlan(round_max=1.0, dt_init=0.30, allow_increase_mid_round=False)
     res = run_superstep_plan(state, plan, dx, targets, ctrl, advance_rec)
 
     # Exact landing within tolerance
