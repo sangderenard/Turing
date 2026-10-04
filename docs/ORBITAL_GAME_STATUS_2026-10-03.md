@@ -11,11 +11,14 @@ command-change gate passes on the final finite-headroom controller. The
 150-second angular-momentum, desaturation and near-empty cutoff gates also
 pass on the current controller in guarded, cache-only execution. The full-tank
 supply readout fails its exact-one assertion (`0.9999999999999999`); its
-separately integrated supplied/demand quotient is being traced. The empty-tank
-case has not run because that assertion comes first. The error-feedback correction is
-now committed as `cf78f24f` and its finite-headroom correction `6a879db3`;
-longer physical remeasurement, frame-partition and game
-acceptance remain pending. Detailed trace and measured gates:
+separately integrated supplied/demand quotient is being traced. That assertion
+stops the combined supply test before its empty-tank case. The error-feedback
+correction is committed as `cf78f24f` and its finite-headroom correction `6a879db3`.
+The ordinary 20-second burn plus cutoff also passes. The guarded longer batch
+finishes four passed / one failed in 1,778.19 s at a 2.507 GB peak. A separate
+empty-tank diagnostic exposes an initial mass reduction differing from the
+canonical native mass by two ULP. Supply/initialization corrections,
+frame-partition and game acceptance remain pending. Detailed trace and measured gates:
 [`concordance_census/ORBITAL_DT_METRICS_2026-10-03.md`](concordance_census/ORBITAL_DT_METRICS_2026-10-03.md).
 
 Verified Turing changes: appended metric-channel transport (`3202f8ba`),

@@ -151,6 +151,35 @@ The earlier AbstractTensor seam and existing `Precision.constant` support are
 being traced. No replacement precision arithmetic, relaxed bound, or native
 acceptance is claimed.
 
+The earlier existing reverse-source owner was then found in
+`vehicle_inverse_compilation._motion_source`, used by
+`prepare_vehicle_inverse_adam_python`. It renders the fused forward/saved/
+backward graph as AbstractTensor source, uses the canonical `BACKWARD_RULES`
+source, and promotes inputs with `Precision.of` around the composed program.
+Its current vehicle test is eager, so it does not establish native reverse
+preservation. Its operation vocabulary and single-loss labels need narrow
+extensions for the actual orbital motion.
+
+A separate supported generated-section native check passes: the existing
+`symbolic_abstract_tensor_source` policy emits three `Precision.of` inputs,
+multiply/add and one collapse. Its cancellation result
+`0x1.434a98a0d86b4p-51` equals the exact-binary Fraction reference bit for bit.
+The public ABI remains three float64 shape-(1,) inputs and one scalar-width
+output. There are no LLVM shortfalls; guarded wall time is 7.16 s and peak
+memory is 1,608,740,864 bytes. Source, full module/book and audit are in
+`C:/Users/alber/AppData/Local/Temp/orbital_generated_precision_probe_vhmzq7vv`.
+Audit: 154 rows / 3 functions, zero structural findings, 759 unsourced facts /
+134 ids, OPEN. This proves the existing promotion/arithmetic/collapse path,
+not yet the complete reverse motion.
+
+Generic authored `Precision.constant(like, parts)` currently has no matching
+source reducer boundary. Its tiny direct-source probe stops before LLVM on
+an indivisible dispatch region crossing a control partition. The native
+precision implementation already creates multi-part constants internally for
+its transcendental algorithms, and existing examples pass declared wide
+constants through precision-annotated formals. A general authored-constant
+connection remains open; eager support alone does not prove native support.
+
 The delayed actual-Hohmann plan/reference gate passes (17.38 s, sampled
 peak 2,573,942,784 bytes): unchanged captured assumptions permit a delayed
 immediate-start candidate, while a disturbance rejects it. This does not

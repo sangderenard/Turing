@@ -6,9 +6,10 @@ configured pure-torque checks pass, as do isolated production actuator,
 derivative, and energy-publication checks. The complete 27-piece craft bank
 now builds below the memory ceiling, and its command-change gate passes on
 the final finite-headroom controller (`6a879db3`).
-Long-duration angular momentum, desaturation and near-empty cutoff also pass
-on the pre-feedback controller. Those longer physical gates are being repeated
-after the error-feedback correction below; frame-partition and game acceptance
+Long-duration angular momentum, desaturation, near-empty cutoff and the
+ordinary 20-second burn plus cutoff now also pass on that controller. The
+full-supply exact-one readout fails; its diagnostic quotient and an initial
+mass summation mismatch are traced below. Frame-partition and game acceptance
 remain open.
 The completed-piece memory accumulation now has a verified archive/runtime split. The later
 sections record the ownership trace, verified compiler commits, failures,
@@ -280,7 +281,41 @@ tank/mass/impulse, integrated-delta-v, exact no-burn coast, and registered-span
 identity assertion passes. Final Gram defect is `1.82051943793e-15`, mass
 `979.353748255 kg`, burned propellant `2.52625174452 kg`, electrical energy
 `903.408316553 J`, and copper loss `900 J`. Adaptive growth remains enabled.
-The longer c0 physical gates and c1 frame/game gates remain separate work.
+The c1 frame/game gates remain separate work.
+
+The following guarded cache-only c0 batch finishes with four passed and one
+failed in 1,778.19 s, at a 2,507,046,912-byte peak. Compiler entrances were
+forbidden and normal cache-stamp validation remained active. These physical
+tests expose attempt counts, not rejection counts:
+
+- Closed-system angular momentum over 150 s passes with 52,733 attempts;
+  worst error is `6.33707055476e-13 Nms`, relative `6.027e-14`.
+- Desaturation over 60 s passes with 1,045 attempts; wheel speed falls from
+  596.9 to 447.566365379 rad/s, hydrazine use is 0.0135 kg, and worst body
+  angular speed is `7.21642797521e-4 rad/s`, below the original `2e-3` bound.
+- Near-empty exhaustion passes. At one second MMH is zero, NTO is
+  `0.0007000000000000004 kg`, impulse is `16.11232595 Ns` and attempts are 70.
+  Later windows preserve the exhausted-tank cutoff and impulse.
+- The 20-second untrimmed main burn and both subsequent cutoff/coast windows
+  pass every original fuel-share, impulse, mass, COM and inertia assertion.
+  Attempts at the 20-second endpoint are 152,315; the final total was not
+  printed and is not inferred.
+
+The sole batch failure is the full-tank supply readout:
+`0.9999999999999999` against exact `1.0`. A separate guarded rerun reproduces
+it in 26.76 s at a 1.644 GB peak. Every observed full-tank stage propellant
+rate is the exact sign inverse of its demand rate. The discrepancy is in the
+new diagnostic expression `-6*Max(-P,(dt/6)*sum(supplied))/(dt*sum(demand))`,
+not a measured stage shortage. Its algebraic correction remains unverified.
+
+The separate empty fixture delivers exactly zero impulse, changes no tank
+charge and retains zero velocity. Its exact initial-mass comparison exposes
+another mismatch: constructor mass `741.8800000000001` versus first native
+canonical mass `741.8799999999999`, unchanged thereafter. The constructor
+takes the machine-package charged-node reduction, while native mass uses
+the separately reduced dry mass plus registered tank charges. Initial mass,
+momentum and energy must use the same canonical law. This is a traced
+initialization gap, not a verified fix or a relaxed assertion.
 
 ## Complete craft command-change gate (before error feedback)
 
