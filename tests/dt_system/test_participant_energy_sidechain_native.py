@@ -79,11 +79,11 @@ def test_actual_piece_publication_owns_native_energy_sidechain(tmp_path):
             proposal = float(execution.buffers[output_ids["proposal"]].reshape(-1)[0])
             next_value = float(execution.buffers[output_ids["next_value"]].reshape(-1)[0])
             expected = (0.125 if contract == BIND and measured_power > 0.0
-                        else 0.25 if contract == HOLD else 0.5)
+                        else 0.25 if contract == HOLD else 0.45)
             print(f"contract={contract} power={measured_power} stored_energy=1 "
                   f"exchange_time={metrics.pub_exchange_time.tolist()} "
                   f"exchange_present={metrics.pub_exchange_time_present.tolist()} "
                   f"proposal={proposal} next={next_value} expected={expected}", flush=True)
             actual_rows.append((proposal, next_value))
-            expected_rows.append((0.5, expected))
+            expected_rows.append((0.45, expected))
     assert actual_rows == expected_rows

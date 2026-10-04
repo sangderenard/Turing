@@ -1,5 +1,14 @@
 # Test baseline and hazards — read before running any test
 
+2026-10-03 orbital archive reconstruction update (`7d984b78`): the
+`ArgumentBindingFact` pickle defect mentioned in the return-site port below
+is fixed at its existing declaration. Nine focused archive tests pass, and
+`tests/test_native_record_return_state.py::test_child_record_conditional_write_reaches_return`
+now passes in 4.94 s, including its four native child-process combinations.
+The actual archived orbital RK4 SSA book also round-trips with identical
+concordance audit and argument/output identities. This closes that specific
+serialization failure; the rest of the port matrix was not rerun.
+
 2026-10-03 return-site identity proposal (written against 3559a8f, ported onto
 854e145c): the focused `test_record_return_site_identity`,
 `test_ssa_record_return_state`, `test_control_source`,

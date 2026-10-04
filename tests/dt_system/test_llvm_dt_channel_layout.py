@@ -57,7 +57,7 @@ def test_declared_conservation_error_reaches_native_proposal(tmp_path):
         {CONSERVATION_ERROR: 2.0}, names=CHANNEL_NAMES, limits=True))
     output_id = int(root.metadata["named_outputs"][0][1])
     for route in ("aggregate", "participant"):
-        for published, expected in (({}, 0.5), ({CONSERVATION_ERROR: 4.0}, 0.5 / np.sqrt(2)),
+        for published, expected in (({}, 0.5), ({CONSERVATION_ERROR: 4.0}, 0.9 / (1 + np.sqrt(2))),
                                     ({CONSERVATION_ERROR: 0.0}, 0.5)):
             fields = channel_fields(published if route == "aggregate" else {}, names=CHANNEL_NAMES)
             metrics = Metrics(2.0, 0.0, 0.0, 0.0, **fields)

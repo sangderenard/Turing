@@ -256,14 +256,14 @@ def _propose_dt_pen(
         channel_penalty,
         0.0,
     )
-    if penalty > 0.0:
-        # Square-root feedback retains accepted headroom and damps the
-        # response before the existing log PI filter.  It is a controller
-        # transfer, not an asserted convergence order: different channels
-        # from the same RK4 step measured sixth- and eighth-power responses.
-        return min(float(dt_cfl), _scalar(dt_current) / math.sqrt(penalty))
-    # An exactly zero (or unjudged) error supplies no finite error bound.
-    return dt_cfl
+    # A zero measured error previously sent the loose CFL time into the PI,
+    # saturating its accumulator in one rotating-craft attempt. Finite 1.8h
+    # headroom permits repeated growth without that singular response.
+    # The proposal equals h at R=.64; acceptance still uses the declared R<=1.
+    # Unit-response alternatives approached R=1 from above for 230+ retries
+    # on sixth/eighth-power toy errors. This headroom crosses that boundary;
+    # it is nonlinear feedback, not an asserted integration error order.
+    return min(float(dt_cfl), _scalar(dt_current) * 1.8 / (1.0 + math.sqrt(penalty)))
 
 
 def step_with_dt_control_used(state,

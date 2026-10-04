@@ -23,19 +23,28 @@ ERROR = "feedback_trial_error"
 CHANNEL_NAMES = (*DT_CHANNEL_NAMES, ERROR)
 
 
-@pytest.mark.parametrize("power", (6, 8))
-def test_native_error_feedback_recovers_headroom_and_handles_command_change(tmp_path, power, capsys):
+@pytest.fixture(scope="module", params=(6, 8))
+def feedback_piece(request, tmp_path_factory):
+    power = request.param
     x, dt, gain = sp.symbols("x dt gain")
     law = compile_sympy_equations((
         sp.Eq(sp.Symbol("x_next"), x + dt, evaluate=False),
         sp.Eq(sp.Symbol(ERROR), (gain * dt) ** power, evaluate=False),
         sp.Eq(sp.Symbol("max_vel"), 1, evaluate=False),
     ), name=f"error_feedback_{power}")
-    piece = piece_from_law(law, f"error_feedback_{power}", 1,
-                           directory=tmp_path).for_runtime()
+    piece = piece_from_law(
+        law, f"error_feedback_{power}", 1,
+        directory=tmp_path_factory.mktemp(f"feedback_{power}"),
+    ).for_runtime()
+    return power, piece
+
+
+@pytest.mark.parametrize("initial", (0.05, 1e-6))
+def test_native_error_feedback_recovers_headroom_and_handles_command_change(feedback_piece, initial, capsys):
+    power, piece = feedback_piece
     targets = Targets(1000.0, 1.0, 1.0, **channel_fields(
         {ERROR: 1.0}, names=CHANNEL_NAMES, limits=True))
-    root = RoundNode(SuperstepPlan(0.5, 0.05, rollback=True),
+    root = RoundNode(SuperstepPlan(0.5, initial, rollback=True),
                      ControllerNode(STController(), targets, 1000.0),
                      children=[piece_leaf(piece)])
     state = instantiate_system(root, {"x": np.zeros(1), "gain": np.array([8.0])},
@@ -51,21 +60,24 @@ def test_native_error_feedback_recovers_headroom_and_handles_command_change(tmp_
         return ok, metrics
 
     state.program["advance_pieces"] = observe
-    for phase, command in enumerate((8.0, 32.0, 0.0), 1):
+    previous_continuation = initial
+    # A small opener exposed retry exhaustion in the previous proposal.
+    # Zero-error windows must recover full-window steps, then safely restart.
+    for phase, command in enumerate((8.0, 32.0, 0.0, 0.0, 0.0, 0.0, 32.0), 1):
         state.gain[...] = command
         attempts.clear()
         advanced, continuation, _ = advance_round(state)
         committed = (phase - 1) * 0.5
         for step, before, ratio in attempts:
-            assert before == pytest.approx(committed, abs=2e-15)
+            assert before == pytest.approx(committed, rel=0.0, abs=2e-15)
             if ratio <= 1.0:
                 committed += step
         assert advanced == 0.5
         assert state.x is owned_x
-        assert float(state.x[0]) == pytest.approx(phase * 0.5, abs=2e-15)
+        assert float(state.x[0]) == pytest.approx(phase * 0.5, rel=0.0, abs=2e-15)
         rejected = sum(ratio > 1.0 for _, _, ratio in attempts)
         with capsys.disabled():
-            print(f"power={power} gain={command} attempts={len(attempts)} "
+            print(f"power={power} initial={initial} gain={command} attempts={len(attempts)} "
                   f"rejected={rejected} acc={_scalar(state.controller.acc):.12g} "
                   f"dt_range=({min(row[0] for row in attempts):.12g},"
                   f"{max(row[0] for row in attempts):.12g}) "
@@ -73,11 +85,18 @@ def test_native_error_feedback_recovers_headroom_and_handles_command_change(tmp_
         assert len(attempts) < 200
         if phase == 1:
             assert max(step for step, _, ratio in attempts if ratio <= 1) > 0.05
-        elif phase == 2:
+        elif command > 0.0:
             assert rejected > 0
         else:
-            assert rejected == 0 and len(attempts) < 5
-            assert continuation > 0.5
+            assert rejected == 0
+            if previous_continuation < 0.5:
+                assert continuation > previous_continuation
+            else:
+                assert len(attempts) == 1 and attempts[0][0] == 0.5
+                assert continuation >= previous_continuation
+            if phase == 6:
+                assert len(attempts) == 1 and attempts[0][0] == 0.5
+        previous_continuation = continuation
 
 
 def test_failure_without_error_estimate_still_refines_with_unit_oscillation_shrink():

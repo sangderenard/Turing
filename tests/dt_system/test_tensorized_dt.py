@@ -46,7 +46,7 @@ def test_unpublished_nan_and_zero_limit_do_not_become_measurements():
     assert _propose_dt_pen(metrics, targets, 1.0, None, 1.0) == 1.0
     metrics.error_channels[5] = 2e-30
     metrics.error_present[5] = 1.0
-    assert _propose_dt_pen(metrics, targets, 1.0, None, 1.0) == pytest.approx(1 / np.sqrt(2))
+    assert _propose_dt_pen(metrics, targets, 1.0, None, 1.0) == 1.8 / (1 + np.sqrt(2))
 
 
 def test_real_energy_helper_lowers_without_keyed_arenas(tmp_path):
@@ -273,9 +273,9 @@ def test_real_proposal_consumes_channel_spans_natively(tmp_path, participants):
         metrics.pub_limits[-1] = 2.0
         metrics.pub_limits_present[-1] = 1.0
     output_id = int(root.metadata["named_outputs"][0][1])
-    for present, measure, expected in ((0.0, 4.0, 0.5),
-                                       (1.0, 4.0, 0.125 / np.sqrt(2)),
-                                       (1.0, 0.5, 0.25), (1.0, 0.0, 0.5)):
+    for present, measure, expected in ((0.0, 4.0, 0.225),
+                                       (1.0, 4.0, 0.225 / (1 + np.sqrt(2))),
+                                       (1.0, 0.5, 0.15), (1.0, 0.0, 0.225)):
         if participants:
             metrics.pub_values[-1] = measure
             metrics.pub_present[-1] = present

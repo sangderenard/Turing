@@ -120,7 +120,7 @@ bytes). Full coordinator compilation remains unverified. The 40-window
 pure-torque gate also passes on this configuration (113.96 s including its
 rebuild), with unchanged 7,003 attempts and physical tolerances.
 
-## Error feedback inside the existing controller
+## Error feedback inside the existing controller (`cf78f24f`)
 
 The user explicitly permitted nonlinear rejection sizing. The default
 proposal now uses the actual attempted dt and the largest declared error
@@ -199,6 +199,58 @@ The original integrated-force and all other physical bounds pass. A bounded
 cached observation is examining the remaining rejection cost before any
 further controller decision. The full 27-piece rebuild is temporarily held
 while the separate planner Jacobian failure is traced.
+
+### Verified finite headroom correction
+
+A cache-only observation of that same torque case completed in 15.64 s
+(peak 1,597,399,040 bytes) and reproduced 6,828 attempts / 5,165 rejections.
+No compilation fallback was allowed. In window 20, a trial of
+`0.00603750082364 s` published exactly zero for every judged error. The loose
+CFL proposal was about `5e35 s`; the existing PI accumulator jumped from
+`0.1934164113` to its `1.5` bound, returning about `3.9769e13 s` before the
+existing outer-window/sidechain limits. Later rejected trials could still
+receive a growing PI proposal because of positive accumulated feedback, then
+fall back to halving. Error granularity was observed; its cause is unproven.
+
+Bounded experiments kept the real controller, rollback and window loop and
+changed only its proposal transfer. `2h/(1+sqrt(R))` removed the singularity
+but produced 230 consecutive above-limit retries for an eighth-power error,
+approaching `R=1` from above. `2h/(1+R)` also approached that boundary slowly
+in a small-start sixth-power case. Neither was applied to production.
+
+The selected proposal is `min(CFL/energy bound, 1.8h/(1+sqrt(R)))`. Its
+zero-error proposal is finite and permits repeated growth; its proposal
+equilibrium is `R=.64`, while acceptance remains the original `R<=1`.
+It does not claim a universal integration order or add acceptance slack,
+new controller state, a no-growth cap, or a rollback mechanism. Long coasts
+can still eventually saturate the existing accumulator; the correction
+removes the single-zero-measurement jump, not all integral saturation.
+
+All 23 targeted nodes pass across an initial 18-pass / five-failure result
+and a corrected five-node rerun (4.43 s, peak 1,625,178,112 bytes). Corrections addressed a
+test reading telemetry as Metrics and a growth sequence clipped by the
+remaining window. Native power-six/eight laws now cover initial dt `.05`
+and `1e-6`, command changes, four zero-error windows and a restart. Small-start
+ignition takes 27/2 and 28/3 attempts/rejections; subsequent restart takes
+33/11 and 30/10. Every variant recovers single full `.5 s` zero-error steps.
+Registered span identity, exact windows and rollback pass. Full-native
+proposal helpers keep exact representable comparisons and one-ULP parity.
+The unchanged physical torque gate then passed in 98.07 s including its
+nine-piece rebuild (peak 2,187,173,888 bytes). A guarded cache-only invocation
+of the identical test emitted its endpoint receipt in 4.235 s (peak
+1,593,548,800 bytes), with both compiler entrances forbidden and normal
+source-stamp validation. It used 1,081 attempts, one metric rejection and
+1,080 within-limit attempts for the same 40 windows / 10 simulated seconds.
+This is an 84.17% attempt reduction against `cf78f24f`'s 6,828 and an 84.56%
+reduction against the original 7,003. Differently instrumented/cold timings
+are not used to claim a wall-time speedup.
+
+Maximum Gram defect is `6.66133814775094e-15`, below the unchanged `1e-14`
+limit; determinant is `0.9999999999999933`, phase `2.39999999999929` versus
+`2.4`, and angular speed `0.480000000000000`. The original integrated-force,
+rotation and phase assertions all pass. No source changes followed this
+result. The full 27-piece craft bank remains held while the independent
+planner Jacobian trace determines whether another compiler edit is needed.
 
 ## Complete craft command-change gate (before error feedback)
 

@@ -44,11 +44,15 @@ Ten simulated seconds still require 27,556 attempts, including 23,969
 error-limit failures; performance remains unresolved.
 
 `cf78f24f` makes the existing PI controller use error measured at the attempted
-dt, including rejected attempts and accepted headroom. Twenty-one focused
-tests pass, followed by three strict full-native helper checks (exact or
-one-ULP comparison). There is no no-growth cap. Source is frozen while the
-normal compiler-stamp checks rebuild the planner and craft artifacts; the
-attempt counts above remain the pre-feedback baseline.
+dt, including rejected attempts and accepted headroom. Its initial zero-error
+CFL jump could saturate PI accumulation, so the verified follow-up uses
+`1.8 * attempted_dt / (1 + sqrt(error_ratio))`, with the existing CFL/energy
+bounds. Proposal equilibrium is ratio `.64`; acceptance stays at ratio `1`.
+Twenty-three focused nodes and the unchanged physical torque gate pass.
+Torque attempts fall from 7,003 to 1,081, with one rejection; every original
+physical assertion passes. There is no no-growth cap. The complete craft
+counts above remain the pre-feedback baseline; its rebuild waits for the
+independent planner Jacobian investigation and a final compiler-source freeze.
 
 Adaptive growth is now the default in the existing dt entry points, and the
 LLVM-piece bridge carries the graph's growth choice into its owned state and
