@@ -34,6 +34,22 @@ with 200 concurrent distinct-feed/seed Jacobian and forward evaluations
 The emitted audit has 451 rows / 20 functions, zero structural findings,
 5,939 unsourced facts and zero unsourced ids; its latch remains OPEN.
 
+A further lifecycle regression reproduced an arrival error: an async
+replacement accepted inside `fly()` moved arrival-plus-settle to 325 s, but
+the game's previously captured frame endpoint kept it flying to 600 s.
+`fly()` now also accepts a callable stopping time and reads it after a round
+can adopt a replacement, before requesting a craft window. The game supplies
+the earlier of its frame endpoint and current plan arrival-plus-settle.
+Static callers retain their fixed endpoint. A completed candidate whose
+entire arrival window has already elapsed is recaptured with an announcement.
+The final service/tracker lifecycle selection passes 19 tests in 7.63 s,
+including earlier/later replacement arrivals and an expired arrival window.
+Source review found no change to finite fixed-deadline callers, and the
+original comparison predicate also retains the prior NaN no-advance behavior.
+These tests use the real tracker loop and service with analytic craft seams;
+they do not claim native flight. The existing dt coordinator still completes
+each physical window requested by the caller.
+
 The planner slice defect now calls the actual library `RK4Integrator.step`
 on its seven-state SymPy matrix, using the existing continuous laws at each
 stage. No RK coefficients or staging adapter were authored. Source-only

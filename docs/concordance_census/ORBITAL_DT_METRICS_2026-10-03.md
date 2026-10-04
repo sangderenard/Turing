@@ -345,6 +345,14 @@ scalar-return and record-return tests do not cover this nested table-field
 arena end to end. See `CONTINUATION_dt_full_native.md` and
 `CONTINUATION_dt_compile_stall.md` for the historical receipts.
 
+A later read-only inventory found the nearest structural coverage at
+`tests/test_process_graph_function_linking.py::test_late_returned_record_with_sequence_publishes_scalar_field_to_caller`.
+It verifies a returned descriptor's `unresolved_report.sequence_id` and the
+caller's scalar `hard_failure` read, but does not execute native table arena
+columns or writeback. The current base contract still declares the mutable
+rank-one int64-token table. No new full-native lowering was run for this
+inventory, so the historical arena failure remains unverified on this head.
+
 ## Initial source audit (before the integration correction)
 
 This initial source audit covers `engine_toy/orbital_jumper.py`,
