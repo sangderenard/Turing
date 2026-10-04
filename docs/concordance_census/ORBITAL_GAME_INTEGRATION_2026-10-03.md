@@ -57,7 +57,14 @@ one precision-reference test passed and the numerical test failed in
 bytes). The ideal case passes all four-ULP comparisons. All seven finite-fuel
 state values match exactly, but its Jacobian exceeds four ULP; maximum
 absolute difference is `2.2737367544323206e-13`. The large ULP count may involve
-an expected zero, but the exact failing cells are still being inspected.
+an expected zero. A subsequent validated-cache diagnostic confirms exactly
+two failing cells: `position_y / throttle` is `-1.734723475976807e-18` and
+`position_z / throttle` is `-4.336808689942018e-18`, both against exact zero.
+Every nonzero Jacobian cell meets four ULP. Exactifying coefficients before
+symbolic differentiation also produces zero in those two cells; the original
+reference's Float differentiation is not the explanation. The actual native
+derivative graph/SSA is being traced before attributing the residuals to a
+specific operation. No threshold or tolerance change was made.
 The new artifact, full SSA/book and emitted audit were archived before the
 failure. No production row bank or game-flight acceptance is claimed.
 

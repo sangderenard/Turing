@@ -1264,6 +1264,9 @@ RESIDENCY_FROM_NAME_MATCH = declare_reason("residency_from_name_match")
 FRAME_SOURCE_CELL_ABSENT = declare_reason("frame_source_cell_absent")
 
 # -- facts -------------------------------------------------------------------
+_ARGUMENT_BINDING_SOURCE_MISSING = object()
+
+
 class ArgumentBindingFact(tuple):
     """``(kind, source)`` of one callee formal at one callsite: ``kind`` is
     the binding kind string the call record carries (``caller_value``,
@@ -1273,8 +1276,22 @@ class ArgumentBindingFact(tuple):
 
     __slots__ = ()
 
-    def __new__(cls, kind: Any, source: Any) -> "ArgumentBindingFact":
+    def __new__(cls, kind: Any,
+                source: Any = _ARGUMENT_BINDING_SOURCE_MISSING) -> "ArgumentBindingFact":
+        if source is _ARGUMENT_BINDING_SOURCE_MISSING:
+            # The orbital RK4 reverse-row book and native child-record return
+            # test could be pickled but not restored: NEWOBJ supplied one
+            # pair while this constructor required two positional fields.
+            # Archives written before __getnewargs__ used tuple's NEWOBJ
+            # arguments: one exact (kind, source) pair. Restore those two
+            # fields, without treating other sequences as a historical fact.
+            if type(kind) is not tuple or len(kind) != 2:
+                raise TypeError("ArgumentBindingFact requires kind and source")
+            kind, source = kind
         return tuple.__new__(cls, (str(kind), source))
+
+    def __getnewargs__(self) -> tuple[Any, Any]:
+        return self.kind, self.source
 
     @property
     def kind(self) -> str:

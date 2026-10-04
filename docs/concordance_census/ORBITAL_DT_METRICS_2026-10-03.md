@@ -64,6 +64,25 @@ Memory-mapping a pickle would still reconstruct its Python objects when
 unpickled. Compression can reduce archive bytes and I/O, but does not eliminate
 those live objects; no alternate file-backed book implementation was added.
 
+A separate archive-read defect was exposed while tracing the planner's
+finite-fuel Jacobian: `ArgumentBindingFact`, a two-field tuple subclass,
+inherited tuple's one-pair pickle reconstruction arguments but required two
+constructor arguments. The existing declaration now supplies both arguments
+for new archives and accepts exactly the old two-item tuple for old archives.
+It preserves source-object aliases and explicit `None`; no identity or schema
+is inferred. Nine focused tests pass for protocols 0 through 5, deepcopy,
+shared aliases and an actual pre-fix byte fixture. The previously recorded
+native child-record return failure now passes (1 test, 4.94 s; sampled root/
+child peak 1,574,211,584 bytes), exercising all four initial/guard combinations.
+
+The actual 92 MB orbital RK4 SSA archive can now be read normally. Its audit
+matches the saved receipt exactly; writing and reloading it again preserves
+that audit, the root argument IDs and the named output IDs. This check takes
+24.16 s at a 3,398,623,232-byte sampled peak. The audit remains 6,637 rows /
+332 functions, zero structural findings, 72,487 unsourced facts and 10
+unsourced identities, OPEN. No stale native artifact was executed. This
+repair establishes archive reconstruction, not planner Jacobian acceptance.
+
 The previously pending postcommit properties and inverse checks now pass in
 the runtime-payload configuration (two tests, 113.95 s, peak 1,441,718,272
 bytes). COM matches within `1e-12`; inertia retains `rel=1e-11, abs=1e-10`;
@@ -167,6 +186,19 @@ The subsequent stricter run selected
 `test_real_proposal_consumes_channel_spans_natively` (two parameter cases)
 and `test_declared_conservation_error_reaches_native_proposal` from that
 same selection. No source changes followed it before the orbital rebuild.
+
+The first post-feedback physical result is green: the unchanged 40-window
+torque gate passes in 115.73 s including its nine-piece rebuild, at a sampled
+peak of 2,186,260,480 bytes. Ten simulated seconds now take 6,828 attempts,
+5,165 above-limit attempts and 1,663 within-limit attempts. Compared with
+7,003 / 5,594 / 1,409 before feedback, total attempts fall only 2.50%; no
+material runtime speedup is claimed. Maximum Gram defect is
+`1.77635683940025e-15`, determinant `0.9999999999999982`, phase
+`2.39999999999983` versus `2.4`, and angular speed `0.480000000000000`.
+The original integrated-force and all other physical bounds pass. A bounded
+cached observation is examining the remaining rejection cost before any
+further controller decision. The full 27-piece rebuild is temporarily held
+while the separate planner Jacobian failure is traced.
 
 ## Complete craft command-change gate (before error feedback)
 
