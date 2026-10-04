@@ -8726,8 +8726,13 @@ def _normalize_lexical_values(
     ordered_graph.graph.update(relabeled.graph)
     ordered_graph.graph["canonical_value_ids"] = True
     # Renumbering changes the id space; a watermark from the AST-id
-    # ingestion graph must not leak into canonical allocation.
+    # ingestion graph must not leak into canonical allocation.  Seed a new
+    # watermark at the top of the canonical id space, though: planner passes
+    # can later remove the highest-numbered nodes while the identity book
+    # still retains their canonical_value rows.  A subsequent synthesized
+    # loop/port node must not reuse one of those historical identities.
     ordered_graph.graph.pop("value_id_watermark", None)
+    ordered_graph.graph["value_id_watermark"] = max(mapping.values(), default=-1)
     # The canonical relabel is DERIVED rows, never an in-place renumbering
     # (plan 60, section 3.1): one ``canonical_value`` row per entry of
     # ``mapping``, new id <- the node's ``ingestion_value`` cell, the token
