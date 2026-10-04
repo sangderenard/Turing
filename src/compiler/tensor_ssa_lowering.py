@@ -875,6 +875,23 @@ def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
     the facts consumed by subsequent passes.
     """
 
+    from .bounded_fixed_point import BoundedFixedPoint, bound_for
+
+    # Each changing round refines at least one still-unshaped result, so the
+    # number of instruction results bounds the rounds.
+    guard = BoundedFixedPoint(
+        "shape-preserving-settlement",
+        bound_for(
+            "settlement",
+            functions=len(module.functions),
+            nodes=sum(
+                len(block.instrs)
+                for function in module.functions.values()
+                for block in function.blocks.values()
+            ),
+        ),
+        scope=("whole-program",),
+    )
     changed_any = False
     changed = True
     while changed:
@@ -1000,6 +1017,7 @@ def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
         if settle_canonical_value_metadata(module):
             changed = True
             changed_any = True
+        guard.round(changed)
     return changed_any
 
 
