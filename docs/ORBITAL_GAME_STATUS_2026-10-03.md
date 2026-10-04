@@ -7,7 +7,9 @@ and performance work. The original game used the existing dt outer coordinator
 and rollback but authored its own leapfrog/Euler/Cayley updates. The correction
 now constructs coupled updates by calling the actual library `RK4Integrator`;
 the existing PieceState owns all physical and stage columns. The full craft
-command-change gate passes; long-duration, cutoff, frame-partition and game
+command-change, 150-second angular-momentum, desaturation and near-empty
+cutoff gates pass on the prior controller. The error-feedback correction is
+now committed as `cf78f24f`; physical remeasurement, frame-partition and game
 acceptance remain pending. Detailed trace and measured gates:
 [`concordance_census/ORBITAL_DT_METRICS_2026-10-03.md`](concordance_census/ORBITAL_DT_METRICS_2026-10-03.md).
 
@@ -40,6 +42,13 @@ now builds below the ceiling (sampled peak max(working set, private bytes)
 peak, covering wheel ignition/reversal, main ignition/cutoff and cold coast.
 Ten simulated seconds still require 27,556 attempts, including 23,969
 error-limit failures; performance remains unresolved.
+
+`cf78f24f` makes the existing PI controller use error measured at the attempted
+dt, including rejected attempts and accepted headroom. Twenty-one focused
+tests pass, followed by three strict full-native helper checks (exact or
+one-ULP comparison). There is no no-growth cap. Source is frozen while the
+normal compiler-stamp checks rebuild the planner and craft artifacts; the
+attempt counts above remain the pre-feedback baseline.
 
 Adaptive growth is now the default in the existing dt entry points, and the
 LLVM-piece bridge carries the graph's growth choice into its owned state and

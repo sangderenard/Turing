@@ -39,7 +39,7 @@ on its seven-state SymPy matrix, using the existing continuous laws at each
 stage. No RK coefficients or staging adapter were authored. Source-only
 measurement gives 165 unique DAG nodes / 33 input symbols for c0/t1 and
 331 / 77 for c1/t6, versus the old kick/drift/kick's 94 / 33 and 200 / 77.
-This written connection is not yet numerically verified. Its small c0/t1
+The small c0/t1 check is not yet fully numerically accepted. Its first
 row/Jacobian artifact compiled and emitted an audit (6,637 rows / 332
 functions, zero structural findings, 72,487 unsourced facts and 10 unsourced
 ids, OPEN). The first test stopped at its 240 s wall bound before numerical
@@ -50,6 +50,25 @@ audit explicitly. The old process's full SSA module was not persisted by
 the production row cache; no reconstructed provenance is claimed. The
 numerical gate includes both zero propellant and finite propellant with
 changing library-stage mass and retains its four-ULP bound.
+
+After controller commit `cf78f24f`, the current-stamp rebuild completed:
+one precision-reference test passed and the numerical test failed in
+270.19 s (watchdog wall time 282.82 s; sampled process peak 4,102,021,120
+bytes). The ideal case passes all four-ULP comparisons. All seven finite-fuel
+state values match exactly, but its Jacobian exceeds four ULP; maximum
+absolute difference is `2.2737367544323206e-13`. The large ULP count may involve
+an expected zero, but the exact failing cells are still being inspected.
+The new artifact, full SSA/book and emitted audit were archived before the
+failure. No production row bank or game-flight acceptance is claimed.
+
+The reference computation now represents the existing Float coefficients
+and float64 ABI inputs as their exact binary rational values before one
+substitution and 80-digit evaluation. It does not replace binary coefficients
+with intended decimal/rational values or alter the laws. This reduces the
+finite reference to about 1.4 s; 24 finite and six ideal cells match the
+original adaptive evalf route bit-for-bit. A cancellation/precision regression
+passes. The original four-ULP numerical assertion is unchanged, and the
+finite-Jacobian failure remains visible.
 
 The delayed actual-Hohmann plan/reference gate passes (17.38 s, sampled
 peak 2,573,942,784 bytes): unchanged captured assumptions permit a delayed
