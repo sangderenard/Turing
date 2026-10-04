@@ -2631,3 +2631,22 @@ __all__ += [
     "ExternalLeafValueFact", "ExternalCallLoweringFact", "EXTERNAL_LEAF",
     "EXTERNAL_LEAF_VALUE", "EXTERNAL_CALL_LOWERING",
 ]
+
+# -- shared deterministic loop guard (``bounded_fixed_point.py``) -------------
+FIXED_POINT_ROUND_STAGE = declare_stage("bounded_fixed_point_round")
+#: The first round of a guarded loop has no earlier cell to derive from: it is
+#: a root (no minted id); later rounds are DERIVED from the previous round.
+FIXED_POINT_ROOT = declare_transform("bounded_fixed_point_root", 0)
+#: One receipt per round of a guarded ``while changed:`` loop.  Row
+#: ``(loop name, scope, round)``; fact ``(changed, state digest, first-N
+#: changed ids, recurrence period)`` -- period 0 when the state did not
+#: recur, else rounds since the earlier identical state.  Mode REVISE (a
+#: loop re-run in one book appends a column).
+FIXED_POINT_ROUND = declare_page("bounded_fixed_point_round", (
+    RowField("name", K.NAME), RowField("scope", K.LABEL),
+    RowField("round", K.INDEX),
+), tuple)
+
+__all__ += [
+    "FIXED_POINT_ROUND_STAGE", "FIXED_POINT_ROOT", "FIXED_POINT_ROUND",
+]
