@@ -720,7 +720,14 @@ def run_superstep(state,
             unresolved.append(metrics)
         if dt_used <= 0.0:
             break
+        total_before = float(total.item())
         total += dt_used
+        if float(total.item()) == total_before:
+            # The accepted step is positive but smaller than the accumulator's
+            # representable spacing.  Repeating it cannot move the managed
+            # clock, so report the same incomplete-window condition as a
+            # collapsed proposal instead of spending the iteration allowance.
+            break
         if substep == "pinned":
             # Held at the requested constant; the controller's proposal and its
             # CFL ceiling are both irrelevant here by construction.

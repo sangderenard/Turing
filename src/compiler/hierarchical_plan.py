@@ -157,6 +157,7 @@ def plan_value_id_watermark(plan: PlanClosure) -> int:
 def expand_plan_regions(
     plan: PlanClosure, *, first_free_value_id: int = 0,
     function_scope: str = "<plan>",
+    lexical_read_scope: tuple | None = None,
 ) -> dict[tuple[str, int], tuple[Instr, ...]]:
     """Lower every top-level ``region_*`` closure of ``plan`` exactly once.
 
@@ -186,6 +187,7 @@ def expand_plan_regions(
             item,
             first_free_value_id=watermark,
             function_scope=function_scope,
+            lexical_read_scope=lexical_read_scope,
         )
         for instruction in instructions:
             for value in (
@@ -223,6 +225,7 @@ def copy_region_instructions(
 def plan_region_to_ssa_instrs(
     region: PlanClosure, *, first_free_value_id: int = 0,
     function_scope: str = "<plan>",
+    lexical_read_scope: tuple | None = None,
 ) -> tuple[Instr, ...]:
     """Lower one planner-owned flat region to repository SSA instructions.
 
@@ -436,7 +439,25 @@ def plan_region_to_ssa_instrs(
 
     values: dict[int, SSAValue] = {}
     def fresh_like(result: SSAValue) -> SSAValue:
-        value_id = GLOBAL_MONOTONIC_IDS.mint()
+        from .concordance_declarations import CANONICAL_VALUE
+
+        source = (
+            None if lexical_read_scope is None else
+            current_identity_book().latest_ref(
+                CANONICAL_VALUE, (tuple(lexical_read_scope), int(result.id)),
+            )
+        )
+        if source is None:
+            value_id = GLOBAL_MONOTONIC_IDS.mint()
+        else:
+            from .concordance_declarations import FRESH_LIKE, PLANNER_HIERARCHY
+            from .precompile_to_ssa import _mint_ssa_id
+
+            value_id = _mint_ssa_id(
+                current_identity_book(), function_scope, FRESH_LIKE, (source,),
+                dtype=result.dtype, shape=tuple(result.shape),
+                stage=PLANNER_HIERARCHY,
+            )
         made = SSAValue(
             value_id,
             dtype=result.dtype,
@@ -445,6 +466,67 @@ def plan_region_to_ssa_instrs(
         )
         values[value_id] = made
         return made
+
+    def fork_operand_read(
+        item: PlanLine, source_position: int, consumer: SSAValue,
+        role: str, operand: SSAValue,
+    ) -> None:
+        """Carry one authored operand occurrence into its binary expansion.
+
+        ``total = min(total, upper, lower)`` in a retained loop used to
+        mint the first Min without the read of ``total`` at its new ``left``
+        position.  The region feed then named a consumer with no lexical
+        binding row.  A fold/clamp operand keeps the exact PlanLine read
+        through an OperandFork, even when the emitted consumer is synthetic.
+        """
+        if lexical_read_scope is None or len(item.inputs) != len(item.input_roles):
+            return
+        from ..common.tensors.topological_reducer import _operand_positions
+        from .concordance_declarations import (
+            CONSUMER_OPERAND, IDENTITY_TRANSITION, LEXICAL_READ_BINDING,
+            OPERAND_FORK, OPERAND_POSITION, OperandFork,
+        )
+        from .identity_concordance import Derived, Mode, Novel
+
+        scope = tuple(lexical_read_scope)
+        positions = tuple(
+            (source_role, ordinal)
+            for source_role, ordinal, _parent in _operand_positions(
+                zip(item.inputs, item.input_roles)
+            )
+            if str(source_role).casefold() not in {
+                "callee", "func", "function", "definition",
+                "operator", "operator_reference",
+            }
+        )
+        source_role, ordinal = positions[source_position]
+        source_row = (scope, int(item.outputs[0]), source_role, ordinal)
+        book = current_identity_book()
+        read = book.latest_ref(LEXICAL_READ_BINDING, source_row)
+        if read is None:
+            return
+        fact = book.page(LEXICAL_READ_BINDING).latest(source_row)
+        if not isinstance(fact, str):
+            return
+        row = (scope, int(consumer.id), role, 0)
+        fork = book.post(
+            IDENTITY_TRANSITION, row,
+            OperandFork("plan_binary_scalar_expansion", *source_row[1:]),
+            stage=OPERAND_POSITION,
+            provenance=Novel(OPERAND_FORK, (read,)), mode=Mode.REVISE,
+        )
+        binding = book.post(
+            LEXICAL_READ_BINDING, row, fact, stage=OPERAND_POSITION,
+            provenance=Derived((fork, read)), mode=Mode.REVISE,
+        )
+        operand_row = (scope, int(consumer.id), int(operand.id))
+        previous = book.page(CONSUMER_OPERAND).latest(operand_row) or ()
+        book.post(
+            CONSUMER_OPERAND, operand_row,
+            tuple(dict.fromkeys((*previous, (role, 0)))),
+            stage=OPERAND_POSITION, provenance=Derived((binding, fork)),
+            mode=Mode.REVISE,
+        )
 
     instructions = []
     for item in region.items:
@@ -563,6 +645,9 @@ def plan_region_to_ssa_instrs(
                         "source_operator": semantic_opcode,
                     },
                 ))
+                if position == 1:
+                    fork_operand_read(item, 0, fold_result, "left", accumulator)
+                fork_operand_read(item, position, fold_result, "right", operand)
                 accumulator = fold_result
             continue
         if is_scalar and opcode.casefold() == "clamp" and len(semantic_inputs) == 3:
@@ -575,11 +660,14 @@ def plan_region_to_ssa_instrs(
                 arg_roles=["operand", "lower"],
                 attributes={**attributes, "source_operator": opcode},
             ))
+            fork_operand_read(item, 0, bounded_below, "operand", operand)
+            fork_operand_read(item, 1, bounded_below, "lower", lower)
             instructions.append(Instr(
                 "Min", [bounded_below, upper], result,
                 arg_roles=["operand", "upper"],
                 attributes={**attributes, "source_operator": opcode},
             ))
+            fork_operand_read(item, 2, result, "upper", upper)
             continue
 
         instructions.append(Instr(

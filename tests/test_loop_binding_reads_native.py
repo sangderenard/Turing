@@ -51,6 +51,16 @@ CONTRACT = (
 )
 
 _PROGRAMS = {
+    "variadic-min-carried": (
+        "def helper(a):\n"
+        "    return a\n\n"
+        "def train(value, count):\n"
+        "    total = 1.0\n"
+        "    for i in range(count):\n"
+        "        total = min(total, value + i * 1.0, value + 3.0)\n"
+        "    return total\n",
+        ((2.0, 3), (-1.5, 2), (4.0, 0)),
+    ),
     "if-alias-carried": (
         "def helper(a):\n"
         "    return a\n\n"

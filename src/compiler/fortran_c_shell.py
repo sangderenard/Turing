@@ -35497,6 +35497,55 @@ def _class_surface_ssa_program(
                             ),
                         )
                         produced_ids.add(caller_result_id)
+                        # The linked call's aggregate result IS the call
+                        # site's own graph id (``plan_callsite_id``): the
+                        # control builder minted the scheduled marker's
+                        # aggregate handle under another id and posted no row
+                        # for this one.  Adopt it here, as the builder's
+                        # ``_value_cell`` adopts a graph id: ADOPTED_GRAPH_ID
+                        # DERIVED from the callsite's ``canonical_value``
+                        # cell, the marker handle's cell it replaces and the
+                        # cells of the outputs it publishes.  A value that
+                        # already has a row keeps it.
+                        if _frame_value_cell(caller, caller_result_id) is None:
+                            from .concordance_declarations import (
+                                SSA_VALUE, SSAValueFact, SSAValueOrigin,
+                            )
+                            marker_handles = tuple(
+                                _frame_value_cell(caller, instruction.res.id)
+                                for marker_block in caller.blocks.values()
+                                for instruction in marker_block.instrs
+                                if instruction.res is not None
+                                and (instruction.attributes or {}).get(
+                                    "plan_callsite_marker"
+                                )
+                                and int((instruction.attributes or {}).get(
+                                    "plan_callsite_id", -1
+                                )) == int(record.callsite_id)
+                            )
+                            _frame_post(
+                                SSA_VALUE,
+                                (_frame_book_scope(caller), caller_result_id),
+                                SSAValueFact(
+                                    result.dtype or "ssa.aggregate",
+                                    tuple(result.shape or ()),
+                                    SSAValueOrigin.ADOPTED_GRAPH_ID,
+                                ),
+                                stage=FRAME_LINK, mode=Mode.REVISE,
+                                cells=(
+                                    _frame_graph_cell(
+                                        caller_graph, int(record.callsite_id),
+                                    ),
+                                    *marker_handles,
+                                    *(
+                                        _frame_value_cell(caller, output_id)
+                                        for output_id in (
+                                            result.accounting or {}
+                                        ).get("ssa_aggregate_outputs", ())
+                                    ),
+                                ),
+                                reason=GRAPH_ID_WITHOUT_CANONICAL_CELL,
+                            )
                     else:
                         aggregate_placeholder = None
                         caller_result_id = (

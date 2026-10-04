@@ -4995,17 +4995,23 @@ class _ControlSSABuilder:
         )
 
     def _aliases_resolving_to(self, value_id: int) -> tuple[int, ...]:
-        """Every value whose alias chain resolves to ``value_id``."""
+        """The graph spellings of a region feed's planning resident.
 
-        found = []
-        for alias in self.value_aliases:
-            current, seen = int(alias), set()
-            while current in self.value_aliases and current not in seen:
-                seen.add(current)
-                current = int(self.value_aliases[current])
-            if current == int(value_id) and int(alias) != int(value_id):
-                found.append(int(alias))
-        return tuple(found)
+        ``blocked[j] = 1.0`` followed by ``rhs[k] = blocked[k]`` in
+        successive inner loops of one retained outer loop reads a LoopResult
+        port in the graph and its resident span in region SSA.  Entering the
+        loops redirects the live aliases to their updates; those temporal
+        aliases cannot identify the graph operand whose lexical row we need.
+        Use the same durable planning concordance that canonicalized the
+        region operand, preserving its exact authored read position.
+        """
+
+        return tuple(
+            int(alias)
+            for alias in self.concorded_value_aliases
+            if int(alias) != int(value_id)
+            and self._concorded_resident(int(alias)) == int(value_id)
+        )
 
     def _region_feed(self, region_index: int, value_id: int) -> Any:
         """A region feed, read by the bindings of the operands it serves."""
@@ -5837,7 +5843,13 @@ class _ControlSSABuilder:
             return self.external_value(int(value_match.group(1)))
         uniform = self.uniform_values.get(spelling)
         if uniform is not None:
-            return uniform
+            # In ``for i in range(n): for j in range(i, n): ...``, the
+            # declared u_control_i initially names a formal, then the outer
+            # loop binds its graph id to its induction Phi. Returning the
+            # cached declaration froze the inner start and leaked that local
+            # as an unnamed function input. The declaration names the id;
+            # the current binding owns its value, as for arithmetic bounds.
+            return self.external_value(int(uniform.id))
         local = self.local_control_values.get(spelling)
         if local is not None:
             return local
@@ -5920,7 +5932,10 @@ class _ControlSSABuilder:
                 value = re.fullmatch(r"value_(\d+)", node.id)
                 if value is not None:
                     return self.external_value(int(value.group(1)))
-                return self.uniform_values.get(node.id) or (
+                uniform = self.uniform_values.get(node.id)
+                return (
+                    self.external_value(int(uniform.id))
+                    if uniform is not None else
                     self.local_control_values.get(node.id)
                 )
             if isinstance(node, ast.UnaryOp) and isinstance(
@@ -14205,6 +14220,7 @@ def lower_control_sections_to_ssa(
             hierarchy_plan,
             first_free_value_id=max(known_value_ids) + 1,
             function_scope=control_name,
+            lexical_read_scope=lexical_read_scope,
         )
         if hierarchy_plan is not None else {}
     )

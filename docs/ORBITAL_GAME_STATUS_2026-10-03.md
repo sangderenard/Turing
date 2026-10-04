@@ -1,5 +1,34 @@
 # Orbital game: challenges and remaining work (2026-10-03)
 
+## All-body Green coast demo (2026-10-04)
+
+`engine_toy/orbital_green.py` now generates one coupled Earth/body/craft
+point-mass law from the exact Newtonian Green kernel at three Lobatto nodes.
+Two Picard corrections and the endpoint are ordinary `equation_piece` laws.
+`engine_toy/orbital_green_world.py` registers every body's position, momentum,
+mass, every stage column, and the Green/conservation publications in one
+existing `PieceState`; it advances only through `advance_round`.  The dt
+system therefore owns checkpoint, restore, rejection, retry, growth, shrinkage,
+and exact landing.  No orbital timestep controller or coast/burn dt switch was
+added.
+
+`python orbital_green_demo.py --headless --frames 3` completed from
+`engine_toy/` after the first piece build and wrote three frames.  Each outer
+window was 600 s.  The controller's continuation changed from 64.1178 s after
+the first window to 1.7621 s and 1.7487 s after the next two windows.  The
+third frame reported a 4.2605e-7 m collocation residual, 1.2419e-23 relative
+energy defect, 3.3522e-22 relative linear-momentum defect, and 9.6329e-24
+relative angular-momentum defect.  These are observed publication values from
+the registered dt participant rows.  The run demonstrates all-body coast and
+metric-driven non-round dt adaptation; it does not yet connect MachineCraft
+thrust, attitude, propellant, or the rendezvous planner to the shared world.
+
+The fixed collocation weights are prepared through
+`AbstractTensor.linalg.solve`.  The eager solve is working.  Whole-source
+compiled solve/Precision proof remains open at the compiler's existing
+`cumsum` emission and root output-dtype metadata boundaries; do not claim that
+native precision proof from this demo.
+
 ## Current integration work on `wip/2026-10-03-inflight`
 
 The user has prioritized correct dt-managed flight before planner, rendering,

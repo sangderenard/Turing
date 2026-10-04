@@ -89,6 +89,9 @@ SYMPY_PROCESS_GRAPH_TRANSLATIONS: Mapping[object, SympyProcessGraphRule] = (
         sympy.Or: SympyProcessGraphRule("LOr"),
         sympy.Not: SympyProcessGraphRule("LNot", ("operand",)),
         sympy.Xor: SympyProcessGraphRule("LXor"),
+        sympy.ITE: SympyProcessGraphRule(
+            "Select", ("condition", "if_true", "if_false")
+        ),
         sympy.Indexed: SympyProcessGraphRule("Indexed", ("base", "index")),
         sympy.Piecewise: SympyProcessGraphRule(
             "Select", ("condition", "if_true", "if_false")

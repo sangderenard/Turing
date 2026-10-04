@@ -204,3 +204,12 @@ Measured: probe c/g/b/a all MATCH (err 0). probe_solve_bisect 2x2 y_forward [1,1
 probe_solve_c_lane llvm 2x2 and 3x3tie MATCH NumPy (max abs err 0.0 both). Gates: scalar_loss_adjoint 2 passed;
 ssa_record_return_state 22 passed; record_return_site_identity 14 passed 1 xfailed; compiled eigh passed;
 test_precompile_to_ssa 13 failed 91 passed (baseline 13); audit unsourced 2818 (unchanged).
+
+## 2026-10-04 dependency bisect (overlay in clean worktree wtv at f1df34d5)
+- Committed solve fix needs ONE uncommitted shared-tree edit: src/common/tensors/topological_reducer.py,
+  `_normalize_lexical_values` (~line 8729): after popping `value_id_watermark`, seed
+  `ordered_graph.graph["value_id_watermark"] = max(mapping.values(), default=-1)`. Patch: docs/concordance_census/solve_dependency.patch.
+- Without it, a synthesized loop/port node (LoopResult) reuses a canonical id that the identity book still holds from a planner-removed
+  node (here the function's docstring Constant) -> canonical_value disagreement in IdentityBook.post.
+- With only that file overlaid: probe_solve_c_lane.py llvm 2x2 and 3x3tie -> NUMERIC_MATCH, MAX_ABS_ERR 0.0. Other modified files not needed.
+- File mtime 2026-10-04 00:44 (after last commit of the file); no CONTINUATION note mentions it -> attributed to a recent working-tree edit, not a documented stopped lane.

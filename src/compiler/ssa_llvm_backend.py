@@ -3889,6 +3889,15 @@ def _emit_repository_call_module(
                 )
                 continue
 
+            # The fused-module emitter and the reference evaluator both
+            # resolve graph-native scalar names (``equal``, ``less_equal``,
+            # and their siblings) through this shared vocabulary.  Keep the
+            # single-function path on the same spelling before asking its
+            # likeness table; otherwise valid scalar comparisons have no
+            # entry even though Eq/Le/etc. are already defined below.
+            operation = TENSOR_OPERATION_SCALAR_SPELLING.get(
+                operation.casefold(), operation,
+            )
             template = scalar_likeness(
                 operation,
                 precision_section=bool(
