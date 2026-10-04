@@ -23118,17 +23118,15 @@ def _fold_callsite_structural_values(
                 isinstance(value, _ProgramABIValueFact)
                 and value.storage == "span"
             ):
-                # The Program ABI has already proved this value is a tensor
-                # span. A keyed Tensor lookup has runtime extents, so its
-                # static shape is empty while its physical rank remains one.
-                # Publish that exact distinction on the graph node before the
-                # hierarchy freezes region values; otherwise the empty shape
-                # is interpreted as a scalar and tensor operators are split
-                # away from the lookup that produced their storage.
+                # Publish the proved rank before hierarchy freezes values.
+                # A keyed Tensor lookup can have runtime extents and rank one,
+                # while ``-values[i]`` / ``abs(values[i])`` prove rank zero
+                # without static extents. Zero is not an absent rank: replacing
+                # it with one promotes scalar reads to anonymous dynamic spans.
                 rank = (
                     len(value.shape)
                     if value.shape is not None
-                    else int(value.rank or 1)
+                    else int(1 if value.rank is None else value.rank)
                 )
                 attributes = dict(data.get("attributes") or {})
                 attributes.update({

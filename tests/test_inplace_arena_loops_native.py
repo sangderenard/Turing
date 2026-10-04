@@ -9,6 +9,11 @@ Both programs computed wrong answers with no shortfall:
 * ``update-after-init-loop`` -- an init loop over ``v`` then a nested update
   loop.  The outer loop's carried initial (the post-init version) was not
   resolved to arena ``v`` and became a second, unconnected ``v`` formal.
+* ``read-after-inner-loop`` -- sibling inner loops write and read ``v``
+  inside one retained outer loop.  The live alias rewrite hid the graph
+  operand's planning resident and its lexical binding row was not found.
+* ``triangular-bound`` -- a bare inner range start must read the enclosing
+  induction, rather than the uniform's initial placeholder formal.
 """
 
 from __future__ import annotations
@@ -20,6 +25,24 @@ from tests.test_compiled_linalg import _run_native
 
 
 _PROGRAMS = {
+    "triangular-bound": (
+        "def f(v, w, n):\n"
+        "    for i in range(n):\n"
+        "        for j in range(i, n):\n"
+        "            w[j] = w[j] + v[i]\n"
+        "    return w\n",
+        ("v", "w"),
+    ),
+    "read-after-inner-loop": (
+        "def f(v, w, n):\n"
+        "    for iteration in range(n):\n"
+        "        for j in range(n):\n"
+        "            v[j] = iteration * 1.0\n"
+        "        for k in range(n):\n"
+        "            w[k] = w[k] + v[k]\n"
+        "    return w\n",
+        ("v", "w"),
+    ),
     "store-after-inner-loop": (
         "def f(v, w, n):\n"
         "    for i0 in range(n):\n"

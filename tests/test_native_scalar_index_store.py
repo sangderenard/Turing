@@ -8,6 +8,44 @@ from src.compiler.ssa_c_backend import emit_ssa_to_c
 from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import c_backend_repository_ssa_reference
 
 
+def test_indexed_unary_scalar_rank_survives_program_abi_settlement():
+    """A scalar indexed read has rank zero even without static extents."""
+    from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
+
+    policy = ExtractionContract(
+        'extraction_contracts/program_extraction.yaml'
+    ).with_execution_file(
+        'extraction_contracts/vehicle_full_native_execution.yaml'
+    ).with_program_abi({
+        'bindings': [], 'values': [{
+            'function': 'root', 'parameter': parameter, 'storage': 'span',
+            'python_type': 'src.common.tensors.abstraction.AbstractTensor',
+            'dtype': 'float64', 'rank': 1, 'shape': [3],
+        } for parameter in ('values', 'output')],
+    })
+    module, _, exports = lower_ast_source_to_ssa(
+        'def root(values, output):\n'
+        '    for i in range(3):\n'
+        '        output[i] = -values[i] + abs(values[i])\n'
+        '    return output\n',
+        'root', name='indexed_unary_scalar', extraction_contract=policy,
+    )
+    unary = [
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op in {'Neg', 'Abs', 'TensorNeg', 'TensorAbs'}
+    ]
+    assert {instruction.op for instruction in unary} == {'Neg', 'Abs'}
+    for instruction in unary:
+        for value in (*instruction.args, instruction.res):
+            assert value.shape == ()
+            assert int(value.accounting.get('program_abi_rank', 0)) == 0
+    artifact = emit_ssa_function_to_llvm(module, exports[0])
+    assert artifact.shortfalls == ()
+
+
 def test_repository_tensor_provider_preserves_scalar_index_assignment(tmp_path):
     policy = ExtractionContract(
         'extraction_contracts/program_extraction.yaml'

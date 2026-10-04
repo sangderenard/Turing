@@ -786,6 +786,10 @@ LEXICAL_READ_BINDING = declare_page("lexical_read_binding", (
     RowField("read_scope", K.SCOPE), RowField("consumer", K.LABEL),
     RowField("role", K.LABEL), RowField("ordinal", K.INDEX),
 ), str)                                # mode CONCORD
+CONSUMER_OPERAND = declare_page("consumer_operand", (
+    RowField("read_scope", K.SCOPE), RowField("consumer", K.VALUE_ID),
+    RowField("value", K.VALUE_ID),
+), tuple)                              # operand positions; mode CONCORD
 IDENTITY_TRANSITION = declare_page("identity_transition", (
     RowField("scope", K.SCOPE), RowField("consumer", K.LABEL),
     RowField("role", K.LABEL), RowField("ordinal", K.INDEX),

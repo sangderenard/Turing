@@ -98,6 +98,34 @@ def test_sympy_reverse_translation_table_recovers_control_index_and_calls():
     assert rebuilt == expression
 
 
+def test_boolean_ite_uses_the_existing_select_identity():
+    x, y, z = sympy.symbols("x y z", real=True)
+    expression = sympy.ITE(x > 0, y > 0, z > 0)
+    graph = ProcessGraph(materialize_memory=False)
+
+    graph.build_from_expression(expression)
+    rebuilt, = process_graph_to_sympy_expressions(graph)
+
+    select = next(
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if data.get("op") == "Select"
+    )
+    assert [role for _parent, role in select["parents"]] == [
+        "condition", "if_true", "if_false",
+    ]
+    assert graph.G.graph["sympy_translation_fallbacks"] == ()
+    parents = {
+        role: graph.G.nodes[parent]["op"]
+        for parent, role in select["parents"]
+    }
+    assert parents == {
+        "condition": "Gt",
+        "if_true": "Gt",
+        "if_false": "Gt",
+    }
+
+
 def test_reduced_ast_function_projects_through_canonical_schema():
     source = (
         "def f(x, y):\n"
