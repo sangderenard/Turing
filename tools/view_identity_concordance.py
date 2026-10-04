@@ -875,18 +875,25 @@ def lower_probe(spec, process_graph_sink):
     ``--probe orbital``: the orbital transfer set as written, lowered by
     ``probe_orbital_transfer.lower_for_viewer`` (its own builder: the
     sanctioned sympy lane through ``piece_from_law``); it refuses with the
-    probe's recorded failures while no law of the set lowers."""
+    probe's recorded failures while no law of the set lowers.
+
+    ``--probe solve_dt`` / ``solve_loop``: the linalg.solve-in-a-loop sources
+    of probe_solve_in_dt_loop.py / probe_solve_in_loop.py, lowered by
+    ``probe_solve_viewer.lower_for_viewer``."""
     import warnings
     sys.path.insert(0, str(Path(__file__).resolve().parent / "compiler_probes"))
     name, _, flag = spec.partition(":")
     if name == "orbital":
         import probe_orbital_transfer as orbital
         return orbital.lower_for_viewer(process_graph_sink)
+    if name in ("solve_dt", "solve_loop"):
+        import probe_solve_viewer as solve
+        return solve.lower_for_viewer(process_graph_sink, name)
     import probe_emission_chain as chain
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     if name not in chain.native.PROGRAMS:
-        raise SystemExit(f"--probe {name!r}: one of {', '.join(chain.native.PROGRAMS)}, orbital "
-                         "(add :annotated)")
+        raise SystemExit(f"--probe {name!r}: one of {', '.join(chain.native.PROGRAMS)}, orbital, "
+                         "solve_dt, solve_loop (add :annotated)")
     template, dtype, _scalar, has_tensor = chain.native.PROGRAMS[name]
     annotation = ((": float" if dtype == "float64" else ": int") if flag == "annotated" else "")
     with warnings.catch_warnings():
