@@ -17254,6 +17254,14 @@ def _class_surface_ssa_program(
     # A formal given two different literals by two callsites is parametric,
     # exactly as a formal given two shapes is.
     literal_conflicts: set[tuple[int, str]] = set()
+    abi_guard = BoundedFixedPoint(
+        "abi-settlement",
+        bound_for(
+            "abi", functions=len(planned_shells),
+            call_operands=len(linked_value_edges),
+        ),
+        scope=("whole-program",), progress=report,
+    )
     changed = True
     settlement_round = 0
     while changed:
@@ -17528,6 +17536,7 @@ def _class_surface_ssa_program(
                     if marker not in polymorphic_formals:
                         polymorphic_formals.add(marker)
                         changed = True
+        abi_guard.round(changed)
     # One page per store, so a value whose stores disagree is a row rather
     # than a hunt.
     _node_page = _shape_book().page("shape.node")
