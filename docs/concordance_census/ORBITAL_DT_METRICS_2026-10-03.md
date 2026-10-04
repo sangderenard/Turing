@@ -4,10 +4,11 @@ Current work uses the actual library RK4 algorithm and the existing dt
 state, window, rejection, and rollback mechanisms. Native rotor and
 configured pure-torque checks pass, as do isolated production actuator,
 derivative, and energy-publication checks. The complete 27-piece craft bank
-now builds below the memory ceiling, and its command-change gate passes.
+now builds below the memory ceiling, and its command-change gate passes on
+the final finite-headroom controller (`6a879db3`).
 Long-duration angular momentum, desaturation and near-empty cutoff also pass
-on the pre-feedback controller. Physical gates must now be repeated after
-the error-feedback correction below; frame-partition and game acceptance
+on the pre-feedback controller. Those longer physical gates are being repeated
+after the error-feedback correction below; frame-partition and game acceptance
 remain open.
 The completed-piece memory accumulation now has a verified archive/runtime split. The later
 sections record the ownership trace, verified compiler commits, failures,
@@ -251,6 +252,35 @@ limit; determinant is `0.9999999999999933`, phase `2.39999999999929` versus
 rotation and phase assertions all pass. No source changes followed this
 result. The full 27-piece craft bank remains held while the independent
 planner Jacobian trace determines whether another compiler edit is needed.
+
+## Complete craft command-change gate with finite headroom
+
+The current-stamp 27-piece c0 bank and unchanged command-change test pass
+against `6a879db3`: 1 passed in 1,478.85 s, including a 1,442.193 s constructor.
+The sampled peak max(working set, private bytes) is 2,969,436,160 bytes,
+below the unchanged 6 GB ceiling. The normal source/ABI cache validation was
+used throughout. No stale artifact or memory-cap bypass was used.
+
+| Two-second command phase | Attempts | Error-limit rejections |
+| --- | ---: | ---: |
+| Wheel ignition | 273 | 81 |
+| Wheel reversal | 271 | 90 |
+| Main ignition | 1,360 | 356 |
+| Main cutoff | 1,086 | 188 |
+| Cold coast | 901 | 205 |
+| Total | 3,891 | 920 |
+
+All 2,971 accepted attempts complete the ten-second command sequence. The
+pre-feedback baseline was 27,556 attempts / 23,969 rejections / 3,587 accepted.
+The same test's five-phase runtime is 30.123 s versus the prior 186.260 s;
+these phase timings exclude compilation and construction.
+
+Every original angular-momentum, electrical/copper/mechanical ledger,
+tank/mass/impulse, integrated-delta-v, exact no-burn coast, and registered-span
+identity assertion passes. Final Gram defect is `1.82051943793e-15`, mass
+`979.353748255 kg`, burned propellant `2.52625174452 kg`, electrical energy
+`903.408316553 J`, and copper loss `900 J`. Adaptive growth remains enabled.
+The longer c0 physical gates and c1 frame/game gates remain separate work.
 
 ## Complete craft command-change gate (before error feedback)
 

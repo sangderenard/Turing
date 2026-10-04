@@ -7,10 +7,11 @@ and performance work. The original game used the existing dt outer coordinator
 and rollback but authored its own leapfrog/Euler/Cayley updates. The correction
 now constructs coupled updates by calling the actual library `RK4Integrator`;
 the existing PieceState owns all physical and stage columns. The full craft
-command-change, 150-second angular-momentum, desaturation and near-empty
-cutoff gates pass on the prior controller. The error-feedback correction is
+command-change gate passes on the final finite-headroom controller. The
+150-second angular-momentum, desaturation and near-empty cutoff gates pass
+on the prior controller and are being remeasured. The error-feedback correction is
 now committed as `cf78f24f` and its finite-headroom correction `6a879db3`;
-full-craft remeasurement, frame-partition and game
+longer physical remeasurement, frame-partition and game
 acceptance remain pending. Detailed trace and measured gates:
 [`concordance_census/ORBITAL_DT_METRICS_2026-10-03.md`](concordance_census/ORBITAL_DT_METRICS_2026-10-03.md).
 
@@ -52,8 +53,11 @@ bounds. Proposal equilibrium is ratio `.64`; acceptance stays at ratio `1`.
 Twenty-three focused nodes and the unchanged physical torque gate pass.
 Torque attempts fall from 7,003 to 1,081, with one rejection; every original
 physical assertion passes. There is no no-growth cap. The complete craft
-counts above remain the pre-feedback baseline; its current-stamp rebuild
-has resumed. The native planner trace found rounded derivative contributions
+counts above remain the pre-feedback baseline. Its current-stamp 27-piece
+rebuild and unchanged command-change gate now pass at a 2.969 GB process
+peak. Attempts fall to 3,891, including 920 rejections; the same five-phase
+runtime falls from 186.260 to 30.123 s, excluding construction. Every original
+physical and registered-span assertion passes. The native planner trace found rounded derivative contributions
 that do not cancel, with no compiler identity defect established. Exact
 algebraic correction and the unchanged numerical gate remain pending.
 
