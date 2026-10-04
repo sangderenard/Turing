@@ -180,6 +180,27 @@ its transcendental algorithms, and existing examples pass declared wide
 constants through precision-annotated formals. A general authored-constant
 connection remains open; eager support alone does not prove native support.
 
+The first complete tiny fused reverse probe uses the actual generated motion
+for `(x*y + z)**2`, canonical multiply/add backward rules, and seed `0.375`.
+All four scalar inputs are promoted before the motion; both returned elements
+are collapsed afterward. The full-native source gate refuses the two collapse
+operators before LLVM (12.45 s, peak 1.770 GB). Source is retained in
+`C:/Users/alber/AppData/Local/Temp/orbital_fused_precision_probe_6ligvual/source.py`.
+There are no unresolved calls, undefined operands or unaccounted formals in
+that gate; no native numerical result exists yet.
+
+The captured source graph locates the loss: root call 12 is declared as an
+authored tuple with leaf value IDs `(14, 18)`, yet the numeric propagation
+marks the whole call `Precision[2]`. Its Indexed projections 14 and 18 have
+no class/width fact, so their collapse consumers 16 and 20 remain generic
+unsupported calls. The raw root/callee/rule/unbroadcast graph receipts are in
+`C:/Users/alber/AppData/Local/Temp/orbital_fused_precision_capture`.
+The existing `propagate_call_formal_numeric_types` deduplicates all returned
+numeric descriptors into one call-level descriptor. Existing `RETURN_SITE_SLOT`
+producer references and caller result-projection paths provide the exact
+identities needed for per-element transfer. The correction belongs at that
+source propagation boundary and is not yet verified.
+
 The delayed actual-Hohmann plan/reference gate passes (17.38 s, sampled
 peak 2,573,942,784 bytes): unchanged captured assumptions permit a delayed
 immediate-start candidate, while a disturbance rejects it. This does not

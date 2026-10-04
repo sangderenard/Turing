@@ -317,6 +317,17 @@ the separately reduced dry mass plus registered tank charges. Initial mass,
 momentum and energy must use the same canonical law. This is a traced
 initialization gap, not a verified fix or a relaxed assertion.
 
+Two source corrections are now authored and await native verification. The
+initializer explicitly adds the shared canonical mass law's ordered terms
+before deriving momentum and energy; its empty-fixture result matches the
+archived native mass exactly. The diagnostic divides after canceling the
+common RK `dt/6`, retaining the original clamp through
+`Min(P/demand, cancel(-unclamped_delta/demand))` when demand is positive.
+Symbolic differences simplify to zero below, at and above the clamp boundary.
+SHA comparisons of all 27 equation tuples show 26 unchanged; only diagnostics
+change. All 16 stage/preparation groups, conservation metrics, canonical
+physical commit and energy stores retain identical authored equations.
+
 ## Complete craft command-change gate (before error feedback)
 
 The 27-piece production c0 bank compiled under the existing 6,000,000,000-byte
