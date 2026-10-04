@@ -497,6 +497,13 @@ def plan_region_to_ssa_instrs(
                 int(item.outputs[0]) if item.outputs else -1, "float64"
             ))
             opcode = "Cast"
+        elif opcode == "const":
+            # A plan line the planner folded to a literal (``0.5 * step`` of
+            # an unrolled loop, ``structural_specialization``) is the SSA
+            # constant, spelled ``Const`` like every other constant the
+            # lowering emits.  The lowercase graph op reached the LLVM
+            # emitter as "operation has no repository LLVM emission".
+            opcode = "Const"
 
         scalar_spelling = TENSOR_OPERATION_SCALAR_SPELLING
         is_scalar = (

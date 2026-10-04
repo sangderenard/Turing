@@ -16901,7 +16901,22 @@ def _class_surface_ssa_program(
 
     def _identity_cell(owner: Any, value_id: int) -> Any:
         scope, page = _copy_scope(owner)
-        return shape_identity_book.latest_ref(page, (scope, int(value_id)))
+        cell = shape_identity_book.latest_ref(page, (scope, int(value_id)))
+        if cell is not None:
+            return cell
+        # A node a pass added after the canonical relabel (a loop-unrolled
+        # body clone: ``loop_composer.add_clone``) has no ``canonical_value``
+        # row, only the ``ingestion_value`` row ``_set_operands`` posted.  It
+        # is still the one identity of that value; without its cell a
+        # caller's statement carried over a call edge derived from the
+        # callee's cell alone, and the second clone's call into one callee
+        # copy was a REVISE with no changed source.  The posted cell, by the
+        # same lookup every other consumer uses (never a new Unsourced row).
+        from ..common.tensors.topological_reducer import (
+            _posted_node_identity_cell,
+        )
+
+        return _posted_node_identity_cell(owner, int(value_id))
 
     def _statement_cell(owner: Any, value_id: int) -> Any:
         return shape_identity_book.latest_ref(
