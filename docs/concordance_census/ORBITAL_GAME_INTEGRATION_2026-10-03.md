@@ -119,6 +119,38 @@ original adaptive evalf route bit-for-bit. A cancellation/precision regression
 passes. The original four-ULP numerical assertion is unchanged, and the
 finite-Jacobian failure remains visible.
 
+The subsequent exact affine correction retains the actual library callback
+stages, temporarily represents their forces as symbols, cancels rational
+coefficients, then restores those forces in dependency order. Five source-only
+tests pass in 29.34 s, including all seven finite-flow relations and actual
+nonzero gravity on each axis. The source retains the exact authored binary
+coefficient `6 * binary(1/6) = 18014398509481983/18014398509481984`.
+The independent reference still uses the original unreduced library RK4 laws.
+
+The corrected native gate fails in 134.29 s at a 3,818,995,712-byte process
+peak. All state values pass, and the previous two transverse throttle cells
+are exactly zero. Finite-fuel momentum rows 0/1/2 versus propellant mass differ
+by 348/6/7 ULP; maximum absolute Jacobian discrepancy is
+`4.829470157119431e-15`. The unchanged limit is four ULP. The full SSA/book and
+audit were archived before assertions under
+`C:/Users/alber/AppData/Local/Temp/orbital_collocation_native_gate_rows/c31aa650ff215ede6a98ada09fecbbd9`.
+The audit has 5,297 rows / 260 functions, zero structural findings,
+57,544 unsourced facts / 10 ids, OPEN. The source digest is unchanged from the
+observation receipt above. Native LLVM rounds the large numerator during
+`sitofp i64 18014398509481983 to double`, so the exact source coefficient alone
+does not establish exact native representation.
+
+The user's requested remedy is existing AbstractTensor limb enrichment.
+`symbolic_abstract_tensor_source` already supports a precision policy through
+`plan_precision`, `materialize_precision_sections`, and authored `Precision.of`
+before the public source compiler. `lower_training_motion_to_repository_ssa`
+does not currently expose that source/policy connection. Its root contains
+calls and memory operations after operator-region planning, so widening only
+the final sum cannot recover forward or reverse operands already rounded.
+The earlier AbstractTensor seam and existing `Precision.constant` support are
+being traced. No replacement precision arithmetic, relaxed bound, or native
+acceptance is claimed.
+
 The delayed actual-Hohmann plan/reference gate passes (17.38 s, sampled
 peak 2,573,942,784 bytes): unchanged captured assumptions permit a delayed
 immediate-start candidate, while a disturbance rejects it. This does not

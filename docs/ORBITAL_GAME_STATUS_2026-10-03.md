@@ -8,8 +8,11 @@ and rollback but authored its own leapfrog/Euler/Cayley updates. The correction
 now constructs coupled updates by calling the actual library `RK4Integrator`;
 the existing PieceState owns all physical and stage columns. The full craft
 command-change gate passes on the final finite-headroom controller. The
-150-second angular-momentum, desaturation and near-empty cutoff gates pass
-on the prior controller and are being remeasured. The error-feedback correction is
+150-second angular-momentum, desaturation and near-empty cutoff gates also
+pass on the current controller in guarded, cache-only execution. The full-tank
+supply readout fails its exact-one assertion (`0.9999999999999999`); its
+separately integrated supplied/demand quotient is being traced. The empty-tank
+case has not run because that assertion comes first. The error-feedback correction is
 now committed as `cf78f24f` and its finite-headroom correction `6a879db3`;
 longer physical remeasurement, frame-partition and game
 acceptance remain pending. Detailed trace and measured gates:
@@ -57,9 +60,16 @@ counts above remain the pre-feedback baseline. Its current-stamp 27-piece
 rebuild and unchanged command-change gate now pass at a 2.969 GB process
 peak. Attempts fall to 3,891, including 920 rejections; the same five-phase
 runtime falls from 186.260 to 30.123 s, excluding construction. Every original
-physical and registered-span assertion passes. The native planner trace found rounded derivative contributions
-that do not cancel, with no compiler identity defect established. Exact
-algebraic correction and the unchanged numerical gate remain pending.
+physical and registered-span assertion passes. The native planner trace found
+rounded derivative contributions that do not cancel, with no compiler identity
+defect established. An exact affine reduction of the actual library RK4 laws
+passes five source-equivalence checks and restores the two exact-zero native
+cells. Its native numerical gate still fails: finite-fuel momentum derivatives
+with respect to propellant mass differ by 348, 6 and 7 ULP against the independent
+original-law reference. The bound remains four ULP. Existing AbstractTensor
+`Precision.of` enrichment is being traced before forward products and reverse
+rule operations; a precision setting for this reverse-motion path has not yet
+been connected. No production planner row bank or game acceptance is claimed.
 
 Adaptive growth is now the default in the existing dt entry points, and the
 LLVM-piece bridge carries the graph's growth choice into its owned state and
