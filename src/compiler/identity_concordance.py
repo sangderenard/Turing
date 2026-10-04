@@ -160,6 +160,18 @@ def publish_program_abi_graph_identities(
                         "program_abi_record_identity"
                     ] = record_identity
 
+    from .bounded_fixed_point import BoundedFixedPoint, bound_for
+
+    # Identities only propagate along existing edges: a changing round moves
+    # at least one identity one edge further, so nodes + edges bound it.
+    guard = BoundedFixedPoint(
+        "program-abi-identity-publication",
+        bound_for(
+            "identity-publication", nodes=len(graph_obj),
+            callsites=int(graph_obj.number_of_edges()),
+        ),
+        scope=(str(graph_obj.graph.get("function_name") or ""),),
+    )
     changed = True
     while changed:
         changed = False
@@ -447,6 +459,7 @@ def publish_program_abi_graph_identities(
                         if attributes.get(key) != identity:
                             attributes[key] = identity
                             changed = True
+        guard.round(changed)
 
     graph_obj.graph[
         "program_abi_identity_publication_receipt"
