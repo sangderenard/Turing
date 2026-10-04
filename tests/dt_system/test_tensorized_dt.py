@@ -43,10 +43,10 @@ def test_unpublished_nan_and_zero_limit_do_not_become_measurements():
     targets = Targets(1.0, 1.0, 1.0, **channel_fields(
         {"height_positivity": 0.0}, limits=True))
     metrics.error_channels[5] = float("nan")
-    assert _propose_dt_pen(metrics, targets, 1.0, None) == 1.0
+    assert _propose_dt_pen(metrics, targets, 1.0, None, 1.0) == 1.0
     metrics.error_channels[5] = 2e-30
     metrics.error_present[5] = 1.0
-    assert _propose_dt_pen(metrics, targets, 1.0, None) == 0.5
+    assert _propose_dt_pen(metrics, targets, 1.0, None, 1.0) == pytest.approx(1 / np.sqrt(2))
 
 
 def test_real_energy_helper_lowers_without_keyed_arenas(tmp_path):
@@ -231,7 +231,6 @@ def test_coerced_metrics_uses_declared_publication_extent():
 @pytest.mark.parametrize("participants", [0, 2])
 def test_real_proposal_consumes_channel_spans_natively(tmp_path, participants):
     from types import SimpleNamespace
-    from src.compiler.extraction_contract import ExtractionContract
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.ssa_c_backend import emit_ssa_module_to_c
     from src.compiler.vehicle_python_compilation import _managed_native_feeds_by_id
@@ -242,22 +241,25 @@ def test_real_proposal_consumes_channel_spans_natively(tmp_path, participants):
     source = (
         "from src.common.dt_system.dt_controller import _propose_dt_pen\n"
         "def root(metrics, targets):\n"
-        "    return _propose_dt_pen(metrics, targets, 1.0, None)\n"
+        "    return _propose_dt_pen(metrics, targets, 1.0, None, 0.125)\n"
     )
-    contract = ExtractionContract("extraction_contracts/program_extraction.yaml")
-    if participants:
-        import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples"))
-        from llvm_dt_system import dt_system_contract
-        contract = dt_system_contract("root", (), 1, participants)
-    module, _, _ = lower_ast_source_to_ssa(
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples"))
+    from llvm_dt_system import dt_system_contract
+    # This test executes the whole root natively, including scalar sqrt.
+    # The generic Python-host contract permits a host-owned sqrt boundary.
+    contract = dt_system_contract("root", (), 1, participants)
+    module, _, exports = lower_ast_source_to_ssa(
         source, "root", name="tensorized_proposal",
         extraction_contract=contract,
         python_bindings={"AbstractTensor": AbstractTensor},
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
     )
     print(concordance_report(module))
-    root = module.functions["tensorized_proposal__root"]
+    roots = [module.functions[name] for name in exports
+             if module.functions[name].metadata.get("source_qualified_name") == "root"]
+    assert len(roots) == 1
+    root = roots[0]
     artifact = emit_ssa_module_to_c(module, root.name)
     assert artifact.complete, artifact.shortfalls
     artifact.compile(tmp_path, optimization="O0")
@@ -271,7 +273,9 @@ def test_real_proposal_consumes_channel_spans_natively(tmp_path, participants):
         metrics.pub_limits[-1] = 2.0
         metrics.pub_limits_present[-1] = 1.0
     output_id = int(root.metadata["named_outputs"][0][1])
-    for present, measure, expected in ((0.0, 4.0, 0.5), (1.0, 4.0, 0.25), (1.0, 0.0, 0.5)):
+    for present, measure, expected in ((0.0, 4.0, 0.5),
+                                       (1.0, 4.0, 0.125 / np.sqrt(2)),
+                                       (1.0, 0.5, 0.25), (1.0, 0.0, 0.5)):
         if participants:
             metrics.pub_values[-1] = measure
             metrics.pub_present[-1] = present
@@ -284,4 +288,9 @@ def test_real_proposal_consumes_channel_spans_natively(tmp_path, participants):
         )
         execution = artifact.prepare_execution(feeds)
         execution.run()
-        assert np.asarray(execution.buffers[output_id]).reshape(-1)[0] == expected
+        actual = np.asarray(execution.buffers[output_id]).reshape(-1)[0]
+        if present and measure == 4.0:
+            authored = _propose_dt_pen(metrics, targets, 1.0, None, 0.125)
+            assert abs(actual - authored) <= abs(np.spacing(authored))
+        else:
+            assert actual == expected

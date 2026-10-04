@@ -283,12 +283,11 @@ def worst_penalty(spans: StepSpans, floor: float = 1.0):
     across every participant and every channel, in one reduction over the whole
     array instead of a hash per channel per attempt.
 
-    ``floor`` is 1.0 because a step that is inside every limit must not be
-    rewarded with a longer one -- the ratio only ever shortens.  Note that an
-    unpublished channel cannot affect this even though the dict form it replaces
-    read absence as a measure of zero: zero loses to the floor.  That is luck
-    rather than design, and it is why absence is masked here instead of being
-    given a value.
+    ``floor=1.0`` supplies a penalty that only shortens a proposal. Callers
+    requesting adaptive headroom use ``floor=0.0`` to retain ratios below
+    one; the floor is not a global timestep-growth policy. An unpublished
+    channel cannot affect either reduction because absence is masked rather
+    than treated as a measured value.
     """
     from ...common.tensors import AbstractTensor
 

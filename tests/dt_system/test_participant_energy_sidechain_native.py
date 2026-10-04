@@ -40,7 +40,7 @@ def test_actual_piece_publication_owns_native_energy_sidechain(tmp_path):
     source = (
         "from src.common.dt_system.dt_controller import _propose_dt_pen, _apply_energy_sidechain\n"
         "def root(metrics, targets):\n"
-        "    proposal = _propose_dt_pen(metrics, targets, 1.0, None)\n"
+        "    proposal = _propose_dt_pen(metrics, targets, 1.0, None, 0.25)\n"
         "    next_value = _apply_energy_sidechain(AbstractTensor.tensor(proposal), "
         "AbstractTensor.tensor(0.25), metrics, targets)\n"
         "    return proposal, next_value\n"

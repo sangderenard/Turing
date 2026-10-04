@@ -5,7 +5,10 @@ state, window, rejection, and rollback mechanisms. Native rotor and
 configured pure-torque checks pass, as do isolated production actuator,
 derivative, and energy-publication checks. The complete 27-piece craft bank
 now builds below the memory ceiling, and its command-change gate passes.
-Long-duration, fuel-cutoff, frame-partition and game acceptance remain open.
+Long-duration angular momentum, desaturation and near-empty cutoff also pass
+on the pre-feedback controller. Physical gates must now be repeated after
+the error-feedback correction below; frame-partition and game acceptance
+remain open.
 The completed-piece memory accumulation now has a verified archive/runtime split. The later
 sections record the ownership trace, verified compiler commits, failures,
 and measured gates. The first section preserves the audit that motivated
@@ -98,7 +101,74 @@ bytes). Full coordinator compilation remains unverified. The 40-window
 pure-torque gate also passes on this configuration (113.96 s including its
 rebuild), with unchanged 7,003 attempts and physical tolerances.
 
-## Complete craft command-change gate
+## Error feedback inside the existing controller
+
+The user explicitly permitted nonlinear rejection sizing. The default
+proposal now uses the actual attempted dt and the largest declared error
+ratio R: `min(CFL/energy bound, attempted_dt / sqrt(R))` for positive R.
+Zero error supplies no finite error bound. Ratios below one retain measured
+headroom. This is a controller response, not an assertion that every RK4
+metric has the same convergence order. The existing three-argument custom
+distribution contract remains unchanged.
+
+Both accepted and rejected evidence now feed the existing log PI controller.
+Rejected publication spans are consumed before the existing state restore;
+no new snapshot or history mechanism was added. A failure with no useful
+error estimate, or a PI proposal that fails to shrink, uses the existing
+halving fallback. Declared energy/participant limits, dt floors, acceptance
+thresholds, fixed outer windows, and rollback retain their existing owners.
+There is no no-growth cap.
+
+The revised focused selection passes 21 tests in 26.56 s (sampled peak
+1,938,812,928 bytes). Three stricter native checks subsequently pass in 14.39 s
+(sampled max(working set, private bytes) 1,756,524,544 bytes). These execute
+the authored helper under the existing full-native dt contract, for zero
+and two participants and an appended conservation channel. Representable
+results retain exact comparisons; the square-root result matches the
+authored helper within one ULP. The larger interrupted run is not counted
+green. Two older persistent-failure tests remain unchanged and excluded:
+their expected raise conflicts with existing floor-retention/default
+unresolved behavior. Bounded floor retention and explicit strict rollback
+are exercised separately.
+
+Compiled sixth- and eighth-power error laws verify growth, an abrupt command
+change, rejection restoration into the original registered span, and exact
+0.5-second window completion. The sixth-power case takes 17/80/2 attempts
+at gain 8/32/0; the eighth-power case takes 10/42/2. Those are measured toy
+law results, not orbital performance acceptance. Production banks require
+normal current-stamp regeneration before measuring the same flight gates.
+
+The generic Python-host extraction contract is not a whole-native execution
+contract. A helper test initially used it and directly executed an extracted
+artifact; its missing square-root contribution was not evidence of a bug in
+the full-native numerical path. The source occurrence is classified as a
+host/native-extension boundary, but its absence is not fully represented in
+the aggregate extraction-boundary accounting. That accounting remains OPEN.
+The corrected tests use `dt_system_contract` and select the unique returned
+export carrying the requested source-root identity.
+
+An adjacent source-order test remains red: the original
+`test_item_capture_depends_on_its_operand_producer` reproduces on untouched
+commit `0d101e3c` in `C:/dev/Powershell/.dt-feedback-baseline` (1 failed,
+9.48 s). Its two `use-not-dominated` findings are in `_energy_time_limit`:
+values 35 and 46 are consumed by `function_exit` isfinite instructions but
+defined in `if_merge` blocks 2 and 11. This matches the working-tree failure
+and establishes that it predates the feedback correction. No compiler fix
+or concordance-debt closure is claimed.
+
+Focused command, from `C:/dev/Powershell/turing`, using system Python 3.11
+and `PYTHONPATH=C:/dev/Powershell/turing`:
+
+```powershell
+python -u -m pytest -p no:faulthandler -q --tb=short --show-capture=no tests/dt_system/test_dt_error_feedback.py tests/dt_system/test_dt_superstep.py::test_error_beyond_soft_band_restores_then_retries tests/dt_system/test_dt_adaptive_growth.py tests/dt_system/test_llvm_dt_channel_layout.py tests/dt_system/test_participant_energy_sidechain_native.py tests/dt_system/test_tensorized_dt.py::test_real_proposal_consumes_channel_spans_natively tests/dt_system/test_tensorized_dt.py::test_unpublished_nan_and_zero_limit_do_not_become_measurements
+```
+
+The subsequent stricter run selected
+`test_real_proposal_consumes_channel_spans_natively` (two parameter cases)
+and `test_declared_conservation_error_reaches_native_proposal` from that
+same selection. No source changes followed it before the orbital rebuild.
+
+## Complete craft command-change gate (before error feedback)
 
 The 27-piece production c0 bank compiled under the existing 6,000,000,000-byte
 ceiling. Sampled peak max(working set, private bytes) was 3,041,787,904 bytes;

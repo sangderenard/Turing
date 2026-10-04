@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "examples"))
 from llvm_dt_system import (  # noqa: E402
     NativeSystem, configure_publication_limits, dt_system, dt_system_contract, instantiate_state,
 )
-from src.common.dt_system.dt_controller import STController, Targets  # noqa: E402
+from src.common.dt_system.dt_controller import STController, Targets, _propose_dt_pen  # noqa: E402
 from src.common.dt_system.dt_scaler import Metrics  # noqa: E402
 from src.common.dt_system.error_channels import DT_CHANNEL_NAMES, channel_fields  # noqa: E402
 from src.common.tensors import AbstractTensor  # noqa: E402
@@ -39,7 +39,7 @@ def test_declared_conservation_error_reaches_native_proposal(tmp_path):
     source = (
         "from src.common.dt_system.dt_controller import _propose_dt_pen\n"
         "def root(metrics, targets):\n"
-        "    return _propose_dt_pen(metrics, targets, 1.0, None)\n"
+        "    return _propose_dt_pen(metrics, targets, 1.0, None, 0.5)\n"
     )
     module, _, exports = lower_ast_source_to_ssa(
         source, "root", name="declared_conservation_proposal",
@@ -57,7 +57,7 @@ def test_declared_conservation_error_reaches_native_proposal(tmp_path):
         {CONSERVATION_ERROR: 2.0}, names=CHANNEL_NAMES, limits=True))
     output_id = int(root.metadata["named_outputs"][0][1])
     for route in ("aggregate", "participant"):
-        for published, expected in (({}, 0.5), ({CONSERVATION_ERROR: 4.0}, 0.25),
+        for published, expected in (({}, 0.5), ({CONSERVATION_ERROR: 4.0}, 0.5 / np.sqrt(2)),
                                     ({CONSERVATION_ERROR: 0.0}, 0.5)):
             fields = channel_fields(published if route == "aggregate" else {}, names=CHANNEL_NAMES)
             metrics = Metrics(2.0, 0.0, 0.0, 0.0, **fields)
@@ -78,7 +78,12 @@ def test_declared_conservation_error_reaches_native_proposal(tmp_path):
             )
             execution = artifact.prepare_execution(feeds)
             execution.run()
-            assert execution.buffers[output_id].reshape(-1)[0] == expected
+            actual = execution.buffers[output_id].reshape(-1)[0]
+            if published.get(CONSERVATION_ERROR) == 4.0:
+                authored = _propose_dt_pen(metrics, targets, 1.0, None, 0.5)
+                assert abs(actual - authored) <= abs(np.spacing(authored))
+            else:
+                assert actual == expected
 
 
 def test_compiled_conservation_publication_rejects_restores_and_lands_window(tmp_path):
@@ -121,8 +126,11 @@ def test_compiled_conservation_publication_rejects_restores_and_lands_window(tmp
         [piece], columns, rounds=1, round_dt=0.25, dt_initial=0.25, dx=0.1,
         state=state, targets=targets, controller=STController(dt_min=None), rollback=True,
     )
-    assert [attempt[0] for attempt in attempts[:3]] == [0.25, 0.125, 0.0625]
-    for _, before, _ in attempts[:3]:
+    first_accepted = next(index for index, row in enumerate(attempts) if row[0] ** 2 <= 0.01)
+    assert attempts[0][0] == 0.25 and first_accepted > 0
+    assert all(after[0] < before[0]
+               for before, after in zip(attempts[:first_accepted], attempts[1:first_accepted + 1]))
+    for _, before, _ in attempts[:first_accepted + 1]:
         np.testing.assert_array_equal(before, [0.0])
     assert state.x is owned_x
     assert columns["x"] is owned_x

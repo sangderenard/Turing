@@ -77,7 +77,9 @@ def test_graph_default_recovers_after_transient_restriction(native_piece):
     owned_x = state.x
     observations = observe_state(state)
     advanced, continuation, _ = advance_round(state)
-    assert [row[0] for row in observations] == [0.03125, 0.21875]
+    assert observations[0][0] == 0.03125
+    assert all(row[3] <= 0.01 for row in observations)
+    assert max(row[0] for row in observations[1:]) > observations[0][0]
     assert observations[0][3] == 0.03125 ** 2
     assert observations[1][3] == 0.0
     assert advanced == 0.25 and continuation > 0.03125
@@ -92,12 +94,18 @@ def test_adaptive_graph_restores_rejections_and_lands_outer_window(native_piece)
     owned_x = state.x
     observations = observe_state(state)
     advanced, continuation, _ = advance_round(state)
-    assert [row[0] for row in observations] == [0.25, 0.125, 0.0625, 0.1875]
-    for _, before, _, _ in observations[:3]:
-        np.testing.assert_array_equal(before, [0.0])
-    np.testing.assert_array_equal(observations[3][1], [0.0625])
-    assert observations[3][3] == 0.0
-    assert state.x is owned_x and advanced == 0.25 and continuation > 0.0625
+    assert observations[0][0] == 0.25 and observations[0][3] > 0.01
+    committed = 0.0
+    accepted = []
+    for step, before, _, error in observations:
+        np.testing.assert_allclose(before, [committed], rtol=0.0, atol=2e-15)
+        if error <= 0.01:
+            committed += step
+            accepted.append(step)
+    assert len(accepted) < len(observations)
+    assert max(accepted[1:]) > accepted[0]
+    assert observations[-1][3] == 0.0
+    assert state.x is owned_x and advanced == 0.25 and continuation > accepted[0]
     np.testing.assert_array_equal(state.x, [0.25])
 
 
@@ -135,7 +143,9 @@ def test_nested_round_uses_actual_graph_growth_choice(native_piece):
     columns = {"x": np.zeros(1)}
     nested.instantiate(columns)
     result, = nested(columns["x"], np.array([0.25]))
-    assert observations == [0.03125, 0.21875]
+    assert observations[0] == 0.03125
+    assert max(observations[1:]) > observations[0]
+    assert sum(observations) == pytest.approx(0.25, abs=2e-15)
     np.testing.assert_array_equal(result, [0.25])
     assert nested.tau == 1.0
 

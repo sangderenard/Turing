@@ -219,8 +219,9 @@ def _propose_dt_pen(
     targets: "Targets",
     dx,
     distribution,
+    dt_current,
 ):
-    """Map (metrics, targets, dx) -> dt_pen (smaller is stricter).
+    """Propose from the step that measured the errors, bounded by CFL/E/P.
 
     ``distribution``, when supplied, replaces the built-in CFL-plus-error-
     ratio proposal below, so a stateful core with no velocity/length-scale
@@ -230,8 +231,8 @@ def _propose_dt_pen(
     """
     if distribution is not None:
         return distribution(metrics, targets, dx)
-    # Default: CFL from the one velocity metric, softened by the worst ratio
-    # across every declared error channel (never just one field alone).
+    # CFL and exchange time are independent bounds.  Numerical error was
+    # measured at dt_current, not at the potentially much larger CFL time.
     dt_cfl = targets.cfl * dx / max(metrics.max_vel, 1e-30)
     energy_limit, energy_present = _energy_time_limit(metrics, targets)
     if energy_present:
@@ -244,18 +245,25 @@ def _propose_dt_pen(
         metrics.error_channels / AbstractTensor.maximum(targets.error_limits, 1e-30),
         AbstractTensor.zeros_like(metrics.error_channels),
     )
-    channel_penalty = float(AbstractTensor.maximum(ratios.max(), 1.0).item())
+    channel_penalty = float(AbstractTensor.maximum(ratios.max(), 0.0).item())
     if int(metrics.pub_values.shape[0]) > 0:
         from .participants import worst_penalty
 
-        channel_penalty = max(channel_penalty, float(worst_penalty(metrics).item()))
+        channel_penalty = max(channel_penalty, float(worst_penalty(metrics, floor=0.0).item()))
     penalty = max(
         metrics.div_inf / targets.div_max,
         metrics.mass_err / targets.mass_max,
         channel_penalty,
-        1.0,
+        0.0,
     )
-    return dt_cfl / penalty
+    if penalty > 0.0:
+        # Square-root feedback retains accepted headroom and damps the
+        # response before the existing log PI filter.  It is a controller
+        # transfer, not an asserted convergence order: different channels
+        # from the same RK4 step measured sixth- and eighth-power responses.
+        return min(float(dt_cfl), _scalar(dt_current) / math.sqrt(penalty))
+    # An exactly zero (or unjudged) error supplies no finite error bound.
+    return dt_cfl
 
 
 def step_with_dt_control_used(state,
@@ -282,20 +290,9 @@ def step_with_dt_control_used(state,
 
     dt_tensor = dt if isinstance(dt, AbstractTensor) else AbstractTensor.tensor(dt)
 
-    # This used to be tail recursion: the halve-and-retry branch below called
-    # this same function again instead of looping.  ``max_retries`` is a
-    # caller policy (when to report defeat), not a safety bound -- passing
-    # ``max_retries=None`` (a real, already-shipping call, see
-    # ``balloon_tire_managed_window``) makes ``retries_exhausted`` permanently
-    # False, so the ONLY thing that used to stop the recursion was Python's
-    # own ~1000-frame call-stack limit turning it into an uncontrolled
-    # ``RecursionError`` instead of the clean, named failure this function
-    # already knows how to report.  A plain loop removes the stack risk
-    # entirely; ``_ABSOLUTE_STEP_RETRY_CEILING`` below is a fixed circuit
-    # breaker that is NOT a parameter, so no caller-supplied value --
-    # including ``None`` -- can remove it.  Double-precision halving
-    # underflows to a subnormal zero within ~1074 steps regardless of
-    # ``dt_min``; the ceiling only needs comfortable margin over that.
+    # Retry in this loop, never by recursion. ``max_retries=None`` is a
+    # supported caller policy; numerical exhaustion below still stops a
+    # refinement that can no longer move the clock.
     while True:
         dt_for_advance = _restore_type(dt_tensor, ref)
 
@@ -373,7 +370,7 @@ def step_with_dt_control_used(state,
                 metrics.control_values[0] = float(dt_for_advance)
                 metrics.control_present[0] = 1.0
 
-            dt_pen = _propose_dt_pen(metrics, targets, dx, distribution)
+            dt_pen = _propose_dt_pen(metrics, targets, dx, distribution, dt_tensor)
             dt_next = ctrl.pi_update(
                 dt_prev=dt_tensor,
                 dt_pen=dt_pen,
@@ -419,47 +416,11 @@ def step_with_dt_control_used(state,
                 "soft_reasons": soft_reasons,
                 "dt_min_retained_reasons": floor_reasons,
             })
-        # ``retries_exhausted`` has TWO independent, differently-justified
-        # causes, never one blanket count:
-        #  1. The caller's own declared patience (``max_retries``).  This is
-        #     a policy choice and is absent entirely when ``max_retries`` is
-        #     None -- a real, already-shipping call (see
-        #     ``balloon_tire_managed_window``) that means "no numeric budget,
-        #     keep going".
-        #  2. ``ctrl.dt_min`` being unset ALSO removes the floor-retention
-        #     exit above (that branch never fires with no floor to compare
-        #     against), so halving would otherwise continue until literal
-        #     float underflow (~1074 steps) -- far too many evaluations of
-        #     ``advance`` for a real-time caller to ever pay for, and no
-        #     caller-supplied number would change that fact.  What IS always
-        #     true, regardless of any parameter, is IEEE-754 itself: halving
-        #     eventually reaches a value where halving again is a genuine
-        #     no-op (``x * 0.5 == x``), because the result has underflowed
-        #     past what float64 can represent as distinct from it.  That
-        #     point -- not an earlier, invented approximation of it -- is
-        #     the one thing every caller in this configuration is ALREADY
-        #     entitled to reach: a caller that passed ``max_retries=None``
-        #     asked for exactly this, "keep going until there is truly
-        #     nothing smaller to try," and deserves the full ~1074-step
-        #     float64 range, not a shortcut that gives up sooner.  It is
-        #     still bounded (this is what makes the loop conversion above
-        #     safe at all) and still cheap: a few thousand pure-arithmetic
-        #     halvings costs nothing next to even one ``advance`` call.
-        #  3. There is no sense subdividing past the point where the step can
-        #     no longer move the clock.  The test below used to be
-        #     ``dt * 0.5 == dt`` -- machine epsilon of ZERO, reached only when
-        #     dt denormalises, about 1074 halvings down.  But a step stops being
-        #     a smaller step long before that: once ``scale + dt == scale`` for
-        #     the scale it started from, adding it changes nothing, and every
-        #     candidate below it is arithmetically distinct and physically
-        #     identical.  From a 1e-3 window that point is near 2e-19, so the
-        #     old rule spent roughly a THOUSAND further halvings, each one
-        #     calling every law again, exploring steps that could not advance
-        #     time.  The comment above claimed those halvings were pure
-        #     arithmetic; they are not, the retry calls ``advance``.
-        #
-        #     The reported reason has always said "machine epsilon of its
-        #     starting scale".  This is that rule, now actually implemented.
+        # Caller patience and numerical exhaustion are separate. Without a
+        # declared floor, stop when the step cannot move its starting clock
+        # scale (or even the halving fallback cannot produce a smaller value).
+        # A caller requesting unlimited retries still gets every numerically
+        # distinguishable attempt, not a controller-specific iteration cap.
         scale = abs(float(_scalar(ref)))
         step = abs(float(dt_tensor.item()))
         numerically_exhausted = (
@@ -502,7 +463,7 @@ def step_with_dt_control_used(state,
                 )
             elif numerically_exhausted:
                 lines.append(
-                    "  dt has halved to machine epsilon of its starting scale "
+                    "  dt has refined to machine epsilon of its starting scale "
                     "with no dt_min floor set; no smaller candidate is "
                     "numerically distinguishable, regardless of max_retries."
                 )
@@ -518,6 +479,30 @@ def step_with_dt_control_used(state,
             # next step is computed the same way it always is.
             rejected = False
         if rejected:
+            if not retries_exhausted:
+                # Publication spans may alias state.  Consume this trial's
+                # errors BEFORE restoring its checkpoint, and let rejected
+                # evidence update the same PI accumulator as accepted steps.
+                dt_pen = _propose_dt_pen(metrics, targets, dx, distribution, dt_tensor)
+                dt_retry = ctrl.pi_update(
+                    dt_prev=dt_tensor, dt_pen=dt_pen,
+                    osc=(metrics.osc_flag or metrics.stiff_flag),
+                )
+                if (not math.isfinite(float(_scalar(dt_retry)))
+                        or float(_scalar(dt_retry)) <= 0.0
+                        or float(_scalar(dt_retry)) >= float(dt_tensor.item())):
+                    # A physical failure need not have a numerical error
+                    # estimate.  Preserve a strictly smaller retry in that
+                    # case, or while the PI accumulator still asks to grow.
+                    dt_retry = dt_tensor * 0.5
+                if (ctrl.dt_min is not None
+                        and float(dt_tensor.item()) >= float(ctrl.dt_min)):
+                    dt_retry = AbstractTensor.maximum(dt_retry, ctrl.dt_min)
+                if (metrics.dt_limit is not None
+                        and math.isfinite(float(metrics.dt_limit))
+                        and float(metrics.dt_limit) > 0.0):
+                    dt_retry = AbstractTensor.minimum(dt_retry, metrics.dt_limit)
+                dt_retry = _apply_energy_sidechain(dt_retry, dt_tensor, metrics, targets)
             state.restore(saved)
             failures.append((float(dt_for_advance), metrics, tuple(reasons)))
             if retries_exhausted:
@@ -534,7 +519,7 @@ def step_with_dt_control_used(state,
                     )
                 elif numerically_exhausted:
                     lines.append(
-                        "  dt has halved to machine epsilon of its starting scale "
+                        "  dt has refined to machine epsilon of its starting scale "
                         "with no dt_min floor set; no smaller candidate is "
                         "numerically distinguishable, regardless of max_retries."
                     )
@@ -556,25 +541,13 @@ def step_with_dt_control_used(state,
                 return metrics, _restore_type(dt_tensor * 0.5, ref), _restore_type(
                     AbstractTensor.tensor(0.0), ref
                 )
-            dt_half = dt_tensor * 0.5
-            if (
-                ctrl.dt_min is not None
-                and float(dt_tensor.item()) >= float(ctrl.dt_min)
-            ):
-                dt_half = AbstractTensor.maximum(dt_half, ctrl.dt_min)
-            if (
-                metrics.dt_limit is not None
-                and math.isfinite(float(metrics.dt_limit))
-                and float(metrics.dt_limit) > 0.0
-            ):
-                dt_half = AbstractTensor.minimum(dt_half, metrics.dt_limit)
             # Loop rather than recurse: same state, same policy, only the
             # proposed dt and the retry count change between attempts.
-            dt_tensor = dt_half
+            dt_tensor = dt_retry
             retries += 1
             continue
 
-        dt_pen = _propose_dt_pen(metrics, targets, dx, distribution)
+        dt_pen = _propose_dt_pen(metrics, targets, dx, distribution, dt_tensor)
         dt_next = ctrl.pi_update(
             dt_prev=dt_tensor,
             dt_pen=dt_pen,

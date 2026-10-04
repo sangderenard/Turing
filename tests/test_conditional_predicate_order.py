@@ -75,7 +75,7 @@ def test_item_capture_depends_on_its_operand_producer():
         "    targets = Targets(cfl=0.5, div_max=1e3, mass_max=1e3,"
         " energy_exchange_fraction=0.25)\n"
         "    metrics = Metrics(value, 0.0, 0.0, 0.0)\n"
-        "    return _propose_dt_pen(metrics, targets, limit, None) * 1.0\n"
+        "    return _propose_dt_pen(metrics, targets, limit, None, value) * 1.0\n"
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

@@ -190,10 +190,12 @@ def test_error_beyond_soft_band_restores_then_retries():
         rollback_threshold_multiplier=2.0,
     )
 
-    assert dt_used == pytest.approx(0.05)
-    assert state.value == pytest.approx(0.05)
-    assert state.restore_count == 1
-    assert [item["accepted"] for item in attempts] == [False, True]
+    assert 0.0 < dt_used <= 0.05
+    assert state.value == pytest.approx(dt_used)
+    assert state.restore_count == len(attempts) - 1 > 0
+    assert all(not item["accepted"] for item in attempts[:-1])
+    assert attempts[-1]["accepted"]
+    assert all(right["dt"] < left["dt"] for left, right in zip(attempts, attempts[1:]))
     assert "rollback limit" in attempts[0]["reasons"][0]
 
 
