@@ -4910,7 +4910,16 @@ def emit_ssa_module_to_c(
                         )
                     if loaded_type in {"int32_t", "int64_t"}:
                         integer_ids.add(result_id)
-                elif op in {"Cast", "CastLike"} and len(args) >= 1:
+                elif op in {"Cast", "CastLike", "cast_like"} and len(args) >= 1:
+                    # ``cast_like(value, reference)`` is the elementwise cast of
+                    # ``value`` to the reference's dtype; the result dtype is
+                    # already settled on ``instruction.res``.  Before this
+                    # branch took it, a SHAPED cast_like (solve's pivot mask,
+                    # ``(a >= 0).cast_like(M)``) reached the scalar spelling
+                    # below, which declares one double from element 0 and never
+                    # writes the result's span: the pivot mask stayed unwritten
+                    # and the LU divided by a zero pivot (NaN).  The LLVM lane
+                    # emits the same cast as a loop over the span.
                     shape = tuple(instruction.res.shape or ())
                     if shape:
                         if shape != tuple(instruction.args[0].shape or ()) or any(

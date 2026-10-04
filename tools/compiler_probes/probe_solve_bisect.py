@@ -40,7 +40,7 @@ root = Path(__file__).resolve().parents[2]
 PRE = """
 from src.common.tensors.linalg import (
     _axis_index, _column, _row, _one_hot_axis, _pivot_mask,
-    _masked_pivot_rows, _lu_decompose_inplace, _forward_substitute,
+    _masked_pivot_rows, _first_occurrence, _lu_decompose_inplace, _forward_substitute,
     _back_substitute,
 )
 """
@@ -144,6 +144,12 @@ BODIES = {
     "y_forward": ("matrix,rhs", PB + "    return _forward_substitute(LU, permutation.matmul(rhs.unsqueeze(-1)))\n", (N, 1)),
     "x_back": ("matrix,rhs", PB + "    y = _forward_substitute(LU, permutation.matmul(rhs.unsqueeze(-1)))\n    return _back_substitute(LU, y)\n", (N, 1)),
 }
+PM = '\n    rows = matrix.get_shape()[-2]\n    columns = matrix.get_shape()[-1]\n    eligible = (_axis_index(matrix, rows) >= 0).cast_like(matrix)\n    column = abs(_column(matrix, _one_hot_axis(matrix, columns, 0)))\n    candidates = column * eligible - (1 - eligible)\n    largest = candidates.max(dim=-1, keepdim=True)\n    eq = (candidates == largest).cast_like(matrix) * eligible\n'
+BODIES_EXTRA.update({name: ("matrix", PM + "    return " + expr + chr(10), shape) for name, expr, shape in (
+    ("pm_eligible", "eligible", (N,)), ("pm_hot", "_one_hot_axis(matrix, columns, 0)", (N,)),
+    ("pm_column", "column", (N,)), ("pm_cand", "candidates", (N,)), ("pm_largest", "largest", (1,)),
+    ("pm_eq", "eq", (N,)), ("pm_first", "_first_occurrence(eq, matrix)", (N,)),
+)})
 BODIES.update(BODIES_EXTRA)
 STAGES = tuple(
     (name, PRE + "\ndef stage(" + params + "):\n" + body, tuple(params.split(",")), shape)
@@ -174,18 +180,32 @@ def run_stage(name, source, parameter_names, out_shape):
     )
     qualified = f"sb_{name}__stage"
     function = module.functions[qualified]
-    artifact = emit_ssa_function_to_llvm(
-        module, qualified, entry_name=f"sb_{name}_stage",
-    )
-    if artifact.shortfalls:
-        print(f"{name}: SHORTFALLS {artifact.shortfalls}", flush=True)
-        return
-    if os.environ.get('PROBE_DUMP_IR'):
-        open(root / 'build' / f'sb_{name}.ll', 'w').write(artifact.llvm_ir)
-    native = compile_artifact(
-        artifact, directory=root / "build" / f"sb_{name}",
-        optimization="O0",
-    )
+    import os
+    lane_c = os.environ.get("PROBE_LANE") == "c"
+    if lane_c:
+        from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+        artifact = emit_ssa_module_to_c(module, qualified)
+        if not artifact.complete:
+            print(f"{name}: C SHORTFALLS {artifact.shortfalls}", flush=True)
+            return
+        if os.environ.get('PROBE_DUMP_IR'):
+            open(root / 'build' / f'sb_{name}.c', 'w').write(
+                getattr(artifact, 'source', None) or getattr(artifact, 'c_source', ''))
+        artifact.compile(root / "build" / f"sb_{name}", optimization="O0")
+        native = None
+    else:
+        artifact = emit_ssa_function_to_llvm(
+            module, qualified, entry_name=f"sb_{name}_stage",
+        )
+        if artifact.shortfalls:
+            print(f"{name}: SHORTFALLS {artifact.shortfalls}", flush=True)
+            return
+        if os.environ.get('PROBE_DUMP_IR'):
+            open(root / 'build' / f'sb_{name}.ll', 'w').write(artifact.llvm_ir)
+        native = compile_artifact(
+            artifact, directory=root / "build" / f"sb_{name}",
+            optimization="O0",
+        )
     parameters = dict(function.metadata["parameter_names"])
     published = [int(v.id) for v in outputs[qualified]]
     feeds = {parameters["matrix"]: MATRIX.copy()}
@@ -193,7 +213,8 @@ def run_stage(name, source, parameter_names, out_shape):
         feeds[parameters["rhs"]] = RHS.copy()
     for value_id in published:
         feeds[value_id] = np.full(out_shape, SENTINEL)
-    execution = prepare_artifact_execution(native, feeds)
+    execution = (artifact.prepare_execution(feeds) if lane_c
+                 else prepare_artifact_execution(native, feeds))
     import os
     for buffer_id, buffer in ([] if os.environ.get('PROBE_NOPOISON') else execution.buffers.items()):
         if buffer_id in feeds:
