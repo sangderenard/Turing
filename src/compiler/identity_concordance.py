@@ -2767,6 +2767,10 @@ def _blocks_between(function: Any, header: str, latch: str) -> set[str]:
         if current in backward:
             continue
         backward.add(current)
+        if current == str(header):
+            # natural loop: the walk stops at the header, it does not
+            # expand the header's predecessors (those are outside the loop)
+            continue
         for candidate, onward in successors.items():
             if current in onward:
                 frontier.append(candidate)
