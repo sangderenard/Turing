@@ -68,6 +68,32 @@ specific operation. No threshold or tolerance change was made.
 The new artifact, full SSA/book and emitted audit were archived before the
 failure. No production row bank or game-flight acceptance is claimed.
 
+The subsequent native observation gate completed in 243.23 s, with a
+4,015,517,696-byte peak. It reproduces both failures and exposes the actual
+reverse-rule operands and throttle contributions through the compiler's
+existing `observed_outputs` contract. Source/adjoint identity links select
+the observations; no integer identity from an older book is assumed.
+Each row has 51 throttle contributions, of which five are nonzero. For
+position_y, the exact sum of the already-rounded contributions is
+`-3 * 2**-61`; one native addition contributes another `-2**-61`, producing
+the observed `-2**-59`. For position_z, the rounded contributions themselves
+sum to `-5 * 2**-60`, exactly its final residual. Opposed full-stage mass
+and momentum-outflow terms differ by one ULP. Every traced operation agrees
+with its authored AD rule; no compiler identity defect was established.
+Changing only final summation cannot remove the measured error.
+
+The complete source, role mapping, native operand arrays, SSA/book and audit
+are archived in
+`C:/Users/alber/AppData/Local/Temp/orbital_collocation_native_observed_gate_rows/c95ab2ca664c80067fa587db6f28a5b9`.
+The observation audit has 6,637 rows / 332 functions, zero structural
+findings, and 72,929 unsourced facts / 10 ids, OPEN. The 442 additional
+facts belong to observations. Compiler digest:
+`574083b7003dd64d8d4de25bd37950cff2c75a099c696ddb31aac828be37d1b0`.
+Exact algebraic reduction at the existing law owner remains under review;
+the numerical gate and all original tolerances remain unchanged. With no
+compiler-source correction justified by this trace, full craft validation
+has resumed against controller `6a879db3`.
+
 The reference computation now represents the existing Float coefficients
 and float64 ABI inputs as their exact binary rational values before one
 substitution and 80-digit evaluation. It does not replace binary coefficients

@@ -9,7 +9,8 @@ now constructs coupled updates by calling the actual library `RK4Integrator`;
 the existing PieceState owns all physical and stage columns. The full craft
 command-change, 150-second angular-momentum, desaturation and near-empty
 cutoff gates pass on the prior controller. The error-feedback correction is
-now committed as `cf78f24f`; physical remeasurement, frame-partition and game
+now committed as `cf78f24f` and its finite-headroom correction `6a879db3`;
+full-craft remeasurement, frame-partition and game
 acceptance remain pending. Detailed trace and measured gates:
 [`concordance_census/ORBITAL_DT_METRICS_2026-10-03.md`](concordance_census/ORBITAL_DT_METRICS_2026-10-03.md).
 
@@ -51,8 +52,10 @@ bounds. Proposal equilibrium is ratio `.64`; acceptance stays at ratio `1`.
 Twenty-three focused nodes and the unchanged physical torque gate pass.
 Torque attempts fall from 7,003 to 1,081, with one rejection; every original
 physical assertion passes. There is no no-growth cap. The complete craft
-counts above remain the pre-feedback baseline; its rebuild waits for the
-independent planner Jacobian investigation and a final compiler-source freeze.
+counts above remain the pre-feedback baseline; its current-stamp rebuild
+has resumed. The native planner trace found rounded derivative contributions
+that do not cancel, with no compiler identity defect established. Exact
+algebraic correction and the unchanged numerical gate remain pending.
 
 Adaptive growth is now the default in the existing dt entry points, and the
 LLVM-piece bridge carries the graph's growth choice into its owned state and
