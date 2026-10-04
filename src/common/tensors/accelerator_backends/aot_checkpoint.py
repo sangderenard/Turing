@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import os
+import pickle
 from pathlib import Path
 import threading
 import uuid
@@ -189,7 +190,10 @@ class AOTCheckpointStore:
                 value = cloudpickle.load(stream)
             self.last_load_status = "hit"
             return value
-        except (OSError, ValueError, TypeError, EOFError, ImportError) as error:
+        except (
+            OSError, ValueError, TypeError, EOFError, ImportError,
+            pickle.UnpicklingError,
+        ) as error:
             self.last_load_status = (
                 f"miss: {type(error).__name__}: {error}"
             )
@@ -274,7 +278,10 @@ class ReductionArtifactStore:
                 value = cloudpickle.load(stream)
             self.hits += 1
             return value, True
-        except (OSError, ValueError, TypeError, EOFError, ImportError):
+        except (
+            OSError, ValueError, TypeError, EOFError, ImportError,
+            pickle.UnpicklingError,
+        ):
             pass
         value = compute()
         self.misses += 1
