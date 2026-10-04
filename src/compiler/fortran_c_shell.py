@@ -16868,6 +16868,7 @@ def _class_surface_ssa_program(
     from .identity_concordance import (
         Derived as _ShapeDerived,
         Mode as _ShapeMode,
+        SHAPE_STATE_PAGE as _SHAPE_STATE_PAGE,
         Unsourced as _ShapeUnsourced,
         invalidate_proven_shape as _invalidate_abi_shape,
         record_proven_shape as _record_abi_shape,
@@ -16947,6 +16948,21 @@ def _class_surface_ssa_program(
                 _statement_cell(source_owner, source_id)
                 or _identity_cell(source_owner, source_id)
             )
+            # The caller's value is a graph identity whose extents the shape
+            # transformation page resolves (a loop result's shape is derived
+            # from its inputs, a descriptor query that first answers "no
+            # extents" and later the callsite's own).  That resolution IS the
+            # changed source of a statement carried over this call edge: the
+            # row's cells are otherwise only the two unchanging identity
+            # cells, and the same caller value stating (3, 3) after stating
+            # nothing was a REVISE with no changed source.  The state cell
+            # is read from the book, never posted here.
+            state = shape_identity_book.latest_ref(
+                _SHAPE_STATE_PAGE,
+                (str(source_owner.graph.get("function_name")), int(source_id)),
+            )
+            if state is not None:
+                cells.append(state)
         cells = tuple(dict.fromkeys(cell for cell in cells if cell is not None))
         ref = shape_identity_book.post(
             _COPY_VALUE_SHAPE, row, statement,
