@@ -201,6 +201,31 @@ producer references and caller result-projection paths provide the exact
 identities needed for per-element transfer. The correction belongs at that
 source propagation boundary and is not yet verified.
 
+At 2026-10-04 03:22 UTC the user requested lower model intensity if work
+continued and an explicit assessment of progress against elapsed time. Sol
+and Astra are stopped with no active native processes; Luna owns one bounded
+15-minute investigation. The full reverse precision gate still has no native
+result. The uncommitted tuple-projection correction resolves the loss collapse,
+but gradient collapse remains blocked: `unbroadcast` return producers 0 and 52
+carry two limbs while fallback reshape producer 62 has no descriptor. The
+actual scalar shape specialization selects the identity case later. Existing
+`_expand_specialized_unbroadcast_identity` also appends reshape unconditionally,
+despite the authored helper's equal-shape identity return; that discrepancy is
+the next exact owner to inspect. The final guarded trace takes 25.6 s with
+1,775,083,520-byte peak memory. Source materializer tests last report four
+passes and one literal clamp failure (`int.shape`). No production row bank is
+justified by these results. Further tracing alone is not a completed gate.
+
+The lower-cost pass located the existing selected-return records but did not
+establish complete scalar numeric-class transfer or a passing native reverse
+gate. Root stopped the investigation before the 15-minute limit, preserved
+the unverified source and tests in
+[`precision_experiment_2026-10-03/`](precision_experiment_2026-10-03/README.md),
+and reverse-applied only the session-owned experimental hunks. The pre-experiment
+compiler contents are restored; unrelated symbolic-graph WIP is untouched.
+The next priority is native validation of the concrete physical initializer
+and supply-readout fixes with a lower-cost worker, then growth/frame/game gates.
+
 The delayed actual-Hohmann plan/reference gate passes (17.38 s, sampled
 peak 2,573,942,784 bytes): unchanged captured assumptions permit a delayed
 immediate-start candidate, while a disturbance rejects it. This does not

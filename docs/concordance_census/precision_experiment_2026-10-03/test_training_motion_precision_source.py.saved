@@ -1,0 +1,107 @@
+"""Exact source regressions for the existing vehicle fused-motion materializer.
+
+These are semantic source gates, not orbital/native flight acceptance.
+"""
+import numpy as np
+import pytest
+import sympy as sp
+
+from src.common.tensors import AbstractTensor
+from src.common.tensors import backward_registry
+from src.compiler.process_graph_autograd import (
+    compile_process_graph_backward, _registry_function_source, reverse_compile_book,
+)
+from src.compiler.symbolic_process_graph import ingest_sympy_expressions
+from src.compiler.vehicle_inverse_compilation import _motion_source
+from src.transmogrifier.graph.graph_express2 import ProcessGraph
+
+
+def _product(expressions, wrt):
+    with reverse_compile_book():
+        graph = ProcessGraph(materialize_memory=False)
+        roots = ingest_sympy_expressions(graph, expressions, strict=True)
+        inputs = {data['expr_obj'].name: int(node)
+                  for node, data in graph.G.nodes(data=True)
+                  if data.get('op') == 'input'}
+        return compile_process_graph_backward(
+            graph, outputs=roots, wrt=[inputs[s.name] for s in wrt],
+            packaging='combined', unit_loss_seed=False)
+
+
+def _source_namespace(product, source):
+    rules = tuple(dict.fromkeys(
+        str((d.get('attributes') or {}).get('backward_rule'))
+        for _, d in product.graph.G.nodes(data=True)
+        if (d.get('attributes') or {}).get('backward_rule')))
+    closure = '\n'.join(_registry_function_source(rule, backward_registry.BACKWARD_RULES[rule])
+                        for rule in rules)
+    namespace = dict(vars(backward_registry))
+    exec(closure + '\n' + source, namespace)
+    return namespace
+
+
+def test_materialized_multi_loss_preserves_seeded_output_contract(tmp_path):
+    x, y, z = sp.symbols('x y z')
+    product = _product([x*y + z, x+y], [x, y, z])
+    source, arguments, outputs = _motion_source(product, name='seeded_motion')
+    (tmp_path/'actual_motion_source.py').write_text(source)
+    assert len(outputs) == len(product.motion.loss_value_ids) + len(product.motion.gradient_value_ids)
+    assert outputs[:2] == ('loss_0', 'loss_1')
+    assert len(arguments) == 5  # Three forward inputs and two distinct seeds.
+    values = {'x': 1., 'y': 2., 'z': 4.}
+    seeds = (3., 5.)
+    for root, seed in zip(product.motion.loss_value_ids, seeds):
+        seed_id = product.motion.seed_value_ids[root]
+        data = product.graph.G.nodes[seed_id]
+        attributes = data.get('attributes') or {}
+        values[attributes.get('binding_name') or attributes.get('name') or data['label']] = seed
+    namespace = _source_namespace(product, source)
+    result = namespace['seeded_motion'](**{
+        n: AbstractTensor.get_tensor(np.array([values[n]])) for n in arguments})
+    np.testing.assert_array_equal([v.tolist()[0] for v in result[:2]], [6., 3.])
+    by_id = dict(zip(product.motion.gradient_value_ids, result[2:]))
+    forward_names = {node: data['expr_obj'].name
+                     for node, data in product.adjoint.forward.G.nodes(data=True)
+                     if data.get('op') == 'input'}
+    expected = {'x': 11., 'y': 8., 'z': 3.}
+    for node, value in by_id.items():
+        np.testing.assert_array_equal(value.tolist(), [expected[forward_names[node]]])
+
+
+def test_materialized_nary_add_preserves_every_authored_operand(tmp_path):
+    x, y, z = sp.symbols('x y z')
+    product = _product([sp.Add(x, y, z, evaluate=False)], [x, y, z])
+    source, arguments, _outputs = _motion_source(product, name='nary_motion')
+    (tmp_path/'actual_motion_source.py').write_text(source)
+    namespace = _source_namespace(product, source)
+    values = {'x': 1., 'y': 2., 'z': 4.}
+    feeds = {n: AbstractTensor.get_tensor(np.array([values.get(n, 1.)])) for n in arguments}
+    result = namespace['nary_motion'](**feeds)
+    np.testing.assert_array_equal(result[0].tolist(), [7.])
+
+
+@pytest.mark.parametrize('expression', (sp.Min, sp.Max))
+def test_materialized_clamp_keeps_existing_min_max_semantics(tmp_path, expression):
+    x, y = sp.symbols('x y')
+    product = _product([expression(x, y)], [x, y])
+    source, arguments, _outputs = _motion_source(product, name='clamp_motion')
+    (tmp_path/'actual_motion_source.py').write_text(source)
+    namespace = _source_namespace(product, source)
+    values = {'x': 1., 'y': 3.}
+    feeds = {n: AbstractTensor.get_tensor(np.array([values.get(n, 1.)])) for n in arguments}
+    result = namespace['clamp_motion'](**feeds)
+    np.testing.assert_array_equal(result[0].tolist(), [1. if expression is sp.Min else 3.])
+    expected = [1., 0.] if expression is sp.Min else [0., 1.]
+    np.testing.assert_array_equal([v.tolist()[0] for v in result[1:]], expected)
+
+
+def test_materialized_actual_throttle_clamp_with_literal_bounds(tmp_path):
+    throttle = sp.Symbol('throttle')
+    product = _product([sp.Max(0, sp.Min(1, throttle))], [throttle])
+    source, arguments, _ = _motion_source(product, name='throttle_motion')
+    (tmp_path/'actual_motion_source.py').write_text(source)
+    namespace = _source_namespace(product, source)
+    feeds = {n: AbstractTensor.get_tensor(np.array([.375 if n == 'throttle' else 1.]))
+             for n in arguments}
+    result = namespace['throttle_motion'](**feeds)
+    np.testing.assert_array_equal([v.tolist()[0] for v in result], [.375, 1.])

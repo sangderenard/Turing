@@ -1,0 +1,168 @@
+diff --git a/src/common/tensors/topological_reducer.py b/src/common/tensors/topological_reducer.py
+index 5e61ae81..7919df81 100644
+--- a/src/common/tensors/topological_reducer.py
++++ b/src/common/tensors/topological_reducer.py
+@@ -13050,6 +13050,104 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
+                     ),)
+                     if history and int(history[-1]) in callee
+                 )
++                # The actual seeded (x*y+z)**2 fused reverse exposed this:
++                # a tuple of wide values is an aggregate, not one Precision.
++                # Read the reducer's control-owned return slots, then carry
++                # each selected producer's descriptor over its resolved caller
++                # projection. This also applies to canonical backward-rule
++                # tuple returns; the motion's saved products stay wide.
++                book = current_identity_book()
++                slot_page = book.page(_RETURN_SITE_SLOT)
++                container_page = book.page(_RETURN_SITE_CONTAINER)
++                return_scope = _operand_position_scope(callee_entry.graph)
++                site_slots = {}
++                if return_scope is not None:
++                    for slot_row in slot_page.scope_rows(return_scope):
++                        site_slots.setdefault(slot_row[1], {})[
++                            int(slot_row[2])
++                        ] = (slot_row, slot_page.latest(slot_row))
++                aggregate_return = bool(site_slots) and all(
++                    container_page.latest((return_scope, site)) in {
++                        _ContainerKind.TUPLE, _ContainerKind.LIST,
++                    } for site in site_slots
++                )
++                if aggregate_return:
++                    projection_page = book.page(
++                        "call_result_projection_concordance"
++                    )
++                    for projection_id, projection_data in tuple(caller.nodes(data=True)):
++                        expression = projection_data.get("expr_obj")
++                        if not isinstance(expression, ast.Subscript):
++                            continue
++                        if not any(
++                            int(parent) == int(call_id) and str(role) == "base"
++                            for parent, role in projection_data.get("parents", ())
++                        ):
++                            continue
++                        index_parents = tuple(
++                            int(parent) for parent, role in
++                            projection_data.get("parents", ())
++                            if str(role) == "index" and int(parent) in caller
++                        )
++                        if len(index_parents) != 1:
++                            continue
++                        index_id = index_parents[0]
++                        index_data = caller.nodes[index_id]
++                        if str(index_data.get("op") or index_data.get("type") or "").casefold() not in {
++                            "const", "constant",
++                        }:
++                            continue
++                        index = index_data.get("constant")
++                        if index is None:
++                            index = (index_data.get("attributes") or {}).get("value")
++                        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
++                            continue
++                        path = (index,)
++                        projection_page.concord((int(call_id), int(projection_id)), path)
++                        sources = []
++                        descriptors = []
++                        complete = True
++                        for site, slots in site_slots.items():
++                            slot = slots.get(index)
++                            if slot is None:
++                                complete = False
++                                break
++                            slot_row, producer_cell = slot
++                            producer_id = _cell_node_id(producer_cell)
++                            descriptor = _resolved_source_value_class(callee, producer_id)
++                            if descriptor[0] is None:
++                                complete = False
++                                break
++                            descriptors.append(descriptor)
++                            sources.extend((
++                                book.latest_ref(_RETURN_SITE_SLOT, slot_row),
++                                book.latest_ref(_SOURCE_VALUE_CLASS, (callee_scope, producer_id)),
++                            ))
++                        if not complete:
++                            continue
++                        if any(descriptor != descriptors[0] for descriptor in descriptors[1:]):
++                            raise ValueError(
++                                "source call projection numeric class disagreement "
++                                f"for {caller_scope!r} call {call_id} path {path!r}: "
++                                f"return-site descriptors={descriptors!r}"
++                            )
++                        returned_class, returned_limbs = descriptors[0]
++                        prior = _resolved_source_value_class(caller, int(projection_id))
++                        sources.extend((node_identity_cell(caller_entry.graph, index_id),
++                                        node_identity_cell(caller_entry.graph, int(call_id)),
++                                        node_identity_cell(caller_entry.graph, int(projection_id))))
++                        _concord_source_value_class(
++                            caller_scope, int(projection_id), str(returned_class),
++                            precision_limbs=int(returned_limbs),
++                            source=f"call return slot {callee_scope}:{path!r}",
++                            provenance=_Derived(tuple(dict.fromkeys(
++                                source for source in sources if source is not None))),
++                        )
++                        projected = projection_data.setdefault("attributes", {})
++                        projected.update({"result_class_ref": str(returned_class),
++                                          "precision_limbs": int(returned_limbs),
++                                          "numeric_identity_source": f"call return slot {callee_scope}:{path!r}"})
++                        changed = changed or prior != descriptors[0]
+                 returned_facts = tuple(dict.fromkeys(
+                     _resolved_source_value_class(callee, value_id)
+                     for value_id in returned_value_ids
+@@ -13057,7 +13155,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
+                         callee, value_id
+                     )[0] is not None
+                 ))
+-                if len(returned_facts) == 1:
++                if len(returned_facts) == 1 and not aggregate_return:
+                     returned_class, returned_limbs = returned_facts[0]
+                     result_page = current_identity_book().page(
+                         "source_call_result_identity_concordance"
+diff --git a/src/compiler/vehicle_inverse_compilation.py b/src/compiler/vehicle_inverse_compilation.py
+index 88ddb412..9ca0c62a 100644
+--- a/src/compiler/vehicle_inverse_compilation.py
++++ b/src/compiler/vehicle_inverse_compilation.py
+@@ -224,6 +224,15 @@ def _motion_source(product: ProcessGraphBackwardProduct, *, name: str) -> tuple[
+             expression = f"({operands[0]} {symbol} {operands[1]})"
+         elif operation == "neg":
+             expression = f"(-{operands[0]})"
++        elif operation in {"minimum", "maximum"}:
++            constants = [str(graph.G.nodes[parent].get("op") or
++                             graph.G.nodes[parent].get("type") or "").casefold()
++                         in {"const", "constant"} for parent in parents]
++            if all(constants):
++                expression = f"{'min' if operation == 'minimum' else 'max'}({', '.join(operands)})"
++            else:
++                receiver = 1 if constants[0] else 0
++                expression = f"{operands[receiver]}.{operation}({operands[1-receiver]})"
+         elif operation == "abs":
+             expression = f"abs({operands[0]})"
+         elif operation in {"sqrt", "tanh", "exp", "log", "sin", "cos"}:
+@@ -239,13 +248,27 @@ def _motion_source(product: ProcessGraphBackwardProduct, *, name: str) -> tuple[
+                 raise ValueError(f"inverse graph call {node_id} has no static backward rule")
+             expression = f"bw_{rule}({', '.join(operands)})"
+         elif operation in {"indexed", "getitem"}:
+-            expression = f"{operands[0]}[int({operands[1]})]"
++            index_data = graph.G.nodes[parents[1]]
++            index = index_data.get("constant")
++            if index is None:
++                index = (index_data.get("attributes") or {}).get("value")
++            # The seeded (x*y+z)**2 reverse selects canonical backward tuple
++            # slots. Preserve its authored graph constant as a literal slot;
++            # int(v_constant) is only resolved after source numeric transport.
++            index_operation = str(index_data.get("op") or index_data.get("type") or "").casefold()
++            if (index_operation in {"const", "constant"}
++                    and isinstance(index, (int, sympy.Integer)) and not isinstance(index, bool)):
++                expression = f"{operands[0]}[{int(index)}]"
++            else:
++                expression = f"{operands[0]}[int({operands[1]})]"
+         else:
+             raise ValueError(f"inverse graph Python materializer has no rule for {node_id}:{operation}")
+         names[node_id] = target
+         lines.append(f"    {target} = {expression}")
+     result_ids = [*product.motion.loss_value_ids, *product.motion.gradient_value_ids.values()]
+-    result_names = tuple(["loss", *(f"gradient__{value}" for value in product.motion.gradient_value_ids)])
++    loss_names = ("loss",) if len(product.motion.loss_value_ids) == 1 else tuple(
++        f"loss_{index}" for index in range(len(product.motion.loss_value_ids)))
++    result_names = (*loss_names, *(f"gradient__{value}" for value in product.motion.gradient_value_ids))
+     rendered = ", ".join(names[int(value_id)] for value_id in result_ids)
+     lines.append(f"    return ({rendered},)")
+     return "\n".join(lines) + "\n", tuple(arguments), result_names
