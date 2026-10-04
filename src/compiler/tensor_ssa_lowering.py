@@ -1936,11 +1936,31 @@ def settle_repository_ssa_shape_metadata(module: IRModule) -> bool:
     checks, so alternate them until a complete round reports no change.
     """
 
+    from .bounded_fixed_point import BoundedFixedPoint, bound_for
+
+    # Both passes only enrich SSAValue shape/dtype/accounting on an immutable
+    # topology, so a changing round enriches at least one value: the number
+    # of SSA values (plus call operands) bounds the rounds.
+    guard = BoundedFixedPoint(
+        "repository-shape-settlement",
+        bound_for(
+            "settlement",
+            functions=len(module.functions),
+            nodes=sum(
+                len(instruction.args) + 1
+                for function in module.functions.values()
+                for block in function.blocks.values()
+                for instruction in block.instrs
+            ),
+        ),
+        scope=("whole-program",),
+    )
     changed_any = False
     while True:
         changed = propagate_repository_ssa_call_metadata(module)
         changed |= settle_shape_preserving_value_metadata(module)
         changed_any |= changed
+        guard.round(changed)
         if not changed:
             return changed_any
 
