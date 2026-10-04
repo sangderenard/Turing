@@ -3542,6 +3542,16 @@ def _build_shell_hierarchy_plan(
                 ]
                 parent_shapes = [record[1] for record in parent_records]
                 parent_dtypes = [record[2] for record in parent_records]
+                if operation == "cast_like" and len(parents) >= 2:
+                    # ``value.cast_like(reference)`` has the REFERENCE's
+                    # element dtype (AbstractTensor.cast_like: the destination
+                    # dtype is the reference operand's), not the domain's
+                    # default.  Left at the default every float32 solve typed
+                    # its one-hot selectors float64 while the formals they
+                    # feed were float32.
+                    reference_record = _shape_dtype_cache.get(parents[1])
+                    if reference_record is not None and reference_record[1]:
+                        dtype = reference_record[1]
                 # DomainNode historically pads scalars with unit axes. If it
                 # says scalar but a canonical tensor op consumes a shaped
                 # tensor, carry that shape through.

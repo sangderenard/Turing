@@ -4921,6 +4921,27 @@ def emit_ssa_module_to_c(
                     # and the LU divided by a zero pivot (NaN).  The LLVM lane
                     # emits the same cast as a loop over the span.
                     shape = tuple(instruction.res.shape or ())
+                    if (
+                        shape
+                        and not tuple(instruction.args[0].shape or ())
+                        and all(isinstance(extent, int) and extent == 1 for extent in shape)
+                        and not _pointer_value_depth(instruction.args[0])
+                    ):
+                        # A scalar converted to the one-element column its
+                        # result descriptor states (``(row * hot).sum(dim=-1)``
+                        # narrowed to float32 in solve's back substitution):
+                        # one element, so the source IS the value, not a span.
+                        target_type = buffer_type(instruction.res)
+                        storage = activation_array(target_type, 1)
+                        converted = (
+                            f"(({args[0]}) != 0)" if instruction.res.dtype == "bool"
+                            else f"({target_type})({args[0]})"
+                        )
+                        body.append(f"        {storage}[0] = {converted};")
+                        expressions[result_id] = storage
+                        addresses[result_id] = storage
+                        address_buffer_types[result_id] = target_type
+                        continue
                     if shape:
                         if shape != tuple(instruction.args[0].shape or ()) or any(
                             not isinstance(extent, int) or extent < 0 for extent in shape
