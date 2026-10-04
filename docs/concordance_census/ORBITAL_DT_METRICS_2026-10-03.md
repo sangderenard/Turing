@@ -145,6 +145,52 @@ was `6.30571983518e-16 rad/s`, below its `1e-12` bound. The controller grows
 back to full-window steps after the spin stops; high retry cost during spin
 is a separate unresolved proposal issue.
 
+Further baseline evidence: the complete 150-second wheel reversal/coast
+angular-momentum test passed its unchanged assertions after 192,625 attempts,
+with worst drift `3.6959222772e-13 Nms` (relative `3.515e-14`, versus its
+`1e-3` bound). Desaturation passed over 60 seconds / 1,216 attempts: wheel
+speed `596.9 -> 447.566 rad/s`, hydrazine consumption `0.0135 kg`, and worst
+body rate `7.22858432220e-4 rad/s < 2e-3`. The enclosing four-test batch was
+subsequently stopped during the ordinary untrimmed burn, whose last printed
+point was 5 seconds / 26,702 attempts. That batch has no final pytest summary;
+the ordinary burn and queued empty-initial cutoff are not counted as passes.
+Its sampled memory peak was 2,502,717,440 bytes. Those unfinished assertions
+will run after the controller correction rather than duplicating the costly
+old proposal behavior.
+
+A separate near-empty physical cutoff gate passes in 28.80 s on the same
+cached c0 bank. It begins with `0.002 kg` MMH and `0.004 kg` NTO. At one
+second MMH is exactly zero, NTO is `0.0007000000000000003 kg` and main impulse
+is `16.11232595 Ns`. Subsequent windows retain exactly the same tanks,
+impulse and mass while the main remains commanded ON; supply is zero. The
+existing `1e-12` stoichiometric/impulse and `1e-13` mass tolerances remain.
+The first fixture used 396 kg NTO; subtracting nearly equal endpoint charges
+lost `2.43e-14 kg`, obscuring a relative ratio of a milligram-scale draw.
+Using the still-nonlimiting smaller NTO charge resolves that test-observation
+cancellation without changing a law, native layout, or tolerance.
+
+## Remaining full-native coordinator boundary
+
+These flight gates use the existing Python dt coordinator with compiled
+physical pieces. They do not prove that the entire coordinator compiles.
+The authoritative native entry remains `examples/llvm_dt_system.py`'s
+`dt_system_over`, lowered by `lowered_system` through
+`lower_ast_source_to_ssa` with `dt_system_contract` and the full-native
+execution overlay. No alternate runner or extraction contract is substituted.
+
+The historical conditional-guard/Phi fixes have source-lowering evidence on
+the recorded small b/d/e variants, but the last recorded full run still
+stopped on the `Metrics.unresolved_report` call-result arena. The base YAML
+already declares this mutable token table; the unresolved issue is carrying
+its physical ABI through the returned record, not a missing base field.
+The old `fv/repro_field_version_loop.py` and `fv/repro_d.py` scratch files are
+absent from this checkout. Tracked `tools/repro_step_with_dt_control_used.py`
+and `tools/repro_run_superstep.py` lower real helper source with a fake advance,
+but do not compile/execute the authoritative full-native entry. Nearby native
+scalar-return and record-return tests do not cover this nested table-field
+arena end to end. See `CONTINUATION_dt_full_native.md` and
+`CONTINUATION_dt_compile_stall.md` for the historical receipts.
+
 ## Initial source audit (before the integration correction)
 
 This initial source audit covers `engine_toy/orbital_jumper.py`,
