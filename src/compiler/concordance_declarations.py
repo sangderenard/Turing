@@ -877,6 +877,9 @@ KERNEL_INPUT_CONVERSION = declare_page("kernel_input_conversion", (
     RowField("function", K.SCOPE), RowField("block", K.NAME),
     RowField("result", K.VALUE_ID), RowField("position", K.INDEX),
 ), tuple)                              # mode REVISE
+#: A scalar operand promoted at a repository kernel's input whose
+#: ``ssa_value`` cell the book does not hold.
+KERNEL_OPERAND_NOT_ON_BOOK = declare_reason("kernel_operand_not_on_book")
 PRECISION_CHANNEL_SHAPE = declare_page("precision_channel_shape_concordance", (
     RowField("function", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), tuple)                              # mode CONCORD

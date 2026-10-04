@@ -3590,6 +3590,12 @@ def _build_shell_hierarchy_plan(
                 if operation in {
                     "sum", "prod", "min", "max", "any", "all",
                     "unsqueeze", "squeeze",
+                    # ``cast_like`` keeps its VALUE's extents (its reference
+                    # operand only names the dtype), so broadcasting the
+                    # parents' shapes would answer the reference's; a scan
+                    # keeps its operand's.  Both are settled by the
+                    # descriptor.
+                    "cast_like", "cumsum", "cumprod",
                 }:
                     # The result extents of a reduction or an axis insertion
                     # are settled by the graph's tensor descriptor
@@ -19319,6 +19325,36 @@ def descriptor_states_a_shape(descriptor: Any) -> bool:
     ) != "unknown"
 
 
+#: The dtype a ``range`` loop target carries.  Python's ``range`` yields
+#: ``int``; the loop composer's carried index is the SSA ``int`` scalar.
+_ARITHMETIC_LOOP_TARGET_DTYPE = "int"
+
+
+def _arithmetic_loop_target_owner(graph: Any, node_id: int) -> int | None:
+    """The ``For`` node whose single arithmetic-sequence (``range``) target
+    Input ``node_id`` is, else None.  The target's integer dtype is that
+    loop's declaration (``iterator_kind``), read here by attribute."""
+
+    data = graph.G.nodes.get(int(node_id)) or {}
+    if data.get("type") != "Input" or (
+        data.get("attributes") or {}
+    ).get("binding_kind") != "loop":
+        return None
+    target_value = int(data.get("value_id", node_id))
+    for loop_id, loop_data in graph.G.nodes(data=True):
+        attributes = loop_data.get("attributes") or {}
+        if attributes.get("iterator_kind") != "arithmetic_sequence":
+            continue
+        targets = [
+            int(value) for value in dict(
+                attributes.get("loop_target_bindings") or {}
+            ).values()
+        ]
+        if len(targets) == 1 and targets[0] in {int(node_id), target_value}:
+            return int(loop_id)
+    return None
+
+
 def _tensor_descriptor(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -19375,6 +19411,10 @@ def _tensor_descriptor(
                     "matmul", "dot", "sum", "mean", "prod", "min", "max",
                     "any", "all", "argmin", "argmax",
                     "zeros", "ones", "empty", "full",
+                    # Shape-preserving operators whose catalogue descriptor
+                    # (the graph domain's scalar default) predates this
+                    # callsite's operands.
+                    "cast_like", "cumsum", "cumprod",
                 }
                 | _ELEMENTWISE_BINARY_OPERATIONS
             )
@@ -19488,6 +19528,24 @@ def _tensor_descriptor(
                 }
             )
             if answer is not None:
+                source_cells: tuple = ()
+                loop_owner = _arithmetic_loop_target_owner(graph, int(node_id))
+                if not semantic_sources and loop_owner is not None:
+                    # A ``range`` target is the loop's own product: the edge
+                    # comes from the ``For`` node, derived from its identity
+                    # cell, not from a descriptor root.
+                    from ..common.tensors.topological_reducer import (
+                        node_identity_cell,
+                    )
+
+                    semantic_sources = ((
+                        loop_owner,
+                        int(graph.G.nodes[loop_owner].get(
+                            "value_id", loop_owner
+                        )),
+                        "loop_target",
+                    ),)
+                    source_cells = (node_identity_cell(graph, loop_owner),)
                 if not semantic_sources:
                     semantic_sources = ((
                         int(node_id), ("descriptor_root", int(node_id)),
@@ -19501,6 +19559,7 @@ def _tensor_descriptor(
                         source_state=concordant_shape_transformation_state(
                             row[0], source_value,
                         ),
+                        source_cells=source_cells,
                         target_state=answer,
                         role=source_role,
                     )
@@ -19742,6 +19801,7 @@ def _tensor_descriptor_rule(
                 "matmul", "dot", "sum", "mean", "prod", "min", "max",
                 "any", "all", "argmin", "argmax",
                 "zeros", "ones", "empty", "full",
+                "cast_like", "cumsum", "cumprod",
             }
             | _ELEMENTWISE_BINARY_OPERATIONS
         )
@@ -19862,6 +19922,13 @@ def _tensor_descriptor_rule(
         )
 
         target_value = int(data.get("value_id", node_id))
+        if _arithmetic_loop_target_owner(graph, int(node_id)) is not None:
+            # ``for k in range(...)``: ``k`` is a Python int scalar, whatever
+            # the tensors it is later compared with.
+            return {
+                "shape": (), "dtype": _ARITHMETIC_LOOP_TARGET_DTYPE,
+                "rank": 0,
+            }
         for loop_id, loop_data in graph.G.nodes(data=True):
             targets = [
                 int(value) for value in dict(
@@ -20629,6 +20696,42 @@ def _tensor_descriptor_rule(
             )
             if len(parents) == 1:
                 return _tensor_descriptor(graph, parents[0], seen)
+        if operation == "cast_like":
+            # ``value.cast_like(reference)`` keeps the VALUE's extents and
+            # takes the REFERENCE's dtype.  Neither operand is optional: with
+            # no rule here the result was never proven, so a consumer such as
+            # the ``cumsum`` of ``_first_occurrence`` read a rank-0 scalar,
+            # its tensor lowering declined (no extents), and the op reached
+            # the LLVM emitter as an un-lowered ``cumsum``.
+            operand_roles = {"operand", "value", "base", "self", "receiver"}
+            parents = tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) not in {"callee", "func", "definition"}
+                and int(parent) in graph.G
+            )
+            by_role = tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role).casefold() in operand_roles
+                and int(parent) in graph.G
+            )
+            references = tuple(
+                parent for parent in parents if parent not in by_role
+            )
+            if len(by_role) == 1 and len(references) == 1:
+                value_descriptor = _tensor_descriptor(graph, by_role[0], seen)
+                reference_descriptor = _tensor_descriptor(
+                    graph, references[0], seen
+                )
+                if value_descriptor is not None and descriptor_states_a_shape(
+                    value_descriptor
+                ):
+                    result = dict(value_descriptor)
+                    if (
+                        reference_descriptor is not None
+                        and reference_descriptor.get("dtype")
+                    ):
+                        result["dtype"] = reference_descriptor["dtype"]
+                    return result
         if operation in _DTYPE_CAST_OPERATIONS:
             # ``x.to_dtype("int64")`` preserves the shape exactly and only
             # changes the element type.  Leaving it descriptor-less made
@@ -20664,8 +20767,25 @@ def _tensor_descriptor_rule(
                     def _literal_dtype(candidate: int) -> str | None:
                         # The dtype argument may be a computed call --
                         # ``other.get_dtype()`` -- which carries no literal at
-                        # all.  That is not an error: the cast then keeps the
-                        # operand's dtype, which is what the source means.
+                        # all.  ``get_dtype`` of a tensor IS that tensor's
+                        # descriptor dtype, so name it from the tensor it
+                        # reads; otherwise the cast would keep the OPERAND's
+                        # dtype (a bool comparison cast to the matrix's dtype
+                        # stayed bool, and every consumer inherited it).
+                        candidate_data = graph.G.nodes[candidate]
+                        if str(candidate_data.get("op") or "") == "get_dtype":
+                            readers = tuple(
+                                int(reader) for reader, _role
+                                in candidate_data.get("parents") or ()
+                                if int(reader) in graph.G
+                            )
+                            if len(readers) == 1:
+                                read = _tensor_descriptor(
+                                    graph, readers[0], seen
+                                )
+                                if read is not None and read.get("dtype"):
+                                    return str(read["dtype"])
+                            return None
                         try:
                             literal = _constant_value(graph.G.nodes[candidate])
                         except (KeyError, TypeError, ValueError):

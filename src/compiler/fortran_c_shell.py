@@ -42430,6 +42430,17 @@ def _class_surface_ssa_program(
             _storage = str(_fact[3] or "")
             for _value in {id(value): value for value in _values}.values():
                 _existing = tuple(_value.shape or ())
+                # A region call's argument is the region formal's own view of
+                # the fed storage: ``feed_shapes`` declares its extents, and
+                # ``ssa_region_feed`` names it.  Its id is the storage
+                # owner's, so the owner's shape is not its shape (a
+                # ``hot.unsqueeze(-1)`` feed is (2, 1) over a (2,) owner);
+                # restamping it is the failure ``ssa_storage_view`` exists to
+                # prevent.
+                if _existing and (_value.accounting or {}).get(
+                    "ssa_region_feed"
+                ) is not None:
+                    continue
                 if _existing and _existing != _shape:
                     raise ValueError(
                         "concorded source/SSA shape disagreement for "

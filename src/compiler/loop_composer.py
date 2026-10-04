@@ -943,6 +943,9 @@ def evaporate_unrolled_loops(
         for member in group:
             nested_groups[int(member.loop.node_id)] = group
     evaporated: list[LoopPlan] = []
+    # carried ``updated`` (the body's last binding of a name) -> the value the
+    # unrolled copies leave the name holding after the loop.
+    carried_finals: dict[int, int] = {}
     deployment_regions = list(
         graph.G.graph.get("control_deployment_regions", ())
     )
@@ -1361,6 +1364,8 @@ def evaporate_unrolled_loops(
             # later as "missing ProcessGraph input" with no loop plan left
             # to explain it.
             final_value = last_mapping.get(int(updated), int(_initial))
+            if int(final_value) != int(updated):
+                carried_finals[int(updated)] = int(final_value)
             _replace_parent_value(
                 graph,
                 next(
@@ -1591,6 +1596,39 @@ def evaporate_unrolled_loops(
         from .concordance_declarations import LOOP_COMPOSER
         from .glsl_deployment_strategy import _post_identity_table_mutation
 
+        # The name's loop-exit version (the body's last binding) is the value
+        # its last unrolled copy produced: a ``name_binding`` ALIAS row from
+        # the evaporated version to that copy.  Without it the version leaves
+        # the table with its node and the name's history ends at the pre-loop
+        # value, so the authored output of ``y = b; for ..: y = f(y); return y``
+        # names the pre-loop ``y``.
+        def settled_final(value_id: int) -> int:
+            seen = {value_id}
+            while value_id in carried_finals:
+                value_id = carried_finals[value_id]
+                if value_id in seen:
+                    break
+                seen.add(value_id)
+            return value_id
+
+        final_aliases = {
+            int(value_id): settled_final(int(value_id))
+            for value_ids in identities.values()
+            for value_id in value_ids
+            if int(value_id) in carried_finals
+            and settled_final(int(value_id)) in graph.G
+        }
+        if final_aliases:
+            _post_identity_table_mutation(
+                graph, aliases=final_aliases, stage=LOOP_COMPOSER,
+            )
+            identities = {
+                name: tuple(
+                    final_aliases.get(int(value_id), int(value_id))
+                    for value_id in value_ids
+                )
+                for name, value_ids in identities.items()
+            }
         _post_identity_table_mutation(graph, removed=(
             int(value_id)
             for value_ids in identities.values()

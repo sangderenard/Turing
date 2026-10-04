@@ -1945,6 +1945,44 @@ def settle_repository_ssa_shape_metadata(module: IRModule) -> bool:
             return changed_any
 
 
+def _post_scalar_kernel_input_conversion(
+    book: Any, function: Any, block_name: str, consumer_id: int,
+    operand_position: int, source: SSAValue, converted: SSAValue,
+) -> None:
+    """One ``kernel_input_conversion`` row for a scalar promoted at the
+    input of ``binary_scalar_double``: (function scope, block, consumer
+    result, operand position) -> (source id, converted id, source dtype,
+    target dtype, callee), DERIVED from the source's ``ssa_value`` cell;
+    ``Unsourced(KERNEL_OPERAND_NOT_ON_BOOK)`` when the book holds none."""
+
+    from .concordance_declarations import (
+        KERNEL_INPUT_CONVERSION, KERNEL_OPERAND_NOT_ON_BOOK,
+        TENSOR_SSA_LOWERING,
+    )
+    from .identity_concordance import Derived, Mode, Unsourced
+    from .ssa_record_return_state import (
+        function_scope_of, ssa_value_identity_cell,
+    )
+
+    cell = ssa_value_identity_cell(function, source.id, book=book)
+    row = (
+        function_scope_of(function), str(block_name), int(consumer_id),
+        int(operand_position),
+    )
+    fact = (
+        int(source.id), int(converted.id), str(source.dtype), "float64",
+        "binary_scalar_double",
+    )
+    book.post(
+        KERNEL_INPUT_CONVERSION, row, fact, stage=TENSOR_SSA_LOWERING,
+        provenance=(
+            Unsourced(KERNEL_OPERAND_NOT_ON_BOOK) if cell is None
+            else Derived((cell,))
+        ),
+        mode=Mode.REVISE,
+    )
+
+
 def lower_tensor_calls_to_repository_ssa(
     module: IRModule,
     reference: SSATensorCodeReference,
@@ -3812,8 +3850,22 @@ def lower_tensor_calls_to_repository_ssa(
                     # bytes.
                     view_shape = tuple(result.shape) or tuple(source.shape)
                     view_accounting = dict(source.accounting or {})
-                    if view_shape and tuple(source.shape or ()) and (
-                        tuple(view_shape) != tuple(source.shape or ())
+                    if view_shape and (
+                        (
+                            tuple(source.shape or ())
+                            and tuple(view_shape) != tuple(source.shape or ())
+                        )
+                        # ``unsqueeze`` adds an axis, so its result differs
+                        # from its source by construction even while the
+                        # source's extents are still unsettled here (a call
+                        # result whose shape the concordance proves later).
+                        # Left unflagged, the alias carried the view's shape
+                        # under the owner's id and the module-wide settlement
+                        # then reported a disagreement with the owner.
+                        or (
+                            not tuple(source.shape or ())
+                            and str(operation) == "unsqueeze"
+                        )
                     ):
                         view_accounting["ssa_storage_view"] = {
                             "storage_value_id": int(source.id),
@@ -5484,6 +5536,18 @@ def lower_tensor_calls_to_repository_ssa(
                                                 "scalar_kernel_operand": True,
                                             },
                                         ))
+                                        # The promotion is a conversion at THIS
+                                        # kernel's input (Python keeps an int
+                                        # an int; the comparison promotes it):
+                                        # a ``kernel_input_conversion`` row
+                                        # DERIVED from the scalar's
+                                        # ``ssa_value`` cell.
+                                        _post_scalar_kernel_input_conversion(
+                                            book, function, str(block_name),
+                                            int(result.id),
+                                            int(scalar_position), scalar,
+                                            promoted,
+                                        )
                                         scalar = promoted
                                     reverse, reverse_def = constant(
                                         1 if scalar_position == 0 else 0, "int32"

@@ -144,3 +144,63 @@ region formal is float64 even though the loop index is int. With a literal k at 
 materialised as a double and everything matches, which is why every non-loop stage matches.
 The failing lines (linalg.py:206, :237) are inside the other agent's diff only in their `.cast_like` tail; the `== position`
 and `>= k` comparisons themselves are unchanged by it. Not fixed.
+
+## 2026-10-04 (loop-index dtype fix): the formal was defaulted float64; fixed at the descriptor
+
+Repro (seconds, no clang for `ssa`): `python tools/compiler_probes/probe_loop_index_dtype.py {ssa|run}`.
+`for k in range(count): total = total + pick(t, k) * (k + 1)`, `pick = (t == k).cast_like(t)`, t=[0,1,2].
+Before: native [1,0,0] vs [1,2,3]; callee region_0 took value 0 (`k`) as float64 while the function-level
+Call fed the caller's `int` Phi; no Cast. (A literal `range(3)` unrolls to literal k per copy and hides it.)
+
+Decision (read-only sys.settrace hook on `_value_shape_dtype.declared`, glsl_deployment_strategy.py ~3394):
+`dtype = tensor.get("dtype") or specialization.dtype or node.dtype or domain.dtype or "float64"`. The callee
+formal Input `k` has none of the first four, so `or "float64"` settles it. Why no actual reaches it:
+`_callsite_specialized_shell_type` builds `tensor_descriptors` from `_tensor_descriptor(caller, actual)`; the
+caller's loop target (Input, `binding_kind=loop`, For `iterator_kind=arithmetic_sequence`) answered None, so only
+`t` was passed (hook: `descs {'t': ...}`). An ABI int scalar (`count`) already answered {shape (), int64} and works.
+
+Fix (glsl_deployment_strategy.py, `_tensor_descriptor_rule` + `_tensor_descriptor`):
+- `_arithmetic_loop_target_owner` (~19333) names the single-target `range` For of an Input; the rule (~19925) answers
+  `{shape (), dtype "int", rank 0}` ("int" = the loop Phi's SSA dtype). It rides the existing channel:
+  `_apply_callsite_tensor_descriptors` stamps the copy's formal, `formal_shape` rows, `_value_shape_dtype` reads it.
+- Edge: in `_tensor_descriptor` (~19532) the answer's `graph_tensor_descriptor` shape transformation for such a
+  target comes from the For node (`loop_target` role, `source_cells=(node_identity_cell(For),)`), not a
+  `descriptor_root` (unsourced). Oscillator audit unsourced 2820 -> 2818.
+- Conversion at the comparison: the existing scalar-kernel Cast (tensor_ssa_lowering.py ~5545, `binary_scalar_double`)
+  now posts a `kernel_input_conversion` row (function scope, block, consumer result, operand position) ->
+  (src id, converted id, src dtype, float64, callee), mode REVISE, stage TENSOR_SSA_LOWERING, Derived from the
+  scalar's `ssa_value` cell; `Unsourced(KERNEL_OPERAND_NOT_ON_BOOK)` (new reason, concordance_declarations.py:886)
+  when the book holds none. `_post_scalar_kernel_input_conversion` at tensor_ssa_lowering.py:1948.
+Result: callee region_0 now has `Cast int -> float64` before `binary_scalar_double`; repro native [1,2,3], err 0.
+
+Solve after fix: `probe_solve_c_lane.py llvm 2x2` PRODUCED [1,2] vs [0.1,0.6] (max err 1.4); `3x3tie` PRODUCED
+[1,2,3] vs [0.833,-1.667,1.167] (max err 3.667). NEW stage state (probe_solve_bisect.py 2x2): lu_U, lu_P, lu_sign,
+loop_hot, loop_after, loop_parity, pivot_mask, pb all MATCH eager (LU is now correct). FIRST WRONG STAGE NOW:
+y_forward (`_forward_substitute`, linalg.py:318): native [1,2] = Pb unchanged vs eager [1,1.5]; inputs LU and Pb
+match, so the `for i in range(n)` y update (`y * (1 - hot_i) + hot_i * solved`) is not applied. Not chased
+(different mechanism: the emitted IR has no remaining scalar `load double` of an index). loop_pivot (a non-carried
+loop temp returned after the loop) still reads [0,0] vs [0,1]; lu_U is correct so it is the post-loop read of a
+per-iteration temp, not LU. Gates: test_native_scalar_loss_adjoint 2 passed; test_ssa_record_return_state 22 passed;
+test_record_return_site_identity 14 passed 1 xfailed; test_symbolic_structural_constants 2 passed;
+test_compiled_linalg eigh passed; audit findings 0,1,0,1,5,0,0 unchanged. NOTE: C: drive hit 0 bytes free mid-run
+(an "IO failure on output stream" in one pytest compile); freed this session's own build/ dirs; rerun passed.
+
+## 2026-10-04 (y_forward): an evaporated loop's carried name lost its loop-exit version
+
+Repro (seconds): `python -u tools/compiler_probes/probe_loop_update_lost.py {c|g|b|a}`; `c` is
+`y = b.clone(); for i in range(2): y = y + 1; return y` (native [1,2] vs eager [3,4]); `a` is the real
+`_forward_substitute`. Not specific to substitution: any literal/static `range` loop carrying one name.
+Cause (read-only trace): the reducer's canonical `identity_table['y']` is (3,6,6) (initial, body binding,
+`authored=False` loop-exit binding = the body's `updated`). `loop_composer.evaporate_unrolled_loops` unrolls the loop
+into clones (ids 10,13), redirects the consumers of `updated` to the last clone (`final_value`) but never says the
+NAME moved: `updated` (6) leaves the graph, the table filter at the end of the function drops it, history = (3,),
+`named_output_histories` (precompile_to_ssa.py ~11097) resolves `y` -> 3 = the pre-loop value, and the Ret carries
+(3, 13) with the authored output first. Native returned the input unchanged.
+Fix (src/compiler/loop_composer.py, evaporate_unrolled_loops): `carried_finals[updated] = final_value` where the
+redirect is already computed; before the table filter, a `name_binding` ALIAS row (existing
+`_post_identity_table_mutation(aliases=..., stage=LOOP_COMPOSER)`: REVISE, Derived from the previous cell + the final
+copy's identity cell) revises the evaporated version to the final copy, and the dict follows.
+Measured: probe c/g/b/a all MATCH (err 0). probe_solve_bisect 2x2 y_forward [1,1.5], x_back [0.1,0.6] MATCH;
+probe_solve_c_lane llvm 2x2 and 3x3tie MATCH NumPy (max abs err 0.0 both). Gates: scalar_loss_adjoint 2 passed;
+ssa_record_return_state 22 passed; record_return_site_identity 14 passed 1 xfailed; compiled eigh passed;
+test_precompile_to_ssa 13 failed 91 passed (baseline 13); audit unsourced 2818 (unchanged).
