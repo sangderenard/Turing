@@ -17,8 +17,12 @@ correction is committed as `cf78f24f` and its finite-headroom correction `6a879d
 The ordinary 20-second burn plus cutoff also passes. The guarded longer batch
 finishes four passed / one failed in 1,778.19 s at a 2.507 GB peak. A separate
 empty-tank diagnostic exposes an initial mass reduction differing from the
-canonical native mass by two ULP. Supply/initialization corrections,
-frame-partition and game acceptance remain pending. Detailed trace and measured gates:
+canonical native mass by two ULP. The lower-cost validation of the proposed
+supply correction still fails in 99.10 s with the same exact-one mismatch;
+only its new diagnostics piece compiled, after all 27 existing c0 pieces
+passed their recorded source-hash checks. The test stops before the empty-tank
+case, so initialization acceptance also remains pending. Frame-partition and
+game acceptance remain pending. Detailed trace and measured gates:
 [`concordance_census/ORBITAL_DT_METRICS_2026-10-03.md`](concordance_census/ORBITAL_DT_METRICS_2026-10-03.md).
 
 Verified Turing changes: appended metric-channel transport (`3202f8ba`),
@@ -70,9 +74,15 @@ passes five source-equivalence checks and restores the two exact-zero native
 cells. Its native numerical gate still fails: finite-fuel momentum derivatives
 with respect to propellant mass differ by 348, 6 and 7 ULP against the independent
 original-law reference. The bound remains four ULP. Existing AbstractTensor
-`Precision.of` enrichment is being traced before forward products and reverse
-rule operations; a precision setting for this reverse-motion path has not yet
-been connected. No production planner row bank or game acceptance is claimed.
+`Precision.of` enrichment before forward products and reverse rule operations
+has no complete native result. At the user's cost/progress checkpoint, the
+unverified compiler experiment was preserved in
+[`precision_experiment_2026-10-03`](concordance_census/precision_experiment_2026-10-03/README.md)
+and only its owned changes were reverse-applied. The working compiler is back
+to its pre-experiment contents. Expensive workers are stopped. The single Luna
+worker at medium reasoning completed the failed supply check above and stopped
+after a bounded read-only quotient inspection. No production planner row bank
+or game acceptance is claimed.
 
 Adaptive growth is now the default in the existing dt entry points, and the
 LLVM-piece bridge carries the graph's growth choice into its owned state and

@@ -16,6 +16,40 @@ sections record the ownership trace, verified compiler commits, failures,
 and measured gates. The first section preserves the audit that motivated
 the correction; its missing-publication findings describe the old source.
 
+## Lower-cost validation checkpoint
+
+After the user's request to reduce model intensity, high-cost workers stopped
+and the unverified reverse-precision experiment was parked in
+[`precision_experiment_2026-10-03`](precision_experiment_2026-10-03/README.md).
+Only its owned compiler edits were reverse-applied. One Luna worker at medium
+reasoning checked the existing craft bank and the proposed supply correction.
+
+All 27 c0/b1 runtime pieces pass `piece_staleness` against their own recorded
+module hashes. A fresh `route_compiler_record` aggregate is not a comparison
+baseline: its module set depends on the process's import closure. No cache
+validation bypass was used. The original supply test then compiled only the
+new diagnostic key `7f378bc5f01feaafa33ed1b0` and **failed in 99.10 s**:
+full supply remains `0.9999999999999999`, not exactly one. The cancellation-only
+source edit is therefore not a verified correction. The combined test again
+stopped before its empty-tank assertions, so the mass initialization change
+still lacks that native acceptance result.
+
+The process ran under the existing 6,000,000,000-byte / 600-second guard.
+One live max(working set, private bytes) sample was 2,059,247,616 bytes; the
+worker lost its outer command-session handle, so a final sampled peak was not
+recovered and is not claimed. No larger build was launched. The nine-piece
+c0/t4/b1 spin-recovery cache is stale in `dt_controller`, `participants`, and
+`concordance_declarations`; its growth gate has not been rerun. Frame-partition,
+actual game flight and production collocation remain open.
+
+The final bounded read-only inspection found reciprocal `fdiv 1.0, denominator`
+operations followed by products in the new diagnostic LLVM. This supports a
+remaining reciprocal-rounding hypothesis, but the worker did not connect an
+individual SSA reciprocal to the supply output or recover its exact runtime
+operands. That chain is still incomplete; no compiler defect or further fix is
+claimed. The worker stopped after reporting this limit. All high-cost workers
+and native processes are stopped at this checkpoint.
+
 ## Compiler audit archives and runtime retention
 
 The user elected disk storage for the full compiler books instead of raising
