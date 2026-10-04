@@ -42,6 +42,7 @@ from ..transmogrifier.graph.edge_roles import (
     ordered_arguments,
     positional_argument_index,
 )
+from .bounded_fixed_point import BoundedFixedPoint, bound_for
 from .fortran_toolchain import (
     aggressive_c_flags,
     aggressive_fortran_flags,
@@ -31609,6 +31610,22 @@ def _class_surface_ssa_program(
         ).hexdigest()
 
     frame_states = {frame_fixed_point_digest(): 0}
+    frame_guard = BoundedFixedPoint(
+        "frame-fixed-point",
+        bound_for(
+            "frame",
+            functions=len(all_functions),
+            call_operands=sum(
+                len(instruction.args)
+                for function in all_functions.values()
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Call", "call"}
+            ),
+            records=sum(len(table.records) for table in all_record_tables.values()),
+        ),
+        scope=("whole-program",), progress=report, recurrence="record",
+    )
     changed = True
     while changed:
         changed = False
@@ -36556,6 +36573,9 @@ def _class_surface_ssa_program(
                 changed = False
             else:
                 frame_states[digest] = frame_round
+        # Recurrence is the incumbent_on_equal_priority branch above; the
+        # guard adds the receipt row, progress line and the size bound.
+        frame_guard.round(changed)
         report(
             f"ssa-frame round {frame_round} complete; changed={changed}"
         )
