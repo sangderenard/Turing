@@ -18169,6 +18169,33 @@ def _propagate_callsite_tensor_specializations(
         digest = hashlib.sha256(repr(tuple(facts)).encode("utf-8")).hexdigest()
         return digest[:16], tensor_fact_count
 
+    def _planner_progress(message: str) -> None:
+        if _progress is not None:
+            _progress({
+                "specialization_state": "fixed-point-guard",
+                "message": message,
+            })
+
+    from .bounded_fixed_point import BoundedFixedPoint, bound_for
+
+    specialization_guard = BoundedFixedPoint(
+        "callsite-specialization",
+        bound_for(
+            "planner",
+            nodes=sum(item.G.number_of_nodes() for item in graphs),
+            callsites=sum(
+                1
+                for item in graphs
+                for _node_id, data in item.G.nodes(data=True)
+                if (data.get("attributes") or {}).get("callee_ref")
+                is not None
+                or (data.get("attributes") or {}).get("method_ref")
+                is not None
+            ),
+        ),
+        scope=("whole-program",), progress=_planner_progress,
+        state=specialization_state()[0],
+    )
     changed = True
     while changed:
         round_index += 1
@@ -18687,6 +18714,7 @@ def _propagate_callsite_tensor_specializations(
                 "oscillating_rows": len(oscillating_rows),
                 **mutation_counts,
             })
+        specialization_guard.round(changed, state=state_digest)
 
 
 def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
