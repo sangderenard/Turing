@@ -347,13 +347,18 @@ def _catalog_maps(
 ) -> tuple[dict[str, Mapping[str, Any]], dict[str, str]]:
     by_name: dict[str, Mapping[str, Any]] = {}
     handler_to_name: dict[str, str] = {}
+    handler_names: dict[str, list[str]] = {}
     for entry in catalog:
         name = entry.get("name")
         if isinstance(name, str) and name not in by_name:
             by_name[name] = entry
         handler = entry.get("handler")
         if isinstance(handler, str) and isinstance(name, str):
-            handler_to_name.setdefault(handler, name)
+            handler_names.setdefault(handler, []).append(name)
+    handler_to_name = {
+        handler: names[0] for handler, names in handler_names.items()
+        if len(names) == 1 and handler != "Call"
+    }
     return by_name, handler_to_name
 
 
@@ -578,10 +583,16 @@ def canvas_from_regions(
                 for operand in instr.args:
                     if operand.id in arg_ids and operand.id not in pushed_args:
                         pull_through(arg_ids.index(operand.id))
-                canonical = (
-                    instr.op if instr.op in by_name
-                    else handler_to_name.get(instr.op)
-                )
+                if instr.op == "Call":
+                    named = (instr.attributes or {}).get("tensor_operation")
+                    canonical = (
+                        named if isinstance(named, str) and named in by_name else None
+                    )
+                else:
+                    canonical = (
+                        instr.op if instr.op in by_name
+                        else handler_to_name.get(instr.op)
+                    )
                 if canonical is None:
                     row_shortfalls.append(CanvasShortfall(
                         where,
@@ -897,9 +908,15 @@ def _same_program(
     for instr in block.instrs:
         if instr.op == "Ret":
             continue
-        canonical = (
-            instr.op if instr.op in by_name else handler_to_name.get(instr.op)
-        )
+        if instr.op == "Call":
+            named = (instr.attributes or {}).get("tensor_operation")
+            canonical = (
+                named if isinstance(named, str) and named in by_name else None
+            )
+        else:
+            canonical = (
+                instr.op if instr.op in by_name else handler_to_name.get(instr.op)
+            )
         operand_ids = tuple(renumber.get(a.id, -1) for a in instr.args)
         if instr.res is not None:
             renumber[instr.res.id] = counter
