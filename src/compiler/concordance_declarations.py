@@ -24,6 +24,7 @@ from enum import Enum
 from typing import Any, NamedTuple
 
 from .identity_concordance import (
+    IdentityLogLevel,
     Ref,
     RowField,
     RowFieldKind as K,
@@ -142,7 +143,7 @@ class ValueKind(Enum):
 SOURCE_SPAN = declare_page("source_span", (
     RowField("module", K.SCOPE), RowField("qualname", K.NAME),
     RowField("path", K.LABEL),
-), SpanFact)
+), SpanFact, rows_level=IdentityLogLevel.FULL)
 CONTRACT_DEMAND_PAGE = declare_page("contract_demand", (
     RowField("kind", K.LABEL), RowField("identity", K.NAME),
 ), DemandFact)
@@ -151,11 +152,11 @@ INGESTION_VALUE = declare_page("ingestion_value", (
 ), NodeFact)
 CANONICAL_VALUE = declare_page("canonical_value", (
     RowField("read_scope", K.SCOPE), RowField("canonical_id", K.VALUE_ID),
-), tuple)
+), tuple, rows_level=IdentityLogLevel.FULL)
 NAME_BINDING = declare_page("name_binding", (
     RowField("read_scope", K.SCOPE), RowField("name", K.NAME),
     RowField("version", K.INDEX),
-), BindingFact)
+), BindingFact, rows_level=IdentityLogLevel.FULL)
 CLASS_DECLARATION = declare_page("class_declaration", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
 ), ClassFact)
@@ -788,7 +789,7 @@ LEXICAL_READ_BINDING = declare_page("lexical_read_binding", (
 IDENTITY_TRANSITION = declare_page("identity_transition", (
     RowField("scope", K.SCOPE), RowField("consumer", K.LABEL),
     RowField("role", K.LABEL), RowField("ordinal", K.INDEX),
-), OperandTransition)                  # mode REVISE
+), OperandTransition, rows_level=IdentityLogLevel.FULL)  # mode REVISE
 SCOPE_ORIGIN = declare_page("scope_origin", (
     RowField("scope", K.SCOPE),
 ), ScopeFork)                          # mode CONCORD

@@ -46461,28 +46461,35 @@ def _lower_ast_source_to_ssa_impl(
 
 def _dump_identity_book_log(
     book: Any, *, name: str | None, entrypoint: str | None, ok: bool,
+    level: Any = None, extra_lines: tuple[str, ...] = (),
 ) -> None:
-    """Write this compile's dense identity-book log next to other build
-    artifacts.  Best-effort and silent on failure: logging must never mask
-    or replace the real compile result, only add to it -- the entire point
-    is a near-free receipt every compile leaves behind, not a gate on any
-    of them."""
+    """Write this compile's identity-book log next to other build
+    artifacts, streamed through lzma (``write_identity_log``) as
+    ``<label>.<stamp>.<ok|failed>.log.xz``.  The level is the caller's
+    ``identity_log_level=``, else ``TURING_IDENTITY_LOG_LEVEL``, else SUMMARY
+    for an OK compile and FULL for a FAILED one.  Best-effort and silent on
+    failure: logging must never mask or replace the real compile result,
+    only add to it -- the entire point is a near-free receipt every compile
+    leaves behind, not a gate on any of them."""
     if book is None or not book.pages:
         return
     try:
         import os
         import time
 
-        from .identity_concordance import render_identity_book
+        from .identity_concordance import (
+            resolve_identity_log_level, write_identity_log)
 
+        resolved = resolve_identity_log_level(level, ok=ok)
         directory = os.path.join("artifacts", "identity_logs")
         os.makedirs(directory, exist_ok=True)
         label = str(name or entrypoint or "compile")
         stamp = time.strftime("%Y%m%dT%H%M%S")
-        status = "ok" if ok else "failed"
-        path = os.path.join(directory, f"{label}.{stamp}.{status}.log")
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(render_identity_book(book))
+        write_identity_log(
+            book, os.path.join(directory, f"{label}.{stamp}"),
+            level=resolved, kind="ok" if ok else "failed",
+            extra_lines=extra_lines,
+        )
     except Exception:
         pass
 
@@ -46506,6 +46513,8 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     resumed_book = kwargs.pop("identity_book", None)
     if resumed_book is not None and getattr(resumed_book, "detached", False):
         resumed_book = None
+    identity_log_level = kwargs.pop("identity_log_level", None)
+    _log_summary: tuple[str, ...] = ()
 
     # Whole-program lowering can run for hours. Every major phase already
     # reports through this callback, but a missing callback used to discard
@@ -46585,6 +46594,16 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
             _unresolved = tuple(_table.findings(module))
         except Exception as _error:
             _unresolved = (f"detector failed: {_error}",)
+        # The detector's own findings are the SUMMARY log's diagnostics:
+        # already computed above, so the log asks nothing new of the book.
+        _log_summary = (
+            f"detector findings: {len(_unresolved)}",
+            *(
+                f"  {getattr(f, 'function', '?')} value "
+                f"{getattr(f, 'value_id', '?')} {getattr(f, 'detail', f)}"
+                for f in _unresolved[:12]
+            ),
+        )
         if _progress is not None:
             _progress(
                 "ssa-program: loop-result uses reconciled at the module "
@@ -46611,6 +46630,7 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
             entrypoint = args[1]
         _dump_identity_book_log(
             book, name=kwargs.get("name"), entrypoint=entrypoint, ok=ok,
+            level=identity_log_level, extra_lines=_log_summary,
         )
 
 

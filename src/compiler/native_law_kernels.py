@@ -219,8 +219,8 @@ def post_piece_book(directory: Any, piece_id: str, batch: int, key: str, *,
     DERIVED from that staleness row when the build is its rebuild, else a
     root (``piece_build``).  Returns the book."""
     from .identity_concordance import (
-        Derived, Mode, Novel, begin_identity_book, end_identity_book,
-        render_identity_book)
+        Derived, IdentityLogLevel, Mode, Novel, begin_identity_book,
+        end_identity_book, write_identity_log)
 
     vocabulary = _piece_vocabulary()
     row = (str(piece_id), int(batch), str(key))
@@ -248,8 +248,13 @@ def post_piece_book(directory: Any, piece_id: str, batch: int, key: str, *,
                 mode=Mode.CONCORD)
     finally:
         end_identity_book(token)
-    name = f"{piece_id}.book.log" if built is not None else f"{piece_id}.stale.book.log"
-    Path(directory, name).write_text(render_identity_book(book), encoding="utf-8")
+    # Streamed and compressed (``<piece_id>.book.log.xz``, or
+    # ``.stale.book.log.xz`` for a served stale piece); a piece event book is
+    # tiny, so it keeps every row.
+    kind = "book" if built is not None else "stale.book"
+    write_identity_log(
+        book, Path(directory, str(piece_id)), level=IdentityLogLevel.FULL,
+        kind=kind)
     return book
 
 

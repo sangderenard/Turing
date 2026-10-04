@@ -101,7 +101,7 @@ import contextvars
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from collections.abc import MutableMapping
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Any, Iterable, Mapping
 
 from .id_space import MINTED, group_by_prefix, has_flag, label as id_label
@@ -2878,13 +2878,31 @@ class RowField:
         return False
 
 
+class IdentityLogLevel(IntEnum):
+    """How much of a book the compile log keeps.  A page declares the
+    minimum level at which its ROWS are printed (``Page.rows_level``)."""
+
+    OFF = 0
+    SUMMARY = 1
+    FACTS = 2
+    FULL = 3
+
+
 @dataclass(frozen=True, repr=False)
 class Page:
-    """A declared page: its name, its row shape and the type of its facts."""
+    """A declared page: its name, its row shape and the type of its facts.
+
+    ``rows_level`` is the minimum log level at which the page's rows are
+    printed (the page's header line is printed from SUMMARY up).  It is a
+    logging declaration, not part of the page's shape: it does not take part
+    in equality, so declaring a page again never conflicts over it."""
 
     name: str
     row_fields: tuple[RowField, ...]
     fact_type: Any = object
+    rows_level: IdentityLogLevel = field(
+        default=IdentityLogLevel.FACTS, compare=False,
+    )
 
     def __repr__(self) -> str:
         return f"Page({self.name!r})"
@@ -2970,6 +2988,7 @@ class Registry:
         fact_type: Any = object,
         *,
         private: bool = False,
+        rows_level: IdentityLogLevel = IdentityLogLevel.FACTS,
     ) -> Page:
         fields = tuple(row_fields)
         if not isinstance(name, str) or not name:
@@ -2978,7 +2997,7 @@ class Registry:
             raise ConcordanceRefusal(
                 f"page {name!r}: row_fields must be a non-empty tuple of RowField"
             )
-        proposed = Page(name, fields, fact_type)
+        proposed = Page(name, fields, fact_type, IdentityLogLevel(rows_level))
         existing = self.pages.get(name)
         if existing is None:
             self.pages[name] = proposed
@@ -3045,14 +3064,14 @@ EDGE_PAGE = declare_page(
     "concordance_edge",
     (RowField("target", _SCOPE), RowField("source", _LABEL),
      RowField("stage", _NAME)),
-    bool, private=True,
+    bool, private=True, rows_level=IdentityLogLevel.FULL,
 )
 #: The same edges read from their source end: row ``(source_key,
 #: edge_row)`` so ``edges_out_of`` is one ``scope_rows`` read.
 DEPENDENTS_PAGE = declare_page(
     "concordance_dependents",
     (RowField("source", _SCOPE), RowField("edge_row", _LABEL)),
-    bool, private=True,
+    bool, private=True, rows_level=IdentityLogLevel.FULL,
 )
 #: One row per ``Novel`` post: ``(target_key, minted_id)`` with fact
 #: ``(transform, operands)``.  ``minted_id`` is None for a root row that
@@ -5333,13 +5352,101 @@ def row_value_id(row: Any) -> int | None:
     return None
 
 
-def render_identity_book(book: IdentityBook) -> str:
-    """Every page, every row, its full span history -- the dense log."""
-    lines = [f"identity book: {len(book.pages)} page(s)"]
+LOG_LEVEL_ENV = "TURING_IDENTITY_LOG_LEVEL"
+LOG_PRESET_ENV = "TURING_IDENTITY_LOG_LZMA_PRESET"
+#: Longest fact text a FACTS-level row keeps before the length marker.
+FACTS_FACT_WIDTH = 240
+_DEFAULT_LZMA_PRESET = 3
+
+
+def parse_identity_log_level(value: Any) -> IdentityLogLevel | None:
+    """``off|summary|facts|full`` (any case), an ``IdentityLogLevel`` or its
+    int; anything else is None (the caller falls back to its default)."""
+    if isinstance(value, IdentityLogLevel):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        try:
+            return IdentityLogLevel(value)
+        except ValueError:
+            return None
+    if isinstance(value, str):
+        return IdentityLogLevel.__members__.get(value.strip().upper())
+    return None
+
+
+def resolve_identity_log_level(
+    explicit: Any = None, *, ok: bool,
+) -> IdentityLogLevel:
+    """The level this compile logs at: the caller's keyword, else the
+    ``TURING_IDENTITY_LOG_LEVEL`` environment variable, else the default --
+    SUMMARY for an OK compile, FULL for a FAILED one (the receipt that
+    explains the failure)."""
+    import os
+
+    for candidate in (explicit, os.environ.get(LOG_LEVEL_ENV)):
+        level = parse_identity_log_level(candidate)
+        if level is not None:
+            return level
+    return IdentityLogLevel.SUMMARY if ok else IdentityLogLevel.FULL
+
+
+def identity_log_lzma_preset() -> int:
+    """``TURING_IDENTITY_LOG_LZMA_PRESET``: int 0-9, optional ``e`` suffix
+    for extreme; default 3 (fast and near the best on measured logs)."""
+    import lzma
+    import os
+
+    text = os.environ.get(LOG_PRESET_ENV, "").strip().lower()
+    extreme = text.endswith("e")
+    digits = text[:-1] if extreme else text
+    if digits.isdigit() and 0 <= int(digits) <= 9:
+        return int(digits) | (lzma.PRESET_EXTREME if extreme else 0)
+    return _DEFAULT_LZMA_PRESET
+
+
+def _page_rows_level(book: IdentityBook, name: str) -> IdentityLogLevel:
+    declared = book.registry.pages.get(name)
+    return IdentityLogLevel.FACTS if declared is None else declared.rows_level
+
+
+def _truncate_fact(text: str) -> str:
+    if len(text) <= FACTS_FACT_WIDTH:
+        return text
+    return f"{text[:FACTS_FACT_WIDTH]}...[{len(text)} chars]"
+
+
+def iter_identity_book_lines(
+    book: IdentityBook,
+    level: IdentityLogLevel = IdentityLogLevel.FULL,
+    *,
+    extra_lines: Iterable[str] = (),
+) -> Iterable[str]:
+    """The book's log, one line at a time, pages sorted by name.
+
+    FULL is the dense log (every row, its full span history) and is exactly
+    the lines ``render_identity_book`` joins.  FACTS prints a row only on a
+    page whose ``rows_level`` is at most FACTS, and then only its LAST span's
+    fact, truncated.  SUMMARY prints the header, one line per page and the
+    book's unsourced counts, then ``extra_lines`` (a caller's own findings).
+    OFF prints nothing."""
+    level = IdentityLogLevel(level)
+    if level is IdentityLogLevel.OFF:
+        return
+    full = level is IdentityLogLevel.FULL
+    yield f"identity book: {len(book.pages)} page(s)"
+    if not full:
+        yield f"log level: {level.name.lower()}"
     for page_name in sorted(book.pages):
         page = book.pages[page_name]
         rows = page.rows()
-        lines.append(f"[{page_name}] {len(rows)} row(s), {len(page.cells)} cell(s)")
+        rows_level = _page_rows_level(book, page_name)
+        withheld = level < rows_level
+        header = f"[{page_name}] {len(rows)} row(s), {len(page.cells)} cell(s)"
+        if not full and withheld and level >= IdentityLogLevel.FACTS:
+            header += f" (rows withheld below {rows_level.name.lower()})"
+        yield header
+        if level < IdentityLogLevel.FACTS or withheld:
+            continue
         # Rows gathered under the id group they belong to, so one page's
         # entries read as the few spaces they actually span rather than as
         # one undifferentiated list.  A row whose key names no id keeps its
@@ -5356,14 +5463,83 @@ def render_identity_book(book: IdentityBook) -> str:
         for group in sorted(by_group):
             group_rows = by_group[group]
             if len(by_group) > 1:
-                lines.append(f"  ({group}) {len(group_rows)} row(s)")
+                yield f"  ({group}) {len(group_rows)} row(s)"
             for row in group_rows:
                 spans = page.spans(row)
-                trail = " -> ".join(
-                    f"{start}..{end}={fact}" for start, end, fact in spans
+                if full:
+                    trail = " -> ".join(
+                        f"{start}..{end}={fact}" for start, end, fact in spans
+                    )
+                    yield f"  {render_row(row)}: {trail}"
+                    continue
+                start, end, fact = spans[-1]
+                more = f" [{len(spans)} spans]" if len(spans) > 1 else ""
+                yield (
+                    f"  {render_row(row)}: {start}..{end}="
+                    f"{_truncate_fact(str(fact))}{more}"
                 )
-                lines.append(f"  {render_row(row)}: {trail}")
-    return "\n".join(lines)
+    if full:
+        return
+    yield f"unsourced: latch {book.latch.name}"
+    tally: Counter = Counter()
+    for page_ref, _row, reason, stage in book.unsourced_rows():
+        tally[(getattr(page_ref, "name", page_ref), stage.name, reason.name)] += 1
+    for (page_name, stage_name, reason_name), count in sorted(tally.items()):
+        yield f"  {page_name} stage={stage_name} reason={reason_name}: {count}"
+    yield from extra_lines
+
+
+def render_identity_book(book: IdentityBook) -> str:
+    """Every page, every row, its full span history -- the dense log."""
+    return "\n".join(iter_identity_book_lines(book, IdentityLogLevel.FULL))
+
+
+def write_identity_log(
+    book: Any,
+    path_stem: Any,
+    *,
+    level: Any = IdentityLogLevel.FULL,
+    kind: str = "book",
+    extra_lines: Iterable[str] = (),
+) -> str | None:
+    """Stream ``book``'s log at ``level`` into ``<path_stem>.<kind>.log.xz``.
+
+    The lines go through ``lzma`` as they are produced (never one big
+    string), into a temporary name that is ``os.replace``d onto the final
+    name only when the stream completed: a crash leaves no half-written
+    file under the final name.  The preset is ``identity_log_lzma_preset()``.
+    Best-effort and silent: any failure returns None, never raises.
+    Returns the final path, or None when nothing was written."""
+    import lzma
+    import os
+
+    temporary = None
+    try:
+        level = parse_identity_log_level(level)
+        if book is None or level is None or level is IdentityLogLevel.OFF:
+            return None
+        final = f"{os.fspath(path_stem)}.{kind}.log.xz"
+        temporary = f"{final}.tmp{os.getpid()}"
+        with lzma.open(
+            temporary, "wt", encoding="utf-8", newline="\n",
+            preset=identity_log_lzma_preset(),
+        ) as handle:
+            for line in iter_identity_book_lines(
+                book, level, extra_lines=extra_lines,
+            ):
+                handle.write(line)
+                handle.write("\n")
+        os.replace(temporary, final)
+        temporary = None
+        return final
+    except Exception:
+        return None
+    finally:
+        if temporary is not None:
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
 
 
 def render_row(row: Any) -> str:
