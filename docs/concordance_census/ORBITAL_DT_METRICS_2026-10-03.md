@@ -3,9 +3,10 @@
 Current work uses the actual library RK4 algorithm and the existing dt
 state, window, rejection, and rollback mechanisms. Native rotor and
 configured pure-torque checks pass, as do isolated production actuator,
-derivative, and energy-publication checks. Full craft and game acceptance
-remain open. The completed-piece memory accumulation now has a verified
-archive/runtime split; a complete fresh production build is still pending. The later
+derivative, and energy-publication checks. The complete 27-piece craft bank
+now builds below the memory ceiling, and its command-change gate passes.
+Long-duration, fuel-cutoff, frame-partition and game acceptance remain open.
+The completed-piece memory accumulation now has a verified archive/runtime split. The later
 sections record the ownership trace, verified compiler commits, failures,
 and measured gates. The first section preserves the audit that motivated
 the correction; its missing-publication findings describe the old source.
@@ -35,7 +36,8 @@ memory 1,626,808,320 bytes); two native full/runtime cache tests pass in 9.03 s
 columns, constants, source stamps, original archive preservation, both cache
 creation orders, legacy loading and source-link refusal. The original tiny
 law's concordance report is unchanged: zero structural findings and 1,128
-unsourced facts, OPEN. Full native craft acceptance remains pending.
+unsourced facts, OPEN. The complete craft command-change gate is recorded below;
+these small compiler tests alone do not establish flight acceptance.
 
 A read-only comparison loaded the same 19 historical production archives
 (714,433,717 bytes) one at a time with `retain_compilation=False`, retained all
@@ -70,7 +72,7 @@ copper minus mechanical work below `1e-12 J`. Raw concordance debt remains
 OPEN (properties/inverse each 19 findings; rotor 21). These isolated and
 small-system results do not establish the full 27-piece craft flight.
 
-## Adaptive growth correction in progress
+## Adaptive growth correction
 
 The user rejected a blanket no-growth policy. The proposed change that would
 have retained a smaller accepted retry as the round's cap was stopped before
@@ -89,8 +91,59 @@ The repair now enables existing adaptive defaults and forwards that choice
 through the LLVM-piece state/ABI. OrbitalJumper explicitly requests it. No
 new step-size algorithm or no-growth cap is being added. Declared physical
 limits, rollback, fixed outer windows and explicitly pinned operation remain
-the acceptance contract. Verification on this configuration is pending;
-earlier pure-torque and rotor attempt counts describe the old configuration.
+the acceptance contract. Turing commit `78c4f502` passes 31 focused tests,
+including native growth, rejection/rollback, fixed-window landing and bool
+field transport (20.31 s; peak max(working set, private bytes) 1,980,862,464
+bytes). Full coordinator compilation remains unverified. The 40-window
+pure-torque gate also passes on this configuration (113.96 s including its
+rebuild), with unchanged 7,003 attempts and physical tolerances.
+
+## Complete craft command-change gate
+
+The 27-piece production c0 bank compiled under the existing 6,000,000,000-byte
+ceiling. Sampled peak max(working set, private bytes) was 3,041,787,904 bytes;
+sampled working-set peak was 1,969,360,896 bytes. The initial runtime was
+stopped after compilation to add test-only phase/retry progress output; the
+completed archives were preserved and no physics/controller source changed.
+
+The cached rerun of
+`tests/test_orbital_library_integration.py::test_production_craft_declares_energy_and_refines_command_changes`
+passed in 211.83 s, with 19.445 s construction and 186.260 s phase execution.
+Its sampled peak max(working set, private bytes) was 1,644,638,208 bytes.
+The five 2-second windows produced these observations:
+
+| Phase | Attempts | Attempts exceeding a declared error limit |
+| --- | ---: | ---: |
+| Wheel ignition | 1,241 | 1,065 |
+| Wheel reversal | 1,394 | 1,201 |
+| Main ignition | 8,753 | 7,666 |
+| Main cutoff | 8,621 | 7,454 |
+| Cold coast | 7,547 | 6,583 |
+
+Total: 27,556 attempts, 23,969 error-limit failures and 3,587 within-limit
+attempts over 10 simulated seconds. Inertial angular-momentum drift remains
+below `1e-5 Nms` through the wheel phases; electrical minus copper loss minus
+mechanical work remains below `1e-10 J`. Tank mass/impulse accounting, exact
+no-burn coast, integrated applied delta-v and registered-span identity pass
+their unchanged assertions. Final mass is `979.353820972 kg`, propellant
+burned `2.52617902765 kg`, electrical energy `903.408316553 J`, copper loss
+`900 J`, and maximum global Gram defect `3.33066907388e-15`.
+
+This is physical acceptance of that command sequence, not performance or
+whole-game acceptance. Incremental Gram error dominates the retry trace.
+The existing default accepted-step proposal floors all error ratios at one
+and aims back toward the loose CFL timescale, repeatedly attempting much
+larger steps. Adaptive growth remains enabled; no blanket cap or new retry
+formula has been added. Long-duration, cutoff, and frame-partition gates are
+still pending, as are actual planned game flights.
+
+The existing growth-after-stop gate also passes unchanged (320.81 s including
+the four-thruster bank build; sampled memory peak 2,147,876,864 bytes).
+Attempts per 10-second spin-up, despin, and subsequent coast window were
+`[9772, 25721, 42926, 42933, 25734, 9758, 2, 1, 1]`. Residual angular speed
+was `6.30571983518e-16 rad/s`, below its `1e-12` bound. The controller grows
+back to full-window steps after the spin stops; high retry cost during spin
+is a separate unresolved proposal issue.
 
 ## Initial source audit (before the integration correction)
 

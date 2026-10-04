@@ -6,8 +6,9 @@ The user has prioritized correct dt-managed flight before planner, rendering,
 and performance work. The original game used the existing dt outer coordinator
 and rollback but authored its own leapfrog/Euler/Cayley updates. The correction
 now constructs coupled updates by calling the actual library `RK4Integrator`;
-the existing PieceState owns all physical and stage columns. Full production
-flight acceptance is still pending. Detailed trace and measured gates:
+the existing PieceState owns all physical and stage columns. The full craft
+command-change gate passes; long-duration, cutoff, frame-partition and game
+acceptance remain pending. Detailed trace and measured gates:
 [`concordance_census/ORBITAL_DT_METRICS_2026-10-03.md`](concordance_census/ORBITAL_DT_METRICS_2026-10-03.md).
 
 Verified Turing changes: appended metric-channel transport (`3202f8ba`),
@@ -33,15 +34,21 @@ through the existing piece contract. Turing `c73c2a26` and root `c4b4fd2`
 separate full compiler archives on disk from runtime piece retention; six
 native tests pass. The same 19 archived pieces occupy 7.9 MB when serialized
 for execution, with a measured sequential-load peak of 767 MB RSS and ending
-RSS of 436 MB. Full archives remain intact. A fresh complete craft build and
-full craft correctness/performance results remain pending.
+RSS of 436 MB. Full archives remain intact. The fresh 27-piece c0 craft bank
+now builds below the ceiling (sampled peak max(working set, private bytes)
+3.042 GB). Its cached command-change test passes in 211.83 s at a 1.645 GB
+peak, covering wheel ignition/reversal, main ignition/cutoff and cold coast.
+Ten simulated seconds still require 27,556 attempts, including 23,969
+error-limit failures; performance remains unresolved.
 
 Adaptive growth is now the default in the existing dt entry points, and the
 LLVM-piece bridge carries the graph's growth choice into its owned state and
 native record contract. The previous bridge silently omitted that choice.
 The focused gate passes 31 tests (20.31 s, peak 1.98 GB), including actual
 native growth, rollback, exact windows, and bool-field transport. Orbital
-flight gates are being rerun against this correction. No blanket no-growth
+flight gates are being rerun against this correction. The pure-torque and
+full craft command-change gates pass without loosening their physical
+tolerances. No blanket no-growth
 cap or replacement timestep algorithm was introduced.
 
 The remainder of this report records the inherited state and historical
