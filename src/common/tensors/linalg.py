@@ -169,7 +169,7 @@ def _swap_rows(M: AbstractTensor, i: int, j: int) -> None:
     M[..., j, :] = Mi
 
 
-def _first_occurrence(mask: AbstractTensor, dtype) -> AbstractTensor:
+def _first_occurrence(mask: AbstractTensor, like: AbstractTensor) -> AbstractTensor:
     """Reduce a comparison mask to its FIRST set position along the last axis.
 
     ``col == col.max(...)`` marks every tie, not the argmax.  A pivot mask with
@@ -182,7 +182,7 @@ def _first_occurrence(mask: AbstractTensor, dtype) -> AbstractTensor:
     tensor vocabulary and with no data-dependent control flow.
     """
 
-    return mask * (mask.cumsum(dim=-1) == 1).to_dtype(dtype)
+    return mask * (mask.cumsum(dim=-1) == 1).cast_like(like)
 
 
 def _axis_index(like: AbstractTensor, n: int) -> AbstractTensor:
@@ -203,7 +203,7 @@ def _axis_index(like: AbstractTensor, n: int) -> AbstractTensor:
 def _one_hot_axis(like: AbstractTensor, n: int, position) -> AbstractTensor:
     """A one at ``position`` along an axis of length ``n``."""
 
-    return (_axis_index(like, n) == position).to_dtype(like.get_dtype())
+    return (_axis_index(like, n) == position).cast_like(like)
 
 
 def _row(M: AbstractTensor, selector: AbstractTensor) -> AbstractTensor:
@@ -223,22 +223,6 @@ def _column(M: AbstractTensor, selector: AbstractTensor) -> AbstractTensor:
     return (M * selector.unsqueeze(-2)).sum(dim=-1)
 
 
-def _first_occurrence(mask: AbstractTensor, dtype) -> AbstractTensor:
-    """Reduce a comparison mask to its FIRST set position along the last axis.
-
-    ``col == col.max(...)`` marks every tie, which is not an argmax.  A pivot
-    mask with two ones makes the exchange below sum those rows instead of
-    swapping one: equal magnitudes of the same sign survive that by accident,
-    since the sum is still an invertible row operation applied to both sides,
-    but ``|a| == |-a|`` cancels in the pivot column and the next division
-    produces NaN.  The running sum is one at the first hit and greater after
-    it, so this is the argmax the source always intended, in the same tensor
-    vocabulary and with no data-dependent control flow.
-    """
-
-    return mask * (mask.cumsum(dim=-1) == 1).to_dtype(dtype)
-
-
 def _pivot_mask(M: AbstractTensor, k) -> AbstractTensor:
     """One-hot over ALL rows: the largest ``|M[..., k]|`` at or below ``k``.
 
@@ -248,17 +232,14 @@ def _pivot_mask(M: AbstractTensor, k) -> AbstractTensor:
     selection at full width.
     """
 
-    dtype = M.get_dtype()
     rows = M.get_shape()[-2]
     columns = M.get_shape()[-1]
-    eligible = (_axis_index(M, rows) >= k).to_dtype(dtype)
+    eligible = (_axis_index(M, rows) >= k).cast_like(M)
     column = abs(_column(M, _one_hot_axis(M, columns, k)))
     # Rows above k are pushed below every magnitude, and magnitudes are >= 0.
     candidates = column * eligible - (1 - eligible)
     largest = candidates.max(dim=-1, keepdim=True)
-    return _first_occurrence(
-        (candidates == largest).to_dtype(dtype) * eligible, dtype
-    )
+    return _first_occurrence((candidates == largest).cast_like(M) * eligible, M)
 
 
 def _masked_pivot_rows(M: AbstractTensor, k, pivot_mask: AbstractTensor):
@@ -278,9 +259,8 @@ def _masked_pivot_rows(M: AbstractTensor, k, pivot_mask: AbstractTensor):
     which made one storage identity carry n+1 versions per pivot step.
     """
 
-    dtype = M.get_dtype()
     n = M.get_shape()[-2]
-    mask = pivot_mask.to_dtype(dtype)
+    mask = pivot_mask.cast_like(M)
     hot_k = _one_hot_axis(M, n, k)
     selected = _row(M, mask)
     original = _row(M, hot_k)

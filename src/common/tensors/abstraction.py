@@ -2038,6 +2038,17 @@ class AbstractTensor:
             params=params,
         )(result)
 
+    def cast_like(self, reference: "AbstractTensor") -> "AbstractTensor":
+        """Cast this value to the element dtype carried by ``reference``.
+
+        Keeping the reference tensor as an operand lets compiled programs
+        derive the destination dtype from its established tensor descriptor,
+        instead of materializing ``reference.get_dtype()`` as a host value.
+        """
+        if not isinstance(reference, AbstractTensor):
+            reference = self.ensure_tensor(reference)
+        return self.to_dtype(reference.get_dtype())
+
     # --- Pure-abstraction utilities ---------------------------------------
     @staticmethod
     def searchsorted(a: Any, v: Any, side: str = "left") -> "AbstractTensor":
