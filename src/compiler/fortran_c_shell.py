@@ -26512,10 +26512,33 @@ def _class_surface_ssa_program(
                 ):
                     continue
                 dtype = field.get("dtype")
+                declared_table_columns = (
+                    tuple(field.get("columns") or ())
+                    if str(field.get("storage") or "") == "table" else ()
+                )
                 for physical_value_id in physical_value_ids:
                     value = values[int(physical_value_id)]
                     if value.dtype in {None, "unknown"} and dtype is not None:
                         value.dtype = str(dtype)
+                    if declared_table_columns and str(
+                        declared_table_columns[0].get("dtype") or ""
+                    ) not in {"", "unknown"}:
+                        # A table field declares its dtype per column, never
+                        # at the top level, so ``field.get("dtype")`` left the
+                        # literal's arena at the provisional dtype the empty
+                        # ``[]`` was typed with (float64).  The declared
+                        # column-0 dtype IS the arena's storage dtype (the
+                        # sequence descriptor is the canonical physical ABI;
+                        # the late reconcile below the frame fixed point
+                        # applies that same contract by identity, but a
+                        # caller linking this function in between copied the
+                        # provisional dtype into its default-literal Const:
+                        # orbital dt_system_over -> run_superstep,
+                        # ``last_metrics = Metrics(..., unresolved_report=[])``
+                        # formal float64 then int64, the caller's Const
+                        # float64 -- "incompatible final physical call
+                        # inputs").  Declare it at the first writer.
+                        value.dtype = str(declared_table_columns[0]["dtype"])
                     value.accounting = {
                         **dict(value.accounting or {}),
                         "program_abi_record": str(record["identity"]),
