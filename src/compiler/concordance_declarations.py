@@ -578,6 +578,25 @@ STRUCTURAL_SPECIALIZATION_FIXED_POINT = declare_page(
         RowField("function", K.NAME), RowField("round", K.INDEX),
     ), tuple,                          # (digest, changed, mutations); REVISE
 )
+#: A compile policy the work contract declares and a pass reads
+#: (``work_contract.WorkContract``): one root row per policy name, its fact
+#: the chosen value, NOVEL(POLICY_DECLARATION, ()) at the stage that reads
+#: it.  CONCORD: a different value arriving later in the same compile is a
+#: disagreement the book refuses.
+POLICY_DECLARATION = declare_transform("policy_declaration", 0)
+COMPILE_POLICY = declare_page("compile_policy", (
+    RowField("policy", K.NAME),
+), str)
+#: ``_propagate_callsite_tensor_specializations``: per callsite per
+#: fixed-point round, whether the callee return descriptors were derived on
+#: this callsite's own callee copy -- ``("computed", signature digest)``,
+#: DERIVED from the ``compile_policy`` cell -- or read from the first
+#: same-signature callsite of the round -- ``("reused", digest)``, DERIVED
+#: from the policy cell and that callsite's row.  CONCORD, one row per round.
+CALLSITE_DESCRIPTOR_REUSE = declare_page("callsite_descriptor_reuse", (
+    RowField("caller", K.NAME), RowField("callee", K.NAME),
+    RowField("call", K.VALUE_ID), RowField("round", K.INDEX),
+), tuple)
 
 # ============================================================================
 # Step 5: control SSA builder (plan 80, part B) -- owned by the step-5 lane

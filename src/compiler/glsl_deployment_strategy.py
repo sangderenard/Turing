@@ -17883,6 +17883,33 @@ def _propagate_callsite_tensor_specializations(
     #: the latest ``call_result_descriptor`` answer for that call.
     return_cells_by_call: dict[tuple[int, int], tuple] = {}
 
+    from .concordance_declarations import (
+        CALLSITE_DESCRIPTOR_REUSE, COMPILE_POLICY, POLICY_DECLARATION,
+        PLANNER_TENSOR_SPECIALIZATION,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Novel, current_identity_book,
+    )
+    from .work_contract import active_contract
+
+    # The work contract's callsite_descriptor_reuse policy, declared on the
+    # book as a root row before the first decision reads it: a different
+    # policy arriving mid-compile is a disagreement the book refuses.
+    reuse_mode = str(active_contract().callsite_descriptor_reuse)
+    _book = current_identity_book()
+    _book.post(
+        COMPILE_POLICY, ("callsite_descriptor_reuse",), reuse_mode,
+        stage=PLANNER_TENSOR_SPECIALIZATION,
+        provenance=Novel(POLICY_DECLARATION, ()), mode=Mode.CONCORD,
+    )
+    reuse_policy_cell = _book.latest_ref(
+        COMPILE_POLICY, ("callsite_descriptor_reuse",),
+    )
+    #: This round's (callee graph id, signature) -> (callee graph, output
+    #: descriptors, output cells, the computing callsite's decision cell).
+    #: Cleared at every round: the callee graphs change between rounds.
+    signature_results: dict[tuple, tuple] = {}
+
     def call_result_descriptor(
         caller: Any,
         node_id: int,
@@ -17941,6 +17968,89 @@ def _propagate_callsite_tensor_specializations(
                 specializations[str(parameter)] = copy.deepcopy(default)
         if not descriptors and not aggregate_descriptors and not callee.G.graph.get("parameter_record_abi"):
             return ()
+
+        def any_descriptor(item: Any) -> bool:
+            if isinstance(item, tuple):
+                return any(any_descriptor(member) for member in item)
+            return item is not None
+
+        def record_and_return(
+            output_descriptors: Any, output_cells: Any,
+        ) -> tuple[dict[str, Any] | None, ...]:
+            # Record this round's decision in the concordance.  The
+            # specialization fixed point below has no bound of its own: it
+            # repeats until nothing changes.  Writing each round's published
+            # return shape to its own page means
+            # ``IdentityPage.oscillating_rows`` can name a row that leaves a
+            # shape and comes back to it -- a round trip, which a settling
+            # fixed point never makes -- instead of the whole compile merely
+            # looking slow from outside.
+            _page = _book.page("callsite_return_specialization")
+            _row = (
+                str(caller.G.graph.get("function_name")),
+                str(callee.G.graph.get("function_name")),
+                int(node_id),
+            )
+            _page.set(_row, len(_page.history(_row)), tuple(
+                None if item is None or not isinstance(item, Mapping)
+                else (tuple(item.get("shape") or ()), str(item.get("dtype") or ""))
+                for item in output_descriptors
+            ))
+            return_cells_by_call[(id(caller.G), int(node_id))] = tuple(
+                output_cells
+            )
+            return (
+                tuple(copy.deepcopy(output_descriptors))
+                if any(any_descriptor(item) for item in output_descriptors)
+                else ()
+            )
+
+        # The callee copy below is a function of exactly these inputs: the
+        # callee graph, the argument descriptors, the aggregate member
+        # descriptors, the literal specializations and the callee's declared
+        # record ABI.  Under ``callsite_descriptor_reuse="signature"`` (the
+        # work contract) the first callsite of a round with this signature
+        # derives the copy and every later one in the same round reads its
+        # answer: the same descriptors, and the same callee return cells for
+        # the member publication to derive from.  ``"callsite"`` derives a
+        # copy per callsite, as every round did before.  Either way the
+        # decision is a row: ``callsite_descriptor_reuse`` (caller, callee,
+        # call, round) = ("computed"|"reused", signature digest), DERIVED
+        # from the policy cell (and, for a reuse, the computing callsite's
+        # row).  A generator callee publishes its yield rows on the caller's
+        # call value while deriving, so it is always derived per callsite.
+        signature = (
+            _stable_signature_value(descriptors),
+            _stable_signature_value(aggregate_descriptors),
+            _stable_signature_value(specializations),
+            _stable_signature_value(
+                callee.G.graph.get("parameter_record_abi") or {}
+            ),
+        )
+        reuse_key = (id(callee.G), signature)
+        signature_digest = hashlib.sha256(
+            repr(signature).encode("utf-8")
+        ).hexdigest()[:12]
+        reuse_row = (
+            str(caller.G.graph.get("function_name")),
+            str(callee.G.graph.get("function_name")),
+            int(node_id), int(round_index),
+        )
+        held = (
+            signature_results.get(reuse_key)
+            if reuse_mode == "signature"
+            and not callee.G.graph.get("generator_stream")
+            else None
+        )
+        if held is not None and held[0] is callee.G:
+            _book.post(
+                CALLSITE_DESCRIPTOR_REUSE, reuse_row,
+                ("reused", signature_digest),
+                stage=PLANNER_TENSOR_SPECIALIZATION,
+                provenance=Derived((reuse_policy_cell, held[3])),
+                mode=Mode.CONCORD,
+            )
+            return record_and_return(copy.deepcopy(held[1]), tuple(held[2]))
         specialized = extract_clean_process_subgraph(callee, callee.G)
         specialized.G.graph["planner_specializations"] = copy.deepcopy(
             specializations
@@ -18113,39 +18223,21 @@ def _propagate_callsite_tensor_specializations(
                     role=f"column:{column}",
                 )
 
-        def any_descriptor(item: Any) -> bool:
-            if isinstance(item, tuple):
-                return any(any_descriptor(member) for member in item)
-            return item is not None
-
-        # Record this round's decision in the concordance.  The
-        # specialization fixed point below has no bound of its own: it repeats
-        # until nothing changes.  Writing each round's published return shape
-        # to its own page means ``IdentityPage.oscillating_rows`` can name a
-        # row that leaves a shape and comes back to it -- a round trip, which
-        # a settling fixed point never makes -- instead of the whole compile
-        # merely looking slow from outside.
-        from .identity_concordance import current_identity_book
-
-        _page = current_identity_book().page("callsite_return_specialization")
-        _row = (
-            str(caller.G.graph.get("function_name")),
-            str(callee.G.graph.get("function_name")),
-            int(node_id),
+        computing_cell = _book.post(
+            CALLSITE_DESCRIPTOR_REUSE, reuse_row,
+            ("computed", signature_digest),
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+            provenance=Derived((reuse_policy_cell,)),
+            mode=Mode.CONCORD,
         )
-        _page.set(_row, len(_page.history(_row)), tuple(
-            None if item is None or not isinstance(item, Mapping)
-            else (tuple(item.get("shape") or ()), str(item.get("dtype") or ""))
-            for item in output_descriptors
-        ))
-        return_cells_by_call[(id(caller.G), int(node_id))] = tuple(
-            output_cells
-        )
-        return (
-            tuple(copy.deepcopy(output_descriptors))
-            if any(any_descriptor(item) for item in output_descriptors)
-            else ()
-        )
+        if reuse_mode == "signature" and not callee.G.graph.get(
+            "generator_stream"
+        ):
+            signature_results[reuse_key] = (
+                callee.G, copy.deepcopy(output_descriptors),
+                tuple(output_cells), computing_cell,
+            )
+        return record_and_return(output_descriptors, output_cells)
 
     round_index = 0
     seen_round_states: dict[str, int] = {}
@@ -18199,6 +18291,9 @@ def _propagate_callsite_tensor_specializations(
     changed = True
     while changed:
         round_index += 1
+        # A round's reuse table is that round's: the callee graphs it was
+        # derived on are mutated by the publications below.
+        signature_results.clear()
         round_started = time.monotonic()
         callsites = 0
         mutation_counts = {
@@ -19398,6 +19493,25 @@ def _arithmetic_loop_target_owner(graph: Any, node_id: int) -> int | None:
         if len(targets) == 1 and targets[0] in {int(node_id), target_value}:
             return int(loop_id)
     return None
+
+
+def _stable_signature_value(value: Any) -> object:
+    """A hashable, order-independent spelling of a descriptor/specialization
+    mapping, for keying one callsite signature against another (the same
+    spelling ``_callsite_specialized_shell_type`` keys planned shells by)."""
+
+    if isinstance(value, dict):
+        return tuple(sorted(
+            (_stable_signature_value(key), _stable_signature_value(item))
+            for key, item in value.items()
+        ))
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return tuple(_stable_signature_value(item) for item in value)
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
 
 
 #: ``id(formal_shape page)`` -> (weak reference to that page, {authored owner

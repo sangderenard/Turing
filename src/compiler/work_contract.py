@@ -22,8 +22,9 @@ The presets
 
 ``prove``    Conservative equality-proving form. Every value lives in and is
              re-read from its pool slot; no register reuse, no identity that
-             changes bits, no contraction. This is the shape you diff two
-             backends over, value by value.
+             changes bits, no contraction; the planner derives a callee copy
+             per callsite (``callsite_descriptor_reuse="callsite"``). This is
+             the shape you diff two backends over, value by value.
 ``develop``  The default. In-place pool composition with same-block register
              reuse and the EXACT identity set only -- bit-identical to
              ``prove`` by construction, measured 6x faster on the fluid
@@ -109,6 +110,19 @@ _HONORED_DEPLOYMENT = ("serial", "auto")
 _HONORED_COMPILER = ("zig-cc",)
 _HONORED_DESTINATION = ("native",)
 _HONORED_GLSL_GEMM = ("glslblas_gemm", "source_algorithm")
+#: ``callsite_descriptor_reuse``: how the planner's callsite tensor
+#: specialization derives a callee's return descriptors
+#: (``glsl_deployment_strategy._propagate_callsite_tensor_specializations``).
+#: ``signature`` -- the first callsite of a fixed-point round with a given
+#: (callee, argument descriptors, aggregate descriptors, literal
+#: specializations, record ABI) signature derives the callee copy and every
+#: later same-signature callsite of that round reads its answer; the copy's
+#: own rows are posted once and the reusing callsites' member publications
+#: derive from the same callee return cells.  ``callsite`` -- a copy per
+#: callsite per round, as every round was derived before.  The choice is a
+#: ``compile_policy`` row on the book and every callsite's decision a
+#: ``callsite_descriptor_reuse`` row.
+_HONORED_CALLSITE_DESCRIPTOR_REUSE = ("signature", "callsite")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -181,8 +195,17 @@ class WorkContract:
     shaders: ShaderOptimizationContract = dataclasses.field(
         default_factory=ShaderOptimizationContract,
     )
+    # Planner callsite tensor specialization: derive a callee copy once per
+    # (callee, signature) per round (``signature``) or once per callsite
+    # (``callsite``).  See ``_HONORED_CALLSITE_DESCRIPTOR_REUSE``.
+    callsite_descriptor_reuse: str = "signature"
 
     def __post_init__(self) -> None:
+        if self.callsite_descriptor_reuse not in _HONORED_CALLSITE_DESCRIPTOR_REUSE:
+            raise ValueError(
+                f"callsite_descriptor_reuse={self.callsite_descriptor_reuse!r} "
+                f"is not honored; honored: {_HONORED_CALLSITE_DESCRIPTOR_REUSE}"
+            )
         # Refuse, never fall back (fusion_levels doctrine): a contract
         # naming behavior no layer honors must fail at construction, not
         # quietly compile something else.
@@ -218,6 +241,7 @@ class WorkContract:
             f"register-block={self.loops.register_block_width}",
             f"glsl-gemm={self.shaders.blas_gemm}",
             f"deployment={self.deployment}",
+            f"callsite-descriptor-reuse={self.callsite_descriptor_reuse}",
         ]
         return f"{self.name}: " + ", ".join(held)
 
@@ -226,6 +250,9 @@ PRESETS: dict[str, WorkContract] = {
     "prove": WorkContract(
         "prove", register_reuse=False, inexact_identities=False,
         contract_multiply_add=False,
+        # The planner derives every callsite's callee copy itself: the form
+        # whose rows and answers every other preset's reuse is diffed against.
+        callsite_descriptor_reuse="callsite",
     ),
     "develop": WorkContract(
         "develop", register_reuse=True, inexact_identities=False,
