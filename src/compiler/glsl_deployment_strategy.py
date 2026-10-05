@@ -19393,6 +19393,41 @@ def _arithmetic_loop_target_owner(graph: Any, node_id: int) -> int | None:
     return None
 
 
+class _DescriptorQuery(set):
+    """The ``_seen`` path set of ONE outermost descriptor query.
+
+    The graph is read, never mutated, for the whole of an outermost query, so
+    a node whose descriptor the query already derived has the same answer
+    when the query reaches it again by another path (a diamond).  This set
+    is created by that outermost query, handed down the recursion, and gone
+    when it returns: it holds the call's own working answers and nothing
+    persists past it.  Every answer is still recorded on the book where it
+    is derived; the book remains the only thing that outlives the query.
+
+    An answer is held only when no cycle guard fired while it was derived
+    (``cuts`` did not move), because a guarded answer depends on the path
+    that reached it, not on the node.
+    """
+
+    __slots__ = ("answers", "cut_counter")
+
+    def __init__(self, members: Any = (), *, answers: Any = None,
+                 cut_counter: Any = None) -> None:
+        super().__init__(members)
+        self.answers = {} if answers is None else answers
+        self.cut_counter = [0] if cut_counter is None else cut_counter
+
+    def branch(self) -> "_DescriptorQuery":
+        """This path, extended by the caller: same query, own path set."""
+        return _DescriptorQuery(
+            self, answers=self.answers, cut_counter=self.cut_counter,
+        )
+
+    def cut(self) -> None:
+        """A cycle guard fired: answers derived across it are path-bound."""
+        self.cut_counter[0] += 1
+
+
 def _tensor_descriptor(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -19407,6 +19442,13 @@ def _tensor_descriptor(
     # node at every recursion depth.
     if _seen is None:
         publish_program_abi_graph_identities(graph.G)
+        _seen = _DescriptorQuery()
+    query = _seen if isinstance(_seen, _DescriptorQuery) else None
+    if query is not None:
+        held = query.answers.get(int(node_id), query)
+        if held is not query:
+            return None if held is None else dict(held)
+        cuts_before = query.cut_counter[0]
 
     row = None
     page = None
@@ -19501,7 +19543,7 @@ def _tensor_descriptor(
                 and len(formal_row) >= 2
                 and authored_function_name(formal_row[0]) == authored_owner
                 and isinstance(formal_page.latest(formal_row), _Unresolved)
-                for formal_row in formal_page.rows()
+                for formal_row in formal_page.scope_rows(authored_owner)
             )
         )
         if (
@@ -19543,6 +19585,10 @@ def _tensor_descriptor(
         row = None
 
     answer = _tensor_descriptor_rule(graph, node_id, _seen)
+    if query is not None and query.cut_counter[0] == cuts_before:
+        query.answers[int(node_id)] = (
+            None if answer is None else dict(answer)
+        )
 
     if row is not None and page is not None:
         try:
@@ -19664,8 +19710,13 @@ def _tensor_descriptor_rule(
 
     if int(node_id) not in graph.G:
         return None
-    seen = set(_seen or ())
+    seen = (
+        _seen.branch() if isinstance(_seen, _DescriptorQuery)
+        else set(_seen or ())
+    )
     if int(node_id) in seen:
+        if isinstance(seen, _DescriptorQuery):
+            seen.cut()
         return None
     seen.add(int(node_id))
     data = graph.G.nodes[int(node_id)]
@@ -20231,6 +20282,10 @@ def _tensor_descriptor_rule(
                 ).get(binding_name)
                 if carried_binding:
                     initial_id = int(tuple(carried_binding)[0])
+                    if initial_id in graph.G and initial_id in seen and isinstance(
+                        seen, _DescriptorQuery
+                    ):
+                        seen.cut()
                     if initial_id in graph.G and initial_id not in seen:
                         seeded = _tensor_descriptor(graph, initial_id, seen)
                         if seeded is not None:
