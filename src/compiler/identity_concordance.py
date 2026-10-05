@@ -160,16 +160,24 @@ def publish_program_abi_graph_identities(
         )
         return matches[0] if len(matches) == 1 else None
 
+    # One pass indexes the nodes by value id; the old form rescanned every
+    # node for each (record, value id) pair -- records x ids x nodes, which
+    # dominated a 838-column dt system.
+    nodes_by_value: dict[int, list] = {}
+    if parameter_records:
+        for node_id, data in graph_obj.nodes(data=True):
+            nodes_by_value.setdefault(
+                int(data.get("value_id", node_id)), [],
+            ).append(data)
     for parameter_name, record in dict(
         parameter_records
     ).items():
         record_identity = str(record.get("identity") or "")
         for value_id in identities.get(str(parameter_name), ()):
-            for node_id, data in graph_obj.nodes(data=True):
-                if int(data.get("value_id", node_id)) == int(value_id):
-                    data.setdefault("attributes", {})[
-                        "program_abi_record_identity"
-                    ] = record_identity
+            for data in nodes_by_value.get(int(value_id), ()):
+                data.setdefault("attributes", {})[
+                    "program_abi_record_identity"
+                ] = record_identity
 
     from .bounded_fixed_point import BoundedFixedPoint, bound_for
 
