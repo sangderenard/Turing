@@ -345,9 +345,12 @@ class LLVMPiece:
     module: Any = None
     entry: str | None = None
     outputs: Any = None
-    #: The authored Python the piece was lowered from.  A lowering that
-    #: links the piece ingests this def for the call's signature and arity
-    #: only; its body is never lowered again -- the link supplies the SSA.
+    #: The authored Python the piece was lowered from: the record of what was
+    #: compiled.  A lowering that links the piece does not parse it -- the
+    #: call site is declared from ``argument_names`` / ``output_names`` and
+    #: the artifact's buffer shapes
+    #: (``fortran_c_shell._declared_piece_signature_definition``), and the
+    #: link supplies the SSA.
     source: str | None = None
     #: The compiler that built this piece (``PieceCompilerRecord``), stamped
     #: by ``piece_from_law``; None on a piece built before records existed.
