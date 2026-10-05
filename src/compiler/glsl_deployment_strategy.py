@@ -19409,18 +19409,21 @@ class _DescriptorQuery(set):
     that reached it, not on the node.
     """
 
-    __slots__ = ("answers", "cut_counter")
+    __slots__ = ("answers", "cut_counter", "polymorphic")
 
     def __init__(self, members: Any = (), *, answers: Any = None,
-                 cut_counter: Any = None) -> None:
+                 cut_counter: Any = None, polymorphic: Any = None) -> None:
         super().__init__(members)
         self.answers = {} if answers is None else answers
         self.cut_counter = [0] if cut_counter is None else cut_counter
+        #: One-element holder shared by every branch of the query.
+        self.polymorphic = [None] if polymorphic is None else polymorphic
 
     def branch(self) -> "_DescriptorQuery":
         """This path, extended by the caller: same query, own path set."""
         return _DescriptorQuery(
             self, answers=self.answers, cut_counter=self.cut_counter,
+            polymorphic=self.polymorphic,
         )
 
     def cut(self) -> None:
@@ -19536,16 +19539,24 @@ def _tensor_descriptor(
         # inherited the `(2, 2)` lane's multiply and consequently returned
         # `(2,)` instead of `(1,)`.
         formal_page = current_identity_book().page("formal_shape")
-        polymorphic_specialization = bool(
-            graph.G.graph.get("planner_tensor_descriptors")
-            and any(
-                isinstance(formal_row, tuple)
-                and len(formal_row) >= 2
-                and authored_function_name(formal_row[0]) == authored_owner
-                and isinstance(formal_page.latest(formal_row), _Unresolved)
-                for formal_row in formal_page.scope_rows(authored_owner)
+        # The owner's formal rows do not change while one outermost query
+        # runs (it posts shape states, never formal shapes), so the query
+        # reads them once.
+        if query is not None and query.polymorphic[0] is not None:
+            polymorphic_specialization = query.polymorphic[0]
+        else:
+            polymorphic_specialization = bool(
+                graph.G.graph.get("planner_tensor_descriptors")
+                and any(
+                    isinstance(formal_row, tuple)
+                    and len(formal_row) >= 2
+                    and authored_function_name(formal_row[0]) == authored_owner
+                    and isinstance(formal_page.latest(formal_row), _Unresolved)
+                    for formal_row in formal_page.scope_rows(authored_owner)
+                )
             )
-        )
+            if query is not None:
+                query.polymorphic[0] = polymorphic_specialization
         if (
             concorded_descriptor is not None
             and not formal_conflict
