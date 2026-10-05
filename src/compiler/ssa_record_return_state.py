@@ -2196,7 +2196,21 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         if ((int(value.id) in formal_ids and not published) or value.shape
                 or (value.dtype != fallback.dtype and not (
                     fallback.dtype == 'bool' and boolean_phi_tree(value, set())))):
-            return exit_with(VERSION_IS_FORMAL_SHAPED_OR_MISTYPED, read)
+            # What this decision read beyond the site and version rows: the
+            # version's SSA value and the descriptor's field value (their
+            # shape, dtype and formal-ness).  Record materialization revisits
+            # the same row inside one fixed point -- the expansion pass
+            # decides before the field Phi exists, the ``record_return_scalar``
+            # revisit after -- and those two values are what changes between
+            # the passes (orbital step_with_dt_control_used, hard_failure at
+            # if_merge.18: a conditional_carried Phi typed float64 against a
+            # bool field, then typed bool).  With only (site, version) as
+            # sources the later decision was a REVISE without a changed
+            # source and the book refused it.
+            return exit_with(
+                VERSION_IS_FORMAL_SHAPED_OR_MISTYPED,
+                (*read, *identity_cells(function, value, fallback)),
+            )
         current = predecessor
         while current in dominators:
             if current == owner:
@@ -2244,12 +2258,46 @@ def scalar_return_field_versions(function, source_graph, functions=None):
                                            for index, arg in enumerate(operation.args)
                                            if int(arg.id) in aliases | record_aliases or
                                            (arg.accounting or {}).get('ssa_storage_alias') in aliases | record_aliases)):
-                                return exit_with(INTERVENING_CALL_NOT_READONLY, read)
+                                # The call this decision read: its result's
+                                # cell, else the aliased argument's.  The
+                                # instructions between definition and return
+                                # change as record Phis are expanded within
+                                # the same fixed point; the row's next
+                                # revision must derive from what it read.
+                                return exit_with(INTERVENING_CALL_NOT_READONLY, (
+                                    *read,
+                                    *identity_cells(
+                                        function,
+                                        operation.res if operation.res is not None
+                                        else next((
+                                            arg for arg in operation.args
+                                            if int(arg.id) in aliases | record_aliases
+                                            or (arg.accounting or {}).get('ssa_storage_alias')
+                                            in aliases | record_aliases
+                                        ), None),
+                                    ),
+                                ))
                         store_target = (operation.args[1:] if operation.op == 'Store'
                                         and len(operation.args) == 2 else operation.args)
                         if writes_slot or (('store' in operation.op.lower() or 'atomic' in operation.op.lower())
                                            and any(int(arg.id) in aliases | record_aliases for arg in store_target)):
-                            return exit_with(INTERVENING_STORE, read)
+                            # The storing operation this decision read: its
+                            # result's cell when it has one, else the aliased
+                            # store target's (orbital step_with_dt_control_used,
+                            # div_inf at if_merge.12: INTERVENING_STORE on the
+                            # expansion pass, INTERVENING_CALL_NOT_READONLY on
+                            # the revisit, from the same (site, version) rows).
+                            return exit_with(INTERVENING_STORE, (
+                                *read,
+                                *identity_cells(
+                                    function,
+                                    operation.res if operation.res is not None
+                                    else next((
+                                        arg for arg in store_target
+                                        if int(arg.id) in aliases | record_aliases
+                                    ), None),
+                                ),
+                            ))
                 # Success: the selection IS the version cell, derived from
                 # the return-site state that named it and that version cell.
                 return decide(
