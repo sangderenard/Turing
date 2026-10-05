@@ -2943,6 +2943,25 @@ class Page:
     def __repr__(self) -> str:
         return f"Page({self.name!r})"
 
+    def __hash__(self) -> int:
+        # The generated frozen-dataclass hash re-hashes the row-field tuple
+        # (each RowField, each kind) on every call, and a Page is hashed
+        # through every Ref inside every edge row and every cell key that
+        # names one (a quarter of the orbital dispatch-extraction profile).
+        # The fields are frozen, so the hash is computed once and kept; it
+        # is the hash of exactly the compared fields, as the generated one
+        # was, so equality semantics are unchanged.
+        cached = self.__dict__.get("_hash")
+        if cached is None:
+            cached = hash((self.name, self.row_fields, self.fact_type))
+            object.__setattr__(self, "_hash", cached)
+        return cached
+
+    def __getstate__(self) -> dict:
+        # The cached hash is this process's (string hashes are salted per
+        # process); a pickled or copied instance recomputes it.
+        return {key: value for key, value in self.__dict__.items() if key != "_hash"}
+
 
 @dataclass(frozen=True)
 class Stage:
@@ -2975,6 +2994,21 @@ class Ref:
 
     def __repr__(self) -> str:
         return f"Ref({self.page.name!r}, {render_row(self.row)}, {self.column})"
+
+    def __hash__(self) -> int:
+        # Same rule as ``Page.__hash__``: frozen fields, hashed once.  A Ref
+        # is a cell key's member wherever a row names a cell (field-state
+        # rows, edge and dependents rows), so it is hashed on every stamp.
+        cached = self.__dict__.get("_hash")
+        if cached is None:
+            cached = hash((self.page, self.row, self.column))
+            object.__setattr__(self, "_hash", cached)
+        return cached
+
+    def __getstate__(self) -> dict:
+        # The cached hash is this process's (string hashes are salted per
+        # process); a pickled or copied instance recomputes it.
+        return {key: value for key, value in self.__dict__.items() if key != "_hash"}
 
 
 @dataclass(frozen=True)
