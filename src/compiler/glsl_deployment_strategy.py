@@ -19401,7 +19401,12 @@ def _tensor_descriptor(
     from .identity_concordance import Unresolved as _Unresolved
     from .identity_concordance import publish_program_abi_graph_identities
 
-    publish_program_abi_graph_identities(graph.G)
+    # Published once per query: the recursion (``_seen`` carried down) asks
+    # the same graph, which the publication already covers.  Its receipt
+    # check costs O(nodes), and a 224k-node dt system asks this for every
+    # node at every recursion depth.
+    if _seen is None:
+        publish_program_abi_graph_identities(graph.G)
 
     row = None
     page = None

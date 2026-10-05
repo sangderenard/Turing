@@ -108,6 +108,17 @@ from .id_space import MINTED, group_by_prefix, has_flag, label as id_label
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 
 
+def _edge_count(graph_obj: Any) -> int:
+    """Edge count for the publication receipt.  ``number_of_edges()`` walks a
+    degree view in Python (O(nodes) per call, hot on 200k-node graphs); a
+    plain directed graph's adjacency sums at C speed."""
+
+    adjacency = getattr(graph_obj, "_adj", None)
+    if adjacency is None or graph_obj.is_multigraph() or not graph_obj.is_directed():
+        return int(graph_obj.number_of_edges())
+    return sum(map(len, adjacency.values()))
+
+
 def publish_program_abi_graph_identities(
     graph_obj: Any, *, force: bool = False,
 ) -> None:
@@ -128,7 +139,7 @@ def publish_program_abi_graph_identities(
     identities = identities_source or {}
     receipt = (
         len(graph_obj),
-        int(graph_obj.number_of_edges()),
+        _edge_count(graph_obj),
         id(program_abi_source),
         id(parameter_records_source),
         id(identities_source),
