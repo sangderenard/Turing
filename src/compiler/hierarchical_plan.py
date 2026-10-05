@@ -353,7 +353,28 @@ def plan_region_to_ssa_instrs(
             output_id = int(item.outputs[0])
             opcode = str(item.opcode).casefold()
             inferred: str | None = None
-            if opcode in {"const", "constant"}:
+            declared_columns = tuple(
+                dict(item.attributes).get("sequence_column_dtypes") or ()
+            )
+            if declared_columns and str(declared_columns[0]) not in {
+                "", "None", "unknown",
+            }:
+                # The line produces a sequence HANDLE whose row contract is
+                # declared on it (a record field's table storage: the
+                # reducer stamps ``sequence_column_dtypes`` from the class
+                # field contract on the field's GetAttr and its seeded
+                # pre-branch state).  The handle's storage dtype is its
+                # column-0 dtype, as ``_sequence_descriptor`` and the
+                # sequence-program entry type an arena.  Without this the
+                # handle fell to the ``float64`` default below: orbital
+                # ``step_with_dt_control_used``, region 80, ``getattr
+                # unresolved_report`` (contract ``token: int64``) -> 518
+                # typed float64, overriding the int64 arena the builder had
+                # declared, while every callee formal for the same arena
+                # stayed int64 -- "10 incompatible final physical call
+                # inputs; storage types are immutable".
+                inferred = str(declared_columns[0])
+            elif opcode in {"const", "constant"}:
                 literal = dict(item.attributes).get("value")
                 inferred = (
                     "bool" if isinstance(literal, bool)
