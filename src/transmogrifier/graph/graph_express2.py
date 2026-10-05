@@ -4113,6 +4113,37 @@ class ProcessGraph:
             state.pop(name, None)
         return state
 
+    def __copy__(self):
+        """A shallow, independent live ProcessGraph.
+
+        ``copy.copy`` used to go through ``__getstate__``/``__setstate__``,
+        which pickle-dumps and pickle-loads EVERY Python binding (all the
+        compiled law pieces of a dt system) on each call.  The reducer takes
+        one such copy per function, so a 35-piece system spent hours there
+        (the stall that looked like a loop).  The bindings are read-only
+        compiler inputs, so the copy shares them; only the live
+        synchronization state is fresh, exactly as ``__setstate__`` leaves it.
+        Checkpointing (pickle, deepcopy) keeps the serialized path."""
+
+        clone = self.__class__.__new__(self.__class__)
+        state = dict(self.__dict__)
+        for name in (
+            "_graph_lock", "_graph_condition", "_graph_accessor",
+            "_graph_subscribers", "_evolution_metagraph", "_evolution_graph",
+            "_graph_progress", "_source_owner_index",
+        ):
+            state.pop(name, None)
+        clone.__dict__.update(state)
+        clone.python_bindings = dict(self.__dict__.get("python_bindings") or {})
+        clone._graph_lock = threading.RLock()
+        clone._graph_condition = threading.Condition(clone._graph_lock)
+        clone._graph_subscribers = []
+        clone._graph_accessor = ProcessGraphAccessor(clone)
+        clone._evolution_metagraph = None
+        clone._evolution_graph = None
+        clone._graph_progress = None
+        return clone
+
     def __setstate__(self, state):
         """Restore a checkpoint as an independent live ProcessGraph."""
 
