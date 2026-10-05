@@ -4659,6 +4659,7 @@ class _ControlSSABuilder:
         snapshot: SSAValue,
         *,
         path: str,
+        arm_value_id: Any = None,
     ) -> tuple[SSAValue, Any]:
         """The SSA value a field-carried merge takes from one arm.
 
@@ -4671,6 +4672,23 @@ class _ControlSSABuilder:
         recorded as ``Unresolved(ARM_VERSION_MISSING)`` at its row and a
         shortfall is raised; the snapshot then stands in for the emitted Phi
         but is never posted as the arm.
+
+        ``arm_value_id`` is the arm's graph value the planner paired with
+        ``arm_cell`` (the reducer Phi's arm parent; ``carried_aliases`` and
+        ``carried_field_cells`` are index-aligned).  An ELEMENT_WRITTEN cell
+        (``obj.field[i] = v``, plan 70 section 1.3) holds the IndexedStore
+        as both value and effect; that store is emitted inside a planned
+        region, so no block of this builder publishes a version for it.
+        Its version IS the storage the store writes in place: the store id
+        is aliased to that storage by its ``control_value_alias`` PLANNING
+        row (the same chain ``_carried_name_arm`` resolves an in-place
+        store through), and the storage's current binding is the value.
+        Program: ``dt_controller.step_with_dt_control_used``, ``if
+        rejected: metrics.control_values[0] = ...; metrics.control_present[0]
+        = 1.0`` on the retry loop -- the only statements of the arm are
+        element writes, and the merge named their ELEMENT_WRITTEN cells
+        with no version (``carried-field-arm-missing``, N=2 orbital dt
+        system; tools/compiler_probes/probe_element_written_field_arm.py).
         """
         book = self._book()
         row = self._field_version_row(arm_cell)
@@ -4696,6 +4714,26 @@ class _ControlSSABuilder:
             # The arm did not write: its cell is the state the branch was
             # entered with, whose SSA value is the snapshot.
             return snapshot, arm_cell
+        if kind is FieldStateKind.ELEMENT_WRITTEN and arm_value_id is not None:
+            storage_id = self._concorded_resident(int(arm_value_id))
+            storage = self.external_values.get(storage_id)
+            if storage is not None:
+                # ELEMENT_WRITTEN version: the in-place storage, DERIVED(the
+                # ELEMENT_WRITTEN cell, the store's PLANNING alias cell, the
+                # storage's binding cell).
+                version_ref = self._publish_field_version(
+                    arm_cell, storage, (
+                        arm_cell,
+                        book.latest_ref(
+                            CONTROL_VALUE_ALIAS,
+                            (self._scope(), int(arm_value_id)),
+                        ),
+                        self._binding_cell(storage_id),
+                    ),
+                )
+                return storage, (
+                    version_ref if version_ref is not None else arm_cell
+                )
         missing = book.post(
             SSA_FIELD_VERSION, row,
             Unresolved(ARM_VERSION_MISSING, read=(arm_cell,)),
@@ -8930,7 +8968,7 @@ class _ControlSSABuilder:
             initial_id = int(alias[2])
             true_value, true_source = self._carried_field_arm(
                 cells[0], cells[1], carried_snapshots[initial_id],
-                path=f"{path}.body",
+                path=f"{path}.body", arm_value_id=int(alias[0]),
             )
             true_carried[initial_id] = true_value
             carried_field_sources[initial_id] = [true_source]
@@ -8993,7 +9031,7 @@ class _ControlSSABuilder:
             initial_id = int(alias[2])
             false_value, false_source = self._carried_field_arm(
                 cells[1], cells[0], carried_snapshots[initial_id],
-                path=f"{path}.orelse",
+                path=f"{path}.orelse", arm_value_id=int(alias[1]),
             )
             false_carried[initial_id] = false_value
             carried_field_sources.setdefault(initial_id, []).append(false_source)
