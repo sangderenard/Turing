@@ -19205,13 +19205,7 @@ def _structured_output_descriptor(graph: Any, value_id: int) -> Any:
     if graph.G.graph.get("planner_tensor_descriptors"):
         owner = authored_function_name(graph.G.graph.get("function_name"))
         formal_page = current_identity_book().page("formal_shape")
-        if any(
-            isinstance(formal_row, tuple)
-            and len(formal_row) >= 2
-            and authored_function_name(formal_row[0]) == owner
-            and isinstance(formal_page.latest(formal_row), _Unresolved)
-            for formal_row in formal_page.rows()
-        ):
+        if _owner_has_polymorphic_formal(formal_page, owner):
             return descriptor
     proof = proven_shape_contract_of(
         graph.G.graph.get("function_name"),
@@ -19406,6 +19400,52 @@ def _arithmetic_loop_target_owner(graph: Any, node_id: int) -> int | None:
     return None
 
 
+#: ``id(formal_shape page)`` -> (weak reference to that page, {authored owner
+#: -> (cell count at the scan, answer)}).  See ``_owner_has_polymorphic_formal``.
+_POLYMORPHIC_FORMAL_SCANS: dict[int, tuple[Any, dict[str, tuple[int, bool]]]] = {}
+
+
+def _owner_has_polymorphic_formal(formal_page: Any, authored_owner: str) -> bool:
+    """Whether any ``formal_shape`` row of ``authored_owner`` is
+    ``Unresolved(FORMAL_SHAPE_CONFLICT)`` -- two call edges disagreed on a
+    formal, so the function has no single descriptor graph.
+
+    This is the scan ``_tensor_descriptor`` and ``_structured_output_descriptor``
+    made on every outermost query (28% of the orbital profile), memoized on
+    the page's content: every writer of ``formal_shape`` is a ``book.post``
+    (``_publish_formal_shape``, mode REVISE: a new column per revision) or a
+    scope fork's copy of a row (a new row), so the page's cell count only
+    grows and is a version of its content; a hit at the same count is the
+    same scan over the same cells.  Rows are keyed by the authored owner
+    (``_publish_formal_shape`` writes ``authored_function_name``), so the
+    owner's ``scope_rows`` are exactly the rows the filter admits.
+    """
+
+    import weakref
+
+    from .identity_concordance import Unresolved as _Unresolved
+    from .identity_concordance import authored_function_name
+
+    key = id(formal_page)
+    entry = _POLYMORPHIC_FORMAL_SCANS.get(key)
+    if entry is None or entry[0]() is not formal_page:
+        entry = (weakref.ref(formal_page), {})
+        _POLYMORPHIC_FORMAL_SCANS[key] = entry
+    version = len(formal_page.cells)
+    held = entry[1].get(authored_owner)
+    if held is not None and held[0] == version:
+        return held[1]
+    answer = any(
+        isinstance(formal_row, tuple)
+        and len(formal_row) >= 2
+        and authored_function_name(formal_row[0]) == authored_owner
+        and isinstance(formal_page.latest(formal_row), _Unresolved)
+        for formal_row in formal_page.scope_rows(authored_owner)
+    )
+    entry[1][authored_owner] = (version, answer)
+    return answer
+
+
 class _DescriptorQuery(set):
     """The ``_seen`` path set of ONE outermost descriptor query.
 
@@ -19560,13 +19600,7 @@ def _tensor_descriptor(
         else:
             polymorphic_specialization = bool(
                 graph.G.graph.get("planner_tensor_descriptors")
-                and any(
-                    isinstance(formal_row, tuple)
-                    and len(formal_row) >= 2
-                    and authored_function_name(formal_row[0]) == authored_owner
-                    and isinstance(formal_page.latest(formal_row), _Unresolved)
-                    for formal_row in formal_page.scope_rows(authored_owner)
-                )
+                and _owner_has_polymorphic_formal(formal_page, authored_owner)
             )
             if query is not None:
                 query.polymorphic[0] = polymorphic_specialization
