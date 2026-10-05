@@ -3654,6 +3654,27 @@ class IdentityBook:
                         f"recorded={incumbent!r}, proposed={fact!r}"
                     )
                 write_cell = False
+                if sources:
+                    # The same fact from the same cells at the same stage,
+                    # again: every edge this post would write already exists
+                    # (edge rows are keyed by target, source and stage), so
+                    # the post would only re-stamp private edge rows and tick
+                    # the clock.  No reader consults an edge row's stamp
+                    # (REVISE and the selection rules compare FACT cells'
+                    # stamps), and skipping a tick keeps every written cell's
+                    # relative order, so the book reads the same afterwards.
+                    # ``publish_program_abi_graph_identities`` re-posts every
+                    # declared field's shape transformation on each of its
+                    # runs; this was a third of the orbital specialization
+                    # stage.
+                    target_key = Ref(page, row, column).key
+                    edge_cells = self.page(EDGE_PAGE).cells
+                    if all(
+                        ((target_key, source_ref.key, stage.name), 0)
+                        in edge_cells
+                        for source_ref, _ in sources
+                    ):
+                        return Ref(page, row, column)
             else:
                 column, write_cell = 0, True
         else:
