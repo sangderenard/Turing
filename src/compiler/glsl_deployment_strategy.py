@@ -19290,7 +19290,12 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
 })
 
 
-_DEPENDENCY_LEVEL_CACHE: dict[int, tuple[int, dict[int, int]]] = {}
+#: ``id(graph.G)`` -> (node count, levels, weak reference to that very
+#: ``graph.G``).  The id alone is not an identity: callsite copies are made
+#: and freed every specialization round, so a freed graph's id is recycled by
+#: a new graph with (by chance) the same node count and the stale levels were
+#: returned for it.  The weak reference is checked on every hit.
+_DEPENDENCY_LEVEL_CACHE: dict[int, tuple[int, dict[int, int], Any]] = {}
 
 
 def _dependency_levels(graph: Any) -> dict[int, int]:
@@ -19302,9 +19307,15 @@ def _dependency_levels(graph: Any) -> dict[int, int]:
     member of one is at the same causal position.
     """
 
+    import weakref
+
     key = id(graph.G)
     cached = _DEPENDENCY_LEVEL_CACHE.get(key)
-    if cached is not None and cached[0] == graph.G.number_of_nodes():
+    if (
+        cached is not None
+        and cached[2]() is graph.G
+        and cached[0] == graph.G.number_of_nodes()
+    ):
         return cached[1]
     levels: dict[int, int] = {}
     try:
@@ -19324,7 +19335,9 @@ def _dependency_levels(graph: Any) -> dict[int, int]:
                 levels[int(member)] = depth
     except Exception:
         levels = {}
-    _DEPENDENCY_LEVEL_CACHE[key] = (graph.G.number_of_nodes(), levels)
+    _DEPENDENCY_LEVEL_CACHE[key] = (
+        graph.G.number_of_nodes(), levels, weakref.ref(graph.G),
+    )
     return levels
 
 

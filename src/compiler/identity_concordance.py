@@ -3293,9 +3293,28 @@ class IdentityPage:
         return fact
 
     def latest(self, row: Any, default: Any = None) -> Any:
-        """Return the most recently recorded fact for ``row``."""
-        entries = self.history(row)
-        return entries[-1][1] if entries else default
+        """Return the most recently recorded fact for ``row``.
+
+        The last entry of ``history(row)``, read through the row index
+        directly: ``row_columns[row]`` already holds the row's columns in
+        recorded order, so the answer is its last column's cell.  Building
+        the whole history tuple to read one cell was the hottest read on the
+        book (``_tensor_descriptor`` asks it per node per query).
+        """
+        if len(self.column_positions) != len(self.columns):
+            self._reindex()
+        columns = self.row_columns.get(row)
+        if not columns:
+            return default
+        return self.cells[(row, columns[-1])]
+
+    def latest_column(self, row: Any) -> int | None:
+        """The column of ``row``'s most recently recorded cell, or None --
+        ``history(row)[-1][0]`` without materializing the history."""
+        if len(self.column_positions) != len(self.columns):
+            self._reindex()
+        columns = self.row_columns.get(row)
+        return columns[-1] if columns else None
 
     def concord(self, row: Any, fact: Any) -> Any:
         """Commit ``fact`` for ``row`` and return the committed fact.
@@ -3724,10 +3743,10 @@ class IdentityBook:
         stored = self.pages.get(page.name)
         if stored is None:
             return None
-        entries = stored.history(row)
-        if not entries:
+        column = stored.latest_column(row)
+        if column is None:
             return None
-        return Ref(page, row, entries[-1][0])
+        return Ref(page, row, column)
 
     def stamp_of(self, ref: Ref) -> int:
         return self._source_stamp(ref)
