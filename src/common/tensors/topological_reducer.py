@@ -2705,18 +2705,26 @@ def _set_operands(
     renamed = dict(same or {})
     taken: set[int] = set()
     moves: dict[tuple[Any, int], tuple[Any, int] | None] = {}
+    # Candidate new positions per parent value, ascending: matching an old
+    # operand scans only the positions that hold ITS value, not every
+    # operand of the node (``connect`` rewrites the whole list once per edge,
+    # so the all-pairs scan made a node with N operands cost ~N^3).
+    new_by_parent: dict[Any, list[int]] = {}
+    for index, (_new_role, _new_ordinal, new_parent) in enumerate(new):
+        new_by_parent.setdefault(new_parent, []).append(index)
     for role, ordinal, parent in old:
         target = renamed.get(parent, parent)
         match = None
+        candidates = new_by_parent.get(target, ())
         # The same role first: an unmoved operand keeps its position even
         # when its value also appears at another position.
-        for index, (new_role, _new_ordinal, new_parent) in enumerate(new):
-            if index not in taken and new_parent == target and new_role == role:
+        for index in candidates:
+            if index not in taken and new[index][0] == role:
                 match = index
                 break
         if match is None:
-            for index, (_new_role, _new_ordinal, new_parent) in enumerate(new):
-                if index not in taken and new_parent == target:
+            for index in candidates:
+                if index not in taken:
                     match = index
                     break
         if match is None:
