@@ -93,6 +93,7 @@ def compiler_toolchain_fingerprint() -> dict[str, Any]:
         "src/compiler/frame_identity_book.py",
         "src/compiler/frame_storage_roles.py",
         "src/compiler/resident_sequence_materialization.py",
+        "src/compiler/sequence_storage_binding.py",
         "src/compiler/glsl_deployment_strategy.py",
         "src/compiler/hierarchical_control.py",
         "src/compiler/hierarchical_plan.py",
