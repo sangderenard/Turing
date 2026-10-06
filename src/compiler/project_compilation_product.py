@@ -86,6 +86,7 @@ def compiler_toolchain_fingerprint() -> dict[str, Any]:
         "src/compiler/extraction_contract.py",
         "src/compiler/fortran_c_shell.py",
         "src/compiler/declared_piece_signature.py",
+        "src/compiler/ast_control_normalization.py",
         "src/compiler/glsl_deployment_strategy.py",
         "src/compiler/hierarchical_control.py",
         "src/compiler/hierarchical_plan.py",
