@@ -11753,6 +11753,26 @@ def _canonicalize_non_dominating_loop_result_uses(
                             and len(defining.args) == 1
                         ):
                             replacement = defining.args[0]
+                        elif (
+                            str(defining.op).casefold() == "phi"
+                            and defining.args
+                            and all(
+                                int(other.id) == int(defining.args[0].id)
+                                for other in defining.args
+                            )
+                            and int(defining.args[0].id) != int(argument.id)
+                        ):
+                            # A Phi whose every incoming is ONE value states
+                            # the same equivalence as a single incoming: the
+                            # port IS that value on every path (the
+                            # return-merge field Phi of a span the function
+                            # forwards unwritten from every return site --
+                            # N=2 orbital dt system, ``pub_limits`` of
+                            # ``step_with_dt_control_used``: Phi(f, f, f),
+                            # read by a call in the retry loop, where the
+                            # Phi's block does not dominate).  The CFG check
+                            # below still decides.
+                            replacement = defining.args[0]
                 if replacement is None:
                     _note("no-candidate", tuple(
                         definition_sites.get(int(argument.id), ())

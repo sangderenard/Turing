@@ -130,6 +130,34 @@ def loop_result_function():
     )
 
 
+def same_incoming_phi_function():
+    """A return-merge Phi whose three incomings are one formal, read by a
+    call in a block the Phi's block does not dominate (``pub_limits`` of
+    ``step_with_dt_control_used``)."""
+    forwarded = SSAValue(40, dtype="float64")
+    merged = SSAValue(41, dtype="float64")
+    use = Instr("Call", [merged], None, attributes={"callee": "consume"})
+    phi = Instr("Phi", [forwarded, forwarded, forwarded], merged, attributes={
+        "binding": "return_merge", "record_field_phi": True,
+        "initial_value_id": 99,  # a stale id: no definition anywhere
+        "incoming_blocks": ("body", "body", "body"),
+    })
+    return forwarded, merged, use, Function(
+        "fwd", [forwarded],
+        {
+            "entry": BasicBlock(
+                "entry", [Instr("Br", [], None, attributes={"target": "body"})],
+                successors=["body"]),
+            "body": BasicBlock(
+                "body", [use, Instr("Br", [], None, attributes={
+                    "target": "function_exit"})],
+                successors=["function_exit"]),
+            "function_exit": BasicBlock(
+                "function_exit", [phi, Instr("Ret", [merged], None)]),
+        },
+    )
+
+
 def part_a() -> None:
     book, token = begin_identity_book()
     try:
@@ -156,6 +184,16 @@ def part_a() -> None:
         check("loop-result row derives from the original's and the "
               "replacement's ssa_value cells", value_ids(srcs) == {30, 31})
         print(f"  fact: {book.page(LOOP_RESULT_USE_REBINDING).latest(row)}")
+
+        forwarded, merged, use, function = same_incoming_phi_function()
+        post_values(book, function, forwarded, merged)
+        receipts = _canonicalize_non_dominating_loop_result_uses(function)
+        check("a Phi of one value, read where it does not dominate, reads "
+              "that value", use.args == [forwarded] and len(receipts) >= 1)
+        row = ("fwd", "body", 0, 0)
+        srcs = sources_of(book, LOOP_RESULT_USE_REBINDING, row)
+        check("same-incoming row derives from the Phi's and the forwarded "
+              "value's ssa_value cells", value_ids(srcs) == {40, 41})
     finally:
         end_identity_book(token)
 
