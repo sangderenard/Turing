@@ -82,6 +82,7 @@ from .concordance_declarations import (
     LOOP_ENTRY_STATE,
     LOOP_RESULT_PORT_BINDING,
     LOOP_RESULT_RECONCILIATION,
+    LOOP_RESULT_USE_REBINDING,
     LOOP_RESULT_VERSION,
     NAME_ARM_VERSION_MISSING,
     NAME_BINDING,
@@ -11783,6 +11784,45 @@ def _canonicalize_non_dominating_loop_result_uses(
                     ))
                     continue
                 _note("replaced", int(replacement.id))
+                # The substitution itself is a fact on the book, one row per
+                # occurrence: DERIVED(the original's and the replacement's
+                # ``ssa_value`` cells, the blocks the dominance proof names)
+                # with the proof's evidence in the fact.  Not swallowed: a
+                # substitution the book did not take is not a valid one.
+                from .ssa_record_return_state import post_dominance_rebinding
+
+                use_target = (
+                    str(incoming_block) if incoming_block is not None
+                    else str(block_name)
+                )
+                replacement_sites = tuple(
+                    definition_sites.get(int(replacement.id), ())
+                )
+                post_dominance_rebinding(
+                    function, LOOP_RESULT_USE_REBINDING, (
+                        str(function.metadata.get(
+                            "tensor_shape_concordance_scope"
+                        ) or function.name),
+                        str(block_name), int(instruction_index),
+                        int(argument_index),
+                    ), (
+                        int(argument.id), int(replacement.id),
+                        (
+                            ("formal",) if int(replacement.id) in argument_ids
+                            else replacement_sites
+                        ),
+                        tuple(definition_sites.get(int(argument.id), ())),
+                        use_target,
+                        "phi_edge" if incoming_block is not None
+                        else int(instruction_index),
+                    ),
+                    original=argument, replacement=replacement,
+                    blocks=(
+                        use_target,
+                        *(site[0] for site in replacement_sites[:1]),
+                    ),
+                    stage=CONTROL_SSA_FINISH, mode=Mode.REVISE,
+                )
                 resolved_args[argument_index] = replacement
                 receipts.append((
                     str(block_name), int(instruction_index),

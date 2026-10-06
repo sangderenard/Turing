@@ -46335,6 +46335,25 @@ def _lower_ast_source_to_ssa_impl(
             # Running this only in the public wrapper after the implementation
             # returned made the proof unreachable on precisely the build the
             # gate rejected: the module never escaped the implementation.
+            # The late dominance repairs belong BEFORE this concordance: the
+            # frame-formal rows are immutable, and the wrapper used to repair
+            # a use AFTER this pass had posted the unrepaired actual.  Every
+            # use they need exists here (the last installer,
+            # ``publish_scalar_record_return_fields``, has run); the gate
+            # below then audits the repaired module.
+            (
+                pre_gate_loop_result_rebindings,
+                pre_gate_record_phi_repairs,
+            ) = _settle_late_dominance_repairs(module)
+            module.metadata["pre_native_gate_dominance_repairs"] = {
+                "loop_result_use_rebindings": pre_gate_loop_result_rebindings,
+                "record_phi_temporal_fallbacks": pre_gate_record_phi_repairs,
+            }
+            report(
+                "pre-native-gate dominance repairs: loop-result uses "
+                f"{pre_gate_loop_result_rebindings}; record-Phi temporal "
+                f"uses {pre_gate_record_phi_repairs}"
+            )
             from .identity_concordance import concord_compiler_frame_formals
 
             frame_formal_receipts = concord_compiler_frame_formals(module)
@@ -46737,6 +46756,51 @@ def _dump_identity_book_log(
         pass
 
 
+def _settle_late_dominance_repairs(module: Any) -> tuple[int, int]:
+    """Apply the two late dominance repairs to every function of ``module``.
+
+    ``_canonicalize_non_dominating_loop_result_uses`` and
+    ``repair_non_dominating_record_phi_uses`` substitute an operand only when
+    CFG dominance proves the replacement available, and each substitution is
+    a row on the book (``loop_result_use_rebinding`` /
+    ``record_phi_temporal_fallback_concordance``).  They were placed in the
+    public wrapper, "the last point at which every use exists", because every
+    earlier placement ran before a later pass installed the use.  The last
+    pass that installs one is ``publish_scalar_record_return_fields`` in the
+    implementation, so the implementation runs this immediately after it:
+    the full-native gate's frame-formal concordance then posts each actual
+    ONCE, final.  Returns (loop-result substitutions, record-Phi
+    substitutions).
+    """
+    from .precompile_to_ssa import (
+        _canonicalize_non_dominating_loop_result_uses as
+        _reconcile_loop_result_uses,
+    )
+    from .ssa_record_return_state import (
+        repair_non_dominating_record_phi_uses,
+    )
+
+    reconciled = 0
+    for _function in getattr(module, "functions", {}).values():
+        receipts = _reconcile_loop_result_uses(_function)
+        if receipts:
+            reconciled += len(receipts)
+            _function.metadata["loop_result_use_rebindings"] = tuple((
+                *_function.metadata.get("loop_result_use_rebindings", ()),
+                *receipts,
+            ))
+    record_phi_temporal_repairs = 0
+    for _function in getattr(module, "functions", {}).values():
+        _receipts = repair_non_dominating_record_phi_uses(_function)
+        if _receipts:
+            record_phi_temporal_repairs += len(_receipts)
+            _function.metadata["record_phi_temporal_fallbacks"] = tuple((
+                *_function.metadata.get("record_phi_temporal_fallbacks", ()),
+                *_receipts,
+            ))
+    return reconciled, record_phi_temporal_repairs
+
+
 def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     """Thin wrapper over ``_lower_ast_source_to_ssa_impl``: opens one
     IdentityBook for this compile and always writes its dense log, success
@@ -46773,44 +46837,15 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     ok = False
     try:
         result = _lower_ast_source_to_ssa_impl(*args, **kwargs)
-        # The LAST point at which every use exists.  Earlier placements of
-        # this reconciliation -- per section, after linking, after aggregate
-        # legalization -- each examined the offending function and did not
-        # yet see the argument the concordance reports, because a later pass
-        # installs it.  Dominance decides every substitution, so running it
-        # on the module the caller receives adds no risk and closes the gap.
-        from .precompile_to_ssa import (
-            _canonicalize_non_dominating_loop_result_uses as
-            _reconcile_loop_result_uses,
-        )
-
+        # The late dominance repairs run inside the implementation, before
+        # the full-native gate and its first frame-formal concordance (see
+        # ``_settle_late_dominance_repairs``).  A module that never reached
+        # that point (no full-native policy) is settled here; for the
+        # others every substitution is already made and this finds none.
         module = result[0] if isinstance(result, tuple) else result
-        reconciled = 0
-        for _function in getattr(module, "functions", {}).values():
-            receipts = _reconcile_loop_result_uses(_function)
-            if receipts:
-                reconciled += len(receipts)
-                _function.metadata["loop_result_use_rebindings"] = tuple((
-                    *_function.metadata.get(
-                        "loop_result_use_rebindings", ()
-                    ),
-                    *receipts,
-                ))
-        from .ssa_record_return_state import (
-            repair_non_dominating_record_phi_uses,
+        reconciled, _record_phi_temporal_repairs = (
+            _settle_late_dominance_repairs(module)
         )
-
-        _record_phi_temporal_repairs = 0
-        for _function in getattr(module, "functions", {}).values():
-            _receipts = repair_non_dominating_record_phi_uses(_function)
-            if _receipts:
-                _record_phi_temporal_repairs += len(_receipts)
-                _function.metadata["record_phi_temporal_fallbacks"] = tuple((
-                    *_function.metadata.get(
-                        "record_phi_temporal_fallbacks", ()
-                    ),
-                    *_receipts,
-                ))
         from .identity_concordance import (
             concord_compiler_frame_formals,
             concord_loop_scope_latch_residents,

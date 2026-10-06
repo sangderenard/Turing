@@ -853,6 +853,16 @@ CALLSITE_ARGUMENT = declare_page("callsite_argument", (
 LOOP_RESULT_RECONCILIATION = declare_page("loop_result_reconciliation", (
     RowField("function", K.SCOPE), RowField("argument", K.VALUE_ID),
 ), tuple)                              # mode REVISE
+#: ``_canonicalize_non_dominating_loop_result_uses``: one row per substituted
+#: OCCURRENCE ``(function scope, block, use index, argument position)`` ->
+#: ``(original id, replacement id, dominance evidence)``.  REVISE (the
+#: function runs at several points and instruction indices shift between
+#: them), DERIVED(the original's and the replacement's ``ssa_value`` cells and
+#: the ``ssa_block`` cells of the blocks the dominance proof names).
+LOOP_RESULT_USE_REBINDING = declare_page("loop_result_use_rebinding", (
+    RowField("function", K.SCOPE), RowField("block", K.NAME),
+    RowField("use_index", K.INDEX), RowField("position", K.INDEX),
+), tuple)
 CONTROL_UNIFORM_DTYPE = declare_page("control_uniform_dtype", (
     RowField("control_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), str)                                # mode CONCORD

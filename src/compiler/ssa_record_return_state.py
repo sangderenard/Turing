@@ -86,6 +86,32 @@ def identity_cells(function, *items):
     return tuple(found)
 
 
+def post_dominance_rebinding(
+    function, page, row, fact, *, original, replacement, blocks=(), stage,
+    mode,
+):
+    """Post one dominance-proved operand substitution on the book.
+
+    DERIVED(the original operand's ``ssa_value`` cell, the replacement's, and
+    the ``ssa_block`` cell of every block the dominance proof names).  A
+    substitution that can name no cell at all is written through the raw
+    primitive, which the book tags ``Unsourced`` so it stays on the worklist
+    (``_post_derived_or_raw``); it is never a metadata-only decision.
+    """
+    from .identity_concordance import current_identity_book
+    from .precompile_to_ssa import _post_derived_or_raw
+
+    cells = list(identity_cells(function, original, replacement))
+    for label in blocks:
+        cell = ssa_block_identity_cell(function, label)
+        if cell is not None and cell not in cells:
+            cells.append(cell)
+    return _post_derived_or_raw(
+        current_identity_book(), page, row, fact, tuple(cells),
+        stage=stage, mode=mode,
+    )
+
+
 # ---------------------------------------------------------------------------
 # The identity of a return SITE (plan 70, section 2).
 #
@@ -1473,9 +1499,11 @@ def repair_non_dominating_record_phi_uses(function):
             owner != target or phi_edge or index < use_index
         )
 
-    page = current_identity_book().page(
-        "record_phi_temporal_fallback_concordance"
+    from .concordance_declarations import (
+        RECORD_PHI_TEMPORAL_FALLBACK, RECORD_RETURN_REPAIR,
     )
+    from .identity_concordance import Mode
+
     receipts = []
     for block_name, block in function.blocks.items():
         for use_index, instruction in enumerate(block.instrs):
@@ -1502,15 +1530,33 @@ def repair_non_dominating_record_phi_uses(function):
                     str(function.name), result_id, str(block_name),
                     int(use_index), int(position),
                 )
-                fact = (fallback_id, target, "initial_record_field_version")
-                prior = page.latest(row)
-                if prior is not None and tuple(prior) != fact:
-                    raise ValueError(
-                        "record Phi temporal fallback disagreement: "
-                        f"row={row!r}, prior={prior!r}, new={fact!r}"
-                    )
-                if prior is None:
-                    page.set(row, max(page.columns, default=-1) + 1, fact)
+                # The dominance evidence: where the fallback is defined (a
+                # formal, or block and index), where the Phi result is
+                # defined, and the use's target block.
+                fallback_site = (
+                    "formal" if fallback_id in formals
+                    else definitions[fallback_id][0][:2]
+                )
+                result_sites = tuple(
+                    site[:2] for site in definitions.get(result_id, ())
+                )
+                fact = (
+                    fallback_id, target, "initial_record_field_version",
+                    fallback_site, result_sites,
+                )
+                # CONCORD: a changed answer for the same occurrence raises.
+                post_dominance_rebinding(
+                    function, RECORD_PHI_TEMPORAL_FALLBACK, row, fact,
+                    original=result_id, replacement=fallback_id,
+                    blocks=(
+                        target,
+                        *(
+                            () if fallback_site == "formal"
+                            else (fallback_site[0],)
+                        ),
+                    ),
+                    stage=RECORD_RETURN_REPAIR, mode=Mode.CONCORD,
+                )
                 arguments[position] = fallback
                 receipts.append((result_id, fallback_id, block_name, use_index, position))
             instruction.args = arguments
