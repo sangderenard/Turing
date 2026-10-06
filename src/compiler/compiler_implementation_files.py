@@ -15,4 +15,5 @@ from __future__ import annotations
 
 COMPILER_IMPLEMENTATION_FILES: tuple[str, ...] = (
     "src/compiler/glsl_deployment_strategy.py",
+    "src/compiler/source_node_facts.py",
 )
