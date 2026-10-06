@@ -1427,6 +1427,36 @@ def repair_non_dominating_return_phi_inputs(function):
     return tuple(receipts)
 
 
+def _refuse_undefined_record_phi_fallback(
+    function, result_id, fallback_id, block_name, use_index, position, target,
+):
+    """Post ``Unresolved(RECORD_PHI_FALLBACK_NOT_DEFINED)`` on the occurrence's
+    ``record_phi_temporal_fallback_concordance`` row and raise."""
+    from .concordance_declarations import (
+        RECORD_PHI_FALLBACK_NOT_DEFINED, RECORD_PHI_TEMPORAL_FALLBACK,
+        RECORD_RETURN_REPAIR,
+    )
+    from .identity_concordance import Mode, Unresolved
+
+    read = identity_cells(function, result_id, fallback_id)
+    post_dominance_rebinding(
+        function, RECORD_PHI_TEMPORAL_FALLBACK,
+        (
+            str(function.name), int(result_id), str(block_name),
+            int(use_index), int(position),
+        ),
+        Unresolved(RECORD_PHI_FALLBACK_NOT_DEFINED, read=read),
+        original=result_id, replacement=fallback_id, blocks=(target,),
+        stage=RECORD_RETURN_REPAIR, mode=Mode.CONCORD,
+    )
+    raise ValueError(
+        f"record-field Phi %{result_id} is read at {block_name}[{use_index}] "
+        f"operand {position} where its block does not dominate, and its "
+        f"recorded initial %{fallback_id} has no definition in "
+        f"{function.name!r}: there is no version to read instead"
+    )
+
+
 def repair_non_dominating_record_phi_uses(function):
     """Use a record-field Phi's authored initial field before its merge.
 
@@ -1514,9 +1544,9 @@ def repair_non_dominating_record_phi_uses(function):
             for position, argument in enumerate(tuple(arguments)):
                 result_id = int(argument.id)
                 fallback_id = fallbacks.get(result_id)
-                fallback = values.get(fallback_id) if fallback_id is not None else None
-                if fallback is None:
+                if fallback_id is None:
                     continue
+                fallback = values.get(fallback_id)
                 target = (
                     str(incoming[position])
                     if position < len(incoming) else str(block_name)
@@ -1524,6 +1554,16 @@ def repair_non_dominating_record_phi_uses(function):
                 phi_edge = position < len(incoming)
                 if dominates(result_id, target, int(use_index), phi_edge):
                     continue
+                if fallback is None:
+                    # The Phi's result is read where it is not available and
+                    # its recorded initial names a value this function does
+                    # not define: there is nothing to substitute, and leaving
+                    # the use reads an undefined value.  That is a refusal
+                    # on the occurrence's row, never a skip.
+                    _refuse_undefined_record_phi_fallback(
+                        function, result_id, fallback_id, str(block_name),
+                        int(use_index), int(position), target,
+                    )
                 if not dominates(fallback_id, target, int(use_index), phi_edge):
                     continue
                 row = (

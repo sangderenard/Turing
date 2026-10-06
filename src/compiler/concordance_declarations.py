@@ -1241,6 +1241,13 @@ RECORD_PHI_TEMPORAL_FALLBACK = declare_page("record_phi_temporal_fallback_concor
     RowField("block", K.NAME), RowField("use_index", K.INDEX),
     RowField("position", K.INDEX),
 ), tuple)                              # CONCORD
+#: ``repair_non_dominating_record_phi_uses``: a record-field Phi result is read
+#: where its block does not dominate, and the Phi's recorded initial version
+#: has no definition in the function, so there is nothing to substitute.  The
+#: occurrence's row on ``record_phi_temporal_fallback_concordance`` is then
+#: ``Unresolved(RECORD_PHI_FALLBACK_NOT_DEFINED, read=<the Phi result's and the
+#: initial's ``ssa_value`` cells>)`` and the repair refuses the module.
+RECORD_PHI_FALLBACK_NOT_DEFINED = declare_reason("record_phi_fallback_not_defined")
 
 # ----------------------------------------------------------------------------
 # Step 7: the frame linker (plan 90, section 3; census 10, sections 1.1-1.6
