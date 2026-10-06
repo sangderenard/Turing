@@ -340,9 +340,51 @@ def _aggregate_projections(
     return projections
 
 
+def _post_passthrough_rebinding(
+    function: Function, source: SSAValue, replacement: SSAValue,
+    via: tuple[str, int],
+) -> int:
+    """Post ``aggregate_passthrough_rebinding`` for one folded projection and
+    return the replacement id THE ROW states.
+
+    DERIVED(the original's and the replacement's ``ssa_value`` cells; a fold
+    that can name neither is written raw, which the book tags ``Unsourced``).
+    """
+
+    from .concordance_declarations import (
+        AGGREGATE_ABI_LEGALIZATION, AGGREGATE_PASSTHROUGH_REBINDING,
+    )
+    from .identity_concordance import Mode, current_identity_book
+    from .precompile_to_ssa import _post_derived_or_raw
+    from .ssa_record_return_state import function_scope_of, identity_cells
+
+    book = current_identity_book()
+    row = (function_scope_of(function), int(source.id))
+    _post_derived_or_raw(
+        book, AGGREGATE_PASSTHROUGH_REBINDING, row,
+        (int(replacement.id), str(via[0]), int(via[1])),
+        identity_cells(function, source, replacement),
+        stage=AGGREGATE_ABI_LEGALIZATION, mode=Mode.REVISE,
+    )
+    return int(book.page(AGGREGATE_PASSTHROUGH_REBINDING).latest(row)[0])
+
+
 def _replace_exact_uses(
     function: Function, source: SSAValue, replacement: SSAValue,
+    *, via: tuple[str, int],
 ) -> None:
+    """Rebind every use of ``source`` to ``replacement`` (the fold removes
+    ``source``'s definition), as one row on the book.
+
+    A use is an operand or an id-carrying reference: a Phi's
+    ``initial_value_id`` names the value that stood before the merge, and a
+    Phi whose initial is the folded projection must name what the row says
+    now stands there.  Left alone it names an id with no definition in the
+    function (N=2 orbital dt system: the return-merge field Phis of
+    ``pub_limits`` / ``pub_limits_present`` of ``step_with_dt_control_used``).
+    """
+
+    rebound_id = _post_passthrough_rebinding(function, source, replacement, via)
     for block in function.blocks.values():
         for instruction in block.instrs:
             instruction.args[:] = [
@@ -351,6 +393,13 @@ def _replace_exact_uses(
                 else argument
                 for argument in instruction.args
             ]
+            attributes = instruction.attributes
+            if (
+                attributes
+                and attributes.get("initial_value_id") is not None
+                and int(attributes["initial_value_id"]) == int(source.id)
+            ):
+                attributes["initial_value_id"] = rebound_id
 
 
 def _remove_instructions(function: Function, removed: set[int]) -> None:
@@ -565,7 +614,10 @@ def legalize_aggregate_adapters(module: IRModule) -> bool:
                             ),
                         },
                     )
-                    _replace_exact_uses(caller, projection.value, replacement)
+                    _replace_exact_uses(
+                        caller, projection.value, replacement,
+                        via=(callee_name, int(output_id)),
+                    )
                     removed_caller.update((
                         id(projection.address), id(projection.load),
                     ))
@@ -792,6 +844,7 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     )
                     _replace_exact_uses(
                         function, projection.value, replacement,
+                        via=(callee_name, int(caller_id)),
                     )
                     passthrough_bindings.append((
                         int(output_position), int(caller_id),

@@ -863,6 +863,18 @@ LOOP_RESULT_USE_REBINDING = declare_page("loop_result_use_rebinding", (
     RowField("function", K.SCOPE), RowField("block", K.NAME),
     RowField("use_index", K.INDEX), RowField("position", K.INDEX),
 ), tuple)
+#: ``ssa_aggregate_abi._replace_exact_uses``: the aggregate-ABI legalization
+#: folds a projected output (``Load(GEP(aggregate, k))``) into the call's own
+#: actual and rebinds every use of the projection's value.  One row per
+#: rebound value ``(function scope, original id)`` -> ``(replacement id,
+#: callee, output id)``.  REVISE (the legalization runs at several stages),
+#: DERIVED(the original's and the replacement's ``ssa_value`` cells).  Every
+#: id-carrying reference to the original (an operand, a Phi's
+#: ``initial_value_id``) follows THIS row; the original has no definition
+#: after the fold, so a reference that still names it is stale.
+AGGREGATE_PASSTHROUGH_REBINDING = declare_page("aggregate_passthrough_rebinding", (
+    RowField("function", K.SCOPE), RowField("original", K.VALUE_ID),
+), tuple)
 CONTROL_UNIFORM_DTYPE = declare_page("control_uniform_dtype", (
     RowField("control_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), str)                                # mode CONCORD
@@ -1113,6 +1125,9 @@ STRUCTURAL_RECOVERY = declare_stage("structural_recovery")
 #: ``freshen_redefined_ssa_objects`` and the other
 #: ``ssa_record_return_state`` repairs.
 RECORD_RETURN_REPAIR = declare_stage("record_return_repair")
+#: ``ssa_aggregate_abi.legalize_aggregate_adapters`` and
+#: ``legalize_aggregate_output_views`` (the pass-through folds).
+AGGREGATE_ABI_LEGALIZATION = declare_stage("aggregate_abi_legalization")
 
 # -- transforms (arity 1: several sources become one ``cell_set`` row) -------
 #: A per-field Phi of a record merge: operand = the ``cell_set`` of the record
