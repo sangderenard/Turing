@@ -69,6 +69,8 @@ def compiler_toolchain_fingerprint() -> dict[str, Any]:
     cache or assigning identity to runtime objects.
     """
 
+    from .compiler_implementation_files import COMPILER_IMPLEMENTATION_FILES
+
     root = Path(__file__).resolve().parents[2]
     relative_paths = (
         "extraction_contracts/program_extraction.yaml",
@@ -85,7 +87,7 @@ def compiler_toolchain_fingerprint() -> dict[str, Any]:
         "src/compiler/deployment_frame.py",
         "src/compiler/extraction_contract.py",
         "src/compiler/fortran_c_shell.py",
-        "src/compiler/glsl_deployment_strategy.py",
+        *COMPILER_IMPLEMENTATION_FILES,
         "src/compiler/hierarchical_control.py",
         "src/compiler/hierarchical_plan.py",
         "src/compiler/ir_identities.py",

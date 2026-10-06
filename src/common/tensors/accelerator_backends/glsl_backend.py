@@ -3009,6 +3009,10 @@ def _semantic_cache_digest(value: Any) -> str:
 def _lowering_implementation_digest() -> str:
     """Fingerprint code that turns the semantic artifact into GLSL."""
 
+    from src.compiler.compiler_implementation_files import (
+        COMPILER_IMPLEMENTATION_FILES,
+    )
+
     digest = hashlib.sha256()
     paths = (
         Path(__file__),
@@ -3017,8 +3021,10 @@ def _lowering_implementation_digest() -> str:
         Path(__file__).parents[3] / "compiler" / "loop_composer.py",
         Path(__file__).parents[3] / "compiler"
         / "hierarchical_control.py",
-        Path(__file__).parents[3] / "compiler"
-        / "glsl_deployment_strategy.py",
+        *(
+            Path(__file__).parents[4] / relative_path
+            for relative_path in COMPILER_IMPLEMENTATION_FILES
+        ),
     )
     for path in paths:
         digest.update(str(path.name).encode("utf-8"))
