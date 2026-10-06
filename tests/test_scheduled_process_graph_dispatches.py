@@ -343,6 +343,47 @@ def test_clean_subgraph_preserves_cyclic_metadata_identity_without_aliasing_sour
     assert shared["label"] == "shared"
 
 
+def test_compartment_carries_its_own_nodes_tokens_and_shares_read_only_tables():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "input")
+    _add(graph, 2, "add", (1,))
+    _add(graph, 3, "sin", (2,))
+    tokens = {1: ("value:x",), 2: ("Add", "value:x"), 3: ("Call", "sin")}
+    trace = {"events": [{"stage": "select"}]}
+    names = {"x": ({"value_id": 1},)}
+    mutable = {"calls": [1, 2]}
+    graph.G.graph.update(
+        ssa_identity_tokens=tokens,
+        deployment_selection_trace=trace,
+        ingestion_identity_table=names,
+        mutable_metadata=mutable,
+    )
+
+    compartment = extract_clean_process_subgraph(graph, (2, 3))
+
+    # The projection onto the compartment's nodes; the source keeps all rows.
+    assert compartment.G.graph["ssa_identity_tokens"] == {
+        2: tokens[2], 3: tokens[3],
+    }
+    assert graph.G.graph["ssa_identity_tokens"] == tokens
+    # Immutable chains need no copy; read-only tables are one object.
+    assert compartment.G.graph["ssa_identity_tokens"][2] is tokens[2]
+    assert compartment.G.graph["deployment_selection_trace"] is trace
+    assert compartment.G.graph["ingestion_identity_table"] is names
+    # Everything else is still the compartment's own copy.
+    assert compartment.G.graph["mutable_metadata"] == mutable
+    assert compartment.G.graph["mutable_metadata"] is not mutable
+    assert compartment.G.graph["mutable_metadata"]["calls"] is not mutable["calls"]
+
+    # A whole-graph copy (a specialization) copies every key, as before.
+    whole = extract_clean_process_subgraph(graph, graph.G)
+    assert whole.G.graph["ssa_identity_tokens"] == tokens
+    assert whole.G.graph["ssa_identity_tokens"] is not tokens
+    assert whole.G.graph["deployment_selection_trace"] is not trace
+    assert whole.G.graph["ingestion_identity_table"] is not names
+    assert whole.G.graph["ingestion_identity_table"]["x"][0] is not names["x"][0]
+
+
 def test_shader_reducer_consumes_existing_process_graph_schedule():
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 0, "Input")

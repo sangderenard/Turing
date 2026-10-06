@@ -112,6 +112,42 @@ class ScheduledProcessGraphDispatchPlan:
     node_locations: Mapping[int, tuple[int, int]]
 
 
+#: Graph metadata a compartment (a proper induced subgraph, i.e. a planned
+#: dispatch region) shares with its source instead of copying.  Each is
+#: written once, by whole assignment, by its owner, and never mutated in
+#: place by anything that holds a compartment:
+#:
+#: ``deployment_selection_trace``
+#:     the selection diagnostic.  Its writer documents it as one shared
+#:     object ("the root and extracted function graphs expose one ordered
+#:     account"); nothing reads it back.  Copying it per region snapshotted
+#:     up to 512 events per region.
+#: ``ingestion_identity_table``
+#:     the function's name -> binding-history view (a view of the
+#:     ``name_binding`` rows), written once at the canonical relabel; its
+#:     only reader (``training_data_store``) reads the whole function's graph.
+_COMPARTMENT_SHARED_METADATA = (
+    "deployment_selection_trace",
+    "ingestion_identity_table",
+)
+
+#: Node-keyed views of book rows.  A compartment's view is the projection of
+#: the source's onto the compartment's nodes.
+#:
+#: ``ssa_identity_tokens``
+#:     canonical value id -> token chain: the view of the ``canonical_value``
+#:     rows ``(read scope, value id)`` posted at the canonical relabel (the
+#:     chain is the row's fact; that is its only writer).  The rows stay on
+#:     the book, whole.  The compartment's members are the
+#:     ``deployment_region_member`` rows posted for it, and each member is
+#:     identified by its ``canonical_value`` cell (``node_identity_cell``), so
+#:     the subset needs no row of its own: it is the join of rows already
+#:     there (member row -> that node's ``canonical_value`` row).  The only reader of the region graph's view
+#:     (``_region_program``) asks for the region's feeds and outputs, which
+#:     are compartment members.
+_COMPARTMENT_NODE_KEYED_METADATA = ("ssa_identity_tokens",)
+
+
 def extract_clean_process_subgraph(
     graph: ProcessGraph,
     node_ids: Iterable[int],
@@ -155,6 +191,10 @@ def extract_clean_process_subgraph(
             incumbent = metadata_memo.get(identity)
             if incumbent is not None:
                 return incumbent
+            if all(new is old for new, old in zip(isolated, value)):
+                # Nothing inside needed isolating (every item is a semantic
+                # leaf), so the copy would be this very tuple again: share it.
+                isolated = value
             metadata_memo[identity] = isolated
             return isolated
         if isinstance(value, set):
@@ -163,7 +203,12 @@ def extract_clean_process_subgraph(
             isolated.update(isolate_metadata(item) for item in value)
             return isolated
         if isinstance(value, frozenset):
-            isolated = frozenset(isolate_metadata(item) for item in value)
+            members = tuple(value)
+            isolated_members = tuple(isolate_metadata(item) for item in members)
+            if all(new is old for new, old in zip(isolated_members, members)):
+                isolated = value
+            else:
+                isolated = frozenset(isolated_members)
             metadata_memo[identity] = isolated
             return isolated
         return value
@@ -177,7 +222,26 @@ def extract_clean_process_subgraph(
     )
 
     extracted.G = graph.G.subgraph(included).copy()
-    extracted.G.graph = isolate_metadata(dict(graph.G.graph))
+    metadata = dict(graph.G.graph)
+    shared_metadata: dict[str, object] = {}
+    if included and len(included) < len(graph.G):
+        # A compartment (a planned dispatch region) is a proper induced
+        # subgraph.  It owns the facts of its own nodes, not a second copy of
+        # its function's: see ``_COMPARTMENT_SHARED_METADATA`` and
+        # ``_COMPARTMENT_NODE_KEYED_METADATA``.
+        for key in _COMPARTMENT_SHARED_METADATA:
+            if key in metadata:
+                shared_metadata[key] = metadata.pop(key)
+        for key in _COMPARTMENT_NODE_KEYED_METADATA:
+            table = metadata.get(key)
+            if isinstance(table, Mapping):
+                metadata[key] = {
+                    node_id: fact
+                    for node_id, fact in table.items()
+                    if node_id in included
+                }
+    extracted.G.graph = isolate_metadata(metadata)
+    extracted.G.graph.update(shared_metadata)
     # The copy owns its read facts from here on; its operand rewrites are
     # recorded in its own scope, never in its source's.
     fork_read_scope(extracted, "extract_clean_process_subgraph")
