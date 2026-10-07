@@ -5,6 +5,19 @@ outer statement is a ``match`` over one class-owned scalar state field. Each
 literal case dispatches to one method on ``self``. Those methods remain normal
 numeric regions; this module creates only the existing ``StateMachineTick``
 control shell and never introduces an SSA operator.
+
+Two layers, because a graph value id exists only after reduction:
+
+* ``plan_marked_state_machines`` reads the module AST (before any graph node
+  exists) and says WHICH ``match`` is a dispatch (``StateMachineASTPlan``:
+  class, state field, case -> method).  Its ``control`` is the AST-level
+  shell with a placeholder state uniform; it names no graph value.
+* the reducer ingests a planned dispatch (``planned_dispatch`` /
+  ``dispatch_arms_are_effects`` gate it), the state selector and each case
+  literal becoming operands of the dispatch node, and
+  ``install_state_machine_control`` builds the tick FROM THAT NODE -- its
+  identity, its state value, its literals, the callsites in each arm -- into
+  the function's ControlProgram.
 """
 from __future__ import annotations
 
@@ -213,6 +226,127 @@ def lower_marked_state_machine_class(
     ), ()
 
 
+def dispatch_arms_are_effects(statement: ast.Match) -> bool:
+    """Whether every case arm is one bare method call (an expression
+    statement): the shape whose arms rebind nothing and return nothing, so
+    the tick's arms are exactly their callsites."""
+
+    return all(
+        len(case.body) == 1
+        and isinstance(case.body[0], ast.Expr)
+        and isinstance(case.body[0].value, ast.Call)
+        for case in statement.cases
+    )
+
+
+def planned_dispatch(plans, scope, function_definition, statement):
+    """The plan whose dispatch ``statement`` is, else None.
+
+    ``plans`` is ``G.graph["state_machine_controls"]``; ``scope`` the
+    class-qualified source function the reducer is reducing
+    (``"Class.transition"``); the statement must be the one outer ``match``
+    of that class's ``transition``.  Anything else keeps the reducer's
+    ordinary handling.
+    """
+
+    transition = f"{{}}.transition"
+    for plan in plans or ():
+        qualified = transition.format(plan.class_name)
+        if scope != qualified and not str(scope).endswith("." + qualified):
+            continue
+        if not isinstance(
+            function_definition, (ast.FunctionDef, ast.AsyncFunctionDef),
+        ):
+            continue
+        if _outer_match(function_definition) is statement:
+            return plan
+    return None
+
+
+def install_state_machine_control(graph, control, hierarchy_plan=None):
+    """Install the tick of every planned dispatch in ``graph`` into
+    ``control``, the function's ControlProgram.
+
+    The reducer (``reduce_state_dispatch``) left one dispatch node per
+    planned ``match``: its ``state`` operand is the selector's value, its
+    ``case:i`` operands the case literals' constants.  The tick is built
+    from that node -- ``source_node_id`` its identity, ``state_value_id`` and
+    ``case_value_ids`` its operands -- and each arm holds the planned
+    callsites (``__plan_callsite_N__``) whose call lies in that case's body,
+    so the callsite scheduler finds the markers already placed.  ``control``
+    is returned unchanged for a function with no dispatch node.
+    """
+
+    from dataclasses import replace
+
+    from .control_source import (
+        ControlProgram, SequenceBlock, StateMachineTick, StatementBlock,
+        _flatten_control_sequence,
+    )
+    from .hierarchical_plan import PlanCall
+
+    G = getattr(graph, "G", graph)
+    dispatches = tuple(
+        (node_id, data) for node_id, data in G.nodes(data=True)
+        if (data.get("attributes") or {}).get("state_machine_dispatch")
+        and isinstance(data.get("expr_obj"), ast.Match)
+    )
+    if not dispatches:
+        return control
+    planned_calls = frozenset(
+        int(item.callsite_id)
+        for item in getattr(hierarchy_plan, "items", ())
+        if isinstance(item, PlanCall)
+    )
+    ticks = []
+    for node_id, data in sorted(dispatches, key=lambda item: int(item[0])):
+        match = data["expr_obj"]
+        roles = {role: parent for parent, role in data.get("parents") or ()}
+        state_value_id = roles.get("state")
+        field = _state_field(match.subject)
+        if state_value_id is None or field is None:
+            continue
+        arms = []
+        for index, case in enumerate(match.cases):
+            value = _literal_case(case.pattern)
+            if value is None:
+                break
+            inside = {
+                id(member) for statement in case.body
+                for member in ast.walk(statement)
+            }
+            callsites = sorted(
+                int(candidate) for candidate, candidate_data in G.nodes(data=True)
+                if int(candidate) in planned_calls
+                and id(candidate_data.get("expr_obj")) in inside
+            )
+            arms.append((
+                str(value),
+                SequenceBlock(tuple(
+                    StatementBlock((f"__plan_callsite_{callsite}__",))
+                    for callsite in callsites
+                )),
+                roles.get(f"case:{index}"),
+            ))
+        else:
+            ticks.append(StateMachineTick(
+                field,
+                tuple((label, body) for label, body, _ in arms),
+                state_value_id=int(state_value_id),
+                source_node_id=int(node_id),
+                case_value_ids=tuple(
+                    None if literal is None else int(literal)
+                    for _, _, literal in arms
+                ),
+            ))
+    if not ticks:
+        return control
+    if control is None:
+        control = ControlProgram(SequenceBlock(()))
+    root = SequenceBlock((*_flatten_control_sequence(control.root), *ticks))
+    return replace(control, root=root)
+
+
 def plan_marked_state_machines(tree: ast.AST):
     """Plan every marked class without importing or executing its module."""
 
@@ -230,8 +364,11 @@ def plan_marked_state_machines(tree: ast.AST):
 
 __all__ = [
     "StateMachineASTPlan",
+    "dispatch_arms_are_effects",
     "StateMachineASTShortfall",
     "lower_marked_state_machine_class",
+    "install_state_machine_control",
     "plan_marked_state_machines",
+    "planned_dispatch",
 ]
 

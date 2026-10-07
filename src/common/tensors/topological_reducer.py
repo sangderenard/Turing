@@ -6863,6 +6863,76 @@ def _normalize_lexical_values(
             f"{ast.dump(target, include_attributes=False)}"
         )
 
+    def reduce_state_dispatch(dispatch: ast.Match) -> int:
+        """Ingest the ``match`` a marked state machine's ``transition`` is.
+
+        The statement is a dispatch construct, not a value: its node keeps
+        the statement's identity and takes the state selector as its
+        ``state`` operand and each literal case's constant as a ``case``
+        operand, in case order (a case with no constant node, a bare
+        ``True``/``False`` singleton, has no operand).  The case bodies are
+        reduced as exclusive paths -- the calls they make are ordinary call
+        nodes the planner places in the arms (``install_state_machine_control``)
+        -- and every path starts from the environment the dispatch was
+        entered with, which is also the environment after it: a planned
+        dispatch's arms are single method calls and rebind no name.
+        """
+
+        # Parameters exist from function entry; mint every one this statement
+        # reads before any arm does (the rule ``if`` and loops apply).
+        for read_name in {
+            member.id
+            for member in source_walk(dispatch)
+            if isinstance(member, ast.Name) and isinstance(member.ctx, ast.Load)
+        }:
+            if (
+                read_name in parameter_names
+                and read_name not in environment
+                and read_name not in static_environment
+            ):
+                input_value(read_name, binding_kind="parameter")
+        state_value = resolve_expression(dispatch.subject)
+        if not isinstance(state_value, int):
+            # No value to dispatch on: leave the construct as it was.
+            record_translation_shortfall(
+                graph, pass_name="state_dispatch", node_id=id(dispatch),
+                operation="Match", role=value_class_scope,
+                reason="the state selector did not resolve to a graph value",
+            )
+            return id(dispatch) if id(dispatch) in graph.G else None
+        case_values = [
+            resolve_expression(case.pattern.value)
+            if isinstance(case.pattern, ast.MatchValue) else None
+            for case in dispatch.cases
+        ]
+        before = dict(environment)
+        before_field_cells = dict(field_state_cursor)
+        for case in dispatch.cases:
+            for nested in case.body:
+                reduce_statement(nested)
+            environment.clear()
+            environment.update(before)
+            field_state_cursor.clear()
+            field_state_cursor.update(before_field_cells)
+        # The pattern syntax carries no value of its own once the literals
+        # are operands of the dispatch.
+        for case in dispatch.cases:
+            _remove_node(graph, id(case.pattern))
+            _remove_node(graph, id(case))
+        operands = [(int(state_value), "state")]
+        operands.extend(
+            (int(value), f"case:{index}")
+            for index, value in enumerate(case_values)
+            if isinstance(value, int)
+        )
+        if id(dispatch) in graph.G:
+            _replace_inputs(graph, id(dispatch), tuple(operands))
+            graph.G.nodes[id(dispatch)].setdefault("attributes", {}).update({
+                "state_machine_dispatch": True,
+                "state_machine_case_count": len(dispatch.cases),
+            })
+        return id(dispatch)
+
     def reduce_statement(body_statement: ast.stmt) -> int | None:
         if isinstance(body_statement, (ast.Nonlocal, ast.Global)):
             # Scope declarations affect name binding while parsing; they are
@@ -7199,6 +7269,30 @@ def _normalize_lexical_values(
                     _remove_node(graph, id(item))
                 _remove_node(graph, id(body_statement))
             return result
+        if isinstance(body_statement, ast.Match):
+            from ...compiler.state_machine_ast import (
+                dispatch_arms_are_effects, planned_dispatch,
+            )
+
+            if planned_dispatch(
+                graph.G.graph.get("state_machine_controls"),
+                value_class_scope, statement, body_statement,
+            ) is not None:
+                if dispatch_arms_are_effects(body_statement):
+                    return reduce_state_dispatch(body_statement)
+                # A ``return`` in a case arm is a return edge the tick would
+                # have to merge per output slot; that merge is not built.
+                # The construct keeps the reducer's ordinary handling and
+                # says so, rather than run the arms' calls unconditionally.
+                record_translation_shortfall(
+                    graph, pass_name="state_dispatch",
+                    node_id=id(body_statement), operation="Match",
+                    role=value_class_scope,
+                    reason=(
+                        "a case arm returns its call's value; the tick does "
+                        "not merge return edges across its arms"
+                    ),
+                )
         if isinstance(body_statement, ast.If):
             # Python parameters exist from function entry.  A parameter first
             # read inside one arm is minted there and dropped with that arm's

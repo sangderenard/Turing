@@ -155,3 +155,113 @@ class SpringWorld(AbstractTensorStateMachine):
     ]
     assert "Eq" in op_names
     assert op_names.count("Call") == 2
+
+
+# -- the reducer ingests a planned dispatch --------------------------------
+
+_DISPATCH_SOURCE = """
+from src.common import AbstractTensorStateMachine
+
+class Ramp(AbstractTensorStateMachine):
+    def transition(self, state, dt, *, state_table):
+        match self.phase:
+            case 0:
+                {first}
+            case 1:
+                {second}
+
+    def grow(self, state, dt, *, state_table):
+        self.x = self.x + self.rate * dt
+
+    def hold(self, state, dt, *, state_table):
+        pass
+
+def root(machine, dt):
+    machine.transition(machine, dt, state_table=None)
+"""
+
+
+def _reduced_transition_graph(first, second):
+    from pathlib import Path
+
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    contracts = Path(__file__).resolve().parents[1] / "extraction_contracts"
+
+    def scalar(dtype="float64"):
+        return {"storage": "scalar", "dtype": dtype, "rank": 0, "mutable": True}
+
+    policy = ExtractionContract(
+        contracts / "program_extraction.yaml"
+    ).with_program_abi({
+        "records": {"Ramp": {"identity": "ramp.Ramp", "fields": {
+            "x": scalar(), "rate": scalar(), "phase": scalar("int64"),
+        }}},
+        "bindings": [
+            {"function": "*", "parameter": "machine", "record": "Ramp"},
+        ],
+        "values": [{
+            "function": "root", "parameter": "dt", "storage": "scalar",
+            "dtype": "float64", "rank": 0, "python_type": "builtins.float",
+        }],
+    })
+    graphs = []
+    lower_ast_source_to_ssa(
+        _DISPATCH_SOURCE.format(first=first, second=second), "root",
+        name="dispatch", extraction_contract=policy,
+        resolved_process_graph_sink=graphs.append,
+        stop_after_compilation_unit_plan=True, progress=lambda message: None,
+    )
+    return next(
+        entry.graph for entry in graphs[0].function_table
+        if entry.name == "transition"
+    )
+
+
+def test_planned_dispatch_is_one_node_with_state_and_case_operands():
+    import ast
+
+    graph = _reduced_transition_graph(
+        "self.grow(state, dt, state_table=state_table)",
+        "self.hold(state, dt, state_table=state_table)",
+    )
+    (dispatch,) = [
+        (node, data) for node, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Match)
+    ]
+    node, data = dispatch
+    roles = {role: parent for parent, role in data["parents"]}
+    assert data["attributes"]["state_machine_dispatch"] is True
+    assert set(roles) == {"state", "case:0", "case:1"}
+    state = graph.G.nodes[roles["state"]]
+    assert state["type"] == "GetAttr"
+    assert state["expr_obj"].attr == "phase"
+    assert [
+        (graph.G.nodes[roles[f"case:{index}"]]["expr_obj"].value)
+        for index in (0, 1)
+    ] == [0, 1]
+    # The arms' calls are ordinary call nodes of the same function.
+    calls = [
+        data for _node, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+    ]
+    assert len(calls) == 2
+    assert not graph.G.graph.get("translation_shortfalls")
+
+
+def test_a_returning_arm_is_not_ingested_and_says_so():
+    import ast
+
+    graph = _reduced_transition_graph(
+        "return self.grow(state, dt, state_table=state_table)",
+        "return self.hold(state, dt, state_table=state_table)",
+    )
+    dispatch = [
+        data for _node, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("state_machine_dispatch")
+    ]
+    assert dispatch == []
+    shortfalls = graph.G.graph.get("translation_shortfalls") or ()
+    assert [item.pass_name for item in shortfalls] == ["state_dispatch"]
+    assert "return" in shortfalls[0].reason

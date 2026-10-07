@@ -13045,6 +13045,11 @@ def _schedule_loop_callsites(
             discover_control(block.body)
         elif isinstance(block, CallBlock):
             discover_control(block.callee)
+        elif isinstance(block, StateMachineTick):
+            for _value, body in block.cases:
+                discover_control(body)
+            if block.default is not None:
+                discover_control(block.default)
 
     discover_control(control.root)
     # Callsites lexically owned by a conditional arm (see
@@ -13066,6 +13071,11 @@ def _schedule_loop_callsites(
             discover_arm_callsites(block.body)
         elif isinstance(block, CallBlock):
             discover_arm_callsites(block.callee)
+        elif isinstance(block, StateMachineTick):
+            for _value, body in block.cases:
+                discover_arm_callsites(body)
+            if block.default is not None:
+                discover_arm_callsites(block.default)
 
     discover_arm_callsites(control.root)
     # Callsites the shell already placed at their authored position (a
@@ -13092,6 +13102,13 @@ def _schedule_loop_callsites(
             discover_placed(block.body)
         elif isinstance(block, CallBlock):
             discover_placed(block.callee)
+        elif isinstance(block, StateMachineTick):
+            # A tick's arms hold the calls its dispatch selects; a marker in
+            # an arm is placed there, not "before the next region".
+            for _value, body in block.cases:
+                discover_placed(body)
+            if block.default is not None:
+                discover_placed(block.default)
 
     discover_placed(control.root)
     arm_owned_callsites: set[int] = set()
@@ -13268,6 +13285,16 @@ def _schedule_loop_callsites(
                     else SequenceBlock(()),
                 )
             return replace(block, body=rebuilt_body, orelse=rebuilt_else)
+        if isinstance(block, StateMachineTick):
+            return replace(
+                block,
+                cases=tuple(
+                    (value, rebuild(body)) for value, body in block.cases
+                ),
+                default=(
+                    None if block.default is None else rebuild(block.default)
+                ),
+            )
         return block
 
     rebuilt_root = rebuild(control.root)
@@ -13298,6 +13325,11 @@ def _schedule_loop_callsites(
             produced.update(produced_sequences(block.body))
         elif isinstance(block, CallBlock):
             produced.update(produced_sequences(block.callee))
+        elif isinstance(block, StateMachineTick):
+            for _value, body in block.cases:
+                produced.update(produced_sequences(body))
+            if block.default is not None:
+                produced.update(produced_sequences(block.default))
         return produced
 
 
@@ -13799,6 +13831,18 @@ def _schedule_loop_callsites(
             )
         if isinstance(block, CallBlock):
             return replace(block, callee=dependency_order(block.callee))
+        if isinstance(block, StateMachineTick):
+            return replace(
+                block,
+                cases=tuple(
+                    (value, dependency_order(body))
+                    for value, body in block.cases
+                ),
+                default=(
+                    None if block.default is None
+                    else dependency_order(block.default)
+                ),
+            )
         return block
 
     return replace(

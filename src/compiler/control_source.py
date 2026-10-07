@@ -928,6 +928,28 @@ def _callsite_marker(block: Any) -> int | None:
         return None
 
 
+def control_callsite_markers(control: "ControlProgram | None") -> frozenset:
+    """The planned callsites a ControlProgram already places: every
+    ``__plan_callsite_N__`` marker in any block, arms of every construct
+    (a state-machine tick's cases included) -- a marker present is placed,
+    and the lexical scheduler must not place it a second time."""
+
+    found: set = set()
+
+    def walk(block: Any) -> None:
+        for child in _flatten_control_sequence(block):
+            marker = _callsite_marker(child)
+            if marker is not None:
+                found.add(int(marker))
+            for _arm, _index, children in _control_block_arms(child):
+                for grandchild in children:
+                    walk(grandchild)
+
+    if control is not None:
+        walk(control.root)
+    return frozenset(found)
+
+
 def _describe_control_block(
     block: Any, *, cell: Any, region_cell: Any, callsite_cell: Any,
 ) -> Any:
@@ -4251,6 +4273,7 @@ def compile_cffi_shell(
 
 __all__ = [
     "ControlBlock",
+    "control_callsite_markers",
     "ControlDeploymentLane",
     "ControlDeploymentRegion",
     "ControlExpression",
