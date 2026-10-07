@@ -870,6 +870,12 @@ CALLSITE_ARGUMENT = declare_page("callsite_argument", (
 LOOP_RESULT_RECONCILIATION = declare_page("loop_result_reconciliation", (
     RowField("function", K.SCOPE), RowField("argument", K.VALUE_ID),
 ), tuple)                              # mode REVISE
+#: ``Unsourced`` reasons of ``_post_loop_result_reconciliation``: a pass that
+#: states something different about the same unchanged cells (the IR was
+#: rewritten between two runs by a pass whose cell is not in hand), and a
+#: value that has no ``ssa_value`` cell in the function's scope.
+REVISION_CAUSE_NOT_ON_BOOK = declare_reason("revision_cause_not_on_book")
+SSA_VALUE_NOT_ON_BOOK = declare_reason("ssa_value_not_on_book")
 #: ``_canonicalize_non_dominating_loop_result_uses``: one row per substituted
 #: OCCURRENCE ``(function scope, block, use index, argument position)`` ->
 #: ``(original id, replacement id, dominance evidence)``.  REVISE (the

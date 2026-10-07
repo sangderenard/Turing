@@ -84,6 +84,8 @@ from .concordance_declarations import (
     LOOP_RESULT_RECONCILIATION,
     LOOP_RESULT_USE_REBINDING,
     LOOP_RESULT_VERSION,
+    REVISION_CAUSE_NOT_ON_BOOK,
+    SSA_VALUE_NOT_ON_BOOK,
     NAME_ARM_VERSION_MISSING,
     NAME_BINDING,
     NO_PRODUCER_AT_USE,
@@ -104,6 +106,7 @@ from .concordance_declarations import (
     SCALAR_PARAMETER,
     SEQUENCE_LENGTH_CELL,
     SSA_FIELD_VERSION,
+    SSA_BLOCK,
     SSA_VALUE,
     TABLE_LOOKUP,
     TENSOR_SHAPE_CONCORDANCE,
@@ -11865,7 +11868,10 @@ class _ControlSSABuilder:
                 },
         )
         loop_result_rebindings = (
-            _canonicalize_non_dominating_loop_result_uses(function)
+            _canonicalize_non_dominating_loop_result_uses(
+                function,
+                book_scope=str(self.tensor_shape_concordance_scope),
+            )
         )
         if loop_result_rebindings:
             function.metadata["loop_result_use_rebindings"] = (
@@ -11877,8 +11883,45 @@ class _ControlSSABuilder:
         return function, tuple(self.shortfalls)
 
 
+def _post_loop_result_reconciliation(
+    book: Any, row: tuple, fact: tuple, sources: tuple,
+) -> None:
+    """``loop_result_reconciliation`` row ``(function, argument)``: REVISE,
+    DERIVED(the cells the pass read -- see ``_note``).
+
+    A pass that runs again over the same, unchanged cells and states the same
+    thing adds nothing.  One that states something different about unchanged
+    cells (the IR was rewritten between the runs by a pass whose cell is not
+    in hand here) has no cause on the book: the api refuses the derived
+    revision, and the statement is posted ``Unsourced`` with the reason, so
+    the audit lists it instead of the page dropping it.  A value with no
+    cell at all is posted ``Unsourced`` the same way.
+    """
+
+    stored = book.pages.get(LOOP_RESULT_RECONCILIATION.name)
+    if sources:
+        try:
+            book.post(
+                LOOP_RESULT_RECONCILIATION, row, fact,
+                stage=CONTROL_SSA_FINISH, provenance=Derived(sources),
+                mode=Mode.REVISE,
+            )
+            return
+        except ConcordanceRefusal:
+            if stored is not None and stored.latest(row) == fact:
+                return
+            reason = REVISION_CAUSE_NOT_ON_BOOK
+    else:
+        reason = SSA_VALUE_NOT_ON_BOOK
+    book.post(
+        LOOP_RESULT_RECONCILIATION, row, fact, stage=CONTROL_SSA_FINISH,
+        provenance=Unsourced(reason), mode=Mode.REVISE,
+    )
+
+
 def _canonicalize_non_dominating_loop_result_uses(
     function: Function,
+    book_scope: str | None = None,
 ) -> tuple[tuple[str, int, int, int, int], ...]:
     """Resolve stale nested LoopResult operands only when CFG proves it.
 
@@ -11991,7 +12034,10 @@ def _canonicalize_non_dominating_loop_result_uses(
                       [int(getattr(a, "id", -1)) for a in instruction.args][:8],
                       flush=True)
             for argument_index, argument in enumerate(instruction.args):
-                def _note(outcome: str, detail: Any = None) -> None:
+                def _note(
+                    outcome: str, detail: Any = None,
+                    candidate: Any = None,
+                ) -> None:
                     """Record this argument's reconciliation decision."""
 
                     try:
@@ -12003,12 +12049,22 @@ def _canonicalize_non_dominating_loop_result_uses(
                         row = (
                             str(function.name), int(argument.id),
                         )
-                        # DERIVED(the ``carried_port_value`` cell it read,
-                        # when the lowering posted one for this port).
-                        scope = str(function.metadata.get(
-                            "tensor_shape_concordance_scope"
-                        ) or function.name)
-                        sources = tuple(
+                        # At the builder's finish the function does not yet
+                        # carry its metadata scope; the builder passes the
+                        # scope its own ``ssa_value`` cells were posted under.
+                        scope = str(
+                            book_scope
+                            or function.metadata.get(
+                                "tensor_shape_concordance_scope"
+                            )
+                            or function.name
+                        )
+                        # The rows it read: the argument's own ``ssa_value``
+                        # cell, the consumer's result cell (each use is a
+                        # different consumer, so each use is a different
+                        # cause for the next revision), and the replacement's
+                        # cell when it replaced.
+                        sources = tuple(dict.fromkeys(
                             cell for cell in (
                                 book.latest_ref(
                                     CARRIED_PORT_VALUE, (scope, int(argument.id)),
@@ -12016,17 +12072,36 @@ def _canonicalize_non_dominating_loop_result_uses(
                                 book.latest_ref(
                                     CONTROL_VALUE_BINDING, (scope, int(argument.id)),
                                 ),
+                                book.latest_ref(
+                                    SSA_VALUE, (scope, int(argument.id)),
+                                ),
+                                *(
+                                    (book.latest_ref(
+                                        SSA_VALUE, (scope, int(instruction.res.id)),
+                                    ),)
+                                    if instruction.res is not None else ()
+                                ),
+                                book.latest_ref(
+                                    SSA_BLOCK,
+                                    (scope, str(function.name), str(block_name)),
+                                ),
+                                *(
+                                    (book.latest_ref(
+                                        SSA_VALUE, (scope, int(candidate.id)),
+                                    ),)
+                                    if candidate is not None else ()
+                                ),
                             )
                             if cell is not None
+                        ))
+                        fact = (
+                            outcome,
+                            f"{block_name}#{instruction_index}",
+                            str(instruction.op),
+                            detail,
                         )
-                        _post_derived_or_raw(
-                            book, LOOP_RESULT_RECONCILIATION, row, (
-                                outcome,
-                                f"{block_name}#{instruction_index}",
-                                str(instruction.op),
-                                detail,
-                            ),
-                            sources, stage=CONTROL_SSA_FINISH, mode=Mode.REVISE,
+                        _post_loop_result_reconciliation(
+                            book, row, fact, sources,
                         )
                     except Exception:
                         pass
@@ -12107,9 +12182,9 @@ def _canonicalize_non_dominating_loop_result_uses(
                     _note("candidate-not-dominating", (
                         int(replacement.id),
                         tuple(definition_sites.get(int(replacement.id), ()))[:3],
-                    ))
+                    ), replacement)
                     continue
-                _note("replaced", int(replacement.id))
+                _note("replaced", int(replacement.id), replacement)
                 # The substitution itself is a fact on the book, one row per
                 # occurrence: DERIVED(the original's and the replacement's
                 # ``ssa_value`` cells, the blocks the dominance proof names)
