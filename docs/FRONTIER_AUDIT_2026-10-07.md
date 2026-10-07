@@ -128,7 +128,14 @@ c0781c7a) were removed today. Disk: 57 GB free.
   `NativeSystem.state_field_ids` spans).
 - Shape proofs keyed by authored function name, shared across specialized copies
   (blocks mixed-shape solve in one function).
-- Cross-book `_turing_source_cells` stamps on cached AST objects.
+- ~~Cross-book `_turing_source_cells` stamps on cached AST objects.~~ Already fixed on
+  `main` before this audit (stamps are `SourceDefinition(page, row, fact)` identities,
+  resolved per book by `resolve_source_definition`; `test_source_definition_cross_book.py`
+  is real and green). The lane that re-checked it (2026-10-07) found and fixed a
+  different bug instead: the root graph sits in its own function table, so callsite
+  tensor specialization visited each root callsite twice per round and double-posted
+  `callsite_descriptor_reuse` (VJP test red on its own). One hunk on
+  `fix/cross-book-stamps` (129c20fa), unmerged.
 
 ## 6. Other known compiler items (from the 2026-10-03 continuation; untouched)
 
