@@ -22,7 +22,8 @@ sys.path.insert(0, str(REPO))
 
 from src.compiler.concordance_declarations import (  # noqa: E402
     CONTROL_BLOCK, CONTROL_OWNER_UNKNOWN, ControlBlockKind, SSA_BLOCK,
-    BindingKind, CARRIED_SNAPSHOT, CONTROL_VALUE_BINDING,
+    BindingKind, CARRIED_SNAPSHOT, CONTROL_BLOCK_PLACEMENT,
+    CONTROL_VALUE_BINDING,
     SSA_BLOCK_OWNER_UNROUTED, SSA_VALUE, SSABlockKind,
 )
 from src.compiler.control_source import (  # noqa: E402
@@ -126,7 +127,7 @@ def lower_tick(fixture, program, *, first=None, outputs=None):
     return lower_control_program_to_ssa(
         program, function_name="tickrows__f",
         first_value_id=fresh + 100 if first is None else first,
-        region_callees={0: "case_zero", 1: "case_one"},
+        region_callees={region: f"case_{region}" for region in outputs},
         region_signatures={
             region: ((fixture.state,), ids) for region, ids in outputs.items()
         },
@@ -377,10 +378,84 @@ def part_a_merge():
     end_identity_book(token)
 
 
+def part_a_two_ticks():
+    print("== part A two ticks: one function, two ticks, distinct rows")
+    book = IdentityBook()
+    _book, token = begin_identity_book(book)
+    fixture = Fixture(book)
+    second_owner = next(
+        node for node, data in fixture.graph.G.nodes(data=True)
+        if data.get("op") == "greater"
+    )
+
+    def tick(owner, first_region):
+        return StateMachineTick(
+            "dispatch",
+            tuple(
+                (str(position), StatementBlock(
+                    (f"__scheduled_region_{first_region + position}__",)))
+                for position in range(2)
+            ),
+            state_value_id=fixture.state, source_node_id=owner,
+            case_value_ids=fixture.literals,
+        )
+
+    program = ControlProgram(
+        SequenceBlock((tick(fixture.owner, 0), tick(second_owner, 2))),
+        region_indices=(0, 1, 2, 3),
+    )
+    function, shortfalls = lower_tick(
+        fixture, program,
+        outputs={r: (fixture.fresh + r,) for r in range(4)},
+    )
+    check("lowering has no shortfalls", shortfalls == ())
+    cells = [fixture.cell(book, node) for node in (fixture.owner, second_owner)]
+    rows = [
+        book.latest_ref(CONTROL_BLOCK, (
+            fixture.scope, ControlBlockKind.STATE_MACHINE_TICK, cell))
+        for cell in cells
+    ]
+    check("each tick has its own control_block row, keyed by its own cell",
+          all(row is not None for row in rows) and rows[0] != rows[1])
+    tick_rows = [
+        row for row in book.page(CONTROL_BLOCK).scope_rows(fixture.scope)
+        if row[1] is ControlBlockKind.STATE_MACHINE_TICK
+    ]
+    check("exactly two tick rows, both keyed by their own cells (neither "
+          "fell back to the program cell and collided)",
+          sorted(row[2].key for row in tick_rows)
+          == sorted(cell.key for cell in cells))
+    ordinals = []
+    for row in rows:
+        placement = None if row is None else fact_at(
+            book, CONTROL_BLOCK_PLACEMENT, book.latest_ref(
+                CONTROL_BLOCK_PLACEMENT, (fixture.scope, row)))
+        ordinals.append(None if placement is None else placement.ordinal)
+    check("the two ticks are placed at ordinals 0 and 1 of the root",
+          ordinals == [0, 1])
+    owners_of = {}
+    for name in function.blocks:
+        stem = name.split(".")[0]
+        if stem not in ("state_case", "state_next", "state_merge"):
+            continue
+        ref = block_ref(book, function.name, name)
+        sources = () if ref is None else sources_of(book, ref)
+        owners_of[name] = tuple(
+            index for index, row in enumerate(rows) if row in sources
+        )
+    check("ten distinct ssa_block labels, each derived from exactly one tick",
+          len(owners_of) == 10
+          and all(len(owner) == 1 for owner in owners_of.values()))
+    check("each tick owns five of them (two case, two next, one merge)",
+          sorted(owner[0] for owner in owners_of.values()) == [0] * 5 + [1] * 5)
+    end_identity_book(token)
+
+
 def main() -> int:
     part_a()
     part_a_control()
     part_a_merge()
+    part_a_two_ticks()
     print()
     print(f"{len(failures)} failure(s)")
     return 1 if failures else 0
