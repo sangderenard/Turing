@@ -77,6 +77,7 @@ from ...compiler.concordance_declarations import (
     CANONICAL_VALUE as _CANONICAL_VALUE,
     CLASS_FIELD_DECLARATION as _CLASS_FIELD_DECLARATION,
     ContainerKind as _ContainerKind,
+    LEXICAL_READ_BINDING as _LEXICAL_READ_BINDING,
     FIELD_STATE_UNRESOLVED_AT_RETURN as _FIELD_STATE_UNRESOLVED_AT_RETURN,
     FieldState as _FieldState,
     FieldStateKind as _FieldStateKind,
@@ -3018,8 +3019,8 @@ def fork_read_scope(graph: Any, cause: str) -> None:
     scope.  A copy's rewrites -- a callsite fold removing an operand -- then
     revise only its own rows.  Sharing one scope, a fold in one
     specialization retired rows the original and every other specialization
-    read.  Page ``identity_transition`` row ``(new scope, "scope")`` records
-    ``("fork", source scope, cause)``.
+    read.  Page ``scope_origin`` row ``(new scope,)`` records
+    ``ScopeFork(source scope, cause)``.
     """
 
     graph_data = graph.G.graph
@@ -3048,7 +3049,7 @@ def fork_read_scope(graph: Any, cause: str) -> None:
             continue
         declared = registered.get(page.name)
         for row in page.scope_rows(source):
-            if page.name == "identity_transition" and row[1:] == ("scope",):
+            if page.name == "scope_origin":
                 # A scope's origin is its own fact, not inherited.
                 continue
             fact = page.latest(row)
@@ -3070,8 +3071,22 @@ def fork_read_scope(graph: Any, cause: str) -> None:
                 provenance=_Derived((book.latest_ref(declared, row),)),
                 mode=_Mode.CONCORD,
             )
-    book.page("identity_transition").concord(
-        (forked, "scope"), ("fork", source, str(cause)),
+    # The fork's origin is its own fact on ``scope_origin``, DERIVED from the
+    # source scope's registry cell (as ``fork_operand_position_scope`` posts
+    # its fork).
+    from ...compiler.concordance_declarations import (
+        SCOPE_ORIGIN, SCOPE_REGISTRY, ScopeFork,
+    )
+
+    source_cell = book.latest_ref(SCOPE_REGISTRY, source)
+    book.post(
+        SCOPE_ORIGIN, (forked,), ScopeFork(source, str(cause)),
+        stage=_READ_SCOPE_FORK,
+        provenance=(
+            _Derived((source_cell,)) if source_cell is not None
+            else _Unsourced(_SYNTHESIZED_NO_SOURCE)
+        ),
+        mode=_Mode.CONCORD,
     )
     graph_data["lexical_read_scope"] = forked
     if tuple(graph_data.get("operand_position_scope") or ()) == source:
@@ -3350,7 +3365,26 @@ def _concord_lexical_reads(
     read instead of per value.
     """
 
-    page = current_identity_book().page("lexical_read_binding")
+    from ...compiler.concordance_declarations import (
+        LEXICAL_READ_BINDING, OPERAND_POSITION,
+    )
+
+    book = current_identity_book()
+    page = book.page("lexical_read_binding")
+
+    def commit(row: tuple, *cells: Any) -> None:
+        """One read: DERIVED(the cells of the nodes it relates)."""
+
+        sources = tuple(dict.fromkeys(cell for cell in cells if cell is not None))
+        if sources:
+            book.post(
+                LEXICAL_READ_BINDING, row, str(binding),
+                stage=OPERAND_POSITION, provenance=_Derived(sources),
+                mode=_Mode.CONCORD,
+            )
+        else:
+            page.concord(row, str(binding))
+
     # The read is a fact of the occurrence before it is one of any consumer:
     # a keyword argument's wrapper (and with it the Name node) can be absent
     # from the function subgraph, leaving the read with no consumer edge.
@@ -3361,7 +3395,13 @@ def _concord_lexical_reads(
     # fields long, and the typed ``OperandFork(cause, consumer, role,
     # ordinal)`` refused it: ``for name, limit in channels.items()`` (the
     # audit mapping case) raised TypeError missing ``source_ordinal``.
-    page.concord((scope, "occurrence", int(occurrence_id), 0), str(binding))
+    # The occurrence's row derives from the occurrence node's cell, a
+    # consumer's from the occurrence's and the consumer's own.
+    occurrence_cell = (
+        node_identity_cell(graph, occurrence_id)
+        if occurrence_id in graph.G else None
+    )
+    commit((scope, "occurrence", int(occurrence_id), 0), occurrence_cell)
     if occurrence_id not in graph.G:
         return
     for consumer in tuple(graph.G.successors(occurrence_id)):
@@ -3369,7 +3409,10 @@ def _concord_lexical_reads(
             graph.G.nodes[consumer].get("parents", ())
         ):
             if parent_id == occurrence_id:
-                page.concord((scope, consumer, role, ordinal), str(binding))
+                commit(
+                    (scope, consumer, role, ordinal), occurrence_cell,
+                    node_identity_cell(graph, consumer),
+                )
 
 
 def _operand_positions(parents: Any):
@@ -8708,10 +8751,24 @@ def _normalize_lexical_values(
         for position, root in enumerate(graph.roots):
             names = return_root_bindings.get(int(root)) if isinstance(root, int) else None
             if names and len(names) == 1:
-                return_page.concord(
-                    (ingestion_read_scope, "return", "root", position),
-                    next(iter(names)),
+                return_row = (
+                    ingestion_read_scope, "return", "root", position,
                 )
+                # The returned binding is read at the root node: DERIVED
+                # from the root's identity cell.
+                root_cell = (
+                    node_identity_cell(graph, root) if root in graph.G
+                    else None
+                )
+                if root_cell is None:
+                    return_page.concord(return_row, next(iter(names)))
+                else:
+                    current_identity_book().post(
+                        _LEXICAL_READ_BINDING, return_row,
+                        next(iter(names)), stage=_REDUCTION,
+                        provenance=_Derived((root_cell,)),
+                        mode=_Mode.CONCORD,
+                    )
 
     # A source-linked unbound method can arrive with its receiver absent from
     # the owned subgraph even though the Attribute load itself is owned.
@@ -9142,12 +9199,20 @@ def _normalize_lexical_values(
         # A position an operand rewrite vacated holds None: no fact to carry.
         if read_page.latest(row) is None:
             continue
-        if len(row) == 4 and row[1] == "return":
-            read_page.concord((read_scope, *row[1:]), read_page.latest(row))
-        elif len(row) == 4 and row[1] in mapping:
-            read_page.concord(
-                (read_scope, mapping[row[1]], row[2], row[3]),
-                read_page.latest(row),
+        if len(row) == 4 and (row[1] == "return" or row[1] in mapping):
+            # The canonical row is the ingestion row relabeled: DERIVED
+            # from that cell, same fact.
+            target_row = (
+                (read_scope, *row[1:]) if row[1] == "return"
+                else (read_scope, mapping[row[1]], row[2], row[3])
+            )
+            book.post(
+                _LEXICAL_READ_BINDING, target_row, read_page.latest(row),
+                stage=_CANONICAL_RELABEL_STAGE,
+                provenance=_Derived((book.latest_ref(
+                    _LEXICAL_READ_BINDING, row,
+                ),)),
+                mode=_Mode.CONCORD,
             )
     # Step 9 (plan 100, 1.1): the operand-position rows follow their
     # consumers into canonical ids, so the canonical graph's edges are the
