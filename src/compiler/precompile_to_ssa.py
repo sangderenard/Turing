@@ -10984,12 +10984,18 @@ class _ControlSSABuilder:
         *,
         path: str,
     ) -> None:
-        state = self.uniform_values.get(str(tick.state))
-        if state is None:
-            state = self.expression_value(
-                tick.state,
-                location=f"{path}.state",
-            )
+        if tick.state_value_id is not None:
+            # The state is the graph value the selector reads, found through
+            # the book like a conditional's predicate -- never a name looked
+            # up in the uniform table.
+            state = self.external_value(int(tick.state_value_id))
+        else:
+            state = self.uniform_values.get(str(tick.state))
+            if state is None:
+                state = self.expression_value(
+                    tick.state,
+                    location=f"{path}.state",
+                )
         merge = self.new_block("state_merge")
         for index, (case_value, case_body) in enumerate(tick.cases):
             case = self.new_block("state_case")

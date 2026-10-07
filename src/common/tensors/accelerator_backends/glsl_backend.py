@@ -2572,11 +2572,15 @@ def compose_control_shader(
                 )
             return lowered_loop
         if isinstance(block, StateMachineTick):
-            return StateMachineTick(
-                block.state,
-                tuple(
+            return replace(
+                block,
+                cases=tuple(
                     (value, substitute(body, parallel_scope))
                     for value, body in block.cases
+                ),
+                default=(
+                    None if block.default is None
+                    else substitute(block.default, parallel_scope)
                 ),
             )
         if isinstance(block, ParallelDeployment):

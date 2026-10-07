@@ -291,11 +291,23 @@ class LoopControlBlock:
 
 @dataclass(frozen=True)
 class StateMachineTick:
-    """One compiled state transition, not a host polling loop."""
+    """One compiled state transition, not a host polling loop.
+
+    ``state`` is the spelling the renderers print (a loop induction name, a
+    uniform).  ``state_value_id`` is the state itself: the graph value the
+    selector reads, resolved through the book like a conditional's
+    predicate.  ``source_node_id`` is the dispatch construct's graph node
+    (the ``match`` statement), the tick's owner cell the way a
+    conditional's ``source_node_id`` is its.  A tick carrying neither is a
+    hand-built one (a coordinator's method switch): it has no owner to name
+    and posts ``Unsourced(CONTROL_OWNER_UNKNOWN)`` like any ownerless block.
+    """
 
     state: str
     cases: tuple[tuple[str, "ControlBlock"], ...]
     default: "ControlBlock | None" = None
+    state_value_id: int | None = None
+    source_node_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -736,6 +748,8 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
             # dropped and the continue edge carried the header value.)
             values.update(int(value) for _initial, value in block.site_values)
         elif isinstance(block, StateMachineTick):
+            if block.state_value_id is not None:
+                values.add(int(block.state_value_id))
             for _case, body in block.cases:
                 visit(body)
             if block.default is not None:
@@ -1007,11 +1021,15 @@ def _describe_control_block(
         owner = cell(block.value_id)
         extra = (bool(block.final),)
     elif isinstance(block, StateMachineTick):
+        # Like a conditional: the owner is the dispatch construct's node
+        # cell, the predicate is the state selector's value cell.
+        owner = cell(block.source_node_id)
+        predicate = cell(block.state_value_id)
         extra = (str(block.state),)
     elif isinstance(block, ParallelDeployment):
         extra = (str(block.schedule_preference),)
     if owner is None and reason is None and not isinstance(
-        block, (StateMachineTick, ParallelDeployment),
+        block, ParallelDeployment,
     ):
         reason = CONTROL_OWNER_UNKNOWN
     return kind, owner, reason, (predicate, carried, sites, regions, callsite, extra)
@@ -2816,10 +2834,15 @@ def compose_region_code(
         if isinstance(block, SequenceQueryBlock):
             return block
         if isinstance(block, StateMachineTick):
-            return StateMachineTick(
-                block.state,
-                tuple((value, substitute(body)) for value, body in block.cases),
-                None if block.default is None else substitute(block.default),
+            return replace(
+                block,
+                cases=tuple(
+                    (value, substitute(body)) for value, body in block.cases
+                ),
+                default=(
+                    None if block.default is None
+                    else substitute(block.default)
+                ),
             )
         if isinstance(block, ParallelDeployment):
             return ParallelDeployment(
@@ -3137,7 +3160,7 @@ def project_control_regions(
                 None if block.default is None else project(block.default)
             )
             return (
-                StateMachineTick(block.state, cases, default)
+                replace(block, cases=cases, default=default)
                 if cases or default is not None else None
             )
         if isinstance(block, ParallelDeployment):
@@ -3626,7 +3649,7 @@ def overlay_scheduled_control(
                     default = nested_root if consumed else SequenceBlock(())
                 consumed_any |= consumed
             return (
-                StateMachineTick(block.state, tuple(cases), default),
+                replace(block, cases=tuple(cases), default=default),
                 consumed_any,
             )
         if isinstance(block, ParallelDeployment):

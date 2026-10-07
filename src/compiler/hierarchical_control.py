@@ -571,13 +571,17 @@ def compose_hierarchical_control(
                     block.source_action,
                 )
             if isinstance(block, StateMachineTick):
-                return StateMachineTick(
-                    rename_control_text(block.state),
-                    tuple(
+                return replace(
+                    block,
+                    state=rename_control_text(block.state),
+                    cases=tuple(
                         (rename_control_text(case), rewrite(body))
                         for case, body in block.cases
                     ),
-                    None if block.default is None else rewrite(block.default),
+                    default=(
+                        None if block.default is None
+                        else rewrite(block.default)
+                    ),
                 )
             if isinstance(block, ParallelDeployment):
                 return ParallelDeployment(
