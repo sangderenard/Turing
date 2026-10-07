@@ -11599,7 +11599,13 @@ def _place_plan_callsites_lexically(
         for item in getattr(hierarchy_plan, "items", ())
         if isinstance(item, PlanCall)
     }
-    callsite_ids = list(planned_calls)
+    from .control_source import control_callsite_markers
+
+    placed_markers = control_callsite_markers(control)
+    callsite_ids = [
+        callsite_id for callsite_id in planned_calls
+        if int(callsite_id) not in placed_markers
+    ]
     if not callsite_ids:
         return control
 
@@ -17904,6 +17910,10 @@ def _class_surface_ssa_program(
         control = getattr(shell, "shell_control_program", None)
         control = _apply_phi_initial_identity_repairs_to_control(
             control, phi_initial_identity_receipts,
+        )
+        from .state_machine_ast import install_state_machine_control
+        control = install_state_machine_control(
+            graph, control, getattr(shell, "hierarchy_plan", None),
         )
         from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         import os as _os, sys as _sys
