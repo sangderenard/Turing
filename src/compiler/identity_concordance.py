@@ -4200,6 +4200,7 @@ def withdraw_superseded_shape_derivations(
             else:
                 invalidate_shape_transformation(
                     target_scope, target_id, source_id, reason,
+                    source_scope=source_scope,
                 )
             pending.append((target_scope, target_id, None))
 
@@ -4220,14 +4221,33 @@ def concordant_shape_transformation_state(
 
 def invalidate_shape_transformation(
     scope: Any, value_id: Any, source_id: Any, reason: Any,
+    *, source_scope: Any = None,
 ) -> None:
-    """Record that a target's prior path was superseded upstream."""
+    """Record that a target's prior path was superseded upstream.
 
-    page = current_identity_book().page("shape_transformation_state")
+    The withdrawal derives from the cell of the identity that changed: the
+    source's shape state cell (``source_scope`` defaults to the target's
+    scope -- a dependency inside one function).  A source with no state cell
+    on the book, or one that has not changed since the target's previous
+    revision, leaves the withdrawal without a cause on the book: it is
+    posted ``Unsourced(SHAPE_SOURCE_NOT_ON_BOOK)`` and listed by the audit.
+    """
+
+    book = current_identity_book()
+    page = book.page(SHAPE_STATE_PAGE)
     row = (_shape_key(scope), value_id)
     fact = ("invalidated", source_id, str(reason))
     if page.latest(row) != fact:
-        page.revise(row, fact)
+        source_ref = book.latest_ref(SHAPE_STATE_PAGE, (
+            _shape_key(scope if source_scope is None else source_scope),
+            source_id,
+        ))
+        _post_or_unsourced(
+            book, SHAPE_STATE_PAGE, row, fact,
+            book.registry.declare_stage(str(reason)),
+            () if source_ref is None else (source_ref,),
+            SHAPE_SOURCE_NOT_ON_BOOK,
+        )
 
 
 def committed_sequence_row_layout(
