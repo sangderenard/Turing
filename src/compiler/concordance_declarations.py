@@ -945,6 +945,9 @@ LOOP_SCOPE_INNER_TRANSITION = declare_page("loop_scope_inner_transition", (
 
 # -- pages: physical call-input adaptation and precision passes (census 75,
 # section 6; ``ssa_call_input_adapters.py`` and ``ir_identities.py``) --------
+#: ``ssa_call_input_adapters``: the pass that restores exact region-feed views
+#: and adapts logical values to compiled physical buffer contracts.
+PHYSICAL_CALL_INPUT_ADAPTATION = declare_stage("physical_call_input_adaptation")
 EXACT_REGION_FEED_DTYPE = declare_page("exact_region_feed_dtype", (
     RowField("control_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), tuple)                              # mode CONCORD
