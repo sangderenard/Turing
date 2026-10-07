@@ -312,6 +312,16 @@ class StateMachineTick:
     # ``MatchValue`` constant), whose identity cell the case's blocks and the
     # equality predicate derive from.  None where a case has no node.
     case_value_ids: tuple[int | None, ...] = ()
+    # One entry per scalar the arms rebind: ``(per-case arm value ids, the
+    # default arm's value id, initial value id, merged value id)``.  An arm
+    # that does not rebind the name repeats the initial id (the entered
+    # version), exactly as ``ConditionalBlock.carried_aliases`` encodes a
+    # missing arm; with no ``default`` the default slot is the initial id --
+    # the version a state matching no case leaves in place.  Lowering joins
+    # every arm that reaches the merge in one Phi.
+    carried_aliases: tuple[
+        tuple[tuple[int, ...], int, int, int], ...
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -758,6 +768,13 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
                 int(value_id) for value_id in block.case_value_ids
                 if value_id is not None
             )
+            for arm_ids, default_id, initial_id, merged_id in (
+                block.carried_aliases
+            ):
+                values.update(int(value_id) for value_id in arm_ids)
+                values.update((
+                    int(default_id), int(initial_id), int(merged_id),
+                ))
             for _case, body in block.cases:
                 visit(body)
             if block.default is not None:
@@ -1038,6 +1055,7 @@ def _describe_control_block(
             value_id for value_id in block.case_value_ids
             if value_id is not None
         )
+        carried = cells(alias[3] for alias in block.carried_aliases)
         extra = (str(block.state),)
     elif isinstance(block, ParallelDeployment):
         extra = (str(block.schedule_preference),)
@@ -2437,6 +2455,15 @@ def enrich_represented_conditionals(
         elif isinstance(block, ResourceScopeBlock):
             yield from conditional_aliases(block.body)
         elif isinstance(block, StateMachineTick):
+            # Loop-carry enrichment reads only (initial, merged); a tick's
+            # N-way alias is reported in the conditional's 4-tuple shape.
+            for arm_ids, default_id, initial_id, merged_id in (
+                block.carried_aliases
+            ):
+                yield (
+                    int(arm_ids[0]) if arm_ids else int(default_id),
+                    int(default_id), int(initial_id), int(merged_id),
+                )
             for _value, body in block.cases:
                 yield from conditional_aliases(body)
             if block.default is not None:

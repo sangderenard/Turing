@@ -11021,6 +11021,51 @@ class _ControlSSABuilder:
         literal_ids = tuple(tick.case_value_ids) + (None,) * (
             len(tick.cases) - len(tick.case_value_ids)
         )
+        aliases = tuple(tick.carried_aliases)
+        # Each arm starts from the versions the tick was entered with: take
+        # the snapshot of every carried initial before any arm lowers, and
+        # restore it between arms (a nested merge inside an arm would
+        # otherwise leave its result as the next arm's incumbent).  One
+        # ``carried_snapshot`` row per id, DERIVED from the binding cell
+        # current at entry and the tick's construct cell.
+        carried_snapshots = {
+            int(initial_id): self.external_value(int(initial_id))
+            for _arms, _default, initial_id, _merged in aliases
+        }
+        tick_cell = self._construct_cell(tick.source_node_id)
+        snapshot_cells = (
+            self._post_carried_snapshots(tick_cell, carried_snapshots)
+            if aliases else {}
+        )
+        stage_before = self.active_stage
+        if aliases:
+            self.active_stage = CONTROL_SSA_CONDITIONAL
+
+        def restore_snapshots() -> None:
+            for snapshot_id, snapshot_value in carried_snapshots.items():
+                if self.external_values.get(int(snapshot_id)) is not snapshot_value:
+                    self._bind(
+                        int(snapshot_id), snapshot_value, BindingKind.RESTORED,
+                        snapshot_cells.get(int(snapshot_id)), tick_cell,
+                    )
+
+        # (exit block, {initial id: (arm value, source cell)}) per arm that
+        # reaches the merge.
+        reaching: list[tuple[BasicBlock, dict[int, tuple[SSAValue, Any]]]] = []
+
+        def arm_values(arm_slot: int | None, where: str) -> dict:
+            found = {}
+            for arm_ids, default_id, initial_id, _merged in aliases:
+                arm_id = (
+                    int(default_id) if arm_slot is None
+                    else int(arm_ids[arm_slot])
+                )
+                found[int(initial_id)] = self._carried_name_arm(
+                    arm_id, initial_id, carried_snapshots[int(initial_id)],
+                    snapshot_cells.get(int(initial_id)), path=where,
+                )
+            return found
+
         for index, (case_value, case_body) in enumerate(tick.cases):
             # The case literal is a graph node with an identity cell: the
             # case's blocks and the literal value derive from it.  A case
@@ -11047,15 +11092,130 @@ class _ControlSSABuilder:
             self.emit(Handler.Eq, [state, literal], condition)
             self.conditional_branch(condition, case, otherwise)
             self.current = case
+            restore_snapshots()
+            values_before_arm = dict(self.external_values)
             self.lower(case_body, path=f"{path}.case[{index}].body")
+            falls_through = (
+                not self.current.successors
+                or merge.name in self.current.successors
+            )
+            exit_block = self.current
+            carried_here = (
+                arm_values(index, f"{path}.case[{index}].body")
+                if aliases else {}
+            )
             if not self.current.successors:
                 self.branch(merge)
+            if falls_through:
+                reaching.append((exit_block, carried_here))
+            else:
+                # An arm that leaves through its own edge (break / continue /
+                # return) never reaches the merge: nothing it binds may.
+                self._restore_view(values_before_arm, tick_cell)
             self.current = otherwise
+        restore_snapshots()
         if tick.default is not None:
+            values_before_arm = dict(self.external_values)
             self.lower(tick.default, path=f"{path}.default")
-        if not self.current.successors:
-            self.branch(merge)
+            falls_through = (
+                not self.current.successors
+                or merge.name in self.current.successors
+            )
+            exit_block = self.current
+            carried_here = (
+                arm_values(None, f"{path}.default") if aliases else {}
+            )
+            if not self.current.successors:
+                self.branch(merge)
+            if falls_through:
+                reaching.append((exit_block, carried_here))
+            else:
+                self._restore_view(values_before_arm, tick_cell)
+        else:
+            # No default arm: a state matching no case falls through with
+            # the versions the tick was entered with.
+            exit_block = self.current
+            carried_here = {
+                initial_id: (
+                    carried_snapshots[initial_id],
+                    snapshot_cells.get(initial_id),
+                )
+                for initial_id in carried_snapshots
+            }
+            if not self.current.successors:
+                self.branch(merge)
+                reaching.append((exit_block, carried_here))
         self.current = merge
+        if reaching:
+            for arm_ids, default_id, initial_id, merged_id in aliases:
+                self._publish_state_merge(
+                    state, reaching, carried_snapshots, snapshot_cells,
+                    tick_cell, arm_ids, default_id, initial_id, merged_id,
+                )
+        self.active_stage = stage_before
+
+    def _publish_state_merge(
+        self,
+        state: SSAValue,
+        reaching: list,
+        carried_snapshots: Mapping[int, SSAValue],
+        snapshot_cells: Mapping[int, Any],
+        tick_cell: Any,
+        arm_ids: tuple[int, ...],
+        default_id: int,
+        initial_id: int,
+        merged_id: int,
+    ) -> None:
+        """One Phi joining every arm that reaches a tick's merge for one
+        carried scalar, the N-way counterpart of ``lower_conditional``'s
+        ``conditional_carried`` Phi.  Its value is made from each arm's
+        source cell (its binding, or the snapshot when it did not write),
+        the snapshot cell and the state it is selected by; every id taking
+        part in the join denotes the merged version afterwards
+        (``CONDITIONAL_MERGE``)."""
+
+        initial_id = int(initial_id)
+        initial = carried_snapshots[initial_id]
+        incoming = [values[initial_id] for _block, values in reaching]
+        incoming_values = [value for value, _source in incoming]
+        sources = [source for _value, source in incoming]
+        phi_operands = (
+            *sources, snapshot_cells.get(initial_id), *incoming_values, state,
+        )
+        if int(merged_id) in {int(value.id) for value in incoming_values}:
+            # The graph reuses an arm's write id as the join id: they are the
+            # same source version but the join is a distinct SSA definition.
+            merged = self.fresh_value(
+                dtype=initial.dtype, shape=initial.shape,
+                transform=PHI_CONDITIONAL, operands=phi_operands,
+            )
+            merged.accounting.update({
+                "source_value_id": int(merged_id),
+                "ssa_conditional_write_version": True,
+            })
+        else:
+            merged = SSAValue(
+                int(merged_id), dtype=initial.dtype, shape=initial.shape,
+            )
+            self._value_cell(merged, *phi_operands)
+        self.emit(
+            Handler.Phi, incoming_values, merged,
+            attributes={
+                "incoming_blocks": tuple(block.name for block, _ in reaching),
+                "binding": "state_carried",
+                "initial_value_id": initial_id,
+            },
+        )
+        protected_sources = frozenset().union(
+            *self.protected_loop_alias_sources
+        ) if self.protected_loop_alias_sources else frozenset()
+        published = {int(merged_id): merged}
+        for value_id in (initial_id, int(default_id), *map(int, arm_ids)):
+            if value_id not in protected_sources:
+                published[value_id] = merged
+        self._rebind_view(
+            published, BindingKind.CONDITIONAL_MERGE, merged, tick_cell,
+        )
 
     def _finish_pages(
         self,

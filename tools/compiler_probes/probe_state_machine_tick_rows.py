@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO))
 
 from src.compiler.concordance_declarations import (  # noqa: E402
     CONTROL_BLOCK, CONTROL_OWNER_UNKNOWN, ControlBlockKind, SSA_BLOCK,
+    BindingKind, CARRIED_SNAPSHOT, CONTROL_VALUE_BINDING,
     SSA_BLOCK_OWNER_UNROUTED, SSA_VALUE, SSABlockKind,
 )
 from src.compiler.control_source import (  # noqa: E402
@@ -35,6 +36,8 @@ from src.compiler.identity_concordance import (  # noqa: E402
     end_identity_book,
 )
 from src.compiler.precompile_to_ssa import lower_control_program_to_ssa  # noqa: E402
+from src.compiler.ssa_self_check import check_definition_dominance  # noqa: E402
+from src.transmogrifier.ssa import IRModule  # noqa: E402
 
 failures: list[str] = []
 
@@ -99,6 +102,16 @@ class Fixture:
         )
         self.literals = tuple(constants[:2])
         self.fresh = max(self.graph.G.nodes) + 10
+        # ``a`` is rebound by the ``if``: the reducer's merge node for it is
+        # the tick's merged id, the arm's ``a + 1`` the rebinding arm's value.
+        self.merged = next(
+            node for node, data in nodes
+            if data.get("type") == "Phi" and data.get("label") == "a"
+        )
+        self.arm_value = min(
+            node for node, data in nodes
+            if data.get("type") == "Add" and node > self.owner
+        )
 
     def cell(self, book, node):
         from src.compiler.concordance_declarations import CANONICAL_VALUE
@@ -106,16 +119,16 @@ class Fixture:
         return book.latest_ref(CANONICAL_VALUE, (self.scope, int(node)))
 
 
-def lower_tick(fixture, program, *, first=None):
+def lower_tick(fixture, program, *, first=None, outputs=None):
     post_control_rewrite(fixture.graph, program)
     fresh = fixture.fresh
+    outputs = outputs or {0: (fresh,), 1: (fresh + 1,)}
     return lower_control_program_to_ssa(
         program, function_name="tickrows__f",
         first_value_id=fresh + 100 if first is None else first,
         region_callees={0: "case_zero", 1: "case_one"},
         region_signatures={
-            0: ((fixture.state,), (fresh,)),
-            1: ((fixture.state,), (fresh + 1,)),
+            region: ((fixture.state,), ids) for region, ids in outputs.items()
         },
         lexical_read_scope=fixture.scope,
     )
@@ -280,9 +293,94 @@ def part_a_control():
     end_identity_book(token)
 
 
+def part_a_merge():
+    print("== part A merge: the arms' rebound scalar joins in one Phi")
+    book = IdentityBook()
+    _book, token = begin_identity_book(book)
+    fixture = Fixture(book)
+    state_cell = fixture.cell(book, fixture.state)
+    merged_cell = fixture.cell(book, fixture.merged)
+    initial_cell = fixture.cell(book, fixture.initial)
+    tick = StateMachineTick(
+        "dispatch",
+        (
+            ("0", StatementBlock(("__scheduled_region_0__",))),
+            ("1", StatementBlock(("__scheduled_region_1__",))),
+        ),
+        state_value_id=fixture.state,
+        source_node_id=fixture.owner,
+        case_value_ids=fixture.literals,
+        # case 0 rebinds ``a`` (its region publishes ``a + 1``); case 1 and
+        # the no-default fall-through keep the entered version.
+        carried_aliases=((
+            (fixture.arm_value, fixture.initial),
+            fixture.initial, fixture.initial, fixture.merged,
+        ),),
+    )
+    program = ControlProgram(
+        SequenceBlock((tick,)), region_indices=(0, 1),
+    )
+    function, shortfalls = lower_tick(
+        fixture, program,
+        outputs={0: (fixture.arm_value,), 1: (fixture.fresh,)},
+    )
+    check("lowering has no shortfalls", shortfalls == ())
+    merge = function.blocks["state_merge"]
+    phis = [i for i in merge.instrs if str(getattr(i.op, "name", i.op)) == "Phi"]
+    check("state_merge holds one Phi for the carried scalar", len(phis) == 1)
+    if not phis:
+        end_identity_book(token)
+        return
+    phi = phis[0]
+    check("the Phi is the N-way state join (3 incoming: case 0, case 1, "
+          "no-case fall-through)",
+          phi.attributes.get("binding") == "state_carried"
+          and len(phi.args) == 3
+          and len(phi.attributes["incoming_blocks"]) == 3)
+    check("the Phi's incoming blocks each branch to the merge",
+          all("state_merge" in function.blocks[name].successors
+              for name in phi.attributes["incoming_blocks"]))
+    check("the merged id is the graph's merge node", int(phi.res.id)
+          == int(fixture.merged))
+    scope = block_ref(book, function.name, "state_merge").row[0]
+    merged_value = book.latest_ref(SSA_VALUE, (scope, int(phi.res.id)))
+    sources = () if merged_value is None else sources_of(book, merged_value)
+    arm_cell = book.latest_ref(SSA_VALUE, (scope, int(phi.args[0].id)))
+    state_value = book.latest_ref(SSA_VALUE, (scope, int(fixture.state)))
+    check("the merged value is DERIVED from the arm's value, the snapshot "
+          "and the state",
+          arm_cell in sources and state_value in sources
+          and any(source.page.name == "carried_snapshot" for source in sources))
+    row = (fixture.scope, ControlBlockKind.STATE_MACHINE_TICK,
+           fixture.cell(book, fixture.owner))
+    block_cell = book.latest_ref(CONTROL_BLOCK, row)
+    fact = None if block_cell is None else fact_at(book, CONTROL_BLOCK, block_cell)
+    check("the tick's control_block fact names the merged cell",
+          fact is not None and fact.carried == (merged_cell,))
+    snapshot = book.latest_ref(
+        CARRIED_SNAPSHOT, (scope, fixture.cell(book, fixture.owner),
+                           int(fixture.initial)))
+    check("one carried_snapshot row, derived from the tick's cell",
+          snapshot is not None
+          and fixture.cell(book, fixture.owner) in sources_of(book, snapshot))
+    binding = book.latest_ref(
+        CONTROL_VALUE_BINDING, (scope, int(fixture.merged)))
+    bound = None if binding is None else fact_at(
+        book, CONTROL_VALUE_BINDING, binding)
+    check("the merged id is bound CONDITIONAL_MERGE",
+          bound is not None and bound.kind is BindingKind.CONDITIONAL_MERGE)
+    findings = check_definition_dominance(IRModule({function.name: function}))
+    check("every use is dominated by its definition (Phi edges included)",
+          not [f for f in findings if "formal" not in str(f).lower()
+               and int(getattr(f, "value_id", -1) or -1) in (
+                   int(fixture.merged), int(fixture.arm_value))])
+    end_identity_book(token)
+
+
 def main() -> int:
     part_a()
     part_a_control()
+    part_a_merge()
     print()
     print(f"{len(failures)} failure(s)")
     return 1 if failures else 0
