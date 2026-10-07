@@ -200,6 +200,19 @@ _REGION_MARKER = re.compile(r"^__scheduled_region_(\d+)__$")
 _CALLSITE_MARKER = re.compile(r"^__plan_callsite_(\d+)__$")
 
 
+def _case_literal_int(spelling: Any) -> int | None:
+    """A tick case label as the integer it denotes (``True``/``False`` are
+    the planner's boolean singletons), else None."""
+
+    text = str(spelling).strip()
+    if text in {"True", "False"}:
+        return int(text == "True")
+    try:
+        return int(text, 10)
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True, order=True)
 class SSALoweringShortfall:
     domain: str
@@ -5310,16 +5323,21 @@ class _ControlSSABuilder:
                     f"unknown post-region table operation {kind!r}"
                 )
 
-    def new_block(self, stem: str) -> BasicBlock:
+    def new_block(self, stem: str, *, also: tuple = ()) -> BasicBlock:
+        """A new block.  ``also`` names cells beyond the owning control
+        block's that the block is made from (a tick's case literal)."""
+
         count = self.block_counts.get(stem, 0)
         self.block_counts[stem] = count + 1
         name = stem if count == 0 else f"{stem}.{count}"
         block = BasicBlock(name)
         self.blocks[name] = block
-        self._post_ssa_block(name, stem)
+        self._post_ssa_block(name, stem, also=also)
         return block
 
-    def _post_ssa_block(self, label: str, stem: str) -> Ref:
+    def _post_ssa_block(
+        self, label: str, stem: str, *, also: tuple = (),
+    ) -> Ref:
         """``ssa_block`` row ``(scope, function, label)`` (plan 100, 2.6),
         CONCORD.  ENTRY / FUNCTION_EXIT belong to the function: DERIVED
         from the shell ``control_program`` cell (when posted) and the
@@ -5357,6 +5375,9 @@ class _ControlSSABuilder:
             )
             sources = (enclosing,) if enclosing is not None else function_cells
             fact = Unresolved(SSA_BLOCK_OWNER_UNROUTED, sources)
+        sources = tuple(dict.fromkeys((
+            *sources, *(cell for cell in also if isinstance(cell, Ref)),
+        )))
         return book.post(
             SSA_BLOCK, (self._scope(), str(self.function_name), str(label)),
             fact, stage=self._stage(), provenance=Derived(sources),
@@ -10997,12 +11018,27 @@ class _ControlSSABuilder:
                     location=f"{path}.state",
                 )
         merge = self.new_block("state_merge")
+        literal_ids = tuple(tick.case_value_ids) + (None,) * (
+            len(tick.cases) - len(tick.case_value_ids)
+        )
         for index, (case_value, case_body) in enumerate(tick.cases):
-            case = self.new_block("state_case")
-            otherwise = self.new_block("state_next")
-            literal = self.expression_value(
-                case_value,
-                location=f"{path}.case[{index}]",
+            # The case literal is a graph node with an identity cell: the
+            # case's blocks and the literal value derive from it.  A case
+            # with no node (a hand-built tick) is a bare spelling.
+            literal_cell = (
+                None if literal_ids[index] is None
+                else self._canonical_cell(literal_ids[index])
+            )
+            case = self.new_block("state_case", also=(literal_cell,))
+            otherwise = self.new_block("state_next", also=(literal_cell,))
+            literal_int = _case_literal_int(case_value)
+            literal = (
+                self.constant_value(literal_int, literal_cell)
+                if literal_cell is not None and literal_int is not None
+                else self.expression_value(
+                    case_value,
+                    location=f"{path}.case[{index}]",
+                )
             )
             condition = self.fresh_value(
                 dtype="bool", transform=CONTROL_PREDICATE,

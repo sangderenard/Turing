@@ -1636,7 +1636,9 @@ class ControlBlockFact:
     ``deployment_region`` cells a marker names (empty for a block whose
     region membership is placement, not identity); ``callsite``: the call's
     ``call_binding`` cell; ``extra``: the non-identity payload (``expect_true``,
-    ``comparison``, ``schedule_preference``, ``dtype``, ``induction``, ...).
+    ``comparison``, ``schedule_preference``, ``dtype``, ``induction``, ...);
+    ``cases``: for a ``StateMachineTick``, the case literals' node cells in
+    case order (a literal with no node has no cell here).
     """
 
     kind: ControlBlockKind
@@ -1646,6 +1648,7 @@ class ControlBlockFact:
     regions: tuple
     callsite: Any
     extra: tuple
+    cases: tuple = ()
 
 
 @dataclass(frozen=True)

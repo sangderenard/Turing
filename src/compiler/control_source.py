@@ -308,6 +308,10 @@ class StateMachineTick:
     default: "ControlBlock | None" = None
     state_value_id: int | None = None
     source_node_id: int | None = None
+    # Aligned with ``cases``: the graph node of each case literal (the
+    # ``MatchValue`` constant), whose identity cell the case's blocks and the
+    # equality predicate derive from.  None where a case has no node.
+    case_value_ids: tuple[int | None, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -750,6 +754,10 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
         elif isinstance(block, StateMachineTick):
             if block.state_value_id is not None:
                 values.add(int(block.state_value_id))
+            values.update(
+                int(value_id) for value_id in block.case_value_ids
+                if value_id is not None
+            )
             for _case, body in block.cases:
                 visit(body)
             if block.default is not None:
@@ -932,6 +940,7 @@ def _describe_control_block(
     sites: tuple = ()
     regions: tuple = ()
     extra: tuple = ()
+    cases: tuple = ()
     if isinstance(block, StatementBlock):
         region = _region_marker(block)
         callsite_ordinal = _callsite_marker(block)
@@ -1025,6 +1034,10 @@ def _describe_control_block(
         # cell, the predicate is the state selector's value cell.
         owner = cell(block.source_node_id)
         predicate = cell(block.state_value_id)
+        cases = cells(
+            value_id for value_id in block.case_value_ids
+            if value_id is not None
+        )
         extra = (str(block.state),)
     elif isinstance(block, ParallelDeployment):
         extra = (str(block.schedule_preference),)
@@ -1032,7 +1045,9 @@ def _describe_control_block(
         block, ParallelDeployment,
     ):
         reason = CONTROL_OWNER_UNKNOWN
-    return kind, owner, reason, (predicate, carried, sites, regions, callsite, extra)
+    return kind, owner, reason, (
+        predicate, carried, sites, regions, callsite, extra, cases,
+    )
 
 
 def control_block_cell(book: Any, scope: Any, block: Any) -> Any:
@@ -1190,9 +1205,11 @@ def post_control_program(
         )
 
     def fact_cells(fields: tuple) -> tuple:
-        predicate, carried, sites, regions, callsite, _extra = fields
+        predicate, carried, sites, regions, callsite, _extra, cases = fields
         return tuple(
-            item for item in (predicate, *carried, *sites, *regions, callsite)
+            item for item in (
+                predicate, *carried, *sites, *regions, callsite, *cases,
+            )
             if isinstance(item, Ref)
         )
 
@@ -3151,16 +3168,26 @@ def project_control_regions(
                 return None
             return block
         if isinstance(block, StateMachineTick):
-            cases = tuple(
-                (value, projected)
-                for value, body in block.cases
-                if (projected := project(body)) is not None
+            literal_ids = tuple(block.case_value_ids) + (None,) * (
+                len(block.cases) - len(block.case_value_ids)
             )
+            kept = [
+                (value, projected, literal_id)
+                for (value, body), literal_id in zip(block.cases, literal_ids)
+                if (projected := project(body)) is not None
+            ]
+            cases = tuple((value, projected) for value, projected, _ in kept)
             default = (
                 None if block.default is None else project(block.default)
             )
             return (
-                replace(block, cases=cases, default=default)
+                replace(
+                    block, cases=cases, default=default,
+                    case_value_ids=(
+                        tuple(literal_id for _, _, literal_id in kept)
+                        if block.case_value_ids else ()
+                    ),
+                )
                 if cases or default is not None else None
             )
         if isinstance(block, ParallelDeployment):

@@ -22,7 +22,7 @@ sys.path.insert(0, str(REPO))
 
 from src.compiler.concordance_declarations import (  # noqa: E402
     CONTROL_BLOCK, CONTROL_OWNER_UNKNOWN, ControlBlockKind, SSA_BLOCK,
-    SSA_BLOCK_OWNER_UNROUTED, SSABlockKind,
+    SSA_BLOCK_OWNER_UNROUTED, SSA_VALUE, SSABlockKind,
 )
 from src.compiler.control_source import (  # noqa: E402
     ControlProgram, ControlUniform, SequenceBlock, StateMachineTick,
@@ -159,12 +159,16 @@ def part_a():
         ),
         state_value_id=fixture.state,
         source_node_id=fixture.owner,
+        case_value_ids=fixture.literals,
     )
     program = ControlProgram(
         SequenceBlock((tick,)), region_indices=(0, 1),
     )
     function, shortfalls = lower_tick(fixture, program)
     check("lowering has no shortfalls", shortfalls == ())
+    literal_cells = tuple(fixture.cell(book, node) for node in fixture.literals)
+    check("both case literals are graph nodes with identity cells",
+          len(literal_cells) == 2 and all(c is not None for c in literal_cells))
 
     row = (fixture.scope, ControlBlockKind.STATE_MACHINE_TICK, owner_cell)
     block_cell = book.latest_ref(CONTROL_BLOCK, row)
@@ -177,6 +181,10 @@ def part_a():
         fact = fact_at(book, CONTROL_BLOCK, block_cell)
         check("the fact's predicate is the state value's cell",
               fact.predicate == state_cell)
+        check("the fact names the case literal cells, in case order",
+              fact.cases == literal_cells)
+        check("the row is DERIVED from the case literal cells",
+              all(cell in sources for cell in literal_cells))
     program_rows = [
         row for row in book.page(CONTROL_BLOCK).scope_rows(fixture.scope)
         if row[1] is ControlBlockKind.STATE_MACHINE_TICK
@@ -202,17 +210,21 @@ def part_a():
           == [2, 2, 1])
     unrouted = []
     for stem, names in labels.items():
-        for name in names:
+        for index, name in enumerate(names):
             ref = block_ref(book, function.name, name)
             fact = None if ref is None else fact_at(book, SSA_BLOCK, ref)
+            expected = (block_cell,) + (
+                (literal_cells[index],) if stem != "state_merge" else ()
+            )
             routed = (
                 isinstance(fact, SSABlockKind)
-                and block_cell in sources_of(book, ref)
+                and all(cell in sources_of(book, ref) for cell in expected)
             )
             if not routed:
                 unrouted.append((name, fact))
     check("every state_case/state_next/state_merge ssa_block row is routed "
-          "to the tick's control_block cell", not unrouted)
+          "to the tick's control_block cell, and each case/next row also to "
+          "its case literal's cell", not unrouted)
     if unrouted:
         print("      unrouted:", unrouted)
 
@@ -223,6 +235,11 @@ def part_a():
     )
     check("the Eq reads the state value by id (no name lookup)",
           int(eq.args[0].id) == int(fixture.state))
+    scope = block_ref(book, function.name, "state_merge").row[0]
+    literal_value = book.latest_ref(SSA_VALUE, (scope, int(eq.args[1].id)))
+    minted = None if literal_value is None else book.mint_of(literal_value)
+    check("the Eq's literal operand is minted from the case literal's cell",
+          minted is not None and minted[1] == (literal_cells[0],))
     end_identity_book(token)
     return book
 
