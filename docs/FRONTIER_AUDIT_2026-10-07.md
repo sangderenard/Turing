@@ -87,6 +87,16 @@ worker died at 2026-10-06 ~15:00 (OAuth revoked). Branch state is from `git` tod
 | `fix/ellipsis-store-ingestion` (wte) | 0 | clean | never started |
 | raw_primitive sweep, cross-book stamps, closure-build costs | no branch, no worktree | — | never started (died before `git worktree add`) |
 
+### 3a. Lanes restarted 2026-10-07 (all 8, Sonnet, off `main` 9297df18+)
+
+| Branch | Landed (unmerged) |
+|---|---|
+| `fix/cross-book-stamps` | 129c20fa: the cross-book bug was already fixed on main; the lane fixed a root-graph double visit in callsite tensor specialization (VJP test red on its own). 3 test files green together (17 passed, 1 pre-existing xfail). |
+| `fix/host-layout-rows` | 5 commits (51b7a473..52e76de1): slot rows, API_CONTRACT, `<entry>_layout.h`, `bind_column`, probe bit-exact. See §5. |
+| `fix/closure-build-costs` | 3 commits (3617c136, ec29c88f, 5d0760c7): run-length edge batching in `connect` (whole-node batching would reorder shared sources' `children`, so it was rejected), append-only `_set_operands` shortcut with position facts read only where positions move, hub-children index. 900-arg call `build_from_ast` 3.30 s -> 0.55 s (now ~linear: N=100 0.03 s, N=300 0.17 s); hub cases 1.8 s -> 0.48 s. Equivalence test: every page's rows identical in order (two global logs as multisets); build-stage output identical to base on 4 sources (37,600 rows). Also fixed a latent bug: every new edge of one call shared the same `extra` set object. **Next target it names:** the reduce stage is unchanged (~3 s on the 900-arg call): `_redirect_value` calls `_set_operands` ~5,400 times through the general path, and `deduplicate_node` scans all graph nodes per non-AST node. |
+| `fix/raw-primitive-posts`, `fix/per-copy-shape-proofs`, `fix/state-machine-tick-rows`, `fix/float32-result-dtype`, `fix/ellipsis-store-ingestion` | running at time of writing |
+| loose end 3 (main tree) | running: 10 dominance violations at N=2 (§2a); the probe is committed (78a69087). |
+
 Both in-progress worktrees import cleanly today (`import src.compiler.glsl_deployment_strategy,
 src.compiler.fortran_c_shell` ok in wtv and wtc), so the uncommitted moves are not broken,
 only unfinished. The three detached baseline worktrees (`wtb2`, `wtmb`, `wtv2`, clean at
