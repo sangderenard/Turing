@@ -956,6 +956,36 @@ class CModuleArtifact:
     def complete(self) -> bool:
         return not self.shortfalls
 
+    def write_layout_header(
+        self, directory: str | Path,
+    ) -> tuple[tuple, ...]:
+        """Write ``<entry>_layout.h`` beside ``<entry>.c`` and return the
+        ``emission.build`` ``extra_sources`` row that posts it.
+
+        The header is printed from this entry's API_CONTRACT row on the
+        book (``c_host_layout``); without a book there is no contract and
+        no header (empty tuple)."""
+
+        from .c_host_layout import layout_header_source
+        from .concordance_declarations import ArtifactPart, EMISSION_ARTIFACT
+        from .emission_concordance import api_contract
+
+        emission = self.emission
+        if emission is None or emission.api_contract is None:
+            return ()
+        entry, batch, buffers = api_contract(
+            emission.book, self.name, emission.backend,
+        )
+        fingerprint = emission.book.pages[EMISSION_ARTIFACT.name].latest(
+            (self.name, emission.backend, ArtifactPart.API_CONTRACT),
+        ).sha256
+        text = layout_header_source(
+            entry, batch, buffers, fingerprint=fingerprint,
+        )
+        path = Path(directory) / f"{self.name}_layout.h"
+        path.write_text(text, encoding="utf-8")
+        return (("layout_header", text, path, (emission.api_contract,)),)
+
     def _dynamic_link_inputs(self) -> tuple[list[str], list[Path]]:
         """What the linker is handed under ``link="dynamic"``: the import
         library beside each piece's DLL when it exists (``.lib``), else the
@@ -1013,6 +1043,7 @@ class CModuleArtifact:
         source_path = destination / f"{self.name}.c"
         library_path = destination / f"{self.name}.dll"
         source_path.write_text(self.source, encoding="utf-8")
+        layout_sources = self.write_layout_header(destination)
         pool_sources: list[str] = []
         if self.pool_required:
             pool_home = (
@@ -1063,6 +1094,7 @@ class CModuleArtifact:
                         self.name, source_text=self.source,
                         source_path=source_path, command=command,
                         library_path=library_path, pieces=pieces,
+                        extra_sources=layout_sources,
                     )
                 return self
             if "sub-compilation" not in (completed.stderr or ""):
@@ -1206,6 +1238,7 @@ class CModuleArtifact:
         initial_state_path = destination / "initial-state.bin"
         final_outputs_path = destination / "final-outputs.bin"
         module_source_path.write_text(self.source, encoding="utf-8")
+        layout_sources = self.write_layout_header(destination)
 
         shapes = self.buffer_shapes or tuple(
             () for _ in self.buffer_order
@@ -1428,7 +1461,7 @@ class CModuleArtifact:
                 extra_sources=((
                     "host", host_source, host_source_path,
                     (self.emission.buffer_order,),
-                ),),
+                ), *layout_sources),
             )
         return CStandaloneExecutable(
             directory=destination,
