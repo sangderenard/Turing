@@ -983,7 +983,8 @@ class CModuleArtifact:
             entry, batch, buffers, fingerprint=fingerprint,
         )
         path = Path(directory) / f"{self.name}_layout.h"
-        path.write_text(text, encoding="utf-8")
+        # Bytes, not text mode: the row's hash and length are the file's.
+        path.write_bytes(text.encode("utf-8"))
         return (("layout_header", text, path, (emission.api_contract,)),)
 
     def _dynamic_link_inputs(self) -> tuple[list[str], list[Path]]:

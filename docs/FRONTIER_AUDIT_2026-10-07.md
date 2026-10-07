@@ -123,9 +123,13 @@ c0781c7a) were removed today. Disk: 57 GB free.
   the program cell; block rows `SSA_BLOCK_OWNER_UNROUTED`; case literals not cells; no
   merge Phis) and unconnected (`G.graph["state_machine_controls"]` has no reader;
   `StateMachineDomain` is dead vocabulary; Python `match` is never ingested).
-- Host-facing layout facts are not on the book (`NativeSystem.layout()` is Python-only,
-  no callers); the written-slot-wins rule exists twice (compiler scalars vs
-  `NativeSystem.state_field_ids` spans).
+- Host-facing layout facts: now book rows (`program_abi_field_slot`, the entry's
+  API_CONTRACT, `<entry>_layout.h` printed from it; probe
+  `tools/compiler_probes/probe_host_layout_rows.py`). Still open: the compiler-side scalar
+  copy of the written-slot-wins rule (`_preferred_linked_field_candidates`) is a second
+  copy of `post_program_abi_field_slots`'s rule; the contract has no declared column roles
+  (scene adapter); a formal's program_abi accounting is not a book cell;
+  `NativeSystem.layout()` is still Python-only.
 - Shape proofs keyed by authored function name, shared across specialized copies
   (blocks mixed-shape solve in one function).
 - Cross-book `_turing_source_cells` stamps on cached AST objects.
