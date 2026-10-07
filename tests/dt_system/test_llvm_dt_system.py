@@ -29,26 +29,51 @@ BATCH = 4
 
 
 def test_native_system_reads_back_authoritative_written_state_slot():
+    """The written slot is the field's resident, whatever the argument order:
+    the rule is applied once, where the ``program_abi_field_slot`` rows are
+    posted, and ``NativeSystem`` reads the rows."""
+    from src.compiler.concordance_declarations import (
+        EMISSION_C, Backend, PROGRAM_ABI_FIELD_SLOT, ProgramAbiSlotRole,
+    )
+    from src.compiler.emission_concordance import post_program_abi_field_slots
+    from src.compiler.identity_concordance import IdentityBook
+    from src.transmogrifier.ssa import Function, SSAValue
+
     def argument(value_id, *, written=False, callsite_id=None):
         accounting = {
             "program_abi_parameter": "state",
             "program_abi_field": "x",
+            "program_abi_storage": "span",
             "program_abi_field_written": written,
         }
         if callsite_id is not None:
             accounting["callsite_id"] = callsite_id
-        return SimpleNamespace(id=value_id, accounting=accounting)
+        return SSAValue(value_id, "float64", (1,), accounting=accounting)
 
-    root = SimpleNamespace(args=[
+    root = Function("entry", [
         argument(10),
         argument(11, written=True),
         # This alias comes later on purpose: argument order must not replace
         # the buffer that the compiler marks as the field's mutable output.
         argument(12, callsite_id=99),
-    ])
-    module = SimpleNamespace(functions={"entry": root})
-    system = NativeSystem(
-        SimpleNamespace(), module, "entry", (), columns=("x",), batch=1)
+    ], {})
+    book = IdentityBook()
+    posted = post_program_abi_field_slots(
+        book, root, "entry", Backend.C_MODULE, buffer_order=(10, 11, 12),
+        buffer_dtypes=("float64",) * 3, buffer_shapes=((1,),) * 3,
+        buffer_order_cell=None, stage=EMISSION_C,
+    )
+    key = ("state", "x", ProgramAbiSlotRole.PAYLOAD)
+    slot = book.pages[PROGRAM_ABI_FIELD_SLOT.name].latest(
+        ("entry", Backend.C_MODULE, *key))
+    assert list(posted) == [key]
+    assert (slot.value_id, slot.buffer_index, slot.aliases) == (11, 1, (10, 12))
+
+    module = SimpleNamespace(functions={"entry": root},
+                             metadata={"identity_book": book})
+    artifact = SimpleNamespace(
+        name="entry", emission=SimpleNamespace(backend=Backend.C_MODULE))
+    system = NativeSystem(artifact, module, "entry", (), columns=("x",), batch=1)
 
     assert system.state_field_ids() == {"x": 11}
 

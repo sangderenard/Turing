@@ -72,12 +72,15 @@ from .concordance_declarations import (
     EMISSION_ARTIFACT,
     EMISSION_FUNCTION,
     EMISSION_UNIT,
+    FUNCTION_PARAMETER,
     FUNCTION_TEXT_PENDING,
     NATIVE_LOOP_VALUE,
     NATIVE_LOOP_WRAPPER_VALUE,
     NO_BOOK_AT_EMISSION,
     NO_FUNCTION_SCOPE,
     PIECE_ARTIFACT_UNROUTED,
+    PROGRAM_ABI_FIELD_SLOT,
+    SSA_VALUE,
     UNIT_ELIDED,
     VALUE_WITHOUT_IDENTITY_CELL,
     ArtifactFact,
@@ -86,6 +89,8 @@ from .concordance_declarations import (
     EmittedUnit,
     FunctionEmission,
     NativeLoopValue,
+    ProgramAbiSlot,
+    ProgramAbiSlotRole,
     UnitKind,
 )
 from .identity_concordance import (
@@ -749,25 +754,210 @@ def post_artifact_part(
                 gaps = metadata[EMISSION_GAPS] = []
             gaps.append((str(artifact), backend, digest, length, str(what)))
         return None
-    sources = tuple(sources)
     digest, length = _sha256(data)
-    fact = ArtifactFact(digest, length, tuple(location))
+    return _post_revision(
+        book, EMISSION_ARTIFACT, (str(artifact), backend, part),
+        ArtifactFact(digest, length, tuple(location)), sources,
+        reason or VALUE_WITHOUT_IDENTITY_CELL, stage,
+    )
+
+
+def _post_revision(
+    book: Any, page: Any, row: tuple, fact: Any, sources: Iterable,
+    reason: Any, stage: Any,
+) -> Ref:
+    """REVISE one row, DERIVED from ``sources`` when every one is a cell and
+    ``Unsourced(reason)`` otherwise.  A rebuild that names the same source
+    cells and no newer one is not a new fact the api admits: the previous
+    row stands and is returned."""
+
+    sources = tuple(sources)
     cells = _distinct(sources)
     if cells and all(isinstance(cell, Ref) for cell in sources):
         provenance: Any = Derived(cells)
     else:
-        provenance = Unsourced(reason or VALUE_WITHOUT_IDENTITY_CELL)
-    row = (str(artifact), backend, part)
-    latest = book.latest_ref(EMISSION_ARTIFACT, row)
+        provenance = Unsourced(reason)
+    latest = book.latest_ref(page, row)
     try:
         return book.post(
-            EMISSION_ARTIFACT, row, fact, stage=stage,
-            provenance=provenance, mode=Mode.REVISE,
+            page, row, fact, stage=stage, provenance=provenance,
+            mode=Mode.REVISE,
         )
     except ConcordanceRefusal:
         if latest is None:
             raise
         return latest
+
+
+def _declared_count(shape: Any) -> int | None:
+    """The element count of a static declared shape; None when the shape is
+    empty or carries a non-static extent."""
+
+    shape = tuple(shape or ())
+    if not shape or any(
+        isinstance(extent, bool) or not isinstance(extent, int) or extent < 0
+        for extent in shape
+    ):
+        return None
+    count = 1
+    for extent in shape:
+        count *= int(extent)
+    return count
+
+
+def post_program_abi_field_slots(
+    book: Any, root: Any, entry: str, backend: Backend, *,
+    buffer_order: Iterable[int],
+    buffer_dtypes: Iterable[str], buffer_shapes: Iterable,
+    buffer_order_cell: Ref | None, stage: Any,
+) -> dict[tuple, Ref]:
+    """Post one ``program_abi_field_slot`` row per ProgramABI slot of the
+    entry ``root`` (the host-facing layout, book rows first).
+
+    A slot is ``(parameter, field, role)``: a record field of a declared
+    parameter, or a bare parameter (``field`` None, named by the root's
+    ``parameter_names``).  A lowered root can carry several formals for one
+    slot: the direct ProgramABI slot and callsite-forwarded aliases used
+    while assembling nested regions.  The ABI rule, here and nowhere else on
+    the host side: the written slot is the resident, then a direct slot over
+    a callsite-forwarded one, then the earlier formal.  Argument order never
+    decides which buffer a host reads back.
+
+    DERIVED(the resident's and each alias's ``ssa_value`` cell, a bare
+    parameter's ``function_parameter`` cell, ``buffer_order_cell``);
+    ``Unsourced(value_without_identity_cell)`` when the resident has no
+    ``ssa_value`` cell.  Descriptors that are not physical storage
+    (``is_structural_abi_value``) and returned-record slots, whose record is
+    a call result and not a parameter, name no slot."""
+
+    if book is None:
+        return {}
+    from .ssa_record_return_state import function_scope_of
+    from .ssa_storage_requirements import is_structural_abi_value
+
+    order = tuple(int(value_id) for value_id in buffer_order)
+    dtypes = tuple(buffer_dtypes)
+    shapes = tuple(buffer_shapes)
+    index_of = {value_id: index for index, value_id in enumerate(order)}
+    scope = function_scope_of(root)
+    parameter_names = {
+        int(value_id): str(name)
+        for name, value_id in root.metadata.get("parameter_names", ())
+    }
+    groups: dict[tuple, list] = {}
+    for formal in root.args:
+        if is_structural_abi_value(root, formal):
+            continue
+        accounting = dict(formal.accounting or {})
+        if accounting.get("returned_record_storage") is not None:
+            continue
+        field = accounting.get("program_abi_field")
+        parameter = accounting.get("program_abi_parameter")
+        if field is None:
+            if parameter is None:
+                parameter = parameter_names.get(int(formal.id))
+            if parameter is None:
+                continue
+        elif parameter is None:
+            continue
+        role = (
+            ProgramAbiSlotRole.PRESENCE
+            if accounting.get("program_abi_optional_presence")
+            else ProgramAbiSlotRole.PAYLOAD
+        )
+        groups.setdefault(
+            (str(parameter), None if field is None else str(field), role), [],
+        ).append(formal)
+
+    def priority(formal: Any) -> tuple[int, int]:
+        accounting = dict(formal.accounting or {})
+        return (
+            int(bool(accounting.get("program_abi_field_written"))),
+            int(accounting.get("callsite_id") is None),
+        )
+
+    posted: dict[tuple, Ref] = {}
+    for key, candidates in groups.items():
+        parameter, field, role = key
+        resident = max(candidates, key=priority)
+        resident_id = int(resident.id)
+        aliases = tuple(
+            int(formal.id) for formal in candidates if formal is not resident
+        )
+        cells = [
+            value_cell(book, root, formal_id)
+            for formal_id in (resident_id, *aliases)
+        ]
+        declared = None
+        if cells[0] is not None:
+            declared = book.pages[SSA_VALUE.name].latest(cells[0].row)
+        shape = tuple(
+            getattr(declared, "shape", None) or resident.shape or ()
+        )
+        accounting = dict(resident.accounting or {})
+        storage = accounting.get("program_abi_storage")
+        count = _declared_count(shape)
+        if count is None and not shape and storage == "scalar":
+            count = 1
+        index = index_of.get(resident_id)
+        capacity = None
+        if index is not None:
+            capacity = _declared_count(shapes[index]) or (
+                1 if not tuple(shapes[index] or ()) else None
+            )
+        elif count is not None:
+            capacity = count
+        dtype = (
+            str(dtypes[index]) if index is not None
+            else str(getattr(declared, "dtype", None) or resident.dtype or "")
+        )
+        fact = ProgramAbiSlot(
+            resident_id, index, dtype, shape, count, capacity,
+            bool(accounting.get("program_abi_field_written")),
+            None if storage is None else str(storage), aliases,
+        )
+        extra = []
+        if field is None:
+            extra.append(book.latest_ref(FUNCTION_PARAMETER, (scope, parameter)))
+        row = (str(entry), backend, parameter, field, role)
+        ref = _post_revision(
+            book, PROGRAM_ABI_FIELD_SLOT, row, fact,
+            (*cells, *extra, buffer_order_cell),
+            VALUE_WITHOUT_IDENTITY_CELL, stage,
+        )
+        recorded = book.pages[PROGRAM_ABI_FIELD_SLOT.name].latest(row)
+        if recorded != fact:
+            raise ConcordanceRefusal(
+                f"program_abi_field_slot {row!r}: the book holds {recorded!r} "
+                f"and nothing new justifies {fact!r}"
+            )
+        posted[key] = ref
+    return posted
+
+
+def program_abi_field_slots(
+    module: Any, entry: str, backend: Backend,
+) -> dict[tuple, ProgramAbiSlot]:
+    """``(parameter, field, role) -> ProgramAbiSlot`` of the entry ``entry``
+    emitted by ``backend``, read from the ``program_abi_field_slot`` rows on
+    the module's attached book.  Loud when there is none: a host layout is a
+    book fact, and an artifact emitted without a book has not published
+    one."""
+
+    metadata = getattr(module, "metadata", None)
+    book = None if metadata is None else metadata.get("identity_book")
+    page = None if book is None else book.pages.get(PROGRAM_ABI_FIELD_SLOT.name)
+    rows = () if page is None else tuple(
+        row for row in page.scope_rows(str(entry)) if row[1] == backend
+    )
+    if not rows:
+        raise RuntimeError(
+            f"no program_abi_field_slot rows for entry {entry!r} "
+            f"({backend.value}): the module "
+            "carries no attached identity book, or the entry was never "
+            "emitted on it"
+        )
+    return {(row[2], row[3], row[4]): page.latest(row) for row in rows}
 
 
 def path_location(path: Any) -> tuple:
@@ -1063,6 +1253,8 @@ __all__ = [
     "path_location",
     "piece_source_cell",
     "post_artifact_part",
+    "post_program_abi_field_slots",
+    "program_abi_field_slots",
     "replay_emission_gaps",
     "ssa_block_cell",
     "unit_kind_of",

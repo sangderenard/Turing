@@ -42,6 +42,25 @@ def is_compiler_owned_storage(value: Any) -> bool:
     ))
 
 
+def is_structural_abi_value(function: Any, value: Any) -> bool:
+    """Whether a root formal is a descriptor rather than physical storage:
+    a declared record parameter, an aggregate, or a keyed ProgramABI slot."""
+
+    metadata = getattr(function, "metadata", None) or {}
+    records = dict(metadata.get("parameter_record_abi") or {})
+    record_parameter_ids = {
+        int(value_id)
+        for parameter_name, value_id in metadata.get("parameter_names", ())
+        if str(parameter_name) in records
+    }
+    accounting = dict(getattr(value, "accounting", None) or {})
+    return (
+        int(value.id) in record_parameter_ids
+        or str(getattr(value, "dtype", "") or "").casefold() == "ssa.aggregate"
+        or accounting.get("program_abi_storage") == "keyed"
+    )
+
+
 def _static_shape(value: Any) -> tuple[int, ...]:
     shape = tuple(getattr(value, "shape", ()) or ())
     if not shape or any(not isinstance(item, int) or item < 0 for item in shape):

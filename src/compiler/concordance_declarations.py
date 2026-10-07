@@ -1835,6 +1835,40 @@ class ArtifactFact:
     location: tuple
 
 
+class ProgramAbiSlotRole(Enum):
+    """Which physical slot of a declared field a formal is: the payload, or
+    the Boolean presence slot an optional field carries beside it (both are
+    marked by the formal's ProgramABI accounting and share the field name)."""
+
+    PAYLOAD = "payload"
+    PRESENCE = "presence"
+
+
+@dataclass(frozen=True)
+class ProgramAbiSlot:
+    """The host-facing facts of one ProgramABI slot of an emitted entry.
+
+    ``value_id``: the root formal that is the slot's resident (the written
+    slot wins, then a direct slot over a callsite-forwarded alias, then
+    argument order).  ``buffer_index``: its position in ``void **buffers``,
+    None when the resident is not a public buffer.  ``dtype``: the public
+    buffer's storage dtype.  ``shape`` / ``count``: the declared extent (the
+    formal's ``ssa_value`` cell); ``count`` None when the declaration is not
+    a static extent.  ``capacity``: the elements the entry may touch (the
+    BUFFER_ORDER cell's shape), at least ``count`` for a host to allocate.
+    ``aliases``: the other root formals claiming the same slot."""
+
+    value_id: int
+    buffer_index: Any
+    dtype: str
+    shape: tuple
+    count: Any
+    capacity: Any
+    written: bool
+    storage: Any
+    aliases: tuple
+
+
 # -- pages -------------------------------------------------------------------
 EMISSION_UNIT = declare_page("emission_unit", (
     RowField("function", K.SCOPE), RowField("backend", K.LABEL),
@@ -1850,6 +1884,23 @@ EMISSION_ARTIFACT = declare_page("emission_artifact", (
 NATIVE_LOOP_VALUE = declare_page("native_loop_value", (
     RowField("wrapper", K.SCOPE), RowField("value", K.VALUE_ID),
 ), NativeLoopValue)                    # NOVEL(NATIVE_LOOP_WRAPPER_VALUE); CONCORD
+#: One row per ProgramABI slot of an emitted entry: ``(entry symbol,
+#: backend, parameter, field, role)`` -> ``ProgramAbiSlot``.  ``field`` is
+#: None for a bare parameter slot (``round_dt``); ``role`` is a
+#: ``ProgramAbiSlotRole``.  The backend keeps one entry's C and LLVM
+#: emissions apart (each has its own buffer order and dtype spelling); the
+#: parameter keeps ``state.dt`` and ``targets.dt`` apart; the role keeps an
+#: optional field's payload and presence slots apart.  REVISE, DERIVED(the
+#: resident's and every alias's ``ssa_value`` cell, a bare parameter's
+#: ``function_parameter`` cell, the entry's BUFFER_ORDER cell).  Writers:
+#: ``emission_concordance.post_program_abi_field_slots`` (C and LLVM module
+#: emission).  The host-facing layout is read from these rows; the header
+#: and every host accessor are artifacts made from them.
+PROGRAM_ABI_FIELD_SLOT = declare_page("program_abi_field_slot", (
+    RowField("entry", K.NAME), RowField("backend", K.LABEL),
+    RowField("parameter", K.NAME), RowField("field", K.LABEL),
+    RowField("role", K.LABEL),
+), ProgramAbiSlot)
 
 # ----------------------------------------------------------------------------
 # Step 9 identities: the cells upstream of emission (plan 100, 2.6 and 4.1

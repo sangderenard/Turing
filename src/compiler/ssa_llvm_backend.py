@@ -1213,7 +1213,7 @@ def _emit_repository_call_module(
     from .emission_concordance import (
         ArtifactEmission, call_demands, calling_units, emission_book,
         emission_recorder, kernel_source_cell, piece_source_cell,
-        post_artifact_part, value_cell,
+        post_artifact_part, post_program_abi_field_slots, value_cell,
     )
 
     emission = emission_book(module, "_emit_repository_call_module")
@@ -4492,6 +4492,12 @@ def _emit_repository_call_module(
             value_cell(emission, root, value_id) for value_id in buffer_order
         ),
         reason=VALUE_WITHOUT_IDENTITY_CELL, stage=EMISSION_LLVM,
+    )
+    post_program_abi_field_slots(
+        emission, root, entry_name, Backend.LLVM_MODULE,
+        buffer_order=buffer_order,
+        buffer_dtypes=buffer_dtypes, buffer_shapes=buffer_shapes,
+        buffer_order_cell=buffer_order_cell, stage=EMISSION_LLVM,
     )
     return LLVMFunctionArtifact(
         name=entry_name,

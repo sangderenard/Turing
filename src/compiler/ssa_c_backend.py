@@ -1540,7 +1540,8 @@ def emit_ssa_module_to_c(
     )
     from .emission_concordance import (
         ArtifactEmission, emission_book, emission_recorder,
-        imported_kernel_scope, kernel_callers, post_artifact_part, value_cell,
+        imported_kernel_scope, kernel_callers, post_artifact_part,
+        post_program_abi_field_slots, value_cell,
     )
 
     emission = emission_book(module, "emit_ssa_module_to_c")
@@ -5404,6 +5405,7 @@ def emit_ssa_module_to_c(
     from .ssa_storage_requirements import (
         function_storage_requirements,
         is_compiler_owned_storage,
+        is_structural_abi_value as _is_structural_abi_value,
     )
 
     storage_requirements = function_storage_requirements(module, function_name)
@@ -5440,12 +5442,7 @@ def emit_ssa_module_to_c(
     def is_structural_abi_value(value) -> bool:
         """Whether *value* is a descriptor rather than physical storage."""
 
-        accounting = dict(value.accounting or {})
-        return (
-            int(value.id) in record_parameter_ids
-            or str(value.dtype or "").casefold() == "ssa.aggregate"
-            or accounting.get("program_abi_storage") == "keyed"
-        )
+        return _is_structural_abi_value(root, value)
 
     def is_private_root_storage(value) -> bool:
         accounting = dict(value.accounting or {})
@@ -5792,6 +5789,13 @@ def emit_ssa_module_to_c(
             value_cell(emission, root, value_id) for value_id in buffer_order
         ),
         reason=VALUE_WITHOUT_IDENTITY_CELL, stage=EMISSION_C,
+    )
+    # The host-facing layout is a book fact first: one row per ProgramABI
+    # slot, DERIVED from the slot values' cells and BUFFER_ORDER.
+    post_program_abi_field_slots(
+        emission, root, name, Backend.C_MODULE, buffer_order=buffer_order,
+        buffer_dtypes=buffer_dtypes, buffer_shapes=buffer_shapes,
+        buffer_order_cell=buffer_order_cell, stage=EMISSION_C,
     )
     return CModuleArtifact(
         external_slots=external_slot_rows(module, slot_functions),
