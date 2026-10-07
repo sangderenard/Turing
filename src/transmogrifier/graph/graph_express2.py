@@ -4653,6 +4653,7 @@ class ProcessGraph:
                 _set_operands(
                     self, tgt_id, [*parents, *appended],
                     cause=INGEST_EDGE, edge_payload={'extra': set()},
+                    append_only=True,
                 )
             for src_id, producer_role, consumer_role, store_id in edges:
                 if not self.G.has_edge(src_id, tgt_id):

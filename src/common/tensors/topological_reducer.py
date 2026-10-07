@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import collections
 import copy
 from dataclasses import MISSING, dataclass, fields, is_dataclass
 from dataclasses import field as _dataclass_field, replace as _dataclass_replace
@@ -12,6 +13,7 @@ import importlib
 import inspect
 import json
 import logging
+import operator
 import os
 import re
 import symtable
@@ -2514,6 +2516,10 @@ def record_translation_shortfall(
     )
 
 
+_first = operator.itemgetter(0)
+_second = operator.itemgetter(1)
+
+
 #: Book pages whose facts name an operand position ``(role, ordinal)`` of a
 #: consumer node.  A position is an identity: when a node's operand list is
 #: rewritten, every one of these follows the operand to its new position.
@@ -2553,6 +2559,8 @@ def _materialize_operands(
     old_parents: Any,
     parents: Any,
     edge_payload: Mapping[str, Any] | None,
+    *,
+    tail_from: int | None = None,
 ) -> None:
     """Make ``children`` and the networkx edges agree with ``parents``.
 
@@ -2565,15 +2573,29 @@ def _materialize_operands(
     ``(consumer, role)`` per role, stale role spellings replaced in place
     so sibling order is kept.  A parent that is not a node is skipped:
     networkx would create it (see ``_replace_inputs``).
+
+    ``tail_from`` is the caller's word that ``parents[:tail_from]`` is
+    ``old_parents`` unchanged (``_set_operands`` checks it) and that those
+    parents are already materialized: only the operands from ``tail_from``
+    on are written, so appending to an N-operand list costs the appended
+    operands, not N.  It applies when no appended operand is already an
+    operand; otherwise the whole list is written as usual.
     """
 
     G = graph.G
+    if tail_from is not None:
+        known = set(map(_first, old_parents))
+        if any(parent in known for parent, _role in parents[tail_from:]):
+            tail_from = None
     by_parent: dict[Any, list[Any]] = {}
-    for parent, role in parents:
+    for parent, role in (parents if tail_from is None else parents[tail_from:]):
         roles = by_parent.setdefault(parent, [])
         if role not in roles:
             roles.append(role)
-    for parent in dict.fromkeys(parent for parent, _role in old_parents):
+    for parent in (
+        () if tail_from is not None
+        else dict.fromkeys(parent for parent, _role in old_parents)
+    ):
         if parent in by_parent or parent not in G:
             continue
         parent_data = G.nodes[parent]
@@ -2629,6 +2651,7 @@ def _set_operands(
     fork_from: Mapping[tuple[Any, int], tuple[Any, ...]] | None = None,
     edge_payload: Mapping[str, Any] | None = None,
     materialize: bool = True,
+    append_only: bool = False,
 ) -> None:
     """The one writer of a node's operand list, recorded on the book.
 
@@ -2648,7 +2671,13 @@ def _set_operands(
     (``_materialize_operands``).  ``edge_payload`` is extra edge data for
     a new edge (``build_from_ast``'s ``extra`` set); ``materialize=False``
     is for the canonical relabel only, whose edges are already relabeled
-    by ``add_edges_from`` while this call moves the rows.
+    by ``add_edges_from`` while this call moves the rows.  ``append_only``
+    is the caller's word that it adds operands at the end of a list whose
+    other operands are already materialized (authoring an edge);
+    the call checks the list really is the old one plus a tail and, if
+    so, writes only the tail -- no earlier position can have moved -- so
+    authoring a node's N operands one by one is O(N) in all, not O(N^2).
+    A list that is not old-plus-tail takes the general path.
 
     Facts keyed by an operand position (the binding one operand read, see
     ``_OPERAND_POSITION_ROW_PAGES``) must name the same operand after any
@@ -2680,16 +2709,35 @@ def _set_operands(
         return
     data = graph.G.nodes[node_id]
     old_parents = list(data.get("parents") or ())
-    old = list(_operand_positions(old_parents))
     parents = list(parents)
+    prefix = len(old_parents)
+    tail_only = bool(
+        append_only and not same and not fork_from
+        and parents[:prefix] == old_parents
+    )
     data["parents"] = parents
     if materialize:
-        _materialize_operands(graph, node_id, old_parents, parents, edge_payload)
+        _materialize_operands(
+            graph, node_id, old_parents, parents, edge_payload,
+            tail_from=prefix if tail_only else None,
+        )
     scope = _operand_position_scope(graph)
-    new = list(_operand_positions(parents))
+    if tail_only:
+        # Old positions are untouched; only the tail's positions are new.
+        old = []
+        new = []
+        seen = collections.Counter(map(_second, old_parents))
+        tail_positions = []
+        for parent_id, role in parents[prefix:]:
+            ordinal = seen[role]
+            seen[role] = ordinal + 1
+            tail_positions.append((role, ordinal, parent_id))
+    else:
+        old = list(_operand_positions(old_parents))
+        new = list(_operand_positions(parents))
     cause_name = cause.name if isinstance(cause, _Transform) else str(cause)
     if scope is None:
-        if new == old:
+        if (not tail_positions) if tail_only else new == old:
             return
         from ...compiler.concordance_declarations import (
             IDENTITY_TRANSITION, NO_OPERAND_POSITION_SCOPE, OPERAND_POSITION,
@@ -2707,49 +2755,53 @@ def _set_operands(
     renamed = dict(same or {})
     taken: set[int] = set()
     moves: dict[tuple[Any, int], tuple[Any, int] | None] = {}
-    # Candidate new positions per parent value, ascending: matching an old
-    # operand scans only the positions that hold ITS value, not every
-    # operand of the node (``connect`` rewrites the whole list once per edge,
-    # so the all-pairs scan made a node with N operands cost ~N^3).
-    new_by_parent: dict[Any, list[int]] = {}
-    for index, (_new_role, _new_ordinal, new_parent) in enumerate(new):
-        new_by_parent.setdefault(new_parent, []).append(index)
-    for role, ordinal, parent in old:
-        target = renamed.get(parent, parent)
-        match = None
-        candidates = new_by_parent.get(target, ())
-        # The same role first: an unmoved operand keeps its position even
-        # when its value also appears at another position.
-        for index in candidates:
-            if index not in taken and new[index][0] == role:
-                match = index
-                break
-        if match is None:
+    forks: dict[tuple[Any, int], tuple[Any, ...]] = {}
+    if tail_only:
+        # Every old operand keeps its position (an identity move, which
+        # posts nothing); the tail's positions are the appends.
+        appends = tail_positions
+    else:
+        # Candidate new positions per parent value, ascending: matching an
+        # old operand scans only the positions that hold ITS value, not
+        # every operand of the node (the all-pairs scan made a node with N
+        # operands cost ~N^3).
+        new_by_parent: dict[Any, list[int]] = {}
+        for index, (_new_role, _new_ordinal, new_parent) in enumerate(new):
+            new_by_parent.setdefault(new_parent, []).append(index)
+        for role, ordinal, parent in old:
+            target = renamed.get(parent, parent)
+            match = None
+            candidates = new_by_parent.get(target, ())
+            # The same role first: an unmoved operand keeps its position
+            # even when its value also appears at another position.
             for index in candidates:
-                if index not in taken:
+                if index not in taken and new[index][0] == role:
                     match = index
                     break
-        if match is None:
-            moves[(role, ordinal)] = None
-            continue
-        taken.add(match)
-        moves[(role, ordinal)] = (new[match][0], new[match][1])
-    forks = {
-        (role, ordinal): source
-        for (role, ordinal), source in dict(fork_from or {}).items()
-        if any(
-            (new_role, new_ordinal) == (role, ordinal)
-            for new_role, new_ordinal, _parent in new
-        )
-    }
-    # An Append: a new position no old position moved into and no fork
-    # feeds (plan 70 section 3; plan 100 1.2).
-    occupied = {target for target in moves.values() if target is not None}
-    appends = [
-        (role, ordinal, parent)
-        for role, ordinal, parent in new
-        if (role, ordinal) not in occupied and (role, ordinal) not in forks
-    ]
+            if match is None:
+                for index in candidates:
+                    if index not in taken:
+                        match = index
+                        break
+            if match is None:
+                moves[(role, ordinal)] = None
+                continue
+            taken.add(match)
+            moves[(role, ordinal)] = (new[match][0], new[match][1])
+        new_positions = {(role, ordinal) for role, ordinal, _parent in new}
+        forks = {
+            position: source
+            for position, source in dict(fork_from or {}).items()
+            if position in new_positions
+        }
+        # An Append: a new position no old position moved into and no fork
+        # feeds (plan 70 section 3; plan 100 1.2).
+        occupied = {target for target in moves.values() if target is not None}
+        appends = [
+            (role, ordinal, parent)
+            for role, ordinal, parent in new
+            if (role, ordinal) not in occupied and (role, ordinal) not in forks
+        ]
     if not forks and not appends and all(
         source == target for source, target in moves.items()
     ):
@@ -2831,15 +2883,28 @@ def _set_operands(
             )),
             mode=_Mode.REVISE,
         )
+    # A position that keeps its place (an identity move) carries its own
+    # fact to itself: nothing to read, nothing to write -- unless a fork
+    # also feeds that position, where "already has a fact" decides.  Only
+    # positions that move (or are forked into) have their rows read, once.
+    moved_sources = {
+        source: target for source, target in moves.items()
+        if target != source or source in forks
+    }
+    # The transition cell of the move INTO each position (targets are unique).
+    arrived_from = {
+        moved_to: source for source, moved_to in moves.items()
+        if moved_to is not None and source in transitions
+    }
     for name in _OPERAND_POSITION_ROW_PAGES:
         page = book.page(name)
         facts = {
             source: page.latest((scope, node_id, *source))
-            for source in moves
+            for source in moved_sources
         }
         arriving = {
             target: facts[source]
-            for source, target in moves.items()
+            for source, target in moved_sources.items()
             if target is not None and facts[source] is not None
         }
         for target, source in forks.items():
@@ -2860,13 +2925,9 @@ def _set_operands(
                 # The follow-up names the transition that caused it: the
                 # arriving fact derives from the position's transition cell
                 # (the move's source position, or the fork's target).
-                cause_cell = next(
-                    (
-                        transitions[source]
-                        for source, moved_to in moves.items()
-                        if moved_to == target and source in transitions
-                    ),
-                    transitions.get(target),
+                cause_cell = (
+                    transitions[arrived_from[target]]
+                    if target in arrived_from else transitions.get(target)
                 )
                 if cause_cell is None:
                     page.revise((scope, node_id, *target), fact)
@@ -2877,8 +2938,16 @@ def _set_operands(
                     provenance=_Derived((cause_cell,)),
                     mode=_Mode.REVISE,
                 )
+    # Positions that all keep their place and operands that keep their id
+    # leave every ``(scope, consumer, value)`` row as it is.
+    positions_moved = (
+        any(renamed.get(parent, parent) != parent for _r, _o, parent in old)
+        if renamed else False
+    ) or any(target != source for source, target in moves.items())
     for name in _OPERAND_POSITION_FACT_PAGES:
         page = book.page(name)
+        if not positions_moved:
+            continue
         for _role, _ordinal, parent in old:
             row = (scope, node_id, parent)
             positions = page.latest(row)

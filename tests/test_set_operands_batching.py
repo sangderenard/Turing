@@ -203,3 +203,52 @@ def test_commit_edges_writes_the_rows_connect_wrote_in_order():
         row.startswith("(('") or "'args'" in row
         for row, _column, _fact in single_rows["identity_transition"]
     )
+
+
+def test_append_only_writes_what_the_general_path_writes():
+    """``append_only`` is a shortcut for lists that are old-plus-tail: the
+    rows, ``parents``, ``children`` and edges must be the general path's,
+    including when a tail operand repeats an existing one (the shortcut
+    declines) and when earlier positions carry ``lexical_read_binding``
+    facts that must stay put."""
+
+    from src.common.tensors.topological_reducer import _set_operands
+    from src.compiler.concordance_declarations import INGEST_EDGE
+
+    steps = (
+        [("a", "args")],
+        [("b", "args"), ("c", "kw")],
+        [("d", "args")],
+        [("a", "kw")],                       # repeats an existing operand
+        [("e", "args"), ("f", "args")],
+    )
+
+    def build(append_only):
+        names = "abcdef"
+        sources = {n: ast.Name(id=n, ctx=ast.Load()) for n in names}
+        target = ast.Call(func=ast.Name(id="f", ctx=ast.Load()), args=[], keywords=[])
+        graph = ProcessGraph(materialize_memory=False)
+        book, token = begin_identity_book()
+        try:
+            scope = book.mint_scope("ingestion:t")
+            graph.G.graph["ingestion_value_scope"] = scope
+            for node in (*sources.values(), target):
+                graph.ensure_node(node)
+                graph.G.nodes[id(node)].setdefault("children", [])
+            tgt = id(target)
+            for step in steps:
+                parents = list(graph.G.nodes[tgt]["parents"])
+                parents += [(id(sources[n]), role) for n, role in step]
+                # A binding fact on a position that must survive the append.
+                book.page("lexical_read_binding").revise(
+                    (scope, tgt, "args", 0), "bound-first",
+                )
+                _set_operands(
+                    graph, tgt, parents, cause=INGEST_EDGE,
+                    edge_payload={"extra": set()}, append_only=append_only,
+                )
+            return _normalized_rows(book, list(graph.G.nodes)), _normalized_graph(graph)
+        finally:
+            end_identity_book(token)
+
+    assert build(True) == build(False)
