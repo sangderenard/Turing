@@ -17873,6 +17873,10 @@ def _propagate_callsite_tensor_specializations(
         entry.graph
         for entry in function_table
         if entry.graph is not None
+        # A root that is itself an executable function is registered in its
+        # own table: it is already ``graph`` above, and a second visit of
+        # the same callsite in one round would post its decision row twice.
+        and entry.graph is not graph
         and (
             runtime_references is None
             or int(entry.reference.address) in runtime_references

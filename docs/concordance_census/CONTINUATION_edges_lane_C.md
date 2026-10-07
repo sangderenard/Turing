@@ -151,3 +151,18 @@ record_return_site_identity (6 failed + 8 errors; each passes in its own
 process).  `_turing_source_cells` stamps from `build_from_ast(source_cells=)`
 apparently persist on AST objects that a later book reuses (a cached parse),
 and `post_source_span` derives from a cell of the old book.
+
+## 2026-10-07 cross-book stamps: resolved
+
+The stamp is `graph_express2.SourceDefinition(page, row, fact)` (declared page
+`backward_rule_definition`, row `(registry, name)`), not a Ref.
+`resolve_source_definition` turns it into the CURRENT book's cell (latest cell of
+that row, else posts the same NOVEL(INGEST_SOURCE) root); `post_source_span` is the
+reader.  Writers: `build_from_ast(source_cells=)`, `_annotate_visual_source_owners`;
+`process_graph_autograd._post_backward_rule_definitions` returns the identities.
+Proof: `tests/test_source_definition_cross_book.py`; VJP test +
+`test_record_return_site_identity.py` in one process: 16 passed, 1 xfailed.
+The VJP test then exposed a second, independent fault: the root graph is also a
+function-table entry, so `_propagate_callsite_tensor_specializations` visited its
+callsites twice per round and posted `callsite_descriptor_reuse` (`computed` then
+`reused`) for one row; the root is now skipped as a table entry (`entry.graph is not graph`).
