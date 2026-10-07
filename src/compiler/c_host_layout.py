@@ -14,7 +14,10 @@ The header carries
   entry per public buffer in ``void **buffers`` order;
 * ``<ENTRY>_BUFFER_COUNT``, ``<ENTRY>_BATCH`` (when the host declared one)
   and ``<ENTRY>_COL_<name>`` buffer-index constants for every named buffer;
-* the entry's prototype.
+* the entry's prototype; and
+* ``<entry>_bind_column``: the one adapter.  It answers a column name with the
+  host's own buffer pointer from the ``buffers`` table the host passes to
+  the entry (CPU, zero-copy, no narrowing) and the layout facts beside it.
 
 A buffer's name is its ProgramABI slot: ``parameter.field`` for a record
 field (``.presence`` appended for an optional field's presence slot),
@@ -104,6 +107,7 @@ def layout_header_source(
         "#define TURING_LAYOUT_TYPES_H",
         "#include <stddef.h>",
         "#include <stdint.h>",
+        "#include <string.h>",
         "",
         "enum turing_dtype {",
         *(
@@ -116,6 +120,12 @@ def layout_header_source(
         "    TURING_LAYOUT_FIELD = 0,",
         "    TURING_LAYOUT_SCALAR = 1,",
         "    TURING_LAYOUT_OTHER = 2,",
+        "};",
+        "",
+        "enum {",
+        "    TURING_BIND_OK = 0,",
+        "    TURING_BIND_UNKNOWN_COLUMN = 1,",
+        "    TURING_BIND_NULL_BUFFER = 2,",
         "};",
         "",
         "/* One public buffer of an entry, at buffer_index of void **buffers.",
@@ -135,6 +145,15 @@ def layout_header_source(
         "    uint64_t itemsize;",
         "} turing_layout_entry;",
         "",
+        "/* A column as the host owns it: the host's own pointer, never a copy. */",
+        "typedef struct turing_column {",
+        "    void *data;",
+        "    uint64_t bytes;",
+        "    uint64_t count;",
+        "    uint64_t itemsize;",
+        "    int32_t dtype;",
+        "    int32_t buffer_index;",
+        "} turing_column;",
         "#endif",
         "",
         f"#ifndef {upper}_LAYOUT_H",
@@ -169,6 +188,25 @@ def layout_header_source(
         ),
         "};",
         f"static const int32_t {symbol}_layout_count = {upper}_BUFFER_COUNT;",
+        "",
+        f"/* The host's own buffer for column `name`, from the `buffers` table the",
+        f" * host passes to {symbol}(). */",
+        f"static inline int32_t {symbol}_bind_column(",
+        "        void *const *buffers, const char *name, turing_column *out) {",
+        f"    for (int32_t i = 0; i < {symbol}_layout_count; ++i) {{",
+        f"        const turing_layout_entry *entry = &{symbol}_layout[i];",
+        "        if (entry->name == NULL || strcmp(entry->name, name) != 0) continue;",
+        "        if (buffers[entry->buffer_index] == NULL) return TURING_BIND_NULL_BUFFER;",
+        "        out->data = buffers[entry->buffer_index];",
+        "        out->count = entry->count;",
+        "        out->itemsize = entry->itemsize;",
+        "        out->bytes = entry->count * entry->itemsize;",
+        "        out->dtype = entry->dtype;",
+        "        out->buffer_index = entry->buffer_index;",
+        "        return TURING_BIND_OK;",
+        "    }",
+        "    return TURING_BIND_UNKNOWN_COLUMN;",
+        "}",
         "",
         f"#endif /* {upper}_LAYOUT_H */",
         "",
