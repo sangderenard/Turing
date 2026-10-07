@@ -125,7 +125,24 @@ c0781c7a) were removed today. Disk: 57 GB free.
   `StateMachineDomain` is dead vocabulary; Python `match` is never ingested).
 - Host-facing layout facts are not on the book (`NativeSystem.layout()` is Python-only,
   no callers); the written-slot-wins rule exists twice (compiler scalars vs
-  `NativeSystem.state_field_ids` spans).
+  `NativeSystem.state_field_ids` spans). **Lane `fix/host-layout-rows` (5 commits,
+  unmerged, 2026-10-07):** `program_abi_field_slot` rows per (entry, backend, parameter,
+  field, role) DERIVED from the resident formal's `ssa_value`, `function_parameter` and
+  BUFFER_ORDER cells; `NativeSystem` reads them (its duplicate rule deleted);
+  `API_CONTRACT` row from the function-header/formal units, `function_output` cells,
+  BUFFER_ORDER and the slot rows; `<entry>_layout.h` posted as a `SOURCE_FILE` part
+  derived from it; `bind_column` adapter; probe bit-exact. **New gap it exposed:** a
+  formal's `program_abi_*` accounting (`written`, `storage`, parameter, field) is NOT a
+  book cell — passes set `formal.accounting` as attributes — so those parts of the slot
+  fact are payload, not derived. Still C-only (LLVM gets slot rows, no contract/header);
+  the scene adapter still waits on declared column roles; `batch` is host payload.
+- Pre-existing failing tests are more extensive than the 7 named in §1: the lane's
+  baseline at 78a69087 shows 24 failures across the whole of
+  `test_process_graph_function_linking.py` + `test_declared_parameter_shape.py`, and
+  17 failed / 4 errors across the 12 emission-related test files
+  (`test_perforated_network_llvm`, `test_process_graph_autograd`,
+  `test_ssa_c_aggregate_constants`, `test_ssa_glsl_compute_backend`). None from this
+  week's work; all unowned.
 - Shape proofs keyed by authored function name, shared across specialized copies
   (blocks mixed-shape solve in one function).
 - ~~Cross-book `_turing_source_cells` stamps on cached AST objects.~~ Already fixed on
