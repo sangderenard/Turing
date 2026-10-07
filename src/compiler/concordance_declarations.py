@@ -875,6 +875,16 @@ LOOP_RESULT_USE_REBINDING = declare_page("loop_result_use_rebinding", (
 AGGREGATE_PASSTHROUGH_REBINDING = declare_page("aggregate_passthrough_rebinding", (
     RowField("function", K.SCOPE), RowField("original", K.VALUE_ID),
 ), tuple)
+#: ``ir_identities.drop_dead_pure_structural_instructions``: a structural
+#: value (recovered for an anonymous formal, a literal, a presence test) that
+#: no instruction reads and no declared output names is retired.  One row per
+#: retired value ``(function scope, value id)`` -> ``(op, structural
+#: operation)``.  REVISE, DERIVED(the value's ``ssa_value`` cell, else the
+#: function's root cell).  A reader of a retired id (a recovered consumer
+#: placed after the sweep, an output ledger) finds this row, not a hole.
+DEAD_STRUCTURAL_RETIREMENT = declare_page("dead_structural_retirement", (
+    RowField("function", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), tuple)
 CONTROL_UNIFORM_DTYPE = declare_page("control_uniform_dtype", (
     RowField("control_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), str)                                # mode CONCORD
@@ -1128,6 +1138,8 @@ RECORD_RETURN_REPAIR = declare_stage("record_return_repair")
 #: ``ssa_aggregate_abi.legalize_aggregate_adapters`` and
 #: ``legalize_aggregate_output_views`` (the pass-through folds).
 AGGREGATE_ABI_LEGALIZATION = declare_stage("aggregate_abi_legalization")
+#: ``ir_identities.drop_dead_pure_structural_instructions``.
+DEAD_STRUCTURAL_SWEEP = declare_stage("dead_structural_sweep")
 
 # -- transforms (arity 1: several sources become one ``cell_set`` row) -------
 #: A per-field Phi of a record merge: operand = the ``cell_set`` of the record

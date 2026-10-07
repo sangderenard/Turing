@@ -202,13 +202,50 @@ def reduce_constant_exponent_pow(functions, inexact: bool | None = None) -> dict
 
 # Operations a region may contain and still be removable when nothing reads
 # its results: value construction and arithmetic only -- no stores, no
-# calls, no table traffic.
+# calls, no table traffic.  ``LNot``, ``Select`` and ``isfinite`` are the
+# operations the structural recovery itself builds a predicate chain from
+# (``not``, the ``and``/``or`` operand selection, ``math.isfinite``); the
+# sweep below is that recovery's counterpart, so it must know every operation
+# the recovery emits or the chain's tail outlives its consumers.
 _PURE_REGION_OPS = frozenset({
     "Const", "Neg", "Add", "Sub", "Mul", "Div", "Pow", "Sqrt", "Abs",
     "Max", "Min", "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "FloorDiv", "Mod",
     "Shl", "Shr", "bitand", "bitor", "bitxor", "invert", "LAnd", "LOr",
+    "LNot", "Select", "isfinite",
     "Cast", "range", "string_token", "Ret",
 })
+
+
+def _post_dead_structural_retirement(function, instruction) -> None:
+    """Post one ``dead_structural_retirement`` row for a swept value.
+
+    DERIVED(the value's ``ssa_value`` cell; the function's root cell when
+    the value was never posted -- a structural value recovered after the
+    control lowering).  A function with neither writes through the raw
+    primitive, which the book tags ``Unsourced`` itself.
+    """
+
+    from .concordance_declarations import (
+        CELL_SET, DEAD_STRUCTURAL_RETIREMENT, DEAD_STRUCTURAL_SWEEP,
+    )
+    from .identity_concordance import Mode, current_identity_book
+    from .precompile_to_ssa import _post_derived_or_raw
+    from .ssa_record_return_state import function_scope_of, identity_cells
+
+    book = current_identity_book()
+    cells = identity_cells(function, instruction.res)
+    if not cells:
+        root = book.latest_ref(CELL_SET, (function_scope_of(function), 0))
+        cells = () if root is None else (root,)
+    _post_derived_or_raw(
+        book, DEAD_STRUCTURAL_RETIREMENT,
+        (function_scope_of(function), int(instruction.res.id)),
+        (
+            str(instruction.op),
+            str(instruction.attributes.get("structural_operation")),
+        ),
+        cells, stage=DEAD_STRUCTURAL_SWEEP, mode=Mode.REVISE,
+    )
 
 
 def drop_dead_pure_structural_instructions(functions) -> int:
@@ -282,6 +319,7 @@ def drop_dead_pure_structural_instructions(functions) -> int:
                         and (is_structural or instruction.op == "Const")
                         and instruction.op in _PURE_REGION_OPS
                     ):
+                        _post_dead_structural_retirement(function, instruction)
                         removed += 1
                         changed = True
                         continue
