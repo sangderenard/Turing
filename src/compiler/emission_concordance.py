@@ -72,6 +72,7 @@ from .concordance_declarations import (
     EMISSION_ARTIFACT,
     EMISSION_FUNCTION,
     EMISSION_UNIT,
+    FUNCTION_OUTPUT,
     FUNCTION_PARAMETER,
     FUNCTION_TEXT_PENDING,
     NATIVE_LOOP_VALUE,
@@ -88,6 +89,8 @@ from .concordance_declarations import (
     Backend,
     EmittedUnit,
     FunctionEmission,
+    LayoutBuffer,
+    LayoutKind,
     NativeLoopValue,
     ProgramAbiSlot,
     ProgramAbiSlotRole,
@@ -935,6 +938,89 @@ def post_program_abi_field_slots(
     return posted
 
 
+def post_api_contract(
+    book: Any, root: Any, entry: str, backend: Backend, *,
+    batch: int | None, buffer_order: Iterable[int],
+    buffer_dtypes: Iterable[str], buffer_shapes: Iterable,
+    buffer_order_cell: Ref | None, unit_cells: Iterable, stage: Any,
+) -> Ref | None:
+    """Post the entry's API_CONTRACT: ``(entry, backend, API_CONTRACT)`` ->
+    ``ArtifactFact`` whose ``location`` is ``(entry, batch, buffers)``, one
+    ``LayoutBuffer`` per public buffer in ``void **buffers`` order.
+
+    DERIVED(``unit_cells``: the wrapper's FUNCTION_HEADER and FORMAL units,
+    the root's ``function_output`` cells, BUFFER_ORDER, and the
+    ``program_abi_field_slot`` row of every buffer a slot names).  A buffer's
+    parameter and field are its resident slot row's; a buffer no row names is
+    ``OTHER`` and carries no name.  ``batch`` is the cells per column the
+    host declared (payload: no declared column role yields it), None when
+    none was declared."""
+
+    if book is None:
+        return None
+    from ..transmogrifier.dtype_layout import DTYPES
+    from .ssa_record_return_state import function_scope_of
+
+    order = tuple(int(value_id) for value_id in buffer_order)
+    dtypes = tuple(buffer_dtypes)
+    shapes = tuple(buffer_shapes)
+    page = book.pages.get(PROGRAM_ABI_FIELD_SLOT.name)
+    resident: dict[int, tuple] = {}
+    slot_cells: list[Ref | None] = []
+    for row in () if page is None else page.scope_rows(str(entry)):
+        if row[1] != backend:
+            continue
+        slot = page.latest(row)
+        if slot.buffer_index is not None and order[slot.buffer_index] == slot.value_id:
+            resident[slot.value_id] = (row, slot)
+            slot_cells.append(book.latest_ref(PROGRAM_ABI_FIELD_SLOT, row))
+    buffers = []
+    for index, value_id in enumerate(order):
+        held = resident.get(value_id)
+        shape_count = _declared_count(shapes[index]) or 1
+        itemsize = int(DTYPES[str(dtypes[index])].byte_size)
+        if held is None:
+            buffers.append(LayoutBuffer(
+                None, None, None, index, str(dtypes[index]), shape_count,
+                shape_count, itemsize, LayoutKind.OTHER, False,
+            ))
+            continue
+        row, slot = held
+        parameter, field, role = row[2], row[3], row[4]
+        buffers.append(LayoutBuffer(
+            parameter, field, role, index, str(dtypes[index]),
+            slot.count if slot.count is not None else shape_count,
+            slot.capacity if slot.capacity is not None else shape_count,
+            itemsize,
+            LayoutKind.SCALAR if field is None else LayoutKind.FIELD,
+            slot.written,
+        ))
+    outputs = book.pages.get(FUNCTION_OUTPUT.name)
+    output_cells = () if outputs is None else tuple(
+        book.latest_ref(FUNCTION_OUTPUT, row)
+        for row in outputs.scope_rows(function_scope_of(root))
+    )
+    location = (str(entry), None if batch is None else int(batch), tuple(buffers))
+    row = (str(entry), backend, ArtifactPart.API_CONTRACT)
+    return _post_revision(
+        book, EMISSION_ARTIFACT, row,
+        ArtifactFact(*_sha256(repr(location)), location),
+        (*unit_cells, *output_cells, buffer_order_cell, *slot_cells),
+        VALUE_WITHOUT_IDENTITY_CELL, stage,
+    )
+
+
+def api_contract(book: Any, entry: str, backend: Backend) -> tuple | None:
+    """``(entry, batch, buffers)`` of the entry's API_CONTRACT row on
+    ``book``, or None when it was never posted."""
+
+    page = book.pages.get(EMISSION_ARTIFACT.name)
+    if page is None:
+        return None
+    fact = page.latest((str(entry), backend, ArtifactPart.API_CONTRACT))
+    return None if fact is None else fact.location
+
+
 def program_abi_field_slots(
     module: Any, entry: str, backend: Backend,
 ) -> dict[tuple, ProgramAbiSlot]:
@@ -972,18 +1058,21 @@ class ArtifactEmission:
 
     __slots__ = (
         "book", "backend", "module_text", "buffer_order", "root",
-        "function_cell",
+        "function_cell", "api_contract",
     )
 
     def __init__(
         self, book: Any, backend: Backend, module_text: Ref | None,
         buffer_order: Ref | None = None, *, root: Any = None,
-        function_cell: Ref | None = None,
+        function_cell: Ref | None = None, api_contract: Ref | None = None,
     ) -> None:
         self.book = book
         self.backend = backend
         self.module_text = module_text
         self.buffer_order = buffer_order
+        # The entry's API_CONTRACT cell: what a host-facing file made from
+        # the layout (``<entry>_layout.h``) derives from.
+        self.api_contract = api_contract
         # The root ``Function`` whose values the public slots are, and its
         # finished ``emission_function`` cell (the entry): what a native
         # loop wrapper of this artifact derives from.
@@ -1240,6 +1329,7 @@ class NativeLoopEmission:
 
 __all__ = [
     "ArtifactEmission",
+    "api_contract",
     "EMISSION_GAPS",
     "EmissionRecorder",
     "NativeLoopEmission",
@@ -1252,6 +1342,7 @@ __all__ = [
     "kernel_source_cell",
     "path_location",
     "piece_source_cell",
+    "post_api_contract",
     "post_artifact_part",
     "post_program_abi_field_slots",
     "program_abi_field_slots",

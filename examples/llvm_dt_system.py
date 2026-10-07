@@ -1539,7 +1539,7 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
         progress("emitting linked repository SSA to C")
         artifact = emit_ssa_module_to_c(
             module, exports[0], trace=trace,
-            trace_full_values=trace_full_values,
+            trace_full_values=trace_full_values, batch=batch,
         )
         if not artifact.complete:
             raise RuntimeError("C emission shortfalls: " + "; ".join(

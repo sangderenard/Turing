@@ -1869,6 +1869,37 @@ class ProgramAbiSlot:
     aliases: tuple
 
 
+class LayoutKind(Enum):
+    """What a public buffer of an entry is to a host: a field of a declared
+    record parameter, a bare scalar parameter, or neither (an output or
+    workspace buffer no ProgramABI slot names)."""
+
+    FIELD = "field"
+    SCALAR = "scalar"
+    OTHER = "other"
+
+
+@dataclass(frozen=True)
+class LayoutBuffer:
+    """One public buffer of an entry's API_CONTRACT, at ``buffer_index`` of
+    ``void **buffers``.  ``parameter`` / ``field`` / ``role`` are the
+    ProgramABI slot the buffer is the resident of (None for ``OTHER``;
+    ``field`` None for a bare parameter); ``count``: the declared elements,
+    ``capacity``: the elements the entry may touch (a host allocates at
+    least this); ``itemsize`` in bytes."""
+
+    parameter: Any
+    field: Any
+    role: Any
+    buffer_index: int
+    dtype: str
+    count: int
+    capacity: int
+    itemsize: int
+    kind: LayoutKind
+    written: bool
+
+
 # -- pages -------------------------------------------------------------------
 EMISSION_UNIT = declare_page("emission_unit", (
     RowField("function", K.SCOPE), RowField("backend", K.LABEL),
