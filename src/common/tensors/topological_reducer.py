@@ -2584,17 +2584,19 @@ def _materialize_operands(
             ]
         if G.has_edge(parent, node_id):
             G.remove_edge(parent, node_id)
-    payload = {
-        key: (set(value) if isinstance(value, set) else value)
-        for key, value in dict(edge_payload or {}).items()
-    }
+    payload_items = tuple(dict(edge_payload or {}).items())
     for parent, roles in by_parent.items():
         if parent not in G:
             continue
         if G.has_edge(parent, node_id):
             G.edges[parent, node_id]["role"] = roles[0]
         else:
-            G.add_edge(parent, node_id, role=roles[0], **payload)
+            # A set in the payload is per edge: parents added by one call
+            # must not share it (``extra`` collects each edge's own records).
+            G.add_edge(parent, node_id, role=roles[0], **{
+                key: (set(value) if isinstance(value, set) else value)
+                for key, value in payload_items
+            })
         parent_data = G.nodes[parent]
         children = list(parent_data.get("children") or ())
         present = [tuple(child) for child in children if child[0] == node_id]
