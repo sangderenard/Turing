@@ -252,3 +252,58 @@ def test_append_only_writes_what_the_general_path_writes():
             end_identity_book(token)
 
     assert build(True) == build(False)
+
+
+def test_hub_children_index_matches_the_scan():
+    """A parent with many children is indexed by consumer; appending, adding
+    a second role, removing a consumer and a foreign in-place edit of the
+    list must leave ``children`` exactly as the unindexed scan leaves it."""
+
+    import src.common.tensors.topological_reducer as reducer
+    from src.common.tensors.topological_reducer import _set_operands
+    from src.compiler.concordance_declarations import INGEST_EDGE
+
+    def build(indexed):
+        saved = reducer._CHILD_INDEX_MIN
+        reducer._CHILD_INDEX_MIN = 8 if indexed else 10 ** 9
+        names = [ast.Name(id=f"c{i}", ctx=ast.Load()) for i in range(40)]
+        hub = ast.Name(id="hub", ctx=ast.Load())
+        graph = ProcessGraph(materialize_memory=False)
+        book, token = begin_identity_book()
+        try:
+            graph.G.graph["ingestion_value_scope"] = book.mint_scope("ingestion:t")
+            for node in (hub, *names):
+                graph.ensure_node(node)
+                graph.G.nodes[id(node)].setdefault("children", [])
+            h = id(hub)
+
+            def write(consumer, parents):
+                _set_operands(
+                    graph, id(consumer), parents, cause=INGEST_EDGE,
+                    edge_payload={"extra": set()},
+                )
+
+            for i, consumer in enumerate(names):
+                write(consumer, [(h, "args" if i % 2 else "value")])
+                if i == 20:
+                    # A foreign in-place append to the hub's list.
+                    graph.G.nodes[h]["children"].append((id(names[0]), "x"))
+                if i == 25:
+                    write(names[3], [])                       # a consumer leaves
+            write(names[7], [(h, "value"), (h, "kw")])         # second role
+            write(names[30], [(h, "args"), (id(names[1]), "kw")])
+            return (
+                graph.G.nodes[h]["children"],
+                _normalized_rows(book, list(graph.G.nodes)),
+                _normalized_graph(graph),
+            )
+        finally:
+            reducer._CHILD_INDEX_MIN = saved
+            end_identity_book(token)
+
+    indexed_children, indexed_rows, indexed_graph = build(True)
+    scanned_children, scanned_rows, scanned_graph = build(False)
+    # Node ids differ between the two builds; compare the normalized graph.
+    assert indexed_graph == scanned_graph
+    assert indexed_rows == scanned_rows
+    assert len(indexed_children) == len(scanned_children) > 30

@@ -19,6 +19,7 @@ import re
 import symtable
 import textwrap
 import types
+import weakref
 from typing import Any, Callable, Iterable, Mapping
 
 import networkx as nx
@@ -2553,6 +2554,38 @@ def _operand_position_scope(graph: Any) -> Any:
 _UNSCOPED_OPERANDS = ("unscoped_operands", 0)
 
 
+#: A parent with this many ``children`` is indexed by consumer id; fewer are
+#: scanned, which is cheaper than keeping an index.
+_CHILD_INDEX_MIN = 32
+#: ``G -> {parent: (children list, {consumer id: entries}, len)}``: how many
+#: ``children`` entries of a hub name each consumer, so appending a consumer
+#: to a parent with C children does not rescan the C.  An entry is trusted
+#: only while it describes the list now in ``children`` (same object, same
+#: length); every ``children`` write here replaces the list, so a write
+#: anywhere else (or an in-place append) just makes the index rebuild.
+_CHILD_INDEX: "weakref.WeakKeyDictionary[Any, dict]" = weakref.WeakKeyDictionary()
+
+
+def _child_counts(G: Any, parent: Any, children: Any) -> dict | None:
+    """The ``{consumer id: entries}`` index of ``children`` (a list of
+    ``(consumer, role)``), kept per graph and parent; None if unindexable."""
+
+    try:
+        per_graph = _CHILD_INDEX.get(G)
+        if per_graph is None:
+            per_graph = _CHILD_INDEX[G] = {}
+        entry = per_graph.get(parent)
+        if entry is not None and entry[0] is children and entry[2] == len(children):
+            return entry[1]
+        counts: dict = {}
+        for child in children:
+            counts[child[0]] = counts.get(child[0], 0) + 1
+        per_graph[parent] = (children, counts, len(children))
+        return counts
+    except TypeError:
+        return None
+
+
 def _materialize_operands(
     graph: Any,
     node_id: Any,
@@ -2620,7 +2653,18 @@ def _materialize_operands(
                 for key, value in payload_items
             })
         parent_data = G.nodes[parent]
-        children = list(parent_data.get("children") or ())
+        stored = parent_data.get("children")
+        if isinstance(stored, list) and len(stored) >= _CHILD_INDEX_MIN:
+            counts = _child_counts(G, parent, stored)
+            if counts is not None and not counts.get(node_id):
+                # This consumer has no entry under the parent: they all go
+                # at the end, as the rebuild below would put them.
+                rebuilt = [*stored, *((node_id, role) for role in roles)]
+                parent_data["children"] = rebuilt
+                counts[node_id] = len(roles)
+                _CHILD_INDEX[G][parent] = (rebuilt, counts, len(rebuilt))
+                continue
+        children = list(stored or ())
         present = [tuple(child) for child in children if child[0] == node_id]
         if (
             len(present) == len(roles)
