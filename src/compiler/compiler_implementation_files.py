@@ -47,4 +47,5 @@ COMPILER_IMPLEMENTATION_FILES: tuple[str, ...] = (
     "src/compiler/sequence_row_projection.py",
     "src/compiler/sequence_column_contracts.py",
     "src/compiler/lexical_control_installation.py",
+    "src/compiler/call_argument_harmonization.py",
 )
