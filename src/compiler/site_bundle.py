@@ -44,6 +44,8 @@ import textwrap
 import time
 from typing import Any, Callable, Mapping, Sequence
 
+from .compiler_implementation_files import COMPILER_IMPLEMENTATION_FILES
+
 
 BUNDLE_SCHEMA = "turing-program-bundle-v1"
 BUNDLE_LAYOUT_VERSION = 1
@@ -92,7 +94,10 @@ _BUNDLE_COMPILER_IMPLEMENTATION_FILES = (
     Path(__file__),
     Path(__file__).with_name("backend_sources.py"),
     Path(__file__).with_name("fused_program_wasm_backend.py"),
-    Path(__file__).with_name("glsl_deployment_strategy.py"),
+    *(
+        Path(__file__).parents[2] / relative_path
+        for relative_path in COMPILER_IMPLEMENTATION_FILES
+    ),
     Path(__file__).with_name("loop_composer.py"),
     Path(__file__).with_name("precompile_to_ssa.py"),
     Path(__file__).with_name("process_graph_fusion.py"),
