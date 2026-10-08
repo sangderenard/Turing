@@ -2432,6 +2432,17 @@ def _emit_repository_call_module(
                     payload = instruction.attributes.get("values")
                 if payload is None and "value" in instruction.attributes:
                     payload = instruction.attributes.get("value")
+                if payload is Ellipsis:
+                    # ``...`` selects the full extent of a rank the program
+                    # ABI declared; it is resolved into the normalized axes
+                    # of the basic-index helper before emission.  One that
+                    # reaches here had no declared extent to resolve against.
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        "structural ellipsis selector reached LLVM without "
+                        "a declared extent to resolve against",
+                    ))
+                    continue
                 if isinstance(payload, slice):
                     uses = tuple(
                         (consumer, position)
