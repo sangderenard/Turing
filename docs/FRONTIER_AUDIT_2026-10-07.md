@@ -190,6 +190,34 @@ own path would rebuild all 35, ~26 min).
 | `fix/fork-read-scope-projection` (wtfr) | **LANDED** ae88b987. Measured first (7 CASES, 285 forks, 64.7k rows): only 15.7% of forked rows had a consumer node in the copy, and only 4.9% were ever READ under the forked scope; `identity_transition`/`canonical_value`/`lexical_read_binding` are ~85% of forked rows. Fix: a dispatch-region fork carries the six node-keyed pages projected onto the copy's nodes, declared on the `scope_origin` row's fact (`ScopeProjection(pages, node_count, node_digest, rows_carried/excluded/stale)`), derived from the source scope's registry cell; whole-graph copies (incl. per-callsite copies) still fork everything (`projection=None`). Loud miss: a read in a projected scope of a source-graph node the copy lacks posts `Unresolved(row_projected_out_of_scope)` and raises `ProjectedScopeRead` (never triggered by the CASES; untested on dt lowerings — the merge gate will tell). Result on the CASES: rows under forked scopes 64.8k → 19.1k (−70%), `fork_read_scope` time 1.73 s → 0.33 s, emitted C byte-identical for all 160 functions, unsourced facts LOWER on every program (view 4546→4503, toplevel 3000→2921, …). Found in passing: `_dispatch_subgraph`'s `next_node_id = max(ids)+1` can reuse a removed node's id whose `canonical_value` row persists (two stale reads observed) — the retired-id-reuse class; follow-up commit requested (mint through the watermark). Retirement: the book cannot retire a scope (no delete; it would leave dangling edges); decision: copy-on-read for whole-graph copies as a later lane, nothing deleted. Queued as merge item 16. |
 | profile lane (read-only, waits for the build slot) | N=2 lowering under py-spy per stage + tracemalloc/RSS at stage boundaries + object histogram at the peak: the measured basis for the next efficiency lanes (deployment instantiate 141 s and select 139 s at N=4 are unprofiled) |
 
+### 3d. 2026-10-09: no-compile rule, memory, progress bars
+
+User orders 2026-10-09: the lane week's concurrent compiles were "a wildly inappropriate
+workload" — from now on exactly ONE compile on the machine at a time; and **the compiler
+is not run at all until it has been made memory-efficient** (fixes by reading, static
+arguments and data-structure unit tests; the first compile afterwards is on the user's
+say-so). All compile caches were deleted (identity logs, both piece caches — the cached
+orbital pieces are gone and rebuild through the game's own path —, compiler checkpoints
+and evidence, `.turing-cache`, build dirs, Temp build dirs, every lane worktree). The
+uncommitted work in the deleted worktrees is lost; committed lane branches survive.
+
+- **Progress bars (e328c107, on main, unverified in a real compile by order):** one
+  persistent tqdm stage bar (source normalisation, source closure, topology reduction,
+  compilation units, deployment select, deployment instantiate, call-topology planning,
+  graph planning, SSA lowering, pre-native repairs) with sub-stage, elapsed and RSS in the
+  postfix; nested `leave=False` bars for per-function lowering, function shells, region
+  extraction, callsite planning/specialization rounds, region reduction, ABI call edges,
+  the frame-fixed-point loops, and every `BoundedFixedPoint` round; every `[compiler]`
+  line goes through `tqdm.write` so the bars stay at the bottom; off (byte-identical
+  output) when stdout/stderr are not TTYs; opt-in `lower_ast_source_to_ssa(progress_bars=)`
+  recorded as a `compile_policy` row `("progress_bars",)`. 30 layer tests. Known cosmetic
+  bug left: the second per-function loop in `_class_surface_ssa_program` reuses
+  `shell_index`, so its "function i/N" log lines always print N/N (the bar counts right).
+- **Memory (in progress, same no-compile rule):** `memory_budget_bytes` work-contract
+  policy with stage-boundary regulation and `memory_release_receipt` rows (247e11b7);
+  the read-only inventory of everything held past its stage, with releases at the source,
+  is the running task.
+
 ## 4. Next walls (measured)
 
 1. **N=8 `extract-dispatch-subgraphs`**: 37 GB private / swapping at the `restore` shell
