@@ -684,6 +684,9 @@ class _EllipsisExpander(ast.NodeTransformer):
     miscompile ``x[..., k]`` on rank > 2). ``obj[...]`` alone becomes
     ``obj[tuple([slice(None)] * obj.ndim)]`` -- correct for every rank, 0-d
     included (an empty index, i.e. the whole value).
+
+    The one exception is the subscript whose ENTIRE index is ``...``: it is a
+    declared full-extent access and stays as authored (see ``visit_Subscript``).
     """
 
     def visit_Subscript(self, node):  # noqa: N802
@@ -697,6 +700,16 @@ class _EllipsisExpander(ast.NodeTransformer):
         ]
         if len(positions) != 1:
             # No ellipsis, or the illegal multi-ellipsis form -- leave as is.
+            return node
+        if len(elements) == 1:
+            # ``obj[...]`` -- the whole index IS the ellipsis.  It selects the
+            # full extent at every rank (0-d included), which is exactly what
+            # ``normalize_basic_index`` resolves against the parent's declared
+            # shape downstream.  The expansion below adds nothing to that
+            # (``ndim`` of the parent is the same declared rank) but costs
+            # ~25 graph nodes per occurrence, folded again per occurrence.
+            # Keep the one Ellipsis constant as the index: the access stays
+            # ONE Indexed/IndexedStore over (base, index, [value]).
             return node
         cut = positions[0]
         before = elements[:cut]

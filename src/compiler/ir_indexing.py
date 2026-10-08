@@ -58,8 +58,11 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                 selectors = instruction.args[1:-1]
             else:
                 return False
+            # ``...`` is a full-extent selector, not an address: it resolves
+            # against the base's rank exactly as a slice does.
             return any(
                 isinstance(constants.get(int(selector.id)), slice)
+                or constants.get(int(selector.id)) is Ellipsis
                 for selector in selectors
             )
 
@@ -75,7 +78,7 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                     or instruction.op
                 )
                 if carries_slice_selector(instruction):
-                    # A Python slice is not an address operand. Keep the
+                    # A Python slice (or ``...``) is not an address operand. Keep the
                     # semantic indexing operation until tensor/layout
                     # settlement can normalize its retained axes into a
                     # contiguous view, gather/copy, or scatter/update. Only

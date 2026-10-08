@@ -7204,7 +7204,9 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
     )
     non_numeric_constant_operand = False
     def basic_index_literal(value):
-        if value is None or isinstance(value, int):
+        # ``...`` is a basic-index literal: the full-extent selector that
+        # ``normalize_basic_index`` resolves against the parent's rank.
+        if value is None or value is Ellipsis or isinstance(value, int):
             return True
         if isinstance(value, slice):
             return all(part is None or isinstance(part, int)
