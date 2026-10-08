@@ -206,8 +206,20 @@ class WorkContract:
     # it.  Nothing is killed or refused, and the compile's output does not
     # depend on it: a release only drops what a later read recomputes.
     memory_budget_bytes: int | None = None
+    # Cold-page spill (``identity_spill``): at every stage boundary the
+    # identity book writes the pages no later stage reads out to its spill
+    # file and drops them from RAM, whether or not the process is over
+    # ``memory_budget_bytes`` (over the budget, a boundary spills them as one
+    # of its releases anyway).  A read or write of a spilled page reads it
+    # back, so the compile's output does not depend on it; each spill and
+    # reload is a ``page_spill_receipt`` row derived from the policy cell.
+    spill_cold_pages: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.spill_cold_pages, bool):
+            raise ValueError(
+                f"spill_cold_pages must be a bool, got {self.spill_cold_pages!r}"
+            )
         if self.memory_budget_bytes is not None and not (
             isinstance(self.memory_budget_bytes, int)
             and not isinstance(self.memory_budget_bytes, bool)
@@ -351,6 +363,11 @@ def active_contract() -> WorkContract:
         contract = dataclasses.replace(
             contract, memory_budget_bytes=int(budget),
         )
+    # Likewise the spill policy: a regulation of this process, not a fidelity
+    # choice, so it does not rename the contract.
+    spill = _flag("TURING_SPILL_COLD_PAGES")
+    if spill is not None and spill != contract.spill_cold_pages:
+        contract = dataclasses.replace(contract, spill_cold_pages=spill)
 
     inexact = _flag("TURING_POW_INEXACT")
     fma = _flag("TURING_FMA_CONTRACT")

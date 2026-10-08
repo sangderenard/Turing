@@ -615,6 +615,49 @@ class MemoryRelease:
 MEMORY_RELEASE_RECEIPT = declare_page("memory_release_receipt", (
     RowField("compile_stage", K.NAME), RowField("ordinal", K.INDEX),
 ), MemoryRelease)
+
+
+@dataclass(frozen=True)
+class PageSpill:
+    action: str                     # "spill" | "reload" | "refuse"
+    page: str
+    #: What moved: "page" (the page's own cells/stamps/indexes) and/or the
+    #: name of a private edge page whose rows are OWNED by ``page``
+    #: (``concordance_edge``/``concordance_dependents`` rows whose target /
+    #: source cell is on ``page``, ``concordance_mint``, ``concordance_unsourced``).
+    parts: tuple
+    #: Byte offset of the first part's segment in the book's spill file.
+    segment_offset: int
+    segment_offsets: tuple
+    stored_bytes: int               # compressed bytes in the spill file
+    raw_bytes: int                  # uncompressed bytes (the pickle stream)
+    cells: int
+    rows: int
+    #: "policy" | "budget" | "explicit" for a spill; why the page was read
+    #: for a reload ("access", "edges_into", "post", ...); the reason for a
+    #: refusal.
+    trigger: str
+    boundary: str                   # the stage-boundary label ("" if none)
+
+
+#: ``identity_spill`` (cold-page spill): the book wrote a page that no later
+#: stage reads out to its spill file and dropped it from RAM (``spill``), read
+#: it back because something asked for it (``reload``), or declined to drop it
+#: (``refuse``: the page's tables are held by a reader, or its facts do not
+#: serialise).  One row per event, keyed (page name, the book's receipt
+#: ordinal).  DERIVED from the ``compile_policy`` cell that licensed the
+#: spill -- ``spill_cold_pages`` (the work contract's explicit policy) or
+#: ``memory_budget_bytes`` (a stage boundary over budget) -- declared when
+#: the first spill needs it, so a compile that never spills posts nothing; a
+#: ``reload`` is also derived from the page's latest ``spill`` receipt.  The
+#: pages a spill concerns are never spilled themselves (this page, the
+#: policy page, the private edge pages' rows OF those pages).
+PAGE_SPILL_RECEIPT = declare_page("page_spill_receipt", (
+    RowField("page", K.NAME), RowField("ordinal", K.INDEX),
+), PageSpill)
+#: The ``compile_policy`` row naming the work contract's explicit policy.
+SPILL_COLD_PAGES_POLICY = ("spill_cold_pages",)
+
 #: ``_propagate_callsite_tensor_specializations``: per callsite per
 #: fixed-point round, whether the callee return descriptors were derived on
 #: this callsite's own callee copy -- ``("computed", signature digest)``,
