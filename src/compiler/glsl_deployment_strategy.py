@@ -218,6 +218,8 @@ from .planner_concordance_posts import (
     _argument_identity_cells as _argument_identity_cells,
     _formal_identity_cells as _formal_identity_cells,
     _post_planner_specialization as _post_planner_specialization,
+    _post_formal_tensor_class as _post_formal_tensor_class,
+    _post_copy_formal_tensor_classes as _post_copy_formal_tensor_classes,
     _post_call_binding as _post_call_binding,
     _post_callsite_activation as _post_callsite_activation,
     _post_control_specialization as _post_control_specialization,
@@ -15952,6 +15954,7 @@ def _propagate_callsite_tensor_specializations(
         _post_copy_planner_specializations(
             specialized, specializations, specialization_cells,
         )
+        _post_copy_formal_tensor_classes(specialized, callee)
         specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
             descriptors
         )
@@ -16214,6 +16217,7 @@ def _propagate_callsite_tensor_specializations(
             "formal_shapes": 0,
             "callee_descriptors": 0,
             "settled_graph_shapes": 0,
+            "formal_tensor_classes": 0,
         }
         if _progress is not None:
             _progress({
@@ -16266,6 +16270,11 @@ def _propagate_callsite_tensor_specializations(
                         ),
                     })
         candidates: dict[tuple[int, str], list[dict[str, Any]]] = {}
+        # Per (callee, formal): one (proven tensor?, actual cells) vote per
+        # call edge.
+        tensor_class_votes: dict[
+            tuple[int, str], list[tuple[bool, Any, int]]
+        ] = {}
         for caller in graphs:
             conditional_changed = _publish_conditional_tuple_members(caller)
             changed |= conditional_changed
@@ -16517,6 +16526,19 @@ def _propagate_callsite_tensor_specializations(
                         role, receiver, positional,
                     )
                     descriptor = _tensor_descriptor(caller, int(parent))
+                    if parameter is not None:
+                        # The same exact call edge also states what KIND of
+                        # value the formal receives.  A formal whose every
+                        # actual is a proven AbstractTensor is one (see
+                        # ``_abstract_tensor_valued``): the type fact a
+                        # declared ProgramABI parameter carries itself, which
+                        # a computed actual has no declaration to state.
+                        tensor_class_votes.setdefault(
+                            (int(reference), str(parameter)), []
+                        ).append((
+                            _abstract_tensor_valued(caller, int(parent)),
+                            caller, int(parent),
+                        ))
                     if parameter is not None and descriptor is not None:
                         # This fixed point is the first stage that knows the
                         # exact caller value and the callee formal together.
@@ -16695,6 +16717,27 @@ def _propagate_callsite_tensor_specializations(
             # descriptor and literal arguments have been collected.
             changed = True
             mutation_counts["callee_descriptors"] += len(additions)
+
+        if publish_to_function_table:
+            # A formal is an AbstractTensor only when EVERY call edge into it
+            # binds a proven tensor; one unproven edge leaves it undeclared.
+            for (reference, parameter), votes in tensor_class_votes.items():
+                if not votes or not all(proven for proven, _c, _p in votes):
+                    continue
+                callee = function_table.entry(reference).graph
+                if callee is None:
+                    continue
+                if _post_formal_tensor_class(callee, parameter, tuple(
+                    dict.fromkeys(
+                        cell
+                        for _proven, vote_caller, vote_parent in votes
+                        for cell in _argument_identity_cells(
+                            vote_caller, vote_parent
+                        )
+                    )
+                )):
+                    changed = True
+                    mutation_counts["formal_tensor_classes"] += 1
 
         state_digest, tensor_fact_count = specialization_state()
         repeated_round = seen_round_states.get(state_digest)
@@ -17254,6 +17297,62 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
     "logical_and", "logical_or", "logical_xor",
     "bitwise_and", "bitwise_or", "bitwise_xor",
 })
+
+
+#: Results of an AbstractTensor operation that are not themselves tensors.
+_TENSOR_SCALARIZING_OPERATIONS = frozenset({"item", "tolist", "numpy"})
+
+
+def _abstract_tensor_valued(
+    graph: Any, node_id: int, _seen: frozenset[int] = frozenset(),
+) -> bool:
+    """Whether the graph PROVES ``node_id`` is an AbstractTensor by construction.
+
+    A positive proof only: a value is a tensor when it is the result of a
+    recognised AbstractTensor operation (``tensor_candidate``), of an
+    elementwise operator with a tensor operand (AbstractTensor defines the
+    operators, so it answers with an AbstractTensor), of a merge whose every
+    arm is a tensor, or when it is a callee formal every callsite binds to
+    such a value (``tensor_valued_parameters``, posted on the
+    ``formal_tensor_class`` page).  ``False`` is "not proven", never "is a
+    scalar": an unproven value stays an undecided ``isinstance`` for whoever
+    asked.
+    """
+
+    node_id = int(node_id)
+    if node_id in _seen or node_id not in graph.G:
+        return False
+    seen = _seen | {node_id}
+    data = graph.G.nodes[node_id]
+    attributes = data.get("attributes") or {}
+    kind = str(data.get("type") or data.get("op") or "").casefold()
+    operands = [
+        (int(parent), str(role))
+        for parent, role in data.get("parents") or ()
+        if str(role) not in {"callee", "func", "definition", "test"}
+        and int(parent) in graph.G
+    ]
+    candidate = attributes.get("tensor_candidate")
+    if candidate is not None:
+        return str(candidate).casefold() not in _TENSOR_SCALARIZING_OPERATIONS
+    if kind == "input":
+        return str(attributes.get("binding_name")) in set(map(
+            str, graph.G.graph.get("tensor_valued_parameters") or (),
+        ))
+    if kind == "phi" or isinstance(data.get("expr_obj"), ast.IfExp):
+        arms = [
+            parent for parent, role in operands
+            if role in {"body", "orelse"}
+        ]
+        return bool(arms) and all(
+            _abstract_tensor_valued(graph, parent, seen) for parent in arms
+        )
+    if kind in _ELEMENTWISE_BINARY_OPERATIONS | {"neg", "abs"}:
+        return any(
+            _abstract_tensor_valued(graph, parent, seen)
+            for parent, _role in operands
+        )
+    return False
 
 
 def _deepest_fact(page: Any, row: Any) -> Any:
@@ -20171,6 +20270,21 @@ def _fold_callsite_structural_values(
                     or declared.endswith("." + identity)
                     for identity in accepted_identities
                 )
+            if (
+                values[0] is unresolved
+                and any(
+                    identity.rsplit(".", 1)[-1] == "AbstractTensor"
+                    for identity in type_identities(
+                        expression.args[1] if len(expression.args) > 1
+                        else None
+                    )
+                )
+                and _abstract_tensor_valued(graph, arguments[0])
+            ):
+                # No declaration states this subject's Python type, but the
+                # graph proves it a tensor: the result of an AbstractTensor
+                # operation, or a formal every callsite binds to one.
+                return True
             accepted = safe_types(
                 expression.args[1] if len(expression.args) > 1 else None
             )
@@ -22754,6 +22868,7 @@ def _callsite_specialized_shell_type(
     _post_copy_planner_specializations(
         specialized, specializations, specialization_cells,
     )
+    _post_copy_formal_tensor_classes(specialized, original)
     specialized.G.graph["planner_parameter_classes"] = dict(
         parameter_classes
     )

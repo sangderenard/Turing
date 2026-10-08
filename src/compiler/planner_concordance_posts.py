@@ -223,6 +223,72 @@ def _post_planner_specialization(
     )
 
 
+def _post_formal_tensor_class(
+    callee: Any, parameter: str, cells: tuple,
+) -> bool:
+    """One ``formal_tensor_class`` row: ``callee``'s formal is an
+    AbstractTensor, DERIVED from the identity cells of the actuals every
+    callsite binds to it.  Returns whether the callee's read view
+    (``tensor_valued_parameters``) gained the formal; False when the graph
+    has no read scope or no cell proves it."""
+
+    from .concordance_declarations import (
+        FORMAL_TENSOR_CLASS, PLANNER_TENSOR_SPECIALIZATION,
+    )
+
+    scope = callee.G.graph.get("lexical_read_scope")
+    if scope is None or not cells:
+        return False
+    _post_if_changed(
+        FORMAL_TENSOR_CLASS, (tuple(scope), str(parameter)), True,
+        stage=PLANNER_TENSOR_SPECIALIZATION, cells=cells,
+    )
+    return _materialize_tensor_valued_parameters(callee)
+
+
+def _post_copy_formal_tensor_classes(specialized: Any, original: Any) -> None:
+    """The ``formal_tensor_class`` rows of one callee COPY: each formal the
+    shared ``original`` states an AbstractTensor, restated under the copy's
+    own read scope and DERIVED from the shared row's cell (design 7.1: the
+    copy inherits none of the original's rows)."""
+
+    from .concordance_declarations import FORMAL_TENSOR_CLASS
+    from .identity_concordance import current_identity_book
+
+    scope = original.G.graph.get("lexical_read_scope")
+    book = current_identity_book()
+    page = book.pages.get(FORMAL_TENSOR_CLASS.name)
+    if scope is None or page is None:
+        return
+    for row in page.scope_rows(tuple(scope)):
+        cell = book.latest_ref(FORMAL_TENSOR_CLASS, row)
+        if page.latest(row) is True and cell is not None:
+            _post_formal_tensor_class(specialized, str(row[1]), (cell,))
+
+
+def _materialize_tensor_valued_parameters(graph: Any) -> bool:
+    """Rebuild ``G.graph["tensor_valued_parameters"]`` as the read view of the
+    graph's ``formal_tensor_class`` rows; True when it changed."""
+
+    from .concordance_declarations import FORMAL_TENSOR_CLASS
+    from .identity_concordance import current_identity_book
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is None:
+        return False
+    page = current_identity_book().pages.get(FORMAL_TENSOR_CLASS.name)
+    if page is None:
+        return False
+    view = tuple(sorted(
+        str(row[1]) for row in page.scope_rows(tuple(scope))
+        if page.latest(row) is True
+    ))
+    if view == tuple(graph.G.graph.get("tensor_valued_parameters") or ()):
+        return False
+    graph.G.graph["tensor_valued_parameters"] = view
+    return True
+
+
 def _post_call_binding(
     graph: Any, node_id: int, reference: int, resolution: str,
 ) -> Any:

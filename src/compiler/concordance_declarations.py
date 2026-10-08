@@ -489,6 +489,13 @@ PLANNER_SPECIALIZATION_PAGE = declare_page("planner_specialization", (
 PLANNER_TENSOR_DESCRIPTOR = declare_page("planner_tensor_descriptor", (
     RowField("callee_scope", K.SCOPE), RowField("parameter", K.NAME),
 ), dict)                               # mode REVISE
+#: A callee formal every callsite binds to a value the graph proves an
+#: AbstractTensor by construction (``_abstract_tensor_valued``): the type
+#: fact a declared ProgramABI parameter states itself, for a formal whose
+#: actuals are computed.  Per COPY, like ``planner_specialization``.
+FORMAL_TENSOR_CLASS = declare_page("formal_tensor_class", (
+    RowField("callee_scope", K.SCOPE), RowField("parameter", K.NAME),
+), bool)                               # mode REVISE
 EXECUTABLE_NODE = declare_page("executable_node", (
     RowField("planning_scope", K.SCOPE), RowField("node", K.VALUE_ID),
 ), NodeExecution)                      # mode CONCORD
