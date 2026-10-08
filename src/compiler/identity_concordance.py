@@ -3832,9 +3832,12 @@ class IdentityBook:
             edge_page = self.page(EDGE_PAGE)
             dependents = self.page(DEPENDENTS_PAGE)
             for source_ref, _ in sources:
-                edge_row = (target_key, source_ref.key, stage.name)
+                # One key tuple for the edge row and the dependents row
+                # (``Ref.key`` builds a new tuple per call).
+                source_key = source_ref.key
+                edge_row = (target_key, source_key, stage.name)
                 edge_page._stamp(edge_row, 0, True)
-                dependents._stamp((source_ref.key, edge_row), 0, True)
+                dependents._stamp((source_key, edge_row), 0, True)
         elif novel:
             self.page(MINT_PAGE)._stamp(
                 (target_key, minted), 0,
