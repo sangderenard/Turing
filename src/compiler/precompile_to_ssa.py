@@ -5453,12 +5453,54 @@ class _ControlSSABuilder:
 
         return self._value_dominates_block(value, self.current.name)
 
+    def _is_stand_in(self, graph_id: int) -> bool:
+        """Whether ``graph_id`` is bound only to the stand-in ``external_value``
+        minted from absence (``Unresolved(NO_PRODUCER_AT_USE)`` on its binding
+        row): no region has produced the id here."""
+
+        fact = self._book().page(CONTROL_VALUE_BINDING).latest(
+            (self._scope(), int(graph_id))
+        )
+        return (
+            isinstance(fact, Unresolved)
+            and fact.reason is NO_PRODUCER_AT_USE
+        )
+
+    def _phi_initial_binding(
+        self, spelled_id: int, resident: SSAValue, phi_result: SSAValue,
+        *, stage: Any,
+    ) -> int:
+        """Post ``phi_initial_binding`` for one Phi and return the resident id
+        THE ROW states, which is what the Phi's ``initial_value_id`` carries.
+
+        The graph speaks of the version that stood before a merge or a loop
+        by its planning spelling (``spelled_id``: a graph id, a planning
+        alias, a literal's graph node); the lowering holds that version as
+        the SSA value ``resident``, whose id is not always the spelling (a
+        planning alias of a region output, a minted literal, a restored
+        carried slot).  An ``initial_value_id`` that kept the spelling named
+        an id its function does not define.  DERIVED(the resident's and the
+        Phi result's ``ssa_value`` cells).
+        """
+
+        from .concordance_declarations import PHI_INITIAL_BINDING
+
+        book = self._book()
+        row = (self._scope(), int(phi_result.id))
+        book.post(
+            PHI_INITIAL_BINDING, row, (int(spelled_id), int(resident.id)),
+            stage=stage, provenance=Derived(self._cells(resident, phi_result)),
+            mode=Mode.REVISE,
+        )
+        return int(book.page(PHI_INITIAL_BINDING).latest(row)[1])
+
     def _complete_current_join_value(
         self,
         candidate: SSAValue,
         incumbent: SSAValue,
         *,
         initial_value_id: int,
+        initial_value: SSAValue,
         updated_value_id: int,
         site_node_id: int | None,
     ) -> SSAValue:
@@ -5518,7 +5560,11 @@ class _ControlSSABuilder:
             attributes={
                 "incoming_blocks": incoming_blocks,
                 "binding": "loop_continue_carried",
-                "initial_value_id": int(initial_value_id),
+                "initial_value_id": self._phi_initial_binding(
+                    initial_value_id, initial_value, completed,
+                    stage=CONTROL_SSA_LOOP,
+                ),
+                "initial_spelled_value_id": int(initial_value_id),
                 "updated_value_id": int(updated_value_id),
                 "site_node_id": site_node_id,
                 "tie_policy": "incumbent",
@@ -5570,7 +5616,7 @@ class _ControlSSABuilder:
             if edge.name in incoming_blocks
         }
         for index, (
-            updated_id, initial_id, _initial, reserved, incumbent
+            updated_id, initial_id, initial_value, reserved, incumbent
         ) in enumerate(carried):
             candidate = carried_updates[index]
             incoming_values = tuple(
@@ -5602,7 +5648,11 @@ class _ControlSSABuilder:
                     attributes={
                         "incoming_blocks": incoming_blocks,
                         "binding": "loop_latch_carried",
-                        "initial_value_id": int(initial_id),
+                        "initial_value_id": self._phi_initial_binding(
+                            initial_id, initial_value, completed,
+                            stage=CONTROL_SSA_LOOP,
+                        ),
+                        "initial_spelled_value_id": int(initial_id),
                         "updated_value_id": int(updated_id),
                         "tie_policy": "incumbent",
                     },
@@ -6565,6 +6615,7 @@ class _ControlSSABuilder:
                     initial_id: int,
                     updated_id: int,
                     incumbent: SSAValue,
+                    initial_value: SSAValue,
                 ) -> SSAValue | None:
                     value_id = site_values.get(int(initial_id))
                     if value_id is None:
@@ -6581,6 +6632,7 @@ class _ControlSSABuilder:
                             value,
                             incumbent,
                             initial_value_id=int(initial_id),
+                            initial_value=initial_value,
                             updated_value_id=int(updated_id),
                             site_node_id=block.site_node_id,
                         )
@@ -6612,9 +6664,12 @@ class _ControlSSABuilder:
                     return value
 
                 carried_values = []
-                for updated_id, initial_id, current in context["carried"]:
+                for updated_id, initial_id, current, initial_value in (
+                    context["carried"]
+                ):
                     at_site = site_value(
                         int(initial_id), int(updated_id), current,
+                        initial_value,
                     )
                     if at_site is not None:
                         carried_values.append(at_site)
@@ -6630,6 +6685,7 @@ class _ControlSSABuilder:
                             candidate,
                             current,
                             initial_value_id=int(initial_id),
+                            initial_value=initial_value,
                             updated_value_id=int(updated_id),
                             site_node_id=block.site_node_id,
                         ))
@@ -6641,6 +6697,7 @@ class _ControlSSABuilder:
                         incumbent = self.external_value(int(initial_id))
                         at_site = site_value(
                             int(initial_id), int(initial_id), incumbent,
+                            incumbent,
                         )
                         bound_values.append(
                             at_site if at_site is not None else incumbent
@@ -9115,6 +9172,25 @@ class _ControlSSABuilder:
                 # The join adopts the graph's merge id; its row derives from
                 # the same operands the Phi is made from.
                 self._value_cell(merged, *phi_operands)
+            # The version that stood before the branch.  The planner spells it
+            # ``initial_value_id``; when no region ever produced that spelling
+            # (``NO_PRODUCER_AT_USE``: ``external_value`` handed back a stand-in
+            # formal) the entered version is the arm value that was already
+            # bound when the branch was entered -- the arm that did not
+            # rebind the name (``_carried_name_arm``).  N=2 orbital dt system,
+            # ``_apply_energy_sidechain``: alias (65, 55, 64, 66), 64 never
+            # produced, 55 the first conditional's merge.
+            entered = initial
+            if self._is_stand_in(initial_value_id):
+                candidates = [
+                    arm_value for arm_id, arm_value in (
+                        (true_value_id, true_value),
+                        (false_value_id, false_value),
+                    )
+                    if values_before_body.get(int(arm_id)) is arm_value
+                ]
+                if len(candidates) == 1:
+                    entered = candidates[0]
             self.emit(
                 Handler.Phi,
                 [true_value, false_value],
@@ -9122,7 +9198,11 @@ class _ControlSSABuilder:
                 attributes={
                     "incoming_blocks": (true_exit.name, false_exit.name),
                     "binding": "conditional_carried",
-                    "initial_value_id": int(initial_value_id),
+                    "initial_value_id": self._phi_initial_binding(
+                        initial_value_id, entered, merged,
+                        stage=CONTROL_SSA_CONDITIONAL,
+                    ),
+                    "initial_spelled_value_id": int(initial_value_id),
                 },
             )
             # The merge IS the reducer's MERGED cell: publish the Phi as that
@@ -9370,7 +9450,11 @@ class _ControlSSABuilder:
                 attributes={
                     "incoming_blocks": tuple(incoming_blocks),
                     "binding": "loop_result_port",
-                    "initial_value_id": int(initial_id),
+                    "initial_value_id": self._phi_initial_binding(
+                        initial_id, carried[carried_index][2], port,
+                        stage=CONTROL_SSA_LOOP,
+                    ),
+                    "initial_spelled_value_id": int(initial_id),
                     "updated_value_id": int(updated_id),
                 },
             )
@@ -9417,7 +9501,11 @@ class _ControlSSABuilder:
                     "incoming_blocks": tuple(incoming_blocks),
                     "binding": "loop_result_port",
                     "result_kind": "break_bound",
-                    "initial_value_id": int(initial_id),
+                    "initial_value_id": self._phi_initial_binding(
+                        initial_id, normal_value, port,
+                        stage=CONTROL_SSA_LOOP,
+                    ),
+                    "initial_spelled_value_id": int(initial_id),
                     "updated_value_id": int(initial_id),
                 },
             )
@@ -9713,7 +9801,11 @@ class _ControlSSABuilder:
                 attributes={
                     "incoming_blocks": (preheader.name, latch.name),
                     "binding": "loop_carried",
-                    "initial_value_id": initial_id,
+                    "initial_value_id": self._phi_initial_binding(
+                        initial_id, initial_value, current_value,
+                        stage=CONTROL_SSA_LOOP,
+                    ),
+                    "initial_spelled_value_id": int(initial_id),
                     "updated_value_id": updated_id,
                     "recursion_region_id": recursion_region_id,
                     # The loop this generation belongs to, so a consumer
@@ -9772,8 +9864,8 @@ class _ControlSSABuilder:
         self.loop_targets.append((latch, exit_block))
         exit_context = {
             "carried": tuple(
-                (updated_id, initial_id, current)
-                for updated_id, initial_id, _initial, _updated, current
+                (updated_id, initial_id, current, initial)
+                for updated_id, initial_id, initial, _updated, current
                 in carried
             ),
             # A port whose "updated" identity IS its initial identity has no
@@ -10609,7 +10701,11 @@ class _ControlSSABuilder:
                 attributes={
                     "incoming_blocks": (preheader.name, latch.name),
                     "binding": "loop_carried",
-                    "initial_value_id": initial_id,
+                    "initial_value_id": self._phi_initial_binding(
+                        initial_id, initial, current,
+                        stage=CONTROL_SSA_LOOP,
+                    ),
+                    "initial_spelled_value_id": int(initial_id),
                     "updated_value_id": updated_id,
                     "recursion_region_id": recursion_region_id,
                     # The loop this generation belongs to, so a consumer
@@ -10664,8 +10760,8 @@ class _ControlSSABuilder:
         self.loop_targets.append((latch, exit_block))
         exit_context = {
             "carried": tuple(
-                (updated_id, initial_id, current)
-                for updated_id, initial_id, _initial, _updated, current
+                (updated_id, initial_id, current, initial)
+                for updated_id, initial_id, initial, _updated, current
                 in carried
             ),
             # A port whose "updated" identity IS its initial identity has no

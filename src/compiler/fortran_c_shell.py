@@ -451,6 +451,43 @@ def _apply_concorded_function_aliases(
                 rewritten[position] = selected
                 receipts.append((*row[1:], *fact))
             instruction.args = rewritten
+            # An id-carrying reference follows the same alias.  A Phi's
+            # ``initial_value_id`` names the version that stood before its
+            # merge; the planning alias that retired that spelling has a
+            # resident, and the Phi must name THAT.  Left alone it names an id
+            # the function no longer defines (N=2 orbital dt system: the
+            # conditional-carried Phis of ``step_with_dt_control_used`` and
+            # ``_apply_energy_sidechain``).  It is a use one past the
+            # operands, and its row is the operands' page.
+            initial = (instruction.attributes or {}).get("initial_value_id")
+            if initial is not None and instruction.res is not None:
+                resident_id = terminal(int(initial))
+                if (
+                    resident_id != int(initial)
+                    and values.get(resident_id) is not None
+                ):
+                    row = (
+                        str(function.name), str(block_name),
+                        int(instruction_index), len(instruction.args),
+                    )
+                    fact = (
+                        int(initial), resident_id, resident_id,
+                        "initial_names_resident", str(block_name),
+                    )
+                    prior = page.latest(row)
+                    if prior is not None and tuple(prior) != fact:
+                        raise ValueError(
+                            "alias application concordance disagreement: "
+                            f"row={row!r}, prior={prior!r}, new={fact!r}"
+                        )
+                    if prior is None:
+                        page.set(
+                            row, max(page.columns, default=-1) + 1, fact,
+                        )
+                    instruction.attributes["initial_value_id"] = int(
+                        page.latest(row)[2]
+                    )
+                    receipts.append((*row[1:], *fact))
     return tuple(receipts)
 
 
@@ -1231,6 +1268,19 @@ def _recover_late_source_slice_offsets(
     return tuple(recovered)
 
 
+def _phi_initial_spellings(instruction: Any) -> frozenset[int]:
+    """The ids a Phi names its initial by: the resident ``initial_value_id``
+    (read from the ``phi_initial_binding`` row) and the graph's spelling of the
+    same version, ``initial_spelled_value_id``.  A source operand is a graph id."""
+
+    attributes = instruction.attributes or {}
+    return frozenset(
+        int(attributes[key])
+        for key in ("initial_value_id", "initial_spelled_value_id")
+        if attributes.get(key) is not None
+    )
+
+
 def _recover_late_source_unary_operations(
     function: Function,
     graph: Any,
@@ -1313,9 +1363,7 @@ def _recover_late_source_unary_operations(
                 if (
                     instruction.op == "Phi"
                     and instruction.res is not None
-                    and int((instruction.attributes or {}).get(
-                        "initial_value_id", -1
-                    )) == operand_id
+                    and operand_id in _phi_initial_spellings(instruction)
                     and (instruction.attributes or {}).get("binding")
                     == "loop_carried"
                 )
@@ -1576,9 +1624,7 @@ def _recover_late_source_pure_expressions(
                         if (
                             instruction.op == "Phi"
                             and instruction.res is not None
-                            and int((instruction.attributes or {}).get(
-                                "initial_value_id", -1
-                            )) == initial_id
+                            and initial_id in _phi_initial_spellings(instruction)
                             and (instruction.attributes or {}).get("binding")
                             == "loop_carried"
                         )

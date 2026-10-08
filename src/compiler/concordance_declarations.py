@@ -885,6 +885,17 @@ AGGREGATE_PASSTHROUGH_REBINDING = declare_page("aggregate_passthrough_rebinding"
 DEAD_STRUCTURAL_RETIREMENT = declare_page("dead_structural_retirement", (
     RowField("function", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), tuple)
+#: ``precompile_to_ssa._phi_initial_binding``: the version that stood before a
+#: merge or a loop, as the lowering holds it.  The graph names that version by
+#: its planning spelling (a graph id, a planning alias, a literal's node); the
+#: lowering holds it as an SSA value whose id is not always the spelling.  One
+#: row per Phi ``(function scope, Phi result id)`` -> ``(spelled id, resident
+#: id)``.  REVISE, DERIVED(the resident's and the Phi result's ``ssa_value``
+#: cells).  The Phi's ``initial_value_id`` is read back from THIS row (the
+#: resident), its ``initial_spelled_value_id`` is the spelling.
+PHI_INITIAL_BINDING = declare_page("phi_initial_binding", (
+    RowField("function", K.SCOPE), RowField("phi", K.VALUE_ID),
+), tuple)
 CONTROL_UNIFORM_DTYPE = declare_page("control_uniform_dtype", (
     RowField("control_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), str)                                # mode CONCORD
