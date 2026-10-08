@@ -154,6 +154,17 @@ the driver takes every column from the authored source the game uses
 (`OrbitalJumper._initial_columns` / the MachineCraft state construction), never invented
 values, then the N=4 lowering + parity runs.
 
+### 3c. Lanes running after the merge (dispatched 2026-10-08, all Sonnet, off `main` 887a858b)
+
+| Branch (worktree) | Task |
+|---|---|
+| `fix/raw-primitive-posts` (wtr) | rebase the 19 commits onto main (heavy overlap with the glsl split and per-copy keys), re-gate, then merge as item 13 |
+| `split/shell-leaves-2` (wtc) | next `fortran_c_shell.py` moves: lexical_control_placement, late_source_recovery, shortfall_settlement, dead_storage_pruning, then the non-leaf areas in dependency order up to `whole_source_lowering` (public wrapper stays in the facade; giant function stays whole) |
+| `split/glsl-leaves-2` (wtv) | next `glsl_deployment_strategy.py` moves: source_control_retention, tensor_descriptor_query, callsite_literal_specialization, captured_region_programs, validation_control, conditional_control_programs, dispatch_metadata_classifier, dispatch_region_partition, dispatch_subgraph_extraction, then structural_fold, scheduled_capture_coordinator, shell_hierarchy_builder, callsite_descriptor_application, callsite_tensor_specialization last |
+| `fix/audit-findings-zero` (wta) | decode and fix the 7 baseline audit findings (`operand-never-written` CondBr in `__restore_type__`; `undefined_operand` in Phi/restore_type functions) at their writers; target 0,0,0,0,0,0,0 |
+| `fix/break-edge-value` (wtbk) | the `break-edge-value ... does not dominate the exit edge` emission error on a retry loop with `break`: carry the value through the break-bound port with its rows; probe on both lanes |
+| merge worker (main tree, build slot) | N=4 native attempt with every column taken from the authored source (`OrbitalJumper._initial_columns` / MachineCraft state), per-stage times, parity on 303 columns |
+
 ## 4. Next walls (measured)
 
 1. **N=8 `extract-dispatch-subgraphs`**: 37 GB private / swapping at the `restore` shell
