@@ -2905,3 +2905,33 @@ CALL_EDGE = declare_page("call_edge", (
     RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
     RowField("caller", K.NAME), RowField("actual", K.VALUE_ID),
 ), str)
+
+# -- source numeric scopes (``topological_reducer`` source pursuit) ----------
+#: ``propagate_call_formal_numeric_types``: a call whose callee the source
+#: pursuit reached.  ``(caller numeric scope, call node, callee numeric scope)``
+#: -> True, CONCORD, DERIVED(the call node's identity cell, the callee's
+#: ``function_address`` cell).
+SOURCE_FUNCTION_REACHABILITY = declare_page(
+    "source_function_reachability_concordance", (
+        RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+        RowField("callee_scope", K.NAME),
+    ), bool,
+)
+#: ``specialize_python_precision_widths``: the numeric scope a callsite
+#: specialization owns, ``(authored function, receipt digest)`` ->
+#: ``(scope, receipt)``, CONCORD, NOVEL(SOURCE_NUMERIC_SPECIALIZATION) from the
+#: authored function's ``function_address`` cell.
+SOURCE_NUMERIC_SPECIALIZATION_PAGE = declare_page(
+    "source_numeric_specialization_concordance", (
+        RowField("authored_scope", K.SCOPE), RowField("digest", K.NAME),
+    ), tuple,
+)
+SOURCE_NUMERIC_SPECIALIZATION = declare_transform(
+    "source_numeric_specialization", 1,
+)
+#: ``resolve_expression``: the Python identity program a call node resolved
+#: to, ``(numeric scope, node)`` -> descriptor, CONCORD, DERIVED(the node's
+#: identity cell).
+SOURCE_PYTHON_IDENTITY = declare_page("source_python_identity_concordance", (
+    RowField("numeric_scope", K.SCOPE), RowField("node", K.VALUE_ID),
+), tuple)

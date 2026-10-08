@@ -801,7 +801,36 @@ def specialize_python_precision_widths(graph: Any) -> bool:
             f"proposed={identity_fact!r}"
         )
     if incumbent is None:
-        identity_page.set(identity_row, 0, identity_fact)
+        from ...compiler.concordance_declarations import (
+            SOURCE_NUMERIC_SPECIALIZATION as _SOURCE_NUMERIC_SPECIALIZATION,
+            SOURCE_NUMERIC_SPECIALIZATION_PAGE as _SPECIALIZATION_PAGE,
+        )
+        from ...compiler.identity_concordance import Novel as _Novel
+
+        specialization_book = current_identity_book()
+        # The graph names its function by address (``function_ref``); the
+        # ``function_address`` row whose fact is that address is its cell.
+        authored_cell = None
+        authored_address = metadata.get("function_ref")
+        address_page = specialization_book.pages.get(_FUNCTION_ADDRESS.name)
+        if authored_address is not None and address_page is not None:
+            authored_cell = next((
+                specialization_book.latest_ref(_FUNCTION_ADDRESS, row)
+                for row in address_page.rows()
+                if address_page.latest(row) == int(authored_address)
+            ), None)
+        # The specialization is its authored function with some inputs
+        # known: NOVEL from the authored function's address cell.
+        specialization_book.post(
+            _SPECIALIZATION_PAGE, identity_row, identity_fact,
+            stage=_REDUCTION,
+            provenance=(
+                _Novel(_SOURCE_NUMERIC_SPECIALIZATION, (authored_cell,))
+                if authored_cell is not None
+                else _Unsourced(_SYNTHESIZED_NO_SOURCE)
+            ),
+            mode=_Mode.CONCORD,
+        )
     metadata["source_numeric_scope"] = scope
     metadata["source_numeric_specialization_receipt"] = receipt
     # A specialization is its authored function with some inputs known: the
@@ -5985,7 +6014,25 @@ def _normalize_lexical_values(
                             f"resolved={descriptor!r}"
                         )
                     if identity_incumbent is None:
-                        identity_page.set(identity_row, 0, descriptor)
+                        from ...compiler.concordance_declarations import (
+                            SOURCE_PYTHON_IDENTITY as _SOURCE_PYTHON_IDENTITY,
+                        )
+
+                        identity_book = current_identity_book()
+                        identity_cell = (
+                            node_identity_cell(graph, int(node_id))
+                            if node_id in graph.G else None
+                        )
+                        identity_book.post(
+                            _SOURCE_PYTHON_IDENTITY, identity_row, descriptor,
+                            stage=_REDUCTION,
+                            provenance=(
+                                _Derived((identity_cell,))
+                                if identity_cell is not None
+                                else _Unsourced(_SYNTHESIZED_NO_SOURCE)
+                            ),
+                            mode=_Mode.CONCORD,
+                        )
             if (
                 isinstance(callee, _StaticPythonReference)
                 and any(
@@ -13305,6 +13352,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 reachability_page = current_identity_book().page(
                     "source_function_reachability_concordance"
                 )
+                from ...compiler.concordance_declarations import (
+                    SOURCE_FUNCTION_REACHABILITY as _SOURCE_FUNCTION_REACHABILITY,
+                )
                 reachability_row = (
                     caller_scope, int(call_id), callee_scope,
                 )
@@ -13320,7 +13370,27 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         f"recorded={incumbent_reachability!r}, proposed=True"
                     )
                 if incumbent_reachability is None:
-                    reachability_page.set(reachability_row, 0, True)
+                    # DERIVED(the call node's cell, the callee's address).
+                    reach_book = current_identity_book()
+                    reach_cells = tuple(
+                        cell for cell in (
+                            node_identity_cell(caller_entry.graph, int(call_id)),
+                            reach_book.latest_ref(
+                                _FUNCTION_ADDRESS,
+                                (str(callee_entry.qualified_name),),
+                            ),
+                        )
+                        if cell is not None
+                    )
+                    reach_book.post(
+                        _SOURCE_FUNCTION_REACHABILITY, reachability_row, True,
+                        stage=_REDUCTION,
+                        provenance=(
+                            _Derived(reach_cells) if reach_cells
+                            else _Unsourced(_SYNTHESIZED_NO_SOURCE)
+                        ),
+                        mode=_Mode.CONCORD,
+                    )
                 if not callee.graph.get("source_pursuit_active"):
                     callee.graph["source_pursuit_active"] = True
                     changed = True
