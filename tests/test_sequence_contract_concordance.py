@@ -174,17 +174,17 @@ def test_function_alias_publication_commits_transitive_terminal_resident():
 def test_sequence_row_layout_is_one_direct_identity_book_row():
     book, token = begin_identity_book()
     try:
+        scope = ("rows|shape", 0)
         committed = commit_sequence_row_layout(
-            "module__rows__specialized_deadbeef",
-            264,
-            ((3,),),
-            ("float64",),
+            scope, 264, ((3,),), ("float64",),
             source="collection value edge",
         )
 
-        assert committed_sequence_row_layout("rows", 264) == committed
+        assert committed_sequence_row_layout(scope, 264) == committed
+        # A sibling copy's scope never reads this copy's layout.
+        assert committed_sequence_row_layout(("rows|shape", 1), 264) is None
         assert book.page("sequence_row_layout_concordance").rows() == (
-            ("rows", 264),
+            (scope, 264),
         )
     finally:
         end_identity_book(token)
