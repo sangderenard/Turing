@@ -251,13 +251,20 @@ C_LANE_NAMES: tuple[str, ...] = (
     "bool", "i1", "uint8", "u8",
     "int", "int32", "i32",
     "int64", "i64", "long",
+    # float32 spans are their own storage class (``float *``); ``float`` is
+    # deliberately absent -- the repository spells Python's binary64 ``float``.
+    "float32", "f32",
 )
 _C_LANE_VOCABULARY = _check_vocabulary(frozenset(C_LANE_NAMES))
 
-#: The four storage classes the C module lane allocates, in the order
+#: The storage classes the C module lane allocates, in the order
 #: ``_dtype_for_c_storage`` tested them.  A dtype belongs to the class whose
 #: ``c_storage_type`` it shares (uint8 -> bool); anything else is float64.
-C_LANE_STORAGE_CLASSES: tuple[str, ...] = ("bool", "int32", "int64", "float64")
+#: float32 spans are stored as ``float`` (the LLVM lane's ``float``), so a
+#: float32 value's public buffer is float32.
+C_LANE_STORAGE_CLASSES: tuple[str, ...] = (
+    "bool", "int32", "int64", "float32", "float64",
+)
 
 #: The names ``ssa_llvm_backend._value_llvm_type`` recognised (lowercased).
 LLVM_LANE_NAMES: tuple[str, ...] = (
@@ -265,6 +272,7 @@ LLVM_LANE_NAMES: tuple[str, ...] = (
     "int", "int32", "i32",
     "int64", "i64", "long",
     "opaque_ref",
+    "float32", "f32",
 )
 _LLVM_LANE_VOCABULARY = _check_vocabulary(frozenset(LLVM_LANE_NAMES))
 
@@ -272,7 +280,9 @@ _LLVM_LANE_VOCABULARY = _check_vocabulary(frozenset(LLVM_LANE_NAMES))
 #: ``_LLVM_TYPE_BYTES`` and of ``solved_buffer_type``'s mapping.  Reverse
 #: lookups by LLVM spelling search only these (``i64`` is also uint64's
 #: spelling, and ``i8``/``i16`` are shared by two dtypes each).
-LLVM_LANE_TYPES: tuple[str, ...] = ("float64", "int64", "ptr", "int32", "bool")
+LLVM_LANE_TYPES: tuple[str, ...] = (
+    "float64", "float32", "int64", "ptr", "int32", "bool",
+)
 
 #: ``ssa_fortran_backend._DTYPE_KIND`` keys (exact case).
 FORTRAN_NAMES: tuple[str, ...] = (
@@ -417,6 +427,21 @@ def by_llvm_type(llvm_type: object) -> DTypeLayout | None:
     return None
 
 
+def llvm_abi_numpy_table() -> dict[str, str]:
+    """``{LLVM spelling: numpy dtype}`` of the LLVM lane's public buffers.
+
+    Declared from the same layouts as every other lookup here; ``ptr`` is the
+    machine word (``uintp``), ``i1`` is numpy ``bool``.
+    """
+
+    return {
+        DTYPES[name].llvm_type: (
+            "uintp" if name == "ptr" else str(DTYPES[name].numpy_dtype)
+        )
+        for name in LLVM_LANE_TYPES
+    }
+
+
 def llvm_type_bytes_table() -> dict[str, int]:
     """``{LLVM spelling: element bytes}`` for the types the LLVM lane emits."""
 
@@ -510,6 +535,7 @@ __all__ = [
     "resolve",
     "layout_for",
     "by_llvm_type",
+    "llvm_abi_numpy_table",
     "C_ABI_NAMES",
     "C_LANE_NAMES",
     "C_LANE_STORAGE_CLASSES",

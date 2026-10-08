@@ -732,6 +732,8 @@ def _buffer_c_type(dtype) -> str:
         return "int32_t"
     if name in {"int64", "i64", "long"}:
         return "int64_t"
+    if name in {"float32", "f32"}:
+        return "float"
     return "double"
 
 
@@ -746,8 +748,17 @@ def _value_buffer_c_type(value) -> str:
     continue to use ``_scalar_c_type`` and therefore remain integer controls.
     """
 
+    from .ssa_llvm_backend import _declared_span_rank
+
     accounting = dict(getattr(value, "accounting", None) or {})
-    return _buffer_c_type(accounting.get("physical_dtype", value.dtype))
+    held = _buffer_c_type(accounting.get("physical_dtype", value.dtype))
+    # float32 is a SPAN storage class (as in the LLVM lane's _value_llvm_type);
+    # a float32 scalar keeps the lane's double width.
+    if held == "float" and not (
+        tuple(getattr(value, "shape", ()) or ()) or _declared_span_rank(value) > 0
+    ):
+        return "double"
+    return held
 
 
 def _pointer_value_depth(value) -> int:
