@@ -42,4 +42,5 @@ COMPILER_IMPLEMENTATION_FILES: tuple[str, ...] = (
     "src/compiler/frame_call_linking.py",
     "src/compiler/alias_retirement.py",
     "src/compiler/record_field_lowering.py",
+    "src/compiler/field_slot_recovery.py",
 )
