@@ -8055,12 +8055,13 @@ def _field_slot_ops(
                 if reference_identity is not None:
                     from .string_table import string_token
 
-                    identity = str(reference_identity)
+                    reference_name = str(reference_identity)
                     const_sources[int(source_id)] = {
-                        "ssa_reference_identity": identity,
+                        "ssa_reference_identity": reference_name,
                         "reference_kind": "static-python",
                         "reference_handle": string_token(
-                            "\x00turing.reference.static-python\x00" + identity
+                            "\x00turing.reference.static-python\x00"
+                            + reference_name
                         ),
                         "host_resident": True,
                     }
@@ -17440,8 +17441,15 @@ def _class_surface_ssa_program(
             receivers.update(alias for alias, original in returned_parameter_aliases.items()
                              if original in receivers)
             for field_name, field in dict(record.get("fields") or {}).items():
-                if field.get("storage") != "scalar" or not field.get("mutable"):
+                if field.get("storage") not in {"scalar", "reference"} or not field.get("mutable"):
                     continue
+                # A declared mutable reference field is written at its
+                # authored site exactly as a scalar is: the Store destination
+                # is the same incoming slot, the value an opaque handle.
+                field_dtype = (
+                    "opaque_ref" if field.get("storage") == "reference"
+                    else str(field["dtype"])
+                )
                 getters = [
                     int(node_id) for node_id, data in graph_obj.nodes(data=True)
                     if str(data.get("type") or data.get("op")).casefold() == "getattr"
@@ -17488,7 +17496,7 @@ def _class_surface_ssa_program(
                         # the block carries it so control SSA publishes
                         # the version at that cell.
                         scalar_writes.append(ScalarFieldWriteBlock(
-                            field_id, value, str(field["dtype"]), int(node_id),
+                            field_id, value, field_dtype, int(node_id),
                             field_state_cell=(
                                 data.get("attributes") or {}
                             ).get("field_state_cell"),
@@ -21685,17 +21693,6 @@ def _class_surface_ssa_program(
             getters: list[tuple[int, bool]] = []
             write_sources: list[int] = []
 
-            def slot_version(value_id: int) -> bool:
-                """A scalar field read the control injection materialised as
-                a slot Load is a VERSION of the field -- read at its own place
-                (before or after a write, in one arm or at the join) -- not
-                the field's address.  The slot address is already the one
-                storage; aliasing one version onto another returns the
-                pre-write value for a read authored after the write, or a
-                Load that does not dominate the use."""
-
-                return storage == "scalar" and int(value_id) in slot_loaded
-
             for node_id, data in graph.nodes(data=True):
                 operation = str(
                     data.get("type") or data.get("op") or ""
@@ -21734,6 +21731,19 @@ def _class_surface_ssa_program(
                 if resolve_indexed_storage(int(value_id)) in getter_ids
             )
             write_sources = list(dict.fromkeys(write_sources))
+            if storage in {"scalar", "reference"} and any(
+                int(value_id) in slot_loaded for value_id, _after in getters
+            ):
+                # The control injection already lowered this field to slot
+                # Loads and Stores: every read is a VERSION of the field,
+                # read at its own place and time, and every stored value is
+                # a value, not the field's address.  The slot address is the
+                # one storage.  Aliasing one version onto another returns
+                # the pre-write value for a read authored after the write,
+                # or a Load that does not dominate its use; aliasing a
+                # stored value onto the field's read makes the value's
+                # defining instruction redefine that read.
+                return
             if not mutable or not write_sources:
                 # One declared field of one parameter is one storage, read
                 # or not written.  Every authored read of it is that one
@@ -21742,7 +21752,6 @@ def _class_surface_ssa_program(
                 # against its callee's single member.
                 read_ids = list(dict.fromkeys(
                     value_id for value_id, _after_write in getters
-                    if not slot_version(value_id)
                 ))
                 if len(read_ids) < 2:
                     return
@@ -21828,7 +21837,7 @@ def _class_surface_ssa_program(
                 ) else RESIDENT_CHOSEN_BY_ORDER
             )
             for value_id, _after_write in getters:
-                if int(value_id) != resident_id and not slot_version(value_id):
+                if int(value_id) != resident_id:
                     post_storage_alias(
                         int(value_id), resident_id,
                         (_frame_graph_cell(graph, resident_id),),
@@ -23206,7 +23215,7 @@ def _class_surface_ssa_program(
                     *field_read_ids,
                     *(
                         write_source_ids_by_field.get(str(field_name), ())
-                        if storage != "scalar"
+                        if storage not in {"scalar", "reference"}
                         else tuple(
                             value_id
                             for value_id in write_source_ids_by_field.get(

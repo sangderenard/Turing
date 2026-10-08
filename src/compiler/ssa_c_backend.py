@@ -4811,6 +4811,16 @@ def emit_ssa_module_to_c(
                     ))
                     integer_ids.add(result_id)
                     continue
+                if op == "StaticRef" and instruction.res is not None:
+                    # A static program reference is its integer handle (the
+                    # reference table carries the descriptor), as the LLVM and
+                    # Fortran lanes spell it.
+                    result_id = int(instruction.res.id)
+                    expressions[result_id] = str(int(
+                        instruction.attributes["reference_handle"]
+                    ))
+                    integer_ids.add(result_id)
+                    continue
                 if op == "NoneValue" and instruction.res is not None:
                     # Structural None is the native record/token zero sentinel,
                     # never a retained Python object.

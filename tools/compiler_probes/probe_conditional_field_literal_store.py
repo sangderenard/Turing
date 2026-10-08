@@ -22,6 +22,7 @@ Exit status is 0 when every (variant, lane) matches.
 """
 from __future__ import annotations
 
+import math
 import pathlib
 import sys
 import warnings
@@ -47,7 +48,7 @@ class Machine:
         self.threshold = 1.0
         self.phase = {phase}
         self.cells = [0.0, 0.0, 0.0]
-
+{extra_init}
     def step(self, x):
 '''
 
@@ -107,6 +108,19 @@ BODIES = {
     "return_field_straight": ("0.0", '''        self.phase = self.phase + x
         return self.phase
 '''),
+    # a REFERENCE field written inside the ``if``: it has no arm Store (its
+    # source is a StaticRef, not a scalar), so where it is stored is the
+    # placement row, not the source's producer
+    "ref_none": ("0.0", '''        if x > self.threshold:
+            self.link = None
+        return x
+'''),
+    # a STATIC reference (a compile-time Python object) into the reference
+    # field inside the ``if``
+    "ref_static": ("0.0", '''        if x > self.threshold:
+            self.link = math.sqrt
+        return x
+'''),
     "return_field_literal": ("5.0", '''\
         if x > self.threshold:
             self.phase = 1.0
@@ -115,25 +129,38 @@ BODIES = {
 }
 
 
+# variants that also declare a reference field ``link`` (optional, mutable).
+# Python starts it at a non-None object; None-ness is what is compared.
+REFERENCE_VARIANTS = {"ref_none", "ref_static"}
+LINK_ANCHOR = 123456789          # the native handle fed for the initial object
+
+
 def source_of(variant):
     phase, body = BODIES[variant]
-    return CLASS_HEAD.format(phase=phase) + body
+    extra = (
+        "        self.link = 'anchor'" + chr(10)
+        if variant in REFERENCE_VARIANTS else ""
+    )
+    return CLASS_HEAD.format(phase=phase, extra_init=extra) + body
 
 
-def contract():
+def contract(variant=None):
+    fields = {
+        "threshold": {"storage": "scalar", "dtype": "float64",
+                      "rank": 0, "mutable": True},
+        "phase": {"storage": "scalar", "dtype": "float64",
+                  "rank": 0, "mutable": True},
+        "cells": {"storage": "span", "dtype": "float64",
+                  "rank": 1, "shape": [3], "mutable": True},
+    }
+    if variant in REFERENCE_VARIANTS:
+        fields["link"] = {"storage": "reference", "mutable": True}
     return (
         ExtractionContract(CONTRACTS / "program_extraction.yaml")
         .with_program_abi({
             "records": {"Machine": {
                 "identity": "Machine",
-                "fields": {
-                    "threshold": {"storage": "scalar", "dtype": "float64",
-                                  "rank": 0, "mutable": True},
-                    "phase": {"storage": "scalar", "dtype": "float64",
-                              "rank": 0, "mutable": True},
-                    "cells": {"storage": "span", "dtype": "float64",
-                              "rank": 1, "shape": [3], "mutable": True},
-                },
+                "fields": fields,
             }},
             "bindings": [
                 {"function": "*step", "parameter": "self",
@@ -149,15 +176,23 @@ def contract():
     )
 
 
+def link_state(is_none, is_anchor):
+    return "none" if is_none else "anchor" if is_anchor else "reference"
+
+
 def python_run(variant):
-    namespace: dict = {}
+    namespace: dict = {"math": math}
     exec(compile(source_of(variant), "<authored>", "exec"), namespace)
     machine = namespace["Machine"]()
     trace = []
     for x in XS:
         result = machine.step(x)
-        trace.append((float(result), float(machine.phase),
-                      tuple(float(c) for c in machine.cells)))
+        row = (float(result), float(machine.phase),
+               tuple(float(c) for c in machine.cells))
+        if variant in REFERENCE_VARIANTS:
+            row += (link_state(machine.link is None,
+                               machine.link == 'anchor'),)
+        trace.append(row)
     return trace
 
 
@@ -167,8 +202,9 @@ def native_run(variant, lane):
         warnings.simplefilter("ignore")
         module, outputs, _exports = lower_ast_source_to_ssa(
             source_of(variant), "Machine.step", name=name,
-            extraction_contract=contract(),
+            extraction_contract=contract(variant),
             tensor_ssa_reference=c_backend_repository_ssa_reference(),
+            python_bindings={"math": math},
         )
     qualified = next(
         symbol for symbol in module.functions
@@ -206,7 +242,9 @@ def native_run(variant, lane):
         prepare = lambda feeds: prepare_artifact_execution(native, feeds)  # noqa: E731
     initial_phase = float(BODIES[variant][0])
     initial = {"threshold": [THRESHOLD], "phase": [initial_phase],
-               "cells": [0.0, 0.0, 0.0]}
+               "cells": [0.0, 0.0, 0.0], "link": [LINK_ANCHOR]}
+    # structural ``None`` is the native zero sentinel (a NoneValue operation)
+    none_handles = {0}
     # A field the method never touches is not an argument of its function.
     feeds = {
         value_id: np.array(initial[field_name])
@@ -227,11 +265,19 @@ def native_run(variant, lane):
             ] or [tuple(float(c) for c in initial[field_name])]
             # all formals of one field must agree; disagreement is reported
             shown[field_name] = copies[0] if len(set(copies)) == 1 else ("DISAGREE", *copies)
-        trace.append((
+        row = (
             float(np.asarray(execution.buffers[published]).reshape(-1)[0]),
             shown["phase"][0] if shown["phase"][0] != "DISAGREE" else shown["phase"],
             shown["cells"],
-        ))
+        )
+        if variant in REFERENCE_VARIANTS:
+            links = {
+                int(np.asarray(execution.buffers[value_id]).reshape(-1)[0])
+                for value_id in fields.get("link", ())
+            }
+            row += (link_state(links <= none_handles,
+                               links == {LINK_ANCHOR}),)
+        trace.append(row)
     return trace
 
 

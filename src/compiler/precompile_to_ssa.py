@@ -12902,12 +12902,7 @@ def _inject_field_slot_access(
             continue
         cell = next(_write_cells, None)
         position = arm_stores.get(cell)
-        if (
-            position is None
-            or int(value_id) in reference_sources
-            or int(value_id) in receiver_column_ids
-            or position in claimed_positions
-        ):
+        if position is None or position in claimed_positions:
             continue
         claimed_positions.add(position)
         arm_owned[op_index] = (position, cell)
@@ -12976,6 +12971,7 @@ def _inject_field_slot_access(
     # The reads this injection materialised as slot Loads: each is a VERSION
     # of its field, read at its own place and time, not an address of it.
     slot_loaded_read_ids: set[int] = set()
+    materialized_references: set[int] = set()
     for schedule_index, (kind, value_id, slot) in enumerate(field_ops):
         if schedule_index in arm_owned:
             position, write_cell = arm_owned[schedule_index]
@@ -12985,6 +12981,31 @@ def _inject_field_slot_access(
             causes = () if placement is None else (placement,)
             prelude, address, slot_dtype = slot_address(slot, *causes)
             group = []
+            # A static reference has no producer in the control body: it is
+            # materialised once where it dominates every use (the entry --
+            # a handle constant, no effect), as a reference write always was.
+            # Only the STORE of it is the arm's.
+            reference = reference_sources.get(int(source.id))
+            if reference is not None and int(source.id) not in (
+                producer_position
+            ) and int(source.id) not in materialized_references:
+                materialized_references.add(int(source.id))
+                reference_value = SSAValue(int(source.id), dtype="opaque_ref")
+                insertions.append((0, schedule_index, entry_name, [Instr(
+                    Handler.StaticRef.value, [], reference_value,
+                    attributes={
+                        "reference_handle": int(reference["reference_handle"]),
+                        "reference_identity": str(
+                            reference["ssa_reference_identity"]
+                        ),
+                        "reference_kind": str(
+                            reference.get("reference_kind", "static-python")
+                        ),
+                        "host_resident": bool(
+                            reference.get("host_resident", True)
+                        ),
+                    },
+                )]))
             # A literal is materialised in the slot's dtype, as a constant
             # field write always was.
             literal = producer_position.get(int(source.id))
@@ -12996,7 +13017,12 @@ def _inject_field_slot_access(
                     "Const", [], source,
                     attributes=dict(flat[literal][1].attributes or {}),
                 ))
-            group += [*prelude, Instr("Store", [source, address], None)]
+            group += [*prelude, Instr(
+                "Store", [source, address], None,
+                attributes={
+                    "opaque_reference_storage": True, "field_slot": int(slot),
+                } if slot_dtype == "opaque_ref" else {},
+            )]
             # A placeholder that named the field by a read is replaced; one
             # that names the field's incoming formal stays (it writes that
             # formal in this arm) and the slot store follows it.
@@ -13151,6 +13177,7 @@ def _inject_field_slot_access(
         if (
             argument_id in seen_argument_ids
             or argument_id in field_read_ids
+            or argument_id in materialized_references
         ):
             continue
         arguments.append(argument)
