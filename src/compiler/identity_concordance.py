@@ -3997,6 +3997,11 @@ SHAPE_SOURCE_NOT_ON_BOOK = declare_reason("shape_source_not_on_book")
 #: A shape state re-resolved over an edge that did not change since the
 #: row's previous revision (the row was withdrawn or re-pointed in between).
 SHAPE_STATE_REDERIVED = declare_reason("shape_state_rederived_over_unchanged_edge")
+#: A binding-kind resolution re-posted over the same ``argument_binding`` cell
+#: with a different requesting kind.
+ARGUMENT_BINDING_RESOLUTION_CAUSE_NOT_ON_BOOK = declare_reason(
+    "argument_binding_resolution_cause_not_on_book"
+)
 #: A loop scope's inner-generation transition re-posted over the same value
 #: cells (the transformation that caused it left no cell).
 LOOP_SCOPE_TRANSITION_CAUSE_NOT_ON_BOOK = declare_reason(
@@ -5499,29 +5504,41 @@ def materializing_binding_kind(
     what it is, and every callsite naming it gets the kind that works.
     """
 
+    from .concordance_declarations import ARGUMENT_BINDING
+    from .concordance_declarations import ARGUMENT_BINDING_RESOLUTION
+
     page = book.page("argument_binding")
-    for _callsite, fact in argument_binding_history(
-        page, str(callee_symbol), int(formal_id),
-    ):
-        if not (isinstance(fact, tuple) and len(fact) == 2):
+    callee_symbol = str(callee_symbol)
+    for row in page.scope_rows(callee_symbol):
+        if not (len(row) == 3 and row[1] == int(formal_id)):
             continue
-        recorded_kind, recorded_source = fact
-        if not isinstance(recorded_source, int):
-            continue
-        if int(recorded_source) != int(source_id):
-            continue
-        if str(recorded_kind) == "caller_storage":
-            resolution_page = book.page("argument_binding_resolution")
-            resolution_row = (
-                str(callee_symbol), int(formal_id), int(source_id),
-            )
-            history = resolution_page.history(resolution_row)
-            column = history[-1][0] + 1 if history else 0
-            resolution_page.set(resolution_row, column, (
-                "caller_storage", str(kind),
-                "materializing_binding_kind",
-            ))
-            return "caller_storage"
+        for column, fact in page.history(row):
+            if not (isinstance(fact, tuple) and len(fact) == 2):
+                continue
+            recorded_kind, recorded_source = fact
+            if not isinstance(recorded_source, int):
+                continue
+            if int(recorded_source) != int(source_id):
+                continue
+            if str(recorded_kind) == "caller_storage":
+                resolution_row = (
+                    callee_symbol, int(formal_id), int(source_id),
+                )
+                resolution = (
+                    "caller_storage", str(kind), "materializing_binding_kind",
+                )
+                stored = book.pages.get(ARGUMENT_BINDING_RESOLUTION.name)
+                if stored is None or stored.latest(resolution_row) != resolution:
+                    # DERIVED from the ``argument_binding`` cell that proved
+                    # the slot is caller storage.
+                    _post_or_unsourced(
+                        book, ARGUMENT_BINDING_RESOLUTION, resolution_row,
+                        resolution,
+                        book.registry.declare_stage("materializing_binding_kind"),
+                        (Ref(ARGUMENT_BINDING, row, column),),
+                        ARGUMENT_BINDING_RESOLUTION_CAUSE_NOT_ON_BOOK,
+                    )
+                return "caller_storage"
     return str(kind)
 
 
