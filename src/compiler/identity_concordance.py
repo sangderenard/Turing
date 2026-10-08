@@ -3330,13 +3330,18 @@ class IdentityPage:
         if position is None:
             position = positions[column] = len(self.columns)
             self.columns.append(column)
-        if (row, column) not in self.cells:
+        # ONE key tuple for the membership test and both tables: each extra
+        # ``(row, column)`` was a tuple the size of the cell's own
+        # bookkeeping, per cell of every page (the edge pages hold most of
+        # the book).
+        key = (row, column)
+        if key not in self.cells:
             columns = self.row_columns.setdefault(row, [])
             columns.append(column)
             if len(columns) > 1 and positions[columns[-2]] > position:
                 columns.sort(key=positions.__getitem__)
-        self.cells[(row, column)] = fact
-        self.stamps[(row, column)] = self.clock[0]
+        self.cells[key] = fact
+        self.stamps[key] = self.clock[0]
         if isinstance(row, tuple) and row:
             self.scopes.setdefault(row[0], {}).setdefault(row, None)
 
