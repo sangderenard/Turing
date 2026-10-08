@@ -213,10 +213,36 @@ uncommitted work in the deleted worktrees is lost; committed lane branches survi
   recorded as a `compile_policy` row `("progress_bars",)`. 30 layer tests. Known cosmetic
   bug left: the second per-function loop in `_class_surface_ssa_program` reuses
   `shell_index`, so its "function i/N" log lines always print N/N (the bar counts right).
-- **Memory (in progress, same no-compile rule):** `memory_budget_bytes` work-contract
-  policy with stage-boundary regulation and `memory_release_receipt` rows (247e11b7);
-  the read-only inventory of everything held past its stage, with releases at the source,
-  is the running task.
+- **Memory (by reading only; nothing verified by a lowering):** fork projection merged
+  (1622736a; its own `excluded` frozenset per region was a regression, fixed 5af5a7b2 by
+  storing the region's nodes + a shared interned set); `process_rss_bytes()` (56156c5c);
+  one key tuple per book cell/edge instead of three/two (5e347050, 9eb0eab7); four
+  process-global caches no longer outlive their graph/page/book — `_DEPENDENCY_LEVEL_CACHE`,
+  `_POLYMORPHIC_FORMAL_SCANS`, `_CALLSITE_SHELL_TYPE_CACHE` (keyed by `id(book)`, so it
+  could never be read by a later compile yet held every callsite copy and region for the
+  process life), `_CHILD_SIGNATURE_RESULTS` (pinned the book) (c6bde49a);
+  `WorkContract.memory_budget_bytes` + `memory_regulation.py`: at six stage boundaries,
+  over budget → release dependency-level memo, polymorphic-formal memo, gc, each a
+  `memory_release_receipt` row derived from the policy cell; unconditional cache release
+  at the end of the outermost compile (247e11b7); **the dispatch region copies
+  (`dispatch_subgraphs`, `deep_compilers`, `ephemeral_callables`) are released when the
+  per-function lowering loop ends** — the one release expected to free a lot; after that
+  loop `fortran_c_shell.py` reads only each shell's `process_graph`, `loop_plans`,
+  `callsite_function_shells`, `hierarchy_plan`; the attributes are replaced by a tuple
+  whose every read raises, so a missed late reader fails loudly (99c53bbd);
+  `tools/compiler_probes/profile_memory_n2.py` written, parse-checked, unrun (01885ad5).
+  **Still holding RAM (design changes, next):** (1) the forked rows of WHOLE-graph copies
+  (`fork_read_scope` from `extract_clean_process_subgraph`, ~95% never read) — decision:
+  copy-on-read (a forked scope resolves reads through its origin until written; ~70
+  `scope_rows` enumeration sites in 15 files must see the chain; nothing deleted);
+  (2) the book itself grows monotonically and stays on `module.metadata["identity_book"]`
+  for the native system's life — needs cold-page spill (pages not read after their stage
+  written to the lzma log and dropped from RAM, re-readable on demand), edges kept;
+  (3) the cap's release set is small until (1)/(2) exist (the callsite shell-type cache
+  and child-signature results cannot be dropped mid-compile without re-planning).
+  First compile after this: `profile_memory_n2.py 2 --trace`, then with a small
+  `--budget-bytes` comparing the emitted-C sha256, then the N=2 parity and solve gates —
+  on the user's say-so.
 
 ## 4. Next walls (measured)
 
