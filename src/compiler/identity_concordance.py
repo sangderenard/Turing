@@ -2871,7 +2871,30 @@ class LiveScopeProjection:
     the relation says the scope does not hold."""
 
     pages: frozenset
-    excluded: frozenset
+    #: Nodes excluded by name (a caller that holds the set itself).
+    excluded: frozenset = frozenset()
+    #: Excluded as a COMPLEMENT: the nodes of the source graph at fork time
+    #: (``universe``, one frozenset shared by every region cut from that
+    #: graph -- see ``IdentityBook.register_scope_projection``) that this
+    #: scope does not hold (``held``).  Spelling a region's exclusions as
+    #: ``universe - held`` cost one source-sized set per region, retained
+    #: for the whole compile; the complement costs the region's own nodes.
+    universe: frozenset = frozenset()
+    held: frozenset = frozenset()
+    #: The projection of the scope this one was forked from, whose
+    #: exclusions it inherits.
+    inherited: "LiveScopeProjection | None" = None
+
+    def excludes(self, node: Any) -> bool:
+        """Whether a read of ``node``'s rows under this scope is refused."""
+        projection: LiveScopeProjection | None = self
+        while projection is not None:
+            if node in projection.excluded or (
+                node in projection.universe and node not in projection.held
+            ):
+                return True
+            projection = projection.inherited
+        return False
 
 
 class Mode(Enum):
@@ -3367,7 +3390,7 @@ class IdentityPage:
         if (
             projection is None
             or self.name not in projection.pages
-            or row[1] not in projection.excluded
+            or not projection.excludes(row[1])
         ):
             return
         book._refuse_projected_read(self, row)
@@ -3850,13 +3873,26 @@ class IdentityBook:
         return Ref(self.registry.page(page_name), row, column)
 
     def register_scope_projection(
-        self, scope: Any, pages: Iterable[str], excluded: Iterable[Any],
+        self, scope: Any, pages: Iterable[str], excluded: Iterable[Any] = (),
+        *, universe: Iterable[Any] | None = None, held: Iterable[Any] = (),
+        inherited: LiveScopeProjection | None = None,
     ) -> None:
         """Hold the read-time form of ``scope``'s declared projection: reads
-        of ``pages`` rows keyed by a node in ``excluded`` are refused."""
+        of ``pages`` rows keyed by a node in ``excluded``, or by a node of
+        ``universe`` that is not in ``held``, or excluded by the ``inherited``
+        projection, are refused.
 
+        ``universe`` is interned on the book: every region cut from one
+        source graph states the same node set, and they share one object."""
+
+        shared = frozenset()
+        if universe is not None:
+            universe = frozenset(universe)
+            interned = self.__dict__.setdefault("_node_universes", {})
+            shared = interned.setdefault(universe, universe)
         self.scope_projections[scope] = LiveScopeProjection(
-            frozenset(pages), frozenset(excluded),
+            frozenset(pages), frozenset(excluded), shared, frozenset(held),
+            inherited,
         )
 
     def _refuse_projected_read(self, page: IdentityPage, row: tuple) -> None:

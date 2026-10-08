@@ -3084,8 +3084,10 @@ def fork_read_scope(
     projecting = source_graph is not None and len(graph.G) > 0
     members: frozenset = frozenset(graph.G.nodes) if projecting else frozenset()
     not_held: frozenset = frozenset()
+    universe: frozenset = frozenset()
     if projecting:
-        not_held = frozenset(source_graph.G.nodes) - members
+        universe = frozenset(source_graph.G.nodes)
+        not_held = universe - members
     inherited = book.__dict__.get("scope_projections", {}).get(source)
     # A forked row on a declared page is DERIVED from the cell it copies
     # (stage READ_SCOPE_FORK, same fact); a page the registry does not
@@ -3116,7 +3118,7 @@ def fork_read_scope(
                 (project or (inherited is not None and page.name in inherited.pages))
                 and len(row) > 1 and isinstance(row[1], int)
             ):
-                if inherited is not None and row[1] in inherited.excluded:
+                if inherited is not None and inherited.excludes(row[1]):
                     # The source scope does not hold this node either (a row
                     # here would be its Unresolved read receipt).
                     excluded += 1
@@ -3176,11 +3178,16 @@ def fork_read_scope(
         mode=_Mode.CONCORD,
     )
     # The refusal: the nodes this copy lacks, and those its source lacked.
-    refused = not_held
-    if inherited is not None:
-        refused = refused | inherited.excluded
-    if refused:
-        book.register_scope_projection(forked, node_keyed, refused)
+    # Registered as the complement of the copy's own nodes in the (shared)
+    # node set of its source, plus the source scope's own refusal: one
+    # source-sized set per region, retained for the whole compile, was the
+    # cost of spelling it as ``not_held | inherited.excluded``.
+    if not_held or inherited is not None:
+        book.register_scope_projection(
+            forked, node_keyed,
+            universe=universe if projecting else None,
+            held=members, inherited=inherited,
+        )
     graph_data["lexical_read_scope"] = forked
     if tuple(graph_data.get("operand_position_scope") or ()) == source:
         graph_data["operand_position_scope"] = forked

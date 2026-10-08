@@ -467,6 +467,67 @@ def test_region_fork_of_read_scope_holds_its_own_nodes_rows_as_a_declared_projec
         end_identity_book(token)
 
 
+def test_region_projections_share_one_node_universe_and_refuse_the_complement():
+    """A region's refusal is the complement of its own nodes in the source's
+    node set, which every region of that source shares as ONE object (not a
+    source-sized set per region), and a copy of a region inherits it."""
+    from src.compiler.concordance_declarations import (
+        INGESTION_VALUE, NodeFact, READ_SCOPE_FORK, SYNTHESIZED_NO_SOURCE,
+    )
+    from src.compiler.identity_concordance import (
+        Mode, Unsourced, begin_identity_book, end_identity_book,
+    )
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        _add(graph, 1, "input")
+        for node_id in range(2, 8):
+            _add(graph, node_id, "add", (node_id - 1,))
+        ingestion = book.mint_scope("universe_test|ingestion", READ_SCOPE_FORK)
+        for node_id in range(1, 8):
+            book.post(
+                INGESTION_VALUE, (ingestion, node_id), NodeFact("t", "t", "t"),
+                stage=READ_SCOPE_FORK,
+                provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+            )
+        graph.G.graph["ingestion_value_scope"] = ingestion
+        graph.G.graph["lexical_read_scope"] = book.mint_scope(
+            "universe_test", READ_SCOPE_FORK,
+        )
+
+        low = extract_clean_process_subgraph(graph, (2, 3))
+        high = extract_clean_process_subgraph(graph, (5, 6))
+        projections = book.scope_projections
+        low_projection = projections[tuple(low.G.graph["lexical_read_scope"])]
+        high_projection = projections[tuple(high.G.graph["lexical_read_scope"])]
+        # One shared universe object; each region holds only its own nodes.
+        assert low_projection.universe is high_projection.universe
+        assert low_projection.universe == frozenset(range(1, 8))
+        assert low_projection.held == frozenset({2, 3})
+        assert high_projection.held == frozenset({5, 6})
+        # The refusal is the complement of the held nodes ...
+        assert {n for n in range(0, 10) if low_projection.excludes(n)} == {
+            1, 4, 5, 6, 7,
+        }
+        assert {n for n in range(0, 10) if high_projection.excludes(n)} == {
+            1, 2, 3, 4, 7,
+        }
+        # ... a node in neither graph is not refused (it is a plain miss) ...
+        assert not low_projection.excludes(99)
+        # ... and a whole copy of a region inherits its refusal.
+        again = extract_clean_process_subgraph(low, low.G)
+        again_projection = projections[tuple(again.G.graph["lexical_read_scope"])]
+        assert again_projection.inherited is low_projection
+        assert {n for n in range(0, 10) if again_projection.excludes(n)} == {
+            1, 4, 5, 6, 7,
+        }
+        # The materialized view agrees with the complement.
+        assert low_projection.excluded == frozenset()
+    finally:
+        end_identity_book(token)
+
+
 def test_shader_reducer_consumes_existing_process_graph_schedule():
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 0, "Input")
