@@ -842,13 +842,15 @@ class ScopeFork:
     #: The declared projection of the source's rows this scope holds, or
     #: ``None`` for a fork that carried every row (a whole-graph copy).
     projection: Any = None
-    #: The fork posted NO copied rows (``fork_read_scope``): a row under the
+    #: The fork posted NO copied rows (``fork_read_scope``,
+    #: ``fork_operand_position_scope``): a row under the
     #: scope with no cell of its own reads as ``source_scope``'s row did when
     #: this fact was posted, and is written (a cell at column 0, DERIVED from
     #: the source's cell at stage ``read_scope_fork``, then the write) when a
     #: write or a source reference first reaches it.  See ``IdentityPage``.
     #: False for a scope whose rows were copied eagerly or are not copied
-    #: (``fork_operand_position_scope``, ``fork_shape_scope``).
+    #: (``fork_shape_scope``).  (``fork_operand_position_scope`` stamps the
+    #: materialised copy ``read_scope_fork``, not ``function_subgraph``.)
     copy_on_read: bool = False
 
 
