@@ -8240,6 +8240,10 @@ def _field_slot_ops(
     # write. Nodes are created in source order, so their ids preserve the order
     # the programmer wrote -- which is the order the memory operations must run.
     field_ops: list[tuple[str, int, int]] = []
+    # One reducer WRITTEN cell per ``"write"`` op, in the same order: the
+    # write's identity on the book, which control lowering published its
+    # in-arm version under (``ssa_field_version``).
+    write_state_cells: list[Any] = []
     const_sources: dict[int, Any] = {}
     sequence_initializations: list[tuple[int, str, int]] = []
     sequence_declarations: list[tuple[int, str, int, bool]] = []
@@ -8927,6 +8931,9 @@ def _field_slot_ops(
             field_ops.append((
                 "write", int(source_id), slot_of[canonical_attribute]
             ))
+            write_state_cells.append(
+                (data.get("attributes") or {}).get("field_state_cell")
+            )
             source_attributes = source_data.get("attributes") or {}
             if node_operation(source_data) == "staticreference":
                 reference_identity = source_attributes.get(
@@ -9410,6 +9417,7 @@ def _field_slot_ops(
             bool(writable),
             source="shell sequence declaration",
         )
+    graph_obj.graph["field_write_state_cells"] = tuple(write_state_cells)
     return (
         self_value_id,
         tuple(field_ops),
@@ -19955,6 +19963,9 @@ def _class_surface_ssa_program(
                 )),
                 self_value_id=self_id,
                 field_ops=field_ops,
+                field_write_state_cells=tuple(
+                    graph_obj.graph.get("field_write_state_cells") or ()
+                ),
                 field_const_sources=const_sources,
                 field_count=field_count,
                 field_names=field_names,

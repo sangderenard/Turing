@@ -12450,6 +12450,8 @@ def _inject_field_slot_access(
     field_dtypes: Mapping[int, str] | None = None,
     separate_field_storage: bool = False,
     field_accounting: Mapping[int, Mapping[str, Any]] | None = None,
+    field_write_state_cells: tuple[Any, ...] = (),
+    lexical_read_scope: Any = None,
 ) -> tuple[Function, dict[int, tuple[int, int, str]]]:
     """Rewrite a method's control function to pass instance state as a slot arena.
 
@@ -12472,6 +12474,17 @@ def _inject_field_slot_access(
     self.x`` -- emits store-then-load and reads back ``v`` with no special case.
     ``field_reads``/``field_writes`` arrive in schedule order so any two ops that
     land at the same point keep it.
+
+    A write whose reducer WRITTEN cell (``field_write_state_cells``, one per
+    ``"write"`` op) was lowered at its authored site -- control lowering
+    emitted the ``scalar_record_field_assignment`` Store in the arm that owns
+    the assignment and published that arm's value under the cell on
+    ``ssa_field_version`` -- is OWNED by that arm: this Store is rewritten in
+    place into the real slot store, and no second store is placed after the
+    source's producer (which, for a literal or a value computed before the
+    ``if``, is a dominating block and would run on every path).  The arm is
+    the ``control_block_placement`` row of the cell's ``scalar_field_write``
+    block; the slot address derives from that row.
     """
 
     if not control_function.blocks:
@@ -12502,14 +12515,14 @@ def _inject_field_slot_access(
         SSA_VALUE, (_slot_scope, int(self_value_id)),
     )
 
-    def fresh() -> int:
+    def fresh(*causes: Any) -> int:
         book = _slot_book()
         operand = (
             _receiver_cell if _receiver_cell is not None
             else _function_root_cell(book, _slot_scope)
         )
         return _mint_ssa_id(
-            book, _slot_scope, FIELD_SLOT_ACCESS, (operand,),
+            book, _slot_scope, FIELD_SLOT_ACCESS, (operand, *causes),
             dtype=dtype, stage=CONTROL_SSA_FINISH,
         )
 
@@ -12613,10 +12626,12 @@ def _inject_field_slot_access(
         if kind == "write" and int(value_id) in reference_sources
     }
 
-    def slot_address(slot: int) -> tuple[list[Instr], SSAValue, str]:
+    def slot_address(
+        slot: int, *causes: Any,
+    ) -> tuple[list[Instr], SSAValue, str]:
         arena_id, offset, slot_dtype = field_locations[int(slot)]
-        index = SSAValue(fresh(), dtype="int64")
-        address = SSAValue(fresh())
+        index = SSAValue(fresh(*causes), dtype="int64")
+        address = SSAValue(fresh(*causes))
         return (
             [
                 Instr("Const", [], index, attributes={"value": int(offset)}),
@@ -12636,6 +12651,58 @@ def _inject_field_slot_access(
         for name, block in control_function.blocks.items()
         for instruction in block.instrs
     ]
+    # Arm-owned writes.  Control lowering emitted each declared scalar field
+    # assignment as a ``scalar_record_field_assignment`` Store at the block's
+    # own site (inside the arm that owns it) and published its value on
+    # ``ssa_field_version`` under the write's reducer cell; the write op of
+    # ``field_ops`` names that same cell.  The authored site is therefore a
+    # lookup by cell, not a search for the source's producer.
+    arm_stores: dict[Any, int] = {}
+    for position, (_name, instruction) in enumerate(flat):
+        if (
+            instruction.op in {"Store", "store"}
+            and (instruction.attributes or {}).get("binding")
+            == "scalar_record_field_assignment"
+            and isinstance(
+                (instruction.attributes or {}).get("field_state_cell"), Ref
+            )
+        ):
+            arm_stores.setdefault(
+                instruction.attributes["field_state_cell"], position
+            )
+    _write_cells = (
+        iter(field_write_state_cells)
+        if len(field_write_state_cells)
+        == sum(1 for op in field_ops if op[0] == "write") else iter(())
+    )
+    _read_ids = {
+        int(value_id) for kind, value_id, _slot in field_ops if kind == "read"
+    }
+    # op index -> flat position of the arm Store that IS that write; and the
+    # positions whose destination is a field READ (the placeholder named the
+    # field by its read value, which injection turns into a Load -- data, not
+    # an address, so that Store does nothing and is replaced by the real one).
+    arm_owned: dict[int, tuple[int, Any]] = {}
+    placeholder_positions: set[int] = set()
+    claimed_positions: set[int] = set()
+    for op_index, (kind, value_id, _slot) in enumerate(field_ops):
+        if kind != "write":
+            continue
+        cell = next(_write_cells, None)
+        position = arm_stores.get(cell)
+        if (
+            position is None
+            or int(value_id) in reference_sources
+            or int(value_id) in receiver_column_ids
+            or position in claimed_positions
+        ):
+            continue
+        claimed_positions.add(position)
+        arm_owned[op_index] = (position, cell)
+        if int(flat[position][1].args[1].id) in _read_ids:
+            placeholder_positions.add(position)
+    replaced_at: dict[int, list[Instr]] = {}
+
     producer_position: dict[int, int] = {}
     produced_values: dict[int, SSAValue] = {}
     first_consumer_position: dict[int, int] = {}
@@ -12643,7 +12710,9 @@ def _inject_field_slot_access(
         if instruction.res is not None:
             producer_position.setdefault(int(instruction.res.id), position)
             produced_values.setdefault(int(instruction.res.id), instruction.res)
-        for argument in instruction.args:
+        for index, argument in enumerate(instruction.args):
+            if index == 1 and position in placeholder_positions:
+                continue  # the replaced placeholder's destination: not a use
             first_consumer_position.setdefault(int(argument.id), position)
 
     entry_name = next(iter(control_function.blocks))
@@ -12673,7 +12742,54 @@ def _inject_field_slot_access(
     field_read_ids: set[int] = {
         int(value_id) for kind, value_id, _slot in field_ops if kind == "read"
     }
+    def arm_placement(cell: Any) -> Any:
+        """The ``control_block_placement`` cell of the ``scalar_field_write``
+        block that IS ``cell`` (None when the book has no such row)."""
+
+        if lexical_read_scope is None:
+            return None
+        from .concordance_declarations import (
+            CONTROL_BLOCK, CONTROL_BLOCK_PLACEMENT, ControlBlockKind,
+        )
+
+        book = _slot_book()
+        scope = tuple(lexical_read_scope)
+        block = book.latest_ref(
+            CONTROL_BLOCK, (scope, ControlBlockKind.SCALAR_FIELD_WRITE, cell),
+        )
+        return None if block is None else book.latest_ref(
+            CONTROL_BLOCK_PLACEMENT, (scope, block),
+        )
+
     for schedule_index, (kind, value_id, slot) in enumerate(field_ops):
+        if schedule_index in arm_owned:
+            position, write_cell = arm_owned[schedule_index]
+            authored = flat[position][1]
+            source = authored.args[0]
+            placement = arm_placement(write_cell)
+            causes = () if placement is None else (placement,)
+            prelude, address, slot_dtype = slot_address(slot, *causes)
+            group = []
+            # A literal is materialised in the slot's dtype, as a constant
+            # field write always was.
+            literal = producer_position.get(int(source.id))
+            if literal is not None and flat[literal][1].op == "Const" and (
+                not flat[literal][1].args
+            ):
+                source = SSAValue(fresh(*causes), dtype=slot_dtype)
+                group.append(Instr(
+                    "Const", [], source,
+                    attributes=dict(flat[literal][1].attributes or {}),
+                ))
+            group += [*prelude, Instr("Store", [source, address], None)]
+            # A placeholder that named the field by a read is replaced; one
+            # that names the field's incoming formal stays (it writes that
+            # formal in this arm) and the slot store follows it.
+            replaced_at[position] = (
+                group if position in placeholder_positions
+                else [authored, *group]
+            )
+            continue
         prelude, address, slot_dtype = slot_address(slot)
         if kind == "read":
             value_dtype = (
@@ -12789,6 +12905,9 @@ def _inject_field_slot_access(
     for position, (name, instruction) in enumerate(flat):
         for group in inserts_at.get(position, ()):
             rebuilt[name].extend(group)
+        if position in replaced_at:
+            rebuilt[name].extend(replaced_at[position])
+            continue
         if position == return_position and returned_field_values:
             instruction = Instr(
                 instruction.op,
@@ -14260,6 +14379,7 @@ def lower_control_sections_to_ssa(
     record_field_write_value_ids: tuple[int, ...] = (),
     self_value_id: int | None = None,
     field_ops: tuple[tuple[str, int, int], ...] = (),
+    field_write_state_cells: tuple[Any, ...] = (),
     field_const_sources: Mapping[int, Any] | None = None,
     field_count: int = 0,
     field_names: tuple[str, ...] = (),
@@ -16956,6 +17076,16 @@ def lower_control_sections_to_ssa(
         for kind, value_id, slot in field_ops
         if slot in compact_slot
     )
+    # The reducer WRITTEN cell of each scalar ``"write"`` op, aligned with the
+    # write ops of ``scalar_field_ops`` (empty when the shell supplied none).
+    _write_ops = [op for op in field_ops if op[0] == "write"]
+    scalar_write_state_cells = (
+        tuple(
+            cell for op, cell in zip(_write_ops, field_write_state_cells)
+            if op[2] in compact_slot
+        )
+        if len(field_write_state_cells) == len(_write_ops) else ()
+    )
     declared_field_dtypes = {
         str(name): str(dtype)
         for name, dtype in dict(record_field_dtypes or {}).items()
@@ -17047,6 +17177,8 @@ def lower_control_sections_to_ssa(
             self_value_id=int(self_value_id),
             non_self_param_ids=non_self_param_ids,
             field_ops=scalar_field_ops,
+            field_write_state_cells=scalar_write_state_cells,
+            lexical_read_scope=lexical_read_scope,
             field_const_sources=field_const_sources or {},
             field_count=len(scalar_slots),
             output_value_ids=output_value_ids,
