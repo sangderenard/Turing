@@ -12968,9 +12968,39 @@ def _inject_field_slot_access(
             CONTROL_BLOCK_PLACEMENT, (scope, block),
         )
 
-    # The reads this injection materialised as slot Loads: each is a VERSION
-    # of its field, read at its own place and time, not an address of it.
-    slot_loaded_read_ids: set[int] = set()
+    # The reads this injection materialises as slot Loads: each is a VERSION
+    # of its field, read at its own place and time, not an address of it.  It
+    # is posted on ``receiver_field_slot_read`` so record-ABI materialization
+    # reads the decision from the book.
+    from .concordance_declarations import (
+        RECEIVER_FIELD_SLOT_READ, ReceiverFieldSlotReadFact,
+    )
+
+    _write_ops = [op for op in field_ops if op[0] == "write"]
+    _slot_write_cell: dict[int, Any] = {}
+    if len(field_write_state_cells) == len(_write_ops):
+        for (_k, _v, _slot), _cell in zip(_write_ops, field_write_state_cells):
+            if isinstance(_cell, Ref):
+                _slot_write_cell.setdefault(int(_slot), _cell)
+
+    def _post_slot_read(read_id: int, slot: int, address: SSAValue) -> None:
+        book = _slot_book()
+        sources = tuple(dict.fromkeys(
+            cell for cell in (
+                book.latest_ref(SSA_VALUE, (_slot_scope, int(address.id))),
+                book.latest_ref(SSA_VALUE, (_slot_scope, int(read_id))),
+                _slot_write_cell.get(int(slot)),
+            ) if isinstance(cell, Ref)
+        ))
+        if not sources:
+            return
+        book.post(
+            RECEIVER_FIELD_SLOT_READ, (_slot_scope, int(read_id)),
+            ReceiverFieldSlotReadFact(int(slot), int(read_id)),
+            stage=CONTROL_SSA_FINISH, provenance=Derived(sources),
+            mode=Mode.CONCORD,
+        )
+
     materialized_references: set[int] = set()
     for schedule_index, (kind, value_id, slot) in enumerate(field_ops):
         if schedule_index in arm_owned:
@@ -13053,7 +13083,7 @@ def _inject_field_slot_access(
                 position = return_position  # returned but otherwise unconsumed
             if position is None:
                 continue  # a read nothing consumes has no place and no effect
-            slot_loaded_read_ids.add(int(value_id))
+            _post_slot_read(int(value_id), int(slot), address)
         else:
             group = []
             reference = reference_sources.get(int(value_id))
@@ -13200,9 +13230,6 @@ def _inject_field_slot_access(
             "receiver_field_locations": tuple(sorted(
                 (int(slot), *location)
                 for slot, location in field_locations.items()
-            )),
-            "receiver_field_read_value_ids": tuple(sorted(
-                slot_loaded_read_ids
             )),
         },
     ), field_locations

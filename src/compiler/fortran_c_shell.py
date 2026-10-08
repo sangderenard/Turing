@@ -21732,7 +21732,7 @@ def _class_surface_ssa_program(
             )
             write_sources = list(dict.fromkeys(write_sources))
             if storage in {"scalar", "reference"} and any(
-                int(value_id) in slot_loaded for value_id, _after in getters
+                slot_loaded(value_id) for value_id, _after in getters
             ):
                 # The control injection already lowered this field to slot
                 # Loads and Stores: every read is a VERSION of the field,
@@ -21851,12 +21851,19 @@ def _class_surface_ssa_program(
                         reason=alias_reason,
                     )
 
-        slot_loaded = {
-            int(value_id)
-            for value_id in function.metadata.get(
-                "receiver_field_read_value_ids", ()
-            )
-        }
+        # The reads the control injection lowered to receiver slot Loads are
+        # rows of ``receiver_field_slot_read`` (function scope, read id).
+        slot_read_scope = str(
+            function.metadata.get("tensor_shape_concordance_scope")
+            or function.name
+        )
+
+        def slot_loaded(value_id: int) -> bool:
+            from .concordance_declarations import RECEIVER_FIELD_SLOT_READ
+
+            return current_identity_book().latest_ref(
+                RECEIVER_FIELD_SLOT_READ, (slot_read_scope, int(value_id)),
+            ) is not None
         for parameter_name, record in declared_records.items():
             parameter_ids = set(map(
                 int, identities.get(str(parameter_name), ())

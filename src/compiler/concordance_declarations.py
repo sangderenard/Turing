@@ -2354,6 +2354,29 @@ RECORD_FIELD_INCOMING_SLOT = declare_page("record_field_incoming_slot", (
     RowField("field", K.NAME),
 ), int)                                # DERIVED; CONCORD
 
+@dataclass(frozen=True)
+class ReceiverFieldSlotReadFact:
+    """The receiver slot a field read was lowered to, and the SSA value of
+    the Load that IS the read at its own place."""
+
+    slot: int
+    load_value_id: int
+
+
+#: A field read that ``_inject_field_slot_access`` turned into a Load of the
+#: receiver's slot.  Such a read is a VERSION of its field -- read at its own
+#: place and time -- and the slot address is the field's one storage, so
+#: record-ABI materialization must not coalesce it (or the values written to
+#: the field) onto another version of the field.  Row: (function scope, the
+#: read's value id).  Writer: ``precompile_to_ssa._inject_field_slot_access``
+#: (stage ``control_ssa_finish``, DERIVED from the slot address's ``ssa_value``
+#: cell, the read's own ``ssa_value`` cell when it has one, and the field's
+#: write ``reducer_field_state`` cell when the field is written); CONCORD.
+#: Reader: ``fortran_c_shell`` ``coalesce_record_field_storage``.
+RECEIVER_FIELD_SLOT_READ = declare_page("receiver_field_slot_read", (
+    RowField("function_scope", K.SCOPE), RowField("read", K.VALUE_ID),
+), ReceiverFieldSlotReadFact)
+
 #: A keyed row's scalar leaf as the element pointer into its declared row
 #: column, selected by the row handle (user decision (A), carried to
 #: materialization).  Row: (function, the pointer's SSA id); fact: the leaf's
