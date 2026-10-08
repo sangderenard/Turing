@@ -2151,6 +2151,14 @@ class SSACallTable(__import__("collections.abc").abc.MutableMapping):
         records = tuple(records)
         if self._page.latest(row) == records:
             return None
+        if not sources and not records:
+            # Registering a caller with no records yet: the row derives from
+            # the table's own scope cell (the scope the book minted for it).
+            from ..compiler.concordance_declarations import SCOPE_REGISTRY
+
+            owner_cell = self.book.latest_ref(SCOPE_REGISTRY, self.owner)
+            if owner_cell is not None:
+                sources = (owner_cell,)
         if sources:
             return _table_post(
                 self.book, self._page.name, row, records,

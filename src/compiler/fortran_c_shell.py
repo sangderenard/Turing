@@ -87,6 +87,7 @@ from .frame_identity_book import (
     _argument_binding_fact as _argument_binding_fact,
     _frame_binding_value_ids as _frame_binding_value_ids,
     _frame_book_scope as _frame_book_scope,
+    _frame_call_cells as _frame_call_cells,
     _frame_cells as _frame_cells,
     _frame_graph_cell as _frame_graph_cell,
     _frame_mint as _frame_mint,
@@ -3662,14 +3663,21 @@ def _prune_unused_callee_formals_once(
         )
         from .identity_concordance import current_identity_book
 
-        pruned_page = current_identity_book().page(
-            "pruned_callee_formal_concordance"
+        from .concordance_declarations import (
+            FRAME_BINDING as _PRUNE_FRAME_BINDING,
+            PRUNED_CALLEE_FORMAL as _PRUNED_CALLEE_FORMAL,
         )
+
+        # A formal no instruction references (or a superseded placeholder):
+        # DERIVED from its own ``ssa_value`` cell in the callee.
         removed_ids = {
             int(callee.args[index].id) for index in removable_indices
-            if pruned_page.concord(
+            if _frame_post(
+                _PRUNED_CALLEE_FORMAL,
                 (str(callee_name), int(callee.args[index].id)), "unused",
-            ) == "unused"
+                stage=_PRUNE_FRAME_BINDING,
+                cells=(_frame_value_cell(callee, callee.args[index].id),),
+            ) is not None
         }
         for call in callers:
             old_output_position = call.attributes.get(
@@ -29114,7 +29122,8 @@ def _class_surface_ssa_program(
                     "ssa_sequence_operation"
                 ))
             ),
-        ))
+        ), sources=_frame_call_cells(caller_graph, planned_call.callsite_id),
+            stage=FRAME_BINDING)
         call_expression = call_data.get("expr_obj")
         call_position = (
             int(getattr(call_expression, "end_lineno", 0) or 0),
@@ -32884,9 +32893,27 @@ def _class_surface_ssa_program(
                     for (_caller_id, callee_id), argument in zip(
                         record.argument_bindings, marker.args
                     ):
-                        scheduled_call_sources[
-                            (*scheduled_key, int(callee_id))
-                        ] = argument
+                        from .concordance_declarations import (
+                            FRAME_BINDING as _SCHEDULED_FRAME_BINDING,
+                            SCHEDULED_CALL_ARGUMENT as _SCHEDULED_CALL_ARGUMENT,
+                        )
+                        from .identity_concordance import Mode as _ScheduledMode
+
+                        # The marker's operand, DERIVED from its own
+                        # ``ssa_value`` cell and the formal it feeds.
+                        _frame_post(
+                            _SCHEDULED_CALL_ARGUMENT,
+                            (
+                                scheduled_call_sources.scope,
+                                (*scheduled_key, int(callee_id)),
+                            ),
+                            argument, stage=_SCHEDULED_FRAME_BINDING,
+                            cells=(
+                                _frame_value_cell(caller, argument.id),
+                                _frame_value_cell(callee, callee_id),
+                            ),
+                            mode=_ScheduledMode.REVISE,
+                        )
                 if eligible:
                     call_arguments = []
                     constants = []
@@ -36474,14 +36501,24 @@ def _class_surface_ssa_program(
                         # hands it a one-element array must not turn it into a
                         # span, which the pass would then push onto every other
                         # caller's scalar.
+                        from .concordance_declarations import (
+                            FRAME_BINDING as _KERNEL_FRAME_BINDING,
+                            KERNEL_BY_VALUE_FORMAL as _KERNEL_BY_VALUE_FORMAL,
+                        )
                         by_value_kernel_formal = bool(
                             callee.metadata.get("llvm_argument_names")
                         ) and str(formal.dtype or "") != "ptr" and (
-                            current_identity_book().page(
-                                "kernel_by_value_formal_concordance"
-                            ).concord(
+                            # The formal crosses by value: DERIVED from the
+                            # formal's and the actual's ``ssa_value`` cells.
+                            _frame_post(
+                                _KERNEL_BY_VALUE_FORMAL,
                                 (str(callee.name), int(formal.id)), "by_value",
-                            ) == "by_value"
+                                stage=_KERNEL_FRAME_BINDING,
+                                cells=(
+                                    _frame_value_cell(callee, formal.id),
+                                    _frame_value_cell(caller, actual.id),
+                                ),
+                            ) is not None
                         )
                         actual_rank = max(
                             len(tuple(actual.shape or ())),
