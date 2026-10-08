@@ -2980,7 +2980,7 @@ AGGREGATE_LEDGER_CAUSE_NOT_ON_BOOK = declare_reason(
 #: ``oscillating_rows`` names a shape that is left and returned to), DERIVED(the
 #: callee's return cells).
 CALLSITE_RETURN_SPECIALIZATION_PAGE = declare_page("callsite_return_specialization", (
-    RowField("caller", K.SCOPE), RowField("callee", K.NAME),
+    RowField("caller", K.SCOPE), RowField("callee", K.SCOPE),
     RowField("call", K.VALUE_ID),
 ), tuple)
 #: A specialization round whose published shape changed over the same return
