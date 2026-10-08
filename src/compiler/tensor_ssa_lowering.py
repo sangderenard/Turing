@@ -4249,14 +4249,24 @@ def lower_tensor_calls_to_repository_ssa(
                     source is not None
                     and opcode_contract is not None
                 ):
-                    result.accounting = {
-                        **dict(result.accounting or {}),
-                        # Both authored C dispatch kernels take ``double *``
-                        # outputs. Tensor comparison masks may remain
-                        # semantically Boolean while retaining that physical
-                        # storage ABI.
-                        "physical_dtype": "float64",
-                    }
+                    if str(result.dtype or "").casefold() not in {
+                        "float32", "float16", "f32", "f16",
+                    }:
+                        # A narrower float result is NOT stamped double: its
+                        # declared dtype is the value's storage, and the call
+                        # adapters convert at the kernel boundary (a double
+                        # temporary, then ``physical_call_output_conversion``
+                        # back to the declared width).  Stamping it double
+                        # made a float32 value live in, and be returned as,
+                        # float64.
+                        result.accounting = {
+                            **dict(result.accounting or {}),
+                            # Both authored C dispatch kernels take
+                            # ``double *`` outputs. Tensor comparison masks
+                            # may remain semantically Boolean while retaining
+                            # that physical storage ABI.
+                            "physical_dtype": "float64",
+                        }
                     if opcode_contract[0] == "binary":
                         shaped_operands = [
                             tuple(operand.shape or ())

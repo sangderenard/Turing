@@ -87,6 +87,7 @@ from .hierarchical_plan import (
 from ..common.tensors.topological_reducer import (
     _append_operand,
     _set_operands,
+    _widest_element,
     indexed_store_site_span,
 )
 # Step 9 (plan 100, 1.2): the causes this module's operand rewrites record.
@@ -3552,6 +3553,32 @@ def _build_shell_hierarchy_plan(
                     reference_record = _shape_dtype_cache.get(parents[1])
                     if reference_record is not None and reference_record[1]:
                         dtype = reference_record[1]
+                if (
+                    operation in {
+                        "unsqueeze", "squeeze", "expand", "broadcast_to",
+                        "sum", "prod", "min", "max", "cumsum", "cumprod",
+                    }
+                    and not tensor.get("dtype")
+                ):
+                    # These keep their VALUE operand's element dtype (the
+                    # descriptor rules above read it from the operand).  With
+                    # no dtype posted on the node, the domain default
+                    # (float64) is not a declaration: take the posted
+                    # descriptor's dtype, else the operand's own record.
+                    posted = _tensor_descriptor(graph, int(current))
+                    value_parent = next((
+                        int(parent)
+                        for parent, role in (_node.get("parents") or ())
+                        if str(role).casefold() in {
+                            "operand", "value", "base", "input", "self",
+                            "receiver",
+                        }
+                        and int(parent) in _shape_dtype_cache
+                    ), next((p for p in parents[:1]), None))
+                    if posted is not None and posted.get("dtype"):
+                        dtype = str(posted["dtype"])
+                    elif value_parent in _shape_dtype_cache:
+                        dtype = _shape_dtype_cache[value_parent][1]
                 # DomainNode historically pads scalars with unit axes. If it
                 # says scalar but a canonical tensor op consumes a shaped
                 # tensor, carry that shape through.
@@ -3578,6 +3605,23 @@ def _build_shell_hierarchy_plan(
                             # tuple here would fabricate a region ABI.
                             pass
                     if parent_dtypes and not tensor.get("dtype"):
+                        # A literal Python float is a weak operand: it names
+                        # no element width, so beside a typed float operand
+                        # it does not widen the result (``float32 * 2.0`` is
+                        # float32, as in the eager lane).  The float rank of
+                        # the result is the widest the operands DECLARE; an
+                        # explicit ``float``/``double`` cast is float64 by
+                        # its own source.
+                        weak_literals = {
+                            parent for parent, _s, _d in parent_records
+                            if declared(parent)[5] in {"const", "constant"}
+                            and isinstance(
+                                declared(parent)[2].get(
+                                    "value", declared(parent)[0].get("constant")
+                                ),
+                                float,
+                            )
+                        }
                         numeric_dtypes = {
                             "int" if candidate in {"i32", "int32"}
                             else "int64" if candidate == "i64"
@@ -3585,12 +3629,22 @@ def _build_shell_hierarchy_plan(
                                 "float", "double", "f64",
                             }
                             else str(candidate)
-                            for candidate in parent_dtypes
+                            for parent, _s, candidate in parent_records
+                            if parent not in weak_literals
                         }
-                        if numeric_dtypes.intersection({
-                            "float16", "float32", "float64",
-                        }):
-                            dtype = "float64"
+                        # The declared promotion rule is the precision
+                        # layer's: the wider element type wins.
+                        declared_float = _widest_element(*numeric_dtypes)
+                        if declared_float is None and weak_literals:
+                            # Only literal floats are float: the literal's
+                            # own default width is all the source says.
+                            declared_float = "float64"
+                        if declared_float is not None:
+                            dtype = (
+                                "float64"
+                                if operation in {"float", "double"}
+                                else declared_float
+                            )
                         elif "int64" in numeric_dtypes:
                             dtype = "int64"
                         elif "int" in numeric_dtypes:
@@ -19875,6 +19929,79 @@ def _shape_only_view_operations() -> frozenset[str]:
 _SHAPE_ONLY_VIEW_OPERATIONS = _shape_only_view_operations()
 
 
+def _promotion_sides(
+    graph: Any, operands: tuple[int, ...], sides: list[Any],
+) -> list[Any]:
+    """The operand descriptors that take part in an elementwise dtype promotion.
+
+    An authored Python scalar (``1 - mask``, ``x * 2.0``) is a weak operand:
+    it names a value, not an element width, so beside a floating tensor it
+    does not widen the result -- ``float32 * 2.0`` is float32, as in the eager
+    lane.  NumPy's ``result_type`` over the literal's own default dtype
+    (int64/float64) would answer float64.  A literal beside anything that is
+    not floating keeps its default dtype and takes part as before.
+    """
+
+    def host_literal(operand: int, side: Any) -> bool:
+        node = graph.G.nodes[int(operand)]
+        if str(node.get("type")) not in {"Constant", "Const", "const"}:
+            return False
+        literal = node.get("constant")
+        if literal is None:
+            literal = (node.get("attributes") or {}).get("value")
+        return isinstance(literal, (int, float, bool)) and not tuple(
+            (side or {}).get("shape") or ()
+        )
+
+    def floating(side: Any) -> bool:
+        try:
+            return np.dtype(str(side.get("dtype"))).kind == "f"
+        except TypeError:
+            return False
+
+    weak = [host_literal(operand, side) for operand, side in zip(operands, sides)]
+    strong = [side for side, is_weak in zip(sides, weak) if not is_weak]
+    if strong and len(strong) < len(sides) and any(floating(side) for side in strong):
+        return strong
+    return list(sides)
+
+
+def _dtype_argument_name(
+    graph: Any, candidate: int, seen: Any = None,
+) -> str | None:
+    """The element dtype a ``dtype=`` argument node names, or ``None``.
+
+    The argument may be a computed call -- ``other.get_dtype()`` -- which
+    carries no literal at all.  ``get_dtype`` of a tensor IS that tensor's
+    descriptor dtype, so name it from the tensor it reads; otherwise a cast
+    (or a constructor such as ``arange``) would keep a default dtype instead
+    of the reference tensor's (a bool comparison cast to the matrix's dtype
+    stayed bool, and every consumer inherited it).
+    """
+
+    candidate_data = graph.G.nodes[candidate]
+    if str(candidate_data.get("op") or "") == "get_dtype":
+        readers = tuple(
+            int(reader) for reader, _role
+            in candidate_data.get("parents") or ()
+            if int(reader) in graph.G
+        )
+        if len(readers) == 1:
+            read = (
+                _tensor_descriptor(graph, readers[0], seen)
+                if seen is not None
+                else _tensor_descriptor(graph, readers[0])
+            )
+            if read is not None and read.get("dtype"):
+                return str(read["dtype"])
+        return None
+    try:
+        literal = _constant_value(graph.G.nodes[candidate])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return str(literal) if isinstance(literal, str) else None
+
+
 def _tensor_descriptor_rule(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -20676,7 +20803,9 @@ def _tensor_descriptor_rule(
                             }
                             else str(np.result_type(*(
                                 np.dtype(str(side.get("dtype")))
-                                for side in sides
+                                for side in _promotion_sides(
+                                    graph, operands, sides,
+                                )
                                 if str(side.get("dtype") or "unknown")
                                 != "unknown"
                             )))
@@ -21035,32 +21164,7 @@ def _tensor_descriptor_rule(
                 inherited = _tensor_descriptor(graph, tensor_parents[0], seen)
                 if inherited is not None:
                     def _literal_dtype(candidate: int) -> str | None:
-                        # The dtype argument may be a computed call --
-                        # ``other.get_dtype()`` -- which carries no literal at
-                        # all.  ``get_dtype`` of a tensor IS that tensor's
-                        # descriptor dtype, so name it from the tensor it
-                        # reads; otherwise the cast would keep the OPERAND's
-                        # dtype (a bool comparison cast to the matrix's dtype
-                        # stayed bool, and every consumer inherited it).
-                        candidate_data = graph.G.nodes[candidate]
-                        if str(candidate_data.get("op") or "") == "get_dtype":
-                            readers = tuple(
-                                int(reader) for reader, _role
-                                in candidate_data.get("parents") or ()
-                                if int(reader) in graph.G
-                            )
-                            if len(readers) == 1:
-                                read = _tensor_descriptor(
-                                    graph, readers[0], seen
-                                )
-                                if read is not None and read.get("dtype"):
-                                    return str(read["dtype"])
-                            return None
-                        try:
-                            literal = _constant_value(graph.G.nodes[candidate])
-                        except (KeyError, TypeError, ValueError):
-                            return None
-                        return str(literal) if isinstance(literal, str) else None
+                        return _dtype_argument_name(graph, candidate, seen)
 
                     cast_dtype = next((
                         named
@@ -23019,8 +23123,23 @@ def _fold_callsite_structural_values(
                     except (TypeError, ValueError, ZeroDivisionError):
                         count = 0
                     if count > 0:
+                        # The element dtype is the constructor's ``dtype=``
+                        # argument when it names one (``AbstractTensor.arange(
+                        # n, dtype=like.get_dtype())`` is ``like``'s dtype);
+                        # float64 only when the source names none.
+                        named_dtype = next((
+                            named
+                            for parent, role in data.get("parents") or ()
+                            if str(role).casefold() == "kw:dtype"
+                            and int(parent) in graph.G
+                            for named in (
+                                _dtype_argument_name(graph, int(parent)),
+                            )
+                            if named is not None
+                        ), None)
                         data["tensor"] = {
-                            "shape": (count,), "dtype": "float64",
+                            "shape": (count,),
+                            "dtype": named_dtype or "float64",
                         }
                         normalized = dict(data.get("attributes") or {})
                         normalized.update({
