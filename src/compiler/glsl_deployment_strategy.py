@@ -125,6 +125,7 @@ from .process_graph_fusion import (
     reduce_scheduled_shader_regions,
 )
 from .shell_reference_tables import build_shell_reference_tables
+from .shell_telemetry import compile_count, compile_iter, compile_selection_event
 from ..transmogrifier.function_table import FunctionReference
 from ..common.tensors.abstraction import AbstractTensor, tensor_identity
 from ..common.tensors.accelerator_backends.glsl_fused_network import (
@@ -23316,6 +23317,11 @@ class ProcessGraphGLSLDeployment:
                 ) + 1
                 callsite_planning_visits[planning_key] = planning_visit
                 callsite_planning_total += 1
+                compile_count(
+                    "callsite-plan", callsite_planning_total,
+                    label="callsite activations planned",
+                    detail=caller_identity,
+                )
                 if (
                     self.selection_progress is not None
                     and (
@@ -26804,6 +26810,9 @@ def strategize_shell_deployment(
         # The shared object means the root and extracted function graphs expose
         # one ordered account rather than unrelated print-only diagnostics.
         graph_metadata["deployment_selection_trace"] = trace
+        compile_selection_event(
+            stage, state, len(_function_table_stack), function_identity, facts,
+        )
         if _selection_progress is not None:
             detail = " ".join(
                 f"{name}={value}"
@@ -27245,7 +27254,11 @@ def strategize_shell_deployment(
                     region_index, "asap"
                 ),
             )
-            for region_index, node_ids in enumerate(executable_dispatch_nodes)
+            for region_index, node_ids in compile_iter(
+                enumerate(executable_dispatch_nodes), "regions",
+                label="extract dispatch subgraphs",
+                total=len(executable_dispatch_nodes),
+            )
             if node_ids
         ),
     )
@@ -27363,7 +27376,10 @@ def strategize_shell_deployment(
         and table_identity not in _function_table_stack
     ):
         nested_stack = (*_function_table_stack, table_identity)
-        for function_index, entry in enumerate(function_table):
+        for function_index, entry in compile_iter(
+            enumerate(function_table), "function-shells",
+            label="function shells", total=len(function_table),
+        ):
             if entry.graph is None:
                 continue
             reference = int(entry.reference.address)

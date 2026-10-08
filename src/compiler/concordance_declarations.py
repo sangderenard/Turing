@@ -584,6 +584,9 @@ STRUCTURAL_SPECIALIZATION_FIXED_POINT = declare_page(
 #: it.  CONCORD: a different value arriving later in the same compile is a
 #: disagreement the book refuses.
 POLICY_DECLARATION = declare_transform("policy_declaration", 0)
+#: ``lower_ast_source_to_ssa`` itself: the compile-level choices its caller
+#: made (``progress_bars``), declared before any pass runs.
+COMPILE_ENTRY = declare_stage("compile_entry")
 COMPILE_POLICY = declare_page("compile_policy", (
     RowField("policy", K.NAME),
 ), str)

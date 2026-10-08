@@ -43,6 +43,14 @@ from ..transmogrifier.graph.edge_roles import (
     positional_argument_index,
 )
 from .bounded_fixed_point import BoundedFixedPoint, bound_for
+from .shell_telemetry import (
+    compile_count,
+    compile_iter,
+    compile_progress,
+    compile_stage,
+    compile_substage,
+    declare_progress_bars_policy,
+)
 from .fortran_toolchain import (
     aggressive_c_flags,
     aggressive_fortran_flags,
@@ -14725,6 +14733,7 @@ def _class_surface_ssa_program(
             ).metadata.get("host_repository_ssa_complete", False))
         )
     )
+    compile_substage("abi settlement")
     report(
         f"discovered {len(planned_shells)} planned function shell(s) "
         f"from {len(discovered_planned_shells)} candidate(s)"
@@ -15275,7 +15284,9 @@ def _class_surface_ssa_program(
                 linked_value_abi_by_graph.setdefault(graph_id, {})
             )
             _fold_callsite_structural_values(wrapper)
-        for caller_graph, caller_id, callee_graph, callee_id in linked_value_edges:
+        for caller_graph, caller_id, callee_graph, callee_id in compile_iter(
+            linked_value_edges, "abi-edges", label="abi settlement: call edges",
+        ):
             source = linked_value_abi_by_graph.get(
                 id(caller_graph), {}
             ).get(int(caller_id))
@@ -15668,6 +15679,7 @@ def _class_surface_ssa_program(
                     "implementation_deployable": implementation_decision.deployable,
                 })
     retained_storage_identities: set[str] = set()
+    compile_substage("function lowering")
     report("sequence-schema survey complete; lowering function shells")
     for shell_index, shell in enumerate(planned_shells, 1):
         graph = getattr(shell, "process_graph", None)
@@ -15779,6 +15791,10 @@ def _class_surface_ssa_program(
         )
         if function_name is None:
             continue
+        compile_count(
+            "functions", total=len(planned_shells),
+            label="SSA lowering: functions", detail=str(function_name),
+        )
         report(
             f"function {shell_index}/{len(planned_shells)} {function_name}: "
             f"local control/region lowering start; graph_nodes={len(graph_obj)}"
@@ -26310,6 +26326,7 @@ def _class_surface_ssa_program(
             dict.fromkeys(receipts)
         )
 
+    compile_substage("record and keyed-sequence ABI")
     report("materializing record and keyed-sequence ABI")
     _debug_loop_carried_operands(
         all_functions, "shell-before-record-materialization",
@@ -27423,6 +27440,7 @@ def _class_surface_ssa_program(
                     later_values[0] if later_values else None
                 )
 
+    compile_substage("source-call records")
     report("building source-call records")
     # A returned record reaches a caller through its callee's own call
     # records (``__truediv__`` returns what ``_binary_same`` returned), so a
@@ -29586,6 +29604,7 @@ def _class_surface_ssa_program(
         f"source-call records built; callers={len(call_records)} "
         f"calls={sum(map(len, call_records.values()))}"
     )
+    compile_substage("call-frame fixed point")
     report("call-frame fixed point start")
     _debug_loop_carried_operands(
         all_functions, "shell-before-call-frame-fixed-point",
@@ -29698,7 +29717,11 @@ def _class_surface_ssa_program(
         # This is the same object-field identity already proven by the record
         # table; it neither compares variable spellings nor aliases two
         # independently constructed records.
-        for function_name, function in all_functions.items():
+        for function_name, function in compile_iter(
+            all_functions.items(), "frame-functions",
+            label="call-frame fixed point: record projections",
+            total=len(all_functions),
+        ):
             report(
                 f"ssa-frame round {frame_round}: record projections "
                 f"{function_name}; aliases="
@@ -29929,7 +29952,10 @@ def _class_surface_ssa_program(
                     ))
                 call_records[caller_symbol] = refreshed_records
             changed = True
-        for caller_symbol, records in tuple(call_records.items()):
+        for caller_symbol, records in compile_iter(
+            tuple(call_records.items()), "frame-callers",
+            label="call-frame fixed point: linking callers",
+        ):
             report(
                 f"ssa-frame round {frame_round}: linking caller "
                 f"{caller_symbol}; calls={len(records)}"
@@ -34655,6 +34681,7 @@ def _class_surface_ssa_program(
 
     module_metadata["frame_link_rounds"] = frame_round
     report(f"ssa-frame converged after {frame_round} rounds")
+    compile_substage("post-frame cleanup")
     report("post-frame call and record cleanup start")
     # A resolved source call and its planning marker are mutually exclusive:
     # the former is the executable occurrence, while the latter was only its
@@ -36332,6 +36359,7 @@ def _class_surface_ssa_program(
         all_functions, call_records, all_record_tables, all_sequence_tables,
     )
     _harmonize_call_argument_shapes(all_functions)
+    compile_substage("call type settlement")
     report("post-frame cleanup complete; call type settlement start")
 
     # A native Call is an equality constraint between each caller operand and
@@ -39962,6 +39990,7 @@ def _class_surface_ssa_program(
                 ))
             )
 
+    compile_substage("module assembly")
     report("final repository module assembly and aggregate legalization start")
     layout_type_tables = getattr(compilation, "layout_type_tables", None)
     lowered_module = IRModule(
@@ -40970,6 +40999,7 @@ def _lower_resolved_process_graph_deployment(
         }
         graph.G.graph["map_ir"] = map_ir
 
+    compile_stage("deployment-select")
     report("ssa-source: selecting complete control/operator deployment")
     deployment_type = strategize_shell_deployment(
         deployment_graph,
@@ -40977,9 +41007,11 @@ def _lower_resolved_process_graph_deployment(
         runtime_closure_only=(runtime_closure_only and not whole_source),
         _selection_progress=report,
     )
+    compile_stage("deployment-instantiate")
     report("ssa-source: instantiating complete control/operator deployment")
     deployment = deployment_type(profiling=False, shell_language="glsl")
     deployment.prepare_complete_catalogue = whole_source
+    compile_stage("call-topology")
     report("ssa-source: validating resolved ProcessGraph call topology")
     deployment.compile_process_graph(prepare_ephemerals=False)
     from .memory_regulation import stage_boundary
@@ -41112,6 +41144,7 @@ def _lower_resolved_process_graph_deployment(
             )
             for region_index in requested_regions
         }
+    compile_stage("graph-planning")
     report("ssa-source: planning complete control/operator graph")
     deployment.prepare_graph_precompile(
         progress=report,
@@ -41124,6 +41157,7 @@ def _lower_resolved_process_graph_deployment(
         assignment_normalization=tuple(assignment_normalization),
         layout_type_tables=graph.G.graph.get("layout_type_tables"),
     )
+    compile_stage("ssa-lowering")
     report("ssa-source: lowering full planned source to repository SSA")
     artifact_name = _identifier(str(name or entrypoint or "whole_source"))
     module, outputs, exports = _class_surface_ssa_program(
@@ -42553,6 +42587,7 @@ def _lower_ast_source_to_ssa_impl(
         receipts = normalize_destructuring_assignments(discovered_tree)
         assignment_receipts.extend(receipts)
 
+    compile_stage("source-closure")
     report("ssa-source: building complete ProcessGraph source closure")
     program_abi_record_identities = tuple(
         str(record.identity)
@@ -42971,6 +43006,7 @@ def _lower_ast_source_to_ssa_impl(
     ):
         if getattr(intrinsic_graph, "G", None) is not None:
             _lower_python_scalar_intrinsics(intrinsic_graph)
+    compile_stage("topology-reduction")
     report("ssa-source: reducing source topology")
     reduce_abstract_tensor_topology(graph)
     for intrinsic_graph in (
@@ -43130,6 +43166,7 @@ def _lower_ast_source_to_ssa_impl(
     _lower_optional_record_presence_catalogue(graph)
     from .compilation_units import record_compilation_unit_plan
 
+    compile_stage("compilation-units")
     report("ssa-source: dividing resolved project into compilation units")
     compilation_unit_plan = record_compilation_unit_plan(graph)
     if compilation_unit_plan_sink is not None:
@@ -43155,6 +43192,7 @@ def _lower_ast_source_to_ssa_impl(
         assignment_normalization=assignment_receipts,
         progress=progress,
     )
+    compile_stage("pre-native-repairs")
     # The deployment (every planned shell, its callsite copies and dispatch
     # subgraphs) was local to that call and is unreachable now; its shell
     # classes and closures are reference cycles, so say so to the collector
@@ -43950,6 +43988,12 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     (``piece_from_law``, ``symbolic_equation_compiler.symbolic_program_book``).
     A DETACHED book is never resumed (it counts as no book, the
     ``emission_concordance.emission_book`` rule); the compile opens its own.
+
+    ``progress_bars=`` (default: on exactly when stdout is a terminal)
+    draws the compile's stage bars with nested bars for its loops, and
+    writes every ``progress`` line above them (``shell_telemetry``).  Off,
+    ``progress`` behaves as it always did.  The choice is a ``compile_policy``
+    row on the book.
     """
     from .identity_concordance import begin_identity_book, end_identity_book
 
@@ -43964,10 +44008,10 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     # all of those messages and make a healthy compile indistinguishable from
     # a hang. Keep the canonical entry loud and unbuffered by default. A caller
     # that deliberately wants silence can pass ``lambda _message: None``.
-    if kwargs.get("progress") is None:
-        kwargs["progress"] = lambda message: print(
-            f"[compiler] {message}", file=sys.stderr, flush=True,
-        )
+    # Off, ``progress`` is the caller's callback or the plain ``[compiler]``
+    # line, exactly as before; on, it writes below-the-bars via tqdm.write.
+    _bars = compile_progress(kwargs.pop("progress_bars", None))
+    kwargs["progress"] = _bars.progress_callback(kwargs.get("progress"))
 
     _book, _token = begin_identity_book(resumed_book)
     from .memory_regulation import begin_regulation, end_regulation
@@ -43977,6 +44021,8 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     )
     ok = False
     try:
+        declare_progress_bars_policy(_bars.enabled)
+        _bars.open()
         result = _lower_ast_source_to_ssa_impl(*args, **kwargs)
         # The late dominance repairs run inside the implementation, before
         # the full-native gate and its first frame-formal concordance (see
@@ -44043,6 +44089,7 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
         ok = True
         return result
     finally:
+        _bars.close(failed=not ok)
         book = end_identity_book(_token)
         entrypoint = kwargs.get("entrypoint")
         if entrypoint is None and len(args) > 1:

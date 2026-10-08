@@ -31,6 +31,7 @@ from .concordance_declarations import (
 from .identity_concordance import (
     ConcordanceRefusal, Derived, Mode, Novel, current_identity_book,
 )
+from .shell_telemetry import compile_count, compile_count_close
 
 #: How many changed ids a receipt row and a message carry.
 RECEIPT_IDS = 8
@@ -137,6 +138,14 @@ class BoundedFixedPoint:
             f"{self.name} round {index}/{self.bound} "
             f"changed={count} ids={list(shown)}"
         )
+        # The round counter of every guarded loop is a nested progress bar.
+        compile_count(
+            f"fixed-point:{self.name}", index, total=self.bound,
+            label=f"{self.name} rounds (bound {self.bound})",
+            detail=f"changed={count}",
+        )
+        if not changed:
+            compile_count_close(f"fixed-point:{self.name}")
         if period and self.recurrence == "refuse":
             raise ConcordanceRefusal(
                 f"{self.name} scope={self.scope!r} repeated a completed state "
