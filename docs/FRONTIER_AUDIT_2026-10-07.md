@@ -128,6 +128,32 @@ src.compiler.fortran_c_shell` ok in wtv and wtc), so the uncommitted moves are n
 only unfinished. The three detached baseline worktrees (`wtb2`, `wtmb`, `wtv2`, clean at
 c0781c7a) were removed today. Disk: 57 GB free.
 
+## 3b. Merge status (2026-10-08)
+
+All twelve lane branches are merged into `main` (488bc9a0, pushed), one at a time, in
+the order region copy, cross-book, closure costs, ellipsis, conditional store, host
+layout, tick rows, shell leaves, glsl leaves, per-copy shape proofs, float32 storage
+class, field-write leftovers (the last as a cherry-pick of its three commits because it
+carried a duplicate of 7f345f24). After EVERY merge: audit findings 0,1,0,1,5,0,0,
+solve-in-dt-loop NUMERIC_MATCH on both lanes, the branch's own probe/tests with no new
+failures, `probe_module_dominance.py 2` = 458 functions / 0 violations, and
+`native_round.py 2` = 69 columns bit-exact. Conflicts resolved: the audit doc (both
+texts kept), the digest list (all nine shell-leaf modules added to the ONE shared
+`compiler_implementation_files.py`; the three readers read only that list — so the
+site-bundle and GLSL digests now also cover the shell-leaf modules), and the f32/per-copy
+weak-literal helper (one `_promoting_sides` kept; the f32 call site uses it).
+Not merged: `fix/raw-primitive-posts` (19 commits; being rebased by its author onto
+488bc9a0, then merge item 13); the two uncommitted in-progress moves in the split
+worktrees (`lexical_control_placement.py`, `source_control_retention.py`).
+
+**First N=4 attempt:** the scratch driver stopped before any lowering — its
+column-coverage guard found 139 of 303 state columns absent from `craft_machine_columns`
+(the 19 thrusters' throttle/limits/max_thrust/propellant/rk-stage delivered values, the
+stage gimbal, tank supply, inertia, mass and centre-of-mass columns). Decision given:
+the driver takes every column from the authored source the game uses
+(`OrbitalJumper._initial_columns` / the MachineCraft state construction), never invented
+values, then the N=4 lowering + parity runs.
+
 ## 4. Next walls (measured)
 
 1. **N=8 `extract-dispatch-subgraphs`**: 37 GB private / swapping at the `restore` shell
