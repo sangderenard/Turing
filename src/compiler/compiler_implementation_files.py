@@ -41,4 +41,5 @@ COMPILER_IMPLEMENTATION_FILES: tuple[str, ...] = (
     "src/compiler/authored_record_abi.py",
     "src/compiler/frame_call_linking.py",
     "src/compiler/alias_retirement.py",
+    "src/compiler/record_field_lowering.py",
 )
