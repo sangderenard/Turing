@@ -4596,38 +4596,77 @@ class ProcessGraph:
         )
 
     def connect(self, src_id, tgt_id, producer_role, consumer_role, store_id=None):
+        """Connect one operand edge: stage it, then commit it alone.
+
+        ``build_graph`` stages every edge of a consumer and commits them
+        together (``_commit_edges``); this is the one-edge caller.
+        """
+
+        self._stage_edge(src_id, tgt_id, consumer_role)
+        self._commit_edges(
+            tgt_id, [(src_id, producer_role, consumer_role, store_id)],
+        )
+
+    def _stage_edge(self, src_id, tgt_id, consumer_role):
+        """The part of an authored edge that does not touch ``tgt_id``'s
+        operand list: the source's ``children`` slot, the field-value use
+        row, and the evolution event.  Posted in the order the edges are
+        authored, whenever the commit happens."""
+
+        if 'children' not in self.G.nodes[src_id]:
+            self.G.nodes[src_id]['children'] = []
+        self._post_field_value_use(src_id, tgt_id)
+        self.observe_evolution_edge(src_id, tgt_id, consumer_role)
+
+    def _commit_edges(self, tgt_id, edges):
+        """Write ``edges`` (``(src, producer_role, consumer_role, store)``,
+        in authored order) into ``tgt_id``'s operand list with ONE
+        ``_set_operands``.
+
+        Step 9 (plan 100, 1.2): an authored operand edge is a row first.
+        ``_set_operands`` is the one writer of ``parents``, ``children`` and
+        the networkx edge; it posts the Append on ``identity_transition``
+        under this build's ``ingestion_value_scope`` DERIVED(operand cell,
+        consumer cell).  The ``Edge`` record stays an edge attribute.
+
+        One call per consumer, not one per edge: appending to the end moves
+        no earlier position, so the rows are the ones the edge-at-a-time
+        writes posted, in the same order, and a consumer with N operands
+        stops being rewritten N times.  A source already among the operands
+        (or earlier in ``edges``) adds only its ``Edge`` record, as before.
+        """
+
+        if not edges:
+            return
         with self.graph_mutation():
-            edge = Edge(
-                id=(src_id, tgt_id, producer_role, consumer_role),
-                operation=None,
-                source=src_id,
-                target=tgt_id,
-                store_id=store_id
-            )
-            # Step 9 (plan 100, 1.2): an authored operand edge is a row
-            # first.  ``_set_operands`` is the one writer of ``parents``,
-            # ``children`` and the networkx edge; it posts the Append on
-            # ``identity_transition`` under this build's
-            # ``ingestion_value_scope`` DERIVED(operand cell, consumer
-            # cell).  The ``Edge`` record stays an edge attribute.
             from ...common.tensors.topological_reducer import _set_operands
             from ...compiler.concordance_declarations import INGEST_EDGE
 
-            if 'children' not in self.G.nodes[src_id]:
-                self.G.nodes[src_id]['children'] = []
-            self._post_field_value_use(src_id, tgt_id)
             parents = list(self.G.nodes[tgt_id].get('parents') or ())
-            if src_id not in [p for p, _ in parents]:
+            known = {p for p, _ in parents}
+            appended = []
+            for src_id, _producer_role, consumer_role, _store_id in edges:
+                if src_id not in known:
+                    known.add(src_id)
+                    appended.append((src_id, consumer_role))
+            if appended:
                 _set_operands(
-                    self, tgt_id, [*parents, (src_id, consumer_role)],
+                    self, tgt_id, [*parents, *appended],
                     cause=INGEST_EDGE, edge_payload={'extra': set()},
+                    append_only=True,
                 )
-            elif not self.G.has_edge(src_id, tgt_id):
-                self.G.add_edge(src_id, tgt_id, extra=set())
-            if 'extra' not in self.G[src_id][tgt_id]:
-                self.G[src_id][tgt_id]['extra'] = set()
-            self.G[src_id][tgt_id]['extra'].add(edge)
-            self.observe_evolution_edge(src_id, tgt_id, consumer_role)
+            for src_id, producer_role, consumer_role, store_id in edges:
+                if not self.G.has_edge(src_id, tgt_id):
+                    self.G.add_edge(src_id, tgt_id, extra=set())
+                if 'extra' not in self.G[src_id][tgt_id]:
+                    self.G[src_id][tgt_id]['extra'] = set()
+                self.G[src_id][tgt_id]['extra'].add(Edge(
+                    id=(src_id, tgt_id, producer_role, consumer_role),
+                    operation=None,
+                    source=src_id,
+                    target=tgt_id,
+                    store_id=store_id
+                ))
 
     def _spec_build_tasks(
         self, nid, args, spec, direction, store_id, schema_repeats,
@@ -4692,6 +4731,32 @@ class ProcessGraph:
         )
         pending = [("visit", initial)]
         root_nid = None
+        # Edges are authored one child at a time.  A run of consecutive
+        # edges into the same consumer (leaf children: nothing is connected
+        # between them) is committed with ONE ``_set_operands``; the run
+        # ends the moment an edge into any other node is authored, so the
+        # order edges reach ``parents``, ``children`` and the networkx graph
+        # is exactly the edge-at-a-time order (a node shared by several
+        # consumers lists them in authored order).
+        run_target = None
+        run_edges: list = []
+
+        def commit_run():
+            nonlocal run_target
+            if run_edges:
+                edges = list(run_edges)
+                run_edges.clear()
+                self._commit_edges(run_target, edges)
+            run_target = None
+
+        def stage_edge(src, tgt, producer_role, consumer_role, store):
+            nonlocal run_target
+            if run_edges and run_target != tgt:
+                commit_run()
+            self._stage_edge(src, tgt, consumer_role)
+            run_target = tgt
+            run_edges.append((src, producer_role, consumer_role, store))
+
         graph_build_verbose = os.environ.get(
             "TURING_GRAPH_BUILD_VERBOSE", ""
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -4704,12 +4769,12 @@ class ProcessGraph:
                     frame_producer_role, frame_consumer_role, frame_store,
                 ) = payload
                 if frame_producer is not None:
-                    self.connect(
+                    stage_edge(
                         frame_producer, nid, frame_producer_role,
                         frame_consumer_role, frame_store,
                     )
                 if frame_consumer is not None:
-                    self.connect(
+                    stage_edge(
                         nid, frame_consumer, frame_producer_role,
                         frame_consumer_role, frame_store,
                     )
@@ -4763,12 +4828,12 @@ class ProcessGraph:
             )
             if already_defined:
                 if frame_producer is not None:
-                    self.connect(
+                    stage_edge(
                         frame_producer, nid, frame_producer_role,
                         frame_consumer_role, frame_store,
                     )
                 if frame_consumer is not None:
-                    self.connect(
+                    stage_edge(
                         nid, frame_consumer, frame_producer_role,
                         frame_consumer_role, frame_store,
                     )
@@ -4895,6 +4960,7 @@ class ProcessGraph:
                 ("visit", task) for task in reversed(child_tasks)
             )
 
+        commit_run()
         return root_nid
 
     def _walk_all_fields(self, node, consumer_id=None, producer_role=None, consumer_role=None, store_id=None, verbose=True):
